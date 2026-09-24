@@ -703,12 +703,23 @@ pub fn evict_cached_cid(id: &ContentId) {
     }
 }
 
+/// Read `id` straight from the store, touching no cache path. This is the
+/// whole read path for a store that decrypts on read: its bytes must not
+/// land in the cache directory, and a stale plaintext entry from an earlier
+/// unencrypted run must not be consulted either.
+async fn fetch_uncached(cs: &dyn ContentStore, id: &ContentId) -> io::Result<Vec<u8>> {
+    cs.get(id).await.map_err(storage_to_io_error)
+}
+
 pub async fn fetch_cached_bytes(
     cs: &dyn ContentStore,
     id: &ContentId,
     cache_dir: &Path,
     ext: &str,
 ) -> io::Result<Vec<u8>> {
+    if !cs.permits_plaintext_cache() {
+        return fetch_uncached(cs, id).await;
+    }
     let cache = DiskArtifactCache::for_dir(cache_dir);
     let cached = cache_dir.join(format!("{}.{}", id.digest_hex(), ext));
 
@@ -742,6 +753,9 @@ pub async fn fetch_cached_bytes_cid(
     id: &ContentId,
     cache_dir: &Path,
 ) -> io::Result<Vec<u8>> {
+    if !cs.permits_plaintext_cache() {
+        return fetch_uncached(cs, id).await;
+    }
     let cache = DiskArtifactCache::for_dir(cache_dir);
     let cached = cache_dir.join(id.to_string());
 
@@ -893,6 +907,7 @@ mod tests {
             data: data.clone(),
             gets: Arc::new(AtomicUsize::new(0)),
             delay: Duration::ZERO,
+            permits_plaintext_cache: true,
         };
 
         fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
@@ -1190,6 +1205,7 @@ mod tests {
         data: Vec<u8>,
         gets: Arc<AtomicUsize>,
         delay: Duration,
+        permits_plaintext_cache: bool,
     }
 
     #[async_trait::async_trait]
@@ -1215,6 +1231,75 @@ mod tests {
         async fn release(&self, _id: &ContentId) -> crate::error::Result<()> {
             Ok(())
         }
+        fn permits_plaintext_cache(&self) -> bool {
+            self.permits_plaintext_cache
+        }
+    }
+
+    fn regular_files_under(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// A store that decrypts on read must leave nothing in the cache
+    /// directory: neither the CID-keyed nor the extension-keyed fetch may
+    /// spill its plaintext, and a second fetch goes back to the store.
+    #[tokio::test]
+    async fn fetch_bypasses_disk_cache_when_store_forbids_plaintext() {
+        let dir = temp_cache_dir("e2e-no-plaintext-spill");
+        let data = vec![7u8; 128];
+        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let store = CountingStore {
+            data: data.clone(),
+            gets: Arc::clone(&gets),
+            delay: Duration::ZERO,
+            permits_plaintext_cache: false,
+        };
+
+        for _ in 0..2 {
+            let bytes = fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
+            assert_eq!(bytes, data);
+            let bytes = fetch_cached_bytes(&store, &id, &dir, "nba").await.unwrap();
+            assert_eq!(bytes, data);
+        }
+
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            4,
+            "every read must hit the store"
+        );
+        assert!(
+            regular_files_under(&dir).is_empty(),
+            "no artifact may be written to the cache directory"
+        );
+
+        // Non-vacuity: the same flow with a permitting store does populate the cache.
+        let permitting = CountingStore {
+            data: data.clone(),
+            gets: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::ZERO,
+            permits_plaintext_cache: true,
+        };
+        fetch_cached_bytes_cid(&permitting, &id, &dir)
+            .await
+            .unwrap();
+        assert_eq!(regular_files_under(&dir).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1227,6 +1312,7 @@ mod tests {
             data: data.clone(),
             gets: Arc::clone(&gets),
             delay: Duration::from_millis(100),
+            permits_plaintext_cache: true,
         });
 
         let mut handles = Vec::new();

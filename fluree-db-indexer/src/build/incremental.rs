@@ -89,12 +89,19 @@ impl Phase2FetchStats {
     }
 }
 
+/// Seed the read-through artifact cache with bytes this build just uploaded,
+/// so the first reader does not re-fetch them. Skipped when the store does
+/// not permit a plaintext copy outside it (encrypted storage).
 fn cache_artifact_bytes(
+    content_store: &dyn ContentStore,
     cache_dir: &std::path::Path,
     cid: &ContentId,
     bytes: &[u8],
     artifact_kind: &'static str,
 ) {
+    if !content_store.permits_plaintext_cache() {
+        return;
+    }
     fluree_db_binary_index::read::artifact_cache::best_effort_cache_bytes_to_path(
         cache_dir,
         &cache_dir.join(cid.to_string()),
@@ -133,7 +140,7 @@ async fn upload_dict_blob_cached(
     cache_dir: &std::path::Path,
 ) -> Result<ContentId> {
     let cid = super::upload::upload_dict_blob(content_store, dict, bytes, msg).await?;
-    cache_artifact_bytes(cache_dir, &cid, bytes, "dict_blob");
+    cache_artifact_bytes(content_store, cache_dir, &cid, bytes, "dict_blob");
     Ok(cid)
 }
 
@@ -571,7 +578,13 @@ async fn execute_phase2_task(
                 .await
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
             debug_assert!(branch_cid == meta.branch_cid);
-            cache_artifact_bytes(&cache_dir, &branch_cid, &meta.branch_bytes, "index_branch");
+            cache_artifact_bytes(
+                &*content_store,
+                &cache_dir,
+                &branch_cid,
+                &meta.branch_bytes,
+                "index_branch",
+            );
             Phase2TaskOutput {
                 seq,
                 g_id,
@@ -618,7 +631,13 @@ async fn execute_phase2_task(
                 .await
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
             debug_assert!(branch_cid == expected_branch_cid);
-            cache_artifact_bytes(&cache_dir, &branch_cid, &branch_bytes, "index_branch");
+            cache_artifact_bytes(
+                &*content_store,
+                &cache_dir,
+                &branch_cid,
+                &branch_bytes,
+                "index_branch",
+            );
             Phase2TaskOutput {
                 seq,
                 g_id,
@@ -1790,7 +1809,13 @@ pub async fn incremental_index(
                         .map_err(|e| {
                             IndexerError::StorageWrite(format!("fulltext CAS write: {e}"))
                         })?;
-                    cache_artifact_bytes(&cache_dir, &arena_cid, &blob, "fulltext_arena");
+                    cache_artifact_bytes(
+                        &*content_store,
+                        &cache_dir,
+                        &arena_cid,
+                        &blob,
+                        "fulltext_arena",
+                    );
 
                     let new_ref = FulltextArenaRef {
                         p_id,
@@ -1989,7 +2014,13 @@ pub async fn incremental_index(
                             .put(ContentKind::SpatialIndex, blob_bytes)
                             .await
                             .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                        cache_artifact_bytes(&cache_dir, &cid, blob_bytes, "spatial_blob");
+                        cache_artifact_bytes(
+                            &*content_store,
+                            &cache_dir,
+                            &cid,
+                            blob_bytes,
+                            "spatial_blob",
+                        );
                     }
 
                     // Build CIDs.
@@ -2000,7 +2031,13 @@ pub async fn incremental_index(
                         .put(ContentKind::SpatialIndex, &root_json)
                         .await
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    cache_artifact_bytes(&cache_dir, &root_cid, &root_json, "spatial_root");
+                    cache_artifact_bytes(
+                        &*content_store,
+                        &cache_dir,
+                        &root_cid,
+                        &root_json,
+                        "spatial_root",
+                    );
                     let manifest_cid =
                         ContentId::from_hex_digest(spatial_codec, &write_result.manifest_address)
                             .ok_or_else(|| {
@@ -2256,7 +2293,13 @@ pub async fn incremental_index(
                     .put(ContentKind::StatsSketch, &sketch_bytes)
                     .await
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                cache_artifact_bytes(&cache_dir, &cid, &sketch_bytes, "stats_sketch");
+                cache_artifact_bytes(
+                    &*content_store,
+                    &cache_dir,
+                    &cid,
+                    &sketch_bytes,
+                    "stats_sketch",
+                );
                 tracing::debug!(
                     %cid,
                     bytes = sketch_bytes.len(),
@@ -4001,7 +4044,13 @@ pub async fn incremental_index(
         .put(ContentKind::IndexRoot, &root_bytes)
         .await
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-    cache_artifact_bytes(&cache_dir, &root_id, &root_bytes, "index_root");
+    cache_artifact_bytes(
+        &*content_store,
+        &cache_dir,
+        &root_id,
+        &root_bytes,
+        "index_root",
+    );
 
     tracing::debug!(
         %root_id,
@@ -4484,7 +4533,13 @@ async fn upload_one_leaf_blob(
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
     crate::fuel::charge_extra_leaflets(tracker, info.re_encoded_leaflet_count)?;
     debug_assert!(leaf_cid == info.leaf_cid);
-    cache_artifact_bytes(cache_dir, &leaf_cid, &info.leaf_bytes, "index_leaf");
+    cache_artifact_bytes(
+        content_store,
+        cache_dir,
+        &leaf_cid,
+        &info.leaf_bytes,
+        "index_leaf",
+    );
     counts.leaf_bytes = info.leaf_bytes.len() as u64;
 
     // Warm-on-write (co-located only): seed the shared read cache with the
@@ -4516,7 +4571,13 @@ async fn upload_one_leaf_blob(
         if let Some(expected) = &info.sidecar_cid {
             debug_assert!(&sidecar_cid == expected);
         }
-        cache_artifact_bytes(cache_dir, &sidecar_cid, sc_bytes, "history_sidecar");
+        cache_artifact_bytes(
+            content_store,
+            cache_dir,
+            &sidecar_cid,
+            sc_bytes,
+            "history_sidecar",
+        );
         counts.sidecar_bytes = sc_bytes.len() as u64;
         counts.sidecar_count = 1;
     }

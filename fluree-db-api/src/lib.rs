@@ -840,6 +840,10 @@ where
         self.commit.supports_ranged_reads() && self.index.supports_ranged_reads()
     }
 
+    fn permits_plaintext_cache(&self) -> bool {
+        self.commit.permits_plaintext_cache() && self.index.permits_plaintext_cache()
+    }
+
     async fn exists(&self, address: &str) -> std::result::Result<bool, fluree_db_core::Error> {
         if Self::route_to_commit(address) {
             self.commit.exists(address).await
@@ -1065,6 +1069,15 @@ impl StorageRead for AddressIdentifierResolverStorage {
     fn resolve_local_path(&self, address: &str) -> Option<std::path::PathBuf> {
         self.route(address).resolve_local_path(address)
     }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        // No address to route on — permit only if every routable storage does.
+        self.default.permits_plaintext_cache()
+            && self
+                .identifier_map
+                .values()
+                .all(fluree_db_core::StorageRead::permits_plaintext_cache)
+    }
 }
 
 #[async_trait]
@@ -1153,6 +1166,22 @@ fn decode_encryption_key_base64(key_str: &str) -> Result<[u8; 32]> {
     Ok(key)
 }
 
+/// Wrap `storage` in [`EncryptedStorage`] when the storage config carries
+/// an `AES256Key`; the one place a config key becomes a key provider.
+fn encrypt_storage_from_config(
+    storage: Arc<dyn Storage>,
+    storage_config: &fluree_db_connection::config::StorageConfig,
+) -> Result<Arc<dyn Storage>> {
+    match storage_config.aes256_key.as_deref() {
+        Some(key_str) => {
+            let key = decode_encryption_key_base64(key_str)?;
+            let key_provider = StaticKeyProvider::new(EncryptionKey::new(key, 0));
+            Ok(Arc::new(EncryptedStorage::new(storage, key_provider)))
+        }
+        None => Ok(storage),
+    }
+}
+
 /// Build an S3 storage instance from a StorageConfig.
 ///
 /// Returns an `Arc<dyn Storage>` which may be either:
@@ -1210,15 +1239,7 @@ async fn build_s3_storage_from_config(
         .await
         .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
 
-    // Wrap with encryption if key is configured
-    if let Some(key_str) = storage_config.aes256_key.as_ref() {
-        let key = decode_encryption_key_base64(key_str.as_ref())?;
-        let encryption_key = EncryptionKey::new(key, 0);
-        let key_provider = StaticKeyProvider::new(encryption_key);
-        Ok(Arc::new(EncryptedStorage::new(storage, key_provider)))
-    } else {
-        Ok(Arc::new(storage))
-    }
+    encrypt_storage_from_config(Arc::new(storage), storage_config)
 }
 
 /// Build a local (memory/file) storage instance from a StorageConfig.
@@ -1229,7 +1250,9 @@ fn build_local_storage_from_config(
     use fluree_db_connection::config::StorageType;
 
     match &storage_config.storage_type {
-        StorageType::Memory => Ok(Arc::new(MemoryStorage::new())),
+        StorageType::Memory => {
+            encrypt_storage_from_config(Arc::new(MemoryStorage::new()), storage_config)
+        }
         StorageType::File => {
             let path = storage_config
                 .path
@@ -1241,14 +1264,7 @@ fn build_local_storage_from_config(
             // files is taken here explicitly.
             storage.sweep_orphaned_staging();
             storage.recover_wal()?;
-            if let Some(key_str) = storage_config.aes256_key.as_ref() {
-                let key = decode_encryption_key_base64(key_str.as_ref())?;
-                let encryption_key = EncryptionKey::new(key, 0);
-                let key_provider = StaticKeyProvider::new(encryption_key);
-                Ok(Arc::new(EncryptedStorage::new(storage, key_provider)))
-            } else {
-                Ok(Arc::new(storage))
-            }
+            encrypt_storage_from_config(Arc::new(storage), storage_config)
         }
         StorageType::S3(_) => Err(ApiError::config(
             "S3 storage in addressIdentifiers is only supported with 'aws' feature",
@@ -1901,19 +1917,25 @@ impl FlureeBuilder {
     ///
     /// ```json
     /// {
-    ///   "@context": {"@vocab": "https://ns.flur.ee/system#"},
-    ///   "@graph": [{
-    ///     "@type": "Connection",
-    ///     "indexStorage": {
+    ///   "@context": {
+    ///     "@base": "https://ns.flur.ee/config/connection/",
+    ///     "@vocab": "https://ns.flur.ee/system#"
+    ///   },
+    ///   "@graph": [
+    ///     {
+    ///       "@id": "storage",
     ///       "@type": "Storage",
     ///       "filePath": "/data/fluree",
     ///       "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
-    ///     }
-    ///   }]
+    ///     },
+    ///     {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "storage"}}
+    ///   ]
     /// }
     /// ```
     ///
-    /// The key should be base64-encoded, 32 bytes when decoded.
+    /// Nodes are located by `@id`, so every node needs one. The key should
+    /// be base64-encoded, 32 bytes when decoded, and is honoured by every
+    /// terminal build method.
     pub fn from_json_ld(json: &serde_json::Value) -> Result<Self> {
         let config = ConnectionConfig::from_json_ld(json)
             .map_err(|e| ApiError::config(format!("Invalid JSON-LD config: {e}")))?;
@@ -2362,7 +2384,9 @@ impl FlureeBuilder {
 
     /// Build a file-backed Fluree instance
     ///
-    /// Returns an error if storage_path is not set.
+    /// Returns an error if storage_path is not set. A key set on the builder
+    /// (`with_encryption_key*()` or `AES256Key` in JSON-LD) encrypts the
+    /// storage; the file nameservice stays plaintext.
     ///
     /// Indexing is enabled by default for `file`-constructed builders; call
     /// `without_indexing()` to opt out (see that method for when that's
@@ -2389,7 +2413,7 @@ impl FlureeBuilder {
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let backend = StorageBackend::Managed(Arc::new(storage));
+        let backend = StorageBackend::Managed(self.encrypt_if_configured(Arc::new(storage)));
         let index_config = self.derive_indexing();
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let attachment_provider_cell = Self::new_attachment_provider_cell();
@@ -2518,15 +2542,19 @@ impl FlureeBuilder {
     /// ```ignore
     /// // From JSON-LD config with environment variable
     /// let config = json!({
-    ///     "@context": {"@vocab": "https://ns.flur.ee/system#"},
-    ///     "@graph": [{
-    ///         "@type": "Connection",
-    ///         "indexStorage": {
+    ///     "@context": {
+    ///         "@base": "https://ns.flur.ee/config/connection/",
+    ///         "@vocab": "https://ns.flur.ee/system#"
+    ///     },
+    ///     "@graph": [
+    ///         {
+    ///             "@id": "storage",
     ///             "@type": "Storage",
     ///             "filePath": "/data/fluree",
     ///             "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
-    ///         }
-    ///     }]
+    ///         },
+    ///         {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "storage"}}
+    ///     ]
     /// });
     /// let fluree = FlureeBuilder::from_json_ld(&config)?
     ///     .build_encrypted_from_config()?;
@@ -2589,6 +2617,20 @@ impl FlureeBuilder {
         self.encryption_key.is_some()
     }
 
+    /// Wrap `storage` in [`EncryptedStorage`] when this builder carries a
+    /// key. Every terminal build path routes its base storage through here,
+    /// so a key set by `with_encryption_key*()` or parsed from JSON-LD is
+    /// honoured on every backend rather than dropped by one backend's path.
+    fn encrypt_if_configured(&self, storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
+        match self.encryption_key {
+            Some(key) => {
+                let key_provider = StaticKeyProvider::new(EncryptionKey::new(key, 0));
+                Arc::new(EncryptedStorage::new(storage, key_provider))
+            }
+            None => storage,
+        }
+    }
+
     /// Build a memory-backed Fluree instance
     ///
     /// Background indexing is **always disabled** for this builder path
@@ -2597,9 +2639,11 @@ impl FlureeBuilder {
     /// outlive the `Fluree` handle. Use `set_indexing_mode` after building
     /// if you need it, or switch to a persistent builder (`file`, `s3`,
     /// `ipfs`), which enable indexing by default.
+    ///
+    /// A key set on the builder encrypts the storage, as on every build path.
     pub fn build_memory(self) -> Fluree {
         self.warn_if_discarding_indexer_config("build_memory");
-        let storage = MemoryStorage::new();
+        let storage = self.encrypt_if_configured(Arc::new(MemoryStorage::new()));
         let nameservice = MemoryNameService::new();
         let event_bus = self.resolve_event_bus();
         let notifying =
@@ -2610,7 +2654,7 @@ impl FlureeBuilder {
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
-                backend: StorageBackend::Managed(Arc::new(storage)),
+                backend: StorageBackend::Managed(storage),
                 nameservice: ns_mode,
                 event_bus,
                 indexing_mode: tx::IndexingMode::Disabled,
@@ -2725,6 +2769,8 @@ impl FlureeBuilder {
     /// - Requires the `aws` feature.
     /// - Uses the AWS default credential/region chain.
     /// - Ledger caching is enabled when `ledger_cache_config` is set on the builder.
+    /// - A key set on the builder encrypts the storage, as on every build path;
+    ///   the storage-backed nameservice stays plaintext.
     #[cfg(feature = "aws")]
     pub async fn build_s3(self) -> Result<Fluree> {
         use fluree_db_connection::aws;
@@ -2776,7 +2822,7 @@ impl FlureeBuilder {
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let index_config = self.derive_indexing();
-        let backend = StorageBackend::Managed(Arc::new(storage));
+        let backend = StorageBackend::Managed(self.encrypt_if_configured(Arc::new(storage)));
         let attachment_provider_cell = Self::new_attachment_provider_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
@@ -2881,7 +2927,7 @@ impl FlureeBuilder {
             fluree_db_nameservice::NotifyingNameService::new(dynamo_ns, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let index_config = self.derive_indexing();
-        let backend = StorageBackend::Managed(Arc::new(storage));
+        let backend = StorageBackend::Managed(self.encrypt_if_configured(Arc::new(storage)));
         let attachment_provider_cell = Self::new_attachment_provider_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
@@ -3271,7 +3317,7 @@ impl FlureeBuilder {
     /// the notifying wrapper + background indexer that ride along
     /// with it).
     fn build_client_memory(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
-        let base_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let base_storage = self.encrypt_if_configured(Arc::new(MemoryStorage::new()));
 
         // Wrap with address identifier routing if configured
         let storage = self.wrap_address_identifiers(base_storage)?;
@@ -3348,13 +3394,7 @@ impl FlureeBuilder {
             file_storage.sweep_orphaned_staging();
             file_storage.recover_wal()?;
             let ns_storage = file_storage.clone();
-            let base_storage: Arc<dyn Storage> = if let Some(key) = self.encryption_key {
-                let encryption_key = EncryptionKey::new(key, 0);
-                let key_provider = StaticKeyProvider::new(encryption_key);
-                Arc::new(EncryptedStorage::new(file_storage, key_provider))
-            } else {
-                Arc::new(file_storage)
-            };
+            let base_storage = self.encrypt_if_configured(Arc::new(file_storage));
 
             // Wrap with address identifier routing if configured
             let storage = self.wrap_address_identifiers(base_storage)?;
@@ -3422,6 +3462,10 @@ impl FlureeBuilder {
             } else {
                 Arc::new(index)
             };
+        // Encrypt below the address-identifier router so both tiers and every
+        // routed write share the key; the AWS nameservice stays plaintext,
+        // as the file nameservice does.
+        let base_storage = self.encrypt_if_configured(base_storage);
 
         // Wrap with address identifier routing if configured
         let storage = self

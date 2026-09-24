@@ -1012,6 +1012,7 @@ impl BinaryIndexStore {
         let cid = leaf_cid.clone();
         let cache_path_owned = cache_path.clone();
         let disk_cache = Arc::clone(&self.disk_cache);
+        let persist = cs.permits_plaintext_cache();
         let timeout = cas_sync_timeout();
         run_sync_on_runtime(async move {
             let fut = cs.get(&cid);
@@ -1030,7 +1031,9 @@ impl BinaryIndexStore {
                 fut.await
                     .map_err(|e| io::Error::other(format!("CAS fetch failed: {e}")))?
             };
-            disk_cache.best_effort_write(&cache_path_owned, &data);
+            if persist {
+                disk_cache.best_effort_write(&cache_path_owned, &data);
+            }
             Ok(data)
         })
     }

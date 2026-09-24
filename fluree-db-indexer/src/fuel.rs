@@ -149,6 +149,10 @@ impl ContentStore for MeteredContentStore {
         self.inner.resolve_local_path(id)
     }
 
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
     async fn release(&self, id: &ContentId) -> StorageResult<()> {
         self.inner.release(id).await
     }

@@ -29,21 +29,36 @@ let fluree = FlureeBuilder::file("/data/fluree")
     .with_encryption_key_base64("your-base64-encoded-32-byte-key")?
     .build_encrypted_from_config()?;
 
-// Option 3: From JSON-LD config with env var
+// Option 3: From JSON-LD config with env var (nodes are located by @id)
 let config = serde_json::json!({
-    "@context": {"@vocab": "https://ns.flur.ee/system#"},
-    "@graph": [{
-        "@type": "Connection",
-        "indexStorage": {
+    "@context": {
+        "@base": "https://ns.flur.ee/config/connection/",
+        "@vocab": "https://ns.flur.ee/system#"
+    },
+    "@graph": [
+        {
+            "@id": "storage",
             "@type": "Storage",
             "filePath": "/data/fluree",
             "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
-        }
-    }]
+        },
+        {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "storage"}}
+    ]
 });
 let fluree = FlureeBuilder::from_json_ld(&config)?
     .build_encrypted_from_config()?;
+
+// Option 4: any build path honours a configured key. This is what the
+// server and embedders use; the storage type comes from the config.
+let client = FlureeBuilder::from_json_ld(&config)?
+    .build_client()
+    .await?;
 ```
+
+A key set on the builder (`with_encryption_key*()` or `AES256Key` in JSON-LD) is
+applied by every terminal build method — `build()`, `build_memory()`, `build_s3()`,
+`build_client()` and friends — on every backend. The `build_*_encrypted()` methods
+remain for callers that want the key to be an explicit argument.
 
 ### Server Configuration
 
@@ -213,11 +228,32 @@ aws s3 sync s3://my-bucket/fluree/ /var/lib/fluree/data
 
 The same encryption key will decrypt data regardless of where it's stored.
 
+## What Stays Plaintext
+
+Encryption covers every blob written through the storage layer: commits,
+transactions, index roots, branches, leaves, dictionaries and arenas. Two things
+are outside it by design:
+
+- **The nameservice.** The file nameservice under `ns@v2/` and the DynamoDB or
+  S3 storage-backed nameservice hold ledger names, head commit ids and index
+  root ids in plaintext. They contain no ledger content.
+- **Nothing else on local disk.** Readers keep a read-through disk cache of
+  index artifacts (`$TMPDIR/fluree_binary_cache` by default, or
+  `LedgerManagerConfig::cache_dir`), and the indexer seeds it with artifacts it
+  just built. With encryption enabled that cache is bypassed entirely: no
+  decrypted leaf, branch, dictionary or vector shard is written outside the
+  encrypted storage, and nothing already in the cache directory is consulted.
+  Fetched artifacts are served from memory instead.
+
 ## Performance Considerations
 
 - **CPU overhead**: ~5-15% for encryption/decryption (depends on hardware AES support)
 - **Storage overhead**: 22 bytes header + 16 bytes tag per object
 - **Memory**: Keys are kept in memory while the connection is open
+- **No disk cache**: because the read-through disk cache is bypassed (see above),
+  a remote backend such as S3 re-fetches an index artifact whenever it falls out
+  of the in-memory leaflet cache. Size that cache (`cacheMaxMb`) for the working
+  set. File storage is unaffected: it reads and decrypts blobs in place.
 
 Modern CPUs with AES-NI instructions provide hardware acceleration, minimizing the performance impact.
 
