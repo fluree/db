@@ -49,7 +49,8 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use async_trait::async_trait;
 use fluree_db_core::{
-    sha256_hex, ContentAddressedWrite, ContentKind, ContentWriteResult, StorageRead, StorageWrite,
+    sha256_hex, ContentAddressedWrite, ContentKind, ContentWriteResult, EncryptionAdmin,
+    StorageRead, StorageWrite,
 };
 use rand_core::{OsRng, RngCore};
 use std::fmt::{self, Debug};
@@ -223,8 +224,8 @@ where
 #[async_trait]
 impl<S, K> StorageRead for EncryptedStorage<S, K>
 where
-    S: StorageRead,
-    K: KeyProvider,
+    S: StorageRead + StorageWrite + Clone + Send + Sync + 'static,
+    K: KeyProvider + 'static,
 {
     async fn read_bytes(&self, address: &str) -> fluree_db_core::error::Result<Vec<u8>> {
         // Read encrypted bytes from underlying storage
@@ -252,6 +253,72 @@ where
     /// would be a plaintext copy of the ledger outside the encrypted tier.
     fn permits_plaintext_cache(&self) -> bool {
         false
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+        Some(Arc::new(self.clone()))
+    }
+}
+
+/// The rotation surface: classify a blob by the key its header names, and
+/// re-envelope it under the current key in place.
+#[async_trait]
+impl<S, K> EncryptionAdmin for EncryptedStorage<S, K>
+where
+    S: StorageRead + StorageWrite + Clone + Send + Sync + 'static,
+    K: KeyProvider + 'static,
+{
+    fn key_ids(&self) -> Vec<u32> {
+        self.keys.key_ids()
+    }
+
+    fn current_key_id(&self) -> u32 {
+        self.keys.current_key().id()
+    }
+
+    async fn key_id_at(&self, address: &str) -> fluree_db_core::error::Result<Option<u32>> {
+        // Header only: a ranged read on the inner storage, no decryption.
+        // An address that is empty or gone (a lock file, or a blob collected
+        // between listing and this read) holds no envelope.
+        let prefix = match self
+            .inner
+            .read_byte_range(address, 0..HEADER_LEN as u64)
+            .await
+        {
+            Ok(prefix) => prefix,
+            Err(fluree_db_core::error::Error::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        match crate::envelope::key_id_of_header(&prefix) {
+            Ok(id) => Ok(Some(id)),
+            // Not an envelope: plaintext left by an unencrypted run, or a
+            // nameservice record. Reported, never rewritten.
+            Err(EncryptionError::InvalidFormat { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn reencrypt(&self, address: &str) -> fluree_db_core::error::Result<bool> {
+        let envelope = self.inner.read_bytes(address).await?;
+        let header = parse_header(&envelope)?;
+        let current = self.keys.current_key();
+        if header.key_id == current.id() {
+            return Ok(false);
+        }
+        let plaintext = self.decrypt(&envelope)?;
+        let rewritten = self.encrypt(&plaintext)?;
+        self.inner.write_bytes(address, &rewritten).await?;
+
+        // Read back through the same path a reader takes: the write must
+        // decrypt under the current key to exactly what was there before.
+        let check = self.inner.read_bytes(address).await?;
+        let check_header = parse_header(&check)?;
+        if check_header.key_id != current.id() || self.decrypt(&check)? != plaintext {
+            return Err(fluree_db_core::error::Error::storage(format!(
+                "re-encryption of {address} did not read back under the current key"
+            )));
+        }
+        Ok(true)
     }
 }
 
