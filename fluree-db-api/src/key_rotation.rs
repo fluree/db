@@ -142,6 +142,9 @@ pub struct KeyRotationStatus {
 struct Control {
     pause: AtomicBool,
     cancel: AtomicBool,
+    /// Stop without changing state: the record stays `Running` with its
+    /// heartbeat cleared, so the next holder takes over at once.
+    release: AtomicBool,
 }
 
 struct ActiveJob {
@@ -405,6 +408,7 @@ impl Fluree {
         let control = Arc::new(Control {
             pause: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
+            release: AtomicBool::new(false),
         });
         let shared = Arc::new(parking_lot::RwLock::new(progress.clone()));
         let mut active = self.key_rotation.active.lock();
@@ -510,6 +514,16 @@ impl Fluree {
     /// Stop the sweep running here and mark the record `Cancelled`.
     pub fn cancel_key_rotation(&self) -> Result<()> {
         self.signal_key_rotation(|c| &c.cancel)
+    }
+
+    /// Hand the sweep off: stop the local task after its next blob and
+    /// leave the record `Running` with a cleared heartbeat, so whichever
+    /// process next calls [`resume_pending_key_rotation`] continues it
+    /// immediately. Used on loss of leadership. Silent when nothing runs.
+    ///
+    /// [`resume_pending_key_rotation`]: Self::resume_pending_key_rotation
+    pub fn release_key_rotation(&self) {
+        let _ = self.signal_key_rotation(|c| &c.release);
     }
 
     fn signal_key_rotation(&self, flag: impl Fn(&Control) -> &AtomicBool) -> Result<()> {
@@ -677,6 +691,19 @@ async fn run_sweep(
             if control.pause.load(Ordering::SeqCst) {
                 progress.state = KeyRotationState::Paused;
                 checkpoint(&storage, &shared, &mut progress).await;
+                return;
+            }
+            if control.release.load(Ordering::SeqCst) {
+                checkpoint(&storage, &shared, &mut progress).await;
+                // Clear the heartbeat after the checkpoint so the record is
+                // stale to the next holder without losing the cursor.
+                progress.updated_at = 0;
+                *shared.write() = progress.clone();
+                if !dry_run {
+                    if let Err(e) = write_record(&storage, &progress).await {
+                        tracing::warn!(%e, "key rotation: failed to release progress record");
+                    }
+                }
                 return;
             }
 

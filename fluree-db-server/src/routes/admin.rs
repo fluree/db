@@ -294,6 +294,15 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         });
     }
 
+    // Key rotation is available whenever the storage encrypts at rest.
+    if let Ok(status) = state.fluree.key_rotation_status().await {
+        doc["encryption"] = serde_json::json!({
+            "current_key_id": status.current_key_id,
+            "key_ids": status.key_ids,
+            "rotation": true,
+        });
+    }
+
     // Advertise `.flpack` import capabilities so clients can negotiate the
     // upload path. `direct` is always available (streaming POST /import);
     // `presigned-put` is offered when the operator enables the negotiated
@@ -375,6 +384,53 @@ pub async fn openapi_spec() -> Result<Json<serde_json::Value>> {
                             "description": "Server is healthy"
                         }
                     }
+                }
+            },
+            "/v1/fluree/encryption": {
+                "get": {
+                    "summary": "Encryption key ids held by this node (admin)",
+                    "responses": {"200": {"description": "encrypted flag, key_ids, current_key_id"}}
+                }
+            },
+            "/v1/fluree/encryption/rotate": {
+                "post": {
+                    "summary": "Start or resume a key rotation sweep (admin; runs on the leader)",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "retire_key_id": {"type": "integer", "description": "Key whose blobs are rewritten under the current key"},
+                                        "dry_run": {"type": "boolean"},
+                                        "ledger": {"type": "string", "description": "Limit to one ledger (name or branch-qualified id)"},
+                                        "max_bytes_per_sec": {"type": "integer"}
+                                    },
+                                    "required": ["retire_key_id"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "The progress record"}, "409": {"description": "A rotation is already running"}}
+                }
+            },
+            "/v1/fluree/encryption/rotate/status": {
+                "get": {
+                    "summary": "Rotation progress record (admin; any node)",
+                    "responses": {"200": {"description": "key_ids, current_key_id, progress, active_here, seconds_since_update, stalled"}}
+                }
+            },
+            "/v1/fluree/encryption/rotate/pause": {
+                "post": {"summary": "Pause the sweep running on this node (admin)", "responses": {"200": {"description": "ok"}}}
+            },
+            "/v1/fluree/encryption/rotate/cancel": {
+                "post": {"summary": "Cancel the sweep running on this node (admin)", "responses": {"200": {"description": "ok"}}}
+            },
+            "/v1/fluree/encryption/rotate/verify": {
+                "post": {
+                    "summary": "Count blobs still on a retiring key and stamp the record (admin)",
+                    "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"retire_key_id": {"type": "integer"}}, "required": ["retire_key_id"]}}}},
+                    "responses": {"200": {"description": "The progress record with its completion stamp"}}
                 }
             },
             "/v1/fluree/create": {
