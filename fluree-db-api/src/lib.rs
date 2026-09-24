@@ -1145,39 +1145,50 @@ impl StorageMethod for AddressIdentifierResolverStorage {
 /// kept for backward compatibility.
 pub type FlureeClient = Fluree;
 
-// Callers live in the native-feature storage builders; the no-native shape
-// (wasm, or a native host building e.g. fluree-db-wasm's dep graph) has none.
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
-fn decode_encryption_key_base64(key_str: &str) -> Result<[u8; 32]> {
-    use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(key_str)
-        .map_err(|e| ApiError::config(format!("Invalid base64 encryption key: {e}")))?;
+/// The key provider a builder carries once a key is configured: the one
+/// place raw bytes or base64 become a provider, and the one place a
+/// storage gets wrapped. A newtype so the builder stays `Debug` without
+/// ever printing key material.
+#[derive(Clone)]
+struct ConfiguredKey(Arc<StaticKeyProvider>);
 
-    if decoded.len() != 32 {
-        return Err(ApiError::config(format!(
-            "Encryption key must be 32 bytes, got {} bytes",
-            decoded.len()
-        )));
+impl std::fmt::Debug for ConfiguredKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConfiguredKey(<redacted>)")
+    }
+}
+
+impl ConfiguredKey {
+    fn from_bytes(key: [u8; 32]) -> Self {
+        Self(Arc::new(StaticKeyProvider::new(EncryptionKey::new(key, 0))))
     }
 
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&decoded);
-    Ok(key)
+    /// Base64 (standard or URL-safe), decoding to exactly 32 bytes.
+    fn from_base64(key_str: &str) -> Result<Self> {
+        StaticKeyProvider::from_base64(key_str)
+            .map(|provider| Self(Arc::new(provider)))
+            .map_err(|e| ApiError::config(format!("Invalid encryption key: {e}")))
+    }
+
+    fn wrap(&self, storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
+        Arc::new(EncryptedStorage::with_arc_keys(
+            storage,
+            Arc::clone(&self.0),
+        ))
+    }
 }
 
 /// Wrap `storage` in [`EncryptedStorage`] when the storage config carries
-/// an `AES256Key`; the one place a config key becomes a key provider.
+/// an `AES256Key`.
+// Callers live in the native/aws storage builders; the no-native shape
+// (wasm, or a native host building e.g. fluree-db-wasm's dep graph) has none.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 fn encrypt_storage_from_config(
     storage: Arc<dyn Storage>,
     storage_config: &fluree_db_connection::config::StorageConfig,
 ) -> Result<Arc<dyn Storage>> {
     match storage_config.aes256_key.as_deref() {
-        Some(key_str) => {
-            let key = decode_encryption_key_base64(key_str)?;
-            let key_provider = StaticKeyProvider::new(EncryptionKey::new(key, 0));
-            Ok(Arc::new(EncryptedStorage::new(storage, key_provider)))
-        }
+        Some(key_str) => Ok(ConfiguredKey::from_base64(key_str)?.wrap(storage)),
         None => Ok(storage),
     }
 }
@@ -1192,7 +1203,7 @@ async fn build_s3_storage_from_config(
     storage_config: &fluree_db_connection::config::StorageConfig,
 ) -> Result<Arc<dyn Storage>> {
     use fluree_db_connection::config::StorageType;
-    use fluree_db_storage_aws::{S3Config as RawS3Config, S3Storage};
+    use fluree_db_storage_aws::S3Storage;
 
     let StorageType::S3(s3_config) = &storage_config.storage_type else {
         return Err(ApiError::config("Expected S3 storage config"));
@@ -1202,42 +1213,12 @@ async fn build_s3_storage_from_config(
         .await
         .map_err(|e| ApiError::config(format!("Failed to get AWS SDK config: {e}")))?;
 
-    let raw_config = RawS3Config {
-        bucket: s3_config.bucket.to_string(),
-        prefix: s3_config
-            .prefix
-            .as_ref()
-            .map(std::string::ToString::to_string),
-        endpoint: s3_config
-            .endpoint
-            .as_ref()
-            .map(std::string::ToString::to_string),
-        force_path_style: s3_config.force_path_style,
-        // Consolidate per-op timeouts to a single SDK operation timeout.
-        // Use the maximum to avoid unexpectedly shortening slower operations.
-        timeout_ms: {
-            let mut max_ms: Option<u64> = None;
-            for ms in [
-                s3_config.read_timeout_ms,
-                s3_config.write_timeout_ms,
-                s3_config.list_timeout_ms,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                max_ms = Some(max_ms.map(|cur| cur.max(ms)).unwrap_or(ms));
-            }
-            max_ms
-        },
-        max_retries: s3_config.max_retries.map(|n| n as u32),
-        retry_base_delay_ms: s3_config.retry_base_delay_ms,
-        retry_max_delay_ms: s3_config.retry_max_delay_ms,
-        max_concurrent_requests: s3_config.max_concurrent_requests,
-    };
-
-    let storage = S3Storage::new(sdk_config, raw_config)
-        .await
-        .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
+    let storage = S3Storage::new(
+        sdk_config,
+        fluree_db_connection::aws::s3_config_from(s3_config),
+    )
+    .await
+    .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
 
     encrypt_storage_from_config(Arc::new(storage), storage_config)
 }
@@ -1390,7 +1371,7 @@ pub struct FlureeBuilder {
     #[cfg(feature = "native")]
     storage_wal_owner: Option<String>,
     /// Optional encryption key (base64-encoded or raw 32 bytes)
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<ConfiguredKey>,
     /// Optional ledger cache configuration (enables LedgerManager)
     ledger_cache_config: Option<LedgerManagerConfig>,
     /// Optional background indexing configuration.
@@ -1864,10 +1845,10 @@ impl FlureeBuilder {
     /// let key = [0u8; 32]; // Use a secure key in production
     /// let fluree = FlureeBuilder::file("/data")
     ///     .with_encryption_key(key)
-    ///     .build_encrypted()?;
+    ///     .build()?;
     /// ```
     pub fn with_encryption_key(mut self, key: [u8; 32]) -> Self {
-        self.encryption_key = Some(key);
+        self.encryption_key = Some(ConfiguredKey::from_bytes(key));
         self
     }
 
@@ -1881,24 +1862,10 @@ impl FlureeBuilder {
     /// ```ignore
     /// let fluree = FlureeBuilder::file("/data")
     ///     .with_encryption_key_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")?
-    ///     .build_encrypted()?;
+    ///     .build()?;
     /// ```
     pub fn with_encryption_key_base64(mut self, base64_key: &str) -> Result<Self> {
-        use base64::Engine;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(base64_key)
-            .map_err(|e| ApiError::config(format!("Invalid base64 encryption key: {e}")))?;
-
-        if decoded.len() != 32 {
-            return Err(ApiError::config(format!(
-                "Encryption key must be 32 bytes, got {} bytes",
-                decoded.len()
-            )));
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        self.encryption_key = Some(key);
+        self.encryption_key = Some(ConfiguredKey::from_base64(base64_key)?);
         Ok(self)
     }
 
@@ -1948,12 +1915,12 @@ impl FlureeBuilder {
             .as_ref()
             .map(std::string::ToString::to_string);
 
-        // Extract encryption key if configured
-        let encryption_key = if let Some(key_str) = &config.index_storage.aes256_key {
-            Some(Self::decode_encryption_key(key_str)?)
-        } else {
-            None
-        };
+        let encryption_key = config
+            .index_storage
+            .aes256_key
+            .as_deref()
+            .map(ConfiguredKey::from_base64)
+            .transpose()?;
 
         // Extract indexing config if enabled in JSON-LD defaults
         let indexing_config = if is_indexing_enabled(&config) {
@@ -1986,25 +1953,6 @@ impl FlureeBuilder {
             #[cfg(feature = "iceberg")]
             secret_resolver: None,
         })
-    }
-
-    /// Decode a base64-encoded encryption key to 32 bytes.
-    fn decode_encryption_key(key_str: &str) -> Result<[u8; 32]> {
-        use base64::Engine;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(key_str)
-            .map_err(|e| ApiError::config(format!("Invalid base64 encryption key: {e}")))?;
-
-        if decoded.len() != 32 {
-            return Err(ApiError::config(format!(
-                "Encryption key must be 32 bytes, got {} bytes",
-                decoded.len()
-            )));
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        Ok(key)
     }
 
     /// Set the maximum cache size in MB.
@@ -2496,8 +2444,9 @@ impl FlureeBuilder {
 
     /// Build a file-backed Fluree instance with AES-256-GCM encryption.
     ///
-    /// Uses the provided `key` argument for encryption. Any key previously set on the
-    /// builder via `with_encryption_key()` or JSON-LD config is ignored.
+    /// Equivalent to `with_encryption_key(key).build()`: the `key` argument
+    /// replaces any key previously set on the builder via
+    /// `with_encryption_key()` or JSON-LD config.
     ///
     /// To use a key configured on the builder, use [`build_encrypted_from_config()`] instead.
     ///
@@ -2524,8 +2473,7 @@ impl FlureeBuilder {
     /// callers should zeroize their own key copies if needed.
     #[cfg(feature = "native")]
     pub fn build_encrypted(self, key: [u8; 32]) -> Result<Fluree> {
-        // Always use the explicitly provided key
-        self.build_encrypted_internal(key)
+        self.with_encryption_key(key).build()
     }
 
     /// Build a file-backed Fluree instance with encryption using the configured key.
@@ -2561,55 +2509,10 @@ impl FlureeBuilder {
     /// ```
     #[cfg(feature = "native")]
     pub fn build_encrypted_from_config(self) -> Result<Fluree> {
-        let key = self.encryption_key.ok_or_else(|| {
-            ApiError::config("No encryption key configured. Set via with_encryption_key(), with_encryption_key_base64(), or AES256Key in JSON-LD config")
-        })?;
-        self.build_encrypted_internal(key)
-    }
-
-    /// Internal helper to build encrypted storage
-    #[cfg(feature = "native")]
-    fn build_encrypted_internal(mut self, key: [u8; 32]) -> Result<Fluree> {
-        let path = self
-            .storage_path
-            .take()
-            .ok_or_else(|| ApiError::config("File storage requires a path"))?;
-
-        let file_storage = self.file_storage(&path);
-        // Startup sweep, before the encryption wrapper hides the concrete
-        // storage. Staging debris is on-disk state, not content, so the
-        // sweep is the same for an encrypted tree.
-        file_storage.sweep_orphaned_staging();
-        file_storage.recover_wal()?;
-        let nameservice = FileNameService::with_storage(file_storage.clone());
-        let encryption_key = EncryptionKey::new(key, 0);
-        let key_provider = StaticKeyProvider::new(encryption_key);
-        let storage = EncryptedStorage::new(file_storage, key_provider);
-        let event_bus = self.resolve_event_bus();
-        let notifying =
-            fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let index_config = self.derive_indexing();
-        let backend = StorageBackend::Managed(Arc::new(storage));
-        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-        let attachment_provider_cell = Self::new_attachment_provider_cell();
-        let indexing_mode =
-            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
-        Ok(Self::finalize_with_backend(
-            self.ledger_cache_config,
-            self.config,
-            RuntimeParts {
-                backend,
-                nameservice: ns_mode,
-                event_bus,
-                indexing_mode,
-                index_config,
-                attachment_provider_cell,
-            },
-            self.remote_connections,
-            self.remote_mounts,
-            #[cfg(feature = "iceberg")]
-            self.secret_resolver,
-        ))
+        if !self.has_encryption_key() {
+            return Err(ApiError::config("No encryption key configured. Set via with_encryption_key(), with_encryption_key_base64(), or AES256Key in JSON-LD config"));
+        }
+        self.build()
     }
 
     /// Check if this builder has an encryption key configured.
@@ -2622,11 +2525,8 @@ impl FlureeBuilder {
     /// so a key set by `with_encryption_key*()` or parsed from JSON-LD is
     /// honoured on every backend rather than dropped by one backend's path.
     fn encrypt_if_configured(&self, storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
-        match self.encryption_key {
-            Some(key) => {
-                let key_provider = StaticKeyProvider::new(EncryptionKey::new(key, 0));
-                Arc::new(EncryptedStorage::new(storage, key_provider))
-            }
+        match &self.encryption_key {
+            Some(key) => key.wrap(storage),
             None => storage,
         }
     }
@@ -2655,43 +2555,6 @@ impl FlureeBuilder {
             self.config,
             RuntimeParts {
                 backend: StorageBackend::Managed(storage),
-                nameservice: ns_mode,
-                event_bus,
-                indexing_mode: tx::IndexingMode::Disabled,
-                index_config,
-                attachment_provider_cell: Self::new_attachment_provider_cell(),
-            },
-            self.remote_connections,
-            self.remote_mounts,
-            #[cfg(feature = "iceberg")]
-            self.secret_resolver,
-        )
-    }
-
-    /// Build a memory-backed Fluree instance with AES-256-GCM encryption
-    ///
-    /// Useful for testing encryption without touching the filesystem.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - 32-byte AES-256 encryption key
-    pub fn build_memory_encrypted(self, key: [u8; 32]) -> Fluree {
-        self.warn_if_discarding_indexer_config("build_memory_encrypted");
-        let mem_storage = MemoryStorage::new();
-        let encryption_key = EncryptionKey::new(key, 0);
-        let key_provider = StaticKeyProvider::new(encryption_key);
-        let storage = EncryptedStorage::new(mem_storage, key_provider);
-        let nameservice = MemoryNameService::new();
-        let event_bus = self.resolve_event_bus();
-        let notifying =
-            fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying));
-        let index_config = self.derive_indexing();
-        Self::finalize_with_backend(
-            self.ledger_cache_config,
-            self.config,
-            RuntimeParts {
-                backend: StorageBackend::Managed(Arc::new(storage)),
                 nameservice: ns_mode,
                 event_bus,
                 indexing_mode: tx::IndexingMode::Disabled,
@@ -2775,7 +2638,7 @@ impl FlureeBuilder {
     pub async fn build_s3(self) -> Result<Fluree> {
         use fluree_db_connection::aws;
         use fluree_db_connection::config::S3StorageConfig;
-        use fluree_db_storage_aws::{S3Config, S3Storage};
+        use fluree_db_storage_aws::S3Storage;
 
         let s3_cfg: &S3StorageConfig = match &self.config.index_storage.storage_type {
             StorageType::S3(s3) => s3,
@@ -2786,34 +2649,10 @@ impl FlureeBuilder {
             }
         };
 
-        let timeout_ms = s3_cfg
-            .read_timeout_ms
-            .into_iter()
-            .chain(s3_cfg.write_timeout_ms)
-            .chain(s3_cfg.list_timeout_ms)
-            .max();
-
         let sdk_config = aws::get_or_init_sdk_config().await?;
-
-        let storage = S3Storage::new(
-            sdk_config,
-            S3Config {
-                bucket: s3_cfg.bucket.to_string(),
-                prefix: s3_cfg.prefix.as_ref().map(std::string::ToString::to_string),
-                endpoint: s3_cfg
-                    .endpoint
-                    .as_ref()
-                    .map(std::string::ToString::to_string),
-                force_path_style: s3_cfg.force_path_style,
-                timeout_ms,
-                max_retries: s3_cfg.max_retries.map(|n| n as u32),
-                retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
-                retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
-                max_concurrent_requests: s3_cfg.max_concurrent_requests,
-            },
-        )
-        .await
-        .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
+        let storage = S3Storage::new(sdk_config, aws::s3_config_from(s3_cfg))
+            .await
+            .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
 
         // Empty prefix: S3Storage already applies its own key prefix.
         let nameservice = StorageNameService::new(storage.clone(), "");
@@ -2865,7 +2704,7 @@ impl FlureeBuilder {
     ) -> Result<Fluree> {
         use fluree_db_connection::aws;
         use fluree_db_connection::config::S3StorageConfig;
-        use fluree_db_storage_aws::{DynamoDbConfig, DynamoDbNameService, S3Config, S3Storage};
+        use fluree_db_storage_aws::{DynamoDbConfig, DynamoDbNameService, S3Storage};
 
         let s3_cfg: &S3StorageConfig =
             match &self.config.index_storage.storage_type {
@@ -2875,36 +2714,13 @@ impl FlureeBuilder {
                 )),
             };
 
-        let timeout_ms = s3_cfg
-            .read_timeout_ms
-            .into_iter()
-            .chain(s3_cfg.write_timeout_ms)
-            .chain(s3_cfg.list_timeout_ms)
-            .max();
-
         let sdk_config = aws::get_or_init_sdk_config().await?;
-
-        let storage = S3Storage::new(
-            sdk_config,
-            S3Config {
-                bucket: s3_cfg.bucket.to_string(),
-                prefix: s3_cfg.prefix.as_ref().map(std::string::ToString::to_string),
-                // Treat an empty endpoint as unset (use the AWS default endpoint).
-                endpoint: s3_cfg
-                    .endpoint
-                    .as_ref()
-                    .map(std::string::ToString::to_string)
-                    .filter(|e| !e.is_empty()),
-                force_path_style: s3_cfg.force_path_style,
-                timeout_ms,
-                max_retries: s3_cfg.max_retries.map(|n| n as u32),
-                retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
-                retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
-                max_concurrent_requests: s3_cfg.max_concurrent_requests,
-            },
-        )
-        .await
-        .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
+        let s3_config = aws::s3_config_from(s3_cfg);
+        // The DynamoDB client shares the consolidated S3 operation timeout.
+        let timeout_ms = s3_config.timeout_ms;
+        let storage = S3Storage::new(sdk_config, s3_config)
+            .await
+            .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
 
         let dynamo_ns = DynamoDbNameService::new(
             sdk_config,
@@ -2951,8 +2767,10 @@ impl FlureeBuilder {
 
     /// Build an S3-backed Fluree instance with AES-256-GCM encryption.
     ///
-    /// All data written to S3 is transparently encrypted before upload,
-    /// and decrypted on read.
+    /// Equivalent to `with_encryption_key(key).build_s3()`: all data written
+    /// to S3 is transparently encrypted before upload and decrypted on read,
+    /// while the storage-backed nameservice stays plaintext, as on every
+    /// other build path.
     ///
     /// Notes:
     /// - Requires the `aws` feature.
@@ -2964,78 +2782,19 @@ impl FlureeBuilder {
     /// * `key` - 32-byte AES-256 encryption key
     #[cfg(feature = "aws")]
     pub async fn build_s3_encrypted(self, key: [u8; 32]) -> Result<Fluree> {
-        use fluree_db_connection::aws;
-        use fluree_db_connection::config::S3StorageConfig;
-        use fluree_db_storage_aws::{S3Config, S3Storage};
+        self.with_encryption_key(key).build_s3().await
+    }
 
-        let s3_cfg: &S3StorageConfig = match &self.config.index_storage.storage_type {
-            StorageType::S3(s3) => s3,
-            _ => return Err(ApiError::config(
-                "build_s3_encrypted requires FlureeBuilder::s3(...) or an S3 indexStorage config",
-            )),
-        };
-
-        let timeout_ms = s3_cfg
-            .read_timeout_ms
-            .into_iter()
-            .chain(s3_cfg.write_timeout_ms)
-            .chain(s3_cfg.list_timeout_ms)
-            .max();
-
-        let sdk_config = aws::get_or_init_sdk_config().await?;
-
-        let s3_storage = S3Storage::new(
-            sdk_config,
-            S3Config {
-                bucket: s3_cfg.bucket.to_string(),
-                prefix: s3_cfg.prefix.as_ref().map(std::string::ToString::to_string),
-                endpoint: s3_cfg
-                    .endpoint
-                    .as_ref()
-                    .map(std::string::ToString::to_string),
-                force_path_style: s3_cfg.force_path_style,
-                timeout_ms,
-                max_retries: s3_cfg.max_retries.map(|n| n as u32),
-                retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
-                retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
-                max_concurrent_requests: s3_cfg.max_concurrent_requests,
-            },
-        )
-        .await
-        .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
-
-        // Wrap with encryption
-        let encryption_key = EncryptionKey::new(key, 0);
-        let key_provider = StaticKeyProvider::new(encryption_key);
-        let storage = EncryptedStorage::new(s3_storage, key_provider);
-
-        // Empty prefix: S3Storage already applies its own key prefix.
-        let nameservice = StorageNameService::new(storage.clone(), "");
-        let event_bus = self.resolve_event_bus();
-        let notifying =
-            fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-        let index_config = self.derive_indexing();
-        let backend = StorageBackend::Managed(Arc::new(storage));
-        let attachment_provider_cell = Self::new_attachment_provider_cell();
-        let indexing_mode =
-            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
-        Ok(Self::finalize_with_backend(
-            self.ledger_cache_config,
-            self.config,
-            RuntimeParts {
-                backend,
-                nameservice: ns_mode,
-                event_bus,
-                indexing_mode,
-                index_config,
-                attachment_provider_cell,
-            },
-            self.remote_connections,
-            self.remote_mounts,
-            #[cfg(feature = "iceberg")]
-            self.secret_resolver,
-        ))
+    /// Build a memory-backed Fluree instance with AES-256-GCM encryption.
+    ///
+    /// Equivalent to `with_encryption_key(key).build_memory()`. Useful for
+    /// testing encryption without touching the filesystem.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - 32-byte AES-256 encryption key
+    pub fn build_memory_encrypted(self, key: [u8; 32]) -> Fluree {
+        self.with_encryption_key(key).build_memory()
     }
 
     // ========================================================================
