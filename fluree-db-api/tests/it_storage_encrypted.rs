@@ -517,10 +517,14 @@ async fn key_set_reopens_old_data_and_admin_reencrypts_in_place() {
     assert!(!on_key_1.is_empty(), "expected blobs written under key 1");
 
     for address in &on_key_1 {
-        assert!(admin.reencrypt(address).await.expect("reencrypt"));
+        assert!(admin.reencrypt(address).await.expect("reencrypt").is_some());
         assert_eq!(admin.key_id_at(address).await.unwrap(), Some(2));
         // Idempotent: already current.
-        assert!(!admin.reencrypt(address).await.expect("reencrypt again"));
+        assert!(admin
+            .reencrypt(address)
+            .await
+            .expect("reencrypt again")
+            .is_none());
     }
 
     // The re-enveloped blobs read back through a fresh client holding key 2 only.

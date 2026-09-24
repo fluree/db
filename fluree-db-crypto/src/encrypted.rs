@@ -298,12 +298,12 @@ where
         }
     }
 
-    async fn reencrypt(&self, address: &str) -> fluree_db_core::error::Result<bool> {
+    async fn reencrypt(&self, address: &str) -> fluree_db_core::error::Result<Option<u64>> {
         let envelope = self.inner.read_bytes(address).await?;
         let header = parse_header(&envelope)?;
         let current = self.keys.current_key();
         if header.key_id == current.id() {
-            return Ok(false);
+            return Ok(None);
         }
         let plaintext = self.decrypt(&envelope)?;
         let rewritten = self.encrypt(&plaintext)?;
@@ -318,7 +318,7 @@ where
                 "re-encryption of {address} did not read back under the current key"
             )));
         }
-        Ok(true)
+        Ok(Some(plaintext.len() as u64))
     }
 }
 

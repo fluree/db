@@ -78,6 +78,7 @@ mod indexer_fulltext_provider;
 mod inline_ontology;
 #[cfg(feature = "shacl")]
 mod inline_shapes;
+pub mod key_rotation;
 mod ledger;
 pub mod ledger_info;
 #[cfg(not(target_arch = "wasm32"))]
@@ -3086,6 +3087,7 @@ impl FlureeBuilder {
             remote_service: build_remote_service(remote_connections),
             #[cfg(feature = "iceberg")]
             secret_resolver,
+            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
         }
     }
 
@@ -3443,6 +3445,8 @@ pub struct Fluree {
     /// resolver authorizes itself.
     #[cfg(feature = "iceberg")]
     secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
+    /// The key-rotation sweep running in this process, if any.
+    key_rotation: Arc<key_rotation::KeyRotationSlot>,
 }
 
 impl Fluree {
@@ -3482,6 +3486,7 @@ impl Fluree {
             remote_service: None,
             #[cfg(feature = "iceberg")]
             secret_resolver: None,
+            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
         }
     }
 
@@ -3507,6 +3512,7 @@ impl Fluree {
             remote_service: None,
             #[cfg(feature = "iceberg")]
             secret_resolver: None,
+            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
         }
     }
 

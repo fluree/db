@@ -502,8 +502,9 @@ pub trait EncryptionAdmin: Send + Sync {
     async fn key_id_at(&self, address: &str) -> Result<Option<u32>>;
 
     /// Re-envelope the blob at `address` under the current key, verifying
-    /// the result reads back. `false` when it was already current.
-    async fn reencrypt(&self, address: &str) -> Result<bool>;
+    /// the result reads back. Returns the plaintext size rewritten, or
+    /// `None` when the blob was already on the current key.
+    async fn reencrypt(&self, address: &str) -> Result<Option<u64>>;
 }
 impl<T: StorageRead + ContentAddressedWrite + StorageMethod> Storage for T {}
 
