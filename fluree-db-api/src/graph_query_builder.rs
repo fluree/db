@@ -131,7 +131,32 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         }
     }
 
-    /// Load the view, using graph source fallback when enabled.
+    /// The request's governance options, in the form policy wrapping takes.
+    ///
+    /// SPARQL has nowhere to carry an `opts` block, so it yields the default and
+    /// only configured defaults can govern it. The verified identity does not
+    /// arrive in the body either: it rides the builder's execution options from
+    /// the auth layer, and without it an `f:IdentityRestricted` override control
+    /// refuses a request the config would permit.
+    fn governance_options(&self) -> Result<crate::GovernanceOptions> {
+        let mut opts = match self.core.input.as_ref() {
+            Some(crate::view::QueryInput::JsonLd(json)) => {
+                crate::GovernanceOptions::from_json(json)
+                    .map_err(|e| ApiError::query(e.to_string()))?
+            }
+            _ => crate::GovernanceOptions::default(),
+        };
+        opts.server_identity = self.core.execution.server_identity.clone();
+        Ok(opts)
+    }
+
+    /// Load the view for this handle's ledger and time, falling back to a graph
+    /// source when enabled, and return it wrapped in the request's policy.
+    ///
+    /// The view carries whatever policy the request selects, gated on
+    /// `has_any_policy_inputs` as on the `from`-driven path. What a request
+    /// selecting nothing gets differs between the two branches below. Execution
+    /// receives the view already wrapped and does not wrap it again.
     async fn load_view(&self) -> Result<crate::view::GraphDb> {
         let result = self
             .graph
@@ -169,30 +194,29 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     else {
                         return result;
                     };
-                    // Unlike the `from`-driven builder, nothing downstream of this
-                    // one wraps policy, so a governed source would otherwise be read
-                    // unfiltered. Gated on the request carrying a policy input, the
-                    // same rule `apply_source_or_global_policy` uses: a request with
-                    // none is unrestricted, exactly as for a native ledger.
-                    let mut opts = match self.core.input.as_ref() {
-                        Some(crate::view::QueryInput::JsonLd(json)) => {
-                            crate::GovernanceOptions::from_json(json)
-                                .map_err(|e| ApiError::query(e.to_string()))?
-                        }
-                        _ => crate::GovernanceOptions::default(),
-                    };
-                    // The body never carries the verified identity; it rides
-                    // the builder's execution options from the auth layer.
-                    opts.server_identity = self.core.execution.server_identity.clone();
+                    // Without the wrap below, a governed source reads unfiltered.
+                    let opts = self.governance_options()?;
                     if opts.has_any_policy_inputs() {
                         return self.graph.fluree.wrap_policy(db, &opts).await;
                     }
+                    // No `wrap_policy_defaults` fallback, unlike the native path
+                    // below. Applying a `--model` source's own policy to requests
+                    // that carry none would change what every reader of a governed
+                    // source sees, so it stays outside #1766.
                     return Ok(db);
                 }
             }
         }
 
-        result
+        let view = result?;
+        let opts = self.governance_options()?;
+        if opts.has_any_policy_inputs() {
+            self.graph.fluree.wrap_policy(view, &opts).await
+        } else {
+            // Not `Ok(view)`: an unconfigured ledger comes back untouched, but a
+            // ledger carrying `f:policyDefaults` must still be governed.
+            self.graph.fluree.wrap_policy_defaults(view).await
+        }
     }
 
     /// Execute the query and return raw [`QueryResult`].
