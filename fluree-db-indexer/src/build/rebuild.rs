@@ -39,6 +39,32 @@ fn dedicated_rebuild_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// The rebuild's session directories, removed when dropped.
+///
+/// Both trees hold plaintext ledger content — sorted commit runs, dictionaries,
+/// staged leaves — and default to the system temp directory. Tying their
+/// removal to a drop rather than to the success path means every exit clears
+/// them: an early `?`, a panic unwinding the blocking task, or the normal
+/// return. A directory that was never created is not an error.
+struct SessionDirs {
+    run_dir: std::path::PathBuf,
+    index_dir: std::path::PathBuf,
+}
+
+impl Drop for SessionDirs {
+    fn drop(&mut self) {
+        for dir in [&self.run_dir, &self.index_dir] {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(dir = %dir.display(), %e, "failed to remove index build session dir");
+                }
+            }
+        }
+    }
+}
+
 ///
 /// Unlike `build_index_for_ledger`, this skips the nameservice lookup and
 /// the "already current" early-return check. Use this when you already have
@@ -89,9 +115,18 @@ where
         .ok_or(IndexerError::NoCommits)?;
 
     // Determine output directory for binary index artifacts
+    let staging_in_temp = config.data_dir.is_none();
     let data_dir = config
         .data_dir
         .unwrap_or_else(|| std::env::temp_dir().join("fluree-index"));
+    if staging_in_temp && !commit_store.permits_plaintext_cache() {
+        tracing::warn!(
+            ledger = %ledger_id,
+            ?data_dir,
+            "encrypted storage: index build staging defaults to the system temp directory; \
+             set IndexerConfig::data_dir to a directory on an encrypted volume"
+        );
+    }
     let ledger_id_path = fluree_db_core::address_path::ledger_id_to_path_prefix(ledger_id)
         .unwrap_or_else(|_| ledger_id.replace(':', "/"));
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -158,6 +193,13 @@ where
 
     tokio::task::spawn_blocking(move || {
         let _guard = parent_span.enter(); // safe: spawn_blocking pins to one thread
+                                          // Owned by the blocking task, not the caller's future: the task runs to
+                                          // completion even when the caller is cancelled, so the directories are
+                                          // removed only after the last write to them.
+        let _session_dirs = SessionDirs {
+            run_dir: run_dir.clone(),
+            index_dir: index_dir.clone(),
+        };
         handle.block_on(async {
             std::fs::create_dir_all(&run_dir)
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
@@ -1161,14 +1203,6 @@ where
             .await?;
 
             drop(_span_v3);
-
-            // Clean up ephemeral session directories.
-            if let Err(e) = std::fs::remove_dir_all(&run_dir) {
-                tracing::warn!(?run_dir, %e, "failed to clean up tmp_import session dir");
-            }
-            if let Err(e) = std::fs::remove_dir_all(&index_dir) {
-                tracing::warn!(?index_dir, %e, "failed to clean up index session dir");
-            }
 
             Ok(result)
         })

@@ -245,13 +245,28 @@ are outside it by design:
 - **The nameservice.** The file nameservice under `ns@v2/` and the DynamoDB or
   S3 storage-backed nameservice hold ledger names, head commit ids and index
   root ids in plaintext. They contain no ledger content.
-- **Nothing else on local disk.** Readers keep a read-through disk cache of
-  index artifacts (`$TMPDIR/fluree_binary_cache` by default, or
-  `LedgerManagerConfig::cache_dir`), and the indexer seeds it with artifacts it
-  just built. With encryption enabled that cache is bypassed entirely: no
-  decrypted leaf, branch, dictionary or vector shard is written outside the
-  encrypted storage, and nothing already in the cache directory is consulted.
-  Fetched artifacts are served from memory instead.
+- **Nothing else on local disk, once a build is done.** Readers keep a
+  read-through disk cache of index artifacts (`$TMPDIR/fluree_binary_cache` by
+  default, or `LedgerManagerConfig::cache_dir`), and the indexer seeds it with
+  artifacts it just built. With encryption enabled that cache is bypassed
+  entirely: no decrypted leaf, branch, dictionary or vector shard is written
+  outside the encrypted storage, and nothing already in the cache directory is
+  consulted. Fetched artifacts are served from memory instead.
+
+### Index build staging
+
+A full index rebuild is an external sort. While it runs it stages sorted
+commit runs, dictionaries and leaves in plaintext under per-session
+directories, `{data_dir}/{ledger}/tmp_import/{session}` and
+`{data_dir}/{ledger}/index/{session}`. Those directories are removed on every
+exit — success, error, or a panic in the build task — so nothing outlives the
+build. Only a process killed mid-build leaves its session directories behind;
+nothing removes those automatically, so clear `tmp_import` after a crash.
+
+`data_dir` (`IndexerConfig::data_dir`; the server's indexer data directory)
+defaults to `$TMPDIR/fluree-index`. For an encrypted deployment point it at a
+directory on an encrypted volume; the rebuild logs a warning when encryption
+is on and `data_dir` is unset.
 
   **Upgrading from an earlier release.** Earlier releases did write decrypted
   index artifacts to this cache when encryption was enabled. This release no
