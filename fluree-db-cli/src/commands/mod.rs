@@ -13,6 +13,7 @@ pub mod doc;
 pub mod doc_sources;
 pub mod docs;
 pub mod drop;
+pub mod encryption;
 pub mod export;
 pub mod graph;
 pub mod graph_sync;

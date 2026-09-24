@@ -189,6 +189,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         #[cfg(feature = "server")]
         Commands::Cluster { action } => commands::cluster::run(action).await,
 
+        Commands::Encryption { action } => commands::encryption::run(action, config_path).await,
+
         Commands::Drop {
             name,
             force,

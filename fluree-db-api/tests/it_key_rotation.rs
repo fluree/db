@@ -95,13 +95,21 @@ async fn count_things(fluree: &Fluree, name: &str) -> usize {
         .unwrap_or(0)
 }
 
-async fn run_to_end(fluree: &Fluree, opts: KeyRotationOptions) -> KeyRotationProgress {
-    fluree.start_key_rotation(opts).await.expect("start");
-    fluree
-        .wait_for_key_rotation()
+/// A sweep over a few hundred blobs finishes in well under a second; a
+/// stall is a bug, and it must fail the test rather than hang it.
+const SWEEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn wait_done(fluree: &Fluree) -> KeyRotationProgress {
+    tokio::time::timeout(SWEEP_DEADLINE, fluree.wait_for_key_rotation())
         .await
+        .expect("sweep finished within the deadline")
         .expect("wait")
         .expect("a sweep ran")
+}
+
+async fn run_to_end(fluree: &Fluree, opts: KeyRotationOptions) -> KeyRotationProgress {
+    fluree.start_key_rotation(opts).await.expect("start");
+    wait_done(fluree).await
 }
 
 #[tokio::test]
@@ -272,11 +280,7 @@ async fn foreign_running_record_is_refused_while_fresh_and_taken_over_when_stale
         .expect("taken over");
     assert_eq!(resumed.holder, "node-me");
     assert_eq!(resumed.started_at, now - 3600, "kept the record's start");
-    let done = fluree
-        .wait_for_key_rotation()
-        .await
-        .unwrap()
-        .expect("a sweep ran");
+    let done = wait_done(&fluree).await;
     assert_eq!(done.state, KeyRotationState::Completed);
     assert!(done.rewritten > 0);
 

@@ -1363,6 +1363,18 @@ pub enum Commands {
         remote: Option<String>,
     },
 
+    /// Encryption at rest: held keys and key rotation
+    ///
+    /// Runs against a server (`--remote`) or, with `--connection-config`,
+    /// directly against the storage that config describes. A rotation
+    /// re-envelopes every blob on a retiring key under the current key, in
+    /// place and resumably; `verify` reports when none remain, which is the
+    /// signal to drop the old key from configuration.
+    Encryption {
+        #[command(subcommand)]
+        action: EncryptionAction,
+    },
+
     /// Manage the Fluree HTTP server
     Server {
         #[command(subcommand)]
@@ -1930,6 +1942,93 @@ pub enum BranchAction {
         #[arg(long)]
         remote: Option<String>,
     },
+}
+
+/// Where an `encryption` command runs.
+#[derive(clap::Args, Debug, Clone)]
+pub struct EncryptionTarget {
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    /// Run directly against the storage a connection config (JSON-LD)
+    /// describes; the config must list every key involved
+    #[arg(long, value_name = "PATH", conflicts_with = "remote")]
+    pub connection_config: Option<PathBuf>,
+
+    /// Print the raw JSON response
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EncryptionAction {
+    /// Show the held key ids and the rotation record, if any
+    Status {
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Start (or resume) a rotation off `--retire` onto the current key
+    Rotate {
+        /// Id of the key being retired
+        #[arg(long)]
+        retire: u32,
+
+        /// Count what would be rewritten without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Limit the sweep to one ledger (name or branch-qualified id)
+        #[arg(long)]
+        ledger: Option<String>,
+
+        /// Throttle rewrites, e.g. "50mb" per second
+        #[arg(long, value_name = "BYTES/S")]
+        rate: Option<String>,
+
+        /// Poll status until the sweep stops, printing progress
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Resume the rotation the record describes
+    Resume {
+        /// Poll status until the sweep stops, printing progress
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Pause the running sweep after its next blob
+    Pause {
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Cancel the running sweep; the next rotate starts over
+    Cancel {
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Count blobs still on a retiring key and stamp the record
+    Verify {
+        /// Id of the key being retired
+        #[arg(long)]
+        retire: u32,
+
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Print a fresh base64 AES-256 key for AES256Key / AES256Keys
+    GenerateKey,
 }
 
 /// `cluster` subcommands.

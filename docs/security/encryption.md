@@ -115,9 +115,14 @@ The encryption key is specified in the storage configuration using `AES256Key`:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `AES256Key` | string or object | Base64-encoded 32-byte encryption key |
+| `AES256Key` | string or object | Base64-encoded 32-byte encryption key. A single key with id `0`. |
 | `AES256Key.envVar` | string | Environment variable containing the key |
 | `AES256Key.defaultVal` | string | Fallback key if env var is not set |
+| `AES256Keys` | list | A key set for rotation: each entry a node with `keyId` (integer) and `AES256Key` (string or object as above). Every listed key decrypts. |
+| `AES256CurrentKey` | integer | The `keyId` that encrypts new writes. Required with `AES256Keys`. |
+
+`AES256Key` and `AES256Keys` are mutually exclusive. Key ids are written into
+every envelope header, so once a key has an id, keep it.
 
 ### Environment Variable Indirection
 
@@ -173,13 +178,86 @@ Recommended secret management solutions:
 
 ### Key Rotation
 
-The encryption envelope format includes a `key_id` field to support key rotation:
+Keys rotate without export and import. Every envelope header records the id
+of the key that encrypted it, so a storage configured with several keys reads
+any of them while new writes use the current one. A rotation is then a
+background sweep that re-envelopes every blob still on the retiring key. Two
+properties make it safe to run over days while serving traffic:
 
-1. **Existing data** continues to be readable with the old key
-2. **New writes** use the new key
-3. **Re-encrypt on read** (optional): Decrypt with old key, re-encrypt with new key
+- **Rewrites are in place.** Addresses are hashes of plaintext, so a blob's
+  address does not change when its key does. Each rewrite is one atomic
+  object write, verified by reading it back; a crash between blobs leaves each
+  blob on exactly one key.
+- **The blobs are the truth.** The progress record at
+  `@maintenance/key-rotation.json` in the same storage caches where the sweep
+  stood; resuming from a stale record only re-reads a few headers. Nothing
+  removes a key automatically. Completion is a verification pass that finds
+  zero blobs on the retiring key, after which an operator drops the key.
 
-> **Note**: Full key rotation support with `KeyProvider` trait is planned for a future release. Currently, a single static key is used.
+#### Rollout order
+
+Nodes share storage, so the order matters more than the commands:
+
+1. Add the new key to every node's configuration as a decrypt-only entry of
+   `AES256Keys` and restart. Every node can now read blobs on either key.
+2. Set `AES256CurrentKey` to the new key on every node and restart. All new
+   writes now use it.
+3. Run the sweep from one node (`fluree encryption rotate --retire <old>`).
+4. Run `fluree encryption verify --retire <old>`. When it reports zero
+   remaining, remove the old key from `AES256Keys` and restart.
+
+A node restarted with the old key already removed cannot read blobs still on
+it, and the sweep refuses to start or resume unless the process holds both the
+retiring key and the current one.
+
+```json
+{
+  "@id": "storage",
+  "@type": "Storage",
+  "filePath": "/var/lib/fluree",
+  "AES256Keys": [
+    {"keyId": 1, "AES256Key": {"envVar": "FLUREE_KEY_1"}},
+    {"keyId": 2, "AES256Key": {"envVar": "FLUREE_KEY_2"}}
+  ],
+  "AES256CurrentKey": 2
+}
+```
+
+#### Commands and endpoints
+
+Every `fluree encryption` subcommand takes `--remote <name>` to run against a
+server or `--connection-config <path>` to run directly against the storage the
+config describes. `--json` prints the raw response.
+
+| Command | Endpoint | What it does |
+|---|---|---|
+| `fluree encryption status` | `GET /v1/fluree/encryption`, `GET /v1/fluree/encryption/rotate/status` | Held key ids, the current key, and the progress record. Any node answers. |
+| `fluree encryption rotate --retire N [--dry-run] [--ledger L] [--rate 50mb] [--wait]` | `POST /v1/fluree/encryption/rotate` | Start, or resume, the sweep. A dry run counts and writes nothing. `--wait` polls status until the sweep stops. |
+| `fluree encryption resume [--wait]` | `POST /v1/fluree/encryption/rotate` | Continue the rotation the record describes. |
+| `fluree encryption pause` / `cancel` | `POST /v1/fluree/encryption/rotate/pause` / `cancel` | Stop after the next blob. A paused sweep resumes from its cursor; a cancelled one starts over. |
+| `fluree encryption verify --retire N` | `POST /v1/fluree/encryption/rotate/verify` | Count blobs still on key N across the whole store, by header, and stamp the record. |
+| `fluree encryption generate-key` | — | Print a fresh base64 key. |
+
+The write endpoints are admin-gated. Under Raft they are forwarded to the
+leader, which is the only node that runs the sweep; on a leadership change the
+outgoing leader releases the record and the new leader resumes it. A
+standalone server resumes a `Running` record at startup. No operator action is
+needed after a restart.
+
+#### Reading status
+
+The record reports `state` (`running`, `paused`, `cancelled`, `failed`,
+`swept`, `completed`), the holder, the unit in progress (a ledger branch, a
+ledger's shared dictionaries, or graph sources) with the last address done,
+and counters: scanned, rewritten, already current, on other held keys, not
+enveloped (nameservice records and lock files), and failed with the first
+hundred failing addresses. `swept` means the sweep finished but verification
+found stragglers; `resume` retries them. `stalled` is set when a `running`
+record has not checkpointed for ten minutes: nobody is advancing it, and the
+next `rotate` or a leader election takes it over.
+
+Only `completed` — a verification stamp with zero remaining — licenses
+removing the retiring key.
 
 ## Encryption Details
 
