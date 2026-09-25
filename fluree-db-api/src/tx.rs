@@ -20,7 +20,7 @@ use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_novelty::TxnMetaEntry;
 #[cfg(feature = "shacl")]
 use fluree_db_shacl::ShaclEngine;
-use fluree_db_transact::stage as stage_txn;
+use fluree_db_transact::stage_with_graph_delta as stage_txn;
 #[cfg(feature = "shacl")]
 use fluree_db_transact::validate_view_with_shacl;
 use fluree_db_transact::{
@@ -174,10 +174,6 @@ impl SequentialStager {
         tracker: Option<&Tracker>,
         advance: bool,
     ) -> Result<usize> {
-        // Captured before staging consumes the Txn; needed to advance the
-        // virtual state between operations.
-        let graph_iris: Vec<String> = txn.graph_delta.values().cloned().collect();
-
         let state = self
             .current
             .take()
@@ -185,6 +181,9 @@ impl SequentialStager {
         let result = fluree
             .stage_transaction_from_txn(state, txn, index_config, policy, tracker)
             .await?;
+        // The staged delta, which includes graphs `GRAPH ?g` templates resolved
+        // to; needed to advance the virtual state between operations.
+        let graph_iris: Vec<String> = result.graph_delta.values().cloned().collect();
 
         // The op's FULL namespace delta: lowering allocations (adopted into
         // the staging registry) PLUS staging-time allocations — relative to
@@ -1435,13 +1434,15 @@ async fn stage_with_config_shacl(
     options: StageOptions<'_>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     txn_context: Option<&JsonValue>,
-) -> std::result::Result<(StagedLedger, NamespaceRegistry, bool), fluree_db_transact::TransactError>
-{
-    // Capture graph_delta + tracker before stage_txn consumes the options/txn.
-    // graph_delta is used both for per-graph config lookup and for rebuilding
-    // graph_sids after staging (IRIs are already interned in ns_registry, so
-    // sid_for_iri hits the trie cache — no new allocations).
-    let graph_delta = txn.graph_delta.clone();
+) -> std::result::Result<
+    (
+        StagedLedger,
+        NamespaceRegistry,
+        bool,
+        FxHashMap<u16, String>,
+    ),
+    fluree_db_transact::TransactError,
+> {
     let tracker = options.tracker;
     // Move inline shapes JSON off the txn — stage_txn consumes
     // `txn` immediately after this, and the in-flight staging
@@ -1501,7 +1502,12 @@ async fn stage_with_config_shacl(
     let cross_ledger_schema =
         resolve_cross_ledger_schema_for_tx(&ledger, config.as_ref(), resolve_ctx).await?;
 
-    let (mut view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
+    // The staged delta, not the Txn's: it includes graphs `GRAPH ?g` templates
+    // resolved to. It drives per-graph config lookup and the graph_sids rebuild
+    // below (IRIs are already interned in ns_registry, so sid_for_iri hits the
+    // trie cache — no new allocations).
+    let (mut view, mut ns_registry, graph_delta) =
+        stage_txn(ledger, txn, ns_registry, options).await?;
 
     // Parse inline shapes (if any) against the staged namespace
     // registry. The bundle becomes an additional shape DB in
@@ -1578,7 +1584,7 @@ async fn stage_with_config_shacl(
     )
     .await?;
 
-    Ok((view, ns_registry, validated))
+    Ok((view, ns_registry, validated, graph_delta))
 }
 
 // =============================================================================
@@ -2768,10 +2774,9 @@ impl crate::Fluree {
         external_tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
-        // Extract txn_meta, graph_delta, and any inline uniqueness
+        // Extract txn_meta and any inline uniqueness
         // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
-        let graph_delta = txn.graph_delta.clone();
         let sync_graph = txn.sync_graph.clone();
         let inline_unique_properties = txn.opts.unique_properties.clone();
         let read_subjects = bounded_read_subjects(&txn, &mut ns_registry, &ledger);
@@ -2822,8 +2827,8 @@ impl crate::Fluree {
         #[cfg(not(feature = "shacl"))]
         let staged = stage_txn(ledger, txn, ns_registry, options)
             .await
-            .map(|(view, ns_registry)| (view, ns_registry, false));
-        let (view, ns_registry, validated) = match staged {
+            .map(|(view, ns_registry, graph_delta)| (view, ns_registry, false, graph_delta));
+        let (view, ns_registry, validated, graph_delta) = match staged {
             Ok(staged) => staged,
             Err(e) => {
                 self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
@@ -2934,10 +2939,9 @@ impl crate::Fluree {
                 })?;
         }
 
-        // Extract txn_meta, graph_delta, and any inline uniqueness
+        // Extract txn_meta and any inline uniqueness
         // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
-        let graph_delta = txn.graph_delta.clone();
         let inline_unique_properties = txn.opts.unique_properties.clone();
         let read_subjects = bounded_read_subjects(&txn, &mut ns_registry, &ledger);
 
@@ -2978,8 +2982,8 @@ impl crate::Fluree {
         #[cfg(not(feature = "shacl"))]
         let staged = stage_txn(ledger, txn, ns_registry, options)
             .await
-            .map(|(view, ns_registry)| (view, ns_registry, false));
-        let (view, ns_registry, validated) = match staged {
+            .map(|(view, ns_registry, graph_delta)| (view, ns_registry, false, graph_delta));
+        let (view, ns_registry, validated, graph_delta) = match staged {
             Ok(staged) => staged,
             Err(e) => {
                 self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
@@ -3180,10 +3184,9 @@ impl crate::Fluree {
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?
         };
 
-        // Extract txn_meta, graph_delta, and any inline uniqueness
+        // Extract txn_meta and any inline uniqueness
         // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
-        let graph_delta = txn.graph_delta.clone();
         let inline_unique_properties = txn.opts.unique_properties.clone();
 
         // Build stage options with policy and tracker
@@ -3223,8 +3226,8 @@ impl crate::Fluree {
         #[cfg(not(feature = "shacl"))]
         let staged = stage_txn(ledger, txn, ns_registry, options)
             .await
-            .map(|(view, ns_registry)| (view, ns_registry, false));
-        let (view, ns_registry, _validated) = match staged {
+            .map(|(view, ns_registry, graph_delta)| (view, ns_registry, false, graph_delta));
+        let (view, ns_registry, _validated, graph_delta) = match staged {
             Ok(staged) => staged,
             Err(e) => {
                 self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)

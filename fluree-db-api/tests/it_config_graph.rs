@@ -1725,6 +1725,97 @@ async fn shacl_per_graph_mode_warn_vs_reject() {
     );
 }
 
+/// Per-graph SHACL governance reaches graphs a SPARQL UPDATE writes through a
+/// `GRAPH ?g` template. The graph is only known once the WHERE runs, so it
+/// must still be counted among the transaction's graphs: missed, the Warn
+/// override below would not apply and the ledger-wide Reject would.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_per_graph_mode_applies_to_graph_variable_targets() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/shacl-pergraph-graph-var:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        @prefix ex: <http://example.org/> .
+
+        ex:PersonShape rdf:type sh:NodeShape ;
+                       sh:targetClass ex:Person ;
+                       sh:property ex:pshape_name .
+        ex:pshape_name sh:path ex:name ;
+                       sh:minCount 1 ;
+                       sh:datatype xsd:string .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:shaclEnabled true ;
+                               f:validationMode f:ValidationReject .
+
+            <urn:config:main> f:graphOverrides <urn:config:scratch-override> .
+            <urn:config:scratch-override> rdf:type f:GraphConfig ;
+                                          f:targetGraph <http://example.org/scratch> ;
+                                          f:shaclDefaults <urn:config:scratch-shacl> .
+            <urn:config:scratch-shacl> f:shaclEnabled true ;
+                                       f:validationMode f:ValidationWarn .
+        }}
+    "
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config + shape write should succeed")
+        .ledger;
+
+    let update = |graph: &str| {
+        format!(
+            r"INSERT {{ GRAPH ?g {{
+                  <http://example.org/p1> a <http://example.org/Person> }} }}
+              WHERE {{ BIND(<{graph}> AS ?g) }}"
+        )
+    };
+    let stage = |ledger: fluree_db_api::LedgerState, sparql: String| {
+        let fluree = &fluree;
+        async move {
+            let parsed = fluree_db_sparql::parse_sparql(&sparql);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let ast = parsed.ast.expect("SPARQL AST");
+            let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+            let txn = fluree_db_transact::lower_sparql_update_ast(
+                &ast,
+                &mut ns,
+                fluree_db_transact::TxnOpts::default(),
+            )
+            .expect("lower SPARQL UPDATE");
+            fluree.stage_owned(ledger).txn(txn).execute().await
+        }
+    };
+
+    let ledger = stage(ledger, update("http://example.org/scratch"))
+        .await
+        .expect("violation in the Warn-mode graph must pass when reached through ?g")
+        .ledger;
+
+    let err = stage(ledger, update("http://example.org/strict"))
+        .await
+        .expect_err("violation in a Reject-mode graph reached through ?g must fail");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "expected a SHACL violation: {err:?}"
+    );
+}
+
 // =============================================================================
 // Test 16: SHACL shapes-exist heuristic (no config)
 // =============================================================================

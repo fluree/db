@@ -1575,26 +1575,28 @@ fn lower_quad_pattern_to_templates(
                 }
                 out.push(t);
             }
-            QuadPatternElement::Graph { name, triples, .. } => {
-                let graph_iri = match name {
-                    fluree_db_sparql::ast::pattern::GraphName::Iri(iri) => {
-                        expand_iri(iri, prologue)?
+            QuadPatternElement::Graph { name, triples, .. } => match name {
+                fluree_db_sparql::ast::pattern::GraphName::Iri(iri) => {
+                    let txn_local_g_id = graph_ids.get_or_assign(expand_iri(iri, prologue)?);
+                    for tp in triples {
+                        out.push(
+                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
+                                .with_graph_id(txn_local_g_id),
+                        );
                     }
-                    fluree_db_sparql::ast::pattern::GraphName::Var(v) => {
-                        return Err(LowerError::UnsupportedFeature {
-                            feature: "GRAPH variables in UPDATE templates",
-                            span: v.span,
-                        });
-                    }
-                };
-                let txn_local_g_id = graph_ids.get_or_assign(graph_iri);
-                for tp in triples {
-                    out.push(
-                        lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
-                            .with_graph_id(txn_local_g_id),
-                    );
                 }
-            }
+                fluree_db_sparql::ast::pattern::GraphName::Var(v) => {
+                    // Same registry key as the WHERE lowering, so the template
+                    // reads the column the WHERE's `GRAPH ?g` binds.
+                    let graph_var = vars.get_or_insert(&format!("?{}", v.name));
+                    for tp in triples {
+                        out.push(
+                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
+                                .with_graph_var(graph_var),
+                        );
+                    }
+                }
+            },
         }
     }
     Ok(out)
@@ -1627,6 +1629,7 @@ fn lower_triple_to_template(
         dtc,
         list_index: None, // Always None for SPARQL UPDATE
         graph_id: None,   // Default graph
+        graph_var: None,
     })
 }
 
@@ -1817,6 +1820,7 @@ fn lower_triple_to_delete_template_delete_where(
         dtc,
         list_index: None,
         graph_id: None,
+        graph_var: None,
     })
 }
 
@@ -2459,6 +2463,40 @@ mod tests {
             txn.graph_delta.values().any(|iri| iri == "urn:g1"),
             "graph_delta must register <urn:g1>, got {:?}",
             txn.graph_delta
+        );
+    }
+
+    #[test]
+    fn test_lower_graph_variable_templates() {
+        // `GRAPH ?g` templates carry the WHERE's `?g` variable, not a graph
+        // id, and register nothing in `graph_delta` until staging resolves it.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE { GRAPH ?g { ?s <http://example.org/status> \"old\" } } \
+             INSERT { GRAPH ?g { ?s <http://example.org/status> \"new\" } } \
+             WHERE  { GRAPH ?g { ?s <http://example.org/status> \"old\" } }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        let g = txn.vars.get("?g").expect("?g registered");
+        for t in txn.delete_templates.iter().chain(&txn.insert_templates) {
+            assert_eq!(t.graph_var, Some(g));
+            assert_eq!(t.graph_id, None);
+        }
+        assert!(txn.graph_delta.is_empty(), "{:?}", txn.graph_delta);
+
+        let parsed = fluree_db_sparql::parse_sparql("DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
+        let ast = parsed.ast.expect("AST");
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        assert_eq!(
+            txn.delete_templates[0].graph_var,
+            Some(txn.vars.get("?g").expect("?g registered"))
         );
     }
 
