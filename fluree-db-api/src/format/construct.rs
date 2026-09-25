@@ -161,6 +161,13 @@ pub(super) fn instantiate_construct_graph(
                     };
                     triple[i] = Some(term);
                 }
+                let [Some(s), Some(p), Some(o)] = triple else {
+                    unreachable!("every position was filled above")
+                };
+                if graph_slot.is_none() && reifier_slots.is_empty() {
+                    dataset.default.add(Triple::new(s, p, o));
+                    continue;
+                }
                 let graph = match graph_slot {
                     Some(slot) => match resolve(slot, Position::Graph)? {
                         Some(name) => Some(name),
@@ -176,9 +183,6 @@ pub(super) fn instantiate_construct_graph(
                         reifiers.push(r);
                     }
                 }
-                let [Some(s), Some(p), Some(o)] = triple else {
-                    unreachable!("every position was filled above")
-                };
                 let g = dataset.graph_mut(graph.as_ref());
                 for r in reifiers.drain(..) {
                     g.add_reification(s.clone(), p.clone(), o.clone(), r);

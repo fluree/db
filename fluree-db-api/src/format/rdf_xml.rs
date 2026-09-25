@@ -74,7 +74,13 @@ pub(super) fn format_graph(graph: &Graph) -> Result<String> {
             current_subject = Some(s);
         }
 
-        match reifiers.remove(triple) {
+        // `remove` hashes even on an empty map; most graphs have no reifiers.
+        let rs = if reifiers.is_empty() {
+            None
+        } else {
+            reifiers.remove(triple)
+        };
+        match rs {
             Some(rs) => {
                 for r in rs {
                     write_predicate_object(triple, Some(r), &ns_to_prefix, &mut out)?;
