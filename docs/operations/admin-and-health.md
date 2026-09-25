@@ -343,7 +343,7 @@ Alert conditions:
 Enable structured logging:
 
 ```bash
-fluree-server --log-level info 2>&1 | jq .
+LOG_FORMAT=json fluree server run --log-level info 2>&1 | jq .
 ```
 
 Search for:
@@ -358,7 +358,7 @@ Search for:
 In production, enable admin authentication:
 
 ```bash
-fluree-server \
+fluree server run -- \
   --admin-auth-mode required \
   --admin-auth-trusted-issuer did:key:z6Mk...
 ```

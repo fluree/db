@@ -3788,12 +3788,12 @@ Enable admin authentication with CLI flags:
 
 ```bash
 # Production: require trusted tokens
-fluree-server \
+fluree server run -- \
   --admin-auth-mode=required \
   --admin-auth-trusted-issuer=did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK
 
 # Development: no authentication (default)
-fluree-server --admin-auth-mode=none
+fluree server run -- --admin-auth-mode=none
 ```
 
 **Environment Variables:**

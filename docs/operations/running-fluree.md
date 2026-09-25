@@ -21,25 +21,34 @@ The primary production deployment. Exposes a full REST API over HTTP.
 
 ### Starting the Server
 
-```bash
-# Build from source
-cargo build --release -p fluree-db-server
+The server runs through the `fluree` CLI, which needs a project directory (`fluree init`):
 
-# Run with defaults (memory storage, port 8090)
-./target/release/fluree-server
+```bash
+# One-time: create .fluree/ in the current directory
+fluree init
+
+# Run with defaults (file storage in ./.fluree/storage, port 8090)
+fluree server run
 
 # Run with file-based persistence
-fluree-server --storage-path /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 
 # Run with debug logging
-fluree-server --log-level debug
+fluree server run --log-level debug
+
+# Pass any other server flag after `--`
+fluree server run -- --cache-max-mb 4096
 ```
+
+`fluree server start` runs the same server in the background. (The `fluree-db-server` crate
+also builds a standalone `fluree-server` binary that takes every server flag directly; the
+Raft cluster mode in [Raft clusters](raft-clusters.md) requires it.)
 
 ### Configuration
 
 Configuration is resolved in this precedence order (highest wins):
 
-1. **CLI flags** — `fluree-server --storage-path ./data --log-level debug`
+1. **CLI flags** — `fluree server run --storage-path ./data --log-level debug`
 2. **Environment variables** — All settings use a `FLUREE_` prefix (e.g., `FLUREE_LISTEN_ADDR`)
 3. **Profile overrides** — Environment-specific sections in the config file
 4. **Config file** — TOML, JSON, or JSON-LD (auto-discovered from `.fluree/config.toml` or `config.jsonld`)
@@ -49,9 +58,9 @@ Configuration is resolved in this precedence order (highest wins):
 
 | Backend | Flag / Config | Use Case |
 |---------|---------------|----------|
-| **Memory** | (default) | Dev/testing — data lost on restart |
-| **File** | `--storage-path /path` | Single-machine persistence |
-| **AWS S3 + DynamoDB** | `--aws` feature + config | Distributed / cloud-native deployments |
+| **Memory** | `--connection-config` with a memory storage node ([example](storage.md#memory-storage)) | Dev/testing — data lost on restart |
+| **File** | (default, `.fluree/storage`) or `--storage-path /path` | Single-machine persistence |
+| **AWS S3 + DynamoDB** | `aws` build feature + `--connection-config` | Distributed / cloud-native deployments |
 
 ### Server Roles
 
@@ -68,18 +77,20 @@ Configuration is resolved in this precedence order (highest wins):
 
 ```bash
 # Transaction server (primary)
-fluree-server \
+fluree server run \
   --storage-path /var/lib/fluree \
+  -- \
   --storage-proxy-enabled
 
 # Query peer (shared storage)
-fluree-server \
+fluree server run \
+  --storage-path /var/lib/fluree \
+  -- \
   --server-role peer \
-  --tx-server-url http://primary:8090 \
-  --storage-path /var/lib/fluree
+  --tx-server-url http://primary:8090
 
 # Query peer (proxy storage — no local data)
-fluree-server \
+fluree server run -- \
   --server-role peer \
   --tx-server-url http://primary:8090 \
   --storage-access-mode proxy \

@@ -117,6 +117,8 @@ Snapshot ids arriving from peers are validated before any disk write: non-empty,
 
 Raft mode is built behind a `raft` Cargo feature. A build without the feature has no `--raft-*` flags at all, so single-node binaries don't pull in openraft.
 
+Unlike single-node deployments, which run the server through `fluree server run`, Raft nodes run the standalone `fluree-server` binary built with the feature (`cargo build --release -p fluree-db-server --features raft`). The Raft bootstrap lives in that binary's startup path; `fluree server run` does not start Raft.
+
 When the feature is enabled, four CLI/env switches govern Raft mode:
 
 | CLI flag                | Env var                        | Required when raft is on |

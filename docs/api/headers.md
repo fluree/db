@@ -262,15 +262,11 @@ Cache-Control: public, max-age=31536000, immutable
 
 Historical queries are immutable and cache indefinitely.
 
-### X-RateLimit Headers
+### Rate Limit Headers
 
-Rate limit information (if enabled):
-
-```http
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 95
-X-RateLimit-Reset: 1642857600
-```
+The server does not rate-limit requests and sends no `X-RateLimit-*` headers. If a reverse
+proxy or API gateway in front of it enforces rate limits, any such headers come from that
+layer.
 
 ### X-Request-ID
 
@@ -420,19 +416,11 @@ ex:alice schema:name "Alice" .
 
 ### Default Limits
 
-The server enforces size limits to prevent resource exhaustion:
+The server enforces a single request body size limit to prevent resource exhaustion. It
+applies to every request body — transactions, queries, and history requests alike:
 
-**Transaction Requests:**
-- Default limit: 10 MB
-- Configurable: `--max-transaction-size`
-
-**Query Requests:**
-- Default limit: 1 MB
-- Configurable: `--max-query-size`
-
-**History Requests:**
-- Default limit: 1 MB
-- Configurable: `--max-history-size`
+- Default limit: 50 MB (52428800 bytes)
+- Configurable: `--body-limit` (env `FLUREE_BODY_LIMIT`, config file `body_limit`)
 
 ### Exceeding Limits
 
@@ -451,35 +439,18 @@ If a request exceeds size limits:
 
 ### Configuration
 
-Set custom limits when starting the server:
+Set a custom limit when starting the server:
 
 ```bash
-./fluree-db-server \
-  --max-transaction-size 20971520 \    # 20 MB
-  --max-query-size 2097152 \           # 2 MB
-  --max-response-size 104857600        # 100 MB
+fluree server run -- --body-limit 20971520   # 20 MB
 ```
 
-### Response Size Limits
+See [Configuration](../operations/configuration.md) for all server options.
 
-The server also limits response sizes:
+### Response Size
 
-**Default limit:** 100 MB
-
-If a query result exceeds the limit:
-
-**Status Code:** `413 Payload Too Large`
-
-**Response:**
-```json
-{
-  "error": "Query result exceeds maximum response size",
-  "status": 413,
-  "@type": "err:http/ResponseTooLarge"
-}
-```
-
-**Solution:** Use LIMIT and pagination:
+The server has no configurable response size limit. To keep large result sets manageable, use
+LIMIT and pagination:
 
 ```json
 {
@@ -565,35 +536,28 @@ Access-Control-Request-Headers: Content-Type
 
 **Preflight Response:**
 ```http
-Access-Control-Allow-Origin: https://example.com
-Access-Control-Allow-Methods: GET, POST, OPTIONS
-Access-Control-Allow-Headers: Content-Type, Authorization
-Access-Control-Max-Age: 86400
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: *
+Access-Control-Allow-Headers: Content-Type
 ```
+
+The requested headers are mirrored back in `Access-Control-Allow-Headers`.
 
 **Actual Response:**
 ```http
-Access-Control-Allow-Origin: https://example.com
-Access-Control-Allow-Credentials: true
+Access-Control-Allow-Origin: *
 ```
 
 ### CORS Configuration
 
-Configure CORS when starting the server:
+CORS is either on or off. It is on by default; disable it with `FLUREE_CORS_ENABLED=false`
+or `cors_enabled = false` in the `[server]` section of the config file (the `--cors-enabled`
+flag can only turn it on). When on, the server allows any
+origin and any method and does not send `Access-Control-Allow-Credentials`.
 
-```bash
-./fluree-db-server \
-  --cors-origin "https://example.com" \
-  --cors-methods "GET,POST,OPTIONS" \
-  --cors-headers "Content-Type,Authorization"
-```
-
-**Allow all origins (development only):**
-```bash
-./fluree-db-server --cors-origin "*"
-```
-
-Never use `--cors-origin "*"` in production with credentials.
+The server has no per-origin, per-method, or per-header allow lists. To restrict CORS to
+specific origins, disable it on the server and set the CORS headers in a reverse proxy in
+front of it.
 
 ## Caching Headers
 
@@ -719,7 +683,8 @@ if (etag) {
 
 ### 6. Monitor Rate Limits
 
-Check rate limit headers and back off when needed:
+If a proxy or gateway in front of the server enforces rate limits, check its headers and back
+off when needed:
 
 ```javascript
 const remaining = response.headers.get('X-RateLimit-Remaining');

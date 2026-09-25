@@ -6,10 +6,22 @@ Fluree supports four storage modes, each optimized for different deployment scen
 
 ### Memory Storage
 
-In-memory storage for development and testing:
+In-memory storage for development and testing. The server has no dedicated flag for it;
+point `--connection-config` at a connection config whose storage node has no backend fields:
+
+```json
+{
+  "@context": {"@vocab": "https://ns.flur.ee/system#"},
+  "@graph": [{
+    "@id": "conn",
+    "@type": "Connection",
+    "indexStorage": {"@id": "mem", "@type": "Storage"}
+  }]
+}
+```
 
 ```bash
-./fluree-db-server --storage memory
+fluree server run --connection-config memory.jsonld
 ```
 
 **Characteristics:**
@@ -31,12 +43,10 @@ In-memory storage for development and testing:
 
 ### File Storage
 
-Local file system storage:
+Local file system storage (the server's default, at `.fluree/storage` when no path is given):
 
 ```bash
-./fluree-db-server \
-  --storage file \
-  --data-dir /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 ```
 
 **Characteristics:**
@@ -59,15 +69,13 @@ Local file system storage:
 
 ### AWS Storage
 
-Distributed storage using S3 and DynamoDB:
+Distributed storage using S3 and DynamoDB. Buckets, DynamoDB table, and region are set in a
+JSON-LD connection config file (requires a server built with the `aws` feature); see the
+[example in Configuration](configuration.md#connection-configuration-s3-dynamodb-etc) and the
+[connection config reference](../reference/connection-config-jsonld.md):
 
 ```bash
-./fluree-db-server \
-  --storage aws \
-  --s3-bucket fluree-prod-data \
-  --s3-region us-east-1 \
-  --dynamodb-table fluree-nameservice \
-  --dynamodb-region us-east-1
+fluree server run --connection-config /etc/fluree/connection.jsonld
 ```
 
 **Characteristics:**
@@ -626,10 +634,12 @@ Export from the running system and import into the new one:
 
 ```bash
 # Export from memory
-curl -X POST http://localhost:8090/export?ledger=mydb:main > mydb-export.jsonld
+curl -X POST http://localhost:8090/v1/fluree/export/mydb:main \
+  -H "Content-Type: application/json" \
+  -d '{"format": "jsonld"}' > mydb-export.jsonld
 
 # Stop memory server, start file server
-./fluree-db-server --storage file --data-dir /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 
 # Import to file storage
 curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
@@ -656,8 +666,8 @@ aws dynamodb create-table \
     AttributeName=sk,KeyType=RANGE \
   --billing-mode PAY_PER_REQUEST
 
-# Start AWS-backed server
-./fluree-db-server --storage aws --s3-bucket fluree-prod-data
+# Start AWS-backed server (S3 bucket + DynamoDB table named in the connection config)
+fluree server run --connection-config /etc/fluree/connection.jsonld
 ```
 
 ### AWS to File
@@ -669,7 +679,7 @@ Download from S3:
 aws s3 sync s3://fluree-prod-data/ /var/lib/fluree/
 
 # Start file-backed server
-./fluree-db-server --storage file --data-dir /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 ```
 
 ## Backup and Recovery
@@ -680,7 +690,9 @@ No native backup (data is ephemeral):
 
 ```bash
 # Export ledger
-curl -X POST http://localhost:8090/export?ledger=mydb:main > backup.jsonld
+curl -X POST http://localhost:8090/v1/fluree/export/mydb:main \
+  -H "Content-Type: application/json" \
+  -d '{"format": "jsonld"}' > backup.jsonld
 ```
 
 ### File Storage

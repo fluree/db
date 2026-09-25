@@ -9,7 +9,7 @@ The Fluree HTTP API provides RESTful endpoints for all database operations. This
 High-level introduction to the Fluree HTTP API, including:
 - API design principles
 - Authentication overview
-- Rate limiting and quotas
+- Rate limiting (not built in; handled by a proxy or gateway)
 - API versioning
 
 ### [Endpoints](endpoints.md)
@@ -98,8 +98,7 @@ Fluree supports multiple authentication mechanisms:
 
 1. **No Authentication** (development only)
 2. **Signed Requests** (JWS/VC for production)
-3. **API Keys** (simple token-based auth)
-4. **Bearer Tokens** (JWT authentication)
+3. **Bearer Tokens** (JWT authentication)
 
 See [Signed Requests](signed-requests.md) for cryptographic authentication details.
 
@@ -203,7 +202,7 @@ HttpResponse<String> response = client.send(request,
 For local development, the API typically runs without authentication:
 
 ```bash
-./fluree-db-server --port 8090 --storage memory
+fluree server run --listen-addr 0.0.0.0:8090
 ```
 
 Access: `http://localhost:8090`
@@ -213,30 +212,31 @@ Access: `http://localhost:8090`
 For production deployments, enable authentication and use HTTPS:
 
 ```bash
-./fluree-db-server \
-  --port 8090 \
-  --storage aws \
-  --require-signed-requests \
-  --https-cert /path/to/cert.pem \
-  --https-key /path/to/key.pem
+fluree server run \
+  --listen-addr 0.0.0.0:8090 \
+  --connection-config /etc/fluree/connection.jsonld \
+  -- \
+  --data-auth-mode required \
+  --data-auth-trusted-issuer did:key:z6Mk...
 ```
+
+The server speaks plain HTTP; terminate TLS at a reverse proxy or load balancer in front of it.
+See [Configuration](../operations/configuration.md) for storage and auth options.
 
 Access: `https://api.yourdomain.com`
 
 Always use:
-- HTTPS in production
-- Signed requests or API keys
-- Rate limiting
-- Request size limits
+- HTTPS in production (terminated at the proxy)
+- Signed requests or Bearer tokens
+- Rate limiting (at the proxy or API gateway; the server has none built in)
+- Request size limits (`--body-limit`)
 
 ## Performance Considerations
 
 ### Request Size Limits
 
-Default limits (configurable):
-- Transaction size: 10MB
-- Query size: 1MB
-- Response size: 100MB
+A single request body limit applies to all requests: 50MB by default, configurable with
+`--body-limit`. There is no response size limit.
 
 See [Headers and Request Sizing](headers.md) for details.
 

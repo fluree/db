@@ -69,20 +69,20 @@ For configuration (mounted JSON-LD/TOML config files, env vars, persistent volum
 
 ## Start the Server
 
-### Memory Storage (Development)
+### Default Storage (Development)
 
-Start the server with in-memory storage (data is lost on restart):
+`fluree server run` needs a Fluree project directory; create one with `fluree init` if you
+haven't. By default the server stores data in the project's `.fluree/storage` directory:
 
 ```bash
+fluree init
 fluree server run
 ```
 
 You should see output like:
 
 ```text
-INFO fluree_db_server: Starting Fluree server
-INFO fluree_db_server: Storage mode: memory
-INFO fluree_db_server: Server listening on 0.0.0.0:8090
+INFO fluree_db_cli::commands::server: Starting Fluree server (foreground) version="…" addr=0.0.0.0:8090 storage="file"
 ```
 
 ### File Storage (Persistent)
@@ -175,29 +175,34 @@ See the [API Reference](../api/endpoints.md) for complete endpoint documentation
 
 ### Storage Modes
 
-**Memory** (default):
-- Fast, in-process storage
-- Data lost on restart
-- Best for development and testing
-
-**File** (with `--storage-path`):
+**File** (default; `.fluree/storage`, or set with `--storage-path`):
 - Persistent local file storage
 - Data survives restarts
 - Best for single-server deployments
 
+**Memory** (via `--connection-config`; see [Storage Modes](../operations/storage.md#memory-storage)):
+- Fast, in-process storage
+- Data lost on restart
+- Best for development and testing
+
 ### Configuration
 
-All options can be set via CLI flags or environment variables:
+All options can be set via CLI flags or environment variables. `fluree server run` takes the
+most common server flags directly; pass any other server flag after `--`
+(for example `fluree server run -- --cache-max-mb 4096`):
 
 ```bash
 # CLI flag
 fluree server run --storage-path /data --log-level debug
 
 # Environment variables
-export FLUREE_STORAGE_PATH=/data
+export FLUREE_LISTEN_ADDR=0.0.0.0:9090
 export FLUREE_LOG_LEVEL=debug
 fluree server run
 ```
+
+The storage path is the exception: set it with `--storage-path` or `storage_path` in the
+config file, since `fluree server run` overrides `FLUREE_STORAGE_PATH`.
 
 See [Configuration](../operations/configuration.md) for all options.
 
@@ -214,9 +219,10 @@ fluree server run --log-level debug
 ```bash
 fluree server run \
   --storage-path /var/lib/fluree \
+  -- \
   --indexing-enabled \
   --events-auth-mode required \
-  --events-auth-trusted-issuers did:key:z6Mk...
+  --events-auth-trusted-issuer did:key:z6Mk...
 ```
 
 ### With Background Indexing
@@ -224,6 +230,7 @@ fluree server run \
 ```bash
 fluree server run \
   --storage-path /var/lib/fluree \
+  -- \
   --indexing-enabled
 ```
 

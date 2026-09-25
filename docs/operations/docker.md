@@ -16,7 +16,7 @@ The official image (`fluree/server`) ships the `fluree` binary on a slim Debian 
 | Healthcheck        | `GET /health` every 30s                |
 | Default log filter | `RUST_LOG=info`                        |
 
-**Entrypoint behavior:** on first start, if `/var/lib/fluree/.fluree/` does not exist, the entrypoint runs `fluree init` to create a default `.fluree/config.toml` and `.fluree/storage/` directory. Subsequent starts skip init. Any arguments passed to `docker run` after the image name are forwarded to `fluree server run`, so you can append CLI flags (e.g. `--log-level debug`) directly.
+**Entrypoint behavior:** on first start, if `/var/lib/fluree/.fluree/` does not exist, the entrypoint runs `fluree init` to create a default `.fluree/config.toml` and `.fluree/storage/` directory. Subsequent starts skip init. Any arguments passed to `docker run` after the image name are forwarded to `fluree server run`, so you can append CLI flags (e.g. `--log-level debug`) directly. Server flags that `fluree server run` doesn't take itself go after `--` (e.g. `fluree/server:latest -- --cache-max-mb 4096`); see [Configuration](configuration.md).
 
 ## Quick Start
 
@@ -73,14 +73,13 @@ You can use any one of these — or, more typically, layer them: bake a base con
 
 ### 1. Environment Variables Only
 
-Every CLI flag has a `FLUREE_*` env var equivalent (see [Configuration](configuration.md)). For simple deployments this is the lowest-friction path:
+Every CLI flag has a `FLUREE_*` env var equivalent (see [Configuration](configuration.md)), except that `FLUREE_STORAGE_PATH` is overridden by `fluree server run` (data goes to `/var/lib/fluree/.fluree/storage` unless the config file sets `storage_path`). For simple deployments this is the lowest-friction path:
 
 ```bash
 docker run -d --name fluree \
   -p 8090:8090 \
   -v fluree-data:/var/lib/fluree \
   -e FLUREE_LISTEN_ADDR=0.0.0.0:8090 \
-  -e FLUREE_STORAGE_PATH=/var/lib/fluree/.fluree/storage \
   -e FLUREE_INDEXING_ENABLED=true \
   -e FLUREE_REINDEX_MIN_BYTES=1000000 \
   -e FLUREE_REINDEX_MAX_BYTES=10000000 \
@@ -368,7 +367,7 @@ docker run -d --name fluree-peer \
   -v fluree-peer-data:/var/lib/fluree \
   -e FLUREE_SERVER_ROLE=peer \
   -e FLUREE_TX_SERVER_URL=http://tx.internal:8090 \
-  fluree/server:latest --peer-subscribe-all
+  fluree/server:latest -- --peer-subscribe-all
 ```
 
 See [Query peers and replication](query-peers.md) for the proxy-mode and auth options.
