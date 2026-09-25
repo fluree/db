@@ -19,7 +19,9 @@
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
-use crate::extract::{negotiate_graph_format, FlureeHeaders, MaybeCredential, MaybeDataBearer};
+use crate::extract::{
+    negotiate_graph_format, FlureeHeaders, GraphFormat, MaybeCredential, MaybeDataBearer,
+};
 use crate::routes::query::SparqlParams;
 use crate::routes::transact::{
     effective_author, enforce_write_access, execute_transaction, execute_turtle_transaction,
@@ -243,12 +245,13 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let format = negotiate_graph_format(accept.as_deref()).ok_or_else(|| {
-        ServerError::not_acceptable(
-            "a graph is available as application/ld+json, text/turtle, \
+    let format =
+        negotiate_graph_format(accept.as_deref(), GraphFormat::SINGLE_GRAPH).ok_or_else(|| {
+            ServerError::not_acceptable(
+                "a graph is available as application/ld+json, text/turtle, \
              application/n-triples or application/rdf+xml",
-        )
-    })?;
+            )
+        })?;
     let head = request.method() == Method::HEAD;
     let (parts, _) = request.into_parts();
 
@@ -281,13 +284,54 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
         }
     }
 
-    let sparql = match &graph {
-        GraphSel::Graph(iri) => {
-            format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}")
-        }
-        GraphSel::Default => "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }".to_string(),
+    // Edge annotations come back with their triples, so a GET of an annotated
+    // graph PUT back unchanged commits nothing. The lookup costs about a
+    // quarter of the query's time, so a ledger that has never held an
+    // annotation skips it. That flag only ever turns on: if it is still off
+    // after the query ran, the snapshot the query read had no annotations;
+    // if a commit or refresh turned it on meanwhile, run again with the
+    // lookup. The first check can run before the caller is authenticated, so
+    // a failure only drops the lookup; the query route answers for the ledger.
+    let annotated = state.fluree.has_annotations(&ledger).await.unwrap_or(false);
+    let response =
+        construct_graph(&state, &ledger, parts.clone(), &graph, format, annotated).await?;
+    if !annotated && response.status().is_success() && state.fluree.has_annotations(&ledger).await?
+    {
+        return construct_graph(&state, &ledger, parts, &graph, format, true).await;
+    }
+    Ok(response)
+}
+
+/// `CONSTRUCT` the graph through the query route. With `annotated`, each
+/// annotated edge also brings its reifier (`?s ?p ?o ~ ?r`). The annotations
+/// come from a `UNION` branch rooted at `rdf:reifies`, which costs a lookup
+/// per annotation; an `OPTIONAL` probing every triple is several times
+/// slower inside a named graph.
+async fn construct_graph(
+    state: &Arc<AppState>,
+    ledger: &str,
+    parts: axum::http::request::Parts,
+    graph: &GraphSel,
+    format: GraphFormat,
+    annotated: bool,
+) -> Result<Response> {
+    let (template, pattern) = if annotated {
+        (
+            "?s ?p ?o ~ ?r",
+            "{ ?s ?p ?o } UNION \
+             { ?r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( ?s ?p ?o )>> }",
+        )
+    } else {
+        ("?s ?p ?o", "?s ?p ?o")
     };
-    query_as_caller(&state, &ledger, parts, sparql, format.media_type()).await
+    // The IRI was validated by `request_graph`, so it cannot close the `<…>`.
+    let sparql = match graph {
+        GraphSel::Graph(iri) => {
+            format!("CONSTRUCT {{ {template} }} WHERE {{ GRAPH <{iri}> {{ {pattern} }} }}")
+        }
+        GraphSel::Default => format!("CONSTRUCT {{ {template} }} WHERE {{ {pattern} }}"),
+    };
+    query_as_caller(state, ledger, parts, sparql, format.media_type()).await
 }
 
 /// Run `sparql` through the query route as the caller would: same auth

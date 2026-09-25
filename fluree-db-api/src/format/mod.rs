@@ -364,12 +364,14 @@ pub fn format_results(
             "SPARQL XML produces String, not JsonValue. Use format_results_string() instead."
                 .to_string(),
         )),
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
-            Err(FormatError::InvalidBinding(format!(
-                "{:?} produces String, not JsonValue. Use format_results_string() instead.",
-                config.format
-            )))
-        }
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => Err(FormatError::InvalidBinding(format!(
+            "{:?} produces String, not JsonValue. Use format_results_string() instead.",
+            config.format
+        ))),
         OutputFormat::Tsv | OutputFormat::Csv => {
             unreachable!("Delimited formats rejected before dispatch")
         }
@@ -442,7 +444,11 @@ pub fn format_results_string(
                 .with_absolute_iris(config.absolute_iris);
             return sparql_xml::format(result, &compactor, config);
         }
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => {
             let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
             return graph_text::format(result, &compactor, config);
         }
@@ -593,12 +599,14 @@ pub async fn format_results_async(
             "SPARQL XML produces String, not JsonValue. Use format_results_string_async() instead."
                 .to_string(),
         )),
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
-            Err(FormatError::InvalidBinding(format!(
-                "{:?} produces String, not JsonValue. Use format_results_string_async() instead.",
-                config.format
-            )))
-        }
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => Err(FormatError::InvalidBinding(format!(
+            "{:?} produces String, not JsonValue. Use format_results_string_async() instead.",
+            config.format
+        ))),
         OutputFormat::Tsv | OutputFormat::Csv => {
             unreachable!("Delimited formats rejected before dispatch")
         }
@@ -693,7 +701,11 @@ pub async fn format_results_string_async(
             let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
         }
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => {
             let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
             return graph_text::format(result, &compactor, config);
         }
@@ -740,7 +752,11 @@ pub async fn format_results_string_async_dataset(
             let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
         }
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => {
             let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
             return graph_text::format(result, &compactor, config);
         }
