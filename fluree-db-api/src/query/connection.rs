@@ -15,6 +15,21 @@ use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
 
 type TrackedResult<T> = std::result::Result<T, crate::query::TrackedErrorResponse>;
 
+/// What a connection query's caller formats its result against.
+///
+/// Carries the view or dataset the query actually executed on, policy included.
+/// Re-resolving the alias instead would produce an unwrapped view, and hydration
+/// would then expand subjects the request was denied.
+pub(crate) enum FormatTarget {
+    /// The single view of a one-ledger query. Boxed because it is by far the
+    /// larger variant and this rides an async fn's state machine, where frame
+    /// size has overflowed the worker stack before (fluree/db#1408).
+    Single(Box<GraphDb>),
+    /// The dataset of a multi-ledger query, whose per-view policies hydration
+    /// routes through for each home ledger.
+    Dataset(DataSetDb),
+}
+
 impl Fluree {
     async fn prepare_single_view_for_connection(
         &self,
@@ -134,23 +149,21 @@ impl Fluree {
             .await
     }
 
-    /// Execute a JSON-LD connection query and, for the multi-ledger case,
-    /// return the `DataSetDb` alongside the result so the caller can format
-    /// hydration output against each ledger's own view (issue #1259).
+    /// Execute a JSON-LD connection query and return what the caller must format
+    /// against alongside the result, so hydration is filtered by the same policy
+    /// the rows were (issue #1259 for the multi-ledger routing).
     ///
     /// Mirrors the policy/r2rml combinations of [`Self::query_connection`],
     /// [`Self::query_connection_with_policy`],
     /// [`Self::query_connection_jsonld_with_r2rml`], and
-    /// [`Self::query_connection_with_policy_and_r2rml`] in one place. Returns
-    /// `None` for the single-ledger fast path (formatting is correct against
-    /// the sole view) and `Some(dataset)` for genuine multi-ledger queries.
-    pub(crate) async fn query_connection_jsonld_returning_dataset_with_options(
+    /// [`Self::query_connection_with_policy_and_r2rml`] in one place.
+    pub(crate) async fn query_connection_jsonld_returning_target_with_options(
         &self,
         query_json: &JsonValue,
         policy: Option<&PolicyContext>,
         r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
         options: QueryExecutionOptions,
-    ) -> Result<(QueryResult, Option<DataSetDb>)> {
+    ) -> Result<(QueryResult, FormatTarget)> {
         let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
 
         if spec.is_empty() {
@@ -178,7 +191,7 @@ impl Fluree {
                 }
                 None => self.query_with_options(&view, query_json, options).await?,
             };
-            return Ok((result, None));
+            return Ok((result, FormatTarget::Single(Box::new(view))));
         }
 
         // Multi-ledger: build the DataSetDb (with per-view policy) and keep it
@@ -197,7 +210,7 @@ impl Fluree {
                     .await?
             }
         };
-        Ok((result, Some(dataset)))
+        Ok((result, FormatTarget::Dataset(dataset)))
     }
 
     /// Execute a JSON-LD connection query with explicit R2RML providers.
