@@ -119,6 +119,7 @@
   - [Endpoints](api/endpoints.md)
   - [Multi-query envelope](api/multi-query.md)
   - [Streaming query (NDJSON)](api/streaming-query.md)
+  - [Graph Store Protocol](api/graph-store.md)
   - [Bolt protocol](api/bolt.md)
   - [Headers, content types, and request sizing](api/headers.md)
   - [Signed requests (JWS/VC)](api/signed-requests.md)

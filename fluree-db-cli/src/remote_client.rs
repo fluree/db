@@ -1250,28 +1250,34 @@ impl RemoteLedgerClient {
     // Sync (graph synchronization)
     // =========================================================================
 
-    /// Synchronize a named graph: make its contents exactly `body`,
-    /// committing only the delta.
+    /// Synchronize a graph: make its contents exactly `body`, committing
+    /// only the delta. `graph: None` is the default graph.
     ///
-    /// `POST {base}/sync/{ledger}?graph=<iri>[&dryRun=true][&allowEmpty=true]`
+    /// `POST {base}/sync/{ledger}[?graph=<iri>][&dryRun=true][&allowEmpty=true]`
     /// with a JSON-LD body. A dry run answers with the delta report; a real
     /// run with the standard transact response.
     pub async fn sync_jsonld(
         &self,
         ledger: &str,
-        graph: &str,
+        graph: Option<&str>,
         body: &serde_json::Value,
         dry_run: bool,
         allow_empty: bool,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let mut url = self.op_url("sync", ledger);
-        url.push_str("?graph=");
-        url.push_str(&urlencoding::encode(graph));
+        let mut params = Vec::new();
+        if let Some(graph) = graph {
+            params.push(format!("graph={}", urlencoding::encode(graph)));
+        }
         if dry_run {
-            url.push_str("&dryRun=true");
+            params.push("dryRun=true".to_string());
         }
         if allow_empty {
-            url.push_str("&allowEmpty=true");
+            params.push("allowEmpty=true".to_string());
+        }
+        let mut url = self.op_url("sync", ledger);
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
         }
         self.send_json(
             reqwest::Method::POST,

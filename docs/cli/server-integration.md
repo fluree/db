@@ -1488,7 +1488,8 @@ Content-Type: application/json
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `graph` (query) | Yes | Full **absolute** IRI of the target named graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address named graphs itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `graph` (query) | No | Full **absolute** IRI of the target named graph; absent means the default graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address named graphs itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `default` (query) | No | Bare key: sync the default graph, said explicitly. Passing it with `graph` is a `400`. The CLI omits `graph` for the default graph. |
 | `dryRun` (query) | No | `true` → stage and report the delta; commit nothing. |
 | `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |
 | body | Yes | The graph's desired full contents: insert-shaped JSON-LD, or Turtle / N-Triples / TriG by `Content-Type` (see [Payload formats](../transactions/sync.md#payload-formats)). The CLI always sends JSON-LD (Turtle is converted client-side), so it works against servers that predate RDF bodies. Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
@@ -1542,7 +1543,7 @@ runs, so scripts consume either path identically.
 
 | Status | When |
 |--------|------|
-| `400` | missing `graph`; malformed / relative graph IRI; system-graph target; empty payload without `allowEmpty`; JSON-LD payload addressing named graphs; TriG block naming a graph other than `graph`; TriG default-graph triples beside a block; unparseable body |
+| `400` | both `graph` and `default`; malformed / relative graph IRI; system-graph target; empty payload without `allowEmpty`; JSON-LD payload addressing named graphs; TriG block naming a graph other than `graph`; TriG default-graph triples beside a block; unparseable body |
 | `401` / `403` | per the policy contract |
 | `404` | unknown ledger |
 

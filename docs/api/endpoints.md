@@ -341,9 +341,10 @@ produces no commit. See [Sync](../transactions/sync.md).
 ```
 POST /sync?ledger={ledger-id}&graph={graph-iri}
 POST /sync/{ledger-id}?graph={graph-iri}
+POST /sync/{ledger-id}
 ```
 
-**Query parameters:** `graph` (required target graph IRI), `dryRun=true`
+**Query parameters:** `graph` (target named graph IRI; omit it for the default graph, or pass a bare `default` to say so explicitly), `dryRun=true`
 (stage and report the delta without committing), `allowEmpty=true` (confirm
 an explicitly empty payload, which clears the graph).
 
@@ -363,6 +364,21 @@ curl -X POST "http://localhost:8090/v1/fluree/sync?ledger=mydb:main&graph=http:/
       { "@id": "ex:alice", "ex:name": "Alice" }
     ]
   }'
+```
+
+### GET | HEAD | PUT | POST | DELETE /data/*ledger
+
+The W3C SPARQL 1.1 Graph Store HTTP Protocol: read (`GET`/`HEAD`), replace
+(`PUT`), add to (`POST`) or remove (`DELETE`) one graph, named by
+`?graph={iri}` or `?default`. `PUT` is [sync](../transactions/sync.md), so it
+commits only the difference. `PUT`/`POST` take Turtle, N-Triples, TriG or
+JSON-LD; `GET` returns JSON-LD or RDF/XML. See
+[Graph Store Protocol](graph-store.md) for status codes, formats and policy.
+
+```bash
+curl -X PUT "http://localhost:8090/v1/fluree/data/mydb:main?graph=urn:example:tools" \
+  -H "Content-Type: text/turtle" \
+  --data-binary @tools.ttl
 ```
 
 ### POST /push/*ledger

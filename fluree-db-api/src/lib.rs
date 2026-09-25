@@ -217,7 +217,7 @@ pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
     TransactResultRef,
 };
-pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged, SyncPayload};
+pub use tx_builder::{GraphPayload, OwnedTransactBuilder, RefTransactBuilder, Staged};
 pub use verify::{LedgerVerifyReport, VerifyProblem, VerifySeverity};
 pub use view::{
     ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,
@@ -350,7 +350,7 @@ pub use fluree_db_query::ir::Query;
 pub use fluree_db_query::parse::ParseError;
 pub use fluree_db_transact::{
     build_commit, lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitOptsRequest,
-    CommitReceipt, LowerError as SparqlUpdateLowerError, NamespaceRegistry, StagedCommit,
+    CommitReceipt, GraphSel, LowerError as SparqlUpdateLowerError, NamespaceRegistry, StagedCommit,
     TransactError, Txn, TxnOpts, TxnType,
 };
 
