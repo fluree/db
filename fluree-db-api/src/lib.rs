@@ -139,6 +139,7 @@ pub use admin::{
     ReindexResult,
     SyncGraphOpts,
     SyncGraphReport,
+    SyncPayload,
     TriggerIndexOptions,
     TriggerIndexResult,
 };

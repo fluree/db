@@ -202,6 +202,18 @@ pub enum TransactionBody {
     /// are postcard-encoded in persisted Raft state, where variant ordinals
     /// are positional — never insert a variant mid-enum.
     JsonLdGraphSync { graph_iri: String, body: JsonValue },
+    /// Turtle, N-Triples or TriG text staged as a graph sync (see
+    /// `fluree_db_api::SyncPayload::Rdf`). `allow_empty` travels with the
+    /// text because an RDF body's emptiness is only known once staging
+    /// parses it.
+    ///
+    /// Appended last, for the same postcard-ordinal reason as
+    /// `JsonLdGraphSync`.
+    RdfGraphSync {
+        graph_iri: String,
+        text: String,
+        allow_empty: bool,
+    },
 }
 
 impl TransactionBody {
@@ -213,7 +225,7 @@ impl TransactionBody {
             Self::JsonLdInsert(_) | Self::TurtleInsert(_) => "insert",
             Self::JsonLdUpsert(_) | Self::TurtleUpsert(_) | Self::TrigUpsert(_) => "upsert",
             Self::JsonLdUpdate(_) => "update",
-            Self::JsonLdGraphSync { .. } => "graph-sync",
+            Self::JsonLdGraphSync { .. } | Self::RdfGraphSync { .. } => "graph-sync",
             Self::Sparql(_) => "sparql-update",
             Self::Cypher { .. } => "cypher",
         }
@@ -252,6 +264,16 @@ impl TransactionBody {
                 hasher.update([0u8]);
                 hasher.update(body.to_string().as_bytes());
             }
+            Self::RdfGraphSync {
+                graph_iri,
+                text,
+                allow_empty,
+            } => {
+                hasher.update(b"rdf-graph-sync");
+                hasher.update(graph_iri.as_bytes());
+                hasher.update([0u8, u8::from(*allow_empty)]);
+                hasher.update(text.as_bytes());
+            }
             Self::TurtleInsert(text) => {
                 hasher.update(b"turtle-insert");
                 hasher.update(text.as_bytes());
@@ -288,7 +310,7 @@ impl TransactionBody {
 /// surface it on [`SubmissionState::Committed`] so clients can tell
 /// what kind of submission they're confirming.
 ///
-/// The eight transact variants mirror [`TransactionBody`]'s
+/// The transact variants mirror [`TransactionBody`]'s
 /// discriminators (and convert via [`From<&TransactionBody>`]).
 /// The remaining four match the non-transact `Committer` methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +347,8 @@ pub enum BodyKind {
     /// inserting mid-enum would make existing snapshots and mixed-version
     /// nodes decode every later variant as the wrong operation.
     JsonLdGraphSync,
+    /// RDF-text graph sync. Appended last (see `JsonLdGraphSync`).
+    RdfGraphSync,
 }
 
 impl From<&TransactionBody> for BodyKind {
@@ -334,6 +358,7 @@ impl From<&TransactionBody> for BodyKind {
             TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
             TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
             TransactionBody::JsonLdGraphSync { .. } => BodyKind::JsonLdGraphSync,
+            TransactionBody::RdfGraphSync { .. } => BodyKind::RdfGraphSync,
             TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
             TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
             TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
@@ -1031,6 +1056,40 @@ mod tests {
     }
 
     #[test]
+    fn rdf_graph_sync_round_trips_and_hashes_every_field() {
+        let body = |graph: &str, allow_empty: bool| TransactionBody::RdfGraphSync {
+            graph_iri: graph.to_string(),
+            text: "<urn:s> <urn:p> <urn:o> .".to_string(),
+            allow_empty,
+        };
+        let queued = QueuedRequest::Transact(Box::new(QueuedTransact {
+            body: body("urn:g", true),
+            txn_opts: fluree_db_transact::TxnOpts::default(),
+            commit_opts: CommitOptsRequest::default(),
+            tracking: None,
+            governance: GovernanceOptions::default(),
+        }));
+        let decoded = QueuedRequest::from_bytes(&queued.to_bytes().expect("encode"));
+        match decoded.expect("decode") {
+            QueuedRequest::Transact(t) => {
+                assert!(matches!(
+                    &t.body,
+                    TransactionBody::RdfGraphSync { graph_iri, allow_empty: true, .. }
+                        if graph_iri == "urn:g"
+                ));
+                assert_eq!(BodyKind::from(&t.body), BodyKind::RdfGraphSync);
+            }
+            other => panic!("expected Transact, got {other:?}"),
+        }
+
+        // A retry that changes the target graph or the empty opt-in is a
+        // different request, not a replay.
+        let hash = body("urn:g", true).body_hash();
+        assert_ne!(hash, body("urn:g", false).body_hash());
+        assert_ne!(hash, body("urn:h", true).body_hash());
+    }
+
+    #[test]
     fn new_accepts_typical_lengths() {
         IdempotencyKey::new("01J5ULIDLOOKINGKEY").expect("ULID-shaped key fits cap");
         let max = "x".repeat(MAX_IDEMPOTENCY_KEY_LEN);
@@ -1076,6 +1135,7 @@ mod body_kind_wire_tests {
             (BodyKind::Merge, 10),
             (BodyKind::Rebase, 11),
             (BodyKind::JsonLdGraphSync, 12),
+            (BodyKind::RdfGraphSync, 13),
         ];
         for (kind, ordinal) in expected {
             let bytes = postcard::to_allocvec(&kind).expect("encode");

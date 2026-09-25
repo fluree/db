@@ -33,7 +33,7 @@ assert/retract introspection.
 Turtle 1.2 annotation syntax is accepted on ingest — `{| ... |}` annotation
 tails, the `~` reifier, `<< s p o >>` reified triples and
 `r rdf:reifies <<( s p o )>>` — on every Turtle write path (insert, upsert,
-import, graph sync), inside TriG `GRAPH { }` blocks, and in N-Triples and
+import, graph sync over the CLI or `/sync`), inside TriG `GRAPH { }` blocks, and in N-Triples and
 N-Quads files. All forms assert the base triple: Fluree reifies asserted
 edges, so `<< s p o >>` is asserting here where RDF 1.2 makes it
 non-asserting. The `VERSION "1.2"` / `@version`

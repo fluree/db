@@ -152,6 +152,17 @@ impl Committer for LocalCommitter {
                 TransactionBody::JsonLdGraphSync { graph_iri, body } => {
                     staged.sync_graph(graph_iri.as_str(), body)
                 }
+                TransactionBody::RdfGraphSync {
+                    graph_iri,
+                    text,
+                    allow_empty,
+                } => staged.sync_graph_payload(
+                    graph_iri.as_str(),
+                    fluree_db_api::SyncPayload::Rdf {
+                        text: text.as_str(),
+                        allow_empty: *allow_empty,
+                    },
+                ),
                 TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
                 TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
                     staged.upsert_turtle(text.as_str())
