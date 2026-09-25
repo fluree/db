@@ -245,12 +245,6 @@ are outside it by design:
 - **The nameservice.** The file nameservice under `ns@v2/` and the DynamoDB or
   S3 storage-backed nameservice hold ledger names, head commit ids and index
   root ids in plaintext. They contain no ledger content.
-
-  Earlier releases' `build_s3_encrypted()` encrypted the S3 storage-backed
-  nameservice records as well. It now writes them in plaintext, like every other
-  build path, and cannot read the encrypted ones. A store written that way fails
-  to open, with a JSON parse error reading a nameservice record, until those
-  records are rewritten in plaintext.
 - **Nothing else on local disk.** Readers keep a read-through disk cache of
   index artifacts (`$TMPDIR/fluree_binary_cache` by default, or
   `LedgerManagerConfig::cache_dir`), and the indexer seeds it with artifacts it
