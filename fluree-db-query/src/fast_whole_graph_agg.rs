@@ -987,7 +987,7 @@ fn compute_histogram(
         return Ok(Some(batch));
     };
     let prepared = crate::eval::PreparedBoolExpression::new(filter.clone());
-    match crate::filter::filter_batch(&batch, &prepared, schema, ctx)? {
+    match crate::filter::filter_batch(batch, &prepared, ctx)? {
         Some(filtered) => Ok(Some(filtered)),
         // Every group rejected: a legitimately empty result, not a decline.
         None => Ok(Some(crate::fast_path_common::empty_batch(schema.clone())?)),

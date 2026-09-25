@@ -24,7 +24,9 @@ impl ArithmeticOp {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<Option<ComparableValue>> {
-        check_min_arity(args, 1, &self.to_string())?;
+        if args.is_empty() {
+            check_min_arity(args, 1, &self.to_string())?;
+        }
 
         let first = match args[0].eval_to_comparable(row, ctx)? {
             Some(v) => v,

@@ -43,7 +43,8 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{ObjectBounds, Sid};
-use rustc_hash::FxHashMap;
+use indexmap::IndexMap;
+use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -99,6 +100,11 @@ fn make_property_join_scan(
 /// correct cross-ledger joins. The operator accepts both `Binding::Sid` (single-ledger)
 /// and `Binding::IriMatch` (multi-ledger) from scans and emits the appropriate
 /// binding type in output rows.
+/// Per-subject state: (subject binding, predicate presence mask, emitted
+/// values per emitted predicate). Insertion-ordered, so rows come out in the
+/// driver scan's subject order.
+type SubjectMap = IndexMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>), FxBuildHasher>;
+
 pub struct PropertyJoinOperator {
     /// The shared subject variable
     subject_var: VarId,
@@ -113,15 +119,14 @@ pub struct PropertyJoinOperator {
     /// - Single-ledger: prefer raw encoded subject IDs (no decoding)
     /// - Dataset/multi-ledger: use canonical IRI strings (cross-ledger safe)
     ///
-    /// Value tuple: (subject_binding, vec of value-vectors per predicate).
     /// The subject_binding is preserved from the scan to emit the correct type.
-    subject_values: FxHashMap<SubjectKey, (Binding, Vec<Vec<Binding>>)>,
-    /// Subjects to process (collected after filtering)
-    pending_subjects: Vec<SubjectKey>,
-    /// Current index into pending_subjects
+    /// After `open`, holds only subjects that matched every required predicate.
+    subject_values: SubjectMap,
+    /// Next position in `subject_values` to expand.
     subject_idx: usize,
-    /// Subject currently being expanded into cartesian rows across batches.
-    current_subject: Option<SubjectKey>,
+    /// Position of the subject currently being expanded into cartesian rows
+    /// across batches.
+    current_subject: Option<usize>,
     /// Per-emitted-predicate odometer indices for `current_subject`.
     current_indices: Vec<usize>,
     /// Optional object bounds for range filter pushdown (VarId -> ObjectBounds)
@@ -268,7 +273,7 @@ impl PropertyJoinOperator {
     fn ingest_probe_match(
         &self,
         ctx: &ExecutionContext<'_>,
-        all_subject_values: &mut FxHashMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>)>,
+        all_subject_values: &mut SubjectMap,
         pred_idx: usize,
         probe_match: BatchedSubjectProbeMatch,
     ) -> Result<()> {
@@ -289,7 +294,7 @@ impl PropertyJoinOperator {
     fn ingest_spot_star_match(
         &self,
         ctx: &ExecutionContext<'_>,
-        all_subject_values: &mut FxHashMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>)>,
+        all_subject_values: &mut SubjectMap,
         spot_match: BatchedSpotStarMatch,
     ) -> Result<()> {
         let subject = Binding::encoded_sid(spot_match.subject_id);
@@ -311,7 +316,7 @@ impl PropertyJoinOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         order_pos: usize,
-        all_subject_values: &FxHashMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>)>,
+        all_subject_values: &SubjectMap,
     ) -> Option<Vec<u64>> {
         if order_pos != 0 || ctx.binary_store.is_none() {
             return None;
@@ -472,8 +477,7 @@ impl PropertyJoinOperator {
             predicates,
             output_schema,
             state: OperatorState::Created,
-            subject_values: FxHashMap::default(),
-            pending_subjects: Vec::new(),
+            subject_values: SubjectMap::default(),
             subject_idx: 0,
             current_subject: None,
             current_indices: Vec::new(),
@@ -772,7 +776,6 @@ impl Operator for PropertyJoinOperator {
         async {
             self.state = OperatorState::Open;
             self.subject_values.clear();
-            self.pending_subjects.clear();
             self.subject_idx = 0;
             self.current_subject = None;
             self.current_indices.clear();
@@ -795,8 +798,7 @@ impl Operator for PropertyJoinOperator {
             // - no datatype constraint on the probed predicate (dt=None)
             // Map: subject -> (subject_binding, presence_mask, emitted_values)
             // presence_mask has one bit per predicate index, regardless of emit flag.
-            let mut all_subject_values: FxHashMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>)> =
-                FxHashMap::default();
+            let mut all_subject_values = SubjectMap::default();
             let required_mask: u64 = if self.predicates.len() >= 64 {
                 u64::MAX
             } else {
@@ -1137,25 +1139,20 @@ impl Operator for PropertyJoinOperator {
                 }
             }
 
-            // Filter to only subjects that have values for ALL predicates
-            self.subject_values = all_subject_values
-                .into_iter()
-                .filter(|(_, (_sb, mask, values))| {
-                    (*mask & required_mask) == required_mask
-                        && (emit_count == 0
-                            || values
-                                .iter()
-                                .enumerate()
-                                .all(|(idx, v)| !self.emitted_required[idx] || !v.is_empty()))
-                })
-                .map(|(k, (sb, _mask, values))| (k, (sb, values)))
-                .collect();
-
-            // Collect subjects for iteration
-            self.pending_subjects = self.subject_values.keys().cloned().collect();
+            // Keep only subjects that have values for ALL predicates
+            let emitted_required = &self.emitted_required;
+            all_subject_values.retain(|_, (_sb, mask, values)| {
+                (*mask & required_mask) == required_mask
+                    && (emit_count == 0
+                        || values
+                            .iter()
+                            .enumerate()
+                            .all(|(idx, v)| !emitted_required[idx] || !v.is_empty()))
+            });
+            self.subject_values = all_subject_values;
 
             tracing::debug!(
-                subjects = self.pending_subjects.len(),
+                subjects = self.subject_values.len(),
                 used_batched_probe,
                 used_spot_star_walk,
                 probe_chunks,
@@ -1185,11 +1182,10 @@ impl Operator for PropertyJoinOperator {
         while all_rows.len() < batch_size {
             if self.current_subject.is_none() {
                 let mut found = false;
-                while self.subject_idx < self.pending_subjects.len() {
-                    let subject_key = self.pending_subjects[self.subject_idx].clone();
+                while self.subject_idx < self.subject_values.len() {
+                    let idx = self.subject_idx;
                     self.subject_idx += 1;
-                    let Some((_subject_binding, values_per_pred)) =
-                        self.subject_values.get(&subject_key)
+                    let Some((_, (_, _, values_per_pred))) = self.subject_values.get_index(idx)
                     else {
                         continue;
                     };
@@ -1197,7 +1193,7 @@ impl Operator for PropertyJoinOperator {
                         continue;
                     }
                     self.current_indices = vec![0; values_per_pred.len()];
-                    self.current_subject = Some(subject_key);
+                    self.current_subject = Some(idx);
                     found = true;
                     break;
                 }
@@ -1206,10 +1202,11 @@ impl Operator for PropertyJoinOperator {
                 }
             }
 
-            let Some(subject_key) = self.current_subject.as_ref() else {
+            let Some(idx) = self.current_subject else {
                 continue;
             };
-            let Some((subject_binding, values_per_pred)) = self.subject_values.get(subject_key)
+            let Some((_, (subject_binding, _, values_per_pred))) =
+                self.subject_values.get_index(idx)
             else {
                 self.current_subject = None;
                 self.current_indices.clear();
@@ -1259,7 +1256,6 @@ impl Operator for PropertyJoinOperator {
     fn close(&mut self) {
         self.state = OperatorState::Closed;
         self.subject_values.clear();
-        self.pending_subjects.clear();
         self.subject_idx = 0;
         self.current_subject = None;
         self.current_indices.clear();
