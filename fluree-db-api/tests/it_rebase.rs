@@ -697,3 +697,64 @@ async fn rebase_take_branch_keeps_value_both_sides_asserted() {
 
     assert_eq!(query_all_names(&fluree, "mydb:dev").await, vec!["C"]);
 }
+
+/// Replaying a commit that created a named graph onto a base that never
+/// registered it routes the graph's flakes and registers the graph.
+#[tokio::test]
+async fn rebase_replays_commit_that_creates_named_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let main_ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx, "@id": "ex:alice", "ex:name": "Alice"}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let graph = "http://example.org/g1";
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(
+            dev,
+            &json!({"@context": ctx, "graph": graph, "insert": {"@id": "ex:dave", "ex:name": "Dave"}}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .insert(
+            main_ledger,
+            &json!({"@context": ctx, "@id": "ex:carol", "ex:name": "Carol"}),
+        )
+        .await
+        .unwrap();
+
+    let report = fluree
+        .rebase_branch("mydb", "dev", ConflictStrategy::TakeBoth)
+        .await
+        .expect("rebase should replay the graph-creating commit");
+    assert!(!report.fast_forward);
+    assert_eq!(report.replayed, 1);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let q = json!({
+        "@context": ctx,
+        "from": format!("mydb:dev#{graph}"),
+        "select": "?n",
+        "where": {"@id": "ex:dave", "ex:name": "?n"}
+    });
+    let rows = fluree
+        .query_connection(&q)
+        .await
+        .expect("the replayed graph must be queryable")
+        .to_jsonld(&dev.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!(["Dave"]));
+}

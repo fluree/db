@@ -602,6 +602,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     post_values,
                     include_system_facts: false,
                     cypher_vocab: None,
+                    unmatched_optional: Default::default(),
                 })
             }
             QueryBody::Construct(construct_query) => self.lower_construct(construct_query),

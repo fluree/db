@@ -171,3 +171,89 @@ async fn inline_property_unknown_to_ledger_fails_loudly() {
         "expected explicit unresolved-IRI diagnostic, got: {msg}"
     );
 }
+
+/// Two named graphs, registered in this order, with alice's email in the
+/// second. A transaction that writes only to the second graph numbers it
+/// first among its own graphs, so enforcement must translate to the ledger's
+/// graph id to look in the right place.
+async fn seed_email_in_second_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger = genesis_ledger(fluree, ledger_id);
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            r#"
+            GRAPH <http://example.org/g/a> {
+                <http://example.org/ns/x> <http://example.org/ns/other> "1" .
+            }
+            GRAPH <http://example.org/g/b> {
+                <http://example.org/ns/alice> <http://example.org/ns/email> "alice@example.org" .
+            }
+        "#,
+        )
+        .execute()
+        .await
+        .expect("seed two named graphs")
+        .ledger
+}
+
+fn email_unique() -> TxnOpts {
+    TxnOpts {
+        unique_properties: Some(vec!["http://example.org/ns/email".to_string()]),
+        ..TxnOpts::default()
+    }
+}
+
+#[tokio::test]
+async fn inline_unique_property_enforced_in_second_named_graph_sparql() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger =
+        seed_email_in_second_graph(&fluree, "test/inline-constraints/second-graph-sparql:main")
+            .await;
+    let parsed = fluree_db_sparql::parse_sparql(
+        r#"INSERT DATA { GRAPH <http://example.org/g/b> {
+            <http://example.org/ns/bob> <http://example.org/ns/email> "alice@example.org" } }"#,
+    );
+    let ast = parsed.ast.expect("SPARQL AST");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, email_unique())
+        .expect("lower SPARQL UPDATE");
+    let err = fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .expect_err("duplicate email in the second named graph must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected uniqueness violation error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn inline_unique_property_enforced_in_second_named_graph_jsonld() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger =
+        seed_email_in_second_graph(&fluree, "test/inline-constraints/second-graph-jsonld:main")
+            .await;
+    let err = fluree
+        .update_with_opts(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "graph": "http://example.org/g/b",
+                "insert": {"@id": "ex:bob", "ex:email": "alice@example.org"}
+            }),
+            email_unique(),
+            CommitOpts::default(),
+            &test_index_cfg(),
+        )
+        .await
+        .expect_err("duplicate email in the second named graph must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected uniqueness violation error, got: {err}"
+    );
+}

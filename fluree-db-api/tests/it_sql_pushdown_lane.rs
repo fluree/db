@@ -1308,10 +1308,20 @@ fn cases() -> Vec<Case> {
             declined: Some("ref object map into a union entity over templates the lane cannot relate"),
         },
         Case {
+            // Cy has no orders, so ?o stays unbound and the second OPTIONAL
+            // joins every order's total, including the customerless one.
             name: "an optional hanging off an optional entity declines",
             sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?o ex:customer ?c } OPTIONAL { ?o ex:total ?t } }",
             sql: &[],
-            rows: &["n=Ada t=5.00", "n=Ada t=99.50", "n=Bo t=42.00", "n=Cy t="],
+            rows: &[
+                "n=Ada t=5.00",
+                "n=Ada t=99.50",
+                "n=Bo t=42.00",
+                "n=Cy t=42.00",
+                "n=Cy t=5.00",
+                "n=Cy t=7.00",
+                "n=Cy t=99.50",
+            ],
             routing: Routing::MustNotFire,
             declined: Some("optional chained on an optional entity"),
         },

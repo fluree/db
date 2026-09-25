@@ -5649,6 +5649,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         }
     }
 
@@ -6843,6 +6844,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -6872,6 +6874,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -6909,6 +6912,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_none());
     }
@@ -7305,6 +7309,7 @@ mod tests {
                 post_values: None,
                 include_system_facts: false,
                 cypher_vocab: None,
+                unmatched_optional: Default::default(),
             };
             assert!(detect_fused_r2rml_aggregate(&q).is_some());
         }
