@@ -351,6 +351,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for GetCountingStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
         async fn has(&self, id: &ContentId) -> Result<bool> {
             self.inner.has(id).await
         }

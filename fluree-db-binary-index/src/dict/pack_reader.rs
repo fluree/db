@@ -1170,6 +1170,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for FilePackStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.fallback.has(id).await
         }

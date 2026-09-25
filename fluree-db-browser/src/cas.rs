@@ -503,6 +503,11 @@ impl BrowserCasStorage {
 
 #[async_trait]
 impl StorageRead for BrowserCasStorage {
+    /// Reads return exactly the bytes at rest.
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         Ok(self.load(address).await?.to_vec())
     }

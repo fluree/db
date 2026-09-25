@@ -237,12 +237,14 @@ pub trait StorageRead: Debug + Send + Sync {
     /// outside it. The binary-index disk cache spills fetched leaves,
     /// branches and dictionaries to a local directory as a read-through
     /// cache; a storage that decrypts on read must answer `false`, or that
-    /// cache becomes a plaintext copy of the ledger. Wrappers delegate to
-    /// what they wrap. The default (`true`) is for storages whose reads
-    /// return exactly the bytes at rest.
-    fn permits_plaintext_cache(&self) -> bool {
-        true
-    }
+    /// cache becomes a plaintext copy of the ledger. Storages whose reads
+    /// return exactly the bytes at rest answer `true`; wrappers delegate to
+    /// what they wrap.
+    ///
+    /// Deliberately without a default: a wrapper that forgot to delegate
+    /// would silently re-open the plaintext leak, so every implementation
+    /// has to answer.
+    fn permits_plaintext_cache(&self) -> bool;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
@@ -616,12 +618,10 @@ pub trait ContentStore: Debug + Send + Sync {
     }
 
     /// Whether bytes returned by [`Self::get`] may be persisted unencrypted
-    /// outside this store — see [`StorageRead::permits_plaintext_cache`].
-    /// The disk artifact cache consults this before writing a fetched
-    /// artifact to its directory.
-    fn permits_plaintext_cache(&self) -> bool {
-        true
-    }
+    /// outside this store — see [`StorageRead::permits_plaintext_cache`],
+    /// including why there is no default. The disk artifact cache consults
+    /// this before reading or writing an artifact in its directory.
+    fn permits_plaintext_cache(&self) -> bool;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///

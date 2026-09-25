@@ -936,6 +936,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl fluree_db_core::StorageRead for FailsToReadOne {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
         async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
             if address == self.address {
                 return Err(fluree_db_core::error::Error::storage("transient failure"));
