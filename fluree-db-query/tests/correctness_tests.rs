@@ -47,7 +47,8 @@ impl Operator for SingleBatchOp {
     fn close(&mut self) {}
 }
 
-/// Builder that always yields no matches, forcing OPTIONAL to emit Poisoned for optional-only vars.
+/// Builder that always yields no matches under Cypher null semantics, forcing
+/// OPTIONAL to emit Poisoned for optional-only vars.
 struct NoMatchOptionalBuilder {
     schema: Arc<[VarId]>,
     optional_only: Vec<VarId>,
@@ -82,6 +83,10 @@ impl OptionalBuilder for NoMatchOptionalBuilder {
 
     fn unify_instructions(&self) -> &[fluree_db_query::UnifyInstruction] {
         &[]
+    }
+
+    fn unmatched_optional(&self) -> fluree_db_query::UnmatchedOptional {
+        fluree_db_query::UnmatchedOptional::Poisoned
     }
 }
 

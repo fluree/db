@@ -22,7 +22,7 @@ use fluree_db_core::VerifiedIdentity;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_novelty::TxnMetaEntry;
 use fluree_db_query::parse::UnresolvedPattern;
-use fluree_db_query::{VarId, VarRegistry};
+use fluree_db_query::{UnmatchedOptional, VarId, VarRegistry};
 use fluree_db_sparql::ast::{GraphPattern as SparqlGraphPattern, Prologue as SparqlPrologue};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,11 @@ pub struct Txn {
 
     /// Optional inline VALUES bindings
     pub values: Option<InlineValues>,
+
+    /// What an unmatched OPTIONAL in the WHERE binds its optional-only
+    /// variables to. `Unbound` (SPARQL / JSON-LD) unless the transaction was
+    /// lowered from Cypher, whose nulls match nothing (`Poisoned`).
+    pub unmatched_optional: UnmatchedOptional,
 
     /// Optional default graph IRI(s) for JSON-LD update WHERE execution.
     ///
@@ -293,6 +298,7 @@ impl Txn {
             delete_templates: Vec::new(),
             insert_templates: Vec::new(),
             values: None,
+            unmatched_optional: UnmatchedOptional::Unbound,
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
             opts: TxnOpts::default(),

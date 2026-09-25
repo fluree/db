@@ -2801,6 +2801,7 @@ async fn stream_where_into_accumulator(
         &txn.vars,
         &query_patterns,
         Some(&runtime_dataset),
+        txn.unmatched_optional,
     )
     .await
     .map_err(TransactError::Query)?;

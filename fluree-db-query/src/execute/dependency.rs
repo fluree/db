@@ -174,6 +174,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         }
     }
 
@@ -192,6 +193,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         }
     }
 
@@ -335,6 +337,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
 
         let deps = compute_variable_deps(&query).unwrap();
@@ -362,6 +365,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         }
     }
 

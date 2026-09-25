@@ -211,6 +211,7 @@ impl<'a> CypherLowering<'a> {
             delete_templates: self.delete_templates,
             insert_templates: self.insert_templates,
             values: None,
+            unmatched_optional: fluree_db_query::UnmatchedOptional::Poisoned,
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
             opts: self.opts,

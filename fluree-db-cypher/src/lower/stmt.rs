@@ -1,7 +1,7 @@
 //! Statement-level read-path lowering.
 
 use fluree_db_core::{FlakeValue, Sid};
-use fluree_db_query::binding::Binding;
+use fluree_db_query::binding::{Binding, UnmatchedOptional};
 use fluree_db_query::ir::grouping::{AggregateFn, AggregateSpec, Grouping};
 use fluree_db_query::ir::{Pattern, Query, QueryOutput, SubqueryPattern};
 use fluree_db_query::parse::encode::IriEncoder;
@@ -53,6 +53,9 @@ pub fn lower_query<E: IriEncoder>(
         // System-fact filter ON — hides f:reifies* from untyped relationship matches.
         include_system_facts: false,
         cypher_vocab: None,
+        // Cypher null: a later pattern using a var an OPTIONAL MATCH left
+        // null matches nothing (SPARQL's unbound would match anything).
+        unmatched_optional: UnmatchedOptional::Poisoned,
     })
 }
 
@@ -146,6 +149,9 @@ fn lower_union_query<E: IriEncoder>(
         post_values: None,
         include_system_facts: false,
         cypher_vocab: None,
+        // Cypher null: a later pattern using a var an OPTIONAL MATCH left
+        // null matches nothing (SPARQL's unbound would match anything).
+        unmatched_optional: UnmatchedOptional::Poisoned,
     })
 }
 
