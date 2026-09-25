@@ -957,6 +957,8 @@ async fn preview_does_not_mutate_nameservice() {
 // 11. Source has no source_branch — same error as merge_branch
 // =============================================================================
 
+/// A branch with no branch point (main itself) has no target to infer,
+/// so previewing it without an explicit target is refused.
 #[tokio::test]
 async fn preview_main_as_source_refused() {
     let fluree = FlureeBuilder::memory().build_memory();

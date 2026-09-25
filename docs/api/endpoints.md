@@ -2456,7 +2456,9 @@ curl -X POST http://localhost:8090/v1/fluree/rebase \
 
 Merge a source branch into a target branch. Admin-protected.
 
-Fast-forward merges copy the source commit chain into the target namespace and advance the target HEAD. When the target has diverged, Fluree performs a general merge: it computes the source and target deltas since their common ancestor, resolves overlapping `(s, p, g)` conflicts according to the requested strategy, and creates a merge commit on the target branch.
+A merge fast-forwards when the target's HEAD is on the source's line of first parents: Fluree copies the source's commits the target lacks into the target namespace and advances the target HEAD. Otherwise it performs a general merge: it folds each side's commits since the two branches diverged, resolves keys both sides changed according to the requested strategy, and creates a merge commit on the target branch.
+
+Each branch numbers its commits from its own fork point, so the two sides are compared by commit identity rather than by `t`. Any branch can be the source, `main` included, as long as `target` names where the changes go.
 
 **URL:**
 ```

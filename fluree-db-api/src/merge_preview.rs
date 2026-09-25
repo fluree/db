@@ -5,10 +5,10 @@
 //! [`crate::Fluree::merge_branch`] but without mutating any nameservice or
 //! content-store state.
 //!
-//! The heavy lifting (per-commit summaries, DAG walking, common-ancestor
-//! discovery, delta-key computation) lives in `fluree-db-core` and
-//! `fluree-db-novelty`. This module orchestrates them: nameservice lookups,
-//! branched-store construction for source/target, and parallel walks.
+//! The heavy lifting (the branch diff, per-commit summaries, delta-key
+//! computation) lives in `fluree-db-core` and `fluree-db-novelty`. This
+//! module orchestrates them: nameservice lookups, branched-store
+//! construction for source/target, and parallel walks.
 
 use crate::error::{ApiError, Result};
 use crate::format::iri::IriCompactor;
@@ -16,11 +16,12 @@ use crate::graph_commit_builder::resolve_flake;
 use crate::rebase::{current_asserted_for_key, ConflictStrategy};
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{
-    find_common_ancestor, walk_commit_summaries, BranchedContentStore, CommitSummary, ConflictKey,
-    ContentId, ContentStore, Flake,
+    commit_to_summary, diff_branches, load_commit_by_id, load_commit_envelope_by_id,
+    walk_commit_summaries, BranchedContentStore, CommitSummary, ConflictKey, ContentId,
+    ContentStore, Flake,
 };
 use fluree_db_ledger::LedgerState;
-use fluree_db_novelty::{compute_delta_keys, compute_delta_keys_and_changes};
+use fluree_db_novelty::{compute_delta_keys_and_changes, delta_keys_and_changes_of, delta_keys_of};
 use futures::{stream, StreamExt, TryStreamExt};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
@@ -52,26 +53,26 @@ pub const DEFAULT_MAX_CHANGES: usize = 500;
 /// lists**, not the cost of computing them:
 ///
 /// - The `BranchDelta::count` on each side is the full unbounded divergence,
-///   computed by walking every commit envelope between HEAD and the common
-///   ancestor. A 1M-commit divergence costs 1M envelope reads regardless of
-///   the cap.
+///   computed by walking every commit envelope down to the commit the other
+///   side holds. A 1M-commit divergence costs 1M envelope reads regardless
+///   of the cap.
 /// - The `ConflictSummary::count` is the full intersection size; both
-///   `compute_delta_keys` walks scan every flake on each side since the
-///   ancestor. Pass [`include_conflicts: false`](Self::include_conflicts) to
-///   skip them entirely when only counts are needed.
+///   delta-key walks scan every flake on each side since the divergence.
+///   Pass [`include_conflicts: false`](Self::include_conflicts) to skip them
+///   entirely when only counts are needed.
 ///
 /// To bound the *I/O cost* of the walk itself, callers must pre-check the
-/// divergence (e.g., refuse before invoking when `target.t - ancestor.t`
-/// exceeds some threshold) or use `include_conflicts: false`.
+/// divergence (for example, refuse before invoking when either side is more
+/// than some number of commits ahead) or use `include_conflicts: false`.
 #[derive(Clone, Debug)]
 pub struct MergePreviewOpts {
     /// Per side. `Some(n)` caps the returned list at `n`; `None` is
     /// unbounded. **Does not bound the divergence walk** — see type docs.
     pub max_commits: Option<usize>,
     /// Cap on `conflicts.keys`. `None` is unbounded. **Does not bound the
-    /// `compute_delta_keys` walks** — see type docs.
+    /// delta-key walks** — see type docs.
     pub max_conflict_keys: Option<usize>,
-    /// When `false`, skips the two `compute_delta_keys` walks — the response
+    /// When `false`, skips the two delta-key walks — the response
     /// still contains commit counts but `conflicts` will be empty. The
     /// fastest way to bound preview cost on diverged branches.
     pub include_conflicts: bool,
@@ -386,14 +387,19 @@ impl crate::Fluree {
             .await?
             .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
 
-        let source_parent = source_record.source_branch.as_deref().ok_or_else(|| {
-            ApiError::InvalidBranch(format!(
-                "Branch {source_branch} has no source branch; \
-                 only branches created from another branch can be previewed"
-            ))
-        })?;
-
-        let resolved_target = target_branch.unwrap_or(source_parent);
+        // Resolve target: explicit, or the branch the source was created
+        // from. Only the second needs the source to have a parent. Mirrors
+        // `prepare_merge`.
+        let resolved_target = match target_branch {
+            Some(target) => target.to_string(),
+            None => source_record.source_branch.clone().ok_or_else(|| {
+                ApiError::InvalidBranch(format!(
+                    "Branch {source_branch} has no source branch; \
+                         name the branch to preview a merge into with an explicit target"
+                ))
+            })?,
+        };
+        let resolved_target = resolved_target.as_str();
         if source_branch == resolved_target {
             return Err(ApiError::InvalidBranch(
                 "Cannot merge a branch into itself".to_string(),
@@ -408,77 +414,71 @@ impl crate::Fluree {
             .ok_or_else(|| ApiError::NotFound(target_id.clone()))?;
 
         // ---- Build branched stores. ---------------------------------------
-        // Source is always a branch by definition (we required source_branch above).
-        let source_store = LedgerState::build_branched_store(
-            &self.nameservice_mode,
-            &source_record,
-            self.backend(),
-        )
-        .await?;
-
-        // Target may or may not be a branch — same logic as merge.rs:296-308.
-        // We always wrap as a `BranchedContentStore` (using `leaf` for the
-        // non-branch case) so the union store below can chain it as a parent.
-        let target_branched: BranchedContentStore = if target_record.source_branch.is_some() {
-            LedgerState::build_branched_store(
-                &self.nameservice_mode,
-                &target_record,
-                self.backend(),
-            )
-            .await?
-        } else {
-            BranchedContentStore::leaf(self.content_store(&target_id))
-        };
+        // Either side may be a root branch, which has only its own
+        // namespace. The union store below chains both.
+        let source_store = self.branch_store(&source_record, &source_id).await?;
+        let target_branched = self.branch_store(&target_record, &target_id).await?;
 
         let source_head = source_record.commit_head_id.clone();
         let target_head = target_record.commit_head_id.clone();
 
-        // ---- Find common ancestor. ----------------------------------------
-        // The ancestor walk needs to load both `source_head` and `target_head`,
-        // which may live in disjoint branch namespaces (e.g., two sibling
-        // branches off `main`). We construct a union view that fans out to
-        // both branched stores' ancestry so either head's envelope resolves.
-        let ancestor = match (&source_head, &target_head) {
-            (Some(s), Some(t)) => {
-                let union_store = BranchedContentStore::with_parents(
-                    Arc::new(source_store.clone()) as Arc<dyn ContentStore>,
-                    vec![target_branched.clone()],
-                );
-                Some(find_common_ancestor(&union_store, s, t).await?)
-            }
+        // ---- Diff the branches. -------------------------------------------
+        // What each side changed since they last shared a commit, by commit
+        // identity. The walk reads both heads, which live in disjoint branch
+        // namespaces, so it runs over a union of the two stores. This is the
+        // same call `prepare_merge` makes, so a preview and the merge it
+        // previews see the same divergence.
+        let union_store = BranchedContentStore::with_parents(
+            Arc::new(source_store.clone()) as Arc<dyn ContentStore>,
+            vec![target_branched.clone()],
+        );
+        let diff = match (&source_head, &target_head) {
+            (Some(s), Some(t)) => Some(diff_branches(&union_store, s, t).await?),
             _ => None,
         };
 
-        // ---- Fast-forward predicate (mirrors merge.rs:135-139). -----------
-        let fast_forward = match (&ancestor, &target_head) {
-            (Some(a), Some(tid)) => a.commit_id == *tid,
+        // The commit both branches last shared, for the response. It can sit
+        // on either branch's line, so it is read through the union.
+        let ancestor = match &diff {
+            Some(diff) => Some(AncestorRef {
+                t: load_commit_envelope_by_id(&union_store, &diff.base)
+                    .await?
+                    .t,
+                commit_id: diff.base.clone(),
+            }),
+            None => None,
+        };
+
+        // ---- Fast-forward predicate (mirrors `prepare_merge`). ------------
+        let fast_forward = match (&diff, &target_head) {
+            (Some(diff), Some(_)) => diff.fast_forward,
             (None, None) => true,
             _ => false,
         };
-
-        let stop_at_t = ancestor.as_ref().map_or(0, |a| a.t);
 
         // ---- Walk both sides in parallel. ---------------------------------
         // `opts.max_commits == None` is a deliberate "unbounded" signal — we
         // pass it through verbatim. The HTTP layer always supplies a bound to
         // protect against unbounded responses; direct Rust callers can opt in.
         let ahead_fut = async {
-            match &source_head {
-                Some(head) => {
-                    walk_commit_summaries(&source_store, head, stop_at_t, opts.max_commits)
+            match (&diff, &source_head) {
+                (Some(diff), _) => {
+                    summarize(&source_store, &diff.source.commits, opts.max_commits).await
+                }
+                // No target head: every source commit is ahead.
+                (None, Some(head)) => {
+                    walk_commit_summaries(&source_store, head, 0, opts.max_commits)
                         .await
                         .map_err(ApiError::from)
                 }
-                None => Ok((Vec::new(), 0)),
+                (None, None) => Ok((Vec::new(), 0)),
             }
         };
 
         let behind_fut = async {
-            match &target_head {
-                Some(head) => {
-                    walk_commit_summaries(&target_branched, head, stop_at_t, opts.max_commits)
-                        .await
-                        .map_err(ApiError::from)
+            match &diff {
+                Some(diff) => {
+                    summarize(&target_branched, &diff.target.commits, opts.max_commits).await
                 }
                 None => Ok((Vec::new(), 0)),
             }
@@ -504,36 +504,43 @@ impl crate::Fluree {
         // both. Conflicts are only possible on non-fast-forward merges;
         // changes are meaningful regardless (fast-forward is the common
         // merge-request review case).
-        let need_conflicts = opts.include_conflicts
-            && !fast_forward
-            && source_head.is_some()
-            && target_head.is_some()
-            && ancestor.is_some();
+        let need_conflicts = opts.include_conflicts && !fast_forward && diff.is_some();
         let need_changes = opts.include_changes;
         // Validation stages the resolved change set on the target, so it
         // needs the netted source delta too. A fast-forward adopts commits
         // already validated when they were authored, so it is skipped.
-        let need_validation = opts.include_validation
-            && !fast_forward
-            && source_head.is_some()
-            && target_head.is_some()
-            && ancestor.is_some();
+        let need_validation = opts.include_validation && !fast_forward && diff.is_some();
 
+        // The change set folds every commit on the source's line, because a
+        // merge the source made carries how it resolved that merge. Conflict
+        // keys come from the source's own changes only.
         let source_fut = async {
-            match &source_head {
-                Some(s_head) if need_changes || need_validation => {
-                    let (keys, net, ns_delta) = compute_delta_keys_and_changes(
-                        source_store.clone(),
-                        s_head.clone(),
-                        stop_at_t,
-                    )
-                    .await?;
-                    Ok::<_, ApiError>((Some(keys), Some(net), Some(ns_delta)))
+            match (&diff, &source_head) {
+                (Some(diff), _) => {
+                    let (_, net, ns_delta) = if need_changes || need_validation {
+                        delta_keys_and_changes_of(&source_store, &diff.source.commits, true).await?
+                    } else {
+                        Default::default()
+                    };
+                    let keys = if need_conflicts || need_validation {
+                        Some(delta_keys_of(&source_store, &diff.source.own).await?)
+                    } else {
+                        None
+                    };
+                    let has_changes = need_changes || need_validation;
+                    Ok::<_, ApiError>((
+                        keys,
+                        has_changes.then_some(net),
+                        has_changes.then_some(ns_delta),
+                    ))
                 }
-                Some(s_head) if need_conflicts => {
-                    let keys =
-                        compute_delta_keys(source_store.clone(), s_head.clone(), stop_at_t).await?;
-                    Ok((Some(keys), None, None))
+                // No target head: the change set is the source's whole
+                // history.
+                (None, Some(s_head)) if need_changes => {
+                    let (keys, net, ns_delta) =
+                        compute_delta_keys_and_changes(source_store.clone(), s_head.clone(), 0)
+                            .await?;
+                    Ok((Some(keys), Some(net), Some(ns_delta)))
                 }
                 _ => Ok((None, None, None)),
             }
@@ -542,10 +549,9 @@ impl crate::Fluree {
         // the target delta even when the caller asked for no conflict
         // reporting (`include_conflicts=false`).
         let target_fut = async {
-            match (&target_head, &ancestor) {
-                (Some(t_head), Some(anc)) if need_conflicts || need_validation => {
-                    let keys =
-                        compute_delta_keys(target_branched.clone(), t_head.clone(), anc.t).await?;
+            match &diff {
+                Some(diff) if need_conflicts || need_validation => {
+                    let keys = delta_keys_of(&target_branched, &diff.target.own).await?;
                     Ok::<_, ApiError>(Some(keys))
                 }
                 _ => Ok(None),
@@ -715,16 +721,13 @@ impl crate::Fluree {
             debug_assert_eq!(conflicts.count, 0);
         }
         if source_head.is_some() && target_head.is_some() {
-            debug_assert!(ancestor.is_some());
+            debug_assert!(diff.is_some());
         }
 
         Ok(MergePreview {
             source: source_branch.to_string(),
             target: resolved_target.to_string(),
-            ancestor: ancestor.map(|a| AncestorRef {
-                commit_id: a.commit_id,
-                t: a.t,
-            }),
+            ancestor,
             ahead,
             behind,
             fast_forward,
@@ -734,6 +737,21 @@ impl crate::Fluree {
             changes,
         })
     }
+}
+
+/// Commit summaries for `cids`, newest first, capped at `max`. The count is
+/// the whole set, whatever the cap.
+async fn summarize(
+    store: &impl ContentStore,
+    cids: &[ContentId],
+    max: Option<usize>,
+) -> Result<(Vec<CommitSummary>, usize)> {
+    let wanted = max.unwrap_or(cids.len()).min(cids.len());
+    let mut summaries = Vec::with_capacity(wanted);
+    for cid in cids.iter().rev().take(wanted) {
+        summaries.push(commit_to_summary(&load_commit_by_id(store, cid).await?));
+    }
+    Ok((summaries, cids.len()))
 }
 
 /// Group netted flakes by subject, order deterministically, and apply the

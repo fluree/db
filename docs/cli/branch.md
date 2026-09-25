@@ -201,7 +201,9 @@ fluree branch rebase <NAME> [OPTIONS]
 
 **Description:**
 
-Replays a branch's unique commits on top of the source branch's current HEAD. This brings the branch up to date with upstream changes. The `main` branch cannot be rebased.
+Replays a branch's unique commits on top of the source branch's current HEAD. This brings the branch up to date with upstream changes, and rewrites the branch's commits to do it. To keep the branch's commits as they are, merge the source into the branch instead. The `main` branch cannot be rebased.
+
+A branch that already merged its source in is rebased on its own commits only. The merge that brought the source in is left out, because its changes came from the source.
 
 If the branch has no unique commits, a fast-forward rebase is performed — the branch point is simply updated to the source's current HEAD.
 
@@ -258,7 +260,7 @@ fluree branch diff <SOURCE> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--target <BRANCH>` | Target branch to preview merging into (defaults to source's parent branch) |
+| `--target <BRANCH>` | Target branch to preview merging into (defaults to the branch the source was created from) |
 | `--max-commits <N>` | Cap on per-side commit summaries shown (default: 50; pass 0 for unbounded in local mode) |
 | `--max-conflict-keys <N>` | Cap on conflict keys shown (default: 50; pass 0 for unbounded in local mode) |
 | `--no-conflicts` | Skip conflict computation for a cheaper preview |
@@ -271,7 +273,7 @@ fluree branch diff <SOURCE> [OPTIONS]
 
 **Description:**
 
-`branch diff` reports ahead/behind commits, fast-forward eligibility, and conflicting `(subject, predicate, graph)` keys without mutating state. With `--conflict-details`, the preview also shows the source and target values for the returned conflict keys and annotates what the selected strategy would do.
+`branch diff` reports ahead/behind commits, fast-forward eligibility, and conflicting `(subject, predicate, graph)` keys without mutating state. It previews the same directions `branch merge` supports, so `fluree branch diff main --target dev` works. With `--conflict-details`, the preview also shows the source and target values for the returned conflict keys and annotates what the selected strategy would do.
 
 By default the preview also stages the merge's resolved change set on the target and validates it against the target's SHACL configuration and shapes, through the same code path `branch merge` uses. The `validation:` line reports `conforms` or the violation report the merge would fail with, and `mergeable:` is `yes` only when the strategy applies and the result conforms. A preview that says `mergeable: yes` therefore means neither the strategy nor the target's shapes will reject the merge. Other conditions still apply at commit time, novelty backpressure among them, so a ledger due for indexing can refuse a merge the preview passed. Fast-forward previews carry no validation line: the adopted commits were validated when they were authored. Pass `--no-validate` for a cheaper count-only preview.
 
@@ -312,15 +314,19 @@ fluree branch merge <SOURCE> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
-| `--target <BRANCH>` | Target branch to merge into (defaults to source's parent branch) |
+| `--target <BRANCH>` | Target branch to merge into (defaults to the branch the source was created from) |
 | `--strategy <STRATEGY>` | Conflict resolution strategy (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-branch`. |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
 
-Merges a source branch into a target branch. When the target hasn't advanced since the source branched, this is a fast-forward; otherwise `--strategy` controls how conflicting edits are resolved (mirroring `branch rebase`).
+Merges a source branch into a target branch. Any two branches of a ledger can be merged: a branch into the one it came from, a branch into one created from it, or two branches that share an earlier commit. `main` can be the source when `--target` names where to merge it.
 
-When `--target` is omitted, the merge target is inferred from the source branch's parent (the branch it was created from).
+When `--target` is omitted, the target is the branch the source was created from. Only then does the source need to have been created from another branch.
+
+The merge fast-forwards when the target's head is on the source's line of commits, which means the source continues where the target left off. The target then adopts the source's head. Otherwise the merge folds the source's changes into one commit on the target, and `--strategy` controls how conflicting edits are resolved (mirroring `branch rebase`).
+
+Each branch numbers its commits from its own fork point, so the two branches' `t` values cannot be compared. The merge finds what each side changed by commit identity instead. A branch that already merged the other in keeps that merge out of its own changes, because those changes came from the other side to begin with.
 
 After a successful merge, the source branch remains intact and can continue to receive new transactions and be merged again. Only the new commits since the last merge (or branch creation) are copied.
 
@@ -334,6 +340,9 @@ fluree branch merge dev
 
 # Merge feature-x into dev (explicit target)
 fluree branch merge feature-x --target dev
+
+# Bring main's latest into a branch, keeping the branch's history
+fluree branch merge main --target dev
 
 # Merge for a specific ledger
 fluree branch merge dev --ledger mydb
