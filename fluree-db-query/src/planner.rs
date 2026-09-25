@@ -1386,6 +1386,10 @@ fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool
 struct RankedPattern {
     orig_index: usize,
     pattern: Pattern,
+    /// Original indices of patterns this one must not be placed before — the
+    /// left-join ordering barrier (see [`left_join_order_barriers`]). Empty
+    /// unless an OPTIONAL in the group shares a not-yet-certain variable with it.
+    after_indices: Vec<usize>,
 }
 
 /// A deferred pattern (FILTER/BIND) with pre-computed input variables.
@@ -1657,6 +1661,94 @@ fn values_optional_barrier_indices(
     blockers
 }
 
+/// Which earlier patterns must each pattern stay behind, because a left join
+/// between them does not commute?
+///
+/// Inner joins commute; a left join does not. For an OPTIONAL `O` and another
+/// pattern `P` in the same group, with `A` the patterns written before the
+/// earlier of the two, reordering them is sound only when every variable they
+/// share is certainly bound by `A`:
+///
+/// - `P` after `O` hoisted above it: `LeftJoin(A, O) ⋈ P` becomes
+///   `LeftJoin(A ⋈ P, O)`. If `P` binds a variable only `O` would otherwise
+///   supply, the left join then matches against it and keeps every row it fails
+///   on — a fabricated binding (#1924).
+/// - `P` before `O` sunk below it: the same identity read the other way.
+/// - Two OPTIONALs: `LeftJoin(LeftJoin(A, O1), O2)` and the swapped form differ
+///   when both can bind a shared variable (#1925).
+///
+/// The result maps each original index to the earlier indices it must follow.
+/// Every edge points from a later index to an earlier one, so the constraints
+/// are acyclic and always satisfiable by the written order.
+///
+/// A variable certainly bound before the earlier pattern ([`must_bind_vars`])
+/// is exempt: the OPTIONAL only restricts it there, and restricting a required
+/// variable commutes. That is the well-designed case — every variable an
+/// OPTIONAL shares with the rest of its group is bound by a required pattern
+/// written before it — so such groups get no barrier and keep their plans.
+/// The first required binder of each such variable does get one (nothing binds
+/// the variable before it), which keeps it ahead of the OPTIONAL and so makes
+/// the exemption hold in the reordered plan too.
+///
+/// A FILTER is never the earlier side: it constrains the whole group wherever
+/// it is written, so an OPTIONAL after it must not be held behind it.
+fn left_join_order_barriers(
+    patterns: &[Pattern],
+    initial_bound_vars: &HashSet<VarId>,
+) -> Vec<Vec<usize>> {
+    let mut barriers: Vec<Vec<usize>> = vec![Vec::new(); patterns.len()];
+    if !patterns.iter().any(|p| matches!(p, Pattern::Optional(_))) {
+        return barriers;
+    }
+    let vars: Vec<HashSet<VarId>> = patterns
+        .iter()
+        .map(|p| p.referenced_vars().into_iter().collect())
+        .collect();
+    let mut certain_before: HashSet<VarId> = initial_bound_vars.clone();
+    for (i, earlier) in patterns.iter().enumerate() {
+        if !matches!(earlier, Pattern::Filter(_)) {
+            let earlier_is_optional = matches!(earlier, Pattern::Optional(_));
+            for (j, later) in patterns.iter().enumerate().skip(i + 1) {
+                if !earlier_is_optional && !matches!(later, Pattern::Optional(_)) {
+                    continue;
+                }
+                if vars[i]
+                    .intersection(&vars[j])
+                    .any(|v| !certain_before.contains(v))
+                {
+                    barriers[j].push(i);
+                }
+            }
+        }
+        certain_before.extend(must_bind_vars(earlier));
+    }
+    barriers
+}
+
+/// Move out the candidates whose ordering barrier is not yet satisfied, so the
+/// placement functions only see placeable patterns. Restore them with
+/// [`unpark`].
+fn park_blocked(list: &mut Vec<RankedPattern>, placed: &HashSet<usize>) -> Vec<RankedPattern> {
+    if list.iter().all(|rp| rp.after_indices.is_empty()) {
+        return Vec::new();
+    }
+    let (parked, ready): (Vec<_>, Vec<_>) = std::mem::take(list)
+        .into_iter()
+        .partition(|rp| !rp.after_indices.iter().all(|i| placed.contains(i)));
+    *list = ready;
+    parked
+}
+
+/// Return parked candidates, restoring original order so tie-breaks that
+/// depend on list position are unchanged.
+fn unpark(list: &mut Vec<RankedPattern>, parked: Vec<RankedPattern>) {
+    if parked.is_empty() {
+        return;
+    }
+    list.extend(parked);
+    list.sort_by_key(|rp| rp.orig_index);
+}
+
 /// Reorder all pattern types for optimal join order.
 ///
 /// Handles all pattern types including triples, compound patterns (UNION,
@@ -1738,6 +1830,8 @@ pub fn reorder_patterns(
             }
         }
     }
+
+    let barriers = left_join_order_barriers(patterns, initial_bound_vars);
 
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
@@ -1880,14 +1974,17 @@ pub fn reorder_patterns(
             PatternEstimate::Source { .. } => sources.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
+                after_indices: barriers[i].clone(),
             }),
             PatternEstimate::Reducer { .. } => reducers.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
+                after_indices: barriers[i].clone(),
             }),
             PatternEstimate::Expander { .. } => expanders.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
+                after_indices: barriers[i].clone(),
             }),
             PatternEstimate::Deferred => {
                 let mut required_vars: HashSet<VarId> =
@@ -1935,6 +2032,14 @@ pub fn reorder_patterns(
         }
     }
 
+    for dp in &mut deferred {
+        for &b in &barriers[dp.orig_index] {
+            if !dp.after_indices.contains(&b) {
+                dp.after_indices.push(b);
+            }
+        }
+    }
+
     let mut result: Vec<Pattern> = Vec::with_capacity(patterns.len());
     // Original indices already emitted into `result`, for the positional
     // `after_indices` barrier (see [`DeferredPattern::after_indices`]).
@@ -1951,6 +2056,9 @@ pub fn reorder_patterns(
 
     // Greedy loop: place patterns by priority
     while !sources.is_empty() || !reducers.is_empty() || !expanders.is_empty() {
+        let parked_sources = park_blocked(&mut sources, &placed_indices);
+        let parked_reducers = park_blocked(&mut reducers, &placed_indices);
+        let parked_expanders = park_blocked(&mut expanders, &placed_indices);
         let placed = try_place_reducer(
             &mut reducers,
             &mut bound_vars,
@@ -1973,10 +2081,39 @@ pub fn reorder_patterns(
             &mut placed_indices,
         );
 
+        let barrier_bound = !(parked_sources.is_empty()
+            && parked_reducers.is_empty()
+            && parked_expanders.is_empty());
+        unpark(&mut sources, parked_sources);
+        unpark(&mut reducers, parked_reducers);
+        unpark(&mut expanders, parked_expanders);
+
         if !placed {
-            // Nothing could be placed (shouldn't happen with sources always eligible).
-            // Force-place the first remaining pattern.
-            let rp = if !sources.is_empty() {
+            // Nothing eligible could be placed — e.g. an uncorrelated OPTIONAL
+            // that a later OPTIONAL is held behind. Force-place the first
+            // remaining pattern; under a left-join barrier, the earliest
+            // unblocked one in written order, so the barrier still holds.
+            let rp = if barrier_bound {
+                let ready = |rp: &RankedPattern| {
+                    rp.after_indices.iter().all(|i| placed_indices.contains(i))
+                };
+                let pick = [&sources, &reducers, &expanders]
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(li, list)| {
+                        list.iter()
+                            .enumerate()
+                            .filter(|(_, rp)| ready(rp))
+                            .map(move |(idx, rp)| (rp.orig_index, li, idx))
+                    })
+                    .min();
+                match pick {
+                    Some((_, 0, idx)) => sources.remove(idx),
+                    Some((_, 1, idx)) => reducers.remove(idx),
+                    Some((_, _, idx)) => expanders.remove(idx),
+                    None => break,
+                }
+            } else if !sources.is_empty() {
                 sources.remove(0)
             } else if !reducers.is_empty() {
                 reducers.remove(0)
@@ -2719,6 +2856,82 @@ mod tests {
         TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p_name)), Term::Var(o))
     }
 
+    fn triple(s: VarId, p_name: &str, o: VarId) -> Pattern {
+        Pattern::Triple(make_pattern(s, p_name, o))
+    }
+
+    fn optional(s: VarId, p_name: &str, o: VarId) -> Pattern {
+        Pattern::Optional(vec![triple(s, p_name, o)])
+    }
+
+    /// Well-designed: every variable the OPTIONAL shares with its group is
+    /// bound by a required pattern written before it. No barrier fires beyond
+    /// the first binder of `?s`, so the trailing `?s r ?y` may still be hoisted
+    /// into the star ahead of the OPTIONAL and the plan is unchanged.
+    #[test]
+    fn left_join_barrier_leaves_well_designed_groups_free() {
+        let (s, o, x, y) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let patterns = vec![triple(s, "p", o), optional(s, "q", x), triple(s, "r", y)];
+        let barriers = left_join_order_barriers(&patterns, &HashSet::new());
+        assert_eq!(barriers, vec![vec![], vec![0], vec![]]);
+
+        let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+        let optional_at = reordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Optional(_)))
+            .expect("optional placed");
+        assert_eq!(
+            optional_at, 2,
+            "both triples join ahead of the OPTIONAL: {reordered:?}"
+        );
+    }
+
+    /// #1924: the triple after the OPTIONAL shares `?org`, which nothing before
+    /// the OPTIONAL binds, so it is held behind it.
+    #[test]
+    fn left_join_barrier_holds_triple_sharing_an_optional_var() {
+        let (p, f, org, y) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let patterns = vec![
+            triple(p, "knows", f),
+            optional(p, "worksFor", org),
+            triple(y, "worksFor", org),
+        ];
+        let barriers = left_join_order_barriers(&patterns, &HashSet::new());
+        assert_eq!(barriers, vec![vec![], vec![0], vec![1]]);
+    }
+
+    /// #1925: two OPTIONALs sharing `?f` keep their written order, even though
+    /// the first shares nothing with the required pattern.
+    #[test]
+    fn left_join_barrier_orders_optionals_sharing_a_var() {
+        let (s, n, f, k) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let patterns = vec![
+            triple(s, "name", n),
+            optional(k, "g", f),
+            optional(s, "fr", f),
+        ];
+        let barriers = left_join_order_barriers(&patterns, &HashSet::new());
+        assert_eq!(barriers, vec![vec![], vec![], vec![0, 1]]);
+
+        let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert_eq!(
+            format!("{reordered:?}"),
+            format!("{patterns:?}"),
+            "written order is the only sound order"
+        );
+    }
+
+    /// Groups with no OPTIONAL pay nothing.
+    #[test]
+    fn left_join_barrier_is_empty_without_optionals() {
+        let (s, o, y) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![triple(s, "p", o), triple(y, "r", o)];
+        assert_eq!(
+            left_join_order_barriers(&patterns, &HashSet::new()),
+            vec![Vec::<usize>::new(); 2]
+        );
+    }
+
     #[test]
     fn scalar_pipeline_consumers_wait_for_all_inputs() {
         use crate::ir::{AggregateFn, AggregateSpec, Aggregation, Expression, InputSemantics};
@@ -3123,14 +3336,17 @@ mod tests {
             RankedPattern {
                 orig_index: 0,
                 pattern: Pattern::Triple(make_pattern(product, "vendor", vendor)),
+                after_indices: Vec::new(),
             },
             RankedPattern {
                 orig_index: 1,
                 pattern: Pattern::Triple(make_pattern(product, "numeric", numeric)),
+                after_indices: Vec::new(),
             },
             RankedPattern {
                 orig_index: 2,
                 pattern: Pattern::Triple(make_pattern(VarId(3), "reviewer", vendor)),
+                after_indices: Vec::new(),
             },
         ];
         let bound = HashSet::from([product]);
@@ -4928,7 +5144,12 @@ mod tests {
 
     #[test]
     fn test_reorder_expander_after_sources() {
-        // OPTIONAL should be placed after all sources and reducers
+        // OPTIONAL should be placed after all sources and reducers. A required
+        // triple binds ?s ahead of it, so the OPTIONAL only restricts ?s and the
+        // later triple may join ahead of it. (An OPTIONAL written FIRST is a
+        // different query — `LeftJoin({}, O)` — and must stay first; see
+        // `leading_optional_is_joined_not_left_joined` in
+        // fluree-db-api/tests/it_optional_after_union.rs.)
         let s = VarId(0);
         let o1 = VarId(1);
         let o2 = VarId(2);
@@ -4938,7 +5159,7 @@ mod tests {
         let triple2 = Pattern::Triple(make_pattern(s, "age", o2));
         let optional = Pattern::Optional(vec![Pattern::Triple(make_pattern(s, "email", o3))]);
 
-        let patterns = vec![optional.clone(), triple1.clone(), triple2.clone()];
+        let patterns = vec![triple1.clone(), optional.clone(), triple2.clone()];
 
         let reordered = reorder_patterns(&patterns, None, &HashSet::new());
 
