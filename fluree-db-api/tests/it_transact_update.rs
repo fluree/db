@@ -3151,3 +3151,35 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
         "the anonymous existential must match every subject in the named graph"
     );
 }
+
+/// An update whose WHERE matches nothing succeeds without a commit on the
+/// tracked path, as it does on the plain one. The tracked path (also the
+/// path every policy-carrying builder write takes) used to commit the empty
+/// stage and fail with "Empty transaction" as a 500.
+#[tokio::test]
+async fn tracked_update_matching_nothing_is_a_noop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/tracked-noop-update:main";
+    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    let seeded = fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:p": "x"}),
+        )
+        .await
+        .expect("seed");
+    let seeded_t = seeded.receipt.t;
+
+    let update = json!({
+        "ledger": ledger_id,
+        "@context": {"ex": "http://example.org/"},
+        "where": {"@id": "?s", "ex:absent": "?o"},
+        "delete": {"@id": "?s", "ex:absent": "?o"}
+    });
+    let (result, _tally) = fluree
+        .update_with_ledger_tracked(&update)
+        .await
+        .expect("a no-match update must succeed on the tracked path");
+    assert_eq!(result.receipt.t, seeded_t, "no commit may be written");
+    assert_eq!(result.receipt.flake_count, 0);
+}

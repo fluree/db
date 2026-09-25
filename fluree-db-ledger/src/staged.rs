@@ -283,6 +283,15 @@ impl StagedLedger {
         &self.staged.store.flakes
     }
 
+    /// Each staged flake with the ledger graph id staging routed it to.
+    pub fn staged_flakes_by_graph(&self) -> impl Iterator<Item = (GraphId, &Flake)> {
+        self.staged
+            .flake_graph_ids
+            .iter()
+            .copied()
+            .zip(&self.staged.store.flakes)
+    }
+
     /// Get a reference to the underlying database
     pub fn db(&self) -> &fluree_db_core::LedgerSnapshot {
         &self.base.snapshot

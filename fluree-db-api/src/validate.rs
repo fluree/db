@@ -518,16 +518,7 @@ async fn validate_view_inner(
             // `sh:class` value-sets living alongside M's shapes: probe M's
             // shapes graph after a local membership miss, translating D-term
             // Sids through the snapshot namespace map.
-            cross_membership = Some(fluree_db_shacl::CrossLedgerMembership {
-                model_db: GraphDbRef::new(
-                    &model.model_db.snapshot,
-                    model.model_g_id,
-                    model.model_db.overlay.as_ref(),
-                    model.model_db.t,
-                ),
-                data_ns_map: snapshot.namespaces(),
-                same_term_space: false,
-            });
+            cross_membership = Some(model.membership(snapshot.namespaces()));
         } else {
             let shapes_g_ids = crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot)?;
             for g_id in &shapes_g_ids {

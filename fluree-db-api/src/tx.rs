@@ -13,8 +13,7 @@ use crate::{TrackedErrorResponse, Tracker, TrackingOptions, TrackingTally};
 use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{
-    range_with_overlay, ContentId, ContentKind, FlakeValue, GraphId, IndexType, RangeMatch,
-    RangeOptions, RangeTest, Sid,
+    range_with_overlay, FlakeValue, GraphId, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
 };
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_novelty::TxnMetaEntry;
@@ -600,19 +599,15 @@ fn build_per_graph_shacl_policy(
 /// All fields are optional: callers without full transaction context (Turtle
 /// insert, commit replay) pass `None` and get sensible default behavior:
 /// - no `graph_delta` → ledger-wide config only (no per-graph overrides)
-/// - no `graph_sids`  → flakes validated against the default graph (g_id=0)
 /// - no `tracker`     → SHACL range scans are not fuel-accounted
+///
+/// Each staged flake is validated in the graph the view routed it to.
 #[cfg(feature = "shacl")]
 pub(crate) struct StagedShaclContext<'a> {
     /// Per-`GraphId` IRI map from the transaction. Used only for resolving
     /// per-graph SHACL config overlays. Pass `None` when txn graph metadata
     /// is unavailable (Turtle insert, commit replay).
     pub graph_delta: Option<&'a FxHashMap<u16, String>>,
-
-    /// `GraphId → Sid` mapping used by [`validate_view_with_shacl`] to route
-    /// each staged flake to the correct per-graph validator. Pass `None` to
-    /// fall back to default-graph validation (see `validate_staged_nodes`).
-    pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
 
     /// Optional tracker for SHACL fuel accounting during validation.
     pub tracker: Option<&'a fluree_db_core::Tracker>,
@@ -773,12 +768,44 @@ pub(crate) struct CrossLedgerShapesModel {
 
 #[cfg(feature = "shacl")]
 impl CrossLedgerShapesModel {
+    /// Handle for `sh:class` value-set probes against this model's shapes
+    /// graph after a local membership miss. `data_ns_map` maps the data
+    /// ledger's namespace codes to prefixes, which translates a data-side Sid
+    /// into the model's term space.
+    pub(crate) fn membership<'a>(
+        &'a self,
+        data_ns_map: &'a HashMap<u16, String>,
+    ) -> fluree_db_shacl::CrossLedgerMembership<'a> {
+        fluree_db_shacl::CrossLedgerMembership {
+            model_db: fluree_db_core::GraphDbRef::new(
+                &self.model_db.snapshot,
+                self.model_g_id,
+                self.model_db.overlay.as_ref(),
+                self.model_db.t,
+            ),
+            data_ns_map,
+            same_term_space: false,
+        }
+    }
+
     pub(crate) fn wire(&self) -> Option<&crate::cross_ledger::ShapesArtifactWire> {
         match &self.resolved.artifact {
             crate::cross_ledger::GovernanceArtifact::Shapes(wire) => Some(wire),
             _ => None,
         }
     }
+}
+
+/// Namespace code → IRI prefix for every code `ns_registry` knows, including
+/// codes the transaction allocated — which the staged base snapshot alone
+/// cannot decode.
+#[cfg(feature = "shacl")]
+pub(crate) fn namespace_prefix_map(ns_registry: &NamespaceRegistry) -> HashMap<u16, String> {
+    ns_registry
+        .all_codes()
+        .into_iter()
+        .filter_map(|code| ns_registry.get_prefix(code).map(|p| (code, p.to_string())))
+        .collect()
 }
 
 /// Resolve a cross-ledger `f:shapesSource` (if the config carries one) and
@@ -1306,7 +1333,6 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         view,
         shacl_cache,
         hierarchy_for_validation,
-        ctx.graph_sids,
         ctx.tracker,
         per_graph_policy.as_ref(),
         &membership_g_ids,
@@ -1502,9 +1528,7 @@ async fn stage_with_config_shacl(
         resolve_cross_ledger_schema_for_tx(&ledger, config.as_ref(), resolve_ctx).await?;
 
     // The staged delta, not the Txn's: it includes graphs `GRAPH ?g` templates
-    // resolved to. It drives per-graph config lookup and the graph_sids rebuild
-    // below (IRIs are already interned in ns_registry, so sid_for_iri hits the
-    // trie cache — no new allocations).
+    // resolved to, and drives per-graph config lookup.
     let (mut view, mut ns_registry, graph_delta) =
         stage_txn(ledger, txn, ns_registry, options).await?;
 
@@ -1523,11 +1547,6 @@ async fn stage_with_config_shacl(
         None
     };
 
-    let graph_sids: HashMap<GraphId, Sid> = graph_delta
-        .iter()
-        .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
-        .collect();
-
     // Cross-ledger `sh:class` value-sets: when f:shapesSource is cross-ledger,
     // the opened model handle exposes a GraphDbRef into its value-set graph
     // (the shapes-source graph, where the controlled vocabulary lives
@@ -1535,38 +1554,18 @@ async fn stage_with_config_shacl(
     // demand — memoized — after a local membership miss. The owned handle and
     // D's namespace map (for term translation) are held across the validation
     // await below.
-    //
-    // D's namespace codes → IRI prefixes (base + this transaction's staged
-    // allocations). Needed to decode a staged value Sid to its IRI before
-    // re-encoding against M — the staged base snapshot alone can't decode a
-    // namespace introduced this transaction.
-    let cross_ledger_data_ns_map: Option<HashMap<u16, String>> =
-        cross_ledger_shapes.as_ref().map(|_| {
-            ns_registry
-                .all_codes()
-                .into_iter()
-                .filter_map(|code| ns_registry.get_prefix(code).map(|p| (code, p.to_string())))
-                .collect()
-        });
-    let cross_ledger_membership = match (&cross_ledger_shapes, &cross_ledger_data_ns_map) {
-        (Some(model), Some(ns_map)) => Some(fluree_db_shacl::CrossLedgerMembership {
-            model_db: fluree_db_core::GraphDbRef::new(
-                &model.model_db.snapshot,
-                model.model_g_id,
-                model.model_db.overlay.as_ref(),
-                model.model_db.t,
-            ),
-            data_ns_map: ns_map,
-            same_term_space: false,
-        }),
-        _ => None,
-    };
+    let cross_ledger_data_ns_map = cross_ledger_shapes
+        .as_ref()
+        .map(|_| namespace_prefix_map(&ns_registry));
+    let cross_ledger_membership = cross_ledger_shapes
+        .as_ref()
+        .zip(cross_ledger_data_ns_map.as_ref())
+        .map(|(model, ns_map)| model.membership(ns_map));
 
     let validated = apply_shacl_policy_to_staged_view(
         &mut view,
         StagedShaclContext {
             graph_delta: Some(&graph_delta),
-            graph_sids: Some(&graph_sids),
             tracker,
             cross_ledger_shapes: cross_ledger_shapes.as_ref().and_then(|m| m.wire()),
             staged_ns: Some(&ns_registry),
@@ -1607,15 +1606,12 @@ async fn enforce_unique_after_staging(
     staged_ns: &NamespaceRegistry,
 ) -> std::result::Result<bool, fluree_db_transact::TransactError> {
     let config = load_transaction_config(view.base()).await;
-    let graph_ids = graph_ids_by_sid(view, graph_delta, staged_ns);
 
     // Start with config-resolved per-graph SIDs (same/cross ledger).
     // No config → empty; inline properties below can still drive
     // enforcement when set.
     let mut per_graph_unique: HashMap<GraphId, FxHashSet<Sid>> = match &config {
-        Some(cfg) => {
-            resolve_per_graph_unique_sids(view, cfg, graph_delta, &graph_ids, resolve_ctx).await?
-        }
+        Some(cfg) => resolve_per_graph_unique_sids(view, cfg, graph_delta, resolve_ctx).await?,
         None => HashMap::new(),
     };
 
@@ -1656,7 +1652,7 @@ async fn enforce_unique_after_staging(
             )));
         }
         if !inline_sids.is_empty() {
-            for g_id in affected_graph_ids(view, &graph_ids) {
+            for g_id in affected_graph_ids(view) {
                 per_graph_unique
                     .entry(g_id)
                     .or_default()
@@ -1668,46 +1664,18 @@ async fn enforce_unique_after_staging(
     if per_graph_unique.is_empty() {
         return Ok(false);
     }
-    enforce_unique_constraints(view, &per_graph_unique, graph_delta, &graph_ids).await?;
+    enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
     Ok(true)
-}
-
-/// Ledger graph id of each named graph a staged flake can sit in, by graph
-/// Sid: the graphs the transaction writes (`graph_delta`, keyed by ledger
-/// graph id) and every registered graph. Sids come from the staged namespace
-/// registry, which also knows namespaces the transaction introduced.
-fn graph_ids_by_sid(
-    view: &StagedLedger,
-    graph_delta: &FxHashMap<u16, String>,
-    staged_ns: &NamespaceRegistry,
-) -> HashMap<Sid, GraphId> {
-    graph_delta
-        .iter()
-        .map(|(&g_id, iri)| (g_id, iri.as_str()))
-        .chain(view.db().graph_registry.iter_entries())
-        .filter_map(|(g_id, iri)| Some((staged_ns.lookup_sid_for_iri(iri)?, g_id)))
-        .collect()
-}
-
-fn flake_graph_id(flake: &fluree_db_core::Flake, graph_ids: &HashMap<Sid, GraphId>) -> GraphId {
-    match &flake.g {
-        None => 0,
-        Some(g_sid) => graph_ids.get(g_sid).copied().unwrap_or(0),
-    }
 }
 
 /// Derive the set of graph IDs touched by staged flakes. Used by
 /// both the config-resolved constraints path and the inline
 /// `opts.uniqueProperties` path so they enforce against the same
 /// set of graphs.
-fn affected_graph_ids(
-    view: &StagedLedger,
-    graph_ids: &HashMap<Sid, GraphId>,
-) -> FxHashSet<GraphId> {
-    view.staged_flakes()
-        .iter()
-        .filter(|flake| flake.op)
-        .map(|flake| flake_graph_id(flake, graph_ids))
+fn affected_graph_ids(view: &StagedLedger) -> FxHashSet<GraphId> {
+    view.staged_flakes_by_graph()
+        .filter(|(_, flake)| flake.op)
+        .map(|(g_id, _)| g_id)
         .collect()
 }
 
@@ -1722,11 +1690,10 @@ async fn resolve_per_graph_unique_sids(
     view: &StagedLedger,
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
-    graph_ids: &HashMap<Sid, GraphId>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<HashMap<GraphId, FxHashSet<Sid>>, fluree_db_transact::TransactError> {
     let snapshot = view.db();
-    let affected_g_ids = affected_graph_ids(view, graph_ids);
+    let affected_g_ids = affected_graph_ids(view);
     let mut per_graph: HashMap<GraphId, FxHashSet<Sid>> = HashMap::new();
 
     for &g_id in &affected_g_ids {
@@ -1938,7 +1905,6 @@ async fn enforce_unique_constraints(
     view: &StagedLedger,
     per_graph_unique: &HashMap<GraphId, FxHashSet<Sid>>,
     graph_delta: &FxHashMap<u16, String>,
-    graph_ids: &HashMap<Sid, GraphId>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     // Fast path: nothing configured
     if per_graph_unique.is_empty() {
@@ -1951,11 +1917,10 @@ async fn enforce_unique_constraints(
     // Uniqueness ignores datatype and language tag — the key is the storage-layer
     // value identity (FlakeValue), not the RDF datatype IRI.
     let mut keys_to_check: FxHashSet<(GraphId, Sid, FlakeValue)> = FxHashSet::default();
-    for flake in view.staged_flakes() {
+    for (g_id, flake) in view.staged_flakes_by_graph() {
         if !flake.op {
             continue;
         }
-        let g_id = flake_graph_id(flake, graph_ids);
         if let Some(unique_set) = per_graph_unique.get(&g_id) {
             if unique_set.contains(&flake.p) {
                 keys_to_check.insert((g_id, flake.p.clone(), flake.o.clone()));
@@ -2138,6 +2103,24 @@ pub struct StageResult {
     /// flakes is a legitimate no-change outcome, so the commit paths skip
     /// the commit for it exactly like a no-op update/upsert.
     pub sync_graph: Option<String>,
+}
+
+impl StageResult {
+    /// Committing this stage would change nothing, so the commit is skipped:
+    /// an update, upsert or sync that staged no flakes and registers no new
+    /// graph. A registration-only stage (SPARQL `CREATE GRAPH`) still
+    /// commits so the registration persists. An insert that staged nothing
+    /// reaches the commit, which reports it as empty.
+    pub(crate) fn is_noop(&self, txn_type: TxnType) -> bool {
+        !self.view.has_staged()
+            && !self
+                .view
+                .base()
+                .snapshot
+                .graph_registry
+                .has_unregistered(self.graph_delta.values().map(String::as_str))
+            && (matches!(txn_type, TxnType::Update | TxnType::Upsert) || self.sync_graph.is_some())
+    }
 }
 
 /// What a staging read and wrote, in the terms a re-base needs.
@@ -3236,32 +3219,52 @@ impl crate::Fluree {
             commit_opts
         };
 
+        let txn_type = input.txn_type;
+        let staged = self
+            .stage_transaction_tracked_with_policy(ledger, input, Some(index_config), &tracker)
+            .await?;
+        let result = self
+            .commit_stage_result(staged, txn_type, commit_opts, index_config)
+            .await
+            .map_err(|e| TrackedErrorResponse::new(500, e.to_string(), tracker.tally()))?;
+        Ok((result, tracker.tally()))
+    }
+
+    /// Commit `staged` — or skip the commit when it is a no-op
+    /// ([`StageResult::is_noop`]) — then refresh the cache and trigger
+    /// indexing.
+    pub(crate) async fn commit_stage_result(
+        &self,
+        staged: StageResult,
+        txn_type: TxnType,
+        commit_opts: CommitOpts,
+        index_config: &IndexConfig,
+    ) -> Result<TransactResult> {
+        let noop = staged.is_noop(txn_type);
         let StageResult {
             view,
             ns_registry,
             txn_meta,
             graph_delta,
-            sync_graph: _,
-            scope: _,
-        } = self
-            .stage_transaction_tracked_with_policy(ledger, input, Some(index_config), &tracker)
-            .await?;
-
-        // Add extracted transaction metadata and graph delta to commit opts
-        let commit_opts = commit_opts
-            .with_txn_meta(txn_meta)
-            .with_graph_iris(graph_delta.into_values());
-
-        // Commit (no-op updates handled by existing transact; for the tracked path we just mirror it).
-        let (receipt, ledger) = self
-            .commit_staged(view, ns_registry, index_config, commit_opts)
-            .await
-            .map_err(|e| TrackedErrorResponse::new(500, e.to_string(), tracker.tally()))?;
-
-        let result = self
+            ..
+        } = staged;
+        let (receipt, ledger) = if noop {
+            let (base, flakes) = view.into_parts();
+            debug_assert!(
+                flakes.is_empty(),
+                "no-op transaction path requires zero staged flakes"
+            );
+            (CommitReceipt::no_op(base.t()), base)
+        } else {
+            let commit_opts = commit_opts
+                .with_txn_meta(txn_meta)
+                .with_graph_iris(graph_delta.into_values());
+            self.commit_staged(view, ns_registry, index_config, commit_opts)
+                .await?
+        };
+        Ok(self
             .finalize_owned_commit(receipt, ledger, index_config)
-            .await;
-        Ok((result, tracker.tally()))
+            .await)
     }
 
     /// Commit a staged transaction (persists commit record + publishes nameservice head).
@@ -3402,56 +3405,11 @@ impl crate::Fluree {
             commit_opts
         };
 
-        let StageResult {
-            view,
-            ns_registry,
-            txn_meta,
-            graph_delta,
-            sync_graph,
-            scope: _,
-        } = self
+        let staged = self
             .stage_transaction(ledger, txn_type, txn_json, txn_opts, Some(index_config))
             .await?;
-
-        // Add extracted transaction metadata and graph delta to commit opts
-        let commit_opts = commit_opts
-            .with_txn_meta(txn_meta)
-            .with_graph_iris(graph_delta.into_values());
-
-        // No-op updates: if WHERE matches nothing (or templates produce no flakes),
-        // return success without committing.
-        //
-        // This allows patterns like "delete if exists, then insert" to execute safely when
-        // there are no matches, and supports conditional updates.
-        let (receipt, ledger) = if !view.has_staged()
-            && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
-                    // A sync that stages zero flakes is a no-change outcome
-                    // (payload identical to the graph), not an empty insert.
-                    || sync_graph.is_some())
-        {
-            let (base, flakes) = view.into_parts();
-            debug_assert!(
-                flakes.is_empty(),
-                "no-op transaction path requires zero staged flakes"
-            );
-            (
-                CommitReceipt {
-                    commit_id: ContentId::new(ContentKind::Commit, &[]),
-                    t: base.t(),
-                    flake_count: 0,
-                    assert_count: 0,
-                    retract_count: 0,
-                },
-                base,
-            )
-        } else {
-            self.commit_staged(view, ns_registry, index_config, commit_opts)
-                .await?
-        };
-
-        Ok(self
-            .finalize_owned_commit(receipt, ledger, index_config)
-            .await)
+        self.commit_stage_result(staged, txn_type, commit_opts, index_config)
+            .await
     }
 
     /// Execute a transaction with optional TriG metadata.
@@ -3479,14 +3437,7 @@ impl crate::Fluree {
             commit_opts
         };
 
-        let StageResult {
-            view,
-            ns_registry,
-            txn_meta,
-            graph_delta,
-            sync_graph,
-            scope: _,
-        } = self
+        let staged = self
             .stage_transaction_with_trig_meta(
                 ledger,
                 txn_type,
@@ -3496,43 +3447,8 @@ impl crate::Fluree {
                 trig_meta,
             )
             .await?;
-
-        // Add extracted transaction metadata and graph delta to commit opts
-        let commit_opts = commit_opts
-            .with_txn_meta(txn_meta)
-            .with_graph_iris(graph_delta.into_values());
-
-        // No-op updates: if WHERE matches nothing (or templates produce no flakes),
-        // return success without committing.
-        let (receipt, ledger) = if !view.has_staged()
-            && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
-                    // A sync that stages zero flakes is a no-change outcome
-                    // (payload identical to the graph), not an empty insert.
-                    || sync_graph.is_some())
-        {
-            let (base, flakes) = view.into_parts();
-            debug_assert!(
-                flakes.is_empty(),
-                "no-op transaction path requires zero staged flakes"
-            );
-            (
-                CommitReceipt {
-                    commit_id: ContentId::new(ContentKind::Commit, &[]),
-                    t: base.t(),
-                    flake_count: 0,
-                    assert_count: 0,
-                    retract_count: 0,
-                },
-                base,
-            )
-        } else {
-            self.commit_staged(view, ns_registry, index_config, commit_opts)
-                .await?
-        };
-
-        Ok(self
-            .finalize_owned_commit(receipt, ledger, index_config)
-            .await)
+        self.commit_stage_result(staged, txn_type, commit_opts, index_config)
+            .await
     }
 
     /// Execute a transaction with optional TriG metadata and named graphs.
@@ -3563,14 +3479,7 @@ impl crate::Fluree {
             commit_opts
         };
 
-        let StageResult {
-            view,
-            ns_registry,
-            txn_meta,
-            graph_delta,
-            sync_graph,
-            scope: _,
-        } = self
+        let staged = self
             .stage_transaction_with_named_graphs(
                 ledger,
                 txn_type,
@@ -3581,43 +3490,8 @@ impl crate::Fluree {
                 named_graphs,
             )
             .await?;
-
-        // Add extracted transaction metadata and graph delta to commit opts
-        let commit_opts = commit_opts
-            .with_txn_meta(txn_meta)
-            .with_graph_iris(graph_delta.into_values());
-
-        // No-op updates: if WHERE matches nothing (or templates produce no flakes),
-        // return success without committing.
-        let (receipt, ledger) = if !view.has_staged()
-            && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
-                    // A sync that stages zero flakes is a no-change outcome
-                    // (payload identical to the graph), not an empty insert.
-                    || sync_graph.is_some())
-        {
-            let (base, flakes) = view.into_parts();
-            debug_assert!(
-                flakes.is_empty(),
-                "no-op transaction path requires zero staged flakes"
-            );
-            (
-                CommitReceipt {
-                    commit_id: ContentId::new(ContentKind::Commit, &[]),
-                    t: base.t(),
-                    flake_count: 0,
-                    assert_count: 0,
-                    retract_count: 0,
-                },
-                base,
-            )
-        } else {
-            self.commit_staged(view, ns_registry, index_config, commit_opts)
-                .await?
-        };
-
-        Ok(self
-            .finalize_owned_commit(receipt, ledger, index_config)
-            .await)
+        self.commit_stage_result(staged, txn_type, commit_opts, index_config)
+            .await
     }
 
     /// Insert new data into the ledger
@@ -3709,31 +3583,11 @@ impl crate::Fluree {
             commit_opts
         };
 
-        let stage_result = self
+        let staged = self
             .stage_turtle_insert(ledger, turtle, Some(index_config), None, policy)
             .await?;
-
-        let StageResult {
-            view,
-            ns_registry,
-            txn_meta,
-            graph_delta,
-            sync_graph: _,
-            scope: _,
-        } = stage_result;
-
-        // Add transaction metadata and graph delta (graph_delta typically empty for Turtle)
-        let commit_opts = commit_opts
-            .with_txn_meta(txn_meta)
-            .with_graph_iris(graph_delta.into_values());
-
-        let (receipt, ledger) = self
-            .commit_staged(view, ns_registry, index_config, commit_opts)
-            .await?;
-
-        Ok(self
-            .finalize_owned_commit(receipt, ledger, index_config)
-            .await)
+        self.commit_stage_result(staged, TxnType::Insert, commit_opts, index_config)
+            .await
     }
 
     /// Stage a Turtle INSERT by parsing directly to flakes (bypass JSON-LD / IR).
@@ -3819,9 +3673,8 @@ impl crate::Fluree {
         };
 
         // Apply SHACL policy to the staged view. Plain Turtle has no named-graph
-        // metadata (that's TriG), so we pass `None` for graph_delta/graph_sids —
-        // validation falls back to default-graph (g_id=0), matching how flakes
-        // are produced by `FlakeSink`.
+        // metadata (that's TriG), so there is no graph_delta: every flake
+        // `FlakeSink` produces is in the default graph.
         // The SHACL pass attaches the staged dictionaries to the view.
         #[cfg(feature = "shacl")]
         let mut view = view;
@@ -3829,34 +3682,17 @@ impl crate::Fluree {
         {
             // D's namespace codes → IRI prefixes (base + this document's
             // declared prefixes), for `sh:class` value-set probes against M.
-            let cross_ledger_data_ns_map: Option<HashMap<u16, String>> =
-                cross_ledger_shapes.as_ref().map(|_| {
-                    ns_registry
-                        .all_codes()
-                        .into_iter()
-                        .filter_map(|code| {
-                            ns_registry.get_prefix(code).map(|p| (code, p.to_string()))
-                        })
-                        .collect()
-                });
-            let cross_ledger_membership = match (&cross_ledger_shapes, &cross_ledger_data_ns_map) {
-                (Some(model), Some(ns_map)) => Some(fluree_db_shacl::CrossLedgerMembership {
-                    model_db: fluree_db_core::GraphDbRef::new(
-                        &model.model_db.snapshot,
-                        model.model_g_id,
-                        model.model_db.overlay.as_ref(),
-                        model.model_db.t,
-                    ),
-                    data_ns_map: ns_map,
-                    same_term_space: false,
-                }),
-                _ => None,
-            };
+            let cross_ledger_data_ns_map = cross_ledger_shapes
+                .as_ref()
+                .map(|_| namespace_prefix_map(&ns_registry));
+            let cross_ledger_membership = cross_ledger_shapes
+                .as_ref()
+                .zip(cross_ledger_data_ns_map.as_ref())
+                .map(|(model, ns_map)| model.membership(ns_map));
             apply_shacl_policy_to_staged_view(
                 &mut view,
                 StagedShaclContext {
                     graph_delta: None,
-                    graph_sids: None,
                     tracker,
                     cross_ledger_shapes: cross_ledger_shapes.as_ref().and_then(|m| m.wire()),
                     staged_ns: Some(&ns_registry),

@@ -52,6 +52,20 @@ pub struct CommitReceipt {
     pub retract_count: usize,
 }
 
+impl CommitReceipt {
+    /// Receipt for a transaction that wrote nothing: no commit exists, and
+    /// the ledger stays at `t`.
+    pub fn no_op(t: i64) -> Self {
+        Self {
+            commit_id: ContentId::new(ContentKind::Commit, &[]),
+            t,
+            flake_count: 0,
+            assert_count: 0,
+            retract_count: 0,
+        }
+    }
+}
+
 /// Count `(asserts, retracts)` in a flake slice — the split every
 /// [`CommitReceipt`] carries alongside its total.
 pub fn count_ops(flakes: &[Flake]) -> (usize, usize) {

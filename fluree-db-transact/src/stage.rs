@@ -3655,12 +3655,8 @@ impl ShaclValidationOutcome {
     }
 }
 
-/// Validate a staged [`StagedLedger`] against SHACL shapes.
-///
-/// `graph_sids` provides the `GraphId → Sid` mapping for per-graph validation.
-/// Pass `None` when the mapping is unavailable (e.g., commit-transfer path
-/// with no per-graph routing yet) — validation falls back to the default
-/// graph (g_id=0).
+/// Validate a staged [`StagedLedger`] against SHACL shapes, each focus node
+/// in the graph staging routed its flakes to.
 ///
 /// `per_graph_policy`:
 /// - `None` = treat every graph containing staged flakes as `Reject` mode
@@ -3677,7 +3673,6 @@ pub async fn validate_view_with_shacl(
     view: &StagedLedger,
     shacl_cache: std::sync::Arc<ShaclCache>,
     hierarchy: Option<fluree_db_core::SchemaHierarchy>,
-    graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
     membership_g_ids: &[GraphId],
@@ -3702,7 +3697,6 @@ pub async fn validate_view_with_shacl(
     let report = validate_staged_nodes(
         view,
         &engine,
-        graph_sids,
         tracker,
         enabled_graphs.as_ref(),
         cross_ledger,
@@ -3745,15 +3739,10 @@ pub async fn validate_view_with_shacl(
 /// — this loop only drives per-graph *validation*. `sh:class` value membership
 /// additionally consults the engine's `membership_g_ids` (the `f:shapesSource`
 /// vocabulary graph[s]) unioned with each focus node's own data graph.
-///
-/// When `graph_sids` is `None` (e.g., commit-transfer path where the txn
-/// context is unavailable), falls back to validating all subjects against
-/// the default graph (g_id=0) — matching the previous behavior.
 #[cfg(feature = "shacl")]
 async fn validate_staged_nodes(
     view: &StagedLedger,
     engine: &ShaclEngine,
-    graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     enabled_graphs: Option<&HashSet<GraphId>>,
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
@@ -3786,14 +3775,8 @@ async fn validate_staged_nodes(
     // because hints derived from staged flakes miss the "base edge persists,
     // node touched for an unrelated reason" case — e.g., alice already has
     // `ex:ssn` in the base DB, and this txn retracts `ex:name`.
-    let reverse_graph = graph_sids.map(build_reverse_graph_lookup);
     let mut subjects_by_graph: HashMap<GraphId, HashSet<Sid>> = HashMap::new();
-    for flake in view.staged_flakes() {
-        let g_id = match &reverse_graph {
-            Some(rev) => resolve_flake_graph_id(flake, rev)?,
-            // No reverse map (commit-transfer path): fall back to default graph
-            None => 0,
-        };
+    for (g_id, flake) in view.staged_flakes_by_graph() {
         // Subject is always a focus (including for retractions — validators
         // must still see retracted-on subjects so class/node-targeted shapes
         // can re-check cardinality, and so the engine's post-state check can
