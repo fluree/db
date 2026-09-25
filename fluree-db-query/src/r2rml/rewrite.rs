@@ -33,7 +33,7 @@ use crate::var_registry::VarId;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
 use fluree_vocab::namespaces::XSD;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Result of rewriting patterns for R2RML.
 #[derive(Debug)]
@@ -241,8 +241,15 @@ pub fn rewrite_patterns_for_r2rml(
     // the class and dropping a redundant correlated re-scan); a subject with no
     // star members, or multiple classes, is emitted as a subject-only scan.
     let mut class_groups: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
+    // Input position of each `result_patterns` entry, and of each group's first
+    // member; a group is emitted after the loop but ordered back to that slot.
+    let mut origins: Vec<usize> = Vec::with_capacity(patterns.len());
+    let mut star_origin: HashMap<VarId, usize> = HashMap::new();
+    let mut class_origin: HashMap<VarId, usize> = HashMap::new();
+    // Variables of each OPTIONAL seen so far, by input position.
+    let mut optional_vars: Vec<(usize, HashSet<VarId>)> = Vec::new();
 
-    for pattern in patterns {
+    for (i, pattern) in patterns.iter().enumerate() {
         match pattern {
             Pattern::Triple(tp) => {
                 if let Some(r2rml_pattern) = convert_triple_to_r2rml(tp, graph_source_id, snapshot)
@@ -252,10 +259,25 @@ pub fn rewrite_patterns_for_r2rml(
                     // subject; a bound-subject pattern (subject_var = None) is
                     // never star/class eligible and falls to standalone emit.
                     if let Some(sv) = star_member_subject(&r2rml_pattern) {
+                        // Joining a star opened before an OPTIONAL moves this
+                        // member above it: sound only if the OPTIONAL does not
+                        // also reference its object variable (#1924).
+                        let crosses_optional = star_origin.get(&sv).is_some_and(|&opened| {
+                            r2rml_pattern.object_var.is_some_and(|v| {
+                                optional_vars
+                                    .iter()
+                                    .any(|(at, vars)| *at > opened && vars.contains(&v))
+                            })
+                        });
                         match star_groups.iter_mut().find(|(s, _)| *s == sv) {
+                            _ if crosses_optional => {
+                                result_patterns.push(Pattern::R2rml(r2rml_pattern));
+                                origins.push(i);
+                            }
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
                                 star_groups.push((sv, vec![r2rml_pattern]));
+                                star_origin.insert(sv, i);
                             }
                         }
                     } else if let Some(sv) = class_only_subject(&r2rml_pattern) {
@@ -263,14 +285,17 @@ pub fn rewrite_patterns_for_r2rml(
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
                                 class_groups.push((sv, vec![r2rml_pattern]));
+                                class_origin.insert(sv, i);
                             }
                         }
                     } else {
                         result_patterns.push(Pattern::R2rml(r2rml_pattern));
+                        origins.push(i);
                     }
                 } else {
                     // Keep original pattern if conversion fails
                     result_patterns.push(pattern.clone());
+                    origins.push(i);
                     unconverted += 1;
                 }
             }
@@ -283,6 +308,9 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::Exists(_)
             | Pattern::NotExists(_)
             | Pattern::Service(_) => {
+                if matches!(pattern, Pattern::Optional(_)) {
+                    optional_vars.push((i, pattern.referenced_vars().into_iter().collect()));
+                }
                 let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
                     let r = rewrite_patterns_for_r2rml(
                         &inner,
@@ -298,6 +326,7 @@ pub fn rewrite_patterns_for_r2rml(
                     r.patterns
                 });
                 result_patterns.push(rewritten);
+                origins.push(i);
             }
             // Non-lowered patterns whose bodies evaluate against THIS R2RML
             // graph source's (empty) native index, so if left unconverted they
@@ -312,14 +341,17 @@ pub fn rewrite_patterns_for_r2rml(
             Pattern::PropertyPath(_) => {
                 unsupported.push("property path");
                 result_patterns.push(pattern.clone());
+                origins.push(i);
             }
             Pattern::ShortestPath(_) => {
                 unsupported.push("shortest path");
                 result_patterns.push(pattern.clone());
+                origins.push(i);
             }
             Pattern::Subquery(_) => {
                 unsupported.push("subquery");
                 result_patterns.push(pattern.clone());
+                origins.push(i);
             }
             // Preserve the rest as-is. These do NOT hydrate this graph's index:
             // Filter/Bind/Unwind/Values transform already-bound solutions;
@@ -344,6 +376,7 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::AnnotationTarget { .. }
             | Pattern::DefaultGraphSource { .. } => {
                 result_patterns.push(pattern.clone());
+                origins.push(i);
             }
         }
     }
@@ -387,6 +420,7 @@ pub fn rewrite_patterns_for_r2rml(
     // TriplesMap fan-out — worse than the OOM this fix targets).
     let mut deferred_wildcard_constraints: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
     for (subject, members) in star_groups {
+        let origin = star_origin[&subject];
         // Split into object-var members (produce bindings) and constant-object
         // members (equality existence constraints fused into the same scan).
         let (mut var_members, const_members): (Vec<R2rmlPattern>, Vec<R2rmlPattern>) =
@@ -412,6 +446,7 @@ pub fn rewrite_patterns_for_r2rml(
             } else {
                 for m in const_members {
                     result_patterns.push(Pattern::R2rml(m));
+                    origins.push(origin);
                 }
             }
             continue;
@@ -427,6 +462,7 @@ pub fn rewrite_patterns_for_r2rml(
         if !distinct {
             for m in var_members.into_iter().chain(const_members) {
                 result_patterns.push(Pattern::R2rml(m));
+                origins.push(origin);
             }
             continue;
         }
@@ -479,6 +515,7 @@ pub fn rewrite_patterns_for_r2rml(
             if !covered {
                 for m in var_members.into_iter().chain(const_members) {
                     result_patterns.push(Pattern::R2rml(m));
+                    origins.push(origin);
                 }
                 continue;
             }
@@ -524,6 +561,7 @@ pub fn rewrite_patterns_for_r2rml(
             .collect();
         base.star_constraints = star_constraints;
         result_patterns.push(Pattern::R2rml(base));
+        origins.push(origin);
     }
 
     // Class patterns not fused into a star. First try to fuse a lone class into
@@ -538,8 +576,8 @@ pub fn rewrite_patterns_for_r2rml(
     // pre-fusion path): the operator projects only the subject columns and scans
     // no RefObjectMap parents.
     for (subject, members) in class_groups {
-        let fused = members.len() == 1
-            && members[0].class_filter.as_deref().is_some_and(|class| {
+        let fusion = match members[..] {
+            [ref m] => m.class_filter.as_deref().map(|class| {
                 try_fuse_wildcard_class(
                     &mut result_patterns,
                     subject,
@@ -548,10 +586,25 @@ pub fn rewrite_patterns_for_r2rml(
                     reasoning_active,
                     crawl_active,
                 )
-            });
-        if !fused {
-            for m in members {
-                result_patterns.push(Pattern::R2rml(m));
+            }),
+            _ => None,
+        };
+        match fusion {
+            Some(WildcardClassFusion::MergedTypeVar) => {
+                let mut keep = result_patterns.iter().map(
+                    |p| !matches!(p, Pattern::R2rml(rp) if is_standalone_type_var(rp, subject)),
+                );
+                origins.retain(|_| keep.next().unwrap_or(true));
+                result_patterns.retain(
+                    |p| !matches!(p, Pattern::R2rml(rp) if is_standalone_type_var(rp, subject)),
+                );
+            }
+            Some(WildcardClassFusion::Constrained) => {}
+            Some(WildcardClassFusion::Refused) | None => {
+                for m in members {
+                    result_patterns.push(Pattern::R2rml(m));
+                    origins.push(class_origin[&subject]);
+                }
             }
         }
     }
@@ -583,9 +636,19 @@ pub fn rewrite_patterns_for_r2rml(
             None => {
                 for m in const_members {
                     result_patterns.push(Pattern::R2rml(m));
+                    origins.push(star_origin[&subject]);
                 }
             }
         }
+    }
+
+    // An OPTIONAL is evaluated where it is written relative to the patterns it
+    // shares a variable with, so restore written order around it.
+    if patterns.iter().any(|p| matches!(p, Pattern::Optional(_))) {
+        debug_assert_eq!(origins.len(), result_patterns.len());
+        let mut ordered: Vec<(usize, Pattern)> = origins.into_iter().zip(result_patterns).collect();
+        ordered.sort_by_key(|(origin, _)| *origin);
+        result_patterns = ordered.into_iter().map(|(_, p)| p).collect();
     }
 
     // Attach pushable FILTER comparisons — and bounded FILTER-IN / single-var
@@ -1324,17 +1387,28 @@ fn is_standalone_type_var(rp: &R2rmlPattern, subject: VarId) -> bool {
         && rp.object_var.is_none()
 }
 
+/// Outcome of [`try_fuse_wildcard_class`].
+enum WildcardClassFusion {
+    /// Not fused; the class stays a standalone scan.
+    Refused,
+    /// The wildcard is class-constrained; the class scan is redundant.
+    Constrained,
+    /// As `Constrained`, and the standalone `?s a ?type` was merged into the
+    /// wildcard, so the caller removes it.
+    MergedTypeVar,
+}
+
 /// Try to fuse the lone class `class` into a same-subject standalone wildcard by
-/// setting its `class_filter`. Returns `true` iff a wildcard was constrained (so
-/// the caller drops the now-redundant class scan). Refuses — leaving the wildcard
+/// setting its `class_filter`. Anything but `Refused` means a wildcard was
+/// constrained (so the caller drops the now-redundant class scan). Refuses — leaving the wildcard
 /// unconstrained and the class scan standalone — when reasoning is active, the
 /// kill-switch is off, the mapping is unavailable, there is no wildcard to
 /// constrain, or the fusion is not provably safe ([`wildcard_class_fusion_is_safe`]).
 ///
 /// Type-var handling has two modes:
 /// - **Browse crawl** (`crawl_active`, exactly one co-located `?s a ?type`): MERGE
-///   the type-var into the wildcard (set `wildcard.type_var`) and REMOVE the
-///   standalone type-var pattern, so the crawl is a SINGLE scan that receives the
+///   the type-var into the wildcard (set `wildcard.type_var`) and return
+///   `MergedTypeVar` so the caller removes the standalone type-var pattern, so the crawl is a SINGLE scan that receives the
 ///   downstream LIMIT budget (the standalone type-var is otherwise the topmost
 ///   budgeted scan and starves the wildcard). The fused operator then emits the
 ///   per-`(predicate,object)` × declared-class cartesian — identical to the
@@ -1344,31 +1418,31 @@ fn is_standalone_type_var(rp: &R2rmlPattern, subject: VarId) -> bool {
 ///   the type-var a standalone scan and only class-constrain it, preserving the
 ///   known-correct two-scan plan.
 fn try_fuse_wildcard_class(
-    patterns: &mut Vec<Pattern>,
+    patterns: &mut [Pattern],
     subject: VarId,
     class: &str,
     mapping: Option<&CompiledR2rmlMapping>,
     reasoning_active: bool,
     crawl_active: bool,
-) -> bool {
+) -> WildcardClassFusion {
     // Reasoning refusal: the class prune is an EXACT `rr:class` match, so a
     // subject entailed into a superclass whose TriplesMap declares only a
     // subclass would be dropped. Refuse defensively when any entailment runs.
     if reasoning_active {
-        return false;
+        return WildcardClassFusion::Refused;
     }
     if !wildcard_class_fusion_enabled() {
-        return false;
+        return WildcardClassFusion::Refused;
     }
     // Proving safety needs the mapping's subject templates; without it, refuse.
     let Some(mapping) = mapping else {
-        return false;
+        return WildcardClassFusion::Refused;
     };
     let has_wildcard = patterns
         .iter()
         .any(|p| matches!(p, Pattern::R2rml(rp) if is_standalone_wildcard(rp, subject)));
     if !has_wildcard {
-        return false;
+        return WildcardClassFusion::Refused;
     }
     // E2 / D9 (unknown-class short-circuit): a class that matches ZERO
     // TriplesMaps can never bind a subject, so the crawl's answer is empty. Fuse
@@ -1380,7 +1454,7 @@ fn try_fuse_wildcard_class(
     // no class-declaring map whose sibling could be dropped — so skip it here.
     let class_unmapped = mapping.find_maps_for_class(class).is_empty();
     if !class_unmapped && !wildcard_class_fusion_is_safe(mapping, class) {
-        return false;
+        return WildcardClassFusion::Refused;
     }
 
     // Decide whether to MERGE the projected type-var into the wildcard. Only for
@@ -1428,12 +1502,11 @@ fn try_fuse_wildcard_class(
     // merge branch above left its `class_filter` unset. Removal is by predicate
     // (not index), scoped to this subject, so it cannot disturb another subject's
     // patterns as the caller iterates its class groups.
-    if fused && do_merge {
-        patterns
-            .retain(|p| !matches!(p, Pattern::R2rml(rp) if is_standalone_type_var(rp, subject)));
+    match (fused, do_merge) {
+        (true, true) => WildcardClassFusion::MergedTypeVar,
+        (true, false) => WildcardClassFusion::Constrained,
+        (false, _) => WildcardClassFusion::Refused,
     }
-
-    fused
 }
 
 /// Whether constraining a wildcard to `class_iri` cannot drop any triple.
