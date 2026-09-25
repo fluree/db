@@ -82,6 +82,16 @@ fn make_property_join_scan(
     ))
 }
 
+/// Per-subject state: (subject binding, predicate presence mask, emitted
+/// values per emitted predicate). Insertion-ordered, so rows come out in the
+/// driver scan's subject order.
+///
+/// Emission tracks subjects by position (`subject_idx`, `current_subject`),
+/// which stays valid only while the map is append-only. Removal (`retain`)
+/// is confined to `open`, before any position is taken; anything that fills
+/// the map during emission must only append.
+type SubjectMap = IndexMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>), FxBuildHasher>;
+
 /// Property-join operator for same-subject multi-predicate patterns
 ///
 /// Optimizes queries of the form:
@@ -100,11 +110,6 @@ fn make_property_join_scan(
 /// correct cross-ledger joins. The operator accepts both `Binding::Sid` (single-ledger)
 /// and `Binding::IriMatch` (multi-ledger) from scans and emits the appropriate
 /// binding type in output rows.
-/// Per-subject state: (subject binding, predicate presence mask, emitted
-/// values per emitted predicate). Insertion-ordered, so rows come out in the
-/// driver scan's subject order.
-type SubjectMap = IndexMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>), FxBuildHasher>;
-
 pub struct PropertyJoinOperator {
     /// The shared subject variable
     subject_var: VarId,

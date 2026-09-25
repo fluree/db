@@ -749,15 +749,22 @@ pub enum ArithmeticOp {
     Mod,
 }
 
+impl ArithmeticOp {
+    /// Return the operator symbol as a static string.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            ArithmeticOp::Add => "+",
+            ArithmeticOp::Sub => "-",
+            ArithmeticOp::Mul => "*",
+            ArithmeticOp::Div => "/",
+            ArithmeticOp::Mod => "%",
+        }
+    }
+}
+
 impl std::fmt::Display for ArithmeticOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ArithmeticOp::Add => write!(f, "+"),
-            ArithmeticOp::Sub => write!(f, "-"),
-            ArithmeticOp::Mul => write!(f, "*"),
-            ArithmeticOp::Div => write!(f, "/"),
-            ArithmeticOp::Mod => write!(f, "%"),
-        }
+        f.write_str(self.symbol())
     }
 }
 
