@@ -10955,8 +10955,9 @@ async fn seed_works_for_graph(
 async fn cypher_null_from_optional_match_matches_nothing_in_later_match() {
     // A null never matches, so Bob — whose `o` the OPTIONAL MATCH left null —
     // drops out of the later MATCH instead of joining every located company.
-    // (SPARQL's unbound would be compatible with both.) The WITH keeps the
-    // planner from hoisting the MATCH above the OPTIONAL MATCH.
+    // (SPARQL's unbound would be compatible with both.) Nor may the planner
+    // hoist the MATCH above the OPTIONAL MATCH: that seeded `o` with every
+    // located company and returned all six person×city pairs (#1924).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_works_for_graph(&fluree, "it/cypher:null-later-match").await;
     let rows = cypher_rows(
@@ -10964,7 +10965,6 @@ async fn cypher_null_from_optional_match_matches_nothing_in_later_match() {
         &graphdb_from_ledger(&ledger),
         r#"MATCH (p:Person)
            OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
-           WITH p, o
            MATCH (o)-[:LOCATED_IN]->(c)
            RETURN p.name AS person, c.name AS city ORDER BY person"#,
     )

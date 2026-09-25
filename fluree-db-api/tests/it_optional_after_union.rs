@@ -1063,3 +1063,272 @@ async fn jsonld_update_second_optional_binds_var_first_left_unbound() {
 
     assert_eq!(tagged_rows(&fluree, &ledger).await, expected_tagged());
 }
+
+// ---------------------------------------------------------------------------
+// #1924 / #1925: the planner must not reorder a left join across a pattern it
+// shares a not-yet-certain variable with.
+// ---------------------------------------------------------------------------
+//
+// Inner joins commute; a left join does not. `LeftJoin(A, O) ⋈ P` equals
+// `LeftJoin(A ⋈ P, O)` only when every variable `P` shares with `O` is already
+// certainly bound by `A`. Each test below is a shape where it is not.
+
+const ORDERING_TTL: &str = r#"@prefix ex: <http://example.com/> .
+ex:alice ex:knows ex:bob .
+ex:bob   ex:worksFor ex:acme .
+ex:carol ex:knows ex:bob ; ex:worksFor ex:globex .
+ex:dave  ex:knows ex:erin .
+ex:a ex:name "A" ; ex:fr ex:b .
+ex:b ex:name "B" .
+ex:k ex:g "k" .
+"#;
+
+async fn seed_ordering(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> LedgerState {
+    let ledger = genesis_ledger_for_fluree(fluree, ledger_id);
+    fluree
+        .insert_turtle(ledger, ORDERING_TTL)
+        .await
+        .expect("seed turtle")
+        .ledger
+}
+
+const ORDERING_PREFIX: &str = "PREFIX ex: <http://example.com/>\n";
+
+async fn ordering_rows(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+    query: &str,
+) -> Vec<Value> {
+    let db = graphdb_from_ledger(ledger);
+    let result = fluree
+        .query(
+            &db,
+            QueryInput::Sparql(&format!("{ORDERING_PREFIX}{query}")),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e}\n{query}"));
+    rows(&result, &ledger.snapshot)
+}
+
+fn ordering_context() -> Value {
+    json!({"ex": "http://example.com/"})
+}
+
+/// The triple after the OPTIONAL binds `?org`, which only the OPTIONAL binds
+/// before it. Hoisted, it seeded `?org = acme` for carol, the OPTIONAL then
+/// failed on `carol worksFor acme` and kept the row: a sixth, fabricated
+/// `(carol, acme, bob)`. Alice and dave (`?org` unbound) join both employers.
+const TRIPLE_AFTER_OPTIONAL: &str = "SELECT ?p ?org ?y WHERE { \
+     ?p ex:knows ?f . \
+     OPTIONAL { ?p ex:worksFor ?org } \
+     ?y ex:worksFor ?org }";
+
+fn expected_triple_after_optional() -> Vec<Value> {
+    normalize_rows(&json!([
+        ["ex:alice", "ex:acme", "ex:bob"],
+        ["ex:alice", "ex:globex", "ex:carol"],
+        ["ex:carol", "ex:globex", "ex:carol"],
+        ["ex:dave", "ex:acme", "ex:bob"],
+        ["ex:dave", "ex:globex", "ex:carol"]
+    ]))
+}
+
+#[tokio::test]
+async fn sparql_triple_after_optional_is_not_hoisted_above_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:hoist").await;
+
+    assert_eq!(
+        ordering_rows(&fluree, &ledger, TRIPLE_AFTER_OPTIONAL).await,
+        expected_triple_after_optional()
+    );
+}
+
+#[tokio::test]
+async fn jsonld_triple_after_optional_is_not_hoisted_above_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:hoist-jsonld").await;
+
+    let query = json!({
+        "@context": ordering_context(),
+        "select": ["?p", "?org", "?y"],
+        "where": [
+            {"@id": "?p", "ex:knows": "?f"},
+            ["optional", {"@id": "?p", "ex:worksFor": "?org"}],
+            {"@id": "?y", "ex:worksFor": "?org"}
+        ]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+
+    assert_eq!(
+        rows(&result, &ledger.snapshot),
+        expected_triple_after_optional()
+    );
+}
+
+/// `{ ex:k ex:g ?f }` shares no variable with the required pattern, so it was
+/// ineligible for placement until the later OPTIONAL had bound `?f` — and ran
+/// second. Written order binds `?f = "k"` everywhere first; the friend OPTIONAL
+/// then fails for `a` (`a ex:fr "k"` is absent) and keeps `"k"`.
+const UNCORRELATED_THEN_CORRELATED: &str = "SELECT ?s ?f WHERE { \
+     ?s ex:name ?n . \
+     OPTIONAL { ex:k ex:g ?f } \
+     OPTIONAL { ?s ex:fr ?f } }";
+
+fn expected_uncorrelated_then_correlated() -> Vec<Value> {
+    normalize_rows(&json!([["ex:a", "k"], ["ex:b", "k"]]))
+}
+
+#[tokio::test]
+async fn sparql_uncorrelated_optional_runs_before_a_later_optional() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:uncorrelated").await;
+
+    assert_eq!(
+        ordering_rows(&fluree, &ledger, UNCORRELATED_THEN_CORRELATED).await,
+        expected_uncorrelated_then_correlated()
+    );
+}
+
+#[tokio::test]
+async fn jsonld_uncorrelated_optional_runs_before_a_later_optional() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:uncorrelated-jsonld").await;
+
+    let query = json!({
+        "@context": ordering_context(),
+        "select": ["?s", "?f"],
+        "where": [
+            {"@id": "?s", "ex:name": "?n"},
+            ["optional", {"@id": "ex:k", "ex:g": "?f"}],
+            ["optional", {"@id": "?s", "ex:fr": "?f"}]
+        ]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+
+    assert_eq!(
+        rows(&result, &ledger.snapshot),
+        expected_uncorrelated_then_correlated()
+    );
+}
+
+/// An OPTIONAL written first is `LeftJoin({}, O)`: `O`'s own solutions when it
+/// has any. The triple then joins those, so only `a` — the one subject with an
+/// `ex:fr` — survives. Hoisting the triple above the OPTIONAL instead made it a
+/// plain left join and let `b` through with `?x` unbound.
+#[tokio::test]
+async fn leading_optional_is_joined_not_left_joined() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:leading").await;
+
+    assert_eq!(
+        ordering_rows(
+            &fluree,
+            &ledger,
+            "SELECT ?s ?x ?n WHERE { OPTIONAL { ?s ex:fr ?x } ?s ex:name ?n }",
+        )
+        .await,
+        normalize_rows(&json!([["ex:a", "ex:b", "A"]]))
+    );
+}
+
+/// A triple held behind an uncorrelated OPTIONAL. The OPTIONAL is never
+/// "eligible" (it shares nothing with what is bound), so the planner falls back
+/// to force-placing a pattern — which must be the OPTIONAL, not the blocked
+/// triple. Written order binds `?f = "k"` on every row, and nothing has
+/// `ex:fr "k"`, so the answer is empty; running the triple first bound
+/// `?f = ex:b` and the OPTIONAL then kept those rows.
+#[tokio::test]
+async fn forced_placement_respects_left_join_order() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:forced").await;
+
+    assert_eq!(
+        ordering_rows(
+            &fluree,
+            &ledger,
+            "SELECT ?s ?f ?y WHERE { ?s ex:name ?n . \
+             OPTIONAL { ex:k ex:g ?f } ?y ex:fr ?f }",
+        )
+        .await,
+        Vec::<Value>::new()
+    );
+}
+
+/// An OPTIONAL reading the output of an uncorrelated sub-SELECT written after
+/// it. The OPTIONAL waits for the sub-SELECT as its pipeline consumer, while
+/// the left-join barrier holds the sub-SELECT behind the OPTIONAL. The planner
+/// must still emit both: dropping the sub-SELECT returned `(ex:b, "B")` too.
+/// Written order binds every named `?s`, then the sub-SELECT keeps `ex:a`.
+const OPTIONAL_BEFORE_SUBSELECT: &str = "SELECT ?s ?nm WHERE { \
+     OPTIONAL { ?s ex:name ?nm } \
+     { SELECT ?s WHERE { ?s ex:fr ?z } } }";
+
+#[tokio::test]
+async fn sparql_optional_before_subselect_keeps_the_subselect() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:subselect").await;
+
+    assert_eq!(
+        ordering_rows(&fluree, &ledger, OPTIONAL_BEFORE_SUBSELECT).await,
+        normalize_rows(&json!([["ex:a", "A"]]))
+    );
+}
+
+#[tokio::test]
+async fn jsonld_optional_before_subselect_keeps_the_subselect() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:subselect-jsonld").await;
+
+    let query = json!({
+        "@context": ordering_context(),
+        "select": ["?s", "?nm"],
+        "where": [
+            ["optional", {"@id": "?s", "ex:name": "?nm"}],
+            ["query", {
+                "@context": ordering_context(),
+                "select": ["?s"],
+                "where": [{"@id": "?s", "ex:fr": "?z"}]
+            }]
+        ]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+
+    assert_eq!(
+        rows(&result, &ledger.snapshot),
+        normalize_rows(&json!([["ex:a", "A"]]))
+    );
+}
+
+/// `COUNT(*)` over both shapes, so a count fast path cannot answer from the
+/// reordered plan.
+#[tokio::test]
+async fn count_star_respects_left_join_order() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:count").await;
+
+    for (query, expected) in [
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?p ex:knows ?f . \
+             OPTIONAL { ?p ex:worksFor ?org } ?y ex:worksFor ?org }",
+            5,
+        ),
+        (
+            "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:name ?n . \
+             OPTIONAL { ex:k ex:g ?f } OPTIONAL { ?s ex:fr ?f } FILTER(?f = \"k\") }",
+            2,
+        ),
+    ] {
+        assert_eq!(
+            ordering_rows(&fluree, &ledger, query).await,
+            normalize_rows(&json!([[expected]])),
+            "{query}"
+        );
+    }
+}

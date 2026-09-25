@@ -1326,6 +1326,17 @@ fn cases() -> Vec<Case> {
             declined: Some("optional chained on an optional entity"),
         },
         Case {
+            // The second `?c ex:name` shares ?k with the OPTIONAL, so it must not
+            // join the star opened above it: Ada and Cy bind ?k to a country no
+            // name equals, and only Bo, with no country, survives.
+            name: "a triple after an optional that reuses its variable declines",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } ?c ex:name ?k }",
+            sql: &[],
+            rows: &["k=Bo n=Bo"],
+            routing: Routing::MustNotFire,
+            declined: Some("optional variable already bound"),
+        },
+        Case {
             name: "an inexact filter inside OPTIONAL declines",
             sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k FILTER(STRLEN(?k) > 1) } }",
             sql: &[],
