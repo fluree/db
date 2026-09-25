@@ -190,7 +190,13 @@ fn push_turtle_graph(out: &mut String, graph: &Graph, prefixes: &PrefixMap, inde
                 predicate = Some(t.predicate());
             }
             push_turtle_term(out, t.object(), prefixes);
-            if let Some(rs) = reifiers.remove(t) {
+            // `remove` hashes even on an empty map; most graphs have no reifiers.
+            let rs = if reifiers.is_empty() {
+                None
+            } else {
+                reifiers.remove(t)
+            };
+            if let Some(rs) = rs {
                 for r in rs {
                     out.push_str(" ~ ");
                     push_turtle_term(out, r, prefixes);
