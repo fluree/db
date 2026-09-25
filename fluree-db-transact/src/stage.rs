@@ -2767,7 +2767,7 @@ async fn stream_where_into_accumulator(
     };
 
     let composite_graph_key =
-        |iri: &str| -> String { format!("{}#{}", base_db.snapshot.ledger_id, iri) };
+        |iri: &str| -> Arc<str> { format!("{}#{}", base_db.snapshot.ledger_id, iri).into() };
 
     // SPARQL 1.1 §13.2.1 (via Update §3.1.3): when the operation carries one
     // or more `USING NAMED` clauses but no plain `USING`, the WHERE dataset's
@@ -2847,8 +2847,8 @@ async fn stream_where_into_accumulator(
     // addressable by `GRAPH <name>` only: were they enumerable, every match
     // would bind `?g` once per name, and a `GRAPH ?g` template would write to
     // a graph named after the alias.
-    // (name, g_id, enumerable), first entry per name wins.
-    let mut named: Vec<(String, GraphId, bool)> = Vec::new();
+    // (name, g_id, enumerable, canonical IRI), first entry per name wins.
+    let mut named: Vec<(Arc<str>, GraphId, bool, Arc<str>)> = Vec::new();
     if let Some(allowlist) = allowed_named_graphs {
         for (iri, alias) in allowlist {
             let Some(g_id) = resolve_graph_id(&iri) else {
@@ -2856,10 +2856,11 @@ async fn stream_where_into_accumulator(
             };
             // Explicitly listed, so enumerable even when reserved.
             let composite = composite_graph_key(&iri);
-            named.push((iri, g_id, true));
-            named.push((composite, g_id, false));
+            let iri: Arc<str> = iri.into();
+            named.push((iri.clone(), g_id, true, iri.clone()));
+            named.push((composite, g_id, false, iri.clone()));
             if let Some(alias) = alias {
-                named.push((alias, g_id, false));
+                named.push((alias.into(), g_id, false, iri));
             }
         }
     } else {
@@ -2877,21 +2878,27 @@ async fn stream_where_into_accumulator(
             .iter_entries()
             .chain(binary_entries)
         {
-            named.push((iri.to_string(), g_id, g_id >= FIRST_USER_GRAPH_ID));
-            named.push((composite_graph_key(iri), g_id, false));
+            let iri: Arc<str> = iri.into();
+            named.push((iri.clone(), g_id, g_id >= FIRST_USER_GRAPH_ID, iri.clone()));
+            named.push((composite_graph_key(&iri), g_id, false, iri));
         }
     }
-    let mut seen_named_keys: HashSet<String> = HashSet::new();
-    for (name, g_id, enumerable) in named {
+    let mut seen_named_keys: HashSet<Arc<str>> = HashSet::new();
+    let mut graph_aliases: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+    for (name, g_id, enumerable, canonical) in named {
         if !seen_named_keys.insert(name.clone()) {
             continue;
         }
         runtime_dataset = if enumerable {
             runtime_dataset.with_named_graph(name, make_graph_ref(g_id))
         } else {
+            if name != canonical {
+                graph_aliases.insert(name.clone(), canonical);
+            }
             runtime_dataset.with_named_graph_alias(name, make_graph_ref(g_id))
         };
     }
+    generator.set_graph_aliases(graph_aliases);
 
     // Open the streaming WHERE cursor. For empty patterns it emits one
     // empty-schema/empty-len batch then EOF, mirroring the eager API's

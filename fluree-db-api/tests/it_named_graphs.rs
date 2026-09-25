@@ -811,6 +811,71 @@ async fn test_sparql_insert_graph_variable_refuses_txn_meta() {
 }
 
 #[tokio::test]
+async fn test_sparql_update_graph_variable_bound_to_composite_key_writes_that_graph() {
+    // A `?g` bound to a graph's composite `<ledger_id>#<graph-iri>` key must
+    // write to that graph, as the WHERE read it, not register a second graph
+    // named after the key. The ledger id must itself parse as an IRI scheme
+    // (`books:`), or the key fails validation and the bug hides behind a 400.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "books:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r#"INSERT DATA { GRAPH <https://example.org/g/1> { <https://example.org/a> <https://example.org/p> "x" } }"#,
+    )
+    .await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            r"INSERT {{ GRAPH ?g {{ <https://example.org/a> <https://example.org/copied> ?o }} }}
+               WHERE {{ VALUES ?g {{ <{ledger_id}#https://example.org/g/1> }}
+                        GRAPH ?g {{ <https://example.org/a> <https://example.org/p> ?o }} }}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        user_graph_iris(&fluree, ledger_id).await,
+        vec!["https://example.org/g/1"]
+    );
+    assert_eq!(
+        graph_values(
+            &fluree,
+            &format!("{ledger_id}#https://example.org/g/1"),
+            "https://example.org/a",
+            "https://example.org/copied"
+        )
+        .await,
+        vec!["x"]
+    );
+}
+
+#[tokio::test]
+async fn test_sparql_insert_graph_variable_refuses_txn_meta_composite_key() {
+    // `#txn-meta`'s composite key is a name for `#txn-meta`, so it gets the
+    // same refusal as the IRI itself.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "books:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let txn_meta = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
+    let update = format!(
+        r#"INSERT {{ GRAPH ?g {{ <https://example.org/s> <https://example.org/p> "x" }} }}
+           WHERE {{ BIND(<{ledger_id}#{txn_meta}> AS ?g) }}"#
+    );
+    let err = try_sparql_update(&fluree, ledger, &update)
+        .await
+        .expect_err("write to #txn-meta through its composite key must be refused");
+    assert!(
+        err.to_string().contains("txn-meta") || err.to_string().contains("reserved"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_sparql_insert_graph_variable_literal_is_error() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-insert-graph-var-literal:main";

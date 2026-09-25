@@ -11,6 +11,7 @@ use fluree_db_query::{Batch, Binding, VarId};
 use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // Well-known datatype SIDs, cached to avoid per-call Arc<str> allocation.
 // Clone is ~5ns (atomic Arc bump) vs ~30-50ns for Sid::new().
@@ -77,6 +78,14 @@ pub struct FlakeGenerator<'a> {
     /// this to route, guard, and register them; unlike `graph_sids` they are
     /// only known once WHERE solutions arrive.
     var_graphs: HashMap<String, Sid>,
+
+    /// WHERE-dataset names that alias a graph, mapped to its canonical IRI, so
+    /// a template `?g` bound to an alias writes to the graph the WHERE read.
+    graph_aliases: HashMap<Arc<str>, Arc<str>>,
+
+    /// Graph-variable resolutions keyed by the bound Sid, so a Sid-bound `?g`
+    /// rebuilds and validates its IRI once per graph, not once per row.
+    sid_graphs: HashMap<Sid, Sid>,
 }
 
 impl<'a> FlakeGenerator<'a> {
@@ -94,7 +103,15 @@ impl<'a> FlakeGenerator<'a> {
             graph_sids: HashMap::new(),
             solution_base: 0,
             var_graphs: HashMap::new(),
+            graph_aliases: HashMap::new(),
+            sid_graphs: HashMap::new(),
         }
+    }
+
+    /// Set the WHERE dataset's alias names and the canonical IRI each resolves
+    /// to (see [`DataSet::with_named_graph_alias`](fluree_db_query::DataSet)).
+    pub fn set_graph_aliases(&mut self, aliases: HashMap<Arc<str>, Arc<str>>) {
+        self.graph_aliases = aliases;
     }
 
     /// Graphs resolved from template graph variables so far, as (IRI, Sid).
@@ -264,6 +281,7 @@ impl<'a> FlakeGenerator<'a> {
             return Err(TransactError::UnboundVariable(format!("var_{var:?}")));
         }
         let sid_iri;
+        let mut bound_sid = None;
         let iri: &str = match bindings.get(row, var) {
             None | Some(Binding::Unbound | Binding::Poisoned) => return Ok(None),
             Some(Binding::Iri(iri)) => iri,
@@ -273,6 +291,10 @@ impl<'a> FlakeGenerator<'a> {
                     primary_sid: sid, ..
                 },
             ) => {
+                if let Some(graph) = self.sid_graphs.get(sid) {
+                    return Ok(Some(graph.clone()));
+                }
+                bound_sid = Some(sid);
                 if sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
                     return Err(TransactError::InvalidTerm(
                         "GRAPH name must be an IRI, not a blank node".to_string(),
@@ -300,14 +322,23 @@ impl<'a> FlakeGenerator<'a> {
                 )))
             }
         };
+        let graph = self.graph_sid_for_iri(iri)?;
+        if let Some(sid) = bound_sid {
+            self.sid_graphs.insert(sid.clone(), graph.clone());
+        }
+        Ok(Some(graph))
+    }
+
+    fn graph_sid_for_iri(&mut self, iri: &str) -> Result<Sid> {
+        let iri = self.graph_aliases.get(iri).map_or(iri, AsRef::as_ref);
         if let Some(sid) = self.var_graphs.get(iri) {
-            return Ok(Some(sid.clone()));
+            return Ok(sid.clone());
         }
         fluree_db_core::graph_registry::validate_absolute_graph_iri(iri)
             .map_err(TransactError::InvalidTerm)?;
         let sid = self.ns_registry.sid_for_iri(iri);
         self.var_graphs.insert(iri.to_string(), sid.clone());
-        Ok(Some(sid))
+        Ok(sid)
     }
 
     /// Resolve a subject term
