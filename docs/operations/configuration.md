@@ -310,7 +310,7 @@ Example connection config (`connection.jsonld`):
 
 - `--connection-config` and `--storage-path` are mutually exclusive. If both are set, `--connection-config` takes precedence (a warning is logged).
 - Server-level settings (`--cache-max-mb`, `--indexing-enabled`, `--reindex-min-bytes`, `--reindex-max-bytes`) override any equivalent values from the connection config.
-- `--indexing-enabled` defaults to `true`. Set `FLUREE_INDEXING_ENABLED=false` (or `[server.indexing] enabled = false`) only when a separate peer/indexer process owns index maintenance for the same storage.
+- `--indexing-enabled` defaults to `true`. Set `--indexing-enabled=false` (or `FLUREE_INDEXING_ENABLED=false`, or `[server.indexing] enabled = false`) only when a separate peer/indexer process owns index maintenance for the same storage.
 - AWS credentials and region are resolved via the standard AWS SDK chain (env vars, instance profile, `~/.aws/config`, etc.) — they are not part of the connection config.
 - The connection config can use `envVar` indirection for sensitive fields like S3 bucket names or encryption keys (see [ConfigurationValue](../reference/connection-config-jsonld.md#configurationvalue-env-var-indirection)).
 
@@ -342,7 +342,7 @@ Enable Cross-Origin Resource Sharing:
 | ---------------- | --------------------- | ------- |
 | `--cors-enabled` | `FLUREE_CORS_ENABLED` | `true`  |
 
-When enabled, allows requests from any origin, with any method and any request headers. There are no per-origin allow lists; restrict CORS at a reverse proxy if needed. `--cors-enabled` is a switch that can only turn CORS on; to disable it, set `FLUREE_CORS_ENABLED=false` or `cors_enabled = false` in the config file.
+When enabled, allows requests from any origin, with any method and any request headers. There are no per-origin allow lists; restrict CORS at a reverse proxy if needed. Disable it with `--cors-enabled=false` (or `FLUREE_CORS_ENABLED=false`, or `cors_enabled = false` in the config file).
 
 ### Outbound HTTPS Certificate Trust
 

@@ -550,9 +550,9 @@ Access-Control-Allow-Origin: *
 
 ### CORS Configuration
 
-CORS is either on or off. It is on by default; disable it with `FLUREE_CORS_ENABLED=false`
-or `cors_enabled = false` in the `[server]` section of the config file (the `--cors-enabled`
-flag can only turn it on). When on, the server allows any
+CORS is either on or off. It is on by default; disable it with `--cors-enabled=false`,
+`FLUREE_CORS_ENABLED=false`, or `cors_enabled = false` in the `[server]` section of the config
+file. When on, the server allows any
 origin and any method and does not send `Access-Control-Allow-Credentials`.
 
 The server has no per-origin, per-method, or per-header allow lists. To restrict CORS to

@@ -251,7 +251,7 @@ For high-load deployments, index maintenance can be moved out of the transacting
 
 ```bash
 # Main server (transact only; background indexing disabled)
-FLUREE_INDEXING_ENABLED=false fluree server run
+fluree server run -- --indexing-enabled=false
 ```
 
 Fluree does not ship a standalone indexer binary. The external indexer is a process you run

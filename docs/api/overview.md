@@ -469,7 +469,7 @@ Never expose credentials in code or logs:
 
 If exposing API to web applications, configure CORS appropriately. The server's built-in
 CORS is on/off only and, when on, allows any origin. To restrict origins, disable it
-(`FLUREE_CORS_ENABLED=false`) and have a reverse proxy send headers such as:
+(`--cors-enabled=false`) and have a reverse proxy send headers such as:
 
 ```http
 Access-Control-Allow-Origin: https://your-app.com
