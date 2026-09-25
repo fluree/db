@@ -25,7 +25,6 @@ use crate::ledger_manager::{
 use crate::tx::{
     IndexingMode, IndexingStatus, StageResult, TransactResult, TransactResultRef, WriteScope,
 };
-use crate::SyncPayload;
 use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
     Tracker, TrackingOptions, TrackingTally,
@@ -40,6 +39,43 @@ use fluree_db_transact::{
 };
 use rustc_hash::FxHashSet;
 use std::collections::HashMap;
+
+/// A graph sync payload: the target graph's desired full contents.
+#[derive(Debug, Clone, Copy)]
+pub enum SyncPayload<'a> {
+    /// An insert-shaped JSON-LD document. `"@graph": []` is how it asks to
+    /// clear the graph.
+    JsonLd(&'a serde_json::Value),
+    /// Turtle, N-Triples or TriG text. Default-graph triples are the target
+    /// graph's contents; a TriG body may instead hold them in `GRAPH` blocks
+    /// naming the target graph, but not both, and no other graph.
+    ///
+    /// RDF has no spelling for "deliberately empty", and emptiness is only
+    /// known once parsed, so the opt-in rides with the text to staging.
+    Rdf { text: &'a str, allow_empty: bool },
+}
+
+impl SyncPayload<'_> {
+    /// The payload as stored for `store_raw_txn`.
+    pub(crate) fn raw_txn(&self) -> serde_json::Value {
+        match self {
+            SyncPayload::JsonLd(data) => (*data).clone(),
+            SyncPayload::Rdf { text, .. } => serde_json::Value::String((*text).to_string()),
+        }
+    }
+
+    /// Only `admin`'s sync entry point asks, and it is native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn is_explicitly_empty_jsonld(&self) -> bool {
+        match self {
+            SyncPayload::JsonLd(data) => data
+                .get("@graph")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty),
+            SyncPayload::Rdf { .. } => false,
+        }
+    }
+}
 
 /// Parse, validate, and lower a SPARQL UPDATE request to a sequence of
 /// transaction IRs (one per `;`-separated operation, in request order)

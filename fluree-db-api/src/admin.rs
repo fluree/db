@@ -9,7 +9,7 @@
 //! capabilities. They work with memory/file/S3 admin backends but are not
 //! available on read-only storage.
 
-use crate::{error::ApiError, tx::IndexingMode, Result};
+use crate::{error::ApiError, tx::IndexingMode, Result, SyncPayload};
 use fluree_db_core::tracking::{Tracker, TrackingOptions};
 use fluree_db_core::ContentId;
 use fluree_db_core::{
@@ -160,41 +160,6 @@ pub struct SyncGraphOpts {
     /// graph. Off by default so a truncated or accidentally-empty export
     /// cannot silently wipe the graph.
     pub allow_empty: bool,
-}
-
-/// A graph sync payload: the target graph's desired full contents.
-#[derive(Debug, Clone, Copy)]
-pub enum SyncPayload<'a> {
-    /// An insert-shaped JSON-LD document. `"@graph": []` is how it asks to
-    /// clear the graph.
-    JsonLd(&'a serde_json::Value),
-    /// Turtle, N-Triples or TriG text. Default-graph triples are the target
-    /// graph's contents; a TriG body may instead hold them in `GRAPH` blocks
-    /// naming the target graph, but not both, and no other graph.
-    ///
-    /// RDF has no spelling for "deliberately empty", and emptiness is only
-    /// known once parsed, so the opt-in rides with the text to staging.
-    Rdf { text: &'a str, allow_empty: bool },
-}
-
-impl SyncPayload<'_> {
-    /// The payload as stored for `store_raw_txn`.
-    pub(crate) fn raw_txn(&self) -> serde_json::Value {
-        match self {
-            SyncPayload::JsonLd(data) => (*data).clone(),
-            SyncPayload::Rdf { text, .. } => serde_json::Value::String((*text).to_string()),
-        }
-    }
-
-    fn is_explicitly_empty_jsonld(&self) -> bool {
-        match self {
-            SyncPayload::JsonLd(data) => data
-                .get("@graph")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(Vec::is_empty),
-            SyncPayload::Rdf { .. } => false,
-        }
-    }
 }
 
 /// Report of a [`Fluree::sync_named_graph`] call.
