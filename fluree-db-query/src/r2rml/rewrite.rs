@@ -645,7 +645,7 @@ pub fn rewrite_patterns_for_r2rml(
     // An OPTIONAL is evaluated where it is written relative to the patterns it
     // shares a variable with, so restore written order around it.
     if patterns.iter().any(|p| matches!(p, Pattern::Optional(_))) {
-        debug_assert_eq!(origins.len(), result_patterns.len());
+        assert_eq!(origins.len(), result_patterns.len());
         let mut ordered: Vec<(usize, Pattern)> = origins.into_iter().zip(result_patterns).collect();
         ordered.sort_by_key(|(origin, _)| *origin);
         result_patterns = ordered.into_iter().map(|(_, p)| p).collect();

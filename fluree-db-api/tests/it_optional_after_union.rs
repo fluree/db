@@ -1259,6 +1259,53 @@ async fn forced_placement_respects_left_join_order() {
     );
 }
 
+/// An OPTIONAL reading the output of an uncorrelated sub-SELECT written after
+/// it. The OPTIONAL waits for the sub-SELECT as its pipeline consumer, while
+/// the left-join barrier holds the sub-SELECT behind the OPTIONAL. The planner
+/// must still emit both: dropping the sub-SELECT returned `(ex:b, "B")` too.
+/// Written order binds every named `?s`, then the sub-SELECT keeps `ex:a`.
+const OPTIONAL_BEFORE_SUBSELECT: &str = "SELECT ?s ?nm WHERE { \
+     OPTIONAL { ?s ex:name ?nm } \
+     { SELECT ?s WHERE { ?s ex:fr ?z } } }";
+
+#[tokio::test]
+async fn sparql_optional_before_subselect_keeps_the_subselect() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:subselect").await;
+
+    assert_eq!(
+        ordering_rows(&fluree, &ledger, OPTIONAL_BEFORE_SUBSELECT).await,
+        normalize_rows(&json!([["ex:a", "A"]]))
+    );
+}
+
+#[tokio::test]
+async fn jsonld_optional_before_subselect_keeps_the_subselect() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ordering(&fluree, "optional-ordering:subselect-jsonld").await;
+
+    let query = json!({
+        "@context": ordering_context(),
+        "select": ["?s", "?nm"],
+        "where": [
+            ["optional", {"@id": "?s", "ex:name": "?nm"}],
+            ["query", {
+                "@context": ordering_context(),
+                "select": ["?s"],
+                "where": [{"@id": "?s", "ex:fr": "?z"}]
+            }]
+        ]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+
+    assert_eq!(
+        rows(&result, &ledger.snapshot),
+        normalize_rows(&json!([["ex:a", "A"]]))
+    );
+}
+
 /// `COUNT(*)` over both shapes, so a count fast path cannot answer from the
 /// reordered plan.
 #[tokio::test]

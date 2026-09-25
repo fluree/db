@@ -1692,6 +1692,11 @@ fn values_optional_barrier_indices(
 ///
 /// A FILTER is never the earlier side: it constrains the whole group wherever
 /// it is written, so an OPTIONAL after it must not be held behind it.
+///
+/// Only an OPTIONAL anchors an edge. MINUS, EXISTS and NOT EXISTS are
+/// order-sensitive too, but `reorder_patterns` already defers each until every
+/// variable produced by the patterns written before it is bound, which keeps
+/// it behind them.
 fn left_join_order_barriers(
     patterns: &[Pattern],
     initial_bound_vars: &HashSet<VarId>,
@@ -2111,7 +2116,36 @@ pub fn reorder_patterns(
                     Some((_, 0, idx)) => sources.remove(idx),
                     Some((_, 1, idx)) => reducers.remove(idx),
                     Some((_, _, idx)) => expanders.remove(idx),
-                    None => break,
+                    None => {
+                        if let Some(dp) = release_barrier_blocker(
+                            &mut deferred,
+                            [&sources, &reducers, &expanders],
+                            &placed_indices,
+                        ) {
+                            for v in dp.pattern.produced_vars() {
+                                bound_vars.insert(v);
+                            }
+                            placed_indices.insert(dp.orig_index);
+                            result.push(dp.pattern);
+                            drain_ready_deferred(
+                                &mut deferred,
+                                &mut bound_vars,
+                                &mut result,
+                                &mut placed_indices,
+                            );
+                            continue;
+                        }
+                        // Unreachable as far as we know; placing out of order
+                        // is unsound, but dropping the pattern is worse.
+                        debug_assert!(false, "left-join barrier stalled with no deferred blocker");
+                        if !sources.is_empty() {
+                            sources.remove(0)
+                        } else if !reducers.is_empty() {
+                            reducers.remove(0)
+                        } else {
+                            expanders.remove(0)
+                        }
+                    }
                 }
             } else if !sources.is_empty() {
                 sources.remove(0)
@@ -2148,6 +2182,36 @@ pub fn reorder_patterns(
     }
 
     result
+}
+
+/// Release the deferred pattern a barrier-held candidate is waiting on.
+///
+/// Every candidate can be held behind an earlier pattern that is itself
+/// deferred on a variable only a held candidate binds: an OPTIONAL deferred as
+/// the pipeline consumer of an uncorrelated sub-SELECT written after it, which
+/// the barrier holds behind the OPTIONAL. Nothing becomes ready, so the
+/// earliest such blocker is placed as written, which is its algebraic position
+/// and satisfies every barrier.
+fn release_barrier_blocker(
+    deferred: &mut Vec<DeferredPattern>,
+    candidates: [&Vec<RankedPattern>; 3],
+    placed: &HashSet<usize>,
+) -> Option<DeferredPattern> {
+    let blockers: HashSet<usize> = candidates
+        .into_iter()
+        .flatten()
+        .flat_map(|rp| rp.after_indices.iter().copied())
+        .filter(|i| !placed.contains(i))
+        .collect();
+    let idx = deferred
+        .iter()
+        .enumerate()
+        .filter(|(_, dp)| {
+            blockers.contains(&dp.orig_index) && dp.after_indices.iter().all(|i| placed.contains(i))
+        })
+        .min_by_key(|(_, dp)| dp.orig_index)
+        .map(|(idx, _)| idx)?;
+    Some(deferred.remove(idx))
 }
 
 /// Try to place the best eligible reducer. Returns true if one was placed.
@@ -2930,6 +2994,39 @@ mod tests {
             left_join_order_barriers(&patterns, &HashSet::new()),
             vec![Vec::<usize>::new(); 2]
         );
+    }
+
+    fn subquery_selecting(out: VarId, p_name: &str, other: VarId) -> Pattern {
+        Pattern::Subquery(SubqueryPattern::new(
+            vec![out],
+            vec![triple(out, p_name, other)],
+        ))
+    }
+
+    /// An OPTIONAL written before an uncorrelated sub-SELECT whose output it
+    /// reads: the OPTIONAL is deferred behind the sub-SELECT as its pipeline
+    /// consumer, while the barrier holds the sub-SELECT behind the OPTIONAL.
+    /// Neither can move, and the plan must still contain both, in written
+    /// order.
+    #[test]
+    fn left_join_barrier_stall_releases_the_deferred_optional() {
+        let (m, x, z) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![optional(m, "p", x), subquery_selecting(m, "fr", z)];
+        let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert_eq!(format!("{reordered:?}"), format!("{patterns:?}"));
+    }
+
+    /// The same stall behind a required triple.
+    #[test]
+    fn left_join_barrier_stall_after_a_required_triple_keeps_every_pattern() {
+        let (a, b, m, z) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let patterns = vec![
+            triple(a, "p", b),
+            optional(m, "q", b),
+            subquery_selecting(m, "fr", z),
+        ];
+        let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert_eq!(format!("{reordered:?}"), format!("{patterns:?}"));
     }
 
     #[test]
