@@ -24,7 +24,7 @@
 //! Uses PSOT index for each predicate scan, which is optimal for
 //! "get all subjects with predicate P" queries.
 
-use crate::binding::{Batch, Binding};
+use crate::binding::{Batch, Binding, UnmatchedOptional};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
@@ -135,6 +135,8 @@ pub struct PropertyJoinOperator {
     inline_ops: Vec<InlineOperator>,
     /// Temporal mode captured at planner-time for the late per-predicate scans.
     mode: TemporalMode,
+    /// Binding emitted for an optional predicate with no values.
+    unmatched: Binding,
 }
 
 #[derive(Clone, Debug)]
@@ -482,7 +484,15 @@ impl PropertyJoinOperator {
             emitted_required,
             inline_ops,
             mode,
+            unmatched: Binding::Unbound,
         })
+    }
+
+    /// Set what an optional predicate with no values binds its object var to
+    /// (see [`UnmatchedOptional`]).
+    pub fn with_unmatched_optional(mut self, unmatched: UnmatchedOptional) -> Self {
+        self.unmatched = unmatched.binding();
+        self
     }
 
     /// Get the subject variable
@@ -599,6 +609,7 @@ impl PropertyJoinOperator {
         subject_binding: &Binding,
         values_per_pred: &[Vec<Binding>],
         emitted_required: &[bool],
+        unmatched: &Binding,
     ) -> Vec<Vec<Binding>> {
         // If no object vars are emitted (existence-only predicates), then each matching
         // subject produces exactly one output row.
@@ -638,7 +649,7 @@ impl PropertyJoinOperator {
             row.push(subject_binding.clone());
             for (pred_idx, val_idx) in indices.iter().enumerate() {
                 if values_per_pred[pred_idx].is_empty() {
-                    row.push(Binding::Poisoned);
+                    row.push(unmatched.clone());
                 } else {
                     row.push(values_per_pred[pred_idx][*val_idx].clone());
                 }
@@ -687,6 +698,7 @@ impl PropertyJoinOperator {
         values_per_pred: &[Vec<Binding>],
         emitted_required: &[bool],
         indices: &[usize],
+        unmatched: &Binding,
     ) -> Option<Vec<Binding>> {
         if !Self::has_cartesian_row(values_per_pred, emitted_required) {
             return None;
@@ -696,7 +708,7 @@ impl PropertyJoinOperator {
         row.push(subject_binding.clone());
         for (pred_idx, values) in values_per_pred.iter().enumerate() {
             if values.is_empty() {
-                row.push(Binding::Poisoned);
+                row.push(unmatched.clone());
             } else {
                 let val_idx = indices.get(pred_idx).copied().unwrap_or(0);
                 row.push(values.get(val_idx)?.clone());
@@ -1222,6 +1234,7 @@ impl Operator for PropertyJoinOperator {
                 values_per_pred,
                 &self.emitted_required,
                 &self.current_indices,
+                &self.unmatched,
             );
             let has_next = Self::advance_indices(&mut self.current_indices, values_per_pred);
             if !has_next {
@@ -1434,6 +1447,7 @@ mod tests {
             &subject_binding,
             &values,
             &[true, true],
+            &Binding::Unbound,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].len(), 3);
@@ -1464,6 +1478,7 @@ mod tests {
             &subject_binding,
             &values,
             &[true, true],
+            &Binding::Unbound,
         );
         // Cartesian product: 2 * 3 = 6 rows
         assert_eq!(rows.len(), 6);
@@ -1492,6 +1507,7 @@ mod tests {
                 &values,
                 &[true, true],
                 &indices,
+                &Binding::Unbound,
             )
             .expect("indices should produce a row");
             assert_eq!(row.len(), 3);
@@ -1520,23 +1536,31 @@ mod tests {
             &subject_binding,
             &values,
             &[true, true],
+            &Binding::Unbound,
         );
         // No rows if any predicate is missing
         assert_eq!(rows.len(), 0);
     }
 
     #[test]
-    fn test_generate_rows_missing_optional_uses_poisoned() {
+    fn test_generate_rows_missing_optional_uses_unmatched_binding() {
         let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
             vec![Binding::sid(Sid::new(200, "Alice"))], // required name
             vec![],                                     // optional probability
         ];
 
-        let rows =
-            PropertyJoinOperator::generate_rows(3, &subject_binding, &values, &[true, false]);
-        assert_eq!(rows.len(), 1);
-        assert!(matches!(rows[0][2], Binding::Poisoned));
+        for unmatched in [UnmatchedOptional::Unbound, UnmatchedOptional::Poisoned] {
+            let rows = PropertyJoinOperator::generate_rows(
+                3,
+                &subject_binding,
+                &values,
+                &[true, false],
+                &unmatched.binding(),
+            );
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][2], unmatched.binding());
+        }
     }
 
     #[test]

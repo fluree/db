@@ -1604,7 +1604,8 @@ fn build_property_join_block(
         Some(&needed),
         inline_ops,
         planning.mode(),
-    )?;
+    )?
+    .with_unmatched_optional(planning.unmatched_optional);
     let mut operator: Option<BoxedOperator> = Some(Box::new(property_join));
 
     if !block_values.is_empty() {

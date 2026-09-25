@@ -32,9 +32,10 @@
 //! probe for a chain of single-triple OPTIONALs. SPARQL and JSON-LD share the
 //! IR, so the surfaces are pinned in pairs.
 //!
-//! The `Binding::Poisoned` door — a second `OPTIONAL` on a variable an earlier
-//! `OPTIONAL` failed to bind — is deliberately NOT covered here; poison blocks
-//! matching by design and unpicking that is #1734.
+//! The same left join over a variable an earlier `OPTIONAL` failed to bind
+//! (#1734) is covered in the last section: SPARQL and JSON-LD now leave that
+//! variable `Unbound` rather than `Binding::Poisoned`, so it reaches exactly the
+//! merge exercised here.
 
 #![cfg(feature = "native")]
 
@@ -651,4 +652,340 @@ async fn grouped_optional_chain_binds_the_subject_the_union_left_unbound() {
             ["ex:liam", "liam@example.org", 13]
         ]))
     );
+}
+
+// ---------------------------------------------------------------------------
+// #1734: a second OPTIONAL on a variable an earlier OPTIONAL failed to bind.
+// ---------------------------------------------------------------------------
+//
+// An OPTIONAL that matches nothing leaves its variables unbound (§18.2.4), and
+// an unbound variable is compatible with any later binding of it. The engine
+// used to record `Binding::Poisoned` instead — Cypher's null, which blocks every
+// later match — so the second OPTIONAL lost both its bindings and its fan-out.
+// Each test reaches the unbound column through a different emitter or the
+// second OPTIONAL through a different lane.
+
+const GREETING_THEN_FRIEND: &str = "SELECT ?s ?f WHERE { \
+     ?s schema:name ?name . \
+     OPTIONAL { ?s ex:greeting ?f } \
+     OPTIONAL { ?s ex:friend ?f } }";
+
+/// The same query with the second `OPTIONAL` deleted.
+const GREETING_ONLY: &str = "SELECT ?s ?f WHERE { \
+     ?s schema:name ?name . \
+     OPTIONAL { ?s ex:greeting ?f } }";
+
+fn greeting(value: &str, lang: &str) -> Value {
+    json!({"@value": value, "@language": lang})
+}
+
+/// Nikola's two greetings, then every friend of a subject with no greeting:
+/// alice 1, cam 2, liam 3, and brian — who has neither — genuinely unbound.
+fn expected_greeting_then_friend() -> Vec<Value> {
+    normalize_rows(&json!([
+        ["ex:nikola", greeting("Здраво", "sb")],
+        ["ex:nikola", greeting("Hello", "en")],
+        ["ex:alice", "ex:brian"],
+        ["ex:cam", "ex:alice"],
+        ["ex:cam", "ex:brian"],
+        ["ex:liam", "ex:alice"],
+        ["ex:liam", "ex:brian"],
+        ["ex:liam", "ex:cam"],
+        ["ex:brian", null]
+    ]))
+}
+
+fn expected_greeting_only() -> Vec<Value> {
+    normalize_rows(&json!([
+        ["ex:nikola", greeting("Здраво", "sb")],
+        ["ex:nikola", greeting("Hello", "en")],
+        ["ex:alice", null],
+        ["ex:brian", null],
+        ["ex:cam", null],
+        ["ex:liam", null]
+    ]))
+}
+
+async fn sparql(
+    fluree: &fluree_db_api::Fluree,
+    db: &fluree_db_api::GraphDb,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    query: &str,
+) -> Vec<Value> {
+    let result = fluree
+        .query(db, QueryInput::Sparql(&format!("{PREFIXES}{query}")))
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e}\n{query}"));
+    rows(&result, snapshot)
+}
+
+/// Exact rows, plus the delete-the-clause property: before the fix the second
+/// OPTIONAL contributed nothing and both queries returned the same six rows.
+fn assert_second_optional_contributes(lane: &str, with_second: &[Value], first_only: &[Value]) {
+    assert_eq!(
+        first_only,
+        expected_greeting_only(),
+        "{lane}: the first OPTIONAL alone must be the six rows the second extends"
+    );
+    assert_ne!(
+        with_second, first_only,
+        "{lane}: deleting the second OPTIONAL must change the answer"
+    );
+    assert_eq!(
+        with_second,
+        expected_greeting_then_friend(),
+        "{lane}: the second OPTIONAL must bind ?f where the first left it unbound"
+    );
+}
+
+#[tokio::test]
+async fn sparql_second_optional_binds_var_first_left_unbound() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_novelty(&fluree, "optional-after-optional:sparql").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    assert_second_optional_contributes(
+        "sparql/novelty",
+        &sparql(&fluree, &db, &ledger.snapshot, GREETING_THEN_FRIEND).await,
+        &sparql(&fluree, &db, &ledger.snapshot, GREETING_ONLY).await,
+    );
+}
+
+#[tokio::test]
+async fn jsonld_second_optional_binds_var_first_left_unbound() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_novelty(&fluree, "optional-after-optional:jsonld").await;
+    let query = |second: bool| {
+        let mut wh = vec![
+            json!({"@id": "?s", "schema:name": "?name"}),
+            json!(["optional", {"@id": "?s", "ex:greeting": "?f"}]),
+        ];
+        if second {
+            wh.push(json!(["optional", {"@id": "?s", "ex:friend": "?f"}]));
+        }
+        json!({"@context": query_context(), "select": ["?s", "?f"], "where": wh})
+    };
+
+    let with_second = support::query_jsonld(&fluree, &ledger, &query(true))
+        .await
+        .expect("query with second OPTIONAL");
+    let first_only = support::query_jsonld(&fluree, &ledger, &query(false))
+        .await
+        .expect("query with first OPTIONAL only");
+
+    assert_second_optional_contributes(
+        "json-ld/novelty",
+        &rows(&with_second, &ledger.snapshot),
+        &rows(&first_only, &ledger.snapshot),
+    );
+}
+
+/// A two-pattern second OPTIONAL routes to `PlanTreeOptionalBuilder`, whose
+/// batched lane partitions by a correlation key the unbound `?f` has no value
+/// for. Every friend has a name, so the answer is unchanged.
+#[tokio::test]
+async fn multi_pattern_second_optional_binds_var_first_left_unbound() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_novelty(&fluree, "optional-after-optional:multi").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    let query = "SELECT ?s ?f WHERE { \
+         ?s schema:name ?name . \
+         OPTIONAL { ?s ex:greeting ?f } \
+         OPTIONAL { ?s ex:friend ?f . ?f schema:name ?fname } }";
+
+    assert_second_optional_contributes(
+        "sparql/multi-pattern",
+        &sparql(&fluree, &db, &ledger.snapshot, query).await,
+        &sparql(&fluree, &db, &ledger.snapshot, GREETING_ONLY).await,
+    );
+}
+
+/// Greeting and email are distinct-variable single-triple OPTIONALs on one
+/// subject, so they group (`GroupedPatternOptionalBuilder`); the friend
+/// OPTIONAL re-uses `?f` and stays outside the group. The grouped builder's
+/// own no-match binding is written on its batched lane, covered in
+/// `indexed_second_optional_binds_var_first_left_unbound`.
+const GROUPED_THEN_FRIEND: &str = "SELECT ?s ?f WHERE { \
+     ?s schema:name ?name . \
+     OPTIONAL { ?s ex:greeting ?f } \
+     OPTIONAL { ?s schema:email ?e } \
+     OPTIONAL { ?s ex:friend ?f } }";
+
+#[tokio::test]
+async fn grouped_optional_leaves_var_unbound_for_later_optional() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_novelty(&fluree, "optional-after-optional:grouped").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    assert_eq!(
+        sparql(&fluree, &db, &ledger.snapshot, GROUPED_THEN_FRIEND).await,
+        expected_greeting_then_friend()
+    );
+}
+
+/// `PropertyJoinOperator` absorbs a trailing single-triple OPTIONAL into a
+/// required star (three wide, anchored by the range filter) and writes the
+/// no-match binding itself. Nikola has no email or age, so the star drops him.
+const STAR_THEN_FRIEND: &str = "SELECT ?s ?f WHERE { \
+     ?s schema:name ?name . \
+     ?s schema:email ?email . \
+     ?s schema:age ?age . \
+     FILTER(?age > 10) \
+     OPTIONAL { ?s ex:greeting ?f } \
+     OPTIONAL { ?s ex:friend ?f } }";
+
+fn expected_star_then_friend() -> Vec<Value> {
+    normalize_rows(&json!([
+        ["ex:alice", "ex:brian"],
+        ["ex:cam", "ex:alice"],
+        ["ex:cam", "ex:brian"],
+        ["ex:liam", "ex:alice"],
+        ["ex:liam", "ex:brian"],
+        ["ex:liam", "ex:cam"],
+        ["ex:brian", null]
+    ]))
+}
+
+#[tokio::test]
+async fn property_join_optional_leaves_var_unbound_for_later_optional() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_novelty(&fluree, "optional-after-optional:property-join").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    assert_eq!(
+        sparql(&fluree, &db, &ledger.snapshot, STAR_THEN_FRIEND).await,
+        expected_star_then_friend()
+    );
+}
+
+/// The unbound variable in SUBJECT position of the second OPTIONAL. Brian and
+/// Nikola have no friend, so `?f` is unbound and every `?f ex:friend ?ff`
+/// triple is compatible with their row — each extends into all six.
+#[tokio::test]
+async fn second_optional_binds_unbound_var_in_subject_position() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_novelty(&fluree, "optional-after-optional:subject").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    let query = "SELECT ?s ?f ?ff WHERE { \
+         ?s schema:name ?name . \
+         OPTIONAL { ?s ex:friend ?f } \
+         OPTIONAL { ?f ex:friend ?ff } }";
+
+    let friend_edges = [
+        ("ex:alice", "ex:brian"),
+        ("ex:cam", "ex:alice"),
+        ("ex:cam", "ex:brian"),
+        ("ex:liam", "ex:alice"),
+        ("ex:liam", "ex:brian"),
+        ("ex:liam", "ex:cam"),
+    ];
+    let mut expected = vec![
+        // ?f bound: extended by ?f's own friends, or padded.
+        json!(["ex:alice", "ex:brian", null]),
+        json!(["ex:cam", "ex:alice", "ex:brian"]),
+        json!(["ex:cam", "ex:brian", null]),
+        json!(["ex:liam", "ex:alice", "ex:brian"]),
+        json!(["ex:liam", "ex:brian", null]),
+        json!(["ex:liam", "ex:cam", "ex:alice"]),
+        json!(["ex:liam", "ex:cam", "ex:brian"]),
+    ];
+    for s in ["ex:brian", "ex:nikola"] {
+        for (f, ff) in friend_edges {
+            expected.push(json!([s, f, ff]));
+        }
+    }
+
+    assert_eq!(
+        sparql(&fluree, &db, &ledger.snapshot, query).await,
+        normalize_rows(&Value::Array(expected))
+    );
+}
+
+/// `COUNT(*)` over the same shape, so a count fast path cannot answer it from
+/// the old six-row plan.
+#[tokio::test]
+async fn count_star_counts_second_optional_fan_out() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_novelty(&fluree, "optional-after-optional:count").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    let query = "SELECT (COUNT(*) AS ?n) WHERE { \
+         ?s schema:name ?name . \
+         OPTIONAL { ?s ex:greeting ?f } \
+         OPTIONAL { ?s ex:friend ?f } }";
+
+    assert_eq!(
+        sparql(&fluree, &db, &ledger.snapshot, query).await,
+        normalize_rows(&json!([[9]]))
+    );
+}
+
+/// The indexed lane reaches the second OPTIONAL through `build_batch`'s
+/// subject probe rather than the per-row substituted scan.
+#[tokio::test]
+async fn indexed_second_optional_binds_var_first_left_unbound() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "optional-after-optional:indexed";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = fluree
+                .insert_with_opts(
+                    ledger,
+                    &seed_data(),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+
+            trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            wait_for_index_application(&fluree, ledger_id, ledger.t()).await;
+            let view = fluree.db(ledger_id).await.expect("indexed view");
+            assert!(
+                view.binary_store().is_some(),
+                "the indexed lane needs a binary store on the view; without one this test is a \
+                 duplicate of the novelty-lane one"
+            );
+
+            assert_second_optional_contributes(
+                "sparql/indexed",
+                &sparql(&fluree, &view, &view.snapshot, GREETING_THEN_FRIEND).await,
+                &sparql(&fluree, &view, &view.snapshot, GREETING_ONLY).await,
+            );
+            // The grouped builder's and the property join's own no-match
+            // bindings are written only on their batched (indexed) lanes; on
+            // novelty both fall back to the per-row OPTIONAL.
+            assert_eq!(
+                sparql(&fluree, &view, &view.snapshot, GROUPED_THEN_FRIEND).await,
+                expected_greeting_then_friend(),
+                "grouped/indexed"
+            );
+            assert_eq!(
+                sparql(&fluree, &view, &view.snapshot, STAR_THEN_FRIEND).await,
+                expected_star_then_friend(),
+                "property-join/indexed"
+            );
+        })
+        .await;
 }
