@@ -159,6 +159,32 @@ pub trait OptionalBuilder: Send + Sync {
     fn unify_instructions(&self) -> &[UnifyInstruction];
 }
 
+/// Encoded id of a subject binding, for the batched probes; `None` when the
+/// binding has none.
+fn resolve_subject_id(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+    let Some(store) = ctx.binary_store.as_deref() else {
+        return Ok(None);
+    };
+    match binding {
+        Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
+        Binding::Sid { sid, .. } => {
+            // Persisted reverse dict first, then DictNovelty — subjects
+            // minted after the last index resolve to novelty s_ids, the
+            // same id space the overlay ops are translated into.
+            let persisted = store
+                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
+            Ok(persisted.or_else(|| {
+                ctx.dict_novelty
+                    .as_ref()
+                    .filter(|dn| dn.is_initialized())
+                    .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Builder for single-pattern OPTIONAL
 ///
 /// This is the simplest form of optional builder - it creates a `DatasetOperator`
@@ -321,37 +347,6 @@ impl PatternOptionalBuilder {
     /// per-row path too.
     fn object_var_shared_with_required(&self) -> bool {
         matches!(&self.pattern.o, Term::Var(v) if !self.optional_only_vars.contains(v))
-    }
-
-    fn resolve_subject_id(
-        &self,
-        required_batch: &Batch,
-        row: usize,
-        subject_left_col: usize,
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<u64>> {
-        let binding = required_batch.get_by_col(row, subject_left_col);
-        let Some(store) = ctx.binary_store.as_deref() else {
-            return Ok(None);
-        };
-        match binding {
-            Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-            Binding::Sid { sid, .. } => {
-                // Persisted reverse dict first, then DictNovelty — subjects
-                // minted after the last index resolve to novelty s_ids, the
-                // same id space the overlay ops are translated into.
-                let persisted = store
-                    .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                    .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
-                Ok(persisted.or_else(|| {
-                    ctx.dict_novelty
-                        .as_ref()
-                        .filter(|dn| dn.is_initialized())
-                        .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-                }))
-            }
-            _ => Ok(None),
-        }
     }
 
     /// Substitute required bindings into pattern
@@ -631,7 +626,8 @@ impl OptionalBuilder for PatternOptionalBuilder {
             if self.has_poisoned_binding(required_batch, row) {
                 continue;
             }
-            let Some(s_id) = self.resolve_subject_id(required_batch, row, subject_left_col, ctx)?
+            let Some(s_id) =
+                resolve_subject_id(required_batch.get_by_col(row, subject_left_col), ctx)?
             else {
                 return Ok(None);
             };
@@ -836,36 +832,6 @@ impl GroupedPatternOptionalBuilder {
             .is_poisoned()
     }
 
-    fn resolve_subject_id(
-        &self,
-        required_batch: &Batch,
-        row: usize,
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<u64>> {
-        let binding = required_batch.get_by_col(row, self.subject_left_col);
-        let Some(store) = ctx.binary_store.as_deref() else {
-            return Ok(None);
-        };
-        match binding {
-            Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-            Binding::Sid { sid, .. } => {
-                // Persisted reverse dict first, then DictNovelty — subjects
-                // minted after the last index resolve to novelty s_ids, the
-                // same id space the overlay ops are translated into.
-                let persisted = store
-                    .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                    .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
-                Ok(persisted.or_else(|| {
-                    ctx.dict_novelty
-                        .as_ref()
-                        .filter(|dn| dn.is_initialized())
-                        .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-                }))
-            }
-            _ => Ok(None),
-        }
-    }
-
     fn grouped_schema(&self) -> Arc<[VarId]> {
         Arc::from(self.optional_only_vars.clone().into_boxed_slice())
     }
@@ -1051,7 +1017,9 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 );
                 return Ok(None);
             }
-            let Some(s_id) = self.resolve_subject_id(required_batch, row, ctx)? else {
+            let Some(s_id) =
+                resolve_subject_id(required_batch.get_by_col(row, self.subject_left_col), ctx)?
+            else {
                 tracing::debug!(
                     predicate_count = self.triples.len(),
                     start_row,
@@ -2366,12 +2334,8 @@ impl OptionalOperator {
         let Some(schema) = schema.filter(|_| rows > 0) else {
             return Ok(None);
         };
-        // Empty-schema (0-column) driving side still carries a row count.
-        if schema.is_empty() {
-            Ok(Some(Batch::empty_schema_with_len(rows)))
-        } else {
-            Ok(Some(Batch::new(schema, columns)?))
-        }
+        // `from_parts` keeps the row count of a 0-column driving side.
+        Ok(Some(Batch::from_parts(schema, columns, rows)?))
     }
 
     /// The next required batch, starting with rows a seed left unread.

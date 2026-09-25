@@ -34,7 +34,7 @@ use crate::fast_path_common::{
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::join::{
     batched_subject_probe_binary, batched_subject_star_spot, make_dict_overlay,
-    BatchedSpotStarMatch, BatchedSubjectProbeMatch, SpotStarPredicateParams, SubjectProbeParams,
+    SpotStarPredicateParams, SubjectProbeParams,
 };
 use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
@@ -344,43 +344,22 @@ impl PropertyJoinOperator {
         }
     }
 
-    fn ingest_probe_match(
-        ctx: &ExecutionContext<'_>,
+    /// Mark predicate `pred_idx` present on a probed subject, keeping the
+    /// object when that predicate is emitted. The probe lanes only run over a
+    /// chunk whose keys are all encoded ids, so the id is the key.
+    fn ingest_match(
         subject_values: &mut SubjectMap,
-        emit_pos: Option<usize>,
+        subject_id: u64,
         pred_idx: usize,
-        probe_match: BatchedSubjectProbeMatch,
-    ) -> Result<()> {
-        let subject = Binding::encoded_sid(probe_match.subject_id);
-        if let Some(key) = Self::subject_key(ctx, &subject)? {
-            if let Some(entry) = subject_values.get_mut(&key) {
-                entry.1 |= 1u64 << pred_idx;
-                if let (Some(epos), Some(object)) = (emit_pos, probe_match.object) {
-                    entry.2[epos].push(object);
-                }
+        emit_pos: Option<usize>,
+        object: Option<Binding>,
+    ) {
+        if let Some(entry) = subject_values.get_mut(&SubjectKey::Id(subject_id)) {
+            entry.1 |= 1u64 << pred_idx;
+            if let (Some(epos), Some(object)) = (emit_pos, object) {
+                entry.2[epos].push(object);
             }
         }
-        Ok(())
-    }
-
-    fn ingest_spot_star_match(
-        ctx: &ExecutionContext<'_>,
-        subject_values: &mut SubjectMap,
-        emit_positions: &[Option<usize>],
-        spot_match: BatchedSpotStarMatch,
-    ) -> Result<()> {
-        let subject = Binding::encoded_sid(spot_match.subject_id);
-        if let Some(key) = Self::subject_key(ctx, &subject)? {
-            if let Some(entry) = subject_values.get_mut(&key) {
-                entry.1 |= 1u64 << spot_match.predicate_idx;
-                if let (Some(epos), Some(object)) =
-                    (emit_positions[spot_match.predicate_idx], spot_match.object)
-                {
-                    entry.2[epos].push(object);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Sorted encoded ids of the chunk's subjects, or `None` when the probe
@@ -725,13 +704,14 @@ impl PropertyJoinOperator {
                 )?;
                 self.stats.used_spot_star_walk = true;
                 self.stats.scan_rows_total += spot_matches.len() as u64;
-                for spot_match in spot_matches {
-                    Self::ingest_spot_star_match(
-                        ctx,
+                for m in spot_matches {
+                    Self::ingest_match(
                         &mut self.subject_values,
-                        &self.emit_positions,
-                        spot_match,
-                    )?;
+                        m.subject_id,
+                        m.predicate_idx,
+                        self.emit_positions[m.predicate_idx],
+                        m.object,
+                    );
                 }
             }
             ChunkLanes::PerPredicate(lanes) => {
@@ -812,14 +792,14 @@ impl PropertyJoinOperator {
                 probe_ops.as_deref_mut(),
             )?;
             self.stats.scan_rows_total += probe_matches.len() as u64;
-            for probe_match in probe_matches {
-                Self::ingest_probe_match(
-                    ctx,
+            for m in probe_matches {
+                Self::ingest_match(
                     &mut self.subject_values,
-                    emit_pos,
+                    m.subject_id,
                     pred_idx,
-                    probe_match,
-                )?;
+                    emit_pos,
+                    m.object,
+                );
             }
             chunk_start = i;
         }
