@@ -2,8 +2,9 @@ use crate::binding::Binding;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
-use fluree_db_core::value_id::ObjKind;
+use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
+use fluree_vocab::xsd_names;
 use std::sync::Arc;
 
 fn encoded_i_val(o_i: u32) -> i32 {
@@ -291,6 +292,38 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
                         0,
                     )
                 }
+                // The temporal types `embedded_temporal_encoding` keeps
+                // encoded. Their keys are the canonical value itself.
+                (FlakeValue::Date(d), DatatypeConstraint::Explicit(dt))
+                    if is_xsd(dt, xsd_names::DATE) =>
+                {
+                    (
+                        ObjKind::DATE.as_u8(),
+                        ObjKey::encode_date(d.days_since_epoch()).as_u64(),
+                        DatatypeDictId::DATE.as_u16(),
+                        0,
+                    )
+                }
+                (FlakeValue::Time(t), DatatypeConstraint::Explicit(dt))
+                    if is_xsd(dt, xsd_names::TIME) =>
+                {
+                    (
+                        ObjKind::TIME.as_u8(),
+                        ObjKey::encode_time(t.micros_since_midnight()).as_u64(),
+                        DatatypeDictId::TIME.as_u16(),
+                        0,
+                    )
+                }
+                (FlakeValue::DateTime(dt_val), DatatypeConstraint::Explicit(dt))
+                    if is_xsd(dt, xsd_names::DATE_TIME) =>
+                {
+                    (
+                        ObjKind::DATE_TIME.as_u8(),
+                        ObjKey::encode_datetime(dt_val.epoch_micros()).as_u64(),
+                        DatatypeDictId::DATE_TIME.as_u16(),
+                        0,
+                    )
+                }
                 _ => return None,
             };
             Some(Binding::EncodedLit {
@@ -305,6 +338,10 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
         }
         _ => None,
     }
+}
+
+fn is_xsd(dt: &Sid, name: &str) -> bool {
+    dt.namespace_code == fluree_vocab::namespaces::XSD && dt.name.as_ref() == name
 }
 
 /// Store handle for representation normalization at equality surfaces.

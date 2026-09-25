@@ -23,10 +23,10 @@
 
 mod support;
 use crate::support::{
-    query_jsonld_formatted, query_sparql, start_background_indexer_local,
+    query_jsonld_formatted, query_sparql, span_capture, start_background_indexer_local,
     trigger_index_and_wait_outcome,
 };
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{FlureeBuilder, ReindexOptions};
 use serde_json::{json, Value};
 
 const PREFIX: &str = "PREFIX ex: <http://example.org/ns/> \
@@ -405,6 +405,122 @@ async fn string_dict_datatypes_keep_their_identity_in_novelty_and_index() {
             );
         })
         .await;
+}
+
+const BATCHED_JOIN_LANE: &str = "join batched binary scan complete";
+const BATCHED_OPTIONAL_LANE: &str = "optional batched probe complete";
+
+/// Runs `run`, asserting the lane that logs `lane` served it.
+async fn served_by<F: std::future::Future<Output = Value>>(
+    lane: &str,
+    what: &str,
+    run: F,
+) -> Value {
+    let (spans, guard) = span_capture::init_test_tracing();
+    let rows = run.await;
+    drop(guard);
+    assert!(
+        !spans.find_events(lane).is_empty(),
+        "{what}: expected the lane that logs {lane:?}"
+    );
+    rows
+}
+
+/// `xsd:date`, `xsd:time` and `xsd:dateTime` keep one key whichever lane
+/// produced them. The batched probe lanes emit them encoded, while a scan over
+/// novelty (and, on an indexed ledger, the nested-loop join's own builder)
+/// emitted them decoded, and the equality surfaces normalized neither form
+/// into the other: a value reached both ways was two DISTINCT keys, two
+/// groups, and survived its own MINUS.
+#[tokio::test]
+async fn temporal_literals_keep_one_key_across_join_lanes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/temporal-join-lanes:main";
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    let typed = |value: &str, dt: &str| json!({"@value": value, "@type": format!("http://www.w3.org/2001/XMLSchema#{dt}")});
+    // Each value twice, so a split key shows as a doubled count.
+    let whens = [
+        typed("2024-01-01", "date"),
+        typed("2024-01-01", "date"),
+        typed("2024-01-01T10:00:00Z", "dateTime"),
+        typed("2024-01-01T10:00:00Z", "dateTime"),
+        typed("10:00:00", "time"),
+        typed("10:00:00", "time"),
+    ];
+    let mut graph: Vec<Value> = whens
+        .iter()
+        .enumerate()
+        .map(|(i, when)| json!({"@id": format!("ex:s{i}"), "ex:name": format!("n{i}"), "ex:when": when}))
+        .collect();
+    graph.push(json!({"@id": "ex:hub",
+                      "ex:ref": (0..whens.len()).map(|i| json!({"@id": format!("ex:s{i}")})).collect::<Vec<_>>()}));
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": graph}),
+        )
+        .await
+        .unwrap();
+    fluree.reindex(id, ReindexOptions::default()).await.unwrap();
+
+    let via_join = "{ ex:hub ex:ref ?s . ?s ex:when ?d }";
+    let via_optional = "{ ?s ex:name ?n OPTIONAL { ?s ex:when ?d } }";
+    let via_scan = "{ ?t ex:when ?d }";
+    for phase in ["indexed", "mixed"] {
+        if phase == "mixed" {
+            // Any novelty makes the scan decode its objects.
+            let head = fluree.ledger(id).await.unwrap();
+            fluree
+                .insert(
+                    head,
+                    &json!({"@context": {"ex": "http://example.org/ns/"},
+                                     "@id": "ex:other", "ex:unrelated": "x"}),
+                )
+                .await
+                .unwrap();
+        }
+        let view = fluree.ledger(id).await.unwrap();
+        assert!(view.snapshot.range_provider.is_some(), "{phase}: setup");
+
+        for (lane, lane_name, branch) in [
+            (BATCHED_JOIN_LANE, "join", via_join),
+            (BATCHED_OPTIONAL_LANE, "optional", via_optional),
+        ] {
+            let what = format!("{phase}: {lane_name}");
+            let q =
+                format!("SELECT (COUNT(DISTINCT ?d) AS ?c) WHERE {{ {branch} UNION {via_scan} }}");
+            let got = served_by(lane, &what, sparql(&fluree, &view, &q)).await;
+            assert_eq!(got, json!([[3]]), "{what}: COUNT(DISTINCT) across lanes");
+            let q = format!(
+                "SELECT (COUNT(*) AS ?rows) WHERE {{ {branch} UNION {via_scan} }} GROUP BY ?d"
+            );
+            let got = served_by(lane, &what, sparql(&fluree, &view, &q)).await;
+            assert_eq!(got, json!([[4], [4], [4]]), "{what}: GROUP BY across lanes");
+            let q = format!("SELECT ?d WHERE {{ ?t ex:when ?d MINUS {branch} }}");
+            let got = served_by(lane, &what, sparql(&fluree, &view, &q)).await;
+            assert_eq!(got, json!([]), "{what}: MINUS across lanes");
+        }
+
+        let got = served_by(BATCHED_JOIN_LANE, phase, async {
+            query_jsonld_formatted(
+                &fluree,
+                &view,
+                &json!({"@context": {"ex": "http://example.org/ns/"},
+                        "select": ["(as (count-distinct ?d) ?c)"],
+                        "where": [["union",
+                                   [{"@id": "ex:hub", "ex:ref": "?s"}, {"@id": "?s", "ex:when": "?d"}],
+                                   {"@id": "?t", "ex:when": "?d"}]]}),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(
+            got,
+            json!([[3]]),
+            "{phase}: json-ld count-distinct across lanes"
+        );
+    }
 }
 
 /// Bare numerics are deliberately unconstrained: `25` still matches a value
