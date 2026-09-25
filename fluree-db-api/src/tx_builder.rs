@@ -839,13 +839,11 @@ impl<'a> OwnedTransactBuilder<'a> {
             // flakes, but a graph_delta IRI the registry doesn't know yet)
             // must still COMMIT so the registration persists — only a no-op
             // whose delta is already fully registered may skip the commit.
-            let registers_new_graph = graph_delta.values().any(|iri| {
-                view.base()
-                    .snapshot
-                    .graph_registry
-                    .graph_id_for_iri(iri)
-                    .is_none()
-            });
+            let registers_new_graph = view
+                .base()
+                .snapshot
+                .graph_registry
+                .has_unregistered(graph_delta.values().map(String::as_str));
 
             // Add extracted transaction metadata and graph delta to commit opts
             let commit_opts = self
@@ -939,13 +937,11 @@ impl<'a> OwnedTransactBuilder<'a> {
                 sync_graph: _,
                 scope: _,
             } = stage_result;
-            let registers_new_graph = graph_delta.values().any(|iri| {
-                view.base()
-                    .snapshot
-                    .graph_registry
-                    .graph_id_for_iri(iri)
-                    .is_none()
-            });
+            let registers_new_graph = view
+                .base()
+                .snapshot
+                .graph_registry
+                .has_unregistered(graph_delta.values().map(String::as_str));
             let commit_opts = self
                 .core
                 .commit_opts

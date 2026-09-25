@@ -2468,6 +2468,103 @@ fn convert_named_graphs_to_templates(
     Ok((templates, graph_iris))
 }
 
+/// Stage options for a write: backpressure against `index_config`, modify
+/// policy, and fuel tracking when the tracker is enabled.
+fn stage_options<'a>(
+    index_config: Option<&'a IndexConfig>,
+    policy: Option<&'a crate::PolicyContext>,
+    tracker: Option<&'a Tracker>,
+) -> StageOptions<'a> {
+    let mut options = StageOptions::new();
+    if let Some(cfg) = index_config {
+        options = options.with_index_config(cfg);
+    }
+    if let Some(p) = policy {
+        options = options.with_policy(p);
+    }
+    if let Some(t) = tracker.filter(|t| t.is_enabled()) {
+        options = options.with_tracker(t);
+    }
+    options
+}
+
+/// A staged transaction that passed the checks every write gets after
+/// staging: SHACL (with the `shacl` feature), uniqueness, and reasoning
+/// modes.
+struct CheckedStage {
+    view: StagedLedger,
+    ns_registry: NamespaceRegistry,
+    graph_delta: FxHashMap<u16, String>,
+    /// SHACL validation or uniqueness enforcement ran, so the stage read
+    /// beyond the subjects the transaction names.
+    governed: bool,
+}
+
+impl crate::Fluree {
+    /// Stage `txn` and run the post-staging checks. A single per-transaction
+    /// `ResolveCtx` serves every cross-ledger governance lookup (SHACL
+    /// shapes, constraints, …) so the transaction observes one `resolved_t`
+    /// per model ledger. A novelty-backpressure rejection also requests an
+    /// index build to the t the ledger was staged at.
+    async fn stage_and_check(
+        &self,
+        ledger: LedgerState,
+        txn: Txn,
+        ns_registry: NamespaceRegistry,
+        options: StageOptions<'_>,
+        txn_context: Option<&JsonValue>,
+    ) -> std::result::Result<CheckedStage, fluree_db_transact::TransactError> {
+        let inline_unique_properties = txn.opts.unique_properties.clone();
+        let ledger_id = ledger.snapshot.ledger_id.to_string();
+        let base_t = ledger.t();
+        let mut resolve_ctx =
+            crate::cross_ledger::ResolveCtx::new(&ledger_id, self).with_data_state(ledger.clone());
+
+        #[cfg(feature = "shacl")]
+        let staged = stage_with_config_shacl(
+            ledger,
+            txn,
+            ns_registry,
+            options,
+            &mut resolve_ctx,
+            txn_context,
+        )
+        .await;
+        #[cfg(not(feature = "shacl"))]
+        let staged = {
+            let _ = txn_context;
+            stage_txn(ledger, txn, ns_registry, options)
+                .await
+                .map(|(view, ns_registry, graph_delta)| (view, ns_registry, false, graph_delta))
+        };
+        let (view, ns_registry, validated, graph_delta) = match staged {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.request_index_after_novelty_rejection(&ledger_id, base_t, &e)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        let unique_enforced = enforce_unique_after_staging(
+            &view,
+            &graph_delta,
+            &mut resolve_ctx,
+            inline_unique_properties.as_deref(),
+            &ns_registry,
+        )
+        .await?;
+        validate_staged_reasoning_modes(&view)?;
+
+        Ok(CheckedStage {
+            view,
+            ns_registry,
+            graph_delta,
+            governed: validated || unique_enforced,
+        })
+    }
+}
+
 impl crate::Fluree {
     /// Stage a transaction against a ledger (no persistence).
     ///
@@ -2754,11 +2851,9 @@ impl crate::Fluree {
         external_tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
-        // Extract txn_meta and any inline uniqueness
-        // properties before staging consumes the Txn.
+        // Extract txn_meta before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
         let sync_graph = txn.sync_graph.clone();
-        let inline_unique_properties = txn.opts.unique_properties.clone();
         let read_subjects = bounded_read_subjects(&txn, &mut ns_registry, &ledger);
 
         // Use external tracker if provided, otherwise fall back to limits-only tracker
@@ -2771,75 +2866,23 @@ impl crate::Fluree {
             }
         };
 
-        let mut options = match index_config {
-            Some(cfg) => StageOptions::new().with_index_config(cfg),
-            None => StageOptions::default(),
-        };
-        if tracker.is_enabled() {
-            options = options.with_tracker(tracker);
-        }
-        if let Some(p) = policy {
-            options = options.with_policy(p);
-        }
+        let options = stage_options(index_config, policy, Some(tracker));
 
-        // Single per-tx ResolveCtx shared by every cross-ledger
-        // governance lookup (SHACL shapes, constraints, …) so the
-        // tx observes a coherent `resolved_t` per model ledger
-        // across all subsystems. `ledger_id_owned` keeps a string
-        // alive past the `ledger` move into `stage_with_config_shacl`.
-        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
-        // Captured before `ledger` moves into staging, so a max-novelty
-        // rejection can name the t the indexer should build to.
-        let base_t = ledger.t();
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
-            .with_data_state(ledger.clone());
-
-        #[cfg(feature = "shacl")]
-        let staged = stage_with_config_shacl(
-            ledger,
-            txn,
-            ns_registry,
-            options,
-            &mut resolve_ctx,
-            txn_json.get("@context"),
-        )
-        .await;
-        #[cfg(not(feature = "shacl"))]
-        let staged = stage_txn(ledger, txn, ns_registry, options)
-            .await
-            .map(|(view, ns_registry, graph_delta)| (view, ns_registry, false, graph_delta));
-        let (view, ns_registry, validated, graph_delta) = match staged {
-            Ok(staged) => staged,
-            Err(e) => {
-                self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
-                    .await;
-                return Err(e.into());
-            }
-        };
-
-        // Enforce uniqueness constraints (independent of shacl feature)
-        let unique_enforced = enforce_unique_after_staging(
-            &view,
-            &graph_delta,
-            &mut resolve_ctx,
-            inline_unique_properties.as_deref(),
-            &ns_registry,
-        )
-        .await?;
-
-        validate_staged_reasoning_modes(&view)?;
+        let staged = self
+            .stage_and_check(ledger, txn, ns_registry, options, txn_json.get("@context"))
+            .await?;
 
         let scope = write_scope(
             read_subjects,
-            &view,
-            validated || unique_enforced || policy.is_some(),
+            &staged.view,
+            staged.governed || policy.is_some(),
         );
         Ok(StageResult {
-            view,
-            ns_registry,
+            view: staged.view,
+            ns_registry: staged.ns_registry,
             scope,
             txn_meta,
-            graph_delta,
+            graph_delta: staged.graph_delta,
             sync_graph,
         })
     }
@@ -2919,77 +2962,36 @@ impl crate::Fluree {
                 })?;
         }
 
-        // Extract txn_meta and any inline uniqueness
-        // properties before staging consumes the Txn.
+        // Extract txn_meta before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
-        let inline_unique_properties = txn.opts.unique_properties.clone();
         let read_subjects = bounded_read_subjects(&txn, &mut ns_registry, &ledger);
 
-        let mut options = match index_config {
-            Some(cfg) => StageOptions::new().with_index_config(cfg),
-            None => StageOptions::default(),
-        };
-        if let Some(p) = policy {
-            options = options.with_policy(p);
-        }
-        if let Some(t) = tracker {
-            if t.is_enabled() {
-                options = options.with_tracker(t);
-            }
-        }
+        let options = stage_options(index_config, policy, tracker);
 
-        // Single per-tx ResolveCtx; see comment on the matching
-        // block above for the consistency rationale.
-        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
-        // Captured before `ledger` moves into staging, so a max-novelty
-        // rejection can name the t the indexer should build to.
-        let base_t = ledger.t();
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
-            .with_data_state(ledger.clone());
-
-        #[cfg(feature = "shacl")]
-        let staged = stage_with_config_shacl(
-            ledger,
-            txn,
-            ns_registry,
-            options,
-            &mut resolve_ctx,
-            // Txn-based entry: no source document, so no authoring
-            // context to compact violation messages against.
-            None,
-        )
-        .await;
-        #[cfg(not(feature = "shacl"))]
-        let staged = stage_txn(ledger, txn, ns_registry, options)
-            .await
-            .map(|(view, ns_registry, graph_delta)| (view, ns_registry, false, graph_delta));
-        let (view, ns_registry, validated, graph_delta) = match staged {
-            Ok(staged) => staged,
-            Err(e) => {
-                self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
-                    .await;
-                return Err(e.into());
-            }
-        };
-
-        // Enforce uniqueness constraints (independent of shacl feature)
-        let unique_enforced = enforce_unique_after_staging(
-            &view,
-            &graph_delta,
-            &mut resolve_ctx,
-            inline_unique_properties.as_deref(),
-            &ns_registry,
-        )
-        .await?;
-
-        validate_staged_reasoning_modes(&view)?;
+        let staged = self
+            .stage_and_check(
+                ledger,
+                txn,
+                ns_registry,
+                options,
+                // Txn-based entry: no source document, so no authoring
+                // context to compact violation messages against.
+                None,
+            )
+            .await?;
 
         let scope = write_scope(
             read_subjects,
-            &view,
-            validated || unique_enforced || policy.is_some(),
+            &staged.view,
+            staged.governed || policy.is_some(),
         );
-        Ok((view, ns_registry, scope, txn_meta, graph_delta))
+        Ok((
+            staged.view,
+            staged.ns_registry,
+            scope,
+            txn_meta,
+            staged.graph_delta,
+        ))
     }
 
     /// Stage an ordered pair of transactions against the same base ledger and
@@ -3164,10 +3166,8 @@ impl crate::Fluree {
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?
         };
 
-        // Extract txn_meta and any inline uniqueness
-        // properties before staging consumes the Txn.
+        // Extract txn_meta before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
-        let inline_unique_properties = txn.opts.unique_properties.clone();
 
         // Build stage options with policy and tracker
         let mut options = StageOptions::new()
@@ -3177,72 +3177,34 @@ impl crate::Fluree {
             options = options.with_index_config(cfg);
         }
 
-        // Single per-tx ResolveCtx; see comment on the matching
-        // block above for the consistency rationale.
-        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
-        // Captured before `ledger` moves into staging; see the matching block
-        // above.
-        let base_t = ledger.t();
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
-            .with_data_state(ledger.clone());
-
-        #[cfg(feature = "shacl")]
-        let staged = stage_with_config_shacl(
-            ledger,
-            txn,
-            ns_registry,
-            options,
-            &mut resolve_ctx,
-            // The source document IS available here — `parse_transaction` above
-            // borrows it — so violations compact against the author's own terms.
-            // This entry point is where policy-bearing writes land, including the
-            // tracked server write path, so passing `None` here meant that on a
-            // deployed server with policy on, essentially every rejected write
-            // reported full IRIs while the same transaction without a policy
-            // reported `ex:alex`.
-            input.txn_json.get("@context"),
-        )
-        .await;
-        #[cfg(not(feature = "shacl"))]
-        let staged = stage_txn(ledger, txn, ns_registry, options)
+        let staged = self
+            .stage_and_check(
+                ledger,
+                txn,
+                ns_registry,
+                options,
+                // The source document IS available here — `parse_transaction`
+                // above borrows it — so violations compact against the
+                // author's own terms. This entry point is where policy-bearing
+                // writes land, including the tracked server write path, so
+                // passing `None` here meant that on a deployed server with
+                // policy on, essentially every rejected write reported full
+                // IRIs while the same transaction without a policy reported
+                // `ex:alex`.
+                input.txn_json.get("@context"),
+            )
             .await
-            .map(|(view, ns_registry, graph_delta)| (view, ns_registry, false, graph_delta));
-        let (view, ns_registry, _validated, graph_delta) = match staged {
-            Ok(staged) => staged,
-            Err(e) => {
-                self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
-                    .await;
-                // The 400 is preserved as-is: correcting the status for novelty
-                // backpressure is a separate concern from noticing it.
-                return Err(TrackedErrorResponse::new(
-                    400,
-                    e.to_string(),
-                    tracker.tally(),
-                ));
-            }
-        };
-
-        // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(
-            &view,
-            &graph_delta,
-            &mut resolve_ctx,
-            inline_unique_properties.as_deref(),
-            &ns_registry,
-        )
-        .await
-        .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
-
-        validate_staged_reasoning_modes(&view)
+            // The 400 is preserved as-is: correcting the status for novelty
+            // backpressure is a separate concern from noticing it.
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 
         Ok(StageResult {
-            view,
-            ns_registry,
+            view: staged.view,
+            ns_registry: staged.ns_registry,
             // Policy-bearing writes commit under the lock; nothing re-bases them.
             scope: WriteScope::Unbounded,
             txn_meta,
-            graph_delta,
+            graph_delta: staged.graph_delta,
             sync_graph: None,
         })
     }
@@ -3843,21 +3805,10 @@ impl crate::Fluree {
         };
 
         // Stage the flakes (backpressure + optional policy)
-        let mut options = match index_config {
-            Some(cfg) => StageOptions::new().with_index_config(cfg),
-            None => StageOptions::default(),
-        };
-        if let Some(tracker) = tracker {
-            if tracker.is_enabled() {
-                options = options.with_tracker(tracker);
-            }
-        }
-        // Enforce f:modify policy on the parsed flakes. Without this a Turtle
+        // Carries f:modify policy for the parsed flakes. Without it a Turtle
         // write would skip transaction-time enforcement entirely (the JSON/IR
         // path applies it via StageOptions; the direct flake path must too).
-        if let Some(policy) = policy {
-            options = options.with_policy(policy);
-        }
+        let options = stage_options(index_config, policy, tracker);
         let view = match stage_flakes(ledger, flakes, options).await {
             Ok(view) => view,
             Err(e) => {

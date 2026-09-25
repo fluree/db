@@ -628,9 +628,7 @@ pub async fn build_commit(
     //    writes one is the durable record the registration probe, merge and
     //    config readers look for.
     let registry = &base.snapshot.graph_registry;
-    let registers_new_graph = graph_iris
-        .iter()
-        .any(|iri| registry.graph_id_for_iri(iri).is_none());
+    let registers_new_graph = registry.has_unregistered(graph_iris.iter().map(String::as_str));
     let mut graph_iris = graph_iris;
     graph_iris.retain(|iri| {
         registry
