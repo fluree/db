@@ -417,7 +417,7 @@ impl Fluree {
 
         let commit_opts = fluree_db_transact::CommitOpts::default()
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
 
         let (receipt, ledger) = if !view.has_staged() {
             let (base, flakes) = view.into_parts();

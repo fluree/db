@@ -217,7 +217,7 @@ impl<'a> CypherLowering<'a> {
             opts: self.opts,
             vars: self.vars,
             txn_meta: Vec::new(),
-            graph_delta: Default::default(),
+            write_graphs: Default::default(),
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
             sync_graph: None,

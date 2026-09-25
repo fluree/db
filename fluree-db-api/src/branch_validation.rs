@@ -18,7 +18,7 @@ use crate::error::{ApiError, Result};
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::{ConflictKey, Flake, GraphId, Sid};
 use fluree_db_ledger::{LedgerState, StagedLedger};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Outcome of validating a branch operation's staged view.
 ///
@@ -63,6 +63,43 @@ impl BranchOpValidation {
     }
 }
 
+/// Named graphs in `graph_iris` that `state` has not registered, as
+/// provisional graph id -> (graph Sid, IRI): the id the commit's registration
+/// will assign. The Sid is resolved against the state's namespaces plus
+/// `namespace_delta`, the codes the incoming commits introduced, so it
+/// matches the Sid their flakes carry.
+fn unregistered_graphs(
+    state: &LedgerState,
+    namespace_delta: &HashMap<u16, String>,
+    graph_iris: &BTreeSet<String>,
+) -> Result<HashMap<GraphId, (Sid, String)>> {
+    let registry = &state.snapshot.graph_registry;
+    let new: Vec<String> = graph_iris
+        .iter()
+        .filter(|iri| registry.graph_id_for_iri(iri).is_none())
+        .cloned()
+        .collect();
+    if new.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&state.snapshot);
+    ns.adopt_delta_for_persistence(namespace_delta)
+        .map_err(|e| {
+            ApiError::BranchConflict(format!(
+                "the incoming commits' namespace allocations conflict with the target's: {e}"
+            ))
+        })?;
+    let ids = registry.provisional_ids(&new);
+    Ok(new
+        .into_iter()
+        .filter_map(|iri| {
+            let g_id = *ids.get(iri.as_str())?;
+            let sid = ns.lookup_sid_for_iri(&iri)?;
+            Some((g_id, (sid, iri)))
+        })
+        .collect())
+}
+
 impl crate::Fluree {
     /// Stage `flakes` onto `state` and validate the result against the
     /// ledger's SHACL configuration and shapes.
@@ -82,15 +119,26 @@ impl crate::Fluree {
         state: LedgerState,
         flakes: Vec<Flake>,
         namespace_delta: &HashMap<u16, String>,
+        graph_iris: &BTreeSet<String>,
         op: &'static str,
     ) -> Result<(StagedLedger, BranchOpValidation)> {
-        let reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
+        let mut reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
             ApiError::internal(format!("Failed to build reverse graph during {op}: {e}"))
         })?;
+        // Graphs the incoming commits created that this state has not
+        // registered, routed by the id the commit will give them.
+        let new_graphs = unregistered_graphs(&state, namespace_delta, graph_iris)?;
+        for (g_id, (sid, _)) in &new_graphs {
+            reverse_graph.insert(sid.clone(), *g_id);
+        }
         let mut view = StagedLedger::new(state, flakes, &reverse_graph)
             .map_err(|e| ApiError::internal(format!("Failed to stage flakes during {op}: {e}")))?;
+        let new_graph_iris: HashMap<GraphId, String> = new_graphs
+            .into_iter()
+            .map(|(g_id, (_, iri))| (g_id, iri))
+            .collect();
         let outcome = self
-            .validate_branch_op_view(&mut view, &reverse_graph, namespace_delta)
+            .validate_branch_op_view(&mut view, &reverse_graph, namespace_delta, &new_graph_iris)
             .await?;
         Ok((view, outcome))
     }
@@ -105,11 +153,12 @@ impl crate::Fluree {
         conflicts: &[ConflictKey],
         strategy: &ConflictStrategy,
         namespace_delta: &HashMap<u16, String>,
+        graph_iris: &BTreeSet<String>,
     ) -> Result<(StagedLedger, BranchOpValidation)> {
         let resolved = self
             .apply_two_way_strategy(source_flakes, conflicts, strategy, &target_state)
             .await?;
-        self.stage_validated(target_state, resolved, namespace_delta, "merge")
+        self.stage_validated(target_state, resolved, namespace_delta, graph_iris, "merge")
             .await
     }
 
@@ -127,6 +176,7 @@ impl crate::Fluree {
         conflicts: &[ConflictKey],
         strategy: &ConflictStrategy,
         namespace_delta: &HashMap<u16, String>,
+        graph_iris: &BTreeSet<String>,
     ) -> Result<Option<(StagedLedger, BranchOpValidation)>> {
         let staged = self
             .apply_two_way_strategy(inverted, conflicts, strategy, &target_state)
@@ -134,7 +184,7 @@ impl crate::Fluree {
         if staged.is_empty() {
             return Ok(None);
         }
-        self.stage_validated(target_state, staged, namespace_delta, "revert")
+        self.stage_validated(target_state, staged, namespace_delta, graph_iris, "revert")
             .await
             .map(Some)
     }
@@ -148,6 +198,7 @@ impl crate::Fluree {
         view: &mut StagedLedger,
         reverse_graph: &HashMap<Sid, GraphId>,
         namespace_delta: &HashMap<u16, String>,
+        new_graph_iris: &HashMap<GraphId, String>,
     ) -> Result<BranchOpValidation> {
         use crate::tx::{
             apply_shacl_policy_to_staged_view, open_cross_ledger_shapes_model,
@@ -230,8 +281,14 @@ impl crate::Fluree {
         let mut graph_delta: rustc_hash::FxHashMap<u16, String> = rustc_hash::FxHashMap::default();
         for g_sid in view.staged_flakes().iter().filter_map(|f| f.g.as_ref()) {
             if let Some(&g_id) = reverse_graph.get(g_sid) {
-                if let Some(iri) = base.snapshot.graph_registry.iri_for_graph_id(g_id) {
-                    graph_delta.entry(g_id).or_insert_with(|| iri.to_string());
+                let iri = base
+                    .snapshot
+                    .graph_registry
+                    .iri_for_graph_id(g_id)
+                    .map(str::to_string)
+                    .or_else(|| new_graph_iris.get(&g_id).cloned());
+                if let Some(iri) = iri {
+                    graph_delta.entry(g_id).or_insert(iri);
                 }
             }
         }
@@ -273,6 +330,7 @@ impl crate::Fluree {
         _view: &mut StagedLedger,
         _reverse_graph: &HashMap<Sid, GraphId>,
         _namespace_delta: &HashMap<u16, String>,
+        _new_graph_iris: &HashMap<GraphId, String>,
     ) -> Result<BranchOpValidation> {
         Ok(BranchOpValidation::default())
     }

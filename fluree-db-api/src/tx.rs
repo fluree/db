@@ -527,8 +527,8 @@ fn validate_staged_reasoning_modes(
 /// per-graph overlay, ledger-wide baseline) and override-control rules — and
 /// include it in the returned map **iff SHACL is enabled for that graph**.
 ///
-/// The returned map is keyed by `GraphId` (the transaction's internal
-/// numeric graph id). Graphs absent from the map are treated as disabled by
+/// The returned map is keyed by ledger `GraphId`, as `graph_delta` is.
+/// Graphs absent from the map are treated as disabled by
 /// the validator. The default graph (g_id=0) is always included when SHACL
 /// is enabled ledger-wide — shapes live there by default, and it's the
 /// implicit focus-graph for Turtle inserts and any flake without an explicit
@@ -1608,12 +1608,15 @@ async fn enforce_unique_after_staging(
     staged_ns: &NamespaceRegistry,
 ) -> std::result::Result<bool, fluree_db_transact::TransactError> {
     let config = load_transaction_config(view.base()).await;
+    let graph_ids = graph_ids_by_sid(view, graph_delta, staged_ns);
 
     // Start with config-resolved per-graph SIDs (same/cross ledger).
     // No config → empty; inline properties below can still drive
     // enforcement when set.
     let mut per_graph_unique: HashMap<GraphId, FxHashSet<Sid>> = match &config {
-        Some(cfg) => resolve_per_graph_unique_sids(view, cfg, graph_delta, resolve_ctx).await?,
+        Some(cfg) => {
+            resolve_per_graph_unique_sids(view, cfg, graph_delta, &graph_ids, resolve_ctx).await?
+        }
         None => HashMap::new(),
     };
 
@@ -1654,7 +1657,7 @@ async fn enforce_unique_after_staging(
             )));
         }
         if !inline_sids.is_empty() {
-            for g_id in affected_graph_ids(view, graph_delta) {
+            for g_id in affected_graph_ids(view, &graph_ids) {
                 per_graph_unique
                     .entry(g_id)
                     .or_default()
@@ -1666,8 +1669,32 @@ async fn enforce_unique_after_staging(
     if per_graph_unique.is_empty() {
         return Ok(false);
     }
-    enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
+    enforce_unique_constraints(view, &per_graph_unique, graph_delta, &graph_ids).await?;
     Ok(true)
+}
+
+/// Ledger graph id of each named graph a staged flake can sit in, by graph
+/// Sid: the graphs the transaction writes (`graph_delta`, keyed by ledger
+/// graph id) and every registered graph. Sids come from the staged namespace
+/// registry, which also knows namespaces the transaction introduced.
+fn graph_ids_by_sid(
+    view: &StagedLedger,
+    graph_delta: &FxHashMap<u16, String>,
+    staged_ns: &NamespaceRegistry,
+) -> HashMap<Sid, GraphId> {
+    graph_delta
+        .iter()
+        .map(|(&g_id, iri)| (g_id, iri.as_str()))
+        .chain(view.db().graph_registry.iter_entries())
+        .filter_map(|(g_id, iri)| Some((staged_ns.lookup_sid_for_iri(iri)?, g_id)))
+        .collect()
+}
+
+fn flake_graph_id(flake: &fluree_db_core::Flake, graph_ids: &HashMap<Sid, GraphId>) -> GraphId {
+    match &flake.g {
+        None => 0,
+        Some(g_sid) => graph_ids.get(g_sid).copied().unwrap_or(0),
+    }
 }
 
 /// Derive the set of graph IDs touched by staged flakes. Used by
@@ -1676,33 +1703,13 @@ async fn enforce_unique_after_staging(
 /// set of graphs.
 fn affected_graph_ids(
     view: &StagedLedger,
-    graph_delta: &FxHashMap<u16, String>,
+    graph_ids: &HashMap<Sid, GraphId>,
 ) -> FxHashSet<GraphId> {
-    let snapshot = view.db();
-    let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
-    for (&g_id, iri) in graph_delta {
-        if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.insert(sid, g_id);
-        }
-    }
-    for (g_id, iri) in snapshot.graph_registry.iter_entries() {
-        if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.entry(sid).or_insert(g_id);
-        }
-    }
-
-    let mut out: FxHashSet<GraphId> = FxHashSet::default();
-    for flake in view.staged_flakes() {
-        if !flake.op {
-            continue;
-        }
-        let g_id = match &flake.g {
-            None => 0u16,
-            Some(g_sid) => sid_to_gid.get(g_sid).copied().unwrap_or(0),
-        };
-        out.insert(g_id);
-    }
-    out
+    view.staged_flakes()
+        .iter()
+        .filter(|flake| flake.op)
+        .map(|flake| flake_graph_id(flake, graph_ids))
+        .collect()
 }
 
 /// Resolve per-graph unique property SIDs from `f:enforceUnique` annotations.
@@ -1716,10 +1723,11 @@ async fn resolve_per_graph_unique_sids(
     view: &StagedLedger,
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
+    graph_ids: &HashMap<Sid, GraphId>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<HashMap<GraphId, FxHashSet<Sid>>, fluree_db_transact::TransactError> {
     let snapshot = view.db();
-    let affected_g_ids = affected_graph_ids(view, graph_delta);
+    let affected_g_ids = affected_graph_ids(view, graph_ids);
     let mut per_graph: HashMap<GraphId, FxHashSet<Sid>> = HashMap::new();
 
     for &g_id in &affected_g_ids {
@@ -1931,6 +1939,7 @@ async fn enforce_unique_constraints(
     view: &StagedLedger,
     per_graph_unique: &HashMap<GraphId, FxHashSet<Sid>>,
     graph_delta: &FxHashMap<u16, String>,
+    graph_ids: &HashMap<Sid, GraphId>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     // Fast path: nothing configured
     if per_graph_unique.is_empty() {
@@ -1938,19 +1947,6 @@ async fn enforce_unique_constraints(
     }
 
     let snapshot = view.db();
-
-    // Build reverse map for flake graph resolution
-    let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
-    for (&g_id, iri) in graph_delta {
-        if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.insert(sid, g_id);
-        }
-    }
-    for (g_id, iri) in snapshot.graph_registry.iter_entries() {
-        if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.entry(sid).or_insert(g_id);
-        }
-    }
 
     // Collect distinct (g_id, p, o) keys from staged asserts on unique properties.
     // Uniqueness ignores datatype and language tag — the key is the storage-layer
@@ -1960,10 +1956,7 @@ async fn enforce_unique_constraints(
         if !flake.op {
             continue;
         }
-        let g_id = match &flake.g {
-            None => 0u16,
-            Some(g_sid) => sid_to_gid.get(g_sid).copied().unwrap_or(0),
-        };
+        let g_id = flake_graph_id(flake, graph_ids);
         if let Some(unique_set) = per_graph_unique.get(&g_id) {
             if unique_set.contains(&flake.p) {
                 keys_to_check.insert((g_id, flake.p.clone(), flake.o.clone()));
@@ -2200,7 +2193,7 @@ fn bounded_read_subjects(
 ) -> Option<FxHashSet<Sid>> {
     if txn.graph_mgmt.is_some()
         || txn.sync_graph.is_some()
-        || !txn.graph_delta.is_empty()
+        || !txn.write_graphs.is_empty()
         || txn.sparql_where.is_some()
         || txn.values.is_some()
         || txn.update_where_default_graph_iris.is_some()
@@ -2263,23 +2256,16 @@ fn write_scope(
     WriteScope::Subjects(subjects)
 }
 
-/// Convert named graph blocks to TripleTemplates with proper graph_id assignments.
-///
-/// Returns a tuple of (templates, graph_delta) where:
-/// - templates: Vec<TripleTemplate> with graph_id set for each template
-/// - graph_delta: HashMap<u16, String> mapping g_id to graph IRI
-///
-/// Graph IDs are assigned starting at 2 (0=default, 1=txn-meta).
+/// Convert named graph blocks to templates in their graphs, returning the
+/// templates and the graph IRIs they write to.
 fn convert_named_graphs_to_templates(
     named_graphs: &[NamedGraphBlock],
     ns_registry: &mut NamespaceRegistry,
-) -> Result<(Vec<TripleTemplate>, rustc_hash::FxHashMap<u16, String>)> {
+) -> Result<(Vec<TripleTemplate>, Vec<String>)> {
     use fluree_db_transact::{RawObject, RawTerm};
 
     let mut templates = Vec::new();
-    let mut graph_delta: rustc_hash::FxHashMap<u16, String> = rustc_hash::FxHashMap::default();
-    let mut iri_to_id: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
-    let mut next_graph_id: u16 = 3; // 0=default, 1=txn-meta, 2=config
+    let mut graph_iris: Vec<String> = Vec::new();
 
     // Helper to expand prefixed name to full IRI
     fn expand_prefixed_name(
@@ -2377,13 +2363,8 @@ fn convert_named_graphs_to_templates(
     }
 
     for block in named_graphs {
-        // Assign a graph_id to this graph IRI (or reuse existing)
-        let g_id = *iri_to_id.entry(block.iri.clone()).or_insert_with(|| {
-            let id = next_graph_id;
-            graph_delta.insert(id, block.iri.clone());
-            next_graph_id += 1;
-            id
-        });
+        graph_iris.push(block.iri.clone());
+        let graph: std::sync::Arc<str> = std::sync::Arc::from(block.iri.as_str());
 
         // Convert each triple in this graph block
         for triple in &block.triples {
@@ -2428,7 +2409,7 @@ fn convert_named_graphs_to_templates(
                 let (object_term, dtc) = convert_object(obj, &block.prefixes, ns_registry)?;
                 let mut template =
                     TripleTemplate::new(subject_term.clone(), predicate_term.clone(), object_term);
-                template = template.with_graph_id(g_id);
+                template = template.in_graph(std::sync::Arc::clone(&graph));
                 if let Some(dtc) = dtc {
                     template = template.with_dtc(dtc);
                 }
@@ -2460,7 +2441,7 @@ fn convert_named_graphs_to_templates(
                                 dtc: Option<DatatypeConstraint>| {
                     let mut t =
                         TripleTemplate::new(ann.clone(), TemplateTerm::Sid(pred.clone()), obj)
-                            .with_graph_id(g_id);
+                            .in_graph(std::sync::Arc::clone(&graph));
                     if let Some(d) = dtc {
                         t = t.with_dtc(d);
                     }
@@ -2485,7 +2466,7 @@ fn convert_named_graphs_to_templates(
         }
     }
 
-    Ok((templates, graph_delta))
+    Ok((templates, graph_iris))
 }
 
 impl crate::Fluree {
@@ -2686,10 +2667,10 @@ impl crate::Fluree {
 
         // Convert named graph blocks to TripleTemplates and merge into the transaction
         if !named_graphs.is_empty() {
-            let (named_graph_templates, named_graph_delta) =
+            let (named_graph_templates, named_graph_iris) =
                 convert_named_graphs_to_templates(named_graphs, &mut ns_registry)?;
             txn.insert_templates.extend(named_graph_templates);
-            txn.graph_delta.extend(named_graph_delta);
+            txn.write_graphs.extend(named_graph_iris);
         }
 
         self.stage_built_txn_tracked(
@@ -3308,7 +3289,7 @@ impl crate::Fluree {
         // Add extracted transaction metadata and graph delta to commit opts
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
 
         // Commit (no-op updates handled by existing transact; for the tracked path we just mirror it).
         let (receipt, ledger) = self
@@ -3474,7 +3455,7 @@ impl crate::Fluree {
         // Add extracted transaction metadata and graph delta to commit opts
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
 
         // No-op updates: if WHERE matches nothing (or templates produce no flakes),
         // return success without committing.
@@ -3558,7 +3539,7 @@ impl crate::Fluree {
         // Add extracted transaction metadata and graph delta to commit opts
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
 
         // No-op updates: if WHERE matches nothing (or templates produce no flakes),
         // return success without committing.
@@ -3643,7 +3624,7 @@ impl crate::Fluree {
         // Add extracted transaction metadata and graph delta to commit opts
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
 
         // No-op updates: if WHERE matches nothing (or templates produce no flakes),
         // return success without committing.
@@ -3783,7 +3764,7 @@ impl crate::Fluree {
         // Add transaction metadata and graph delta (graph_delta typically empty for Turtle)
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
 
         let (receipt, ledger) = self
             .commit_staged(view, ns_registry, index_config, commit_opts)

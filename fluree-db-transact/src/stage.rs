@@ -12,7 +12,9 @@
 use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
 use crate::ir::InlineValues;
-use crate::ir::{GraphMgmtOp, GraphSel, GraphTarget, TemplateTerm, TripleTemplate, Txn, TxnType};
+use crate::ir::{
+    GraphMgmtOp, GraphSel, GraphTarget, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnType,
+};
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::graph_registry::{FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
@@ -46,7 +48,7 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 
 /// Build a reverse lookup from graph Sid → GraphId.
 ///
-/// Given `graph_sids` (GraphId → Sid from `txn.graph_delta`), returns the
+/// Given `graph_sids` (ledger GraphId → Sid), returns the
 /// inverse mapping. Used by SHACL/policy to determine which graph a flake
 /// belongs to based on its `Flake.g` field.
 /// Generate cascade `f:reifies*` retraction flakes for any base edges
@@ -563,7 +565,7 @@ pub struct StageOptions<'a> {
     /// **Required** when any flake has `g != None`. If `None` is provided and
     /// named-graph flakes are present, `stage_flakes` will return an error.
     ///
-    /// The normal `stage()` path builds this internally from `txn.graph_delta`.
+    /// The normal `stage()` path builds this internally from `txn.write_graphs`.
     pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
 
     /// These flakes come from a commit that was already authored and written,
@@ -675,10 +677,12 @@ pub async fn stage(
     Ok((view, ns_registry))
 }
 
-/// [`stage`], also returning the graphs the transaction writes: its
-/// `graph_delta` extended with any graph a `GRAPH ?g` template resolved to.
-/// Callers that register graphs or apply per-graph governance must use this
-/// delta rather than the one on the `Txn` they passed in.
+/// [`stage`], also returning the named graphs the transaction writes, keyed
+/// by ledger graph id. Graphs not yet registered carry the id the commit will
+/// give them. The map covers the `Txn`'s `write_graphs`, every graph a
+/// `GRAPH ?g` template resolved to, and every graph a graph-management
+/// operation touches, so per-graph governance and commit registration can
+/// use it directly.
 pub async fn stage_with_graph_delta(
     ledger: LedgerState,
     mut txn: Txn,
@@ -694,9 +698,7 @@ pub async fn stage_with_graph_delta(
     // template/WHERE pipeline below. Dispatch before any hot-path setup so the
     // ordinary insert/upsert/update path is byte-identical.
     if txn.graph_mgmt.is_some() {
-        let graph_delta = txn.graph_delta.clone();
-        let (view, ns_registry) = stage_graph_mgmt(ledger, txn, ns_registry, options).await?;
-        return Ok((view, ns_registry, graph_delta));
+        return stage_graph_mgmt(ledger, txn, ns_registry, options).await;
     }
 
     let span = tracing::debug_span!("txn_stage",
@@ -753,26 +755,26 @@ pub async fn stage_with_graph_delta(
             .unwrap_or_else(generate_txn_id);
 
         // B2 (data writes): `#txn-meta` is never a write target (see
-        // `refuse_txn_meta_write`). `txn.graph_delta` holds the fixed write
+        // `refuse_txn_meta_write`). `txn.write_graphs` holds the fixed write
         // targets — a `GRAPH <iri>` block, a `WITH <iri>` default, a sync
         // target, a `CREATE GRAPH <iri>`; WHERE-side graph references live on
         // the where clause, so this refuses writes without touching reads.
         // `GRAPH ?g` targets are checked as the WHERE resolves them
         // (`route_var_graphs`).
-        for iri in txn.graph_delta.values() {
+        for iri in &txn.write_graphs {
             refuse_txn_meta_write(&ledger, iri)?;
         }
 
-        // Convert graph_delta (g_id -> IRI) to graph_sids (g_id -> Sid) for named graph support
-        let mut graph_sids: HashMap<GraphId, Sid> = txn
-            .graph_delta
+        // Graph Sid of each named graph written, by IRI.
+        let mut graph_sids: HashMap<String, Sid> = txn
+            .write_graphs
             .iter()
-            .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
+            .map(|iri| (iri.clone(), ns_registry.sid_for_iri(iri)))
             .collect();
-        let mut reverse_graph = txn_reverse_graph(&ledger, &txn.graph_delta, &graph_sids);
+        let mut reverse_graph = txn_reverse_graph(&ledger, &graph_sids);
         // Fixed write targets, which `GRAPH ?g` targets must not collide with
         // when assigned provisional graph ids mid-stream.
-        let fixed_graph_iris: Vec<String> = txn.graph_delta.values().cloned().collect();
+        let fixed_graph_iris: Vec<String> = txn.write_graphs.iter().cloned().collect();
 
         // Graph-sync target: resolve the g_id + graph Sid now, before the
         // generator takes `ns_registry` mutably. An unregistered target is a
@@ -808,8 +810,7 @@ pub async fn stage_with_graph_delta(
             None => None,
         };
 
-        let mut generator = FlakeGenerator::new(new_t, &mut ns_registry, txn_id)
-            .with_graph_sids(graph_sids.clone());
+        let mut generator = FlakeGenerator::new(new_t, &mut ns_registry, txn_id);
 
         // Stream the WHERE result into a single accumulator per-batch,
         // projecting / materializing / hydrating in the same step. This keeps
@@ -863,10 +864,17 @@ pub async fn stage_with_graph_delta(
         .instrument(where_span)
         .await?;
 
-        if !generator.var_graphs().is_empty() {
-            let var_graphs = generator.var_graphs().clone();
-            add_var_graphs_to_delta(&mut txn.graph_delta, &mut graph_sids, var_graphs)?;
-            reverse_graph = txn_reverse_graph(&ledger, &txn.graph_delta, &graph_sids);
+        // Graphs a `GRAPH ?g` template resolved to join the fixed targets.
+        let mut resolved_new_graph = false;
+        for (iri, sid) in generator.written_graphs() {
+            if !graph_sids.contains_key(iri) {
+                txn.write_graphs.insert(iri.clone());
+                graph_sids.insert(iri.clone(), sid.clone());
+                resolved_new_graph = true;
+            }
+        }
+        if resolved_new_graph {
+            reverse_graph = txn_reverse_graph(&ledger, &graph_sids);
         }
 
         // Per SPARQL 1.1 Update §3.1.3: INSERT/DELETE templates are instantiated
@@ -1100,10 +1108,11 @@ pub async fn stage_with_graph_delta(
             "transaction staging completed"
         );
 
+        let graph_delta = ledger_graph_delta(&ledger, &txn.write_graphs);
         Ok((
             StagedLedger::new(ledger, flakes, &reverse_graph)?,
             ns_registry,
-            txn.graph_delta,
+            graph_delta,
         ))
     }
     .instrument(span)
@@ -1149,27 +1158,29 @@ fn refuse_txn_meta_write(ledger: &LedgerState, iri: &str) -> Result<()> {
     Ok(())
 }
 
-/// Graph Sid → ledger graph id for a transaction's write targets.
-///
-/// `graph_delta` keys are *transaction-local* graph ids used by templates.
-/// Novelty routing must use the ledger's `GraphRegistry` ids, so new graphs
-/// get `GraphRegistry::provisional_ids()` — the same assignment the commit's
-/// `apply_delta` will make.
+/// Ledger graph id → IRI for the named graphs `iris`. Unregistered graphs get
+/// `GraphRegistry::provisional_ids()`, the id the commit's `apply_delta` will
+/// assign.
+fn ledger_graph_delta<'a>(
+    ledger: &LedgerState,
+    iris: impl IntoIterator<Item = &'a String>,
+) -> rustc_hash::FxHashMap<u16, String> {
+    let iris: Vec<String> = iris.into_iter().cloned().collect();
+    let ids = ledger.snapshot.graph_registry.provisional_ids(&iris);
+    iris.into_iter()
+        .filter_map(|iri| Some((*ids.get(iri.as_str())?, iri)))
+        .collect()
+}
+
+/// Graph Sid → ledger graph id for the named graphs in `graph_sids`, numbered
+/// as in [`ledger_graph_delta`].
 fn txn_reverse_graph(
     ledger: &LedgerState,
-    graph_delta: &rustc_hash::FxHashMap<u16, String>,
-    graph_sids: &HashMap<GraphId, Sid>,
+    graph_sids: &HashMap<String, Sid>,
 ) -> HashMap<Sid, GraphId> {
-    let provisional = ledger
-        .snapshot
-        .graph_registry
-        .provisional_ids(&graph_delta.values().cloned().collect::<Vec<_>>());
-    graph_delta
-        .iter()
-        .filter_map(|(local, iri)| {
-            let g_id = provisional.get(iri.as_str()).copied()?;
-            Some((graph_sids.get(local)?.clone(), g_id))
-        })
+    ledger_graph_delta(ledger, graph_sids.keys())
+        .into_iter()
+        .filter_map(|(g_id, iri)| Some((graph_sids.get(&iri)?.clone(), g_id)))
         .collect()
 }
 
@@ -1183,11 +1194,11 @@ fn txn_reverse_graph(
 /// interim ids never select existing rows.
 fn route_var_graphs(
     ledger: &LedgerState,
-    var_graphs: &HashMap<String, Sid>,
+    written_graphs: &HashMap<String, Sid>,
     fixed_graph_iris: &[String],
     reverse_graph: &mut HashMap<Sid, GraphId>,
 ) -> Result<()> {
-    if var_graphs
+    if written_graphs
         .values()
         .all(|sid| reverse_graph.contains_key(sid))
     {
@@ -1196,10 +1207,10 @@ fn route_var_graphs(
     let all_iris: Vec<String> = fixed_graph_iris
         .iter()
         .cloned()
-        .chain(var_graphs.keys().cloned())
+        .chain(written_graphs.keys().cloned())
         .collect();
     let provisional = ledger.snapshot.graph_registry.provisional_ids(&all_iris);
-    for (iri, sid) in var_graphs {
+    for (iri, sid) in written_graphs {
         if reverse_graph.contains_key(sid) {
             continue;
         }
@@ -1208,37 +1219,6 @@ fn route_var_graphs(
             TransactError::FlakeGeneration(format!("no provisional graph id for <{iri}>"))
         })?;
         reverse_graph.insert(sid.clone(), g_id);
-    }
-    Ok(())
-}
-
-/// Add graphs resolved from `GRAPH ?g` templates to the transaction's graph
-/// delta under fresh transaction-local ids, so commit registration and
-/// per-graph governance see them like a `GRAPH <iri>` target.
-fn add_var_graphs_to_delta(
-    graph_delta: &mut rustc_hash::FxHashMap<u16, String>,
-    graph_sids: &mut HashMap<GraphId, Sid>,
-    var_graphs: HashMap<String, Sid>,
-) -> Result<()> {
-    let listed: HashSet<String> = graph_delta.values().cloned().collect();
-    let mut next = graph_delta
-        .keys()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .max(FIRST_USER_GRAPH_ID - 1);
-    // Sorted so local ids are deterministic for a given result set.
-    let mut new: Vec<(String, Sid)> = var_graphs
-        .into_iter()
-        .filter(|(iri, _)| !listed.contains(iri))
-        .collect();
-    new.sort_by(|a, b| a.0.cmp(&b.0));
-    for (iri, sid) in new {
-        next = next.checked_add(1).ok_or_else(|| {
-            TransactError::FlakeGeneration("too many graphs in one transaction".to_string())
-        })?;
-        graph_delta.insert(next, iri);
-        graph_sids.insert(next, sid);
     }
     Ok(())
 }
@@ -1379,7 +1359,11 @@ async fn stage_graph_mgmt(
     txn: Txn,
     mut ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
-) -> Result<(StagedLedger, NamespaceRegistry)> {
+) -> Result<(
+    StagedLedger,
+    NamespaceRegistry,
+    rustc_hash::FxHashMap<u16, String>,
+)> {
     let op = txn
         .graph_mgmt
         .as_ref()
@@ -1787,9 +1771,19 @@ async fn stage_graph_mgmt(
             "graph-management staging completed"
         );
 
+        // Every named graph the operation writes: the (possibly new)
+        // destination, plus each registered graph it clears or moves from.
+        let mut graph_delta = ledger_graph_delta(&ledger, &txn.write_graphs);
+        for g_id in graph_sids.keys() {
+            if let Some(iri) = ledger.snapshot.graph_registry.iri_for_graph_id(*g_id) {
+                graph_delta.entry(*g_id).or_insert_with(|| iri.to_string());
+            }
+        }
+
         Ok((
             StagedLedger::new(ledger, flakes, &reverse_graph)?,
             ns_registry,
+            graph_delta,
         ))
     }
     .instrument(span)
@@ -2605,7 +2599,7 @@ fn collect_template_vars(template_groups: &[&[TripleTemplate]]) -> Vec<VarId> {
                     }
                 }
             }
-            if let Some(v) = tmpl.graph_var {
+            if let TemplateGraph::Var(v) = tmpl.graph {
                 if seen.insert(v) {
                     out.push(v);
                 }
@@ -2942,7 +2936,7 @@ async fn stream_where_into_accumulator(
             let mut r = generator.generate_retractions(&txn.delete_templates, &batch)?;
             route_var_graphs(
                 ledger,
-                generator.var_graphs(),
+                generator.written_graphs(),
                 fixed_graph_iris,
                 reverse_graph,
             )?;
@@ -2973,7 +2967,7 @@ async fn stream_where_into_accumulator(
                 let a = generator.generate_assertions(&txn.insert_templates, &batch)?;
                 route_var_graphs(
                     ledger,
-                    generator.var_graphs(),
+                    generator.written_graphs(),
                     fixed_graph_iris,
                     reverse_graph,
                 )?;
@@ -3302,22 +3296,30 @@ async fn generate_upsert_deletions(
     ledger: &LedgerState,
     txn: &Txn,
     new_t: i64,
-    graph_sids: &std::collections::HashMap<u16, Sid>,
+    graph_sids: &HashMap<String, Sid>,
 ) -> Result<Vec<fluree_db_core::Flake>> {
     use fluree_db_binary_index::BinaryGraphView;
     use fluree_db_core::{Flake, IndexType};
     use fluree_db_query::materializer::JoinKeyMode;
     use fluree_db_query::{BinaryRangeProvider, Materializer};
 
-    // Group deduplicated predicates by (subject, graph_id) so subject existence
-    // is resolved once per subject rather than once per (subject, predicate).
-    let mut subject_groups: HashMap<(Sid, Option<u16>), Vec<Sid>> = HashMap::new();
+    // Group deduplicated predicates by (subject, graph IRI) so subject
+    // existence is resolved once per subject rather than once per (subject,
+    // predicate).
+    let mut subject_groups: HashMap<(Sid, Option<Arc<str>>), Vec<Sid>> = HashMap::new();
     for template in &txn.insert_templates {
+        let graph = match &template.graph {
+            TemplateGraph::Default => None,
+            TemplateGraph::Iri(iri) => Some(Arc::clone(iri)),
+            // Upsert payloads name their graphs; a graph variable has no
+            // stored values to replace.
+            TemplateGraph::Var(_) => continue,
+        };
         if let (TemplateTerm::Sid(s), TemplateTerm::Sid(p)) =
             (&template.subject, &template.predicate)
         {
             subject_groups
-                .entry((s.clone(), template.graph_id))
+                .entry((s.clone(), graph))
                 .or_default()
                 .push(p.clone());
         }
@@ -3342,27 +3344,20 @@ async fn generate_upsert_deletions(
     let binary_store = brp_ref.map(|brp| Arc::clone(brp.store()));
     let dict_novelty = brp_ref.map(|brp| Arc::clone(brp.dict_novelty()));
 
-    // IMPORTANT: `TripleTemplate.graph_id` is a transaction-local ID.
-    // It must be translated to a ledger-stable GraphId before we can query
-    // the correct per-graph index partition.
-    //
-    // txn_local_g_id -> graph IRI (txn.graph_delta) -> ledger g_id (GraphRegistry)
-    // None in the value position means the graph is not yet in the ledger
-    // registry (new graph in this txn), so there cannot be existing values.
-    let ledger_g_for_txn_g: HashMap<Option<u16>, Option<u16>> = subject_groups
+    // Ledger graph id per graph IRI. None in the value position means the
+    // graph is not yet in the ledger registry (new graph in this txn), so
+    // there cannot be existing values.
+    let ledger_g_for_txn_g: HashMap<Option<Arc<str>>, Option<u16>> = subject_groups
         .keys()
-        .map(|(_, txn_g)| *txn_g)
+        .map(|(_, graph)| graph.clone())
         .collect::<HashSet<_>>()
         .into_iter()
-        .map(|txn_g| {
-            let ledger_g = match txn_g {
+        .map(|graph| {
+            let ledger_g = match &graph {
                 None => Some(0),
-                Some(tg) => txn
-                    .graph_delta
-                    .get(&tg)
-                    .and_then(|iri| ledger.snapshot.graph_registry.graph_id_for_iri(iri)),
+                Some(iri) => ledger.snapshot.graph_registry.graph_id_for_iri(iri),
             };
-            (txn_g, ledger_g)
+            (graph, ledger_g)
         })
         .collect();
 
@@ -3450,19 +3445,16 @@ async fn generate_upsert_deletions(
     for ((subject, graph_id), predicates) in &subject_groups {
         let ledger_g_id: Option<u16> = ledger_g_for_txn_g.get(graph_id).copied().flatten();
 
-        // Retraction flakes carry the graph Sid (flake.g), looked up by the
-        // txn-local g_id. Resolved before any skip so broken graph delta/sid
-        // wiring still surfaces as an error.
+        // Retraction flakes carry the graph Sid (flake.g). Resolved before any
+        // skip so broken graph wiring still surfaces as an error.
         let graph_sid: Option<Sid> = match graph_id {
             None => None,
-            Some(txn_g_id) => Some(
-                graph_sids.get(txn_g_id).cloned().ok_or_else(|| {
-                    TransactError::FlakeGeneration(format!(
-                        "upsert deletion generation references graph_id {txn_g_id} but no graph Sid was provided; \
-                         this indicates a bug in graph delta/sid wiring"
-                    ))
-                })?,
-            ),
+            Some(iri) => Some(graph_sids.get(&**iri).cloned().ok_or_else(|| {
+                TransactError::FlakeGeneration(format!(
+                    "upsert deletion generation references graph <{iri}> with no graph Sid; \
+                     this indicates a bug in graph wiring"
+                ))
+            })?),
         };
 
         // Named graph not yet in the ledger registry: nothing to retract.

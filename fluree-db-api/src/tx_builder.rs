@@ -852,7 +852,7 @@ impl<'a> OwnedTransactBuilder<'a> {
                 .core
                 .commit_opts
                 .with_txn_meta(txn_meta)
-                .with_graph_delta(graph_delta.into_iter().collect());
+                .with_graph_iris(graph_delta.into_values());
 
             // No-op updates: return success without committing.
             let (receipt, ledger) = if !view.has_staged()
@@ -950,7 +950,7 @@ impl<'a> OwnedTransactBuilder<'a> {
                 .core
                 .commit_opts
                 .with_txn_meta(txn_meta)
-                .with_graph_delta(graph_delta.into_iter().collect());
+                .with_graph_iris(graph_delta.into_values());
             let (receipt, ledger) = if !view.has_staged() && !registers_new_graph {
                 let (base, flakes) = view.into_parts();
                 debug_assert!(
@@ -1883,7 +1883,7 @@ impl Fluree {
         });
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
         let staged = view.staged_flakes();
         // A commit that changes what staging depends on beyond its own
         // subjects records no subject set, which the ring reads as touching
@@ -2383,7 +2383,7 @@ impl Fluree {
         }
         let mut commit_opts = commit_opts
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
 
         // Resolve head temporal metadata if it wasn't observed at load time
         // (index == head, no novelty walk): the event-time monotonicity

@@ -24,8 +24,9 @@ use fluree_db_novelty::TxnMetaEntry;
 use fluree_db_query::parse::UnresolvedPattern;
 use fluree_db_query::{UnmatchedOptional, VarId, VarRegistry};
 use fluree_db_sparql::ast::{GraphPattern as SparqlGraphPattern, Prologue as SparqlPrologue};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Named graph spec for scoping JSON-LD UPDATE `where` evaluation.
 #[derive(Debug, Clone)]
@@ -168,18 +169,14 @@ pub struct Txn {
     /// commit as subject.
     pub txn_meta: Vec<TxnMetaEntry>,
 
-    /// Named graph IRI to g_id mappings introduced by this transaction.
+    /// Named graphs this transaction writes to, by IRI: `GRAPH <iri>`
+    /// template blocks, a `WITH <iri>` default, a sync target, a `CREATE
+    /// GRAPH` or transfer destination. Graphs a `GRAPH ?g` template resolves
+    /// to are only known once the WHERE runs; staging adds them.
     ///
-    /// When a transaction references named graphs (via TriG GRAPH blocks or
-    /// JSON-LD @graph with graph IRIs), this map tracks the g_id assignment
-    /// for each graph IRI. These mappings are stored in the commit envelope
-    /// for replay-safe persistence.
-    ///
-    /// Reserved g_ids:
-    /// - `0`: default graph
-    /// - `1`: txn-meta graph (`#txn-meta`)
-    /// - `2+`: user-defined named graphs
-    pub graph_delta: FxHashMap<u16, String>,
+    /// Staging reports the full set keyed by ledger graph id, and the commit
+    /// registers any that are new.
+    pub write_graphs: BTreeSet<String>,
 
     /// Namespace allocations made during lowering that the staging path must
     /// merge into its own registry before flake generation.
@@ -304,7 +301,7 @@ impl Txn {
             opts: TxnOpts::default(),
             vars: VarRegistry::new(),
             txn_meta: Vec::new(),
-            graph_delta: FxHashMap::default(),
+            write_graphs: BTreeSet::new(),
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
             sync_graph: None,
@@ -315,8 +312,8 @@ impl Txn {
     ///
     /// The DELETE/INSERT templates and WHERE clause are empty; staging reads
     /// the directive from [`Txn::graph_mgmt`] and executes it by whole-graph
-    /// scan. `graph_delta` still carries any newly-referenced destination
-    /// graph IRI so the commit envelope registers it.
+    /// scan. `write_graphs` still carries any newly-referenced destination
+    /// graph IRI so the commit registers it.
     pub fn graph_mgmt(op: GraphMgmtOp) -> Self {
         Self {
             graph_mgmt: Some(op),
@@ -358,8 +355,7 @@ impl Txn {
         });
         // Register the (possibly-new) destination graph so the commit envelope
         // persists its g_id; `apply_delta` skips already-registered IRIs.
-        txn.graph_delta
-            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn.write_graphs.insert(to_iri);
         txn
     }
 
@@ -377,8 +373,7 @@ impl Txn {
             // non-SILENT SPARQL MOVE (roadmap O3).
             silent: false,
         });
-        txn.graph_delta
-            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn.write_graphs.insert(to_iri);
         txn
     }
 
@@ -396,8 +391,7 @@ impl Txn {
             // non-SILENT SPARQL ADD (roadmap O3).
             silent: false,
         });
-        txn.graph_delta
-            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn.write_graphs.insert(to_iri);
         txn
     }
 
@@ -516,23 +510,8 @@ pub struct TripleTemplate {
     /// - `Some(i)`: list element at position `i`
     pub list_index: Option<i32>,
 
-    /// Transaction-local graph ID for named graphs
-    ///
-    /// - `0`: default graph
-    /// - `1`: txn-meta graph (reserved)
-    /// - `2+`: user-defined named graphs
-    ///
-    /// If None, defaults to 0 (default graph).
-    ///
-    /// IMPORTANT: this ID is scoped to the transaction envelope (see `Txn.graph_delta`).
-    /// It is **not** ledger-stable and must be translated via:
-    /// `txn_local_id -> graph IRI (Txn.graph_delta) -> ledger GraphId (GraphRegistry)`
-    /// before doing any per-graph index/range queries.
-    pub graph_id: Option<u16>,
-
-    /// Graph variable (`GRAPH ?g { … }` in a SPARQL UPDATE template), resolved
-    /// per WHERE solution at staging time. Mutually exclusive with `graph_id`.
-    pub graph_var: Option<VarId>,
+    /// The graph this template writes to.
+    pub graph: TemplateGraph,
 }
 
 impl TripleTemplate {
@@ -544,8 +523,7 @@ impl TripleTemplate {
             object,
             dtc: None,
             list_index: None,
-            graph_id: None,
-            graph_var: None,
+            graph: TemplateGraph::Default,
         }
     }
 
@@ -561,23 +539,31 @@ impl TripleTemplate {
         self
     }
 
-    /// Set the graph ID (for named graph support)
-    ///
-    /// - `0`: default graph
-    /// - `1`: txn-meta graph (reserved for commit metadata)
-    /// - `2+`: user-defined named graphs
-    pub fn with_graph_id(mut self, graph_id: u16) -> Self {
-        self.graph_id = Some(graph_id);
-        self.graph_var = None;
+    /// Write to the named graph `iri`. The transaction must also list it in
+    /// [`Txn::write_graphs`].
+    pub fn in_graph(mut self, iri: impl Into<Arc<str>>) -> Self {
+        self.graph = TemplateGraph::Iri(iri.into());
         self
     }
 
-    /// Target the graph named by `var`'s binding in each WHERE solution.
+    /// Write to the graph named by `var`'s binding in each WHERE solution.
     pub fn with_graph_var(mut self, var: VarId) -> Self {
-        self.graph_var = Some(var);
-        self.graph_id = None;
+        self.graph = TemplateGraph::Var(var);
         self
     }
+}
+
+/// The graph a [`TripleTemplate`] writes to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum TemplateGraph {
+    /// The default graph.
+    #[default]
+    Default,
+    /// A named graph, by IRI.
+    Iri(Arc<str>),
+    /// `GRAPH ?g`: the graph named by this variable's binding in each WHERE
+    /// solution, resolved at staging time.
+    Var(VarId),
 }
 
 /// A term in a triple template
