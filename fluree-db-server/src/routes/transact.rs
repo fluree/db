@@ -968,6 +968,7 @@ async fn insert_local(
 ) -> Result<Response> {
     // Extract query params before consuming the request
     let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
 
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {
@@ -1121,6 +1122,7 @@ async fn upsert_local(
 ) -> Result<Response> {
     // Extract query params before consuming the request
     let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
 
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {
@@ -1289,6 +1291,7 @@ async fn sync_local(
     request: Request,
 ) -> Result<Response> {
     let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
     let headers = FlureeHeaders::from_headers(request.headers())?;
     let credential = MaybeCredential::extract(request).await?;
     let headers = crate::routes::policy_auth::bind_authorization(
@@ -1462,6 +1465,7 @@ async fn insert_ledger_local(
 ) -> Result<Response> {
     // Extract query params before consuming the request
     let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
 
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {
@@ -1616,6 +1620,7 @@ async fn upsert_ledger_local(
 ) -> Result<Response> {
     // Extract query params before consuming the request
     let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
 
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {

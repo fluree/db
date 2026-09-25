@@ -61,7 +61,7 @@ POST /update/{ledger-id}
 - `using-graph-uri` (optional, repeatable, SPARQL UPDATE only): a graph for each operation's WHERE clause, as `USING <iri>` would name it
 - `using-named-graph-uri` (optional, repeatable, SPARQL UPDATE only): a named graph for each WHERE clause, as `USING NAMED <iri>` would name it
 
-The `using-*` parameters apply to every `DELETE`/`INSERT … WHERE` operation in the request (W3C SPARQL 1.1 Protocol §2.2.3). With the form-encoded transport (`Content-Type: application/x-www-form-urlencoded`, `update=…`) they may also be sent in the body. The request is a `400` if an operation already has its own `USING`, `USING NAMED`, or `WITH` clause, or if it contains `DELETE WHERE`, which has no `USING` form. It is also a `400` on a JSON-LD update, which scopes its WHERE with `from` / `fromNamed`.
+The `using-*` parameters apply to every `DELETE`/`INSERT … WHERE` operation in the request (W3C SPARQL 1.1 Protocol §2.2.3). With the form-encoded transport (`Content-Type: application/x-www-form-urlencoded`, `update=…`) they may also be sent in the body. The request is a `400` if an operation already has its own `USING`, `USING NAMED`, or `WITH` clause, or if it contains `DELETE WHERE`, which has no `USING` form. It is also a `400` on a JSON-LD update, which scopes its WHERE with `from` / `fromNamed`, and on the insert, upsert and sync routes, which take no SPARQL UPDATE.
 
 **Request Headers:**
 
@@ -1202,7 +1202,7 @@ The SPARQL Protocol's form-encoded POST is also accepted: `Content-Type: applica
 | `default-graph-uri` | IRI, repeatable | — | SPARQL only. A default graph for the query, as `FROM <iri>` would name it; repeat the parameter to merge several. On `/query` it names a ledger (`books:main`); on `/query/{ledger}` a graph within that ledger. |
 | `named-graph-uri` | IRI, repeatable | — | SPARQL only. A named graph for the query, as `FROM NAMED <iri>` would name it. |
 
-When `default-graph-uri` or `named-graph-uri` is present, it replaces any `FROM` / `FROM NAMED` in the query text (W3C SPARQL 1.1 Protocol §2.1.4: the protocol dataset takes precedence). They are read from the URL for `GET` and for `POST` with `Content-Type: application/sparql-query`, and from the URL or the body for a form-encoded `POST`. On a JSON-LD query they are a `400`; use `from` / `fromNamed` in the body instead.
+When `default-graph-uri` or `named-graph-uri` is present, it replaces any `FROM` / `FROM NAMED` in the query text (W3C SPARQL 1.1 Protocol §2.1.4: the protocol dataset takes precedence). They are read from the URL for `GET` and for `POST` with `Content-Type: application/sparql-query`, and from the URL or the body for a form-encoded `POST`. On a JSON-LD query they are a `400`; use `from` / `fromNamed` in the body instead. They are also a `400` when the `FROM` they would replace pins a time (`FROM … TO …`, or an `@t:`, `@time:`, `@iso:`, `@recorded:`, `@commit:` or `@snapshot:` suffix), since replacing it would silently read the current state; put the pin on the parameter value instead, as in `default-graph-uri=books:main@t:100`.
 
 **Request Headers:**
 ```http

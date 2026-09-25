@@ -35,6 +35,13 @@ pub enum ProtocolDatasetError {
     /// the parameters cannot scope it. Refused rather than run against the
     /// unscoped default graph.
     DeleteWhereUnscoped,
+    /// The query's dataset carries a Fluree time-travel qualifier — a
+    /// `FROM … TO …` range or an `@t:`-style pin — that replacing it with the
+    /// protocol dataset would silently drop.
+    TimePinnedDataset,
+    /// The parser did not record where an update's `WHERE` begins, so the
+    /// `USING` clauses have nowhere to go. Refused rather than run unscoped.
+    UnlocatedWhere,
 }
 
 impl std::fmt::Display for ProtocolDatasetError {
@@ -50,6 +57,15 @@ impl std::fmt::Display for ProtocolDatasetError {
             Self::DeleteWhereUnscoped => f.write_str(
                 "using-graph-uri / using-named-graph-uri cannot scope a DELETE WHERE operation; \
                  write it as DELETE { … } WHERE { … }",
+            ),
+            Self::TimePinnedDataset => f.write_str(
+                "default-graph-uri / named-graph-uri would replace a FROM clause that pins a time \
+                 (FROM … TO …, or an @t:, @time:, @iso:, @recorded:, @commit: or @snapshot: \
+                 suffix); put the pin on the parameter value instead",
+            ),
+            Self::UnlocatedWhere => f.write_str(
+                "using-graph-uri / using-named-graph-uri could not be applied: the update's WHERE \
+                 position was not recorded",
             ),
         }
     }
@@ -92,7 +108,14 @@ pub fn apply_query_dataset<'a>(
 
     let clause = dataset_clause("FROM", default_graphs, named_graphs);
     let (start, end, replacement) = match dataset {
-        Some(existing) => (existing.span.start, existing.span.end, clause),
+        Some(existing) => {
+            if existing.to_graph.is_some()
+                || has_time_pin(&query[existing.span.start..existing.span.end])
+            {
+                return Err(ProtocolDatasetError::TimePinnedDataset);
+            }
+            (existing.span.start, existing.span.end, clause)
+        }
         None => (insert_at, insert_at, format!(" {clause} ")),
     };
     Ok(Cow::Owned(splice(query, &[(start, end, replacement)])))
@@ -132,7 +155,7 @@ pub fn apply_update_using<'a>(
                 }
                 // The parser always records it; a hand-built AST cannot reach here.
                 let Some(where_keyword) = modify.where_keyword else {
-                    return Ok(Cow::Borrowed(update));
+                    return Err(ProtocolDatasetError::UnlocatedWhere);
                 };
                 edits.push((
                     where_keyword.start,
@@ -150,6 +173,22 @@ pub fn apply_update_using<'a>(
         return Ok(Cow::Borrowed(update));
     }
     Ok(Cow::Owned(splice(update, &edits)))
+}
+
+/// Whether dataset-clause text names a graph with a time-travel suffix
+/// (the sigils `split_time_travel_suffix` accepts). `@` cannot appear in a
+/// prefixed name, so only `<…>` IRIs can carry one.
+fn has_time_pin(clause: &str) -> bool {
+    [
+        "@t:",
+        "@time:",
+        "@iso:",
+        "@recorded:",
+        "@commit:",
+        "@snapshot:",
+    ]
+    .iter()
+    .any(|sigil| clause.contains(sigil))
 }
 
 /// `FROM <a> FROM NAMED <b>` / `USING <a> USING NAMED <b>`.
@@ -261,6 +300,35 @@ mod tests {
             (strings(&["http://ex.org/g"]), vec![]),
             "{rewritten}"
         );
+    }
+
+    /// Replacing a time-pinned dataset would silently turn a snapshot or
+    /// history read into a current-head read, so it is refused. A pin on the
+    /// parameter value itself is fine.
+    #[test]
+    fn a_time_pinned_dataset_is_not_replaced() {
+        let g = strings(&["books:main"]);
+        for query in [
+            "SELECT * FROM <books:main@t:100> WHERE { ?s ?p ?o }",
+            "SELECT * FROM <books:main@iso:2026-01-01T00:00:00Z> WHERE { ?s ?p ?o }",
+            "SELECT * FROM NAMED <books:main@commit:bafy> WHERE { ?s ?p ?o }",
+            "SELECT * FROM <books:main@t:1> TO <books:main@t:5> WHERE { ?s ?p ?o }",
+        ] {
+            assert_eq!(
+                apply_query_dataset(query, &g, &[]),
+                Err(ProtocolDatasetError::TimePinnedDataset),
+                "{query}"
+            );
+        }
+
+        let pinned = strings(&["books:main@t:100"]);
+        let rewritten = apply_query_dataset(
+            "SELECT * FROM <books:main> WHERE { ?s ?p ?o }",
+            &pinned,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(dataset_of(&rewritten), (pinned, vec![]), "{rewritten}");
     }
 
     #[test]

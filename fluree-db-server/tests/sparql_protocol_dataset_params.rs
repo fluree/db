@@ -287,6 +287,24 @@ async fn a_value_that_is_not_an_iri_is_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
 }
 
+/// Replacing a `FROM` that pins a time would silently turn a snapshot read
+/// into a current-head read, so the protocol dataset refuses it.
+#[tokio::test]
+async fn protocol_dataset_does_not_replace_a_time_pinned_from() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, json) = get_query(
+        &app,
+        &ledger_path(),
+        &format!("PREFIX ex: <http://ex.org/> SELECT ?n FROM <{G1}@t:1> WHERE {{ ?s ex:name ?n }}"),
+        &format!("default-graph-uri={}", enc(G2)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(json.to_string().contains("pins a time"), "{json}");
+}
+
 /// Protocol §2.1.2: query via POST with URL-encoded parameters in the body.
 async fn post_form(app: &axum::Router, path: &str, form: String) -> (StatusCode, JsonValue) {
     send(
@@ -531,4 +549,28 @@ async fn using_graph_uri_cannot_scope_delete_where() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
     let (_, names) = get_query(&app, &ledger_path(), NAMES, "").await;
     assert_eq!(values(&names, "n"), ["D"], "the default graph is untouched");
+}
+
+/// The insert, upsert and sync routes take no SPARQL UPDATE, so a USING
+/// parameter there is refused rather than ignored.
+#[tokio::test]
+async fn using_graph_uri_on_an_insert_route_is_refused() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, json) = update(
+        &app,
+        &format!("/v1/fluree/insert/{LEDGER}?using-graph-uri={}", enc(G2)),
+        "application/json",
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "@id": "ex:x",
+            "ex:name": "X"
+        })
+        .to_string(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    let (_, names) = get_query(&app, &ledger_path(), NAMES, "").await;
+    assert_eq!(values(&names, "n"), ["D"], "nothing may be written");
 }

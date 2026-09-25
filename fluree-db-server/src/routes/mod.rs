@@ -24,8 +24,8 @@ mod push;
 pub(crate) mod query;
 pub(crate) mod serving;
 mod show;
-#[cfg(feature = "sql")]
 mod sparql_protocol;
+#[cfg(feature = "sql")]
 mod sql;
 mod storage_proxy;
 mod stream_query;
