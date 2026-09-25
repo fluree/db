@@ -131,14 +131,19 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         }
     }
 
-    /// The request's governance options, in the form policy wrapping takes.
+    /// Wrap a loaded view in the request's policy.
     ///
-    /// SPARQL has nowhere to carry an `opts` block, so it yields the default and
-    /// only configured defaults can govern it. The verified identity does not
-    /// arrive in the body either: it rides the builder's execution options from
-    /// the auth layer, and without it an `f:IdentityRestricted` override control
-    /// refuses a request the config would permit.
-    fn governance_options(&self) -> Result<crate::GovernanceOptions> {
+    /// A request selecting any policy is wrapped with it, gated on
+    /// `has_any_policy_inputs` as on the `from`-driven path. One selecting nothing
+    /// leaves the ledger's or source's configured defaults in force, and those
+    /// leave an unconfigured ledger untouched.
+    ///
+    /// SPARQL has nowhere to carry an `opts` block, so only configured defaults
+    /// can govern it. The verified identity does not arrive in the body either:
+    /// it rides the builder's execution options from the auth layer, and without
+    /// it an `f:IdentityRestricted` override control refuses a request the config
+    /// would permit.
+    async fn wrap_request_policy(&self, view: GraphDb) -> Result<GraphDb> {
         let mut opts = match self.core.input.as_ref() {
             Some(crate::view::QueryInput::JsonLd(json)) => {
                 crate::GovernanceOptions::from_json(json)
@@ -147,16 +152,18 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             _ => crate::GovernanceOptions::default(),
         };
         opts.server_identity = self.core.execution.server_identity.clone();
-        Ok(opts)
+        if opts.has_any_policy_inputs() {
+            self.graph.fluree.wrap_policy(view, &opts).await
+        } else {
+            self.graph.fluree.wrap_policy_defaults(view).await
+        }
     }
 
     /// Load the view for this handle's ledger and time, falling back to a graph
     /// source when enabled, and return it wrapped in the request's policy.
     ///
-    /// The view carries whatever policy the request selects, gated on
-    /// `has_any_policy_inputs` as on the `from`-driven path. What a request
-    /// selecting nothing gets differs between the two branches below. Execution
-    /// receives the view already wrapped and does not wrap it again.
+    /// Execution receives the view already wrapped and does not wrap it again.
+    /// See [`Self::wrap_request_policy`] for which requests engage enforcement.
     async fn load_view(&self) -> Result<crate::view::GraphDb> {
         let result = self
             .graph
@@ -194,29 +201,14 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     else {
                         return result;
                     };
-                    // Without the wrap below, a governed source reads unfiltered.
-                    let opts = self.governance_options()?;
-                    if opts.has_any_policy_inputs() {
-                        return self.graph.fluree.wrap_policy(db, &opts).await;
-                    }
-                    // No `wrap_policy_defaults` fallback, unlike the native path
-                    // below. Applying a `--model` source's own policy to requests
-                    // that carry none would change what every reader of a governed
-                    // source sees, so it stays outside #1766.
-                    return Ok(db);
+                    // A governed source's configured defaults are its model's
+                    // policy, resolved onto the view above.
+                    return self.wrap_request_policy(db).await;
                 }
             }
         }
 
-        let view = result?;
-        let opts = self.governance_options()?;
-        if opts.has_any_policy_inputs() {
-            self.graph.fluree.wrap_policy(view, &opts).await
-        } else {
-            // Not `Ok(view)`: an unconfigured ledger comes back untouched, but a
-            // ledger carrying `f:policyDefaults` must still be governed.
-            self.graph.fluree.wrap_policy_defaults(view).await
-        }
+        self.wrap_request_policy(result?).await
     }
 
     /// Execute the query and return raw [`QueryResult`].
