@@ -156,15 +156,11 @@ All CLI flags have corresponding environment variables with `FLUREE_` prefix:
 
 ```bash
 export FLUREE_LISTEN_ADDR=0.0.0.0:8090
+export FLUREE_STORAGE_PATH=/var/lib/fluree
 export FLUREE_LOG_LEVEL=info
 
 fluree server run
 ```
-
-The exception is `FLUREE_STORAGE_PATH`: `fluree server run` always hands the server an explicit
-storage path (its `--storage-path`, else `[server] storage_path` from the config file, else the
-project's `.fluree/storage`), and that overrides the env var. Set the storage path with the flag
-or the config file.
 
 A few operational knobs are environment-only (no CLI flag):
 
@@ -246,8 +242,6 @@ Path for file-based storage. If not specified, defaults to `.fluree/storage` rel
 | Flag             | Env Var               | Default           |
 | ---------------- | --------------------- | ----------------- |
 | `--storage-path` | `FLUREE_STORAGE_PATH` | `.fluree/storage` |
-
-Under `fluree server run`, `FLUREE_STORAGE_PATH` has no effect; see [Environment Variables](#environment-variables).
 
 ```bash
 # Explicit storage path (e.g. production)

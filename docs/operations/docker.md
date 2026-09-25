@@ -73,13 +73,14 @@ You can use any one of these — or, more typically, layer them: bake a base con
 
 ### 1. Environment Variables Only
 
-Every CLI flag has a `FLUREE_*` env var equivalent (see [Configuration](configuration.md)), except that `FLUREE_STORAGE_PATH` is overridden by `fluree server run` (data goes to `/var/lib/fluree/.fluree/storage` unless the config file sets `storage_path`). For simple deployments this is the lowest-friction path:
+Every CLI flag has a `FLUREE_*` env var equivalent (see [Configuration](configuration.md)). For simple deployments this is the lowest-friction path:
 
 ```bash
 docker run -d --name fluree \
   -p 8090:8090 \
   -v fluree-data:/var/lib/fluree \
   -e FLUREE_LISTEN_ADDR=0.0.0.0:8090 \
+  -e FLUREE_STORAGE_PATH=/var/lib/fluree/.fluree/storage \
   -e FLUREE_INDEXING_ENABLED=true \
   -e FLUREE_REINDEX_MIN_BYTES=1000000 \
   -e FLUREE_REINDEX_MAX_BYTES=10000000 \

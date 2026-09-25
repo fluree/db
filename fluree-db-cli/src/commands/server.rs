@@ -801,19 +801,16 @@ fn build_server_config(
         args.push(addr.to_string());
     }
 
+    // Connection config takes precedence over a storage path. With neither
+    // flag, the storage path is left to the server's own precedence
+    // (`FLUREE_STORAGE_PATH`, then the profile and config file) and only
+    // defaulted after that, below.
     if let Some(ref path) = connection_config {
-        // Connection config takes precedence — don't set a default storage path
         args.push("--connection-config".into());
         args.push(path.display().to_string());
     } else if let Some(ref path) = storage_path {
         args.push("--storage-path".into());
         args.push(path.display().to_string());
-    } else {
-        // Default: use the CLI's resolved storage path
-        let dirs = config::require_fluree_dir(config_override)?;
-        let resolved = config::resolve_storage_path(&dirs);
-        args.push("--storage-path".into());
-        args.push(resolved.display().to_string());
     }
 
     if let Some(ref level) = log_level {
@@ -869,6 +866,12 @@ fn build_server_config(
             return Err(CliError::Server(format!("config file error: {e}")));
         }
         eprintln!("{} config file: {e}", "warning:".yellow().bold());
+    }
+
+    // Nothing named a storage location: use the project's `.fluree/storage`.
+    if server_config.storage_path.is_none() && server_config.connection_config.is_none() {
+        let dirs = config::require_fluree_dir(config_override)?;
+        server_config.storage_path = Some(config::default_storage_path(&dirs));
     }
 
     Ok(server_config)
@@ -1408,4 +1411,74 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
     era * 146_097 + doe as i64 - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Tests here set `FLUREE_STORAGE_PATH`; hold this while they do.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const ENV: &str = "FLUREE_STORAGE_PATH";
+
+    fn project(config: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), config).unwrap();
+        dir
+    }
+
+    fn storage_path(
+        dir: &tempfile::TempDir,
+        flag: Option<&str>,
+        profile: Option<&str>,
+        env: Option<&str>,
+    ) -> Option<PathBuf> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: holding ENV_LOCK, no concurrent mutation of this variable.
+        match env {
+            Some(v) => std::env::set_var(ENV, v),
+            None => std::env::remove_var(ENV),
+        }
+        let config = build_server_config(
+            Some(dir.path()),
+            None,
+            flag.map(PathBuf::from),
+            None,
+            None,
+            None,
+            None,
+            profile.map(String::from),
+            &[],
+        );
+        std::env::remove_var(ENV);
+        config.unwrap().storage_path
+    }
+
+    /// Flag, then `FLUREE_STORAGE_PATH`, then profile, then config file,
+    /// then the project default, as `docs/operations/configuration.md` says.
+    #[test]
+    fn storage_path_precedence() {
+        let dir = project(
+            "[server]\nstorage_path = \"/from/file\"\n\n\
+             [profiles.prod.server]\nstorage_path = \"/from/profile\"\n",
+        );
+        let path = |flag, profile, env| storage_path(&dir, flag, profile, env);
+        let p = |s: &str| Some(PathBuf::from(s));
+
+        assert_eq!(
+            path(Some("/from/flag"), Some("prod"), Some("/from/env")),
+            p("/from/flag")
+        );
+        assert_eq!(path(None, Some("prod"), Some("/from/env")), p("/from/env"));
+        assert_eq!(path(None, Some("prod"), None), p("/from/profile"));
+        assert_eq!(path(None, None, None), p("/from/file"));
+
+        let bare = project("");
+        assert_eq!(
+            storage_path(&bare, None, None, None),
+            Some(bare.path().join("storage"))
+        );
+    }
 }

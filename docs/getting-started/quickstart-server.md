@@ -201,9 +201,6 @@ export FLUREE_LOG_LEVEL=debug
 fluree server run
 ```
 
-The storage path is the exception: set it with `--storage-path` or `storage_path` in the
-config file, since `fluree server run` overrides `FLUREE_STORAGE_PATH`.
-
 See [Configuration](../operations/configuration.md) for all options.
 
 ## Common Configurations
