@@ -31,6 +31,8 @@ pub enum GraphFormat {
     Turtle,
     NTriples,
     RdfXml,
+    TriG,
+    NQuads,
 }
 
 impl GraphFormat {
@@ -40,6 +42,8 @@ impl GraphFormat {
             GraphFormat::Turtle => "Turtle",
             GraphFormat::NTriples => "N-Triples",
             GraphFormat::RdfXml => "RDF/XML",
+            GraphFormat::TriG => "TriG",
+            GraphFormat::NQuads => "N-Quads",
         }
     }
 
@@ -49,6 +53,8 @@ impl GraphFormat {
             GraphFormat::Turtle => "text/turtle",
             GraphFormat::NTriples => "application/n-triples",
             GraphFormat::RdfXml => "application/rdf+xml",
+            GraphFormat::TriG => "application/trig",
+            GraphFormat::NQuads => "application/n-quads",
         }
     }
 
@@ -59,8 +65,33 @@ impl GraphFormat {
             GraphFormat::Turtle => "text/turtle; charset=utf-8",
             GraphFormat::NTriples => "application/n-triples; charset=utf-8",
             GraphFormat::RdfXml => "application/rdf+xml; charset=utf-8",
+            GraphFormat::TriG => "application/trig; charset=utf-8",
+            GraphFormat::NQuads => "application/n-quads; charset=utf-8",
         }
     }
+
+    /// Every format, for negotiating a CONSTRUCT / DESCRIBE result.
+    pub const ALL: &'static [GraphFormat] = &[
+        GraphFormat::JsonLd,
+        GraphFormat::Turtle,
+        GraphFormat::NTriples,
+        GraphFormat::RdfXml,
+        GraphFormat::TriG,
+        GraphFormat::NQuads,
+    ];
+
+    /// The formats that can express named graphs, for a CONSTRUCT whose
+    /// template writes into them.
+    pub const DATASET: &'static [GraphFormat] =
+        &[GraphFormat::JsonLd, GraphFormat::TriG, GraphFormat::NQuads];
+
+    /// The formats for one graph: a Graph Store `GET`.
+    pub const SINGLE_GRAPH: &'static [GraphFormat] = &[
+        GraphFormat::JsonLd,
+        GraphFormat::Turtle,
+        GraphFormat::NTriples,
+        GraphFormat::RdfXml,
+    ];
 
     pub fn formatter(self) -> fluree_db_api::FormatterConfig {
         match self {
@@ -68,6 +99,8 @@ impl GraphFormat {
             GraphFormat::Turtle => fluree_db_api::FormatterConfig::turtle(),
             GraphFormat::NTriples => fluree_db_api::FormatterConfig::ntriples(),
             GraphFormat::RdfXml => fluree_db_api::FormatterConfig::rdf_xml(),
+            GraphFormat::TriG => fluree_db_api::FormatterConfig::trig(),
+            GraphFormat::NQuads => fluree_db_api::FormatterConfig::nquads(),
         }
     }
 
@@ -83,6 +116,8 @@ impl GraphFormat {
             ("application/x-turtle", GraphFormat::Turtle),
             ("application/n-triples", GraphFormat::NTriples),
             ("application/rdf+xml", GraphFormat::RdfXml),
+            ("application/trig", GraphFormat::TriG),
+            ("application/n-quads", GraphFormat::NQuads),
         ];
         TYPES
             .iter()
@@ -120,23 +155,29 @@ fn media_ranges(accept: &str) -> impl Iterator<Item = (f32, &str)> {
     ranges.into_iter()
 }
 
-/// The graph format an `Accept` value prefers: the highest-`q` media range a
-/// graph format satisfies. `*/*` and `application/*` are JSON-LD, `text/*` is
-/// Turtle, and no `Accept` at all is JSON-LD. `None` when no range matches.
-pub fn negotiate_graph_format(accept: Option<&str>) -> Option<GraphFormat> {
+/// The graph format an `Accept` value prefers among `allowed`: the highest-`q`
+/// media range an allowed format satisfies. `*/*` and `application/*` are
+/// JSON-LD, `text/*` is Turtle, and no `Accept` at all is JSON-LD. `None`
+/// when no range matches.
+pub fn negotiate_graph_format(
+    accept: Option<&str>,
+    allowed: &[GraphFormat],
+) -> Option<GraphFormat> {
     let Some(accept) = accept.filter(|a| !a.trim().is_empty()) else {
         return Some(GraphFormat::JsonLd);
     };
     media_ranges(accept).find_map(|(_, media)| {
-        GraphFormat::from_media_type(media).or_else(|| {
-            if media == "*/*" || media.eq_ignore_ascii_case("application/*") {
-                Some(GraphFormat::JsonLd)
-            } else if media.eq_ignore_ascii_case("text/*") {
-                Some(GraphFormat::Turtle)
-            } else {
-                None
-            }
-        })
+        GraphFormat::from_media_type(media)
+            .or_else(|| {
+                if media == "*/*" || media.eq_ignore_ascii_case("application/*") {
+                    Some(GraphFormat::JsonLd)
+                } else if media.eq_ignore_ascii_case("text/*") {
+                    Some(GraphFormat::Turtle)
+                } else {
+                    None
+                }
+            })
+            .filter(|f| allowed.contains(f))
     })
 }
 
@@ -463,9 +504,10 @@ impl FlureeHeaders {
         get_header_str(&self.raw, "fluree-max-bytes").and_then(|v| v.parse().ok())
     }
 
-    /// The graph serialization `Accept` prefers; see [`negotiate_graph_format`].
-    pub fn graph_format(&self) -> Option<GraphFormat> {
-        negotiate_graph_format(self.accept.as_deref())
+    /// The graph serialization `Accept` prefers among `allowed`; see
+    /// [`negotiate_graph_format`].
+    pub fn graph_format(&self, allowed: &[GraphFormat]) -> Option<GraphFormat> {
+        negotiate_graph_format(self.accept.as_deref(), allowed)
     }
 
     /// Whether every media range `Accept` admits is a graph-only serialization
@@ -660,7 +702,7 @@ mod tests {
 
     #[test]
     fn graph_format_negotiation_follows_q() {
-        let n = negotiate_graph_format;
+        let n = |a| negotiate_graph_format(a, GraphFormat::ALL);
         assert_eq!(n(None), Some(GraphFormat::JsonLd));
         assert_eq!(n(Some("*/*")), Some(GraphFormat::JsonLd));
         assert_eq!(n(Some("text/turtle")), Some(GraphFormat::Turtle));
@@ -693,6 +735,16 @@ mod tests {
         );
         assert_eq!(n(Some("application/sparql-results+json")), None);
         assert_eq!(n(Some("text/turtle;q=0")), None);
+        assert_eq!(n(Some("application/trig")), Some(GraphFormat::TriG));
+
+        // A format outside `allowed` is skipped, not chosen.
+        let dataset = |a| negotiate_graph_format(Some(a), GraphFormat::DATASET);
+        assert_eq!(
+            dataset("text/turtle, application/n-quads;q=0.5"),
+            Some(GraphFormat::NQuads)
+        );
+        assert_eq!(dataset("text/turtle"), None);
+        assert_eq!(dataset("text/*"), None);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::ir::ReasoningConfig;
 use crate::ir::{AggregateFn, AggregateSpec, InputSemantics};
 use crate::ir::{
     Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
-    Query, QueryOutput, Restriction, Root,
+    Query, QueryOutput, Restriction, Root, TemplateReification,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, PathStep, Pattern,
@@ -1419,22 +1419,66 @@ fn lower_subquery<E: IriEncoder>(
 
 /// Lower an unresolved CONSTRUCT template to a resolved ConstructTemplate
 ///
-/// Only processes triple patterns from the template (filters/optionals are ignored).
+/// Triples, edge annotations and named-graph blocks become template patterns,
+/// reifier attachments and per-pattern graphs; other patterns (filters,
+/// optionals, binds) are ignored.
 fn lower_construct_template<E: IriEncoder>(
     template: &UnresolvedConstructTemplate,
     encoder: &E,
     vars: &mut VarRegistry,
 ) -> Result<ConstructTemplate> {
-    let mut patterns = Vec::new();
+    let mut out = ConstructTemplate::new(Vec::new());
+    lower_construct_patterns(&template.patterns, None, encoder, vars, &mut out)?;
+    // An `@annotation` block without an `@id` names its reifier with a
+    // synthetic variable no WHERE clause binds: mint a fresh blank node for
+    // it on each row, as SPARQL does for a `[ ]` reifier.
+    out.bnode_vars = out
+        .reifications
+        .iter()
+        .filter_map(|r| r.reifier.as_var())
+        .filter(|&v| vars.try_name(v).is_some_and(|n| n.starts_with("?__ann")))
+        .collect();
+    Ok(out)
+}
 
-    for unresolved in &template.patterns {
-        if let UnresolvedPattern::Triple(tp) = unresolved {
-            patterns.push(lower_triple_pattern(tp, encoder, vars)?);
+fn lower_construct_patterns<E: IriEncoder>(
+    patterns: &[UnresolvedPattern],
+    graph: Option<&Ref>,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut ConstructTemplate,
+) -> Result<()> {
+    for unresolved in patterns {
+        match unresolved {
+            UnresolvedPattern::Triple(tp) => {
+                out.push_pattern(lower_triple_pattern(tp, encoder, vars)?, graph.cloned());
+            }
+            UnresolvedPattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            } => {
+                let triple =
+                    out.push_pattern(lower_triple_pattern(edge, encoder, vars)?, graph.cloned());
+                out.reifications.push(TemplateReification {
+                    triple,
+                    reifier: lower_ref_term(annotation, encoder, vars)?,
+                });
+                lower_construct_patterns(body, graph, encoder, vars, out)?;
+            }
+            UnresolvedPattern::Graph { name, patterns } => {
+                let name = if name.starts_with('?') {
+                    Ref::Var(vars.get_or_insert(name))
+                } else {
+                    Ref::Iri(std::sync::Arc::from(name.as_ref()))
+                };
+                lower_construct_patterns(patterns, Some(&name), encoder, vars, out)?;
+            }
+            // Filters, optionals and binds have no meaning in a template.
+            _ => {}
         }
-        // Ignore non-triple patterns in templates (filters, optionals, binds)
     }
-
-    Ok(ConstructTemplate::new(patterns))
+    Ok(())
 }
 
 // ============================================================================

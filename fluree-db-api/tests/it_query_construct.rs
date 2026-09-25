@@ -1091,6 +1091,8 @@ mod construct_license_output_gate {
         RdfXml     => Canonicalizes, // graph_text::format → Graph::canonicalize
         Turtle     => Canonicalizes, // graph_text::format → Graph::canonicalize
         NTriples   => Canonicalizes, // graph_text::format → Graph::canonicalize
+        TriG       => Canonicalizes, // graph_text::format → Dataset::canonicalize
+        NQuads     => Canonicalizes, // graph_text::format → Dataset::canonicalize
         TypedJson  => Canonicalizes, // coerced to construct::format
         Tsv        => Rejects,       // delimited::reject_non_tabular
         Csv        => Rejects,       // delimited::reject_non_tabular
@@ -1300,5 +1302,423 @@ mod graph_text_output {
         let id = label.trim_start_matches("_:");
         assert!(xml.contains(&format!(r#"rdf:nodeID="{id}""#)), "{xml}");
         assert!(!xml.contains(r#"rdf:about="_:"#), "{xml}");
+    }
+}
+
+// ============================================================================
+// Edge annotations and GRAPH blocks in CONSTRUCT templates
+// ============================================================================
+
+mod annotations_and_graphs {
+    use super::{context_people, seed_people};
+    use crate::support;
+    use fluree_db_api::format::{format_results, format_results_string, FormatterConfig};
+    use fluree_db_api::{LedgerState, QueryResult};
+    use serde_json::{json, Value as JsonValue};
+
+    const PREFIXES: &str = "PREFIX ex: <http://example.org/>
+        PREFIX person: <http://example.org/Person#>
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>";
+    const EX: &str = "http://example.org/";
+    const REIFIES: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+
+    fn render(result: &QueryResult, ledger: &LedgerState, config: FormatterConfig) -> String {
+        format_results_string(result, &result.context, &ledger.snapshot, &config)
+            .expect("graph text output")
+    }
+
+    fn jsonld(result: &QueryResult, ledger: &LedgerState) -> JsonValue {
+        format_results(
+            result,
+            &result.context,
+            &ledger.snapshot,
+            &FormatterConfig::jsonld(),
+        )
+        .expect("JSON-LD output")
+    }
+
+    fn sorted_lines(text: &str) -> Vec<&str> {
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.sort_unstable();
+        lines
+    }
+
+    /// People plus two annotated `ex:worksFor` edges: one with a named
+    /// reifier and a body, one without.
+    async fn annotated() -> (fluree_db_api::Fluree, LedgerState) {
+        let (fluree, ledger) = seed_people().await;
+        let ledger = fluree
+            .insert_turtle(
+                ledger,
+                "@prefix ex: <http://example.org/> .\n\
+                 ex:jdoe ex:worksFor ex:acme ~ ex:claim1 {| ex:confidence 0.9 |} .\n\
+                 ex:bbob ex:worksFor ex:acme .\n",
+            )
+            .await
+            .expect("annotate")
+            .ledger;
+        (fluree, ledger)
+    }
+
+    async fn sparql(
+        fluree: &fluree_db_api::Fluree,
+        ledger: &LedgerState,
+        body: &str,
+    ) -> QueryResult {
+        support::query_sparql(fluree, ledger, &format!("{PREFIXES}\n{body}"))
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {e}\n{body}"))
+    }
+
+    /// `?s ?p ?o ~ ?r` carries each edge's reifier into every format, and an
+    /// unbound reifier attaches nothing.
+    #[tokio::test]
+    async fn template_annotation_reaches_every_format() {
+        let (fluree, ledger) = annotated().await;
+        let result = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { ?s ex:worksFor ?o ~ ?r }
+             WHERE { ?s ex:worksFor ?o OPTIONAL { ?r rdf:reifies <<( ?s ex:worksFor ?o )>> } }",
+        )
+        .await;
+
+        let nt = render(&result, &ledger, FormatterConfig::ntriples());
+        let (jdoe, acme, works) = (
+            format!("<{EX}jdoe>"),
+            format!("<{EX}acme>"),
+            format!("<{EX}worksFor>"),
+        );
+        assert_eq!(
+            sorted_lines(&nt),
+            sorted_lines(&format!(
+                "<{EX}bbob> {works} {acme} .\n\
+                 {jdoe} {works} {acme} .\n\
+                 <{EX}claim1> {REIFIES} <<( {jdoe} {works} {acme} )>> .\n"
+            )),
+            "{nt}"
+        );
+
+        let ttl = render(&result, &ledger, FormatterConfig::turtle());
+        assert!(
+            ttl.contains("ex:jdoe ex:worksFor ex:acme ~ ex:claim1 ."),
+            "{ttl}"
+        );
+        assert!(ttl.contains("ex:bbob ex:worksFor ex:acme ."), "{ttl}");
+
+        let xml = render(&result, &ledger, FormatterConfig::rdf_xml());
+        assert!(
+            xml.contains(&format!(r#"rdf:annotation="{EX}claim1""#)),
+            "{xml}"
+        );
+
+        let doc = jsonld(&result, &ledger);
+        let node = doc["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["@id"] == "ex:jdoe")
+            .unwrap_or_else(|| panic!("no ex:jdoe node: {doc}"));
+        assert_eq!(
+            node["ex:worksFor"][0],
+            json!({"@id": "ex:acme", "@annotation": {"@id": "ex:claim1"}}),
+            "{doc}"
+        );
+    }
+
+    /// An annotation block in the template writes the reifier's description;
+    /// without a reifier id each row mints its own blank node.
+    #[tokio::test]
+    async fn template_annotation_blocks_write_bodies() {
+        let (fluree, ledger) = annotated().await;
+        let named = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { ?s ex:worksFor ?o ~ ?r {| ex:checked true |} }
+             WHERE { ?s ex:worksFor ?o ~ ?r }",
+        )
+        .await;
+        let nt = render(&named, &ledger, FormatterConfig::ntriples());
+        for line in [
+            format!(
+                "<{EX}claim1> <{EX}checked> \"true\"^^<http://www.w3.org/2001/XMLSchema#boolean> ."
+            ),
+            format!("<{EX}claim1> {REIFIES} <<( <{EX}jdoe> <{EX}worksFor> <{EX}acme> )>> ."),
+        ] {
+            assert!(nt.lines().any(|l| l == line), "missing {line}\nin:\n{nt}");
+        }
+
+        let anonymous = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { ?s ex:worksFor ?o {| ex:note \"seen\" |} } WHERE { ?s ex:worksFor ?o }",
+        )
+        .await;
+        let nt = render(&anonymous, &ledger, FormatterConfig::ntriples());
+        let reifiers: Vec<&str> = nt
+            .lines()
+            .filter(|l| l.contains(REIFIES))
+            .map(|l| l.split_whitespace().next().unwrap())
+            .collect();
+        assert_eq!(reifiers.len(), 2, "one per edge:\n{nt}");
+        assert_ne!(reifiers[0], reifiers[1], "fresh per row:\n{nt}");
+        for r in reifiers {
+            assert!(r.starts_with("_:"), "{nt}");
+            assert!(
+                nt.lines()
+                    .any(|l| l == format!("{r} <{EX}note> \"seen\" .")),
+                "{nt}"
+            );
+        }
+    }
+
+    /// `?r rdf:reifies <<( s p o )>>` in a template is the same attachment as
+    /// the `~ ?r` spelling.
+    #[tokio::test]
+    async fn reifies_spelling_matches_annotation_tail() {
+        let (fluree, ledger) = annotated().await;
+        let where_clause = "WHERE { ?r rdf:reifies <<( ?s ex:worksFor ?o )>> }";
+        let tail = sparql(
+            &fluree,
+            &ledger,
+            &format!("CONSTRUCT {{ ?s ex:worksFor ?o ~ ?r }} {where_clause}"),
+        )
+        .await;
+        let reifies = sparql(
+            &fluree,
+            &ledger,
+            &format!("CONSTRUCT {{ ?r rdf:reifies <<( ?s ex:worksFor ?o )>> }} {where_clause}"),
+        )
+        .await;
+        assert_eq!(
+            sorted_lines(&render(&tail, &ledger, FormatterConfig::ntriples())),
+            sorted_lines(&render(&reifies, &ledger, FormatterConfig::ntriples()))
+        );
+    }
+
+    /// SPARQL and JSON-LD share the template IR: an annotated edge in either
+    /// surface's template serializes alike.
+    #[tokio::test]
+    async fn sparql_and_jsonld_annotation_templates_serialize_alike() {
+        let (fluree, ledger) = annotated().await;
+        let sparql_result = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { ?s ex:worksFor ?o ~ ?r } WHERE { ?s ex:worksFor ?o ~ ?r }",
+        )
+        .await;
+        let jsonld_result = support::query_jsonld(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": context_people(),
+                "where": [{"@id": "?s", "ex:worksFor": {"@id": "?o", "@annotation": {"@id": "?r"}}}],
+                "construct": [{"@id": "?s", "ex:worksFor": {"@id": "?o", "@annotation": {"@id": "?r"}}}]
+            }),
+        )
+        .await
+        .expect("JSON-LD construct");
+        let nt = render(&sparql_result, &ledger, FormatterConfig::ntriples());
+        assert_eq!(
+            sorted_lines(&nt),
+            sorted_lines(&render(
+                &jsonld_result,
+                &ledger,
+                FormatterConfig::ntriples()
+            ))
+        );
+        assert!(nt.contains(REIFIES), "{nt}");
+    }
+
+    /// A `GRAPH` block writes into a named graph, so the result is a dataset:
+    /// TriG, N-Quads and JSON-LD carry it, and the triples-only formats refuse.
+    #[tokio::test]
+    async fn graph_blocks_produce_a_dataset() {
+        let (fluree, ledger) = seed_people().await;
+        let result = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { GRAPH ex:people { ?s ex:name ?n } ?s a ex:Named }
+             WHERE { ?s person:fullName ?n FILTER(?n = \"Jane Doe\") }",
+        )
+        .await;
+
+        let nq = render(&result, &ledger, FormatterConfig::nquads());
+        assert_eq!(
+            sorted_lines(&nq),
+            sorted_lines(&format!(
+                "<{EX}jdoe> <{EX}name> \"Jane Doe\" <{EX}people> .\n\
+                 <{EX}jdoe> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}Named> .\n"
+            )),
+            "{nq}"
+        );
+
+        let trig = render(&result, &ledger, FormatterConfig::trig());
+        assert!(trig.contains("ex:jdoe a ex:Named ."), "{trig}");
+        assert!(
+            trig.contains("GRAPH ex:people {\n    ex:jdoe ex:name \"Jane Doe\" .\n}"),
+            "{trig}"
+        );
+
+        let doc = jsonld(&result, &ledger);
+        let graph_node = doc["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["@id"] == "ex:people")
+            .unwrap_or_else(|| panic!("no named graph node: {doc}"));
+        assert_eq!(graph_node["@graph"][0]["@id"], "ex:jdoe", "{doc}");
+
+        for config in [
+            FormatterConfig::turtle(),
+            FormatterConfig::ntriples(),
+            FormatterConfig::rdf_xml(),
+        ] {
+            let err = format_results_string(&result, &result.context, &ledger.snapshot, &config)
+                .expect_err("a triples format cannot carry named graphs");
+            assert!(err.to_string().contains("named graphs"), "{err}");
+        }
+    }
+
+    /// `GRAPH ?g` in a template writes into the graph the WHERE clause bound.
+    #[tokio::test]
+    async fn graph_variable_copies_named_graphs() {
+        let (fluree, ledger) = seed_people().await;
+        let ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(
+                "@prefix ex: <http://example.org/> .\n\
+                 GRAPH ex:g1 { ex:a ex:p \"one\" . }\n\
+                 GRAPH ex:g2 { ex:b ex:p \"two\" . }\n",
+            )
+            .execute()
+            .await
+            .expect("seed named graphs")
+            .ledger;
+        let result = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { GRAPH ?g { ?s ex:p ?o } } WHERE { GRAPH ?g { ?s ex:p ?o } }",
+        )
+        .await;
+        let nq = render(&result, &ledger, FormatterConfig::nquads());
+        assert_eq!(
+            sorted_lines(&nq),
+            sorted_lines(&format!(
+                "<{EX}a> <{EX}p> \"one\" <{EX}g1> .\n<{EX}b> <{EX}p> \"two\" <{EX}g2> .\n"
+            )),
+            "{nq}"
+        );
+    }
+
+    /// The JSON-LD twin of a `GRAPH` block: `["graph", <iri>, node-map, ...]`,
+    /// the `where` clause's form.
+    #[tokio::test]
+    async fn sparql_and_jsonld_graph_templates_serialize_alike() {
+        let (fluree, ledger) = seed_people().await;
+        let sparql_result = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { GRAPH ex:people { ?s ex:name ?n } ?s a ex:Named }
+             WHERE { ?s person:fullName ?n }",
+        )
+        .await;
+        let jsonld_result = support::query_jsonld(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": context_people(),
+                "where": [{"@id": "?s", "person:fullName": "?n"}],
+                "construct": [
+                    ["graph", "ex:people", {"@id": "?s", "ex:name": "?n"}],
+                    {"@id": "?s", "@type": "ex:Named"}
+                ]
+            }),
+        )
+        .await
+        .expect("JSON-LD construct");
+        let nq = render(&sparql_result, &ledger, FormatterConfig::nquads());
+        assert_eq!(
+            sorted_lines(&nq),
+            sorted_lines(&render(&jsonld_result, &ledger, FormatterConfig::nquads()))
+        );
+        assert!(nq.contains(&format!("<{EX}people> .")), "{nq}");
+    }
+
+    /// An `@annotation` block without an `@id` mints a fresh reifier per row,
+    /// exactly as SPARQL's anonymous `{| ... |}` does.
+    #[tokio::test]
+    async fn anonymous_annotation_blocks_match_across_surfaces() {
+        let (fluree, ledger) = annotated().await;
+        let sparql_result = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { ?s ex:worksFor ?o {| ex:note \"seen\" |} } WHERE { ?s ex:worksFor ?o }",
+        )
+        .await;
+        let jsonld_result = support::query_jsonld(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": context_people(),
+                "where": [{"@id": "?s", "ex:worksFor": "?o"}],
+                "construct": [{
+                    "@id": "?s",
+                    "ex:worksFor": {"@id": "?o", "@annotation": {"ex:note": "seen"}}
+                }]
+            }),
+        )
+        .await
+        .expect("JSON-LD construct");
+        let nt = render(&jsonld_result, &ledger, FormatterConfig::ntriples());
+        assert_eq!(
+            sorted_lines(&render(
+                &sparql_result,
+                &ledger,
+                FormatterConfig::ntriples()
+            )),
+            sorted_lines(&nt)
+        );
+        assert_eq!(nt.matches(REIFIES).count(), 2, "{nt}");
+    }
+
+    /// The JSON-LD twin of `GRAPH ?g` in a template.
+    #[tokio::test]
+    async fn jsonld_graph_variable_copies_named_graphs() {
+        let (fluree, ledger) = seed_people().await;
+        let ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(
+                "@prefix ex: <http://example.org/> .\n\
+                 GRAPH ex:g1 { ex:a ex:p \"one\" . }\n\
+                 GRAPH ex:g2 { ex:b ex:p \"two\" . }\n",
+            )
+            .execute()
+            .await
+            .expect("seed named graphs")
+            .ledger;
+        let sparql_result = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { GRAPH ?g { ?s ex:p ?o } } WHERE { GRAPH ?g { ?s ex:p ?o } }",
+        )
+        .await;
+        let jsonld_result = support::query_jsonld(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": context_people(),
+                "where": [["graph", "?g", {"@id": "?s", "ex:p": "?o"}]],
+                "construct": [["graph", "?g", {"@id": "?s", "ex:p": "?o"}]]
+            }),
+        )
+        .await
+        .expect("JSON-LD construct");
+        let nq = render(&jsonld_result, &ledger, FormatterConfig::nquads());
+        assert_eq!(
+            sorted_lines(&render(&sparql_result, &ledger, FormatterConfig::nquads())),
+            sorted_lines(&nq)
+        );
+        assert!(nq.contains(&format!("<{EX}g2> .")), "{nq}");
     }
 }

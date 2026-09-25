@@ -46,12 +46,12 @@ For TriG format transactions with named graphs (GRAPH blocks). Supported on `/up
 ```http
 Content-Type: application/n-triples
 ```
-For N-Triples format (future support).
+For N-Triples bodies, parsed as Turtle; accepted wherever Turtle is.
 
 ```http
 Content-Type: application/rdf+xml
 ```
-For RDF/XML format (future support).
+RDF/XML is an output format only; it is not accepted as a request body.
 
 ### Accept
 
@@ -95,6 +95,12 @@ Accept: application/rdf+xml
 RDF/XML graph format (for CONSTRUCT/DESCRIBE queries and Graph Store `GET`).
 
 ```http
+Accept: application/trig
+Accept: application/n-quads
+```
+TriG and N-Quads (for CONSTRUCT/DESCRIBE queries). Required, with JSON-LD, for a CONSTRUCT whose template writes into named graphs (`GRAPH` blocks).
+
+```http
 Accept: application/vnd.fluree.agent+json
 ```
 Agent JSON format — optimized for LLM/agent consumption. Returns a self-describing envelope with schema, compact rows, and pagination support. See [Output Formats](../query/output-formats.md#agent-json-format) for details.
@@ -103,11 +109,6 @@ Use the `Fluree-Max-Bytes` header to set a byte budget for response truncation:
 ```http
 Fluree-Max-Bytes: 32768
 ```
-
-```http
-Accept: application/n-triples
-```
-N-Triples format (future support).
 
 **Multiple Accept Values:**
 

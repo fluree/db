@@ -1262,6 +1262,15 @@ impl crate::Fluree {
         Ok(!flakes.is_empty())
     }
 
+    /// Whether the ledger holds, or has held, an RDF 1.2 edge annotation
+    /// (indexed or in novelty). Lets a reader skip annotation lookups on the
+    /// many ledgers that have none.
+    pub async fn has_annotations(&self, ledger_id: &str) -> Result<bool> {
+        let handle = self.ledger_cached(ledger_id).await?;
+        let ledger = handle.snapshot().await.to_ledger_state();
+        Ok(ledger.snapshot.has_annotations || ledger.novelty.attachments.has_annotations())
+    }
+
     /// Cancel indexing, delete storage artifacts, purge nameservice record,
     /// and disconnect from cache. Returns the parent's new child count.
     ///

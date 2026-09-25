@@ -5,7 +5,7 @@
 
 use super::{FormatError, Result};
 
-use fluree_graph_ir::{push_canonical_xsd_double, Graph, LiteralValue, Term};
+use fluree_graph_ir::{push_canonical_xsd_double, Graph, LiteralValue, Term, Triple};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -55,6 +55,11 @@ pub(super) fn format_graph(graph: &Graph) -> Result<String> {
     }
     out.push('>');
 
+    // Reifiers by the triple they reify. RDF/XML 1.2 attaches one with an
+    // `rdf:annotation` / `rdf:annotationNodeID` attribute on the property
+    // element; a triple with several reifiers is written once per reifier.
+    let mut reifiers = graph.reifiers_by_triple();
+
     // Group triples by subject (graph is sorted SPO).
     let mut current_subject: Option<&Term> = None;
     for triple in graph.iter() {
@@ -69,10 +74,22 @@ pub(super) fn format_graph(graph: &Graph) -> Result<String> {
             current_subject = Some(s);
         }
 
-        write_predicate_object(triple.predicate(), triple.object(), &ns_to_prefix, &mut out)?;
+        match reifiers.remove(triple) {
+            Some(rs) => {
+                for r in rs {
+                    write_predicate_object(triple, Some(r), &ns_to_prefix, &mut out)?;
+                }
+            }
+            None => write_predicate_object(triple, None, &ns_to_prefix, &mut out)?,
+        }
     }
     if current_subject.is_some() {
         out.push_str("</rdf:Description>");
+    }
+    if !reifiers.is_empty() {
+        return Err(FormatError::InvalidBinding(
+            "RDF/XML cannot express a reifier whose triple is not in the graph".to_string(),
+        ));
     }
 
     out.push_str("</rdf:RDF>");
@@ -128,11 +145,12 @@ fn write_subject_attr(subject: &Term, out: &mut String) -> Result<()> {
 }
 
 fn write_predicate_object(
-    predicate: &Term,
-    object: &Term,
+    triple: &Triple,
+    reifier: Option<&Term>,
     ns_to_prefix: &BTreeMap<String, String>,
     out: &mut String,
 ) -> Result<()> {
+    let (predicate, object) = (triple.predicate(), triple.object());
     let p_iri = predicate.as_iri().ok_or_else(|| {
         FormatError::InvalidBinding("RDF/XML requires IRI predicates".to_string())
     })?;
@@ -145,6 +163,29 @@ fn write_predicate_object(
     out.push_str(prefix);
     out.push(':');
     out.push_str(local);
+    match reifier {
+        Some(Term::Iri(iri)) if iri.starts_with("_:") => {
+            out.push_str(r#" rdf:annotationNodeID=""#);
+            escape_attr_into(&iri[2..], out);
+            out.push('"');
+        }
+        Some(Term::Iri(iri)) => {
+            out.push_str(r#" rdf:annotation=""#);
+            escape_attr_into(iri, out);
+            out.push('"');
+        }
+        Some(Term::BlankNode(id)) => {
+            out.push_str(r#" rdf:annotationNodeID=""#);
+            escape_attr_into(id.as_str(), out);
+            out.push('"');
+        }
+        Some(Term::Literal { .. }) => {
+            return Err(FormatError::InvalidBinding(
+                "a reifier cannot be a literal".to_string(),
+            ))
+        }
+        None => {}
+    }
 
     match object {
         Term::Iri(iri) if iri.starts_with("_:") => {
@@ -292,6 +333,45 @@ mod tests {
             "{xml}"
         );
         assert!(xml.contains(r#"rdf:nodeID="x30""#), "{xml}");
+    }
+
+    #[test]
+    fn rdfxml_reifiers_use_annotation_attributes() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let mut g = Graph::new();
+        g.add(Triple::new(ex("alice"), ex("knows"), ex("bob")));
+        g.add(Triple::new(ex("alice"), ex("age"), Term::integer(42)));
+        g.add_reification(ex("alice"), ex("knows"), ex("bob"), ex("claim"));
+        g.add_reification(ex("alice"), ex("knows"), ex("bob"), Term::blank("r1"));
+        g.add_reification(
+            ex("alice"),
+            ex("age"),
+            Term::integer(42),
+            Term::iri("_:fdb-9"),
+        );
+        g.canonicalize();
+
+        let xml = format_graph(&g).unwrap();
+        // One property element per reifier.
+        assert_eq!(
+            xml.matches("rdf:resource=\"http://example.org/bob\"")
+                .count(),
+            2,
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"rdf:annotation="http://example.org/claim""#),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"rdf:annotationNodeID="r1""#), "{xml}");
+        assert!(xml.contains(r#"rdf:annotationNodeID="fdb-9""#), "{xml}");
+
+        let mut orphan = Graph::new();
+        orphan.add_reification(ex("a"), ex("p"), ex("b"), ex("r"));
+        assert!(
+            format_graph(&orphan).is_err(),
+            "a reification without its triple"
+        );
     }
 
     #[test]

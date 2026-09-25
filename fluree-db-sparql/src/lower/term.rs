@@ -66,6 +66,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         self.vars.get_or_insert(&format!("?{}", v.name))
     }
 
+    /// Register a fresh anonymous blank-node variable in the shared `_:[]`
+    /// namespace, which cannot collide with a user-written blank-node label.
+    pub(super) fn fresh_blank_node_var(&mut self) -> VarId {
+        self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()))
+    }
+
     pub(super) fn lower_subject(&mut self, term: &SubjectTerm) -> Result<Ref> {
         match term {
             SubjectTerm::Var(v) => Ok(self.lower_var_ref(v)),
@@ -82,10 +88,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     let var_id = self.vars.get_or_insert(&format!("_:{label}"));
                     Ok(Ref::Var(var_id))
                 }
-                BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
-                    Ok(Ref::Var(var_id))
-                }
+                BlankNodeValue::Anon => Ok(Ref::Var(self.fresh_blank_node_var())),
             },
             SubjectTerm::QuotedTriple(_qt) => {
                 // This path is reached when a quoted triple appears in a
@@ -141,10 +144,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     let var_id = self.vars.get_or_insert(&format!("_:{label}"));
                     Ok(Term::Var(var_id))
                 }
-                BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
-                    Ok(Term::Var(var_id))
-                }
+                BlankNodeValue::Anon => Ok(Term::Var(self.fresh_blank_node_var())),
             },
             SparqlTerm::QuotedTriple(qt) => {
                 // Reified-triple objects are desugared by

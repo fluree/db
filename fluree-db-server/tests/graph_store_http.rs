@@ -540,3 +540,43 @@ async fn invalid_language_tag_is_refused_on_write() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("invalid language tag"), "{body}");
 }
+
+/// Edge annotations come back with a `GET`, so reading an annotated graph and
+/// putting it back unchanged commits nothing — in the default graph and in a
+/// named one.
+#[tokio::test]
+async fn annotated_graphs_round_trip() {
+    let (_tmp, app) = seeded_app().await;
+    let tools = named(TOOLS);
+    let annotated = "@prefix ex: <http://example.org/> .\n\
+                     ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} .\n\
+                     ex:alice ex:name \"Alice\" .\n";
+
+    for target in [tools.clone(), default_graph()] {
+        let (status, body) = send(&app, "PUT", &target, TTL, annotated, None).await;
+        assert!(status.is_success(), "{target}: {body}");
+        let t1 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["t"].as_i64();
+
+        let (status, ttl) = send(&app, "GET", &target, None, "", TTL).await;
+        assert_eq!(status, StatusCode::OK, "{ttl}");
+        assert!(
+            ttl.contains("<http://example.org/bob> ~ <http://example.org/claim1>"),
+            "{target}: {ttl}"
+        );
+        assert!(
+            ttl.contains("<http://example.org/confidence> 0.9"),
+            "{target}: {ttl}"
+        );
+
+        let (status, body) = send(&app, "PUT", &target, TTL, &ttl, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let t2 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["t"].as_i64();
+        assert_eq!(
+            t1, t2,
+            "{target}: the annotated graph PUT back must not commit:\n{ttl}"
+        );
+
+        let (_, json) = send(&app, "GET", &target, None, "", JSON_LD).await;
+        assert!(json.contains("@annotation"), "{target}: {json}");
+    }
+}

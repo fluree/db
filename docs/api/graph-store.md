@@ -71,7 +71,7 @@ The TriG rules are those of [sync](../transactions/sync.md#payload-formats): eve
 
 An `Accept` that names none of these is a `406`. The Turtle and N-Triples a `GET` returns are what `PUT` accepts, so a graph read as Turtle and put back unchanged commits nothing: blank nodes are written under their stored labels, which a write resolves back to the same nodes.
 
-**Edge annotations are not returned.** `GET` returns a graph's triples, including an annotation's own triples (`ex:claim1 ex:confidence 0.9`), but not the link that ties the annotation to its edge, because `CONSTRUCT` does not serialize RDF 1.2 annotations yet. So a graph with annotations does not survive a `GET` followed by a `PUT` of the result: the `PUT` commits a change that removes those links. Keep the source file as the copy you `PUT`, and read annotations with a JSON-LD query (see [Edge annotations](../concepts/edge-annotations.md)).
+**Edge annotations are returned with their edges**: `ex:alice ex:knows ex:bob ~ ex:claim1` in Turtle, an `rdf:reifies` line in N-Triples, `@annotation` in JSON-LD, the `rdf:annotation` attribute in RDF/XML (see [Edge annotations](../concepts/edge-annotations.md)). A graph with annotations therefore survives a `GET` followed by a `PUT` of the result, too. A ledger that has never held an annotation skips the annotation lookup, which otherwise adds a lookup per annotation to the read.
 
 ## Auth and policy
 

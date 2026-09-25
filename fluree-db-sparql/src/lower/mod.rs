@@ -1204,6 +1204,66 @@ mod tests {
         lower_query_with_vars(sparql).map(|(q, _)| q)
     }
 
+    fn construct_template(sparql: &str) -> fluree_db_query::ir::ConstructTemplate {
+        match lower_query(sparql).expect("lowers").output {
+            QueryOutput::Construct(t) => t,
+            other => panic!("expected CONSTRUCT, got {other:?}"),
+        }
+    }
+
+    /// `GRAPH` blocks set each template triple's graph; triples outside any
+    /// block stay in the default graph.
+    #[test]
+    fn construct_template_graph_blocks() {
+        let t = construct_template(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?s ex:a ?o . GRAPH ex:g { ?s ex:b ?o } GRAPH ?g { ?s ex:c ?o } ?s ex:d ?o }
+             WHERE { GRAPH ?g { ?s ?p ?o } }",
+        );
+        assert_eq!(t.patterns.len(), 4);
+        assert!(t.names_graphs());
+        assert!(t.graph(0).is_none());
+        assert!(
+            matches!(t.graph(1), Some(Ref::Iri(iri)) if iri.as_ref() == "http://example.org/g"),
+            "{:?}",
+            t.graphs
+        );
+        assert!(matches!(t.graph(2), Some(Ref::Var(_))), "{:?}", t.graphs);
+        assert!(t.graph(3).is_none());
+
+        // A template that opens with a GRAPH block.
+        let first = construct_template(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { GRAPH ex:g { ?s ex:b ?o } ?s ex:a ?o } WHERE { ?s ex:a ?o }",
+        );
+        assert!(first.graph(0).is_some(), "{:?}", first.graphs);
+        assert!(first.graph(1).is_none(), "{:?}", first.graphs);
+
+        let plain = construct_template("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+        assert!(
+            plain.graphs.is_empty(),
+            "no graph metadata without GRAPH blocks"
+        );
+    }
+
+    /// Annotation tails and `rdf:reifies` in a template become reifier
+    /// attachments on the triple they annotate.
+    #[test]
+    fn construct_template_annotations() {
+        let t = construct_template(
+            "PREFIX ex: <http://example.org/>
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             CONSTRUCT { ?s ex:p ?o ~ ?r {| ex:q 1 |} . ?r2 rdf:reifies <<( ?s ex:t ?o )>> }
+             WHERE { ?s ex:p ?o ; ex:t ?o . ?r ex:x ?o . ?r2 ex:y ?o }",
+        );
+        // ?s ex:p ?o, the body triple ?r ex:q 1, then ?s ex:t ?o.
+        assert_eq!(t.patterns.len(), 3, "{:?}", t.patterns);
+        assert_eq!(t.reifications.len(), 2);
+        assert_eq!(t.reifications[0].triple, 0);
+        assert_eq!(t.reifications[1].triple, 2);
+        assert_eq!(t.patterns[1].s, t.reifications[0].reifier);
+    }
+
     fn lower_query_with_vars(sparql: &str) -> Result<(Query, VarRegistry)> {
         let output = parse_sparql(sparql);
         assert!(
@@ -4608,18 +4668,23 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn m45_construct_with_annotation_in_template_is_rejected() {
-        let err = lower_query(
+    fn m45_construct_with_annotation_in_template_preserves_reifier() {
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              CONSTRUCT { ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} }
              WHERE { ex:alice ex:worksFor ex:acme }",
         )
-        .expect_err("annotation in CONSTRUCT template must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("CONSTRUCT projection of edge-annotation"),
-            "got: {msg}"
-        );
+        .expect("annotation in CONSTRUCT template should lower");
+        let template = query.output.construct_template().unwrap();
+        assert_eq!(template.patterns.len(), 2);
+        assert_eq!(template.reifications.len(), 1);
+        let attachment = &template.reifications[0];
+        assert_eq!(attachment.triple, 0);
+        assert_eq!(template.patterns[1].s, attachment.reifier);
+        let reifier = attachment.reifier.as_var().unwrap();
+        assert_eq!(template.bnode_vars.len(), 1);
+        assert!(template.bnode_vars.contains(&reifier));
+        assert!(template.graphs.is_empty());
     }
 
     #[test]

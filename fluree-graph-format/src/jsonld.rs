@@ -4,7 +4,7 @@
 
 use crate::policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
 use fluree_graph_ir::datatype::iri as dt_iri;
-use fluree_graph_ir::{BlankId, Datatype, Graph, LiteralValue, Term};
+use fluree_graph_ir::{BlankId, Dataset, Datatype, Graph, LiteralValue, Term};
 use serde_json::{json, Map, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -258,22 +258,58 @@ impl BlankNodeRenamer {
 /// let json = format_jsonld(&graph, &config);
 /// ```
 pub fn format_jsonld(graph: &Graph, config: &JsonLdFormatConfig) -> JsonValue {
-    let mut output = Map::new();
+    let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
+    let nodes = graph_nodes(graph, config, &mut bnode_renamer);
+    document(config, nodes)
+}
 
-    // Add context based on policy
+/// Format a dataset as JSON-LD: the default graph's nodes, then one
+/// `{"@id": <graph name>, "@graph": [...]}` node per named graph. Blank-node
+/// labels are shared across graphs, since a JSON-LD document scopes them to
+/// the whole document. A dataset with no named graphs formats exactly as
+/// [`format_jsonld`] formats its default graph.
+pub fn format_jsonld_dataset(dataset: &Dataset, config: &JsonLdFormatConfig) -> JsonValue {
+    let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
+    let mut nodes = graph_nodes(&dataset.default, config, &mut bnode_renamer);
+    for (name, graph) in &dataset.named {
+        let mut node = Map::new();
+        node.insert(
+            "@id".to_string(),
+            JsonValue::String(term_to_subject_key(name, config, &mut bnode_renamer)),
+        );
+        node.insert(
+            "@graph".to_string(),
+            JsonValue::Array(graph_nodes(graph, config, &mut bnode_renamer)),
+        );
+        nodes.push(JsonValue::Object(node));
+    }
+    document(config, nodes)
+}
+
+fn document(config: &JsonLdFormatConfig, nodes: Vec<JsonValue>) -> JsonValue {
+    let mut output = Map::new();
     if let Some(ctx) = config.context_policy.context() {
         output.insert("@context".to_string(), ctx.clone());
     }
+    output.insert("@graph".to_string(), JsonValue::Array(nodes));
+    JsonValue::Object(output)
+}
 
-    // Initialize blank node renamer
-    let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
+/// One graph's node objects, in subject order.
+fn graph_nodes(
+    graph: &Graph,
+    config: &JsonLdFormatConfig,
+    bnode_renamer: &mut BlankNodeRenamer,
+) -> Vec<JsonValue> {
+    // Reifiers by the triple they reify, rendered as `@annotation`.
+    let reifiers = graph.reifiers_by_triple();
 
     // Group triples by subject, then by predicate
     // This allows us to detect and handle list predicates
     let mut subjects: BTreeMap<String, SubjectData> = BTreeMap::new();
 
     for triple in graph.iter() {
-        let subj_key = term_to_subject_key(&triple.s, config, &mut bnode_renamer);
+        let subj_key = term_to_subject_key(&triple.s, config, bnode_renamer);
 
         let subj_data = subjects
             .entry(subj_key.clone())
@@ -286,7 +322,7 @@ pub fn format_jsonld(graph: &Graph, config: &JsonLdFormatConfig) -> JsonValue {
     let mut nodes: BTreeMap<String, Map<String, JsonValue>> = BTreeMap::new();
 
     for (subj_key, subj_data) in subjects {
-        let node = subj_data.into_jsonld_node(config, &mut bnode_renamer);
+        let node = subj_data.into_jsonld_node(config, bnode_renamer, &reifiers);
         nodes.insert(subj_key, node);
     }
 
@@ -298,12 +334,36 @@ pub fn format_jsonld(graph: &Graph, config: &JsonLdFormatConfig) -> JsonValue {
         }
     }
 
-    // Build @graph array
-    let graph_array: Vec<JsonValue> = nodes.into_values().map(JsonValue::Object).collect();
+    nodes.into_values().map(JsonValue::Object).collect()
+}
 
-    output.insert("@graph".to_string(), JsonValue::Array(graph_array));
-
-    JsonValue::Object(output)
+/// Attach `@annotation` to a rendered object value: `{"@id": r}` for one
+/// reifier, an array for several. A bare scalar becomes a value object.
+fn annotate(
+    value: JsonValue,
+    reifiers: &[&Term],
+    bnode_renamer: &mut BlankNodeRenamer,
+    config: &JsonLdFormatConfig,
+) -> JsonValue {
+    let mut refs: Vec<JsonValue> = reifiers
+        .iter()
+        .map(|r| json!({"@id": term_to_subject_key(r, config, bnode_renamer)}))
+        .collect();
+    let annotation = if refs.len() == 1 {
+        refs.remove(0)
+    } else {
+        JsonValue::Array(refs)
+    };
+    let mut obj = match value {
+        JsonValue::Object(obj) => obj,
+        scalar => {
+            let mut obj = Map::new();
+            obj.insert("@value".to_string(), scalar);
+            obj
+        }
+    };
+    obj.insert("@annotation".to_string(), annotation);
+    JsonValue::Object(obj)
 }
 
 /// Intermediate structure for grouping triples by predicate
@@ -338,6 +398,7 @@ impl SubjectData {
         self,
         config: &JsonLdFormatConfig,
         bnode_renamer: &mut BlankNodeRenamer,
+        reifiers: &HashMap<&fluree_graph_ir::Triple, Vec<&Term>>,
     ) -> Map<String, JsonValue> {
         let mut node = Map::new();
         node.insert("@id".to_string(), JsonValue::String(self.id.clone()));
@@ -346,10 +407,19 @@ impl SubjectData {
             // Check if this predicate is a list (any triple has list_index)
             let is_list = triples.iter().any(|(idx, _)| idx.is_some());
 
-            // Handle rdf:type specially
+            // Handle rdf:type specially. `@type` cannot carry an annotation,
+            // so an annotated type is written as an `rdf:type` property.
             if pred_iri == dt_iri::RDF_TYPE && config.type_handling.use_at_type() {
                 for (_, triple) in &triples {
-                    add_type_value(&mut node, &triple.o, config, bnode_renamer);
+                    match reifiers.get(triple) {
+                        Some(rs) => {
+                            let obj = term_to_object(&triple.o, config, bnode_renamer);
+                            let obj = annotate(obj, rs, bnode_renamer, config);
+                            let pred_key = config.compact_vocab_iri(&pred_iri);
+                            add_property(&mut node, &pred_key, obj);
+                        }
+                        None => add_type_value(&mut node, &triple.o, config, bnode_renamer),
+                    }
                 }
                 continue;
             }
@@ -371,7 +441,10 @@ impl SubjectData {
                 // indistinguishable once rendered despite being distinct RDF
                 // terms.
                 for (_, triple) in triples {
-                    let obj_val = term_to_object(&triple.o, config, bnode_renamer);
+                    let mut obj_val = term_to_object(&triple.o, config, bnode_renamer);
+                    if let Some(rs) = reifiers.get(&triple) {
+                        obj_val = annotate(obj_val, rs, bnode_renamer, config);
+                    }
                     add_property(&mut node, &pred_key, obj_val);
                 }
             }
@@ -991,6 +1064,71 @@ mod tests {
         let arr = nicks.as_array().unwrap();
         // Should have 2 values, not 3
         assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn reifiers_render_as_annotation() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let mut g = Graph::new();
+        g.add_triple(ex("alice"), ex("knows"), ex("bob"));
+        g.add_triple(ex("alice"), ex("name"), Term::string("Alice"));
+        g.add_triple(ex("alice"), Term::iri(rdf::TYPE), ex("Person"));
+        g.add_triple(ex("alice"), Term::iri(rdf::TYPE), ex("Agent"));
+        g.add_reification(ex("alice"), ex("knows"), ex("bob"), ex("c1"));
+        g.add_reification(ex("alice"), ex("knows"), ex("bob"), ex("c2"));
+        g.add_reification(ex("alice"), ex("name"), Term::string("Alice"), ex("c3"));
+        g.add_reification(ex("alice"), Term::iri(rdf::TYPE), ex("Person"), ex("c4"));
+        g.canonicalize();
+
+        let node = &format_jsonld(&g, &JsonLdFormatConfig::default())["@graph"][0];
+        let p = |l: &str| format!("http://example.org/{l}");
+        assert_eq!(
+            node[p("knows")],
+            json!({"@id": p("bob"), "@annotation": [{"@id": p("c1")}, {"@id": p("c2")}]})
+        );
+        // A plain literal becomes a value object to carry the annotation.
+        assert_eq!(
+            node[p("name")],
+            json!({"@value": "Alice", "@annotation": {"@id": p("c3")}})
+        );
+        // `@type` cannot carry one: the annotated type is an rdf:type value,
+        // the unannotated one stays in `@type`.
+        assert_eq!(node["@type"], json!(p("Agent")));
+        assert_eq!(
+            node[rdf::TYPE],
+            json!({"@id": p("Person"), "@annotation": {"@id": p("c4")}})
+        );
+    }
+
+    #[test]
+    fn dataset_named_graphs_share_blank_node_labels() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let mut d = Dataset::new();
+        d.graph_mut(None)
+            .add_triple(ex("a"), ex("p"), Term::blank("shared"));
+        d.graph_mut(Some(&ex("g")))
+            .add_triple(Term::blank("shared"), ex("q"), Term::string("x"));
+        d.canonicalize();
+        let config =
+            JsonLdFormatConfig::default().with_blank_node_policy(BlankNodePolicy::Deterministic);
+        let doc = format_jsonld_dataset(&d, &config);
+        let nodes = doc["@graph"].as_array().unwrap();
+        let label = nodes[0]["http://example.org/p"]["@id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let graph_node = nodes
+            .iter()
+            .find(|n| n["@id"] == "http://example.org/g")
+            .unwrap_or_else(|| panic!("no named graph node: {doc}"));
+        assert_eq!(graph_node["@graph"][0]["@id"], json!(label), "{doc}");
+
+        // No named graphs: the same document as the default graph alone.
+        let only = Dataset::from(d.default.clone());
+        assert_eq!(
+            format_jsonld_dataset(&only, &config),
+            format_jsonld(&d.default, &config)
+        );
     }
 
     #[test]

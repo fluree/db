@@ -747,7 +747,7 @@ pub async fn query(
             )));
         }
         if let Some(fmt) = headers
-            .graph_format()
+            .graph_format(GraphFormat::ALL)
             .filter(|f| *f != GraphFormat::JsonLd)
         {
             return Err(ServerError::not_acceptable(format!(
@@ -1336,12 +1336,13 @@ fn service_description(
             .map(|v| v.split(',').next().unwrap_or(v).trim())
             .filter(|v| !v.is_empty())
     };
-    let format = negotiate_graph_format(header("accept")).ok_or_else(|| {
-        ServerError::not_acceptable(
-            "a service description is available as application/ld+json, text/turtle, \
+    let format =
+        negotiate_graph_format(header("accept"), GraphFormat::SINGLE_GRAPH).ok_or_else(|| {
+            ServerError::not_acceptable(
+                "a service description is available as application/ld+json, text/turtle, \
              application/n-triples or application/rdf+xml",
-        )
-    })?;
+            )
+        })?;
     // `sd:endpoint` is the URL the client asked for, as it addressed us.
     let scheme = header("x-forwarded-proto").unwrap_or("http");
     let host = header("x-forwarded-host")
@@ -1753,15 +1754,30 @@ fn is_graph_query(ast: Option<&fluree_db_sparql::ast::SparqlAst>) -> bool {
 }
 
 /// The byte serialization a SPARQL result gets: for a CONSTRUCT / DESCRIBE, the
-/// Turtle, N-Triples or RDF/XML that `Accept` prefers (JSON-LD stays on the
-/// JSON paths). A SELECT / ASK whose `Accept` admits only graph formats is a
-/// `406`.
+/// graph text format `Accept` prefers (JSON-LD stays on the JSON paths). A
+/// CONSTRUCT whose template writes into named graphs (`GRAPH` blocks) produces
+/// a dataset, so only TriG, N-Quads and JSON-LD can carry it: asking for only
+/// a triples format is a `406`. A SELECT / ASK whose `Accept` admits only
+/// graph formats is a `406`.
 fn sparql_graph_format(
     ast: Option<&fluree_db_sparql::ast::SparqlAst>,
     headers: &FlureeHeaders,
 ) -> Result<Option<GraphFormat>> {
-    if is_graph_query(ast) {
-        Ok(headers.graph_format().filter(|f| *f != GraphFormat::JsonLd))
+    let not_json = |f: &GraphFormat| *f != GraphFormat::JsonLd;
+    if template_names_graphs(ast) {
+        match headers.graph_format(GraphFormat::DATASET) {
+            Some(fmt) => Ok(Some(fmt).filter(not_json)),
+            None if headers.graph_format(GraphFormat::ALL).is_some() => {
+                Err(ServerError::not_acceptable(
+                    "this CONSTRUCT template writes into named graphs, which Turtle, \
+                     N-Triples and RDF/XML cannot express; accept application/trig, \
+                     application/n-quads or application/ld+json",
+                ))
+            }
+            None => Ok(None),
+        }
+    } else if is_graph_query(ast) {
+        Ok(headers.graph_format(GraphFormat::ALL).filter(not_json))
     } else if headers.accepts_only_graph_formats() {
         Err(ServerError::not_acceptable(
             "Turtle, N-Triples and RDF/XML are only available for SPARQL \
@@ -1770,6 +1786,15 @@ fn sparql_graph_format(
     } else {
         Ok(None)
     }
+}
+
+/// Whether a CONSTRUCT's template has `GRAPH` blocks.
+fn template_names_graphs(ast: Option<&fluree_db_sparql::ast::SparqlAst>) -> bool {
+    matches!(
+        ast.map(|a| &a.body),
+        Some(fluree_db_sparql::ast::QueryBody::Construct(q))
+            if q.template.as_ref().is_some_and(fluree_db_sparql::ast::ConstructTemplate::names_graphs)
+    )
 }
 
 /// Pick the formatter config and response `Content-Type` for a SPARQL query that
@@ -4555,7 +4580,7 @@ fn negotiate_multi_query_format(
         || headers.wants_csv()
         || headers.wants_sparql_results_xml()
         || headers
-            .graph_format()
+            .graph_format(GraphFormat::ALL)
             .is_some_and(|f| f != GraphFormat::JsonLd)
     {
         return Err(ServerError::not_acceptable(
