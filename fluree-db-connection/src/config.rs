@@ -147,10 +147,19 @@ pub enum StorageType {
 
 /// One entry of a rotation key set: a base64 AES-256 key and the id the
 /// envelope header records for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KeyedAes256Key {
     pub id: u32,
     pub key: Arc<str>,
+}
+
+impl std::fmt::Debug for KeyedAes256Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyedAes256Key")
+            .field("id", &self.id)
+            .field("key", &format_args!("<redacted>"))
+            .finish()
+    }
 }
 
 /// Storage configuration
@@ -185,6 +194,8 @@ impl std::fmt::Debug for StorageConfig {
             .field("storage_type", &self.storage_type)
             .field("path", &self.path)
             .field("aes256_key", &Redacted(&self.aes256_key))
+            .field("aes256_keys", &self.aes256_keys)
+            .field("aes256_current_key", &self.aes256_current_key)
             .field("address_identifier", &self.address_identifier)
             .field("durability", &self.durability)
             .finish()
@@ -1450,6 +1461,11 @@ mod tests {
         let config = ConnectionConfig {
             index_storage: StorageConfig {
                 aes256_key: Some(Arc::from("c2VjcmV0LWFlcy1rZXk=")),
+                aes256_keys: vec![KeyedAes256Key {
+                    id: 7,
+                    key: Arc::from("cm90YXRpb24ta2V5LXNlY3JldA=="),
+                }],
+                aes256_current_key: Some(7),
                 ..Default::default()
             },
             defaults: Some(DefaultsConfig {
@@ -1463,6 +1479,11 @@ mod tests {
         };
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("c2VjcmV0LWFlcy1rZXk="), "{rendered}");
+        assert!(
+            !rendered.contains("cm90YXRpb24ta2V5LXNlY3JldA=="),
+            "{rendered}"
+        );
+        assert!(rendered.contains("id: 7"), "{rendered}");
         assert!(!rendered.contains("secret-private-key"), "{rendered}");
         assert!(rendered.contains("public-key"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");

@@ -38,20 +38,20 @@ pub struct EncryptionResponse {
     pub current_key_id: Option<u32>,
 }
 
-/// `GET /encryption` — the keys this node holds, by id.
+/// `GET /encryption` — the keys this node holds, by id. Asks the storage
+/// directly rather than inferring "not encrypted" from an error.
 pub async fn encryption(State(state): State<Arc<AppState>>) -> Result<Json<EncryptionResponse>> {
-    Ok(Json(match state.fluree.key_rotation_status().await {
-        Ok(status) => EncryptionResponse {
+    Ok(Json(match state.fluree.encryption_key_ids() {
+        Some((key_ids, current_key_id)) => EncryptionResponse {
             encrypted: true,
-            key_ids: status.key_ids,
-            current_key_id: Some(status.current_key_id),
+            key_ids,
+            current_key_id: Some(current_key_id),
         },
-        Err(fluree_db_api::ApiError::Config(_)) => EncryptionResponse {
+        None => EncryptionResponse {
             encrypted: false,
             key_ids: Vec::new(),
             current_key_id: None,
         },
-        Err(e) => return Err(ServerError::Api(e)),
     }))
 }
 

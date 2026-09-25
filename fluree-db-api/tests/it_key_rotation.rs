@@ -112,7 +112,7 @@ async fn run_to_end(fluree: &Fluree, opts: KeyRotationOptions) -> KeyRotationPro
     wait_done(fluree).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rotation_dry_run_scoped_run_full_run_and_verify() {
     let data = tempfile::TempDir::new().expect("tempdir");
 
@@ -189,13 +189,11 @@ async fn rotation_dry_run_scoped_run_full_run_and_verify() {
     assert!(!status.active_here);
     assert!(!status.stalled);
 
-    // Full run resumes the swept record and finishes: everything rewritten.
+    // Widening the scope is a new job, not a resumption of the scoped record
+    // (its counters describe the scoped units). It finishes the rest.
     let full = run_to_end(&fluree, opts(1)).await;
     assert_eq!(full.state, KeyRotationState::Completed);
-    assert_eq!(
-        full.started_at, scoped.started_at,
-        "resumed the swept record"
-    );
+    assert_eq!(full.ledger_scope, None, "a new, unscoped record");
     assert_eq!(full.units_total, 5);
     assert_eq!(full.failed, 0);
     assert_eq!(full.completion.expect("verified").remaining_on_retired, 0);
@@ -213,7 +211,7 @@ async fn rotation_dry_run_scoped_run_full_run_and_verify() {
     assert_eq!(count_things(&fluree, "rot-b").await, 25);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn foreign_running_record_is_refused_while_fresh_and_taken_over_when_stale() {
     let data = tempfile::TempDir::new().expect("tempdir");
     {
@@ -266,6 +264,15 @@ async fn foreign_running_record_is_refused_while_fresh_and_taken_over_when_stale
     let status = fluree.key_rotation_status().await.unwrap();
     assert!(!status.stalled);
 
+    // Released by its holder on leadership loss (`updated_at == 0`): mid-
+    // handover, not stalled — the next leader takes it over at once.
+    storage
+        .write_bytes(&record_address, record(0).to_string().as_bytes())
+        .await
+        .unwrap();
+    let status = fluree.key_rotation_status().await.unwrap();
+    assert!(!status.stalled, "a released record is not stalled");
+
     // Stale heartbeat: reported stalled, taken over, run to completion.
     storage
         .write_bytes(&record_address, record(now - 3600).to_string().as_bytes())
@@ -294,4 +301,48 @@ async fn foreign_running_record_is_refused_while_fresh_and_taken_over_when_stale
         .read_bytes(&record_address)
         .await
         .expect("record exists");
+}
+
+/// `addressIdentifiers` puts a read router over the encrypted storage. The
+/// router must report the encrypted default rather than read as plaintext:
+/// status names the keys, and a rotation runs to completion.
+#[tokio::test(flavor = "multi_thread")]
+async fn rotation_through_an_address_identifier_router() {
+    let data = tempfile::TempDir::new().expect("tempdir");
+    let routed = tempfile::TempDir::new().expect("tempdir");
+    let with_router = |keys: &[(u32, &str)], current: u32| {
+        let mut config = config(data.path(), keys, current);
+        let graph = config["@graph"].as_array_mut().unwrap();
+        graph.push(json!({
+            "@id": "routed",
+            "@type": "Storage",
+            "filePath": routed.path().to_string_lossy()
+        }));
+        graph[1]["addressIdentifiers"] = json!({"elsewhere": {"@id": "routed"}});
+        config
+    };
+
+    {
+        let fluree = FlureeBuilder::from_json_ld(&with_router(&[(1, KEY1)], 1))
+            .expect("config")
+            .build_client()
+            .await
+            .expect("build_client");
+        seed(&fluree, "rot-routed", 20).await;
+    }
+
+    let fluree = FlureeBuilder::from_json_ld(&with_router(&[(1, KEY1), (2, KEY2)], 2))
+        .expect("config")
+        .build_client()
+        .await
+        .expect("build_client");
+    assert_eq!(fluree.encryption_key_ids(), Some((vec![2, 1], 2)));
+    let status = fluree.key_rotation_status().await.expect("status");
+    assert_eq!(status.key_ids, vec![2, 1]);
+
+    let done = run_to_end(&fluree, opts(1)).await;
+    assert_eq!(done.state, KeyRotationState::Completed);
+    assert!(done.rewritten > 0);
+    assert_eq!(done.completion.expect("verified").remaining_on_retired, 0);
+    assert_eq!(count_things(&fluree, "rot-routed").await, 20);
 }

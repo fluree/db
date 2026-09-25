@@ -247,11 +247,11 @@ pub trait StorageRead: Debug + Send + Sync {
     fn permits_plaintext_cache(&self) -> bool;
 
     /// The encryption administration surface, when this storage encrypts
-    /// at rest. `None` (the default) for plaintext storages. Wrappers
-    /// delegate to what they wrap; routers return an admin that routes.
-    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
-        None
-    }
+    /// at rest. `None` for plaintext storages; wrappers delegate to what
+    /// they wrap. Required for the same reason as
+    /// [`Self::permits_plaintext_cache`]: a wrapper that answered `None` by
+    /// default would report an encrypted store as plaintext.
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>>;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///

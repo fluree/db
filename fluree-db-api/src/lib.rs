@@ -788,11 +788,57 @@ impl<S> TieredStorage<S> {
     }
 
     fn route_to_commit(address: &str) -> bool {
-        // Extract the path portion after :// if present (fluree:*://path)
-        let path = address.split("://").nth(1).unwrap_or(address);
+        tier_routes_to_commit(address)
+    }
+}
 
-        // Commit blobs + txn blobs go to commit storage.
-        path.contains("/commit/") || path.contains("/txn/")
+fn tier_routes_to_commit(address: &str) -> bool {
+    // Extract the path portion after :// if present (fluree:*://path)
+    let path = address.split("://").nth(1).unwrap_or(address);
+
+    // Commit blobs + txn blobs go to commit storage.
+    path.contains("/commit/") || path.contains("/txn/")
+}
+
+/// Encryption admin for a [`TieredStorage`] whose tiers both encrypt: each
+/// address goes to the tier that holds it, as reads and writes do.
+struct TieredEncryptionAdmin {
+    commit: Arc<dyn fluree_db_core::EncryptionAdmin>,
+    index: Arc<dyn fluree_db_core::EncryptionAdmin>,
+}
+
+impl TieredEncryptionAdmin {
+    fn tier(&self, address: &str) -> &Arc<dyn fluree_db_core::EncryptionAdmin> {
+        if tier_routes_to_commit(address) {
+            &self.commit
+        } else {
+            &self.index
+        }
+    }
+}
+
+#[async_trait]
+impl fluree_db_core::EncryptionAdmin for TieredEncryptionAdmin {
+    fn key_ids(&self) -> Vec<u32> {
+        self.commit.key_ids()
+    }
+
+    fn current_key_id(&self) -> u32 {
+        self.commit.current_key_id()
+    }
+
+    async fn key_id_at(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<u32>, fluree_db_core::Error> {
+        self.tier(address).key_id_at(address).await
+    }
+
+    async fn reencrypt(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<u64>, fluree_db_core::Error> {
+        self.tier(address).reencrypt(address).await
     }
 }
 
@@ -843,6 +889,19 @@ where
 
     fn permits_plaintext_cache(&self) -> bool {
         self.commit.permits_plaintext_cache() && self.index.permits_plaintext_cache()
+    }
+
+    /// Both tiers encrypted under the same key set rotate as one store.
+    /// Otherwise there is no single key set to rotate to: `None`. In-repo
+    /// builds encrypt above the tiers instead, where this is not consulted.
+    fn encryption_admin(&self) -> Option<Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        let commit = self.commit.encryption_admin()?;
+        let index = self.index.encryption_admin()?;
+        if commit.key_ids() != index.key_ids() || commit.current_key_id() != index.current_key_id()
+        {
+            return None;
+        }
+        Some(Arc::new(TieredEncryptionAdmin { commit, index }))
     }
 
     async fn exists(&self, address: &str) -> std::result::Result<bool, fluree_db_core::Error> {
@@ -1078,6 +1137,14 @@ impl StorageRead for AddressIdentifierResolverStorage {
                 .identifier_map
                 .values()
                 .all(fluree_db_core::StorageRead::permits_plaintext_cache)
+    }
+
+    /// The default storage's admin. Every write and every listing goes to
+    /// the default, so it is the whole of what this node can rotate. Routed
+    /// storages are read-only here and carry their own keys; a routing admin
+    /// would rewrite blobs in storage this node only reads.
+    fn encryption_admin(&self) -> Option<Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        self.default.encryption_admin()
     }
 }
 

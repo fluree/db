@@ -227,6 +227,15 @@ impl Throttle {
 }
 
 impl Fluree {
+    /// The key ids this instance's storage holds, current first, and the id
+    /// of the current key; `None` when the storage does not encrypt at rest.
+    /// A permanent (IPFS) backend has no admin storage and is never
+    /// encrypted: `build_ipfs` refuses a key.
+    pub fn encryption_key_ids(&self) -> Option<(Vec<u32>, u32)> {
+        let admin = self.backend.admin_storage_cloned()?.encryption_admin()?;
+        Some((admin.key_ids(), admin.current_key_id()))
+    }
+
     /// Ids of the keys the storage holds, current first, or an error when
     /// the storage is not encrypted.
     fn encryption_admin(&self) -> Result<(Arc<dyn Storage>, Arc<dyn EncryptionAdmin>)> {
@@ -491,9 +500,13 @@ impl Fluree {
         };
         let now = now_secs();
         let seconds_since_update = progress.as_ref().map(|p| now.saturating_sub(p.updated_at));
+        // A released record (`updated_at == 0`) is mid-handover, about to be
+        // taken over by the next leader, not stalled.
         let stalled = matches!(
             (&progress, seconds_since_update),
-            (Some(p), Some(age)) if p.state == KeyRotationState::Running && age > STALE_AFTER.as_secs()
+            (Some(p), Some(age)) if p.state == KeyRotationState::Running
+                && p.updated_at != 0
+                && age > STALE_AFTER.as_secs()
         );
         Ok(KeyRotationStatus {
             key_ids: admin.key_ids(),
