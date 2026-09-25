@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_custom_datatype_limit.rs"]
+mod it_custom_datatype_limit;
 #[path = "it_duration_index_roundtrip.rs"]
 mod it_duration_index_roundtrip;
 #[path = "it_fwd_pack_compaction.rs"]
