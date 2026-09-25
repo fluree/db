@@ -282,7 +282,7 @@ impl crate::Fluree {
                 let CollectedCommitData {
                     flakes: inverted,
                     namespace_delta,
-                    ..
+                    graph_iris,
                 } = collect_from_commits(commits, Fold::Undo);
                 let branch_state = self.ledger(&branch_id).await?;
                 let staged = self
@@ -292,6 +292,7 @@ impl crate::Fluree {
                         &all_conflict_keys,
                         &opts.conflict_strategy,
                         &namespace_delta,
+                        &graph_iris,
                     )
                     .await?;
                 Some(match staged {

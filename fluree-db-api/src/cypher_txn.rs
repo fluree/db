@@ -350,7 +350,7 @@ impl Fluree {
 
         let mut commit_opts = CommitOpts::default()
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
         if let Some(identity) = &txn.governance.identity {
             commit_opts = commit_opts.identity(identity.clone());
         }
