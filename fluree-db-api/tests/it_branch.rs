@@ -139,6 +139,23 @@ async fn create_branch_missing_source() {
     );
 }
 
+/// Branching from a source with no commits is a client error, and creates nothing.
+#[tokio::test]
+async fn create_branch_from_empty_source_fails() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+
+    let err = fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .expect_err("branching from an empty source should fail");
+    assert_eq!(err.status_code(), 400, "got: {err}");
+
+    let branches = fluree.list_branches("mydb").await.unwrap();
+    let names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
+    assert_eq!(names, vec!["main"]);
+}
+
 /// Transact divergent data on two branches and verify isolation.
 ///
 /// This is the core branching test: after branching, transactions on one
