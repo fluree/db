@@ -38,12 +38,13 @@ use crate::join::{
 };
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::temporal_mode::TemporalMode;
+use crate::temporal_mode::{PlanningContext, TemporalMode};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{ObjectBounds, Sid};
-use rustc_hash::FxHashMap;
+use indexmap::IndexMap;
+use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -81,6 +82,16 @@ fn make_property_join_scan(
     ))
 }
 
+/// Per-subject state: (subject binding, predicate presence mask, emitted
+/// values per emitted predicate). Insertion-ordered, so rows come out in the
+/// driver scan's subject order.
+///
+/// Emission tracks subjects by position (`subject_idx`, `current_subject`),
+/// which stays valid only while the map is append-only. Removal (`retain`)
+/// is confined to `open`, before any position is taken; anything that fills
+/// the map during emission must only append.
+type SubjectMap = IndexMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>), FxBuildHasher>;
+
 /// Property-join operator for same-subject multi-predicate patterns
 ///
 /// Optimizes queries of the form:
@@ -113,15 +124,14 @@ pub struct PropertyJoinOperator {
     /// - Single-ledger: prefer raw encoded subject IDs (no decoding)
     /// - Dataset/multi-ledger: use canonical IRI strings (cross-ledger safe)
     ///
-    /// Value tuple: (subject_binding, vec of value-vectors per predicate).
     /// The subject_binding is preserved from the scan to emit the correct type.
-    subject_values: FxHashMap<SubjectKey, (Binding, Vec<Vec<Binding>>)>,
-    /// Subjects to process (collected after filtering)
-    pending_subjects: Vec<SubjectKey>,
-    /// Current index into pending_subjects
+    /// After `open`, holds only subjects that matched every required predicate.
+    subject_values: SubjectMap,
+    /// Next position in `subject_values` to expand.
     subject_idx: usize,
-    /// Subject currently being expanded into cartesian rows across batches.
-    current_subject: Option<SubjectKey>,
+    /// Position of the subject currently being expanded into cartesian rows
+    /// across batches.
+    current_subject: Option<usize>,
     /// Per-emitted-predicate odometer indices for `current_subject`.
     current_indices: Vec<usize>,
     /// Optional object bounds for range filter pushdown (VarId -> ObjectBounds)
@@ -135,6 +145,8 @@ pub struct PropertyJoinOperator {
     inline_ops: Vec<InlineOperator>,
     /// Temporal mode captured at planner-time for the late per-predicate scans.
     mode: TemporalMode,
+    /// Binding emitted for an optional predicate with no values.
+    unmatched: Binding,
 }
 
 #[derive(Clone, Debug)]
@@ -268,7 +280,7 @@ impl PropertyJoinOperator {
     fn ingest_probe_match(
         &self,
         ctx: &ExecutionContext<'_>,
-        all_subject_values: &mut FxHashMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>)>,
+        all_subject_values: &mut SubjectMap,
         pred_idx: usize,
         probe_match: BatchedSubjectProbeMatch,
     ) -> Result<()> {
@@ -289,7 +301,7 @@ impl PropertyJoinOperator {
     fn ingest_spot_star_match(
         &self,
         ctx: &ExecutionContext<'_>,
-        all_subject_values: &mut FxHashMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>)>,
+        all_subject_values: &mut SubjectMap,
         spot_match: BatchedSpotStarMatch,
     ) -> Result<()> {
         let subject = Binding::encoded_sid(spot_match.subject_id);
@@ -311,7 +323,7 @@ impl PropertyJoinOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         order_pos: usize,
-        all_subject_values: &FxHashMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>)>,
+        all_subject_values: &SubjectMap,
     ) -> Option<Vec<u64>> {
         if order_pos != 0 || ctx.binary_store.is_none() {
             return None;
@@ -356,9 +368,9 @@ impl PropertyJoinOperator {
     pub fn new(
         patterns: &[TriplePattern],
         object_bounds: HashMap<VarId, ObjectBounds>,
-        mode: TemporalMode,
+        planning: PlanningContext,
     ) -> Result<Self> {
-        Self::new_with_options(patterns, &[], object_bounds, None, Vec::new(), mode)
+        Self::new_with_options(patterns, &[], object_bounds, None, Vec::new(), planning)
     }
 
     /// Create a new property-join operator, optionally treating some predicate patterns
@@ -367,9 +379,16 @@ impl PropertyJoinOperator {
         patterns: &[TriplePattern],
         object_bounds: HashMap<VarId, ObjectBounds>,
         needed_vars: Option<&std::collections::HashSet<VarId>>,
-        mode: TemporalMode,
+        planning: PlanningContext,
     ) -> Result<Self> {
-        Self::new_with_options(patterns, &[], object_bounds, needed_vars, Vec::new(), mode)
+        Self::new_with_options(
+            patterns,
+            &[],
+            object_bounds,
+            needed_vars,
+            Vec::new(),
+            planning,
+        )
     }
 
     pub fn new_with_options(
@@ -378,7 +397,7 @@ impl PropertyJoinOperator {
         object_bounds: HashMap<VarId, ObjectBounds>,
         needed_vars: Option<&std::collections::HashSet<VarId>>,
         inline_ops: Vec<InlineOperator>,
-        mode: TemporalMode,
+        planning: PlanningContext,
     ) -> Result<Self> {
         if !crate::planner::is_property_join(required_patterns) {
             return Err(QueryError::Internal(
@@ -472,8 +491,7 @@ impl PropertyJoinOperator {
             predicates,
             output_schema,
             state: OperatorState::Created,
-            subject_values: FxHashMap::default(),
-            pending_subjects: Vec::new(),
+            subject_values: SubjectMap::default(),
             subject_idx: 0,
             current_subject: None,
             current_indices: Vec::new(),
@@ -481,7 +499,8 @@ impl PropertyJoinOperator {
             emit_positions,
             emitted_required,
             inline_ops,
-            mode,
+            mode: planning.mode(),
+            unmatched: planning.unmatched_optional.binding(),
         })
     }
 
@@ -599,6 +618,7 @@ impl PropertyJoinOperator {
         subject_binding: &Binding,
         values_per_pred: &[Vec<Binding>],
         emitted_required: &[bool],
+        unmatched: &Binding,
     ) -> Vec<Vec<Binding>> {
         // If no object vars are emitted (existence-only predicates), then each matching
         // subject produces exactly one output row.
@@ -638,7 +658,7 @@ impl PropertyJoinOperator {
             row.push(subject_binding.clone());
             for (pred_idx, val_idx) in indices.iter().enumerate() {
                 if values_per_pred[pred_idx].is_empty() {
-                    row.push(Binding::Poisoned);
+                    row.push(unmatched.clone());
                 } else {
                     row.push(values_per_pred[pred_idx][*val_idx].clone());
                 }
@@ -687,6 +707,7 @@ impl PropertyJoinOperator {
         values_per_pred: &[Vec<Binding>],
         emitted_required: &[bool],
         indices: &[usize],
+        unmatched: &Binding,
     ) -> Option<Vec<Binding>> {
         if !Self::has_cartesian_row(values_per_pred, emitted_required) {
             return None;
@@ -696,7 +717,7 @@ impl PropertyJoinOperator {
         row.push(subject_binding.clone());
         for (pred_idx, values) in values_per_pred.iter().enumerate() {
             if values.is_empty() {
-                row.push(Binding::Poisoned);
+                row.push(unmatched.clone());
             } else {
                 let val_idx = indices.get(pred_idx).copied().unwrap_or(0);
                 row.push(values.get(val_idx)?.clone());
@@ -772,7 +793,6 @@ impl Operator for PropertyJoinOperator {
         async {
             self.state = OperatorState::Open;
             self.subject_values.clear();
-            self.pending_subjects.clear();
             self.subject_idx = 0;
             self.current_subject = None;
             self.current_indices.clear();
@@ -795,8 +815,7 @@ impl Operator for PropertyJoinOperator {
             // - no datatype constraint on the probed predicate (dt=None)
             // Map: subject -> (subject_binding, presence_mask, emitted_values)
             // presence_mask has one bit per predicate index, regardless of emit flag.
-            let mut all_subject_values: FxHashMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>)> =
-                FxHashMap::default();
+            let mut all_subject_values = SubjectMap::default();
             let required_mask: u64 = if self.predicates.len() >= 64 {
                 u64::MAX
             } else {
@@ -1137,25 +1156,20 @@ impl Operator for PropertyJoinOperator {
                 }
             }
 
-            // Filter to only subjects that have values for ALL predicates
-            self.subject_values = all_subject_values
-                .into_iter()
-                .filter(|(_, (_sb, mask, values))| {
-                    (*mask & required_mask) == required_mask
-                        && (emit_count == 0
-                            || values
-                                .iter()
-                                .enumerate()
-                                .all(|(idx, v)| !self.emitted_required[idx] || !v.is_empty()))
-                })
-                .map(|(k, (sb, _mask, values))| (k, (sb, values)))
-                .collect();
-
-            // Collect subjects for iteration
-            self.pending_subjects = self.subject_values.keys().cloned().collect();
+            // Keep only subjects that have values for ALL predicates
+            let emitted_required = &self.emitted_required;
+            all_subject_values.retain(|_, (_sb, mask, values)| {
+                (*mask & required_mask) == required_mask
+                    && (emit_count == 0
+                        || values
+                            .iter()
+                            .enumerate()
+                            .all(|(idx, v)| !emitted_required[idx] || !v.is_empty()))
+            });
+            self.subject_values = all_subject_values;
 
             tracing::debug!(
-                subjects = self.pending_subjects.len(),
+                subjects = self.subject_values.len(),
                 used_batched_probe,
                 used_spot_star_walk,
                 probe_chunks,
@@ -1185,11 +1199,10 @@ impl Operator for PropertyJoinOperator {
         while all_rows.len() < batch_size {
             if self.current_subject.is_none() {
                 let mut found = false;
-                while self.subject_idx < self.pending_subjects.len() {
-                    let subject_key = self.pending_subjects[self.subject_idx].clone();
+                while self.subject_idx < self.subject_values.len() {
+                    let idx = self.subject_idx;
                     self.subject_idx += 1;
-                    let Some((_subject_binding, values_per_pred)) =
-                        self.subject_values.get(&subject_key)
+                    let Some((_, (_, _, values_per_pred))) = self.subject_values.get_index(idx)
                     else {
                         continue;
                     };
@@ -1197,7 +1210,7 @@ impl Operator for PropertyJoinOperator {
                         continue;
                     }
                     self.current_indices = vec![0; values_per_pred.len()];
-                    self.current_subject = Some(subject_key);
+                    self.current_subject = Some(idx);
                     found = true;
                     break;
                 }
@@ -1206,10 +1219,11 @@ impl Operator for PropertyJoinOperator {
                 }
             }
 
-            let Some(subject_key) = self.current_subject.as_ref() else {
+            let Some(idx) = self.current_subject else {
                 continue;
             };
-            let Some((subject_binding, values_per_pred)) = self.subject_values.get(subject_key)
+            let Some((_, (subject_binding, _, values_per_pred))) =
+                self.subject_values.get_index(idx)
             else {
                 self.current_subject = None;
                 self.current_indices.clear();
@@ -1222,6 +1236,7 @@ impl Operator for PropertyJoinOperator {
                 values_per_pred,
                 &self.emitted_required,
                 &self.current_indices,
+                &self.unmatched,
             );
             let has_next = Self::advance_indices(&mut self.current_indices, values_per_pred);
             if !has_next {
@@ -1259,7 +1274,6 @@ impl Operator for PropertyJoinOperator {
     fn close(&mut self) {
         self.state = OperatorState::Closed;
         self.subject_values.clear();
-        self.pending_subjects.clear();
         self.subject_idx = 0;
         self.current_subject = None;
         self.current_indices.clear();
@@ -1273,6 +1287,7 @@ impl Operator for PropertyJoinOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binding::UnmatchedOptional;
     use fluree_db_core::Sid;
 
     fn make_property_join_patterns() -> Vec<TriplePattern> {
@@ -1313,8 +1328,8 @@ mod tests {
     #[test]
     fn test_property_join_creation() {
         let patterns = make_property_join_patterns();
-        let op =
-            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current())
+            .unwrap();
 
         assert_eq!(op.subject_var(), VarId(0));
         assert_eq!(op.predicates.len(), 2);
@@ -1324,8 +1339,8 @@ mod tests {
     #[test]
     fn test_property_join_schema() {
         let patterns = make_property_join_patterns();
-        let op =
-            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current())
+            .unwrap();
 
         let schema = op.output_schema();
         assert_eq!(schema[0], VarId(0)); // subject
@@ -1336,8 +1351,8 @@ mod tests {
     #[test]
     fn test_property_join_schema_with_bound_object_predicate() {
         let patterns = make_property_join_patterns_with_bound_object();
-        let op =
-            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current())
+            .unwrap();
 
         let schema = op.output_schema();
         assert_eq!(&schema[..], &[VarId(0), VarId(1), VarId(2)]);
@@ -1346,8 +1361,8 @@ mod tests {
     #[test]
     fn test_property_join_prefers_bound_object_driver_over_bounds() {
         let patterns = make_property_join_patterns_with_bound_object();
-        let op =
-            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current())
+            .unwrap();
 
         let mut bounds = HashMap::new();
         bounds.insert(VarId(2), ObjectBounds::new());
@@ -1375,8 +1390,8 @@ mod tests {
                 Term::Sid(Sid::new(100, "User")),
             ),
         ];
-        let op =
-            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current())
+            .unwrap();
         let driver =
             PropertyJoinOperator::select_driver_predicate(&op.predicates, &HashMap::new(), false);
         assert_eq!(driver, Some(0), "specific bound value should drive");
@@ -1402,8 +1417,8 @@ mod tests {
                 Term::Value(fluree_db_core::value::FlakeValue::String("active".into())),
             ),
         ];
-        let op =
-            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current())
+            .unwrap();
         let driver =
             PropertyJoinOperator::select_driver_predicate(&op.predicates, &HashMap::new(), false);
         assert_eq!(driver, Some(0), "planner-first class should keep driving");
@@ -1419,8 +1434,8 @@ mod tests {
     #[test]
     fn test_generate_rows_single_values() {
         let patterns = make_property_join_patterns();
-        let op =
-            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current())
+            .unwrap();
 
         let subject_sid = Sid::new(1, "alice");
         let subject_binding = Binding::sid(subject_sid.clone());
@@ -1434,6 +1449,7 @@ mod tests {
             &subject_binding,
             &values,
             &[true, true],
+            &Binding::Unbound,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].len(), 3);
@@ -1443,8 +1459,8 @@ mod tests {
     #[test]
     fn test_generate_rows_cartesian_product() {
         let patterns = make_property_join_patterns();
-        let op =
-            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current())
+            .unwrap();
 
         let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
@@ -1464,6 +1480,7 @@ mod tests {
             &subject_binding,
             &values,
             &[true, true],
+            &Binding::Unbound,
         );
         // Cartesian product: 2 * 3 = 6 rows
         assert_eq!(rows.len(), 6);
@@ -1492,6 +1509,7 @@ mod tests {
                 &values,
                 &[true, true],
                 &indices,
+                &Binding::Unbound,
             )
             .expect("indices should produce a row");
             assert_eq!(row.len(), 3);
@@ -1506,8 +1524,8 @@ mod tests {
     #[test]
     fn test_generate_rows_empty_pred() {
         let patterns = make_property_join_patterns();
-        let op =
-            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current())
+            .unwrap();
 
         let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
@@ -1520,23 +1538,31 @@ mod tests {
             &subject_binding,
             &values,
             &[true, true],
+            &Binding::Unbound,
         );
         // No rows if any predicate is missing
         assert_eq!(rows.len(), 0);
     }
 
     #[test]
-    fn test_generate_rows_missing_optional_uses_poisoned() {
+    fn test_generate_rows_missing_optional_uses_unmatched_binding() {
         let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
             vec![Binding::sid(Sid::new(200, "Alice"))], // required name
             vec![],                                     // optional probability
         ];
 
-        let rows =
-            PropertyJoinOperator::generate_rows(3, &subject_binding, &values, &[true, false]);
-        assert_eq!(rows.len(), 1);
-        assert!(matches!(rows[0][2], Binding::Poisoned));
+        for unmatched in [UnmatchedOptional::Unbound, UnmatchedOptional::Poisoned] {
+            let rows = PropertyJoinOperator::generate_rows(
+                3,
+                &subject_binding,
+                &values,
+                &[true, false],
+                &unmatched.binding(),
+            );
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][2], unmatched.binding());
+        }
     }
 
     #[test]
@@ -1561,7 +1587,8 @@ mod tests {
                 Term::Var(VarId(3)),
             ),
         ];
-        let result = PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current);
+        let result =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), PlanningContext::current());
         assert!(
             result.is_err(),
             "should reject invalid property-join patterns"

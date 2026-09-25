@@ -1514,3 +1514,73 @@ async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
             .unwrap();
     }
 }
+
+/// A branch whose commits each create a different named graph merges into a
+/// diverged target with every graph registered and routed. Commits used to
+/// record their graphs under transaction-local numbers, so two such commits
+/// both said "graph 2", and combining them kept only the first graph.
+#[tokio::test]
+async fn merge_registers_each_new_graph_from_separate_commits() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let main_ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx, "@id": "ex:alice", "ex:name": "Alice"}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let graphs = ["http://example.org/g1", "http://example.org/g2"];
+    for graph in graphs {
+        let dev = fluree.ledger("mydb:dev").await.unwrap();
+        fluree
+            .update(
+                dev,
+                &json!({
+                    "@context": ctx,
+                    "graph": graph,
+                    "insert": {"@id": "ex:bob", "ex:name": graph}
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    // Diverge main so the merge folds the branch's commits into one.
+    fluree
+        .insert(
+            main_ledger,
+            &json!({"@context": ctx, "@id": "ex:carol", "ex:name": "Carol"}),
+        )
+        .await
+        .unwrap();
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect("merge should register both graphs");
+    assert!(!report.fast_forward);
+
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    for graph in graphs {
+        let q = json!({
+            "@context": ctx,
+            "from": format!("mydb:main#{graph}"),
+            "select": "?n",
+            "where": {"@id": "ex:bob", "ex:name": "?n"}
+        });
+        let rows = fluree
+            .query_connection(&q)
+            .await
+            .unwrap_or_else(|e| panic!("<{graph}> must be queryable on main: {e}"))
+            .to_jsonld(&main.snapshot)
+            .unwrap();
+        assert_eq!(rows, json!([graph]), "<{graph}> must hold its own data");
+    }
+}

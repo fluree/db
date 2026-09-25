@@ -35,6 +35,7 @@
 //! Additional restrictions:
 //! - WITH/USING clauses are rejected
 
+use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Arc;
 
@@ -53,12 +54,11 @@ use fluree_db_sparql::ast::{
     TriplePattern, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
-use rustc_hash::FxHashMap;
 use thiserror::Error;
 
 use crate::ir::{
-    GraphMgmtOp, GraphSel, GraphTarget, SparqlWhereClause, TemplateTerm, TripleTemplate, Txn,
-    TxnOpts, TxnType,
+    GraphMgmtOp, GraphSel, GraphTarget, SparqlWhereClause, TemplateGraph, TemplateTerm,
+    TripleTemplate, Txn, TxnOpts, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_vocab::{fluree, xsd};
@@ -697,41 +697,6 @@ struct BlankNodeVarNamer {
     anon_counter: u32,
 }
 
-struct TemplateGraphIds {
-    next: u16,
-    iri_to_local: std::collections::HashMap<String, u16>,
-    delta: FxHashMap<u16, String>,
-}
-
-impl TemplateGraphIds {
-    fn new() -> Self {
-        // 0=default, 1=txn-meta, 2=config, 3+=user graphs (txn-local ids)
-        Self {
-            next: 3,
-            iri_to_local: std::collections::HashMap::new(),
-            delta: FxHashMap::default(),
-        }
-    }
-
-    fn get_or_assign(&mut self, iri: String) -> u16 {
-        if let Some(id) = self.iri_to_local.get(&iri) {
-            return *id;
-        }
-        let id = self.next;
-        self.next = self
-            .next
-            .checked_add(1)
-            .expect("txn-local graph id overflow");
-        self.iri_to_local.insert(iri.clone(), id);
-        self.delta.insert(id, iri);
-        id
-    }
-
-    fn delta(&self) -> FxHashMap<u16, String> {
-        self.delta.clone()
-    }
-}
-
 impl BlankNodeVarNamer {
     fn new() -> Self {
         Self { anon_counter: 0 }
@@ -888,7 +853,7 @@ pub fn lower_sparql_update(
         UpdateOperation::Create(create) => {
             // Fluree cannot represent an empty named graph (roadmap D-6), so
             // CREATE stages no flakes — but it DOES register the graph IRI in
-            // the additive registry (same `graph_delta` mechanism as a
+            // the additive registry (same `write_graphs` mechanism as a
             // transfer destination). Registration is what O3's source-existence
             // check consults, so `CREATE GRAPH <g>` followed by a non-SILENT
             // `COPY <g> TO <h>` is a legitimate empty source rather than the
@@ -900,8 +865,7 @@ pub fn lower_sparql_update(
             // non-enumerable until a flake lands in it.
             let iri = expand_iri(&create.graph, prologue)?;
             let mut txn = Txn::update().with_opts(opts);
-            txn.graph_delta
-                .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, iri);
+            txn.write_graphs.insert(iri);
             txn
         }
         UpdateOperation::Add(t) => lower_transfer(t, prologue, TransferMode::Add, opts)?,
@@ -978,7 +942,7 @@ fn lower_clear_drop(
 ///
 /// Composes over the CLEAR primitive: COPY/MOVE clear the destination first,
 /// MOVE additionally clears the source afterward. A destination named graph is
-/// recorded in `graph_delta` so the commit envelope registers it even when it
+/// recorded in `write_graphs` so the commit registers it even when it
 /// did not previously exist (COPY/ADD into a fresh graph).
 fn lower_transfer(
     t: &GraphTransfer,
@@ -1003,16 +967,10 @@ fn lower_transfer(
         silent: t.silent,
     })
     .with_opts(opts);
-    // Register a (possibly-new) destination named graph so the commit envelope
-    // persists its g_id. `apply_delta` skips already-registered IRIs, so this
-    // is harmless when the destination already exists. The txn-local key is
-    // arbitrary — `apply_delta`/`provisional_ids` re-derive the ledger g_id
-    // deterministically from the IRI.
+    // A (possibly-new) destination named graph is a write target, so the
+    // commit registers it; an already-registered one is left as is.
     if let GraphSel::Graph(iri) = &to {
-        txn.graph_delta.insert(
-            fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
-            iri.clone(),
-        );
+        txn.write_graphs.insert(iri.clone());
     }
     Ok(txn)
 }
@@ -1040,7 +998,7 @@ fn lower_load(load: &Load, opts: TxnOpts) -> Result<Txn, LowerError> {
 ///
 /// INSERT DATA contains ground quads (no variables) that are directly inserted.
 /// `GRAPH <iri> { ... }` blocks route their triples into the named graph,
-/// registering it via `graph_delta` (same machinery as DELETE/INSERT ... WHERE).
+/// listing it in `write_graphs` (same machinery as DELETE/INSERT ... WHERE).
 fn lower_insert_data(
     data: &QuadData,
     prologue: &Prologue,
@@ -1060,14 +1018,14 @@ fn lower_insert_data(
         AnnotationExpansionMode::InsertData,
         bnodes,
     )?;
-    let mut graph_ids = TemplateGraphIds::new();
+    let mut write_graphs = BTreeSet::new();
     let insert_templates = lower_quad_pattern_to_templates(
         &pattern.patterns,
         prologue,
         ns,
         vars,
         bnodes,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
     )?;
 
@@ -1078,12 +1036,13 @@ fn lower_insert_data(
         delete_templates: Vec::new(),
         insert_templates,
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: graph_ids.delta(),
+        write_graphs,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1113,14 +1072,14 @@ fn lower_delete_data(
         AnnotationExpansionMode::DeleteData,
         bnodes,
     )?;
-    let mut graph_ids = TemplateGraphIds::new();
+    let mut write_graphs = BTreeSet::new();
     let delete_templates = lower_quad_pattern_to_templates(
         &pattern.patterns,
         prologue,
         ns,
         vars,
         bnodes,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
     )?;
 
@@ -1131,12 +1090,13 @@ fn lower_delete_data(
         delete_templates,
         insert_templates: Vec::new(),
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: graph_ids.delta(),
+        write_graphs,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1233,12 +1193,13 @@ fn lower_delete_where(
         delete_templates,
         insert_templates: Vec::new(),
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: FxHashMap::default(),
+        write_graphs: BTreeSet::new(),
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1275,7 +1236,7 @@ fn lower_delete_where_with_graphs(
         pattern: quad_pattern_to_graph_pattern(&rewritten),
     };
 
-    let mut graph_ids = TemplateGraphIds::new();
+    let mut write_graphs = BTreeSet::new();
     // Blank nodes were rewritten to variables above, so the counter is only a
     // signature requirement here — the template lowering never mints from it.
     let mut bnodes = BlankNodeCounter::new();
@@ -1285,7 +1246,7 @@ fn lower_delete_where_with_graphs(
         ns,
         vars,
         &mut bnodes,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
     )?;
 
@@ -1296,12 +1257,13 @@ fn lower_delete_where_with_graphs(
         delete_templates,
         insert_templates: Vec::new(),
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: graph_ids.delta(),
+        write_graphs,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1440,7 +1402,7 @@ fn lower_modify(
     //
     // Note: `lower_sparql_update` takes `&UpdateOperation`, so we can't move out of the AST here.
     // Cloning keeps the lowering interface simple and ensures the transaction IR owns its WHERE.
-    let mut graph_ids = TemplateGraphIds::new();
+    let mut write_graphs = BTreeSet::new();
     let with_graph_iri: Option<String> = if let Some(iri) = modify.with_iri.as_ref() {
         Some(expand_iri(iri, prologue)?)
     } else {
@@ -1467,9 +1429,10 @@ fn lower_modify(
         Vec::new()
     };
 
-    let default_template_graph_id: Option<u16> = with_graph_iri
-        .as_ref()
-        .map(|iri| graph_ids.get_or_assign(iri.clone()));
+    let default_template_graph: Option<Arc<str>> = with_graph_iri.as_deref().map(|iri| {
+        write_graphs.insert(iri.to_string());
+        Arc::from(iri)
+    });
 
     let sparql_where = SparqlWhereClause {
         prologue: prologue.clone(),
@@ -1486,7 +1449,7 @@ fn lower_modify(
     let delete_templates = if let Some(delete_clause) = &modify.delete_clause {
         reject_blank_nodes_in_delete_quad_pattern(delete_clause, "DELETE templates")?;
         reject_user_authored_reifies_in_quad_pattern(delete_clause, prologue)?;
-        if default_template_graph_id.is_some() {
+        if default_template_graph.is_some() {
             reject_with_scoped_annotations(delete_clause)?;
         }
         let mut expanded = delete_clause.clone();
@@ -1501,8 +1464,8 @@ fn lower_modify(
             ns,
             vars,
             bnodes,
-            &mut graph_ids,
-            default_template_graph_id,
+            &mut write_graphs,
+            default_template_graph.clone(),
         )?
     } else {
         Vec::new()
@@ -1510,7 +1473,7 @@ fn lower_modify(
 
     let insert_templates = if let Some(insert_clause) = &modify.insert_clause {
         reject_user_authored_reifies_in_quad_pattern(insert_clause, prologue)?;
-        if default_template_graph_id.is_some() {
+        if default_template_graph.is_some() {
             reject_with_scoped_annotations(insert_clause)?;
         }
         let mut expanded = insert_clause.clone();
@@ -1525,8 +1488,8 @@ fn lower_modify(
             ns,
             vars,
             bnodes,
-            &mut graph_ids,
-            default_template_graph_id,
+            &mut write_graphs,
+            default_template_graph.clone(),
         )?
     } else {
         Vec::new()
@@ -1539,12 +1502,13 @@ fn lower_modify(
         delete_templates,
         insert_templates,
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: graph_ids.delta(),
+        write_graphs,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1557,39 +1521,43 @@ fn lower_quad_pattern_to_templates(
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
     bnodes: &mut BlankNodeCounter,
-    graph_ids: &mut TemplateGraphIds,
-    default_graph_id: Option<u16>,
+    write_graphs: &mut BTreeSet<String>,
+    default_graph: Option<Arc<str>>,
 ) -> Result<Vec<TripleTemplate>, LowerError> {
     let mut out: Vec<TripleTemplate> = Vec::new();
     for el in elements {
         match el {
             QuadPatternElement::Triple(tp) => {
                 let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes)?;
-                if let Some(g_id) = default_graph_id {
-                    t = t.with_graph_id(g_id);
+                if let Some(iri) = &default_graph {
+                    t = t.in_graph(Arc::clone(iri));
                 }
                 out.push(t);
             }
-            QuadPatternElement::Graph { name, triples, .. } => {
-                let graph_iri = match name {
-                    fluree_db_sparql::ast::pattern::GraphName::Iri(iri) => {
-                        expand_iri(iri, prologue)?
+            QuadPatternElement::Graph { name, triples, .. } => match name {
+                fluree_db_sparql::ast::pattern::GraphName::Iri(iri) => {
+                    let iri = expand_iri(iri, prologue)?;
+                    write_graphs.insert(iri.clone());
+                    let iri: Arc<str> = Arc::from(iri);
+                    for tp in triples {
+                        out.push(
+                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
+                                .in_graph(Arc::clone(&iri)),
+                        );
                     }
-                    fluree_db_sparql::ast::pattern::GraphName::Var(v) => {
-                        return Err(LowerError::UnsupportedFeature {
-                            feature: "GRAPH variables in UPDATE templates",
-                            span: v.span,
-                        });
-                    }
-                };
-                let txn_local_g_id = graph_ids.get_or_assign(graph_iri);
-                for tp in triples {
-                    out.push(
-                        lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
-                            .with_graph_id(txn_local_g_id),
-                    );
                 }
-            }
+                fluree_db_sparql::ast::pattern::GraphName::Var(v) => {
+                    // Same registry key as the WHERE lowering, so the template
+                    // reads the column the WHERE's `GRAPH ?g` binds.
+                    let graph_var = vars.get_or_insert(&format!("?{}", v.name));
+                    for tp in triples {
+                        out.push(
+                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
+                                .with_graph_var(graph_var),
+                        );
+                    }
+                }
+            },
         }
     }
     Ok(out)
@@ -1621,7 +1589,7 @@ fn lower_triple_to_template(
         object,
         dtc,
         list_index: None, // Always None for SPARQL UPDATE
-        graph_id: None,   // Default graph
+        graph: TemplateGraph::Default,
     })
 }
 
@@ -1811,7 +1779,7 @@ fn lower_triple_to_delete_template_delete_where(
         object,
         dtc,
         list_index: None,
-        graph_id: None,
+        graph: TemplateGraph::Default,
     })
 }
 
@@ -2393,7 +2361,7 @@ mod tests {
     #[test]
     fn test_lower_insert_data_graph_block_registers_named_graph() {
         // Issue #1288: INSERT DATA { GRAPH <g> { ... } } must lower into
-        // graph-tagged templates plus a graph_delta registering the named graph.
+        // graph-tagged templates plus a write_graphs entry for the named graph.
         let parsed = fluree_db_sparql::parse_sparql(
             "INSERT DATA { GRAPH <urn:g1> { <http://example.org/s> <http://example.org/p> \"v\" } }",
         );
@@ -2410,14 +2378,14 @@ mod tests {
         assert_eq!(txn.txn_type, TxnType::Insert);
         assert_eq!(txn.insert_templates.len(), 1);
         assert!(
-            txn.insert_templates[0].graph_id.is_some(),
-            "template should carry a txn-local graph id"
+            txn.insert_templates[0].graph == TemplateGraph::Iri("urn:g1".into()),
+            "template should carry the graph IRI"
         );
-        // The named graph IRI must be registered in graph_delta.
+        // The named graph IRI must be listed in write_graphs.
         assert!(
-            txn.graph_delta.values().any(|iri| iri == "urn:g1"),
-            "graph_delta must register <urn:g1>, got {:?}",
-            txn.graph_delta
+            txn.write_graphs.contains("urn:g1"),
+            "write_graphs must list <urn:g1>, got {:?}",
+            txn.write_graphs
         );
     }
 
@@ -2447,13 +2415,46 @@ mod tests {
         assert!(txn.where_patterns.is_empty());
         assert_eq!(txn.delete_templates.len(), 1);
         assert!(
-            txn.delete_templates[0].graph_id.is_some(),
-            "delete template should carry a txn-local graph id"
+            txn.delete_templates[0].graph == TemplateGraph::Iri("urn:g1".into()),
+            "delete template should carry the graph IRI"
         );
         assert!(
-            txn.graph_delta.values().any(|iri| iri == "urn:g1"),
-            "graph_delta must register <urn:g1>, got {:?}",
-            txn.graph_delta
+            txn.write_graphs.contains("urn:g1"),
+            "write_graphs must list <urn:g1>, got {:?}",
+            txn.write_graphs
+        );
+    }
+
+    #[test]
+    fn test_lower_graph_variable_templates() {
+        // `GRAPH ?g` templates carry the WHERE's `?g` variable, not a graph
+        // IRI, and list nothing in `write_graphs` until staging resolves it.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE { GRAPH ?g { ?s <http://example.org/status> \"old\" } } \
+             INSERT { GRAPH ?g { ?s <http://example.org/status> \"new\" } } \
+             WHERE  { GRAPH ?g { ?s <http://example.org/status> \"old\" } }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        let g = txn.vars.get("?g").expect("?g registered");
+        for t in txn.delete_templates.iter().chain(&txn.insert_templates) {
+            assert_eq!(t.graph, TemplateGraph::Var(g));
+        }
+        assert!(txn.write_graphs.is_empty(), "{:?}", txn.write_graphs);
+
+        let parsed = fluree_db_sparql::parse_sparql("DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
+        let ast = parsed.ast.expect("AST");
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        assert_eq!(
+            txn.delete_templates[0].graph,
+            TemplateGraph::Var(txn.vars.get("?g").expect("?g registered"))
         );
     }
 
@@ -2477,7 +2478,7 @@ mod tests {
         assert!(txn.sparql_where.is_none());
         assert_eq!(txn.where_patterns.len(), 1);
         assert_eq!(txn.delete_templates.len(), 1);
-        assert!(txn.delete_templates[0].graph_id.is_none());
+        assert_eq!(txn.delete_templates[0].graph, TemplateGraph::Default);
     }
 
     #[test]
@@ -2683,7 +2684,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_insert_data_default_graph_has_no_graph_delta() {
+    fn test_lower_insert_data_default_graph_has_no_write_graphs() {
         // A plain INSERT DATA (no GRAPH block) lowers with no named-graph delta.
         let parsed = fluree_db_sparql::parse_sparql(
             "INSERT DATA { <http://example.org/s> <http://example.org/p> \"v\" }",
@@ -2699,8 +2700,8 @@ mod tests {
         let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
 
         assert_eq!(txn.insert_templates.len(), 1);
-        assert!(txn.insert_templates[0].graph_id.is_none());
-        assert!(txn.graph_delta.is_empty());
+        assert_eq!(txn.insert_templates[0].graph, TemplateGraph::Default);
+        assert!(txn.write_graphs.is_empty());
     }
 
     #[test]

@@ -673,7 +673,13 @@ impl crate::Fluree {
         // the state it lands on; the first violation aborts the whole rebase,
         // which has published nothing yet, naming the commit it stopped on.
         let (view, outcome) = self
-            .stage_validated(state, flakes, &original_commit.namespace_delta, "rebase")
+            .stage_validated(
+                state,
+                flakes,
+                &original_commit.namespace_delta,
+                &original_commit.graph_delta.values().cloned().collect(),
+                "rebase",
+            )
             .await?;
         outcome.into_result_with(|report| {
             format!(
@@ -686,7 +692,7 @@ impl crate::Fluree {
         let commit_opts = CommitOpts::default()
             .with_skip_backpressure()
             .with_namespace_delta(original_commit.namespace_delta.clone())
-            .with_graph_delta(original_commit.graph_delta.clone());
+            .with_graph_iris(original_commit.graph_delta.values().cloned());
 
         // Replay commits never go through `StagedCommit::apply` — the
         // caller publishes the batch's final head once — so

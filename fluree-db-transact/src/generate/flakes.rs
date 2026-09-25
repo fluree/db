@@ -4,13 +4,14 @@
 //! with variable bindings into concrete flakes.
 
 use crate::error::{Result, TransactError};
-use crate::ir::{TemplateTerm, TripleTemplate};
+use crate::ir::{TemplateGraph, TemplateTerm, TripleTemplate};
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
-use fluree_db_query::{Batch, Binding};
+use fluree_db_query::{Batch, Binding, VarId};
 use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // Well-known datatype SIDs, cached to avoid per-call Arc<str> allocation.
 // Clone is ~5ns (atomic Arc bump) vs ~30-50ns for Sid::new().
@@ -56,13 +57,6 @@ pub struct FlakeGenerator<'a> {
     /// Transaction ID for blank node skolemization
     txn_id: String,
 
-    /// Graph ID to Sid mapping for named graphs
-    ///
-    /// When a template has a `graph_id`, this map provides the corresponding
-    /// graph Sid for `Flake::new_in_graph()`. Graph IDs 0 (default) and 1 (txn-meta)
-    /// are reserved and should not appear in this map.
-    graph_sids: HashMap<u16, Sid>,
-
     /// Global index of the first WHERE solution in the current batch.
     ///
     /// Per SPARQL 1.1 Update §3.1.3, blank nodes in INSERT templates are
@@ -72,6 +66,19 @@ pub struct FlakeGenerator<'a> {
     /// streaming driver sets this before generating each batch. Defaults to 0
     /// (the no-WHERE single-solution case).
     solution_base: u64,
+
+    /// Named graphs written so far, by IRI. Staging reads this to route,
+    /// guard, and register graphs that `GRAPH ?g` templates resolve to, which
+    /// are only known once WHERE solutions arrive.
+    written_graphs: HashMap<String, Sid>,
+
+    /// WHERE-dataset names that alias a graph, mapped to its canonical IRI, so
+    /// a template `?g` bound to an alias writes to the graph the WHERE read.
+    graph_aliases: HashMap<Arc<str>, Arc<str>>,
+
+    /// Graph-variable resolutions keyed by the bound Sid, so a Sid-bound `?g`
+    /// rebuilds and validates its IRI once per graph, not once per row.
+    sid_graphs: HashMap<Sid, Sid>,
 }
 
 impl<'a> FlakeGenerator<'a> {
@@ -86,9 +93,31 @@ impl<'a> FlakeGenerator<'a> {
             t,
             ns_registry,
             txn_id,
-            graph_sids: HashMap::new(),
             solution_base: 0,
+            written_graphs: HashMap::new(),
+            graph_aliases: HashMap::new(),
+            sid_graphs: HashMap::new(),
         }
+    }
+
+    /// Set the WHERE dataset's alias names and the canonical IRI each resolves
+    /// to (see [`DataSet::with_named_graph_alias`](fluree_db_query::DataSet)).
+    pub fn set_graph_aliases(&mut self, aliases: HashMap<Arc<str>, Arc<str>>) {
+        self.graph_aliases = aliases;
+    }
+
+    /// Named graphs written so far, as (IRI, Sid).
+    pub fn written_graphs(&self) -> &HashMap<String, Sid> {
+        &self.written_graphs
+    }
+
+    fn graph_sid(&mut self, iri: &str) -> Sid {
+        if let Some(sid) = self.written_graphs.get(iri) {
+            return sid.clone();
+        }
+        let sid = self.ns_registry.sid_for_iri(iri);
+        self.written_graphs.insert(iri.to_string(), sid.clone());
+        sid
     }
 
     /// Set the global solution index of the next batch's first row, so blank
@@ -97,16 +126,6 @@ impl<'a> FlakeGenerator<'a> {
     /// the cumulative count of solution rows already processed.
     pub fn set_solution_base(&mut self, base: u64) {
         self.solution_base = base;
-    }
-
-    /// Set the graph Sid mapping for named graph support.
-    ///
-    /// The map should contain entries for user-defined named graphs (g_id >= 2).
-    /// Templates with a `graph_id` matching an entry in this map will produce
-    /// flakes in the corresponding named graph.
-    pub fn with_graph_sids(mut self, graph_sids: HashMap<u16, Sid>) -> Self {
-        self.graph_sids = graph_sids;
-        self
     }
 
     /// Generate assertion flakes from insert templates
@@ -165,6 +184,15 @@ impl<'a> FlakeGenerator<'a> {
         row_idx: usize,
         op: bool,
     ) -> Result<Option<Flake>> {
+        let graph = match &template.graph {
+            TemplateGraph::Default => None,
+            TemplateGraph::Iri(iri) => Some(self.graph_sid(iri)),
+            TemplateGraph::Var(var) => match self.resolve_graph_var(*var, bindings, row_idx)? {
+                Some(g_sid) => Some(g_sid),
+                None => return Ok(None),
+            },
+        };
+
         // Resolve each component
         let s = self.resolve_subject(&template.subject, bindings, row_idx)?;
         let p = self.resolve_predicate(&template.predicate, bindings, row_idx)?;
@@ -212,20 +240,83 @@ impl<'a> FlakeGenerator<'a> {
         let meta_lang = template_lang.or(bound_lang);
         let meta = FlakeMeta::from_parts(meta_lang.as_deref(), template.list_index);
 
-        // Create flake in named graph if template has graph_id
-        let flake = if let Some(g_id) = template.graph_id {
-            let g_sid = self.graph_sids.get(&g_id).ok_or_else(|| {
-                TransactError::FlakeGeneration(format!(
-                    "template references graph_id {g_id} but no graph Sid was provided; \
-                     this indicates a bug in graph delta/sid wiring"
-                ))
-            })?;
-            Flake::new_in_graph(g_sid.clone(), s, p, o, dt, self.t, op, meta)
-        } else {
-            Flake::new(s, p, o, dt, self.t, op, meta)
+        let flake = match graph {
+            Some(g_sid) => Flake::new_in_graph(g_sid, s, p, o, dt, self.t, op, meta),
+            None => Flake::new(s, p, o, dt, self.t, op, meta),
         };
 
         Ok(Some(flake))
+    }
+
+    /// Resolve a template graph variable to the graph's Sid.
+    ///
+    /// `None` (unbound, or poisoned by OPTIONAL) skips the triple, as for any
+    /// other template variable. A binding that cannot name a graph is an error
+    /// rather than a skip, matching how a literal subject is treated.
+    fn resolve_graph_var(
+        &mut self,
+        var: VarId,
+        bindings: &Batch,
+        row: usize,
+    ) -> Result<Option<Sid>> {
+        if bindings.is_empty() {
+            return Err(TransactError::UnboundVariable(format!("var_{var:?}")));
+        }
+        let sid_iri;
+        let mut bound_sid = None;
+        let iri: &str = match bindings.get(row, var) {
+            None | Some(Binding::Unbound | Binding::Poisoned) => return Ok(None),
+            Some(Binding::Iri(iri)) => iri,
+            Some(
+                Binding::Sid { sid, .. }
+                | Binding::IriMatch {
+                    primary_sid: sid, ..
+                },
+            ) => {
+                if let Some(graph) = self.sid_graphs.get(sid) {
+                    return Ok(Some(graph.clone()));
+                }
+                bound_sid = Some(sid);
+                if sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
+                    return Err(TransactError::InvalidTerm(
+                        "GRAPH name must be an IRI, not a blank node".to_string(),
+                    ));
+                }
+                let prefix = self
+                    .ns_registry
+                    .get_prefix(sid.namespace_code)
+                    .ok_or_else(|| {
+                        TransactError::InvalidTerm(format!(
+                            "GRAPH name {sid} has an unknown namespace code"
+                        ))
+                    })?;
+                sid_iri = format!("{prefix}{}", sid.name);
+                &sid_iri
+            }
+            Some(Binding::Lit { .. } | Binding::EncodedLit { .. }) => {
+                return Err(TransactError::InvalidTerm(
+                    "GRAPH name must be an IRI, not a literal".to_string(),
+                ))
+            }
+            Some(other) => {
+                return Err(TransactError::InvalidTerm(format!(
+                    "GRAPH name must be an IRI; got {other:?}"
+                )))
+            }
+        };
+        let iri = self.graph_aliases.get(iri).map_or(iri, AsRef::as_ref);
+        let graph = if let Some(sid) = self.written_graphs.get(iri) {
+            sid.clone()
+        } else {
+            fluree_db_core::graph_registry::validate_absolute_graph_iri(iri)
+                .map_err(TransactError::InvalidTerm)?;
+            let iri = iri.to_string();
+            self.graph_sid(&iri)
+        };
+        if let Some(sid) = bound_sid {
+            self.sid_graphs.insert(sid.clone(), graph.clone());
+        }
+        Ok(Some(graph))
     }
 
     /// Resolve a subject term

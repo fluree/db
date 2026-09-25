@@ -13,7 +13,7 @@
 
 use super::txn_meta::extract_txn_meta;
 use crate::error::{Result, TransactError};
-use crate::ir::{InlineValues, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+use crate::ir::{InlineValues, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
@@ -27,42 +27,29 @@ use fluree_vocab::{
     rdf_names,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-/// Assigns per-transaction graph IDs for JSON-LD `@graph` selectors.
-///
-/// These IDs are scoped to the transaction envelope via `Txn.graph_delta`.
-/// They do not need to be globally stable across commits, as long as the commit
-/// carries the mapping used to encode flakes.
-struct GraphIdAssigner {
-    iri_to_id: HashMap<String, u16>,
-    next_id: u16, // 2+ reserved for user graphs
-}
+/// Named graphs a JSON-LD transaction writes to, interned so the templates
+/// of one graph share its IRI.
+struct WriteGraphs(HashMap<String, Arc<str>>);
 
-impl GraphIdAssigner {
+impl WriteGraphs {
     fn new() -> Self {
-        Self {
-            iri_to_id: HashMap::new(),
-            next_id: 2,
-        }
+        Self(HashMap::new())
     }
 
-    fn get_or_assign(&mut self, iri: &str) -> u16 {
-        if let Some(&id) = self.iri_to_id.get(iri) {
-            return id;
+    fn get_or_assign(&mut self, iri: &str) -> Arc<str> {
+        if let Some(iri) = self.0.get(iri) {
+            return Arc::clone(iri);
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.iri_to_id.insert(iri.to_string(), id);
-        id
+        let interned: Arc<str> = Arc::from(iri);
+        self.0.insert(iri.to_string(), Arc::clone(&interned));
+        interned
     }
 
-    fn delta(&self) -> rustc_hash::FxHashMap<u16, String> {
-        self.iri_to_id
-            .iter()
-            .map(|(iri, &g_id)| (g_id, iri.clone()))
-            .collect()
+    fn iris(&self) -> BTreeSet<String> {
+        self.0.keys().cloned().collect()
     }
 }
 
@@ -177,11 +164,6 @@ pub fn parse_transaction(
     }
 }
 
-/// Transaction-local graph id assigned to the sync target graph. The
-/// payload may not address named graphs itself (rejected below), so the
-/// assigner never hands this id to anything else.
-const SYNC_GRAPH_LOCAL_ID: u16 = 2;
-
 /// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
 ///
 /// The payload is an ordinary insert-shaped JSON-LD document describing the
@@ -212,14 +194,15 @@ pub fn parse_sync_transaction(
     } else {
         parse_transaction(json, TxnType::Insert, opts, ns_registry)?
     };
-    if !txn.graph_delta.is_empty() {
+    if !txn.write_graphs.is_empty() {
         return Err(TransactError::Parse(
             "sync payload must not address named graphs; the target graph is the sync scope"
                 .to_string(),
         ));
     }
+    let sync_graph: Arc<str> = Arc::from(graph_iri);
     for t in &mut txn.insert_templates {
-        t.graph_id = Some(SYNC_GRAPH_LOCAL_ID);
+        t.graph = TemplateGraph::Iri(Arc::clone(&sync_graph));
     }
     // Edge annotations were lowered against a payload with no graph identity,
     // so their `f:reifies*` bundles carry no `f:reifiesGraph`. Re-homing the
@@ -248,8 +231,7 @@ pub fn parse_sync_transaction(
         })
         .collect();
     txn.insert_templates.extend(anchors);
-    txn.graph_delta
-        .insert(SYNC_GRAPH_LOCAL_ID, graph_iri.to_string());
+    txn.write_graphs.insert(graph_iri.to_string());
     txn.sync_graph = Some(graph_iri.to_string());
     Ok(txn)
 }
@@ -257,7 +239,7 @@ pub fn parse_sync_transaction(
 /// Parse an insert transaction
 fn parse_insert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry) -> Result<Txn> {
     let mut vars = VarRegistry::new();
-    let mut graph_ids = GraphIdAssigner::new();
+    let mut write_graphs = WriteGraphs::new();
 
     // Parse and merge context
     let context = extract_context(json)?;
@@ -286,7 +268,7 @@ fn parse_insert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         ns_registry,
         false,
         strict,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
         &empty_aliases,
     );
@@ -303,7 +285,7 @@ fn parse_insert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_vars(vars)
         .with_opts(opts)
         .with_txn_meta(txn_meta);
-    txn.graph_delta = graph_ids.delta();
+    txn.write_graphs = write_graphs.iris();
     Ok(txn)
 }
 
@@ -315,7 +297,7 @@ fn parse_upsert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
     // For now, upsert is handled the same as insert at parse time
     // The actual upsert logic (query existing, delete old) happens in stage
     let mut vars = VarRegistry::new();
-    let mut graph_ids = GraphIdAssigner::new();
+    let mut write_graphs = WriteGraphs::new();
 
     let context = extract_context(json)?;
 
@@ -342,7 +324,7 @@ fn parse_upsert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         ns_registry,
         false,
         strict,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
         &empty_aliases,
     );
@@ -359,7 +341,7 @@ fn parse_upsert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_vars(vars)
         .with_opts(opts)
         .with_txn_meta(txn_meta);
-    txn.graph_delta = graph_ids.delta();
+    txn.write_graphs = write_graphs.iris();
     Ok(txn)
 }
 
@@ -387,7 +369,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
     }
 
     let mut vars = VarRegistry::new();
-    let mut graph_ids = GraphIdAssigner::new();
+    let mut write_graphs = WriteGraphs::new();
 
     // Parse context from the outer document
     let context = extract_context(json)?;
@@ -430,7 +412,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         obj.get("graph"),
         &context,
         &from_named_aliases,
-        &mut graph_ids,
+        &mut write_graphs,
         strict,
     )?;
 
@@ -488,8 +470,10 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
             ns_registry,
             object_var_parsing,
             strict,
-            &mut graph_ids,
-            template_default_graph.as_ref().map(|(g_id, _)| *g_id),
+            &mut write_graphs,
+            template_default_graph
+                .as_ref()
+                .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
         let templates = parse_update_templates_with_ctx(delete_val, &mut ctx)?;
@@ -532,8 +516,10 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
             ns_registry,
             object_var_parsing,
             strict,
-            &mut graph_ids,
-            template_default_graph.as_ref().map(|(g_id, _)| *g_id),
+            &mut write_graphs,
+            template_default_graph
+                .as_ref()
+                .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
         let templates = parse_update_templates_with_ctx(insert_val, &mut ctx)?;
@@ -555,7 +541,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_vars(vars)
         .with_opts(opts)
         .with_txn_meta(txn_meta);
-    txn.graph_delta = graph_ids.delta();
+    txn.write_graphs = write_graphs.iris();
     txn.update_where_default_graph_iris = Some(where_default_graph_iris);
     txn.update_where_named_graphs = where_named_graphs;
 
@@ -571,9 +557,9 @@ fn parse_update_template_default_graph(
     graph_val: Option<&Value>,
     context: &ParsedContext,
     from_named_aliases: &HashMap<String, String>,
-    graph_ids: &mut GraphIdAssigner,
+    write_graphs: &mut WriteGraphs,
     strict: bool,
-) -> Result<Option<(u16, String)>> {
+) -> Result<Option<(Arc<str>, String)>> {
     let Some(v) = graph_val else {
         return Ok(None);
     };
@@ -591,7 +577,7 @@ fn parse_update_template_default_graph(
     }
 
     let resolved = resolve_graph_selector_value_for_update(v, from_named_aliases);
-    parse_update_default_graph(Some(&resolved), context, graph_ids, strict)
+    parse_update_default_graph(Some(&resolved), context, write_graphs, strict)
 }
 
 fn parse_update_where_default_graph_iris(
@@ -784,9 +770,9 @@ fn expand_update_graph_iri(v: &Value, context: &ParsedContext, strict: bool) -> 
 fn parse_update_default_graph(
     graph_val: Option<&Value>,
     context: &ParsedContext,
-    graph_ids: &mut GraphIdAssigner,
+    write_graphs: &mut WriteGraphs,
     strict: bool,
-) -> Result<Option<(u16, String)>> {
+) -> Result<Option<(Arc<str>, String)>> {
     let Some(v) = graph_val else {
         return Ok(None);
     };
@@ -839,8 +825,8 @@ fn parse_update_default_graph(
     }
     .ok_or_else(|| TransactError::Parse("graph must expand to an @id IRI".to_string()))?;
 
-    let g_id = graph_ids.get_or_assign(&iri);
-    Ok(Some((g_id, iri)))
+    let graph = write_graphs.get_or_assign(&iri);
+    Ok(Some((graph, iri)))
 }
 
 struct TemplateParseCtx<'a> {
@@ -849,8 +835,8 @@ struct TemplateParseCtx<'a> {
     ns_registry: &'a mut NamespaceRegistry,
     object_var_parsing: bool,
     strict_compact_iri: bool,
-    graph_ids: &'a mut GraphIdAssigner,
-    default_graph_id: Option<u16>,
+    write_graphs: &'a mut WriteGraphs,
+    default_graph: Option<Arc<str>>,
     from_named_aliases: &'a HashMap<String, String>,
     blank_counter: usize,
 }
@@ -863,8 +849,8 @@ impl<'a> TemplateParseCtx<'a> {
         ns_registry: &'a mut NamespaceRegistry,
         object_var_parsing: bool,
         strict_compact_iri: bool,
-        graph_ids: &'a mut GraphIdAssigner,
-        default_graph_id: Option<u16>,
+        write_graphs: &'a mut WriteGraphs,
+        default_graph: Option<Arc<str>>,
         from_named_aliases: &'a HashMap<String, String>,
     ) -> Self {
         Self {
@@ -873,8 +859,8 @@ impl<'a> TemplateParseCtx<'a> {
             ns_registry,
             object_var_parsing,
             strict_compact_iri,
-            graph_ids,
-            default_graph_id,
+            write_graphs,
+            default_graph,
             from_named_aliases,
             blank_counter: 0,
         }
@@ -953,17 +939,16 @@ fn parse_update_templates_with_ctx(
                     let graph = parse_update_default_graph(
                         Some(&resolved_graph),
                         ctx.context,
-                        ctx.graph_ids,
+                        ctx.write_graphs,
                         ctx.strict_compact_iri,
                     )?
                     .ok_or_else(|| {
                         TransactError::Parse("graph wrapper requires a graph IRI".to_string())
                     })?;
                     let expanded = ctx.expand_document(&arr[2])?;
-                    let prev_default = ctx.default_graph_id;
-                    ctx.default_graph_id = Some(graph.0);
+                    let prev_default = ctx.default_graph.replace(graph.0);
                     let templates = parse_expanded_triples_with_ctx(&expanded, ctx)?;
-                    ctx.default_graph_id = prev_default;
+                    ctx.default_graph = prev_default;
                     out.extend(templates);
                     continue;
                 }
@@ -1357,7 +1342,7 @@ fn parse_expanded_object_with_ctx(
     //
     // This is distinct from *envelope form* (top-level `@graph: [...]`) used
     // for txn-meta extraction.
-    let graph_id = obj
+    let node_graph = obj
         .get("@graph")
         .and_then(|v| match v {
             Value::String(s) => Some(s.as_str()),
@@ -1369,12 +1354,12 @@ fn parse_expanded_object_with_ctx(
             }),
             _ => None,
         })
-        .map(|raw| -> Result<u16> {
+        .map(|raw| -> Result<Arc<str>> {
             let resolved = resolve_graph_selector_str_for_templates(raw, ctx)?;
-            Ok(ctx.graph_ids.get_or_assign(&resolved))
+            Ok(ctx.write_graphs.get_or_assign(&resolved))
         })
         .transpose()?;
-    let graph_id = graph_id.or(ctx.default_graph_id);
+    let node_graph = node_graph.or_else(|| ctx.default_graph.clone());
 
     // Get subject from @id (already expanded IRI or variable)
     let subject = if let Some(id) = obj.get("@id") {
@@ -1412,8 +1397,8 @@ fn parse_expanded_object_with_ctx(
                         TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(type_iri))
                     };
                     let mut t = TripleTemplate::new(subject.clone(), predicate.clone(), object);
-                    if let Some(g_id) = graph_id {
-                        t = t.with_graph_id(g_id);
+                    if let Some(graph) = &node_graph {
+                        t = t.in_graph(Arc::clone(graph));
                     }
                     templates.push(t);
                 } else {
@@ -1444,8 +1429,8 @@ fn parse_expanded_object_with_ctx(
         for parsed_value in parsed_values {
             let mut template =
                 TripleTemplate::new(subject.clone(), predicate.clone(), parsed_value.term);
-            if let Some(g_id) = graph_id {
-                template = template.with_graph_id(g_id);
+            if let Some(graph) = &node_graph {
+                template = template.in_graph(Arc::clone(graph));
             }
             if let Some(dtc) = parsed_value.dtc {
                 template = template.with_dtc(dtc);
@@ -1508,7 +1493,7 @@ fn parse_expanded_id(
     ns_registry: &mut NamespaceRegistry,
 ) -> Result<TemplateTerm> {
     let context = ParsedContext::new();
-    let mut graph_ids = GraphIdAssigner::new();
+    let mut write_graphs = WriteGraphs::new();
     let empty_aliases: HashMap<String, String> = HashMap::new();
     let mut ctx = TemplateParseCtx::new(
         &context,
@@ -1516,7 +1501,7 @@ fn parse_expanded_id(
         ns_registry,
         true,
         true,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
         &empty_aliases,
     );
@@ -1718,8 +1703,8 @@ fn parse_expanded_value(
     ns_registry: &mut NamespaceRegistry,
     templates: &mut Vec<TripleTemplate>,
     object_var_parsing: bool,
-    graph_ids: &mut GraphIdAssigner,
-    default_graph_id: Option<u16>,
+    write_graphs: &mut WriteGraphs,
+    default_graph: Option<Arc<str>>,
     from_named_aliases: &HashMap<String, String>,
     blank_counter: &mut usize,
 ) -> Result<ParsedValue> {
@@ -1729,8 +1714,8 @@ fn parse_expanded_value(
         ns_registry,
         object_var_parsing,
         true,
-        graph_ids,
-        default_graph_id,
+        write_graphs,
+        default_graph,
         from_named_aliases,
     );
     ctx.blank_counter = *blank_counter;
@@ -1984,8 +1969,8 @@ fn parse_list_values(
     ns_registry: &mut NamespaceRegistry,
     object_var_parsing: bool,
     templates: &mut Vec<TripleTemplate>,
-    graph_ids: &mut GraphIdAssigner,
-    default_graph_id: Option<u16>,
+    write_graphs: &mut WriteGraphs,
+    default_graph: Option<Arc<str>>,
     from_named_aliases: &HashMap<String, String>,
     blank_counter: &mut usize,
 ) -> Result<Vec<ParsedValue>> {
@@ -1995,8 +1980,8 @@ fn parse_list_values(
         ns_registry,
         object_var_parsing,
         true,
-        graph_ids,
-        default_graph_id,
+        write_graphs,
+        default_graph,
         from_named_aliases,
     );
     ctx.blank_counter = *blank_counter;
@@ -2282,14 +2267,14 @@ mod tests {
 
         let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry).unwrap();
         assert!(
-            txn.graph_delta
-                .values()
-                .any(|iri| iri == "http://example.org/g2"),
-            "expected graph_delta to contain resolved graph IRI for alias g2"
+            txn.write_graphs.contains("http://example.org/g2"),
+            "expected write_graphs to contain resolved graph IRI for alias g2"
         );
         assert!(
-            txn.insert_templates.iter().any(|t| t.graph_id.is_some()),
-            "expected insert templates to be tagged with a graph_id"
+            txn.insert_templates
+                .iter()
+                .any(|t| t.graph == TemplateGraph::Iri("http://example.org/g2".into())),
+            "expected insert templates to target the resolved graph IRI"
         );
     }
 
@@ -2394,7 +2379,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let mut templates: Vec<TripleTemplate> = Vec::new();
         let ctx = ParsedContext::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter: usize = 0;
 
         // @value with @type - should preserve datatype
@@ -2406,7 +2391,7 @@ mod tests {
             &mut ns_registry,
             &mut templates,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2426,7 +2411,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let mut templates: Vec<TripleTemplate> = Vec::new();
         let ctx = ParsedContext::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter: usize = 0;
 
         let val = json!({"@value": "before", "@type": "xsd:string"});
@@ -2437,7 +2422,7 @@ mod tests {
             &mut ns_registry,
             &mut templates,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2459,7 +2444,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let mut templates: Vec<TripleTemplate> = Vec::new();
         let ctx = ParsedContext::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter: usize = 0;
 
         // @value with @language
@@ -2471,7 +2456,7 @@ mod tests {
             &mut ns_registry,
             &mut templates,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2499,7 +2484,7 @@ mod tests {
         // Parse a @list with three string items
         let list_val = json!(["a", "b", "c"]);
         let mut templates = Vec::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter = 0usize;
         let results = parse_list_values(
             &list_val,
@@ -2508,7 +2493,7 @@ mod tests {
             &mut ns_registry,
             true,
             &mut templates,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2548,7 +2533,7 @@ mod tests {
         // zero values, silently losing the statement).
         let list_val = json!([]);
         let mut templates = Vec::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter = 0usize;
         let results = parse_list_values(
             &list_val,
@@ -2557,7 +2542,7 @@ mod tests {
             &mut ns_registry,
             true,
             &mut templates,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2583,7 +2568,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let mut templates: Vec<TripleTemplate> = Vec::new();
         let ctx = ParsedContext::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let mut blank_counter: usize = 0;
 
         let val = json!({"@list": []});
@@ -2594,7 +2579,7 @@ mod tests {
             &mut ns_registry,
             &mut templates,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &HashMap::new(),
             &mut blank_counter,
@@ -2624,7 +2609,7 @@ mod tests {
         }]);
 
         let mut vars = VarRegistry::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
         let empty_aliases = HashMap::new();
         let mut parse_ctx = TemplateParseCtx::new(
             &ctx,
@@ -2632,7 +2617,7 @@ mod tests {
             &mut ns_registry,
             true,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &empty_aliases,
         );
@@ -2668,7 +2653,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let ctx = ParsedContext::new();
         let mut vars = VarRegistry::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
 
         let expanded = json!([{
             "@id": "http://example.org/thing/1",
@@ -2685,7 +2670,7 @@ mod tests {
             &mut ns_registry,
             false,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &empty_aliases,
         );
@@ -2731,7 +2716,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let ctx = ParsedContext::new();
         let mut vars = VarRegistry::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
 
         let expanded = json!([{
             "@id": "http://example.org/root",
@@ -2751,7 +2736,7 @@ mod tests {
             &mut ns_registry,
             false,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &empty_aliases,
         );
@@ -2782,7 +2767,7 @@ mod tests {
         let mut ns_registry = test_registry();
         let ctx = ParsedContext::new();
         let mut vars = VarRegistry::new();
-        let mut graph_ids = GraphIdAssigner::new();
+        let mut write_graphs = WriteGraphs::new();
 
         let expanded = json!([{
             "@id": "http://example.org/parent",
@@ -2803,7 +2788,7 @@ mod tests {
             &mut ns_registry,
             false,
             true,
-            &mut graph_ids,
+            &mut write_graphs,
             None,
             &empty_aliases,
         );

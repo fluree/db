@@ -92,6 +92,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         post_values: None,
         include_system_facts: false,
         cypher_vocab: None,
+        unmatched_optional: Default::default(),
     }
 }
 

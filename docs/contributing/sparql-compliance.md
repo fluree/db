@@ -540,6 +540,7 @@ Each test creates an in-memory Fluree ledger, loads RDF data, executes a SPARQL 
 - Post-query VALUES (`WHERE { ... } VALUES ?x { ... }`) is now parsed and lowered. Added `values` field on `SelectQuery` AST and `post_values` field on `ParsedQuery` to prevent the planner from reordering it relative to OPTIONAL/UNION.
 - `NestedLoopJoinOperator::combine_rows` fixed to handle `Unbound`/`Poisoned` left-side shared variables by falling back to right-side values. This fixes VALUES with UNDEF (values4, values5, values8).
 - `ValuesOperator` updated to treat `Poisoned` (from failed OPTIONAL) as wildcard in `is_compatible` and `merge_rows`, fixing values7 (OPTIONAL + VALUES).
+- Since #1734, an unmatched OPTIONAL leaves its variables `Unbound` in SPARQL and JSON-LD (§18.2.4), so they join later patterns like UNION- or `VALUES … UNDEF`-unbound ones. Only Cypher writes `Poisoned`, its null, which matches nothing downstream.
 - Remaining failure: `graph` test requires named graph support (GRAPH keyword) — tracked separately.
 
 ## Managing the Skip List

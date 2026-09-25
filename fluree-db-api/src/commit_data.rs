@@ -1,5 +1,5 @@
-//! Fold a sequence of commits into the flakes and `namespace_delta` /
-//! `graph_delta` of ONE new commit.
+//! Fold a sequence of commits into the flakes, `namespace_delta` and named
+//! graphs of ONE new commit.
 //!
 //! Used by the merge and revert paths to bundle multiple source commits into
 //! a single commit. Because that commit lands at a single `t`, and novelty
@@ -11,7 +11,7 @@
 
 use fluree_db_core::{Commit, Flake};
 use fluree_db_novelty::NetChangeAccumulator;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Flakes and metadata accumulated from a sequence of commits.
 #[derive(Default)]
@@ -20,8 +20,11 @@ pub(crate) struct CollectedCommitData {
     pub(crate) flakes: Vec<Flake>,
     /// Union of namespace deltas; earlier commits win on key collisions.
     pub(crate) namespace_delta: HashMap<u16, String>,
-    /// Union of graph deltas; earlier commits win on key collisions.
-    pub(crate) graph_delta: HashMap<u16, String>,
+    /// Named graphs the range's commits list, by IRI. Unioned by IRI: each
+    /// commit keys its graphs by its own branch's ids (older commits by
+    /// transaction-local numbers), so keys from different commits can
+    /// collide while naming different graphs.
+    pub(crate) graph_iris: BTreeSet<String>,
 }
 
 /// Which direction the new commit applies the range in.
@@ -38,8 +41,8 @@ pub(crate) enum Fold {
 /// Fold `commits` into a [`CollectedCommitData`].
 ///
 /// Commits must be supplied in **oldest-first** order so that earlier
-/// commits take precedence on namespace and graph delta keys (matches the
-/// historical `or_insert` semantics in `merge.rs::collect_commit_data`).
+/// commits take precedence on namespace delta keys (matches the historical
+/// `or_insert` semantics in `merge.rs::collect_commit_data`).
 ///
 /// Flake `t` is not a concern here: `StagedLedger::new` restamps every
 /// staged flake.
@@ -54,9 +57,7 @@ where
         for (code, prefix) in commit.namespace_delta {
             data.namespace_delta.entry(code).or_insert(prefix);
         }
-        for (g_id, iri) in commit.graph_delta {
-            data.graph_delta.entry(g_id).or_insert(iri);
-        }
+        data.graph_iris.extend(commit.graph_delta.into_values());
     }
 
     // The accumulator wants the range newest-change-first. For a replay
