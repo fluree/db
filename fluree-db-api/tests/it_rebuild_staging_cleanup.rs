@@ -41,6 +41,10 @@ impl ContentStore for RangeReadsFail {
         self.0.release(id).await
     }
 
+    fn permits_plaintext_cache(&self) -> bool {
+        self.0.permits_plaintext_cache()
+    }
+
     async fn get_range(
         &self,
         _id: &ContentId,

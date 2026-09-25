@@ -3697,8 +3697,7 @@ where
             fluree_db_core::address_path::ledger_id_to_path_prefix(&normalized_alias)
                 .unwrap_or_else(|_| normalized_alias.replace(':', "/"));
 
-        // Derive session dir from storage's data directory.
-        // For file storage: {data_dir}/{alias_path}/tmp_import/{session_id}/
+        // Session dir under the import scratch base (see `derive_session_dir`).
         let sid = session_id();
         let session_dir = derive_session_dir(storage, &alias_prefix, &sid);
         let run_dir = session_dir.join("runs");
@@ -7184,9 +7183,10 @@ fn session_id() -> String {
 
 /// Derive the session directory path.
 ///
-/// Uses `{temp_dir}/fluree-import/{alias_prefix}/tmp_import/{session_id}/`.
-/// The cleanup phase removes this directory on success; on failure it is
-/// kept for debugging (logged with full path).
+/// Uses `{temp_dir}/fluree-import/{alias_prefix}/tmp_import/{session_id}/`,
+/// or `FLUREE_IMPORT_DIR` in place of `{temp_dir}/fluree-import`. Storage is
+/// not consulted. The import removes this directory when it finishes, on
+/// success or failure, unless `cleanup_local_files` is off.
 fn derive_session_dir<S: Storage>(_storage: &S, alias_prefix: &str, sid: &str) -> PathBuf {
     // Allow overriding import scratch space for large imports.
     //

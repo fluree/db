@@ -253,6 +253,18 @@ are outside it by design:
   outside the encrypted storage, and nothing already in the cache directory is
   consulted. Fetched artifacts are served from memory instead.
 
+  **Upgrading from an earlier release.** Earlier releases did write decrypted
+  index artifacts to this cache when encryption was enabled. This release no
+  longer reads them, but it does not delete them. After upgrading, stop the
+  server and delete the cache directory to remove those plaintext copies from
+  disk. The same applies to a host that held a ledger unencrypted before it was
+  re-imported with a key.
+- **Peers reading through a proxy.** A peer in proxy mode fetches artifacts over
+  HTTP from a server. It holds no key, and what it receives is plaintext even
+  when that server encrypts at rest, so the peer's own disk cache holds
+  plaintext. Encryption at rest covers the server's storage, not a peer's local
+  disk. Protect a peer's cache directory as you would the ledger data itself.
+
 ### Index build staging
 
 A full index rebuild is an external sort. While it runs it stages sorted
@@ -268,17 +280,14 @@ defaults to `$TMPDIR/fluree-index`. For an encrypted deployment point it at a
 directory on an encrypted volume; the rebuild logs a warning when encryption
 is on and `data_dir` is unset.
 
-  **Upgrading from an earlier release.** Earlier releases did write decrypted
-  index artifacts to this cache when encryption was enabled. This release no
-  longer reads them, but it does not delete them. After upgrading, stop the
-  server and delete the cache directory to remove those plaintext copies from
-  disk. The same applies to a host that held a ledger unencrypted before it was
-  re-imported with a key.
-- **Peers reading through a proxy.** A peer in proxy mode fetches artifacts over
-  HTTP from a server. It holds no key, and what it receives is plaintext even
-  when that server encrypts at rest, so the peer's own disk cache holds
-  plaintext. Encryption at rest covers the server's storage, not a peer's local
-  disk. Protect a peer's cache directory as you would the ledger data itself.
+A bulk import stages the same kind of plaintext, but not under `data_dir`: it
+uses `$TMPDIR/fluree-import/{ledger}/tmp_import/{session}`, or the directory
+named by `FLUREE_IMPORT_DIR`. For an encrypted deployment, point
+`FLUREE_IMPORT_DIR` at an encrypted volume too. Import removes its session
+directory when it finishes, on success or error, unless `cleanup_local_files`
+is turned off. Unlike a rebuild, an import that panics or is cancelled leaves
+its session directory behind
+([#1950](https://github.com/fluree/db/issues/1950)).
 
 ## Performance Considerations
 

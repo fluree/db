@@ -65,6 +65,7 @@ impl Drop for SessionDirs {
     }
 }
 
+/// Build a binary index from the full commit chain, from scratch.
 ///
 /// Unlike `build_index_for_ledger`, this skips the nameservice lookup and
 /// the "already current" early-return check. Use this when you already have
