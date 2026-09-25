@@ -330,7 +330,7 @@ async fn eval_exists_for_row(
     ctx: &ExecutionContext<'_>,
     planning: &crate::temporal_mode::PlanningContext,
 ) -> Result<bool> {
-    let seed = SeedOperator::from_batch_row(batch, row_idx);
+    let seed = SeedOperator::for_exists_from_batch_row(batch, row_idx);
     let mut exists_op =
         build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
 

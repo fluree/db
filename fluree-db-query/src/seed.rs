@@ -55,6 +55,22 @@ impl SeedOperator {
         }
     }
 
+    /// Seed for an EXISTS / NOT EXISTS body.
+    ///
+    /// EXISTS substitutes only the bindings the row actually carries (SPARQL 1.1
+    /// §18.6), so a variable left unbound by an unmatched OPTIONAL is free inside
+    /// the body. `Poisoned` would instead make every inner pattern mentioning it
+    /// match nothing, so it is demoted to `Unbound` here.
+    pub fn for_exists_from_batch_row(batch: &Batch, row_idx: usize) -> Self {
+        let mut seed = Self::from_batch_row(batch, row_idx);
+        for binding in &mut seed.row {
+            if binding.is_poisoned() {
+                *binding = Binding::Unbound;
+            }
+        }
+        seed
+    }
+
     /// Create a seed operator from explicit schema and row
     pub fn from_row(schema: Arc<[VarId]>, row: Vec<Binding>) -> Self {
         debug_assert_eq!(

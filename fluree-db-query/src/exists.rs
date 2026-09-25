@@ -115,7 +115,7 @@ impl ExistsOperator {
         }
 
         // Seed with current row bindings (correlated subquery)
-        let seed = SeedOperator::from_batch_row(input_batch, row_idx);
+        let seed = SeedOperator::for_exists_from_batch_row(input_batch, row_idx);
         let mut exists_op = build_where_operators_seeded(
             Some(Box::new(seed)),
             &self.exists_patterns,

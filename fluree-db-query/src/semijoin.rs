@@ -112,7 +112,7 @@ impl SemijoinOperator {
         input_batch: &Batch,
         row_idx: usize,
     ) -> Result<bool> {
-        let seed = SeedOperator::from_batch_row(input_batch, row_idx);
+        let seed = SeedOperator::for_exists_from_batch_row(input_batch, row_idx);
         let mut inner_op = build_where_operators_seeded(
             Some(Box::new(seed)),
             &self.inner_patterns,
