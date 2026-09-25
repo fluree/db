@@ -73,10 +73,31 @@ pub struct DefaultsConfig {
     pub indexing: Option<IndexingDefaults>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IdentityDefaults {
     pub public_key: Option<Arc<str>>,
     pub private_key: Option<Arc<str>>,
+}
+
+impl std::fmt::Debug for IdentityDefaults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityDefaults")
+            .field("public_key", &self.public_key)
+            .field("private_key", &Redacted(&self.private_key))
+            .finish()
+    }
+}
+
+/// `Debug` for a secret: shows whether one is set, never its value.
+struct Redacted<'a>(&'a Option<Arc<str>>);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("Some(<redacted>)"),
+            None => f.write_str("None"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +146,7 @@ pub enum StorageType {
 }
 
 /// Storage configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StorageConfig {
     /// Optional identifier for the storage
     pub id: Option<Arc<str>>,
@@ -140,6 +161,19 @@ pub struct StorageConfig {
     /// Optional durability mode for file storage. `None` leaves the choice to
     /// `FLUREE_STORAGE_FSYNC` and the built-in default.
     pub durability: Option<Durability>,
+}
+
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("id", &self.id)
+            .field("storage_type", &self.storage_type)
+            .field("path", &self.path)
+            .field("aes256_key", &Redacted(&self.aes256_key))
+            .field("address_identifier", &self.address_identifier)
+            .field("durability", &self.durability)
+            .finish()
+    }
 }
 
 impl Default for StorageConfig {
@@ -1165,6 +1199,29 @@ mod tests {
     /// `AES256Key` is a storage-node field: the S3 and memory branches must
     /// carry it exactly as the file branch does, or a documented encrypted
     /// S3 deployment silently writes plaintext.
+    #[test]
+    fn debug_never_prints_secrets() {
+        let config = ConnectionConfig {
+            index_storage: StorageConfig {
+                aes256_key: Some(Arc::from("c2VjcmV0LWFlcy1rZXk=")),
+                ..Default::default()
+            },
+            defaults: Some(DefaultsConfig {
+                identity: Some(IdentityDefaults {
+                    public_key: Some(Arc::from("public-key")),
+                    private_key: Some(Arc::from("secret-private-key")),
+                }),
+                indexing: None,
+            }),
+            ..Default::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("c2VjcmV0LWFlcy1rZXk="), "{rendered}");
+        assert!(!rendered.contains("secret-private-key"), "{rendered}");
+        assert!(rendered.contains("public-key"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
     #[test]
     fn test_jsonld_aes256_key_parsed_for_every_storage_type() {
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";

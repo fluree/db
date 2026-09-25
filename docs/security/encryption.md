@@ -7,7 +7,7 @@ Fluree supports transparent encryption of data at rest using AES-256-GCM authent
 **Key Features:**
 - **AES-256-GCM**: Industry-standard authenticated encryption with integrity protection
 - **Transparent Operation**: Encryption/decryption happens automatically on read/write
-- **All Storage Backends**: Works natively with file, S3, and memory storage
+- **All Storage Backends**: Works natively with file, S3, and memory storage (not IPFS)
 - **Portable Ciphertext**: Encrypted data can be moved between storage backends (file ↔ S3)
 - **Environment Variable Support**: Keys can be loaded from environment variables
 - **Secure Key Handling**: Key material in `EncryptionKey` is zeroized on drop
@@ -58,7 +58,15 @@ let client = FlureeBuilder::from_json_ld(&config)?
 A key set on the builder (`with_encryption_key*()` or `AES256Key` in JSON-LD) is
 applied by every terminal build method — `build()`, `build_memory()`, `build_s3()`,
 `build_client()` and friends — on every backend. The `build_*_encrypted()` methods
-remain for callers that want the key to be an explicit argument.
+remain for callers that want the key to be an explicit argument. Two build
+methods are exceptions:
+
+- `build_ipfs()` returns an error when a key is configured. IPFS storage cannot
+  be wrapped for encryption, and it publishes to a content-addressed network, so
+  silently writing plaintext is not an option.
+- `build_with()` takes a storage you have already composed, and may already have
+  wrapped in `EncryptedStorage`. It leaves the key to you and logs a warning when
+  one is configured.
 
 ### Server Configuration
 
@@ -231,12 +239,18 @@ The same encryption key will decrypt data regardless of where it's stored.
 ## What Stays Plaintext
 
 Encryption covers every blob written through the storage layer: commits,
-transactions, index roots, branches, leaves, dictionaries and arenas. Two things
+transactions, index roots, branches, leaves, dictionaries and arenas. These
 are outside it by design:
 
 - **The nameservice.** The file nameservice under `ns@v2/` and the DynamoDB or
   S3 storage-backed nameservice hold ledger names, head commit ids and index
   root ids in plaintext. They contain no ledger content.
+
+  Earlier releases' `build_s3_encrypted()` encrypted the S3 storage-backed
+  nameservice records as well. It now writes them in plaintext, like every other
+  build path, and cannot read the encrypted ones. A store written that way fails
+  to open, with a JSON parse error reading a nameservice record, until those
+  records are rewritten in plaintext.
 - **Nothing else on local disk.** Readers keep a read-through disk cache of
   index artifacts (`$TMPDIR/fluree_binary_cache` by default, or
   `LedgerManagerConfig::cache_dir`), and the indexer seeds it with artifacts it
@@ -245,6 +259,18 @@ are outside it by design:
   encrypted storage, and nothing already in the cache directory is consulted.
   Fetched artifacts are served from memory instead.
 
+  **Upgrading from an earlier release.** Earlier releases did write decrypted
+  index artifacts to this cache when encryption was enabled. This release no
+  longer reads them, but it does not delete them. After upgrading, stop the
+  server and delete the cache directory to remove those plaintext copies from
+  disk. The same applies to a host that held a ledger unencrypted before it was
+  re-imported with a key.
+- **Peers reading through a proxy.** A peer in proxy mode fetches artifacts over
+  HTTP from a server. It holds no key, and what it receives is plaintext even
+  when that server encrypts at rest, so the peer's own disk cache holds
+  plaintext. Encryption at rest covers the server's storage, not a peer's local
+  disk. Protect a peer's cache directory as you would the ledger data itself.
+
 ## Performance Considerations
 
 - **CPU overhead**: ~5-15% for encryption/decryption (depends on hardware AES support)
@@ -252,8 +278,9 @@ are outside it by design:
 - **Memory**: Keys are kept in memory while the connection is open
 - **No disk cache**: because the read-through disk cache is bypassed (see above),
   a remote backend such as S3 re-fetches an index artifact whenever it falls out
-  of the in-memory leaflet cache. Size that cache (`cacheMaxMb`) for the working
-  set. File storage is unaffected: it reads and decrypts blobs in place.
+  of the in-memory leaflet cache. Concurrent readers of the same artifact still
+  share one fetch. Size that cache (`cacheMaxMb`) for the working set. File
+  storage is unaffected: it reads and decrypts blobs in place.
 
 Modern CPUs with AES-NI instructions provide hardware acceleration, minimizing the performance impact.
 

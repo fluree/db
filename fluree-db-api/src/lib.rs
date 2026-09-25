@@ -2422,6 +2422,14 @@ impl FlureeBuilder {
         nameservice: NameServiceMode,
     ) -> Fluree {
         self.warn_if_discarding_indexer_config("build_with");
+        // Wrapping here could double-encrypt a storage the caller already
+        // wrapped, so the key is left to the caller — but not silently.
+        if self.has_encryption_key() {
+            tracing::warn!(
+                build_path = "build_with",
+                "a configured encryption key is ignored: this path uses the storage you supplied"
+            );
+        }
         let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
         Self::finalize_with_backend(
@@ -2587,11 +2595,22 @@ impl FlureeBuilder {
     ///   garbage collector can reclaim them.
     /// - Admin operations that require prefix listing (e.g., fast-path ledger
     ///   drop) fall back to CID-walking, which is slower but correct.
+    /// - Encryption at rest is not supported: a builder carrying an
+    ///   encryption key is rejected rather than publishing plaintext to IPFS.
     ///
     /// [`build_with`]: FlureeBuilder::build_with
     #[cfg(feature = "ipfs")]
-    pub fn build_ipfs(self, api_url: impl Into<String>) -> Fluree {
+    pub fn build_ipfs(self, api_url: impl Into<String>) -> Result<Fluree> {
         use fluree_db_storage_ipfs::{IpfsConfig, IpfsStorage};
+        // `IpfsStorage` is a `ContentStore`, not a `Storage`, so
+        // `encrypt_if_configured` cannot wrap it.
+        if self.has_encryption_key() {
+            return Err(ApiError::config(
+                "build_ipfs cannot honour a configured encryption key: IPFS storage \
+                 does not support encryption at rest. Remove the key or choose \
+                 another storage backend.",
+            ));
+        }
         let ipfs_store = IpfsStorage::new(IpfsConfig {
             api_url: api_url.into(),
             pin_on_put: true,
@@ -2606,7 +2625,7 @@ impl FlureeBuilder {
         let attachment_provider_cell = Self::new_attachment_provider_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
-        Self::finalize_with_backend(
+        Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
@@ -2621,7 +2640,7 @@ impl FlureeBuilder {
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
             self.secret_resolver,
-        )
+        ))
     }
 
     /// Build an S3-backed Fluree instance (storage-backed nameservice).
@@ -5891,7 +5910,9 @@ mod tests {
     #[cfg(feature = "ipfs")]
     async fn test_build_ipfs_constructs_fluree() {
         // No real Kubo node needed — this only verifies the type plumbing.
-        let fluree = FlureeBuilder::memory().build_ipfs("http://127.0.0.1:5001");
+        let fluree = FlureeBuilder::memory()
+            .build_ipfs("http://127.0.0.1:5001")
+            .expect("build_ipfs");
         // Backend should be Permanent (IPFS), not Managed.
         assert!(matches!(
             fluree.backend(),
@@ -5899,6 +5920,17 @@ mod tests {
         ));
         // Admin storage should be None for IPFS (no raw Storage interface).
         assert!(fluree.admin_storage().is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "ipfs")]
+    async fn build_ipfs_rejects_an_encryption_key() {
+        let err = FlureeBuilder::memory()
+            .with_encryption_key([7u8; 32])
+            .build_ipfs("http://127.0.0.1:5001")
+            .err()
+            .expect("a configured key must not be dropped silently");
+        assert!(err.to_string().contains("encryption key"), "{err}");
     }
 }
 
