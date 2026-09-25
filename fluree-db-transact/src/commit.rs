@@ -620,9 +620,24 @@ pub async fn build_commit(
     //    stages no flakes (D-6: an empty graph has no representation) but
     //    must persist its graph_delta so the registry learns the IRI — O3's
     //    transfer source-existence check consults exactly that registration.
+    //
+    //    An already-registered user graph is dropped from the commit's
+    //    `graph_delta`: its registering commit already lists it, and listing
+    //    every graph written would hit the envelope's entry cap on a
+    //    `GRAPH ?g` update over many existing graphs. System graphs stay
+    //    listed — they are seeded in memory at genesis, so the commit that
+    //    writes one is the durable record the registration probe, merge and
+    //    config readers look for.
+    let registry = &base.snapshot.graph_registry;
     let registers_new_graph = graph_delta
         .values()
-        .any(|iri| base.snapshot.graph_registry.graph_id_for_iri(iri).is_none());
+        .any(|iri| registry.graph_id_for_iri(iri).is_none());
+    let mut graph_delta = graph_delta;
+    graph_delta.retain(|_, iri| {
+        registry
+            .graph_id_for_iri(iri)
+            .is_none_or(|g_id| g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
+    });
     if flakes.is_empty() && merge_parents.is_empty() && !registers_new_graph {
         return Err(TransactError::EmptyTransaction);
     }

@@ -625,6 +625,54 @@ async fn test_sparql_update_graph_variable_rewrites_in_place() {
 }
 
 #[tokio::test]
+async fn test_sparql_update_graph_variable_across_more_graphs_than_envelope_cap() {
+    // A commit lists only the graphs it registers. Listing every graph a
+    // `GRAPH ?g` update writes would exceed the envelope's graph-delta cap
+    // once the update spans more existing graphs than that.
+    const GRAPHS: usize = fluree_db_core::commit::codec::envelope::MAX_GRAPH_DELTA_ENTRIES + 44;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-update-graph-var-wide:main";
+    let mut ledger = genesis_ledger(&fluree, ledger_id);
+
+    // Seed in two commits so neither registers more graphs than the cap.
+    for half in [0..GRAPHS / 2, GRAPHS / 2..GRAPHS] {
+        let blocks: String = half
+            .map(|i| {
+                format!(
+                    r#"GRAPH <https://example.org/wide/{i}> {{ <https://example.org/s> <https://example.org/status> "old" }}
+"#
+                )
+            })
+            .collect();
+        run_sparql_update(&fluree, ledger, &format!("INSERT DATA {{ {blocks} }}")).await;
+        ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    }
+    assert_eq!(user_graph_iris(&fluree, ledger_id).await.len(), GRAPHS);
+
+    let update = r#"
+        DELETE { GRAPH ?g { ?s <https://example.org/status> "old" } }
+        INSERT { GRAPH ?g { ?s <https://example.org/status> "new" } }
+        WHERE  { GRAPH ?g { ?s <https://example.org/status> "old" } }
+    "#;
+    try_sparql_update(&fluree, ledger, update)
+        .await
+        .expect("an update over more existing graphs than the cap must commit");
+
+    for i in [0, GRAPHS - 1] {
+        assert_eq!(
+            graph_values(
+                &fluree,
+                &format!("{ledger_id}#https://example.org/wide/{i}"),
+                "https://example.org/s",
+                "https://example.org/status"
+            )
+            .await,
+            vec!["new"]
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_sparql_insert_graph_variable_registers_new_graphs() {
     // `?g` may name a graph the ledger has never seen; the commit must
     // register it so it is queryable afterwards, including after indexing.
