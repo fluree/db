@@ -21,9 +21,9 @@
 //!
 //! ## Running
 //!
-//!   cargo bench -p fluree-db-api --bench query_construct_formats
-//!   cargo bench -p fluree-db-api --bench query_construct_formats -- --test
-//!   FLUREE_BENCH_SCALE=medium cargo bench -p fluree-db-api --bench query_construct_formats
+//!   cargo bench -p fluree-db-api --bench query_hot_construct_formats
+//!   cargo bench -p fluree-db-api --bench query_hot_construct_formats -- --test
+//!   FLUREE_BENCH_SCALE=medium cargo bench -p fluree-db-api --bench query_hot_construct_formats
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use fluree_bench_alloc::TrackingAllocator;
@@ -38,7 +38,7 @@ use fluree_db_api::{FlureeBuilder, FormatterConfig};
 #[global_allocator]
 static ALLOC: TrackingAllocator = TrackingAllocator::new();
 
-const GROUP: &str = "query_construct_formats";
+const GROUP: &str = "query_hot_construct_formats";
 const NODES_PER_TXN: usize = 1_000;
 
 const QUERY: &str = "PREFIX ex: <http://example.org/ns/>
