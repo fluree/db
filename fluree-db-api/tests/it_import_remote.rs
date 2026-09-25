@@ -477,6 +477,10 @@ struct YieldingStorage {
 
 #[async_trait]
 impl StorageRead for YieldingStorage {
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
     async fn read_bytes(&self, address: &str) -> fluree_db_core::error::Result<Vec<u8>> {
         // Hand control back to the runtime so the producer task genuinely
         // depends on the worker being free to make progress.

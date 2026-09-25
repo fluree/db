@@ -7,7 +7,7 @@ Fluree supports transparent encryption of data at rest using AES-256-GCM authent
 **Key Features:**
 - **AES-256-GCM**: Industry-standard authenticated encryption with integrity protection
 - **Transparent Operation**: Encryption/decryption happens automatically on read/write
-- **All Storage Backends**: Works natively with file, S3, and memory storage
+- **All Storage Backends**: Works natively with file, S3, and memory storage (not IPFS)
 - **Portable Ciphertext**: Encrypted data can be moved between storage backends (file ↔ S3)
 - **Environment Variable Support**: Keys can be loaded from environment variables
 - **Secure Key Handling**: Key material in `EncryptionKey` is zeroized on drop
@@ -29,21 +29,44 @@ let fluree = FlureeBuilder::file("/data/fluree")
     .with_encryption_key_base64("your-base64-encoded-32-byte-key")?
     .build_encrypted_from_config()?;
 
-// Option 3: From JSON-LD config with env var
+// Option 3: From JSON-LD config with env var (nodes are located by @id)
 let config = serde_json::json!({
-    "@context": {"@vocab": "https://ns.flur.ee/system#"},
-    "@graph": [{
-        "@type": "Connection",
-        "indexStorage": {
+    "@context": {
+        "@base": "https://ns.flur.ee/config/connection/",
+        "@vocab": "https://ns.flur.ee/system#"
+    },
+    "@graph": [
+        {
+            "@id": "storage",
             "@type": "Storage",
             "filePath": "/data/fluree",
             "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
-        }
-    }]
+        },
+        {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "storage"}}
+    ]
 });
 let fluree = FlureeBuilder::from_json_ld(&config)?
     .build_encrypted_from_config()?;
+
+// Option 4: any build path honours a configured key. This is what the
+// server and embedders use; the storage type comes from the config.
+let client = FlureeBuilder::from_json_ld(&config)?
+    .build_client()
+    .await?;
 ```
+
+A key set on the builder (`with_encryption_key*()` or `AES256Key` in JSON-LD) is
+applied by every terminal build method — `build()`, `build_memory()`, `build_s3()`,
+`build_client()` and friends — on every backend. The `build_*_encrypted()` methods
+remain for callers that want the key to be an explicit argument. Two build
+methods are exceptions:
+
+- `build_ipfs()` returns an error when a key is configured. IPFS storage cannot
+  be wrapped for encryption, and it publishes to a content-addressed network, so
+  silently writing plaintext is not an option.
+- `build_with()` takes a storage you have already composed, and may already have
+  wrapped in `EncryptedStorage`. It leaves the key to you and logs a warning when
+  one is configured.
 
 ### Server Configuration
 
@@ -213,11 +236,45 @@ aws s3 sync s3://my-bucket/fluree/ /var/lib/fluree/data
 
 The same encryption key will decrypt data regardless of where it's stored.
 
+## What Stays Plaintext
+
+Encryption covers every blob written through the storage layer: commits,
+transactions, index roots, branches, leaves, dictionaries and arenas. These
+are outside it by design:
+
+- **The nameservice.** The file nameservice under `ns@v2/` and the DynamoDB or
+  S3 storage-backed nameservice hold ledger names, head commit ids and index
+  root ids in plaintext. They contain no ledger content.
+- **Nothing else on local disk.** Readers keep a read-through disk cache of
+  index artifacts (`$TMPDIR/fluree_binary_cache` by default, or
+  `LedgerManagerConfig::cache_dir`), and the indexer seeds it with artifacts it
+  just built. With encryption enabled that cache is bypassed entirely: no
+  decrypted leaf, branch, dictionary or vector shard is written outside the
+  encrypted storage, and nothing already in the cache directory is consulted.
+  Fetched artifacts are served from memory instead.
+
+  **Upgrading from an earlier release.** Earlier releases did write decrypted
+  index artifacts to this cache when encryption was enabled. This release no
+  longer reads them, but it does not delete them. After upgrading, stop the
+  server and delete the cache directory to remove those plaintext copies from
+  disk. The same applies to a host that held a ledger unencrypted before it was
+  re-imported with a key.
+- **Peers reading through a proxy.** A peer in proxy mode fetches artifacts over
+  HTTP from a server. It holds no key, and what it receives is plaintext even
+  when that server encrypts at rest, so the peer's own disk cache holds
+  plaintext. Encryption at rest covers the server's storage, not a peer's local
+  disk. Protect a peer's cache directory as you would the ledger data itself.
+
 ## Performance Considerations
 
 - **CPU overhead**: ~5-15% for encryption/decryption (depends on hardware AES support)
 - **Storage overhead**: 22 bytes header + 16 bytes tag per object
 - **Memory**: Keys are kept in memory while the connection is open
+- **No disk cache**: because the read-through disk cache is bypassed (see above),
+  a remote backend such as S3 re-fetches an index artifact whenever it falls out
+  of the in-memory leaflet cache. Concurrent readers of the same artifact still
+  share one fetch. Size that cache (`cacheMaxMb`) for the working set. File
+  storage is unaffected: it reads and decrypts blobs in place.
 
 Modern CPUs with AES-NI instructions provide hardware acceleration, minimizing the performance impact.
 

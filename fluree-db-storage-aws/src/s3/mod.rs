@@ -288,6 +288,11 @@ impl S3Storage {
 
 #[async_trait]
 impl StorageRead for S3Storage {
+    /// Reads return exactly the bytes at rest.
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
     async fn read_bytes(&self, address: &str) -> std::result::Result<Vec<u8>, CoreError> {
         const SLOW_S3_SEND_WARN_MS: u64 = 1_000;
         const SLOW_S3_BODY_WARN_MS: u64 = 5_000;

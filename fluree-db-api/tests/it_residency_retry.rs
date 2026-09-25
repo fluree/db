@@ -118,6 +118,10 @@ fn digest_hex_in(address: &str) -> Option<String> {
 
 #[async_trait]
 impl StorageRead for ResidencyStorage {
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
     async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
         let bytes = self.inner.read_bytes(address).await?;
         // Fetch-pins contract: bytes served async become sync-resident.

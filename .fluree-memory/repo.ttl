@@ -2632,6 +2632,34 @@ mem:decision-01kv5jegwe2h3fmsrbygh9j644 a mem:Decision ;
     mem:createdAt "2026-06-15T12:00:08.590823Z"^^xsd:dateTime ;
     mem:rationale "Old behavior silently returned 0 rows for FILTER(DATATYPE(?v)=xsd:decimal) instead of erroring — a correctness bug reported against 4.0.6. Future work touching datatype()/eval must know it's an IRI term now, and that the JSON-LD compact-string convention was intentionally removed (unify-on-IRI decision)." .
 
+mem:constraint-01m38cy00ac9k2ms1n6xp0qast a mem:Constraint ;
+    mem:content "Any code that writes bytes fetched from a ContentStore/Storage to local disk outside that storage (disk artifact cache, indexer cache seeding, dict pack .fpk, vector shard .vas) must consult permits_plaintext_cache() on the store first. EncryptedStorage answers false; wrappers (Tiered, AddressIdentifierResolver, Branched, StorageContentStore, Metered) delegate. DiskArtifactCache is a process-global per-dir singleton, so the gate belongs at the callers, not on the cache." ;
+    mem:tag "disk-cache" ;
+    mem:tag "encryption" ;
+    mem:tag "security" ;
+    mem:tag "storage" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-binary-index/src/arena/vector.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/dict/pack_reader.rs" ;
+    mem:artifactRef "fluree-db-core/src/disk_cache.rs" ;
+    mem:artifactRef "fluree-db-core/src/storage.rs" ;
+    mem:branch "fix/encryption-at-rest-coverage" ;
+    mem:createdAt "2026-09-24T00:27:02.026429+00:00"^^xsd:dateTime ;
+    mem:rationale "Encryption at rest was defeated by the read-through cache writing decrypted leaves to $TMPDIR; cache files are mmap'd and range-read, so encrypting cache entries was not viable." .
+
+mem:fact-01m38cy2g76e891v6k39zp1grq a mem:Fact ;
+    mem:content "ConnectionConfig::from_json_ld indexes nodes by @id: a Connection node without @id yields \"No Connection node found\". Config examples must use the @base + @id form. Also, the S3 LocalStack test file needs `--features aws,aws-testcontainers`; aws-testcontainers alone makes build_client fail with \"S3 storage requires the 'aws' feature\"." ;
+    mem:tag "config" ;
+    mem:tag "jsonld" ;
+    mem:tag "s3" ;
+    mem:tag "testing" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_storage_s3_testcontainers.rs" ;
+    mem:artifactRef "fluree-db-connection/src/config.rs" ;
+    mem:branch "fix/encryption-at-rest-coverage" ;
+    mem:createdAt "2026-09-24T00:27:04.583337+00:00"^^xsd:dateTime .
+
 mem:fact-01kwpj81fpnp0rk5s952wf3shd a mem:Fact ;
     mem:content "`range_with_overlay` looks like a cheap point lookup at call sites but pays a full overlay-translation tax per call (unbounded novelty walk + dict-translate + sort in binary_range_eq_v3) — per-flake lookup loops are O(calls x novelty log novelty) and once livelocked filtered-DELETE staging >900s. Mitigations now in place: staging list-meta hydration grouped per (g_id, s, p) taking the FIRST dt-compatible meta per retraction (duplicate-value @list entries must lose exactly one entry per distinct WHERE binding), and a cross-call LRU in binary_range.rs keyed (store_id, index_t, OverlayProvider::content_version, to_t, g, index). content_version is refreshed on every Novelty mutation; wrapper overlays stay uncached." ;
     mem:tag "delete" ;

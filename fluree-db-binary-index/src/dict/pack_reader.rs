@@ -482,7 +482,10 @@ fn fetch_and_load(
         validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
         return Ok(LazyLoaded { meta, backing });
     }
-    if cache_path.exists() {
+    // A store that decrypts on read gets no disk cache: nothing is written
+    // there, and nothing left there by an earlier run is consulted.
+    let disk_cache = ctx.cs.permits_plaintext_cache();
+    if disk_cache && cache_path.exists() {
         let backing = load_pack_backing(cache_path)?;
         let meta = parse_pack_meta(backing.bytes())?;
         validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
@@ -529,6 +532,15 @@ fn fetch_and_load(
         );
         io::Error::other(format!("lazy pack fetch: {e}"))
     })?;
+
+    if !disk_cache {
+        // Heap-backed regardless of size: the only on-disk copy allowed is
+        // the encrypted one the store holds.
+        let backing = LoadedBacking::InMemory(Arc::from(bytes));
+        let meta = parse_pack_meta(backing.bytes())?;
+        validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
+        return Ok(LazyLoaded { meta, backing });
+    }
 
     // Write to cache, then re-open it. Re-opening rather than keeping `bytes`
     // is deliberate: `load_pack_backing` is the single place that decides
@@ -1158,6 +1170,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for FilePackStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.fallback.has(id).await
         }

@@ -247,6 +247,12 @@ where
         // Pass through - listing doesn't need encryption
         self.inner.list_prefix(prefix).await
     }
+
+    /// Reads come back decrypted, so a read-through disk cache of them
+    /// would be a plaintext copy of the ledger outside the encrypted tier.
+    fn permits_plaintext_cache(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -668,5 +674,24 @@ mod tests {
         let raw = storage.read_bytes(&result.address).await.unwrap();
         assert_ne!(raw.as_slice(), plaintext);
         assert!(raw.len() > plaintext.len()); // Encrypted data is larger
+    }
+
+    #[test]
+    fn encrypted_storage_forbids_plaintext_cache() {
+        use fluree_db_core::{ContentStore, Storage, StorageContentStore};
+        use std::sync::Arc;
+
+        let plain = MemoryStorage::new();
+        assert!(plain.permits_plaintext_cache());
+
+        let encrypted = EncryptedStorage::new(plain, test_provider());
+        assert!(!encrypted.permits_plaintext_cache());
+
+        // The answer must survive type erasure and the content-store bridge,
+        // which is how the binary-index reader sees the storage.
+        let erased: Arc<dyn Storage> = Arc::new(encrypted);
+        assert!(!erased.permits_plaintext_cache());
+        let cs = StorageContentStore::new(erased, "db:main", "memory");
+        assert!(!cs.permits_plaintext_cache());
     }
 }

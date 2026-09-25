@@ -73,10 +73,31 @@ pub struct DefaultsConfig {
     pub indexing: Option<IndexingDefaults>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IdentityDefaults {
     pub public_key: Option<Arc<str>>,
     pub private_key: Option<Arc<str>>,
+}
+
+impl std::fmt::Debug for IdentityDefaults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityDefaults")
+            .field("public_key", &self.public_key)
+            .field("private_key", &Redacted(&self.private_key))
+            .finish()
+    }
+}
+
+/// `Debug` for a secret: shows whether one is set, never its value.
+struct Redacted<'a>(&'a Option<Arc<str>>);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("Some(<redacted>)"),
+            None => f.write_str("None"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +146,7 @@ pub enum StorageType {
 }
 
 /// Storage configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StorageConfig {
     /// Optional identifier for the storage
     pub id: Option<Arc<str>>,
@@ -140,6 +161,19 @@ pub struct StorageConfig {
     /// Optional durability mode for file storage. `None` leaves the choice to
     /// `FLUREE_STORAGE_FSYNC` and the built-in default.
     pub durability: Option<Durability>,
+}
+
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("id", &self.id)
+            .field("storage_type", &self.storage_type)
+            .field("path", &self.path)
+            .field("aes256_key", &Redacted(&self.aes256_key))
+            .field("address_identifier", &self.address_identifier)
+            .field("durability", &self.durability)
+            .finish()
+    }
 }
 
 impl Default for StorageConfig {
@@ -394,6 +428,10 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
     let address_identifier =
         resolve_string(graph, node, vocab::FIELD_ADDRESS_IDENTIFIER).map(Arc::from);
 
+    // `AES256Key` belongs to the storage node, not to one backend: every
+    // branch below carries it through.
+    let aes256_key = resolve_string(graph, node, vocab::FIELD_AES256_KEY).map(Arc::from);
+
     // Determine storage type from properties (not hardcoded strings)
     if node.get(vocab::FIELD_S3_BUCKET).is_some() {
         let bucket = resolve_string(graph, node, vocab::FIELD_S3_BUCKET).ok_or_else(|| {
@@ -423,7 +461,7 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
             id: get_id(node),
             storage_type: StorageType::S3(s3),
             path: None,
-            aes256_key: None,
+            aes256_key,
             address_identifier,
             durability: None,
         });
@@ -431,7 +469,6 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
 
     if node.get(vocab::FIELD_FILE_PATH).is_some() {
         let path = resolve_string(graph, node, vocab::FIELD_FILE_PATH).map(Arc::from);
-        let aes256_key = resolve_string(graph, node, vocab::FIELD_AES256_KEY).map(Arc::from);
         let durability = match resolve_string(graph, node, vocab::FIELD_DURABILITY) {
             None => None,
             Some(v) => Some(Durability::from_mode_name(&v).ok_or_else(|| {
@@ -455,7 +492,7 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
         id: get_id(node),
         storage_type: StorageType::Memory,
         path: None,
-        aes256_key: None,
+        aes256_key,
         address_identifier,
         durability: None,
     })
@@ -1157,6 +1194,82 @@ mod tests {
             parsed.index_storage.storage_type,
             StorageType::Memory
         ));
+    }
+
+    /// `AES256Key` is a storage-node field: the S3 and memory branches must
+    /// carry it exactly as the file branch does, or a documented encrypted
+    /// S3 deployment silently writes plaintext.
+    #[test]
+    fn debug_never_prints_secrets() {
+        let config = ConnectionConfig {
+            index_storage: StorageConfig {
+                aes256_key: Some(Arc::from("c2VjcmV0LWFlcy1rZXk=")),
+                ..Default::default()
+            },
+            defaults: Some(DefaultsConfig {
+                identity: Some(IdentityDefaults {
+                    public_key: Some(Arc::from("public-key")),
+                    private_key: Some(Arc::from("secret-private-key")),
+                }),
+                indexing: None,
+            }),
+            ..Default::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("c2VjcmV0LWFlcy1rZXk="), "{rendered}");
+        assert!(!rendered.contains("secret-private-key"), "{rendered}");
+        assert!(rendered.contains("public-key"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn test_jsonld_aes256_key_parsed_for_every_storage_type() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let with_storage = |mut storage: serde_json::Value| {
+            storage["@id"] = json!("storage");
+            json!({
+                "@context": {
+                    "@base": "https://ns.flur.ee/config/connection/",
+                    "@vocab": "https://ns.flur.ee/system#"
+                },
+                "@graph": [
+                    storage,
+                    {
+                        "@id": "connection",
+                        "@type": "Connection",
+                        "indexStorage": {"@id": "storage"}
+                    }
+                ]
+            })
+        };
+
+        let s3 = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@type": "Storage",
+            "s3Bucket": "my-bucket",
+            "AES256Key": key
+        })))
+        .expect("s3 config parses");
+        assert!(matches!(s3.index_storage.storage_type, StorageType::S3(_)));
+        assert_eq!(s3.index_storage.aes256_key.as_deref(), Some(key));
+
+        let memory = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@type": "Storage",
+            "AES256Key": key
+        })))
+        .expect("memory config parses");
+        assert!(matches!(
+            memory.index_storage.storage_type,
+            StorageType::Memory
+        ));
+        assert_eq!(memory.index_storage.aes256_key.as_deref(), Some(key));
+
+        let file = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@type": "Storage",
+            "filePath": "/data/fluree",
+            "AES256Key": key
+        })))
+        .expect("file config parses");
+        assert_eq!(file.index_storage.aes256_key.as_deref(), Some(key));
     }
 
     #[test]

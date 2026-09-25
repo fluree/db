@@ -233,6 +233,19 @@ pub trait StorageRead: Debug + Send + Sync {
         None
     }
 
+    /// Whether bytes read from this storage may be persisted unencrypted
+    /// outside it. The binary-index disk cache spills fetched leaves,
+    /// branches and dictionaries to a local directory as a read-through
+    /// cache; a storage that decrypts on read must answer `false`, or that
+    /// cache becomes a plaintext copy of the ledger. Storages whose reads
+    /// return exactly the bytes at rest answer `true`; wrappers delegate to
+    /// what they wrap.
+    ///
+    /// Deliberately without a default: a wrapper that forgot to delegate
+    /// would silently re-open the plaintext leak, so every implementation
+    /// has to answer.
+    fn permits_plaintext_cache(&self) -> bool;
+
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
     /// Mirror of [`ContentStore::resolve_cached_bytes`] for address-keyed
@@ -503,6 +516,10 @@ impl StorageRead for Arc<dyn Storage> {
         self.as_ref().resolve_local_path(address)
     }
 
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
+    }
+
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
         self.as_ref().resolve_cached_bytes(id)
     }
@@ -599,6 +616,12 @@ pub trait ContentStore: Debug + Send + Sync {
         let _ = id;
         None
     }
+
+    /// Whether bytes returned by [`Self::get`] may be persisted unencrypted
+    /// outside this store — see [`StorageRead::permits_plaintext_cache`],
+    /// including why there is no default. The disk artifact cache consults
+    /// this before reading or writing an artifact in its directory.
+    fn permits_plaintext_cache(&self) -> bool;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
@@ -722,6 +745,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
         self.as_ref().resolve_local_path(id)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
@@ -1000,6 +1027,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // A resident tier indexes by CID regardless of which (current or
         // legacy) address the bytes were fetched from.
         self.storage.resolve_cached_bytes(id)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.storage.permits_plaintext_cache()
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
@@ -1341,6 +1372,16 @@ impl ContentStore for BranchedContentStore {
         self.branch_store
             .resolve_cached_bytes(id)
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_cached_bytes(id)))
+    }
+
+    /// A read may be served by any ancestor, so every store in the
+    /// ancestry must permit the spill.
+    fn permits_plaintext_cache(&self) -> bool {
+        self.branch_store.permits_plaintext_cache()
+            && self
+                .parents
+                .iter()
+                .all(ContentStore::permits_plaintext_cache)
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {

@@ -224,19 +224,24 @@ Fluree supports transparent AES-256-GCM encryption for data at rest. When enable
 export FLUREE_ENCRYPTION_KEY=$(openssl rand -base64 32)
 ```
 
-Configure via JSON-LD (file storage):
+Configure via JSON-LD (file storage). Nodes are located by `@id`, so give
+every node one:
 
 ```json
 {
-  "@context": {"@vocab": "https://ns.flur.ee/system#"},
-  "@graph": [{
-    "@type": "Connection",
-    "indexStorage": {
+  "@context": {
+    "@base": "https://ns.flur.ee/config/connection/",
+    "@vocab": "https://ns.flur.ee/system#"
+  },
+  "@graph": [
+    {
+      "@id": "storage",
       "@type": "Storage",
       "filePath": "/var/lib/fluree",
       "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
-    }
-  }]
+    },
+    {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "storage"}}
+  ]
 }
 ```
 
@@ -244,25 +249,36 @@ For S3 storage with encryption:
 
 ```json
 {
-  "@context": {"@vocab": "https://ns.flur.ee/system#"},
-  "@graph": [{
-    "@type": "Connection",
-    "indexStorage": {
+  "@context": {
+    "@base": "https://ns.flur.ee/config/connection/",
+    "@vocab": "https://ns.flur.ee/system#"
+  },
+  "@graph": [
+    {
+      "@id": "storage",
       "@type": "Storage",
       "s3Bucket": "my-fluree-bucket",
-      "s3Endpoint": "https://s3.us-east-1.amazonaws.com",
       "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
+    },
+    {"@id": "publisher", "@type": "Publisher", "dynamodbTable": "fluree-nameservice"},
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "indexStorage": {"@id": "storage"},
+      "primaryPublisher": {"@id": "publisher"}
     }
-  }]
+  ]
 }
 ```
 
 **Key Features:**
 - AES-256-GCM authenticated encryption
-- Works natively with all storage backends (memory, file, S3)
+- Works natively with all storage backends (memory, file, S3), on every build path
 - Transparent encryption/decryption on read/write
 - Portable ciphertext format (encrypted data can be moved between backends)
 - Environment variable support for key configuration
+- The binary-index disk cache is bypassed, so no decrypted artifact is written
+  outside the encrypted storage (the nameservice stays plaintext)
 
 See [Storage Encryption](../security/encryption.md) for full documentation.
 
