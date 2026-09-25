@@ -1353,19 +1353,12 @@ impl SqlBlockSource {
                 batch = Batch::from_parts(schema, columns, len)
                     .map_err(|e| QueryError::Internal(e.to_string()))?;
             }
-            let mut dropped = false;
+            let mut kept = Some(batch);
             for f in &self.resolved.branches[branch].residuals {
-                match crate::filter::filter_batch(&batch, f, &self.schema, ctx)? {
-                    Some(kept) => batch = kept,
-                    None => {
-                        dropped = true;
-                        break;
-                    }
-                }
+                let Some(b) = kept.take() else { break };
+                kept = crate::filter::filter_batch(b, f, ctx)?;
             }
-            if dropped {
-                continue;
-            }
+            let Some(batch) = kept else { continue };
             let stamp_ledger_id = match ctx.dataset {
                 Some(ds) if ds.spans_multiple_ledgers() => ds
                     .named_graph(self.graph_iri.as_ref())

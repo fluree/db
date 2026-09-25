@@ -1526,6 +1526,36 @@ impl Batch {
         (0..self.len).map(move |row| RowView { batch: self, row })
     }
 
+    /// Keep the rows whose `keep` flag is set, or `None` when none survive.
+    ///
+    /// The row count is carried explicitly, so a zero-column batch keeps its
+    /// surviving rows (#1439).
+    pub fn filter_rows(self, keep: &[bool]) -> Option<Self> {
+        debug_assert_eq!(keep.len(), self.len, "Batch::filter_rows: mask length");
+        let kept = keep.iter().filter(|&&k| k).count();
+        if kept == 0 {
+            return None;
+        }
+        if kept == self.len {
+            return Some(self);
+        }
+        let columns = self
+            .columns
+            .into_iter()
+            .map(|col| {
+                col.into_iter()
+                    .zip(keep)
+                    .filter_map(|(b, &k)| k.then_some(b))
+                    .collect()
+            })
+            .collect();
+        Some(Self {
+            len: kept,
+            schema: self.schema,
+            columns,
+        })
+    }
+
     /// Retain only the specified variables, dropping all other columns.
     ///
     /// The output preserves the original schema order (i.e. columns that
@@ -1971,6 +2001,28 @@ mod tests {
             0,
             "Batch::new with no columns infers len = 0"
         );
+    }
+
+    #[test]
+    fn test_batch_filter_rows() {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let long = |n| Binding::lit(FlakeValue::Long(n), xsd_long());
+        let batch = || Batch::new(schema.clone(), vec![vec![long(1), long(2), long(3)]]).unwrap();
+
+        let kept = batch().filter_rows(&[true, false, true]).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept.column(VarId(0)).unwrap(), &[long(1), long(3)]);
+
+        assert_eq!(batch().filter_rows(&[true; 3]).unwrap().len(), 3);
+        assert!(batch().filter_rows(&[false; 3]).is_none());
+    }
+
+    #[test]
+    fn test_batch_filter_rows_keeps_len_for_empty_schema() {
+        let kept = Batch::empty_schema_with_len(3)
+            .filter_rows(&[true, false, true])
+            .unwrap();
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]
