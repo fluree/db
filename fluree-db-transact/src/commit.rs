@@ -782,11 +782,23 @@ pub async fn build_commit(
         commit_record = commit_record.with_txn_meta(txn_meta);
     }
     // Keyed by the ids the registry now holds, so a commit's graph_delta is
-    // the ledger's own id -> IRI mapping.
+    // the ledger's own id -> IRI mapping. A written graph missing from the
+    // registry here would silently lose its registration, so it is an error.
     commit_record.graph_delta = graph_iris
         .into_iter()
-        .filter_map(|iri| Some((base.snapshot.graph_registry.graph_id_for_iri(&iri)?, iri)))
-        .collect();
+        .map(|iri| {
+            let g_id = base
+                .snapshot
+                .graph_registry
+                .graph_id_for_iri(&iri)
+                .ok_or_else(|| {
+                    TransactError::FlakeGeneration(format!(
+                        "graph <{iri}> was written but is not in the registry after apply"
+                    ))
+                })?;
+            Ok((g_id, iri))
+        })
+        .collect::<Result<_>>()?;
     if let Some(split_mode) = ns_split_mode_for_genesis {
         commit_record.ns_split_mode = Some(split_mode);
     }

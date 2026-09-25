@@ -517,9 +517,8 @@ fn validate_staged_reasoning_modes(
 /// default/schema graph (g_id=0) and target instances in any graph. Even if a
 /// transaction only touches named graphs, the ledger-wide SHACL posture applies.
 ///
-/// Note: `graph_delta` for normal JSON-LD transactions (non-import) contains ALL
-/// named graphs referenced by the transaction, not just newly-created ones.
-/// The `GraphIdAssigner` is created fresh per transaction during JSON-LD parsing.
+/// Note: the staged graph delta contains every named graph the transaction
+/// writes, not just newly-created ones.
 /// Build the per-graph SHACL policy map for a transaction.
 ///
 /// For each graph referenced by the transaction (via `graph_delta`), resolve
