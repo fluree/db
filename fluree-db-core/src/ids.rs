@@ -264,6 +264,23 @@ impl DatatypeDictId {
     pub const FULL_TEXT: Self = Self(14);
     /// Number of reserved well-known datatype dictionary IDs.
     pub const RESERVED_COUNT: u16 = 15;
+    /// Largest datatype dictionary ID the index can store.
+    ///
+    /// A custom datatype is persisted as `OType::customer_datatype(id)`,
+    /// whose payload is 14 bits wide.
+    pub const MAX: u16 = crate::o_type::OType::MAX_PAYLOAD;
+
+    /// Convert a datatype dictionary ID to a `DatatypeDictId`.
+    ///
+    /// Returns `None` if the ID is above [`Self::MAX`].
+    #[inline]
+    pub fn try_from_dict_id(id: u32) -> Option<Self> {
+        if id <= u32::from(Self::MAX) {
+            Some(Self(id as u16))
+        } else {
+            None
+        }
+    }
 
     #[inline]
     pub fn as_u16(self) -> u16 {
