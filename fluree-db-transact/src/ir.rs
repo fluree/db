@@ -529,6 +529,10 @@ pub struct TripleTemplate {
     /// `txn_local_id -> graph IRI (Txn.graph_delta) -> ledger GraphId (GraphRegistry)`
     /// before doing any per-graph index/range queries.
     pub graph_id: Option<u16>,
+
+    /// Graph variable (`GRAPH ?g { … }` in a SPARQL UPDATE template), resolved
+    /// per WHERE solution at staging time. Mutually exclusive with `graph_id`.
+    pub graph_var: Option<VarId>,
 }
 
 impl TripleTemplate {
@@ -541,6 +545,7 @@ impl TripleTemplate {
             dtc: None,
             list_index: None,
             graph_id: None,
+            graph_var: None,
         }
     }
 
@@ -563,6 +568,14 @@ impl TripleTemplate {
     /// - `2+`: user-defined named graphs
     pub fn with_graph_id(mut self, graph_id: u16) -> Self {
         self.graph_id = Some(graph_id);
+        self.graph_var = None;
+        self
+    }
+
+    /// Target the graph named by `var`'s binding in each WHERE solution.
+    pub fn with_graph_var(mut self, var: VarId) -> Self {
+        self.graph_var = Some(var);
+        self.graph_id = None;
         self
     }
 }

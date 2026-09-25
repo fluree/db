@@ -667,16 +667,36 @@ impl<'a> StageOptions<'a> {
 /// ```
 pub async fn stage(
     ledger: LedgerState,
+    txn: Txn,
+    ns_registry: NamespaceRegistry,
+    options: StageOptions<'_>,
+) -> Result<(StagedLedger, NamespaceRegistry)> {
+    let (view, ns_registry, _) = stage_with_graph_delta(ledger, txn, ns_registry, options).await?;
+    Ok((view, ns_registry))
+}
+
+/// [`stage`], also returning the graphs the transaction writes: its
+/// `graph_delta` extended with any graph a `GRAPH ?g` template resolved to.
+/// Callers that register graphs or apply per-graph governance must use this
+/// delta rather than the one on the `Txn` they passed in.
+pub async fn stage_with_graph_delta(
+    ledger: LedgerState,
     mut txn: Txn,
     mut ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
-) -> Result<(StagedLedger, NamespaceRegistry)> {
+) -> Result<(
+    StagedLedger,
+    NamespaceRegistry,
+    rustc_hash::FxHashMap<u16, String>,
+)> {
     // SPARQL graph-management verbs (CLEAR/DROP/COPY/MOVE/ADD) execute by a
     // whole-graph scan + retract/re-home at staging time rather than by the
     // template/WHERE pipeline below. Dispatch before any hot-path setup so the
     // ordinary insert/upsert/update path is byte-identical.
     if txn.graph_mgmt.is_some() {
-        return stage_graph_mgmt(ledger, txn, ns_registry, options).await;
+        let graph_delta = txn.graph_delta.clone();
+        let (view, ns_registry) = stage_graph_mgmt(ledger, txn, ns_registry, options).await?;
+        return Ok((view, ns_registry, graph_delta));
     }
 
     let span = tracing::debug_span!("txn_stage",
@@ -732,78 +752,27 @@ pub async fn stage(
             .clone()
             .unwrap_or_else(generate_txn_id);
 
-        // B2 (data writes): `#txn-meta` is never a write target.
-        //
-        // `txn.graph_delta` is the transaction's set of *write* targets — a
-        // `GRAPH <iri> { … }` block, a `WITH <iri>` default, a sync target, a
-        // `CREATE GRAPH <iri>`. WHERE-side graph references (`USING [NAMED]`,
-        // a `GRAPH` pattern inside the WHERE) are carried on the where clause
-        // instead, so guarding here refuses writes without touching reads.
-        //
-        // Why it must be refused: `#txn-meta` (g_id 1) holds commit
-        // provenance, and `resolve_commit_prefix` / `commit_to_t` resolve a
-        // user-typed commit prefix by scanning exactly those indexed
-        // `fluree:commit:sha256:<hex>` subjects. They trust what they find, so
-        // a forged record sharing a real commit's prefix permanently shadows
-        // that commit for `fluree show`, `--at`, `@commit:`, `history` and
-        // `branch create --at` — reachable with ordinary write access and
-        // persistent through indexing.
-        //
-        // Checked by IRI shape *and* by what the IRI actually routes to: the
-        // shape check (borrowed from the sync guard below) refuses the
-        // ledger's own system-graph IRI even on a ledger whose registry never
-        // seeded it, and the registry check refuses any other spelling that
-        // resolves to g_id 1.
-        //
-        // `#config` (g_id 2) is DELIBERATELY not covered here.
-        // `docs/ledger-config/README.md` and `docs/ledger-config/writing-config.md`
-        // document maintaining ledger configuration through an ordinary
-        // transaction, so refusing config writes at this site would contradict
-        // shipped documentation. The asymmetry is intentional — it is not an
-        // oversight to tidy up. Graph management (CLEAR/DROP/COPY/MOVE/ADD)
-        // and graph sync refuse BOTH reserved graphs; those paths have their
-        // own guards (`stage_graph_mgmt`, dispatched above; `sync_scan`,
-        // below) because they destroy or re-home a whole graph rather than
-        // adding facts to one.
-        {
-            let ledger_id = ledger.snapshot.ledger_id.as_ref();
-            let txn_meta_iri = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
-            for iri in txn.graph_delta.values() {
-                let routes_to_txn_meta = ledger
-                    .snapshot
-                    .graph_registry
-                    .graph_id_for_iri(iri)
-                    .is_some_and(|g_id| g_id == TXN_META_GRAPH_ID);
-                if *iri == txn_meta_iri || routes_to_txn_meta {
-                    return Err(TransactError::ReservedGraphTarget {
-                        graph_iri: iri.clone(),
-                    });
-                }
-            }
+        // B2 (data writes): `#txn-meta` is never a write target (see
+        // `refuse_txn_meta_write`). `txn.graph_delta` holds the fixed write
+        // targets — a `GRAPH <iri>` block, a `WITH <iri>` default, a sync
+        // target, a `CREATE GRAPH <iri>`; WHERE-side graph references live on
+        // the where clause, so this refuses writes without touching reads.
+        // `GRAPH ?g` targets are checked as the WHERE resolves them
+        // (`route_var_graphs`).
+        for iri in txn.graph_delta.values() {
+            refuse_txn_meta_write(&ledger, iri)?;
         }
 
         // Convert graph_delta (g_id -> IRI) to graph_sids (g_id -> Sid) for named graph support
-        let graph_sids: HashMap<GraphId, Sid> = txn
+        let mut graph_sids: HashMap<GraphId, Sid> = txn
             .graph_delta
             .iter()
             .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
             .collect();
-        // Build reverse graph routing for novelty application.
-        //
-        // IMPORTANT: `txn.graph_delta` keys are *transaction-local* graph IDs used by templates.
-        // Novelty routing, however, must use the ledger's `GraphRegistry` IDs (g_id=3+ for user graphs).
-        // Use `GraphRegistry::provisional_ids()` so new graphs referenced in this txn route consistently
-        // during staging even before the commit is applied.
-        let provisional_graph_ids = ledger
-            .snapshot
-            .graph_registry
-            .provisional_ids(&txn.graph_delta.values().cloned().collect::<Vec<_>>());
-        let mut reverse_graph: HashMap<Sid, GraphId> = HashMap::new();
-        for iri in txn.graph_delta.values() {
-            if let Some(g_id) = provisional_graph_ids.get(iri.as_str()).copied() {
-                reverse_graph.insert(ns_registry.sid_for_iri(iri), g_id);
-            }
-        }
+        let mut reverse_graph = txn_reverse_graph(&ledger, &txn.graph_delta, &graph_sids);
+        // Fixed write targets, which `GRAPH ?g` targets must not collide with
+        // when assigned provisional graph ids mid-stream.
+        let fixed_graph_iris: Vec<String> = txn.graph_delta.values().cloned().collect();
 
         // Graph-sync target: resolve the g_id + graph Sid now, before the
         // generator takes `ns_registry` mutably. An unregistered target is a
@@ -879,7 +848,8 @@ pub async fn stage(
                 &template_vars,
                 &mut generator,
                 pure_delete,
-                &reverse_graph,
+                &fixed_graph_iris,
+                &mut reverse_graph,
                 &mut acc,
                 options.policy_ctx,
             )
@@ -892,6 +862,12 @@ pub async fn stage(
         }
         .instrument(where_span)
         .await?;
+
+        if !generator.var_graphs().is_empty() {
+            let var_graphs = generator.var_graphs().clone();
+            add_var_graphs_to_delta(&mut txn.graph_delta, &mut graph_sids, var_graphs)?;
+            reverse_graph = txn_reverse_graph(&ledger, &txn.graph_delta, &graph_sids);
+        }
 
         // Per SPARQL 1.1 Update §3.1.3: INSERT/DELETE templates are instantiated
         // once per WHERE solution, so a WHERE that matches zero solutions is a
@@ -1127,10 +1103,144 @@ pub async fn stage(
         Ok((
             StagedLedger::new(ledger, flakes, &reverse_graph)?,
             ns_registry,
+            txn.graph_delta,
         ))
     }
     .instrument(span)
     .await
+}
+
+/// Refuse a write that targets `#txn-meta`.
+///
+/// `#txn-meta` (g_id 1) holds commit provenance, and `resolve_commit_prefix`
+/// / `commit_to_t` resolve a user-typed commit prefix by scanning exactly
+/// those indexed `fluree:commit:sha256:<hex>` subjects. They trust what they
+/// find, so a forged record sharing a real commit's prefix permanently
+/// shadows that commit for `fluree show`, `--at`, `@commit:`, `history` and
+/// `branch create --at` — reachable with ordinary write access and persistent
+/// through indexing.
+///
+/// Checked by IRI shape *and* by what the IRI actually routes to: the shape
+/// check refuses the ledger's own system-graph IRI even on a ledger whose
+/// registry never seeded it, and the registry check refuses any other
+/// spelling that resolves to g_id 1.
+///
+/// `#config` (g_id 2) is DELIBERATELY not covered here.
+/// `docs/ledger-config/README.md` and `docs/ledger-config/writing-config.md`
+/// document maintaining ledger configuration through an ordinary transaction,
+/// so refusing config writes at this site would contradict shipped
+/// documentation. The asymmetry is intentional — it is not an oversight to
+/// tidy up. Graph management (CLEAR/DROP/COPY/MOVE/ADD) and graph sync refuse
+/// BOTH reserved graphs; those paths have their own guards
+/// (`stage_graph_mgmt`; `sync_scan` in [`stage_with_graph_delta`]) because
+/// they destroy or re-home a whole graph rather than adding facts to one.
+fn refuse_txn_meta_write(ledger: &LedgerState, iri: &str) -> Result<()> {
+    let ledger_id = ledger.snapshot.ledger_id.as_ref();
+    let routes_to_txn_meta = ledger
+        .snapshot
+        .graph_registry
+        .graph_id_for_iri(iri)
+        .is_some_and(|g_id| g_id == TXN_META_GRAPH_ID);
+    if iri == fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id) || routes_to_txn_meta {
+        return Err(TransactError::ReservedGraphTarget {
+            graph_iri: iri.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Graph Sid → ledger graph id for a transaction's write targets.
+///
+/// `graph_delta` keys are *transaction-local* graph ids used by templates.
+/// Novelty routing must use the ledger's `GraphRegistry` ids, so new graphs
+/// get `GraphRegistry::provisional_ids()` — the same assignment the commit's
+/// `apply_delta` will make.
+fn txn_reverse_graph(
+    ledger: &LedgerState,
+    graph_delta: &rustc_hash::FxHashMap<u16, String>,
+    graph_sids: &HashMap<GraphId, Sid>,
+) -> HashMap<Sid, GraphId> {
+    let provisional = ledger
+        .snapshot
+        .graph_registry
+        .provisional_ids(&graph_delta.values().cloned().collect::<Vec<_>>());
+    graph_delta
+        .iter()
+        .filter_map(|(local, iri)| {
+            let g_id = provisional.get(iri.as_str()).copied()?;
+            Some((graph_sids.get(local)?.clone(), g_id))
+        })
+        .collect()
+}
+
+/// Route graphs first reached through a `GRAPH ?g` template during the WHERE
+/// stream, so retraction hydration can resolve them, and refuse `#txn-meta`.
+///
+/// Ids given to new graphs here are provisional for the stream only: the
+/// final routing is rebuilt from the full delta once the stream ends, because
+/// `provisional_ids` numbers new graphs in sorted-IRI order and a later batch
+/// can introduce one that sorts first. New graphs hold no data yet, so the
+/// interim ids never select existing rows.
+fn route_var_graphs(
+    ledger: &LedgerState,
+    var_graphs: &HashMap<String, Sid>,
+    fixed_graph_iris: &[String],
+    reverse_graph: &mut HashMap<Sid, GraphId>,
+) -> Result<()> {
+    if var_graphs
+        .values()
+        .all(|sid| reverse_graph.contains_key(sid))
+    {
+        return Ok(());
+    }
+    let all_iris: Vec<String> = fixed_graph_iris
+        .iter()
+        .cloned()
+        .chain(var_graphs.keys().cloned())
+        .collect();
+    let provisional = ledger.snapshot.graph_registry.provisional_ids(&all_iris);
+    for (iri, sid) in var_graphs {
+        if reverse_graph.contains_key(sid) {
+            continue;
+        }
+        refuse_txn_meta_write(ledger, iri)?;
+        let g_id = provisional.get(iri.as_str()).copied().ok_or_else(|| {
+            TransactError::FlakeGeneration(format!("no provisional graph id for <{iri}>"))
+        })?;
+        reverse_graph.insert(sid.clone(), g_id);
+    }
+    Ok(())
+}
+
+/// Add graphs resolved from `GRAPH ?g` templates to the transaction's graph
+/// delta under fresh transaction-local ids, so commit registration and
+/// per-graph governance see them like a `GRAPH <iri>` target.
+fn add_var_graphs_to_delta(
+    graph_delta: &mut rustc_hash::FxHashMap<u16, String>,
+    graph_sids: &mut HashMap<GraphId, Sid>,
+    var_graphs: HashMap<String, Sid>,
+) -> Result<()> {
+    let listed: HashSet<String> = graph_delta.values().cloned().collect();
+    let mut next = graph_delta
+        .keys()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(FIRST_USER_GRAPH_ID - 1);
+    // Sorted so local ids are deterministic for a given result set.
+    let mut new: Vec<(String, Sid)> = var_graphs
+        .into_iter()
+        .filter(|(iri, _)| !listed.contains(iri))
+        .collect();
+    new.sort_by(|a, b| a.0.cmp(&b.0));
+    for (iri, sid) in new {
+        next = next.checked_add(1).ok_or_else(|| {
+            TransactError::FlakeGeneration("too many graphs in one transaction".to_string())
+        })?;
+        graph_delta.insert(next, iri);
+        graph_sids.insert(next, sid);
+    }
+    Ok(())
 }
 
 /// Content identity of a flake, ignoring its graph, transaction time, and
@@ -2495,6 +2605,11 @@ fn collect_template_vars(template_groups: &[&[TripleTemplate]]) -> Vec<VarId> {
                     }
                 }
             }
+            if let Some(v) = tmpl.graph_var {
+                if seen.insert(v) {
+                    out.push(v);
+                }
+            }
         }
     }
     out
@@ -2533,7 +2648,8 @@ async fn stream_where_into_accumulator(
     template_vars: &[VarId],
     generator: &mut FlakeGenerator<'_>,
     pure_delete: bool,
-    reverse_graph: &HashMap<Sid, GraphId>,
+    fixed_graph_iris: &[String],
+    reverse_graph: &mut HashMap<Sid, GraphId>,
     acc: &mut FlakeAccumulator,
     view_policy: Option<&PolicyContext>,
 ) -> Result<WhereStreamStats> {
@@ -2651,7 +2767,7 @@ async fn stream_where_into_accumulator(
     };
 
     let composite_graph_key =
-        |iri: &str| -> String { format!("{}#{}", base_db.snapshot.ledger_id, iri) };
+        |iri: &str| -> Arc<str> { format!("{}#{}", base_db.snapshot.ledger_id, iri).into() };
 
     // SPARQL 1.1 §13.2.1 (via Update §3.1.3): when the operation carries one
     // or more `USING NAMED` clauses but no plain `USING`, the WHERE dataset's
@@ -2725,73 +2841,64 @@ async fn stream_where_into_accumulator(
                 .map(|v| v.iter().map(|g| (g.iri.clone(), g.alias.clone())).collect())
         };
 
-    let mut seen_named_keys: HashSet<Arc<str>> = HashSet::new();
-
+    // Each graph is enumerable by `GRAPH ?g` under exactly one name. Its
+    // composite `<ledger_id>#<graph_iri>` key (the syntax used to reference a
+    // named graph as a queryable graph source) and any `fromNamed` alias are
+    // addressable by `GRAPH <name>` only: were they enumerable, every match
+    // would bind `?g` once per name, and a `GRAPH ?g` template would write to
+    // a graph named after the alias.
+    // (name, g_id, enumerable, canonical IRI), first entry per name wins.
+    let mut named: Vec<(Arc<str>, GraphId, bool, Arc<str>)> = Vec::new();
     if let Some(allowlist) = allowed_named_graphs {
         for (iri, alias) in allowlist {
-            let g_id = resolve_graph_id(&iri);
-            let Some(g_id) = g_id else {
+            let Some(g_id) = resolve_graph_id(&iri) else {
                 continue;
             };
-
-            let iri_key: Arc<str> = Arc::from(iri.as_str());
-            if seen_named_keys.insert(Arc::clone(&iri_key)) {
-                runtime_dataset =
-                    runtime_dataset.with_named_graph(Arc::clone(&iri_key), make_graph_ref(g_id));
-            }
-
-            // Also register a composite ledger-local graph identifier:
-            // `<ledger_id>#<graph_iri>`. This matches the syntax used to reference a named
-            // graph as a queryable graph source (e.g., via `from`), and allows GRAPH patterns
-            // to use that same identifier when desired.
-            let composite = composite_graph_key(iri_key.as_ref());
-            let composite_key: Arc<str> = Arc::from(composite.as_str());
-            if seen_named_keys.insert(Arc::clone(&composite_key)) {
-                runtime_dataset = runtime_dataset
-                    .with_named_graph(Arc::clone(&composite_key), make_graph_ref(g_id));
-            }
-
+            // Explicitly listed, so enumerable even when reserved.
+            let composite = composite_graph_key(&iri);
+            let iri: Arc<str> = iri.into();
+            named.push((iri.clone(), g_id, true, iri.clone()));
+            named.push((composite, g_id, false, iri.clone()));
             if let Some(alias) = alias {
-                let alias_key: Arc<str> = Arc::from(alias.as_str());
-                if seen_named_keys.insert(Arc::clone(&alias_key)) {
-                    runtime_dataset = runtime_dataset
-                        .with_named_graph(Arc::clone(&alias_key), make_graph_ref(g_id));
-                }
+                named.push((alias.into(), g_id, false, iri));
             }
         }
     } else {
-        for (g_id, iri) in ledger.snapshot.graph_registry.iter_entries() {
-            let iri: Arc<str> = Arc::from(iri);
-            if seen_named_keys.insert(Arc::clone(&iri)) {
-                runtime_dataset =
-                    runtime_dataset.with_named_graph(Arc::clone(&iri), make_graph_ref(g_id));
-            }
-
-            let composite = composite_graph_key(iri.as_ref());
-            let composite_key: Arc<str> = Arc::from(composite.as_str());
-            if seen_named_keys.insert(Arc::clone(&composite_key)) {
-                runtime_dataset = runtime_dataset
-                    .with_named_graph(Arc::clone(&composite_key), make_graph_ref(g_id));
-            }
-        }
-
-        if let Some(store) = &binary_store {
-            for (g_id, iri) in store.graph_entries() {
-                let iri: Arc<str> = Arc::from(iri);
-                if seen_named_keys.insert(Arc::clone(&iri)) {
-                    runtime_dataset =
-                        runtime_dataset.with_named_graph(Arc::clone(&iri), make_graph_ref(g_id));
-                }
-
-                let composite = composite_graph_key(iri.as_ref());
-                let composite_key: Arc<str> = Arc::from(composite.as_str());
-                if seen_named_keys.insert(Arc::clone(&composite_key)) {
-                    runtime_dataset = runtime_dataset
-                        .with_named_graph(Arc::clone(&composite_key), make_graph_ref(g_id));
-                }
-            }
+        // The ambient graph store. Reserved system graphs (txn-meta, config)
+        // stay addressable by their full IRI — config maintenance reads
+        // `GRAPH <…#config>` in an update's WHERE — but, as on the query
+        // side, are never enumerated.
+        let binary_entries = binary_store
+            .as_ref()
+            .map(|store| store.graph_entries())
+            .unwrap_or_default();
+        for (g_id, iri) in ledger
+            .snapshot
+            .graph_registry
+            .iter_entries()
+            .chain(binary_entries)
+        {
+            let iri: Arc<str> = iri.into();
+            named.push((iri.clone(), g_id, g_id >= FIRST_USER_GRAPH_ID, iri.clone()));
+            named.push((composite_graph_key(&iri), g_id, false, iri));
         }
     }
+    let mut seen_named_keys: HashSet<Arc<str>> = HashSet::new();
+    let mut graph_aliases: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+    for (name, g_id, enumerable, canonical) in named {
+        if !seen_named_keys.insert(name.clone()) {
+            continue;
+        }
+        runtime_dataset = if enumerable {
+            runtime_dataset.with_named_graph(name, make_graph_ref(g_id))
+        } else {
+            if name != canonical {
+                graph_aliases.insert(name.clone(), canonical);
+            }
+            runtime_dataset.with_named_graph_alias(name, make_graph_ref(g_id))
+        };
+    }
+    generator.set_graph_aliases(graph_aliases);
 
     // Open the streaming WHERE cursor. For empty patterns it emits one
     // empty-schema/empty-len batch then EOF, mirroring the eager API's
@@ -2833,6 +2940,12 @@ async fn stream_where_into_accumulator(
         let retractions = {
             let _g = delete_span.enter();
             let mut r = generator.generate_retractions(&txn.delete_templates, &batch)?;
+            route_var_graphs(
+                ledger,
+                generator.var_graphs(),
+                fixed_graph_iris,
+                reverse_graph,
+            )?;
 
             // Hydrate BEFORE push. `Flake::eq` includes `m`, so raw retractions
             // with `m = None` must have their list-index filled in from the
@@ -2858,6 +2971,12 @@ async fn stream_where_into_accumulator(
             let assertions = {
                 let _g = insert_span.enter();
                 let a = generator.generate_assertions(&txn.insert_templates, &batch)?;
+                route_var_graphs(
+                    ledger,
+                    generator.var_graphs(),
+                    fixed_graph_iris,
+                    reverse_graph,
+                )?;
                 insert_span.record("assertion_count", a.len() as u64);
                 a
             };
@@ -3539,12 +3658,11 @@ pub async fn stage_with_shacl(
     options: StageOptions<'_>,
     shacl_cache: &ShaclCache,
 ) -> Result<(StagedLedger, NamespaceRegistry)> {
-    // Capture graph_delta + tracker before stage() consumes the options/txn.
-    let graph_delta = txn.graph_delta.clone();
     let tracker = options.tracker;
 
     // First, perform regular staging
-    let (mut view, mut ns_registry) = stage(ledger, txn, ns_registry, options).await?;
+    let (mut view, mut ns_registry, graph_delta) =
+        stage_with_graph_delta(ledger, txn, ns_registry, options).await?;
 
     // Fast path: if there are no SHACL shapes, elide validation entirely.
     // This ensures SHACL has *zero* transaction-time overhead unless rules exist.
