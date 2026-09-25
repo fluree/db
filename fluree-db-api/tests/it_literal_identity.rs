@@ -426,6 +426,106 @@ async fn served_by<F: std::future::Future<Output = Value>>(
     rows
 }
 
+/// The same literals reached through a subject join. The nested-loop join's
+/// batched lane builds its own object bindings and kept handing every
+/// string-dictionary datatype `xsd:string`'s id after #1729, so a join
+/// collapsed the four literals again. Pinned on the indexed lane and with
+/// novelty layered over it, where the lane injects the novelty rows.
+#[tokio::test]
+async fn string_dict_datatypes_keep_their_identity_through_a_subject_join() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/string-dict-join:main";
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    let data = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": [
+        {"@id": "ex:hub", "ex:ref": [{"@id": "ex:s1"}, {"@id": "ex:s2"}, {"@id": "ex:s3"}, {"@id": "ex:s4"}]},
+        {"@id": "ex:s1", "ex:p": "abc"},
+        {"@id": "ex:s2", "ex:p": {"@value": "abc", "@type": "http://example.org/ns/custom"}},
+        {"@id": "ex:s3", "ex:p": {"@value": "abc", "@type": "http://www.w3.org/2001/XMLSchema#anyURI"}},
+        {"@id": "ex:s4", "ex:p": {"@value": "abc", "@type": "http://www.w3.org/2001/XMLSchema#token"}}
+    ]});
+    fluree.insert(ledger, &data).await.unwrap();
+    fluree.reindex(id, ReindexOptions::default()).await.unwrap();
+
+    let datatypes =
+        "SELECT ?s (DATATYPE(?o) AS ?d) WHERE { ex:hub ex:ref ?s . ?s ex:p ?o } ORDER BY ?s";
+    let distinct = "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ex:hub ex:ref ?s . ?s ex:p ?o }";
+    let jsonld_where = json!([
+        {"@id": "ex:hub", "ex:ref": "?s"},
+        {"@id": "?s", "ex:p": "?o"}
+    ]);
+    let jsonld_context = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let mut want = vec![
+        json!(["ex:s1", "xsd:string"]),
+        json!(["ex:s2", "ex:custom"]),
+        json!(["ex:s3", "xsd:anyURI"]),
+        json!(["ex:s4", "xsd:token"]),
+    ];
+    for phase in ["indexed", "mixed"] {
+        if phase == "mixed" {
+            // A novelty subject with a novelty lexical form, so its row is
+            // injected by the lane and its string resolves through the
+            // dictionary overlay.
+            let more = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": [
+                {"@id": "ex:hub", "ex:ref": {"@id": "ex:s5"}},
+                {"@id": "ex:s5", "ex:p": {"@value": "xyz", "@type": "http://www.w3.org/2001/XMLSchema#anyURI"}}
+            ]});
+            let head = fluree.ledger(id).await.unwrap();
+            fluree.insert(head, &more).await.unwrap();
+            want.push(json!(["ex:s5", "xsd:anyURI"]));
+        }
+        let view = fluree.ledger(id).await.unwrap();
+        assert!(view.snapshot.range_provider.is_some(), "{phase}: setup");
+
+        let got = served_by(BATCHED_JOIN_LANE, phase, sparql(&fluree, &view, datatypes)).await;
+        assert_eq!(got, json!(want), "{phase}: DATATYPE through the join");
+        let got = served_by(BATCHED_JOIN_LANE, phase, sparql(&fluree, &view, distinct)).await;
+        assert_eq!(
+            got,
+            json!([[want.len()]]),
+            "{phase}: one DISTINCT key per term"
+        );
+
+        let got = served_by(BATCHED_JOIN_LANE, phase, async {
+            query_jsonld_formatted(
+                &fluree,
+                &view,
+                &json!({"@context": jsonld_context, "select": ["?s", "?d"],
+                        "where": [jsonld_where[0], jsonld_where[1], ["bind", "?d", "(datatype ?o)"]],
+                        "orderBy": "?s"}),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(
+            got,
+            json!(want),
+            "{phase}: json-ld datatype through the join"
+        );
+        let got = served_by(BATCHED_JOIN_LANE, phase, async {
+            query_jsonld_formatted(
+                &fluree,
+                &view,
+                &json!({"@context": jsonld_context,
+                        "select": ["(as (count-distinct ?o) ?c)"],
+                        "where": jsonld_where}),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(
+            got,
+            json!([[want.len()]]),
+            "{phase}: json-ld count-distinct"
+        );
+    }
+}
+
 /// `xsd:date`, `xsd:time` and `xsd:dateTime` keep one key whichever lane
 /// produced them. The batched probe lanes emit them encoded, while a scan over
 /// novelty (and, on an indexed ledger, the nested-loop join's own builder)
