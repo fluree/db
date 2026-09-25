@@ -58,6 +58,10 @@ POST /update/{ledger-id}
 **Query Parameters:**
 - `ledger` (required for /update): Target ledger (format: `name:branch`)
 - `context` (optional): URL to default JSON-LD context
+- `using-graph-uri` (optional, repeatable, SPARQL UPDATE only): a graph for each operation's WHERE clause, as `USING <iri>` would name it
+- `using-named-graph-uri` (optional, repeatable, SPARQL UPDATE only): a named graph for each WHERE clause, as `USING NAMED <iri>` would name it
+
+The `using-*` parameters apply to every `DELETE`/`INSERT … WHERE` operation in the request (W3C SPARQL 1.1 Protocol §2.2.3). With the form-encoded transport (`Content-Type: application/x-www-form-urlencoded`, `update=…`) they may also be sent in the body. The request is a `400` if an operation already has its own `USING`, `USING NAMED`, or `WITH` clause, or if it contains `DELETE WHERE`, which has no `USING` form. It is also a `400` on a JSON-LD update, which scopes its WHERE with `from` / `fromNamed`.
 
 **Request Headers:**
 
@@ -1188,11 +1192,17 @@ GET  /query?query={urlencoded-sparql}   # SPARQL Protocol GET form
 
 The `GET` form is provided for W3C SPARQL Protocol compliance. It accepts SPARQL queries via the `query` query parameter; the body forms below are preferred for larger queries and for JSON-LD. The same form is available on the ledger-scoped `/query/{ledger}` route.
 
+The SPARQL Protocol's form-encoded POST is also accepted: `Content-Type: application/x-www-form-urlencoded` with `query={sparql}` in the body, plus any of the parameters below. Parameters in the body and in the URL are combined; `query` may appear only once across both. A form-encoded `update=` sent here is refused — use `/update`.
+
 **Optional Query Parameters:**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `default-context` | boolean | `false` | When `true`, use the ledger's stored default JSON-LD context if the request omits its own `@context` (JSON-LD) or `PREFIX` declarations (ledger-scoped SPARQL). |
+| `default-graph-uri` | IRI, repeatable | — | SPARQL only. A default graph for the query, as `FROM <iri>` would name it; repeat the parameter to merge several. On `/query` it names a ledger (`books:main`); on `/query/{ledger}` a graph within that ledger. |
+| `named-graph-uri` | IRI, repeatable | — | SPARQL only. A named graph for the query, as `FROM NAMED <iri>` would name it. |
+
+When `default-graph-uri` or `named-graph-uri` is present, it replaces any `FROM` / `FROM NAMED` in the query text (W3C SPARQL 1.1 Protocol §2.1.4: the protocol dataset takes precedence). They are read from the URL for `GET` and for `POST` with `Content-Type: application/sparql-query`, and from the URL or the body for a form-encoded `POST`. On a JSON-LD query they are a `400`; use `from` / `fromNamed` in the body instead.
 
 **Request Headers:**
 ```http

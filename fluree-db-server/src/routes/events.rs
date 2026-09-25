@@ -160,26 +160,7 @@ fn decode_component(raw: &str, what: &str) -> Result<String, ServerError> {
         ))
     };
 
-    // `urlencoding::decode` only fails on invalid UTF-8: a MALFORMED escape
-    // (`%ZZ`, a trailing `%`) is left in the string verbatim and returns
-    // `Ok`. That is the passthrough this function exists to prevent, so the
-    // escapes are validated before decoding rather than trusted to it.
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            match bytes.get(i + 1..i + 3) {
-                Some(hex) if hex.iter().all(u8::is_ascii_hexdigit) => i += 3,
-                _ => return Err(reject("malformed percent-escape")),
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    urlencoding::decode(&raw.replace('+', " "))
-        .map(std::borrow::Cow::into_owned)
-        .map_err(|e| reject(&e.to_string()))
+    super::sparql_protocol::percent_decode_strict(raw).map_err(|why| reject(&why))
 }
 
 fn parse_all(value: Option<&str>) -> Result<bool, ServerError> {
