@@ -2212,7 +2212,7 @@ POST /branch
 
 **Status Codes:**
 - `201 Created` - Branch created successfully
-- `400 Bad Request` - Invalid request body (including malformed `at` value)
+- `400 Bad Request` - Invalid request body (including malformed `at` value), or the source branch has no commits yet
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
 - `404 Not Found` - Source branch does not exist, or `at` commit is not reachable from source HEAD
 - `409 Conflict` - Branch already exists
