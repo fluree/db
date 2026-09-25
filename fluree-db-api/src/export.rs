@@ -16,7 +16,7 @@ use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
 use fluree_db_query::binary_scan::{
     translate_overlay_flakes_with_untranslated, EphemeralPredicateMap,
 };
-use fluree_graph_ir::canonical_xsd_double;
+use fluree_graph_ir::{canonical_xsd_double, syntax};
 use fluree_vocab::{namespaces, xsd};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -508,107 +508,8 @@ fn row_reifiers(reifiers: &[Vec<Sid>], row: usize) -> &[Sid] {
     reifiers.get(row).map_or(&[], Vec::as_slice)
 }
 
-// ---------------------------------------------------------------------------
-// Prefix map — IRI → prefixed name compression for Turtle/TriG
-// ---------------------------------------------------------------------------
-
-/// A sorted prefix map for compressing IRIs into prefixed names.
-///
-/// Prefixes are sorted by IRI length descending so that longest-prefix-first
-/// matching produces the most specific result.
-#[derive(Debug, Clone)]
-pub struct PrefixMap {
-    /// (prefix, namespace_iri) sorted by namespace IRI length descending.
-    entries: Vec<(String, String)>,
-}
-
-impl PrefixMap {
-    /// Build a prefix map from a JSON-LD `@context` object.
-    ///
-    /// Expects `{"prefix": "iri", ...}` — ignores entries where the value
-    /// is not a string or the key starts with `@`.
-    pub fn from_context(ctx: &serde_json::Value) -> Self {
-        let mut entries = Vec::new();
-        if let Some(obj) = ctx.as_object() {
-            for (key, val) in obj {
-                if key.starts_with('@') {
-                    continue;
-                }
-                if let Some(iri) = val.as_str() {
-                    entries.push((key.clone(), iri.to_string()));
-                }
-            }
-        }
-        // Sort by IRI length descending for longest-prefix-first matching
-        entries.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
-        PrefixMap { entries }
-    }
-
-    /// Build from an explicit map of prefix → IRI.
-    pub fn from_map(map: BTreeMap<String, String>) -> Self {
-        let mut entries: Vec<(String, String)> = map.into_iter().collect();
-        entries.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
-        PrefixMap { entries }
-    }
-
-    /// Try to compress a full IRI into a prefixed name (e.g., `ex:alice`).
-    ///
-    /// Returns `None` if no prefix matches or the local name contains
-    /// characters that are invalid in a Turtle prefixed name.
-    pub fn compact(&self, iri: &str) -> Option<String> {
-        for (prefix, ns) in &self.entries {
-            if let Some(local) = iri.strip_prefix(ns.as_str()) {
-                if is_valid_pname_local(local) {
-                    return Some(format!("{prefix}:{local}"));
-                }
-            }
-        }
-        None
-    }
-
-    /// Returns `true` if the map has any entries.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Iterate `(prefix, namespace_iri)` pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.entries.iter().map(|(p, n)| (p.as_str(), n.as_str()))
-    }
-}
-
-/// Check if `local` is a valid Turtle PN_LOCAL (simplified).
-///
-/// We allow ASCII alphanumeric, `-`, `_`, and `.` (but not leading/trailing `.`).
-/// This is conservative — the full Turtle grammar allows more, but this covers
-/// the vast majority of real-world local names without risking invalid output.
-fn is_valid_pname_local(local: &str) -> bool {
-    if local.is_empty() {
-        return true; // bare prefix like `ex:` is valid
-    }
-    if local.starts_with('.') || local.ends_with('.') {
-        return false;
-    }
-    local
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-}
-
-/// Write `@prefix` declarations to a Turtle/TriG writer.
-pub fn write_prefix_declarations<W: Write>(prefixes: &PrefixMap, writer: &mut W) -> io::Result<()> {
-    // Sort alphabetically for deterministic, readable output
-    let mut sorted: Vec<(&str, &str)> = prefixes.iter().collect();
-    sorted.sort_by_key(|(p, _)| *p);
-    for (prefix, ns) in sorted {
-        write!(writer, "@prefix {prefix}: <")?;
-        write_escaped_iri(writer, ns)?;
-        writeln!(writer, "> .")?;
-    }
-    if !prefixes.is_empty() {
-        writeln!(writer)?; // blank line after prefixes
-    }
-    Ok(())
-}
+/// IRI → prefixed name compression for Turtle/TriG (and JSON-LD compact IRIs).
+pub use fluree_graph_format::PrefixMap;
 
 // ---------------------------------------------------------------------------
 // Turtle streaming export
@@ -839,7 +740,7 @@ fn write_turtle_batch<W: Write>(
         if p_iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
             writer.write_all(b"a")?;
         } else {
-            write_turtle_iri(writer, &p_iri, prefixes)?;
+            prefixes.write_iri(writer, &p_iri)?;
         }
         writer.write_all(b" ")?;
 
@@ -867,17 +768,6 @@ fn write_turtle_batch<W: Write>(
     Ok(())
 }
 
-/// Write an IRI as a Turtle prefixed name or `<full-iri>`.
-pub fn write_turtle_iri<W: Write>(w: &mut W, iri: &str, prefixes: &PrefixMap) -> io::Result<()> {
-    if let Some(pname) = prefixes.compact(iri) {
-        w.write_all(pname.as_bytes())
-    } else {
-        w.write_all(b"<")?;
-        write_escaped_iri(w, iri)?;
-        w.write_all(b">")
-    }
-}
-
 /// Write a subject term as Turtle (prefixed name, `<iri>`, or `_:bnode`).
 ///
 /// Blank-node labels are written verbatim, deliberately: an export has to
@@ -899,7 +789,7 @@ fn write_turtle_iri_or_bnode<W: Write>(
     if iri.starts_with("_:") {
         w.write_all(iri.as_bytes())
     } else {
-        write_turtle_iri(w, iri, prefixes)
+        prefixes.write_iri(w, iri)
     }
 }
 
@@ -1607,7 +1497,7 @@ pub async fn export_graph_ntriples<W: Write>(
     let graph_term = config.graph_iri.as_deref().map(|iri| {
         let mut buf = String::with_capacity(iri.len() + 2);
         buf.push('<');
-        escape_iri_into(&mut buf, iri);
+        syntax::push_iri(&mut buf, iri);
         buf.push('>');
         buf
     });
@@ -1697,7 +1587,7 @@ fn write_batch<W: Write>(
 
         // Write predicate (always an IRI)
         writer.write_all(b"<")?;
-        write_escaped_iri(writer, &p_iri)?;
+        syntax::write_iri(writer, &p_iri)?;
         writer.write_all(b"> ")?;
 
         // Write object
@@ -1722,11 +1612,11 @@ fn write_batch<W: Write>(
                 };
                 write_iri_or_bnode(writer, &r_iri)?;
                 writer.write_all(b" <")?;
-                write_escaped_iri(writer, fluree_vocab::rdf::REIFIES)?;
+                syntax::write_iri(writer, fluree_vocab::rdf::REIFIES)?;
                 writer.write_all(b"> <<( ")?;
                 write_iri_or_bnode(writer, &s_iri)?;
                 writer.write_all(b" <")?;
-                write_escaped_iri(writer, &p_iri)?;
+                syntax::write_iri(writer, &p_iri)?;
                 writer.write_all(b"> ")?;
                 write_object(writer, &value, resolver.store, o_type)?;
                 writer.write_all(b" )>>")?;
@@ -1753,7 +1643,7 @@ fn write_iri_or_bnode<W: Write>(w: &mut W, iri: &str) -> io::Result<()> {
         w.write_all(iri.as_bytes())
     } else {
         w.write_all(b"<")?;
-        write_escaped_iri(w, iri)?;
+        syntax::write_iri(w, iri)?;
         w.write_all(b">")
     }
 }
@@ -1777,7 +1667,7 @@ fn write_object<W: Write>(
             // Check for language tag first (takes precedence over datatype)
             if let Some(lang) = store.resolve_lang_tag(o_type) {
                 w.write_all(b"\"")?;
-                write_escaped_ntriples_string(w, s)?;
+                syntax::write_string(w, s)?;
                 w.write_all(b"\"@")?;
                 w.write_all(lang.as_bytes())?;
                 return Ok(());
@@ -1786,12 +1676,12 @@ fn write_object<W: Write>(
             // Resolve datatype; omit ^^<xsd:string> (implicit)
             let dt_iri = resolve_datatype_iri(store, o_type);
             w.write_all(b"\"")?;
-            write_escaped_ntriples_string(w, s)?;
+            syntax::write_string(w, s)?;
             w.write_all(b"\"")?;
             if let Some(dt) = &dt_iri {
                 if *dt != xsd::STRING {
                     w.write_all(b"^^<")?;
-                    write_escaped_iri(w, dt)?;
+                    syntax::write_iri(w, dt)?;
                     w.write_all(b">")?;
                 }
             }
@@ -1912,9 +1802,9 @@ fn write_object<W: Write>(
             let dt = resolve_datatype_iri(store, o_type)
                 .unwrap_or_else(|| "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON".to_string());
             w.write_all(b"\"")?;
-            write_escaped_ntriples_string(w, s)?;
+            syntax::write_string(w, s)?;
             w.write_all(b"\"^^<")?;
-            write_escaped_iri(w, &dt)?;
+            syntax::write_iri(w, &dt)?;
             w.write_all(b">")
         }
         FlakeValue::Vector(v) => {
@@ -1923,9 +1813,9 @@ fn write_object<W: Write>(
             // Serialize as JSON array string
             let json = serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
             w.write_all(b"\"")?;
-            write_escaped_ntriples_string(w, &json)?;
+            syntax::write_string(w, &json)?;
             w.write_all(b"\"^^<")?;
-            write_escaped_iri(w, &dt)?;
+            syntax::write_iri(w, &dt)?;
             w.write_all(b">")
         }
         FlakeValue::GeoPoint(bits) => {
@@ -1933,9 +1823,9 @@ fn write_object<W: Write>(
                 .unwrap_or_else(|| "http://www.opengis.net/ont/geosparql#wktLiteral".to_string());
             let wkt = bits.to_string(); // "POINT(lng lat)"
             w.write_all(b"\"")?;
-            write_escaped_ntriples_string(w, &wkt)?;
+            syntax::write_string(w, &wkt)?;
             w.write_all(b"\"^^<")?;
-            write_escaped_iri(w, &dt)?;
+            syntax::write_iri(w, &dt)?;
             w.write_all(b">")
         }
 
@@ -1979,17 +1869,17 @@ fn write_raw_object<W: Write>(
         FlakeValue::String(s) => {
             if let Some(lang) = lang {
                 w.write_all(b"\"")?;
-                write_escaped_ntriples_string(w, s)?;
+                syntax::write_string(w, s)?;
                 w.write_all(b"\"@")?;
                 w.write_all(lang.as_bytes())?;
             } else {
                 w.write_all(b"\"")?;
-                write_escaped_ntriples_string(w, s)?;
+                syntax::write_string(w, s)?;
                 w.write_all(b"\"")?;
                 if let Some(dt) = dt_iri() {
                     if dt != xsd::STRING {
                         w.write_all(b"^^<")?;
-                        write_escaped_iri(w, &dt)?;
+                        syntax::write_iri(w, &dt)?;
                         w.write_all(b">")?;
                     }
                 }
@@ -2069,7 +1959,7 @@ fn write_raw_flake_ntriples<W: Write>(
     let mut body: Vec<u8> = Vec::new();
     write_iri_or_bnode(&mut body, &s_iri)?;
     body.write_all(b" <")?;
-    write_escaped_iri(&mut body, &p_iri)?;
+    syntax::write_iri(&mut body, &p_iri)?;
     body.write_all(b"> ")?;
     if !write_raw_object(&mut body, resolver.store, flake, None)? {
         stats.rows_skipped += 1;
@@ -2093,7 +1983,7 @@ fn write_raw_flake_ntriples<W: Write>(
             };
             write_iri_or_bnode(writer, &r_iri)?;
             writer.write_all(b" <")?;
-            write_escaped_iri(writer, fluree_vocab::rdf::REIFIES)?;
+            syntax::write_iri(writer, fluree_vocab::rdf::REIFIES)?;
             writer.write_all(b"> <<( ")?;
             writer.write_all(&body)?;
             writer.write_all(b" )>>")?;
@@ -2182,7 +2072,7 @@ fn write_raw_po_turtle(
     if p_iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
         out.write_all(b"a")?;
     } else {
-        write_turtle_iri(out, &p_iri, prefixes)?;
+        prefixes.write_iri(out, &p_iri)?;
     }
     out.write_all(b" ")?;
     if !write_raw_object(out, resolver.store, flake, Some(prefixes))? {
@@ -2290,7 +2180,7 @@ fn write_raw_flake_turtle<W: Write>(
     if p_iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
         body.write_all(b"a")?;
     } else {
-        write_turtle_iri(&mut body, &p_iri, prefixes)?;
+        prefixes.write_iri(&mut body, &p_iri)?;
     }
     body.write_all(b" ")?;
     if !write_raw_object(&mut body, resolver.store, flake, Some(prefixes))? {
@@ -2317,9 +2207,9 @@ fn resolve_datatype_iri(store: &BinaryIndexStore, o_type: u16) -> Option<String>
 /// Write `"lexical"^^<datatype_iri>`.
 fn write_typed_literal<W: Write>(w: &mut W, lexical: &str, datatype_iri: &str) -> io::Result<()> {
     w.write_all(b"\"")?;
-    write_escaped_ntriples_string(w, lexical)?;
+    syntax::write_string(w, lexical)?;
     w.write_all(b"\"^^<")?;
-    write_escaped_iri(w, datatype_iri)?;
+    syntax::write_iri(w, datatype_iri)?;
     w.write_all(b">")
 }
 
@@ -2336,135 +2226,9 @@ fn write_typed_literal_display<W: Write, T: std::fmt::Display>(
     write_typed_literal(w, &lexical, &dt)
 }
 
-// ---------------------------------------------------------------------------
-// N-Triples escaping (W3C compliant)
-// ---------------------------------------------------------------------------
-
-/// Write an N-Triples-escaped string to `w`.
-///
-/// Escapes: `\` `"` `\n` `\r` `\t` and control chars (U+0000..U+001F, U+007F..U+009F)
-/// via `\uXXXX`.
-fn write_escaped_ntriples_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
-    for ch in s.chars() {
-        match ch {
-            '\\' => w.write_all(b"\\\\")?,
-            '"' => w.write_all(b"\\\"")?,
-            '\n' => w.write_all(b"\\n")?,
-            '\r' => w.write_all(b"\\r")?,
-            '\t' => w.write_all(b"\\t")?,
-            c if c.is_control() => {
-                let cp = c as u32;
-                if cp <= 0xFFFF {
-                    write!(w, "\\u{cp:04X}")?;
-                } else {
-                    write!(w, "\\U{cp:08X}")?;
-                }
-            }
-            c => {
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                w.write_all(encoded.as_bytes())?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Write an IRI with escaping per N-Triples/Turtle `IRIREF` grammar.
-///
-/// Disallowed characters in `IRIREF`:
-/// - ASCII control and space: U+0000..=U+0020
-/// - DEL + C1 controls: U+007F..=U+009F
-/// - Punctuation: `<`, `>`, `"`, `{`, `}`, `|`, `^`, `` ` ``, `\`
-///
-/// We percent-encode the UTF-8 bytes of these characters to ensure the output
-/// remains syntactically valid RDF, even if the stored IRI contains invalid
-/// characters.
-pub fn write_escaped_iri<W: Write>(w: &mut W, iri: &str) -> io::Result<()> {
-    for ch in iri.chars() {
-        let cp = ch as u32;
-        let is_forbidden_range = cp <= 0x20 || (0x7F..=0x9F).contains(&cp);
-        let is_forbidden_punct = matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\');
-
-        if is_forbidden_range || is_forbidden_punct {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            for &b in encoded.as_bytes() {
-                write!(w, "%{b:02X}")?;
-            }
-        } else {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            w.write_all(encoded.as_bytes())?;
-        }
-    }
-    Ok(())
-}
-
-/// Escape an IRI into a pre-allocated String (for graph term caching).
-fn escape_iri_into(out: &mut String, iri: &str) {
-    for ch in iri.chars() {
-        let cp = ch as u32;
-        let is_forbidden_range = cp <= 0x20 || (0x7F..=0x9F).contains(&cp);
-        let is_forbidden_punct = matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\');
-
-        if is_forbidden_range || is_forbidden_punct {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            for &b in encoded.as_bytes() {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_escape_ntriples_string() {
-        let mut buf = Vec::new();
-        write_escaped_ntriples_string(&mut buf, "hello \"world\"\nline2\\end").unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "hello \\\"world\\\"\\nline2\\\\end"
-        );
-    }
-
-    #[test]
-    fn test_escape_ntriples_control_chars() {
-        let mut buf = Vec::new();
-        write_escaped_ntriples_string(&mut buf, "a\x00b\x1Fc").unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "a\\u0000b\\u001Fc");
-    }
-
-    #[test]
-    fn test_escape_iri() {
-        let mut buf = Vec::new();
-        write_escaped_iri(&mut buf, "http://example.org/foo>bar").unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "http://example.org/foo%3Ebar"
-        );
-
-        let mut buf = Vec::new();
-        write_escaped_iri(&mut buf, "http://example.org/a\\b<c\"d").unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "http://example.org/a%5Cb%3Cc%22d"
-        );
-
-        let mut buf = Vec::new();
-        write_escaped_iri(&mut buf, "http://example.org/a b\tc").unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "http://example.org/a%20b%09c"
-        );
-    }
 
     #[test]
     fn test_write_iri_or_bnode() {
@@ -2478,84 +2242,6 @@ mod tests {
         let mut buf = Vec::new();
         write_iri_or_bnode(&mut buf, "_:b123").unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), "_:b123");
-    }
-
-    #[test]
-    fn test_prefix_map_from_context() {
-        let ctx = serde_json::json!({
-            "ex": "http://example.org/",
-            "schema": "http://schema.org/",
-            "@base": "http://ignored.org/"
-        });
-        let pm = PrefixMap::from_context(&ctx);
-        assert_eq!(
-            pm.compact("http://example.org/alice"),
-            Some("ex:alice".to_string())
-        );
-        assert_eq!(
-            pm.compact("http://schema.org/name"),
-            Some("schema:name".to_string())
-        );
-        assert_eq!(pm.compact("http://other.org/foo"), None);
-    }
-
-    #[test]
-    fn test_prefix_map_longest_match() {
-        let ctx = serde_json::json!({
-            "ex": "http://example.org/",
-            "exn": "http://example.org/ns/"
-        });
-        let pm = PrefixMap::from_context(&ctx);
-        // Should match the longer prefix
-        assert_eq!(
-            pm.compact("http://example.org/ns/thing"),
-            Some("exn:thing".to_string())
-        );
-        assert_eq!(
-            pm.compact("http://example.org/other"),
-            Some("ex:other".to_string())
-        );
-    }
-
-    #[test]
-    fn test_prefix_map_invalid_local_name() {
-        let ctx = serde_json::json!({
-            "ex": "http://example.org/"
-        });
-        let pm = PrefixMap::from_context(&ctx);
-        // Spaces and special chars → falls back to full IRI
-        assert_eq!(pm.compact("http://example.org/has space"), None);
-        assert_eq!(pm.compact("http://example.org/has:colon"), None);
-        // Leading/trailing dots invalid
-        assert_eq!(pm.compact("http://example.org/.hidden"), None);
-    }
-
-    #[test]
-    fn test_write_prefix_declarations() {
-        let ctx = serde_json::json!({
-            "ex": "http://example.org/",
-            "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-        });
-        let pm = PrefixMap::from_context(&ctx);
-        let mut buf = Vec::new();
-        write_prefix_declarations(&pm, &mut buf).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("@prefix ex: <http://example.org/> ."));
-        assert!(output.contains("@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ."));
-    }
-
-    #[test]
-    fn test_write_turtle_iri() {
-        let ctx = serde_json::json!({"ex": "http://example.org/"});
-        let pm = PrefixMap::from_context(&ctx);
-
-        let mut buf = Vec::new();
-        write_turtle_iri(&mut buf, "http://example.org/alice", &pm).unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "ex:alice");
-
-        let mut buf = Vec::new();
-        write_turtle_iri(&mut buf, "http://other.org/bob", &pm).unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "<http://other.org/bob>");
     }
 
     #[test]

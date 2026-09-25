@@ -82,12 +82,17 @@ SPARQL XML Results format (for SPARQL SELECT/ASK queries).
 ```http
 Accept: text/turtle
 ```
-Turtle RDF format (for CONSTRUCT queries).
+Turtle (for CONSTRUCT/DESCRIBE queries and Graph Store `GET`).
+
+```http
+Accept: application/n-triples
+```
+N-Triples (for CONSTRUCT/DESCRIBE queries and Graph Store `GET`).
 
 ```http
 Accept: application/rdf+xml
 ```
-RDF/XML graph format (for CONSTRUCT/DESCRIBE queries).
+RDF/XML graph format (for CONSTRUCT/DESCRIBE queries and Graph Store `GET`).
 
 ```http
 Accept: application/vnd.fluree.agent+json

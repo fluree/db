@@ -625,6 +625,10 @@ name = "query_overlay_matrix"
 harness = false
 
 [[bench]]
+name = "query_construct_formats"
+harness = false
+
+[[bench]]
 name = "query_hot_bsbm_bi"
 harness = false
 

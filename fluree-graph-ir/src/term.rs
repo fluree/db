@@ -462,21 +462,30 @@ impl Ord for Term {
     }
 }
 
+/// N-Triples syntax, escapes included.
 impl std::fmt::Display for Term {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Term::Iri(iri) => write!(f, "<{iri}>"),
+            Term::Iri(iri) => {
+                f.write_str("<")?;
+                crate::syntax::escape_iri(iri, |seg| f.write_str(seg))?;
+                f.write_str(">")
+            }
             Term::BlankNode(id) => write!(f, "{id}"),
             Term::Literal {
                 value,
                 datatype,
                 language,
             } => {
-                write!(f, "\"{}\"", value.lexical())?;
+                f.write_str("\"")?;
+                crate::syntax::escape_string(&value.lexical(), |seg| f.write_str(seg))?;
+                f.write_str("\"")?;
                 if let Some(lang) = language {
                     write!(f, "@{lang}")
                 } else if !datatype.is_xsd_string() {
-                    write!(f, "^^<{}>", datatype.as_iri())
+                    f.write_str("^^<")?;
+                    crate::syntax::escape_iri(datatype.as_iri(), |seg| f.write_str(seg))?;
+                    f.write_str(">")
                 } else {
                     Ok(())
                 }
@@ -495,6 +504,23 @@ mod tests {
         assert_eq!(id.as_str(), "b0");
         assert_eq!(id.to_ntriples(), "_:b0");
         assert_eq!(format!("{id}"), "_:b0");
+    }
+
+    #[test]
+    fn display_is_escaped_ntriples() {
+        assert_eq!(
+            Term::iri("http://ex.org/a b").to_string(),
+            r"<http://ex.org/a\u0020b>"
+        );
+        assert_eq!(
+            Term::string("say \"hi\"\n").to_string(),
+            r#""say \"hi\"\n""#
+        );
+        assert_eq!(Term::lang_string("chat", "fr").to_string(), r#""chat"@fr"#);
+        assert_eq!(
+            Term::integer(5).to_string(),
+            r#""5"^^<http://www.w3.org/2001/XMLSchema#integer>"#
+        );
     }
 
     #[test]

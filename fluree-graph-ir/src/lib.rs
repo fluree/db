@@ -41,6 +41,7 @@ pub mod datatype;
 mod graph;
 pub mod json_canonical;
 mod sink;
+pub mod syntax;
 mod term;
 mod triple;
 pub mod xsd_double;

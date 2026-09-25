@@ -212,6 +212,32 @@ WHERE {
 }
 ```
 
+## Output Formats
+
+A CONSTRUCT result is returned as JSON-LD unless you ask for another graph
+format. Over HTTP, send `Accept: text/turtle`, `application/n-triples` or
+`application/rdf+xml` to `POST /v1/fluree/query/{ledger}`; in Rust, pass
+`FormatterConfig::turtle()`, `ntriples()` or `rdf_xml()` and call
+`execute_formatted_string()`. Turtle output uses the query's `PREFIX`es:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/query/mydb:main \
+  -H "Content-Type: application/sparql-query" \
+  -H "Accept: text/turtle" \
+  --data 'PREFIX ex: <http://example.org/ns/>
+CONSTRUCT { ?person ex:displayName ?name } WHERE { ?person ex:name ?name }'
+```
+
+```turtle
+@prefix ex: <http://example.org/ns/> .
+
+ex:alice ex:displayName "Alice" .
+```
+
+DESCRIBE results take the same formats. See
+[Graph Formats](output-formats.md#graph-formats-construct--describe) for the
+details of each.
+
 ## Best Practices
 
 1. **Specific Patterns**: Construct specific patterns rather than wildcards
@@ -221,10 +247,9 @@ WHERE {
 
 ## Current Limitations
 
-- **RDF collection syntax** (`( ?a ?b )`) is not yet supported in CONSTRUCT
-  templates — list the `rdf:first`/`rdf:rest`/`rdf:nil` triples explicitly.
-- **No annotations in CONSTRUCT templates** (the template output form is
-  deferred); a `CONSTRUCT` whose `WHERE` uses annotations to filter still works.
+- **No annotations in CONSTRUCT templates or output** (the template output form is
+  deferred); a `CONSTRUCT` whose `WHERE` uses annotations to filter still works,
+  but its result does not link a reifier to its edge in any format.
 
 ## Related Documentation
 

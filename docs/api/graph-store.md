@@ -60,14 +60,16 @@ For `GET` and `HEAD`, existence is as the caller sees it: a named graph with no 
 
 The TriG rules are those of [sync](../transactions/sync.md#payload-formats): every block must name the request's graph, a block for another graph is a `400`, and a body targeting the default graph cannot contain blocks.
 
-`GET` answers in the first format in `Accept` it supports:
+`GET` answers in the highest-weighted (`q`) format in `Accept` that it supports; equal weights keep the header's order:
 
 | Accept | Response |
 |---|---|
-| `application/ld+json`, `application/json`, `*/*`, or no `Accept` | JSON-LD |
+| `application/ld+json`, `application/json`, `*/*`, `application/*`, or no `Accept` | JSON-LD |
+| `text/turtle` (or `text/*`) | Turtle |
+| `application/n-triples` | N-Triples |
 | `application/rdf+xml` | RDF/XML |
 
-Turtle and N-Triples output are not available yet; a `GET` that accepts only those is a `406`.
+An `Accept` that names none of these is a `406`. The Turtle and N-Triples a `GET` returns are what `PUT` accepts, so a graph read as Turtle and put back unchanged commits nothing: blank nodes are written under their stored labels, which a write resolves back to the same nodes.
 
 **Edge annotations are not returned.** `GET` returns a graph's triples, including an annotation's own triples (`ex:claim1 ex:confidence 0.9`), but not the link that ties the annotation to its edge, because `CONSTRUCT` does not serialize RDF 1.2 annotations yet. So a graph with annotations does not survive a `GET` followed by a `PUT` of the result: the `PUT` commits a change that removes those links. Keep the source file as the copy you `PUT`, and read annotations with a JSON-LD query (see [Edge annotations](../concepts/edge-annotations.md)).
 
@@ -96,7 +98,7 @@ curl -X POST "http://localhost:8090/v1/fluree/data/mydb:main?graph=urn:example:t
 
 # Read it back
 curl "http://localhost:8090/v1/fluree/data/mydb:main?graph=urn:example:tools" \
-  -H "Accept: application/ld+json"
+  -H "Accept: text/turtle"
 
 # Replace the default graph
 curl -X PUT "http://localhost:8090/v1/fluree/data/mydb:main?default" \

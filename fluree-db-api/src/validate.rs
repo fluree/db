@@ -273,31 +273,19 @@ fn turtle_term(iri_or_bnode: &str) -> String {
     }
 }
 
-/// Render an IRI as a Turtle IRIREF, `\uXXXX`-escaping the characters the Turtle
-/// grammar forbids inside `<…>` (controls, space, and ``<>"{}|^`\``). The parser
-/// unescapes these back to the original codepoint, so the IRI round-trips —
-/// unlike percent-encoding, which would change the IRI's identity.
+/// Render an IRI as a Turtle IRIREF; characters the grammar forbids inside
+/// `<…>` are `\uXXXX`-escaped, which the parser reads back as the same IRI.
 fn turtle_iri(iri: &str) -> String {
-    use std::fmt::Write;
     let mut out = String::with_capacity(iri.len() + 2);
-    out.push('<');
-    for c in iri.chars() {
-        match c {
-            '\u{00}'..='\u{20}' | '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' => {
-                let _ = write!(out, "\\u{:04X}", c as u32);
-            }
-            _ => out.push(c),
-        }
-    }
-    out.push('>');
+    fluree_graph_ir::syntax::push_iri_ref(&mut out, iri);
     out
 }
 
 /// Render an IRI as `sh:Name` when it lives in the SHACL namespace.
 fn turtle_sh_term(iri: &str) -> String {
     match iri.strip_prefix("http://www.w3.org/ns/shacl#") {
-        Some(local) => format!("sh:{local}"),
-        None => turtle_term(iri),
+        Some(local) if fluree_graph_ir::syntax::is_pn_local(local) => format!("sh:{local}"),
+        _ => turtle_term(iri),
     }
 }
 
@@ -330,16 +318,7 @@ fn turtle_value_term(value: &JsonValue) -> String {
 fn turtle_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
+    fluree_graph_ir::syntax::push_string(&mut out, s);
     out.push('"');
     out
 }

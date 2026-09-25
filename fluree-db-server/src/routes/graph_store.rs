@@ -19,7 +19,7 @@
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
-use crate::extract::{FlureeHeaders, MaybeCredential, MaybeDataBearer};
+use crate::extract::{negotiate_graph_format, FlureeHeaders, MaybeCredential, MaybeDataBearer};
 use crate::routes::query::SparqlParams;
 use crate::routes::transact::{
     effective_author, enforce_write_access, execute_transaction, execute_turtle_transaction,
@@ -236,58 +236,6 @@ async fn delete_graph(
     .await
 }
 
-/// RDF formats `GET` can return. Turtle and N-Triples are not here yet:
-/// CONSTRUCT has no Turtle serializer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GraphFormat {
-    JsonLd,
-    RdfXml,
-}
-
-impl GraphFormat {
-    fn media_type(self) -> &'static str {
-        match self {
-            GraphFormat::JsonLd => "application/ld+json",
-            GraphFormat::RdfXml => "application/rdf+xml",
-        }
-    }
-}
-
-/// The format to answer `GET` in: the highest-`q` media range in `Accept`
-/// that a supported format satisfies. No `Accept` means JSON-LD.
-fn negotiate(accept: Option<&str>) -> Result<GraphFormat> {
-    let Some(accept) = accept.filter(|a| !a.trim().is_empty()) else {
-        return Ok(GraphFormat::JsonLd);
-    };
-    let mut ranges: Vec<(f32, &str)> = accept
-        .split(',')
-        .filter_map(|range| {
-            let mut parts = range.split(';').map(str::trim);
-            let media = parts.next().filter(|m| !m.is_empty())?;
-            let q = parts
-                .find_map(|p| p.strip_prefix("q="))
-                .map_or(1.0, |q| q.parse().unwrap_or(0.0));
-            Some((q, media))
-        })
-        .filter(|(q, _)| *q > 0.0)
-        .collect();
-    // Stable: equal weights keep the client's order.
-    ranges.sort_by(|a, b| b.0.total_cmp(&a.0));
-    for (_, media) in ranges {
-        match media.to_ascii_lowercase().as_str() {
-            "application/ld+json" | "application/json" | "*/*" | "application/*" => {
-                return Ok(GraphFormat::JsonLd)
-            }
-            "application/rdf+xml" => return Ok(GraphFormat::RdfXml),
-            _ => {}
-        }
-    }
-    Err(ServerError::not_acceptable(
-        "a graph is available as application/ld+json or application/rdf+xml; \
-         Turtle and N-Triples output is not supported yet",
-    ))
-}
-
 async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> Result<Response> {
     let graph = request_graph(&request, &ledger)?;
     let accept = request
@@ -295,7 +243,12 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let format = negotiate(accept.as_deref())?;
+    let format = negotiate_graph_format(accept.as_deref()).ok_or_else(|| {
+        ServerError::not_acceptable(
+            "a graph is available as application/ld+json, text/turtle, \
+             application/n-triples or application/rdf+xml",
+        )
+    })?;
     let head = request.method() == Method::HEAD;
     let (parts, _) = request.into_parts();
 
@@ -334,18 +287,7 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
         }
         GraphSel::Default => "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }".to_string(),
     };
-    let query_accept = match format {
-        GraphFormat::JsonLd => "application/json",
-        GraphFormat::RdfXml => "application/rdf+xml",
-    };
-    let mut response = query_as_caller(&state, &ledger, parts, sparql, query_accept).await?;
-    if response.status().is_success() {
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(format.media_type()),
-        );
-    }
-    Ok(response)
+    query_as_caller(&state, &ledger, parts, sparql, format.media_type()).await
 }
 
 /// Run `sparql` through the query route as the caller would: same auth
@@ -415,25 +357,4 @@ fn with_status(mut response: Response, created: bool) -> Response {
         *response.status_mut() = StatusCode::CREATED;
     }
     response
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn negotiation_follows_q_and_falls_back_to_json_ld() {
-        assert_eq!(negotiate(None).unwrap(), GraphFormat::JsonLd);
-        assert_eq!(negotiate(Some("*/*")).unwrap(), GraphFormat::JsonLd);
-        assert_eq!(
-            negotiate(Some("text/turtle, application/rdf+xml;q=0.9, */*;q=0.1")).unwrap(),
-            GraphFormat::RdfXml
-        );
-        assert_eq!(
-            negotiate(Some("application/rdf+xml;q=0.5, application/ld+json")).unwrap(),
-            GraphFormat::JsonLd
-        );
-        assert!(negotiate(Some("text/turtle, application/n-triples")).is_err());
-        assert!(negotiate(Some("application/rdf+xml;q=0")).is_err());
-    }
 }

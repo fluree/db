@@ -134,7 +134,7 @@ async fn named_graph_lifecycle() {
 
     let (status, ct, body) = send_full(&app, "GET", &tools, None, "", JSON_LD).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(ct.as_deref(), Some("application/ld+json"));
+    assert_eq!(ct.as_deref(), Some("application/ld+json; charset=utf-8"));
     assert!(body.contains("search") && body.contains("\"q\""), "{body}");
     assert!(
         !body.contains("Zed") && !body.contains("SeedDefault"),
@@ -147,14 +147,31 @@ async fn named_graph_lifecycle() {
         &tools,
         None,
         "",
-        Some("text/turtle, application/rdf+xml;q=0.5"),
+        Some("text/turtle;q=0.5, application/rdf+xml"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(ct.as_deref(), Some("application/rdf+xml"));
+    assert_eq!(ct.as_deref(), Some("application/rdf+xml; charset=utf-8"));
     assert!(body.contains("search"), "{body}");
 
-    let (status, body) = send(&app, "GET", &tools, None, "", Some("text/turtle")).await;
+    let (status, ct, nt) =
+        send_full(&app, "GET", &tools, None, "", Some("application/n-triples")).await;
+    assert_eq!(status, StatusCode::OK, "{nt}");
+    assert_eq!(ct.as_deref(), Some("application/n-triples; charset=utf-8"));
+    assert_eq!(nt.lines().count(), 3, "{nt}");
+
+    // Turtle out, Turtle back in: the graph (its blank node included, by its
+    // stored label) comes back unchanged, so the PUT commits nothing.
+    let (status, ct, ttl) = send_full(&app, "GET", &tools, None, "", TTL).await;
+    assert_eq!(status, StatusCode::OK, "{ttl}");
+    assert_eq!(ct.as_deref(), Some("text/turtle; charset=utf-8"));
+    assert!(ttl.contains("\"search\""), "{ttl}");
+    let (status, body) = send(&app, "PUT", &tools, TTL, &ttl, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let t3 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["t"].as_i64();
+    assert_eq!(t1, t3, "a GET's Turtle PUT back must not commit:\n{ttl}");
+
+    let (status, body) = send(&app, "GET", &tools, None, "", Some("text/csv")).await;
     assert_eq!(status, StatusCode::NOT_ACCEPTABLE, "{body}");
 
     let (status, body) = send(&app, "HEAD", &tools, None, "", None).await;
@@ -500,6 +517,10 @@ async fn graph_store_requires_authorization() {
         StatusCode::OK,
         "identity-scoped RDF/XML GET: {body}"
     );
-    assert_eq!(ct.as_deref(), Some("application/rdf+xml"));
+    assert!(
+        ct.as_deref()
+            .is_some_and(|ct| ct.starts_with("application/rdf+xml")),
+        "{ct:?}"
+    );
     assert!(body.contains("tool"), "{body}");
 }

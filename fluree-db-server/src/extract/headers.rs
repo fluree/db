@@ -23,6 +23,113 @@ fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
     h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
+/// A serialization of an RDF graph: a SPARQL CONSTRUCT / DESCRIBE result, or a
+/// Graph Store `GET`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphFormat {
+    JsonLd,
+    Turtle,
+    NTriples,
+    RdfXml,
+}
+
+impl GraphFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            GraphFormat::JsonLd => "JSON-LD",
+            GraphFormat::Turtle => "Turtle",
+            GraphFormat::NTriples => "N-Triples",
+            GraphFormat::RdfXml => "RDF/XML",
+        }
+    }
+
+    pub fn media_type(self) -> &'static str {
+        match self {
+            GraphFormat::JsonLd => "application/ld+json",
+            GraphFormat::Turtle => "text/turtle",
+            GraphFormat::NTriples => "application/n-triples",
+            GraphFormat::RdfXml => "application/rdf+xml",
+        }
+    }
+
+    /// The response `Content-Type`.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            GraphFormat::JsonLd => "application/ld+json; charset=utf-8",
+            GraphFormat::Turtle => "text/turtle; charset=utf-8",
+            GraphFormat::NTriples => "application/n-triples; charset=utf-8",
+            GraphFormat::RdfXml => "application/rdf+xml; charset=utf-8",
+        }
+    }
+
+    pub fn formatter(self) -> fluree_db_api::FormatterConfig {
+        match self {
+            GraphFormat::JsonLd => fluree_db_api::FormatterConfig::jsonld(),
+            GraphFormat::Turtle => fluree_db_api::FormatterConfig::turtle(),
+            GraphFormat::NTriples => fluree_db_api::FormatterConfig::ntriples(),
+            GraphFormat::RdfXml => fluree_db_api::FormatterConfig::rdf_xml(),
+        }
+    }
+
+    /// The format a media type names. `application/turtle` and
+    /// `application/x-turtle` are pre-registration Turtle types some SPARQL
+    /// clients still send.
+    fn from_media_type(media: &str) -> Option<Self> {
+        const TYPES: &[(&str, GraphFormat)] = &[
+            ("application/ld+json", GraphFormat::JsonLd),
+            ("application/json", GraphFormat::JsonLd),
+            ("text/turtle", GraphFormat::Turtle),
+            ("application/turtle", GraphFormat::Turtle),
+            ("application/x-turtle", GraphFormat::Turtle),
+            ("application/n-triples", GraphFormat::NTriples),
+            ("application/rdf+xml", GraphFormat::RdfXml),
+        ];
+        TYPES
+            .iter()
+            .find(|(t, _)| media.eq_ignore_ascii_case(t))
+            .map(|(_, f)| *f)
+    }
+}
+
+/// `(q, media type)` for each range in an `Accept` value, weight-zero ranges
+/// dropped, highest `q` first; equal weights keep the header's order.
+fn media_ranges(accept: &str) -> impl Iterator<Item = (f32, &str)> {
+    let mut ranges: Vec<(f32, &str)> = accept
+        .split(',')
+        .filter_map(|range| {
+            let mut parts = range.split(';').map(str::trim);
+            let media = parts.next().filter(|m| !m.is_empty())?;
+            let q = parts
+                .find_map(|p| p.strip_prefix("q="))
+                .map_or(1.0, |q| q.parse().unwrap_or(0.0));
+            Some((q, media))
+        })
+        .filter(|(q, _)| *q > 0.0)
+        .collect();
+    ranges.sort_by(|a, b| b.0.total_cmp(&a.0));
+    ranges.into_iter()
+}
+
+/// The graph format an `Accept` value prefers: the highest-`q` media range a
+/// graph format satisfies. `*/*` and `application/*` are JSON-LD, `text/*` is
+/// Turtle, and no `Accept` at all is JSON-LD. `None` when no range matches.
+pub fn negotiate_graph_format(accept: Option<&str>) -> Option<GraphFormat> {
+    let Some(accept) = accept.filter(|a| !a.trim().is_empty()) else {
+        return Some(GraphFormat::JsonLd);
+    };
+    media_ranges(accept).find_map(|(_, media)| {
+        GraphFormat::from_media_type(media).or_else(|| {
+            if media == "*/*" || media.eq_ignore_ascii_case("application/*") {
+                Some(GraphFormat::JsonLd)
+            } else if media.eq_ignore_ascii_case("text/*") {
+                Some(GraphFormat::Turtle)
+            } else {
+                None
+            }
+        })
+    })
+}
+
 /// Fluree-specific HTTP headers
 ///
 /// These headers allow clients to specify query options, ledger selection,
@@ -346,15 +453,19 @@ impl FlureeHeaders {
         get_header_str(&self.raw, "fluree-max-bytes").and_then(|v| v.parse().ok())
     }
 
-    /// Check if the client explicitly requests RDF/XML output via Accept header.
-    ///
-    /// Matches `application/rdf+xml` (case-insensitive).
-    /// Does NOT match `*/*` — RDF/XML must be explicitly requested.
-    pub fn wants_rdf_xml(&self) -> bool {
-        self.accept
-            .as_ref()
-            .map(|a| a.to_ascii_lowercase().contains("application/rdf+xml"))
-            .unwrap_or(false)
+    /// The graph serialization `Accept` prefers; see [`negotiate_graph_format`].
+    pub fn graph_format(&self) -> Option<GraphFormat> {
+        negotiate_graph_format(self.accept.as_deref())
+    }
+
+    /// Whether every media range `Accept` admits is a graph-only serialization
+    /// (Turtle, N-Triples, RDF/XML): a request no solution table can satisfy.
+    pub fn accepts_only_graph_formats(&self) -> bool {
+        let mut ranges = media_ranges(self.accept.as_deref().unwrap_or_default()).peekable();
+        ranges.peek().is_some()
+            && ranges.all(|(_, media)| {
+                GraphFormat::from_media_type(media).is_some_and(|f| f != GraphFormat::JsonLd)
+            })
     }
 
     /// Check if the client explicitly requests JSON-LD output via Accept header.
@@ -534,8 +645,52 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{FlureeHeaders, JsonValue};
+    use super::{negotiate_graph_format, FlureeHeaders, GraphFormat, JsonValue};
     use axum::http::HeaderMap;
+
+    #[test]
+    fn graph_format_negotiation_follows_q() {
+        let n = negotiate_graph_format;
+        assert_eq!(n(None), Some(GraphFormat::JsonLd));
+        assert_eq!(n(Some("*/*")), Some(GraphFormat::JsonLd));
+        assert_eq!(n(Some("text/turtle")), Some(GraphFormat::Turtle));
+        assert_eq!(
+            n(Some("Application/N-Triples")),
+            Some(GraphFormat::NTriples)
+        );
+        assert_eq!(n(Some("text/*")), Some(GraphFormat::Turtle));
+        assert_eq!(
+            n(Some("application/ld+json;q=0.5, text/turtle, */*;q=0.1")),
+            Some(GraphFormat::Turtle)
+        );
+        assert_eq!(
+            n(Some("text/turtle;q=0.5, application/rdf+xml;q=0.9")),
+            Some(GraphFormat::RdfXml)
+        );
+        assert_eq!(
+            n(Some("application/n-triples, text/turtle")),
+            Some(GraphFormat::NTriples),
+            "equal weights keep the header's order"
+        );
+        assert_eq!(n(Some("application/sparql-results+json")), None);
+        assert_eq!(n(Some("text/turtle;q=0")), None);
+    }
+
+    #[test]
+    fn graph_only_accept() {
+        let only = |accept: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("accept", accept.parse().unwrap());
+            FlureeHeaders::from_headers(&headers)
+                .unwrap()
+                .accepts_only_graph_formats()
+        };
+        assert!(only("text/turtle"));
+        assert!(only("text/turtle, application/rdf+xml;q=0.5"));
+        assert!(!only("text/turtle, application/sparql-results+json;q=0.1"));
+        assert!(!only("text/turtle, */*;q=0.1"));
+        assert!(!only("application/ld+json"));
+    }
 
     #[test]
     fn parses_min_t_header() {
