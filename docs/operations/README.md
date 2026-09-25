@@ -37,7 +37,7 @@ Storage backend options:
 - Memory storage (development)
 - File system storage (single server)
 - AWS S3/DynamoDB (distributed)
-- IPFS / Kubo (decentralized)
+- IPFS / Kubo (experimental, Rust API only)
 - Storage selection criteria
 - Switching between storage modes
 
@@ -58,9 +58,9 @@ A worked benchmark (SPARQLoscope on ~574 M-triple DBLP) showing how hardware map
 
 ### [IPFS Storage](ipfs-storage.md)
 
-IPFS-specific setup and configuration:
+Experimental IPFS storage for programs embedding Fluree through the Rust API:
 - Kubo node installation and setup
-- JSON-LD configuration fields
+- Using `FlureeBuilder::build_ipfs`, and its in-memory nameservice
 - Content addressing and CID mapping
 - Pinning strategies
 - Operational considerations
@@ -150,7 +150,6 @@ TLS is not terminated by the server; put a reverse proxy or load balancer in fro
 - Storage mode selection
 - Storage path (file mode)
 - AWS credentials (S3 mode)
-- IPFS / Kubo connection (IPFS mode)
 - Cache settings
 
 ### Indexing Configuration
@@ -361,7 +360,6 @@ balancer.
 - Development: memory
 - Single server: file
 - Production/Distributed: AWS
-- Decentralized: IPFS
 
 ### 2. Enable Monitoring
 

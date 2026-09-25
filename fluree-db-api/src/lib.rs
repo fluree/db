@@ -2713,9 +2713,10 @@ impl FlureeBuilder {
     ///
     /// Stores content-addressed data (commits, indexes) in IPFS via the Kubo
     /// HTTP RPC API. The nameservice is in-memory only — ledger heads and
-    /// branch metadata do not persist across restarts. For persistent
-    /// nameservice, compose your own with [`build_with`] using
-    /// [`fluree_db_storage_ipfs::IpfsStorage`].
+    /// branch metadata do not persist across restarts. There is no builder yet
+    /// that pairs IPFS storage with a persistent nameservice: [`build_with`]
+    /// takes an address-based `Storage`, which
+    /// [`fluree_db_storage_ipfs::IpfsStorage`] does not implement.
     ///
     /// # Arguments
     ///

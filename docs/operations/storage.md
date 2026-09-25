@@ -102,43 +102,18 @@ Indexes are reproducible from commits, so they can use either Standard S3 or S3
 Express One Zone depending on latency and cost requirements. See
 [Serverless Storage Choices](serverless-storage.md) for benchmark-backed guidance.
 
-### IPFS Storage
+### IPFS Storage (experimental, Rust API only)
 
-Decentralized content-addressed storage via a local Kubo node:
+Content-addressed storage in IPFS through a local Kubo node. It is available only to programs
+that embed Fluree through the Rust API (`FlureeBuilder::build_ipfs`, with the `ipfs` feature on
+`fluree-db-api`). The server and CLI cannot use it, and a connection config cannot select it: a
+storage node with `ipfsApiUrl` is rejected.
 
-```json
-{
-  "@context": {"@vocab": "https://ns.flur.ee/system#"},
-  "@graph": [{
-    "@type": "Connection",
-    "indexStorage": {
-      "@type": "Storage",
-      "ipfsApiUrl": "http://127.0.0.1:5001",
-      "ipfsPinOnPut": true
-    }
-  }]
-}
-```
+The builder keeps the nameservice in memory, so blocks persist in IPFS but a restarted process no
+longer knows each ledger's current commit. Use it to publish and fetch content-addressed Fluree
+data, not as durable primary storage.
 
-**Characteristics:**
-- Content-addressed (every blob identified by SHA-256 hash)
-- Immutable, tamper-evident storage
-- Decentralized replication via IPFS network
-- Fluree's native CIDs work directly with IPFS
-
-**Use Cases:**
-- Decentralized / censorship-resistant deployments
-- Content integrity verification
-- Cross-organization data sharing
-- Foundation for IPNS/ENS-based ledger discovery
-
-**Limitations:**
-- Requires a running Kubo node
-- No prefix listing (manifest-based tracking needed)
-- No native deletion (unpin + GC)
-- Higher write latency than local file I/O
-
-See [IPFS Storage Guide](ipfs-storage.md) for complete setup and configuration.
+See the [IPFS Storage Guide](ipfs-storage.md) for setup and details.
 
 ## Storage Architecture
 
@@ -219,7 +194,7 @@ Multiple processes coordinate via AWS.
      └─────────────┘
 ```
 
-Data stored as content-addressed blocks in IPFS via Kubo.
+Data stored as content-addressed blocks in IPFS via Kubo (Rust API only; the nameservice is in memory).
 
 ## Storage Encryption
 
@@ -585,19 +560,18 @@ Required IAM permissions:
 
 ### Decision Matrix
 
-| Requirement | Memory | File | AWS | IPFS |
+| Requirement | Memory | File | AWS | IPFS (Rust API) |
 |-------------|--------|------|-----|------|
-| **Development** | Best | Good | Overkill | Overkill |
-| **Single server** | No | Best | Overkill | Good |
-| **Multi-server** | No | No | Best | Good |
-| **Persistence** | No | Yes | Yes | Yes |
+| **Development** | Best | Good | Overkill | Experimental |
+| **Single server** | No | Best | Overkill | No |
+| **Multi-server** | No | No | Best | No |
+| **Persistence** | No | Yes | Yes | Blocks only; ledger heads are in memory |
 | **Cloud-native** | No | No | Yes | No |
-| **Decentralized** | No | No | No | Best |
-| **Content integrity** | No | No | No | Best |
+| **Decentralized** | No | No | No | Blocks can replicate |
 | **Cost** | Free | Free | Monthly | Free |
 | **Setup complexity** | Trivial | Simple | Complex | Moderate |
 | **Performance** | Fastest | Fast | Good | Good |
-| **Durability** | None | Local | 11 9's | Network-wide |
+| **Durability** | None | Local | 11 9's | Blocks: network-wide; ledger heads: none |
 
 ### Recommendations
 
@@ -620,11 +594,8 @@ Required IAM permissions:
 - Cloud-native architecture
 
 **Use IPFS when:**
-- Decentralized storage required
-- Content integrity verification is critical
-- Cross-organization data sharing
-- Building toward IPNS/ENS-based ledger discovery
-- Censorship resistance is a requirement
+- You embed Fluree through the Rust API and want to publish or fetch content-addressed Fluree
+  data through IPFS, and don't need ledgers to survive a restart
 
 ## Switching Storage Modes
 

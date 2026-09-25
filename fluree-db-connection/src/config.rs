@@ -482,6 +482,9 @@ fn validate_commit_storage_keys(
 }
 
 /// Parse storage config from a resolved JSON-LD node
+/// Recognized only to reject it: see [`parse_storage_node`].
+const IPFS_API_URL: &str = "https://ns.flur.ee/system#ipfsApiUrl";
+
 fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageConfig> {
     let address_identifier =
         resolve_string(graph, node, vocab::FIELD_ADDRESS_IDENTIFIER).map(Arc::from);
@@ -564,6 +567,16 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
             address_identifier,
             durability,
         });
+    }
+
+    // IPFS storage is not built from connection configs (only the Rust API's
+    // `FlureeBuilder::build_ipfs`). Without this check a node configured for
+    // it fell through to memory storage, and lost its data on restart.
+    if node.get(IPFS_API_URL).is_some() {
+        return Err(ConnectionError::invalid_config(
+            "IPFS storage (ipfsApiUrl) is not available in a connection config; \
+             it is only reachable through the Rust API (FlureeBuilder::build_ipfs)",
+        ));
     }
 
     // Memory storage: Storage node with no additional configuration
@@ -1187,6 +1200,24 @@ mod tests {
             StorageType::File
         ));
         assert_eq!(config.index_storage.path.as_deref(), Some("/data/fluree"));
+    }
+
+    #[test]
+    fn ipfs_storage_node_is_rejected_not_memory() {
+        let json = json!({
+            "@context": {"@vocab": "https://ns.flur.ee/system#"},
+            "@graph": [{
+                "@id": "conn",
+                "@type": "Connection",
+                "indexStorage": {
+                    "@id": "ipfs",
+                    "@type": "Storage",
+                    "ipfsApiUrl": "http://127.0.0.1:5001"
+                }
+            }]
+        });
+        let err = ConnectionConfig::from_json_ld(&json).unwrap_err();
+        assert!(err.to_string().contains("build_ipfs"), "{err}");
     }
 
     #[test]
