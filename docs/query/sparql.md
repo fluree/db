@@ -1289,7 +1289,7 @@ like a database without deferred constraints).
 
 Current restrictions / boundaries:
 
-- **Graph management operations**: `LOAD`, `CLEAR`, `DROP`, `CREATE`, `ADD`, `MOVE`, `COPY` are not yet supported.
+- **Graph management operations**: `CREATE`, `CLEAR`, `DROP`, `ADD`, `MOVE` and `COPY` are supported, and `CLEAR`/`DROP` accept `GRAPH <iri>`, `DEFAULT`, `NAMED` and `ALL`. `DROP` behaves like `CLEAR`: the graph registry is additive, so a dropped graph stays registered but empty. These operations refuse the reserved `#config` and `#txn-meta` graphs. Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op.
 - **SERVICE**: Only local-ledger endpoints of the form `fluree:ledger:<name>[:<branch>]` are supported; arbitrary remote HTTP `SERVICE` endpoints are not supported.
 - **Property paths**: Supported in `WHERE` (subject to Fluree capability settings).
 - **Edge annotations are default-graph only**: an annotation tail (`{| ... |}`) inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected; a blank or anonymous reifier is rejected in `DELETE DATA`. See [Edge annotations](#edge-annotations-sparql-12--rdf-12) for the full boundary list.
