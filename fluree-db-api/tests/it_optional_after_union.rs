@@ -989,3 +989,77 @@ async fn indexed_second_optional_binds_var_first_left_unbound() {
         })
         .await;
 }
+
+// ============================================================================
+// Update WHERE
+// ============================================================================
+//
+// The update WHERE plans separately from reads, so its surface opts into the
+// same null semantics on the lowered `Txn`. Here a wrong mode doesn't show on a
+// screen — it writes a different set of flakes.
+
+const TAG_GREETING_THEN_FRIEND: &str = "INSERT { ?s ex:tagged ?f } WHERE { \
+     ?s schema:name ?name . \
+     OPTIONAL { ?s ex:greeting ?f } \
+     OPTIONAL { ?s ex:friend ?f } }";
+
+/// The read-side answer minus brian, whose genuinely unbound `?f` writes nothing.
+fn expected_tagged() -> Vec<Value> {
+    expected_greeting_then_friend()
+        .into_iter()
+        .filter(|row| !row[1].is_null())
+        .collect()
+}
+
+async fn tagged_rows(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) -> Vec<Value> {
+    sparql(
+        fluree,
+        &graphdb_from_ledger(ledger),
+        &ledger.snapshot,
+        "SELECT ?s ?f WHERE { ?s ex:tagged ?f }",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn sparql_update_second_optional_binds_var_first_left_unbound() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "optional-after-optional:sparql-update";
+    seed_novelty(&fluree, ledger_id).await;
+
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(&format!("{PREFIXES}{TAG_GREETING_THEN_FRIEND}"))
+        .commit()
+        .await
+        .expect("sparql update");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    assert_eq!(tagged_rows(&fluree, &ledger).await, expected_tagged());
+}
+
+#[tokio::test]
+async fn jsonld_update_second_optional_binds_var_first_left_unbound() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_novelty(&fluree, "optional-after-optional:jsonld-update").await;
+
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": query_context(),
+                "where": [
+                    {"@id": "?s", "schema:name": "?name"},
+                    ["optional", {"@id": "?s", "ex:greeting": "?f"}],
+                    ["optional", {"@id": "?s", "ex:friend": "?f"}]
+                ],
+                "insert": {"@id": "?s", "ex:tagged": "?f"}
+            }),
+        )
+        .await
+        .expect("json-ld update")
+        .ledger;
+
+    assert_eq!(tagged_rows(&fluree, &ledger).await, expected_tagged());
+}
