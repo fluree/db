@@ -4,6 +4,13 @@
 //! not arbitrary common subexpressions. It does not change join planning or
 //! UNION key inference. The original AVG is retained; only the existing
 //! complement fold's SUM/COUNT are added to the same grouped scan.
+//!
+//! Admission requires exactly two independent, unsliced sub-SELECTs plus the
+//! dividing `BIND`; a three-triple universe (a typed entity and an offer linking
+//! it to a numeric value); the same `xsd:float` or `xsd:double` cast on both
+//! sides; no outer grouping or reasoning; and current-state, single-graph
+//! execution under root or no policy. Anything else falls back to the
+//! complement fold alone.
 use super::{non_empty, not_exists_inner};
 use crate::ir::{
     AggregateFn, AggregateSpec, Aggregation, Expression, Function, Grouping, InputSemantics,

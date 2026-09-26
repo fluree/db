@@ -8,8 +8,8 @@
 //! later window geometrically back to the lane's cap, so a lane that keeps
 //! pulling pays for only a few extra flushes.
 
-/// Narrowest first window: per-flush setup isn't worth paying for fewer rows,
-/// even under `LIMIT 1`.
+/// Minimum first window for probes whose setup should be amortized. Lanes
+/// bounded by their input subjects can start smaller with `ramped_from`.
 pub(crate) const MIN_FLUSH: usize = 1024;
 /// Growth between consecutive windows.
 pub(crate) const FLUSH_GROWTH: usize = 8;
@@ -31,6 +31,15 @@ impl FlushSchedule {
     pub(crate) fn ramped(cap: usize) -> Self {
         Self {
             size: MIN_FLUSH.min(cap),
+            cap,
+        }
+    }
+
+    /// Start at the requested size for lanes whose probes are bounded by
+    /// their input subjects, then grow geometrically if more rows are needed.
+    pub(crate) fn ramped_from(initial: usize, cap: usize) -> Self {
+        Self {
+            size: initial.max(1).min(cap),
             cap,
         }
     }
@@ -86,6 +95,19 @@ mod tests {
         assert_eq!(FlushSchedule::budgeted(10, 100_000).size(), MIN_FLUSH);
         assert_eq!(FlushSchedule::budgeted(5000, 100_000).size(), 5000);
         assert_eq!(FlushSchedule::budgeted(usize::MAX, 100_000).size(), 100_000);
+    }
+
+    #[test]
+    fn subject_windows_start_at_the_goal_and_keep_growing() {
+        assert_eq!(
+            sizes(FlushSchedule::ramped_from(10, 100_000), 6),
+            [10, 80, 640, 5120, 40_960, 100_000]
+        );
+        assert_eq!(FlushSchedule::ramped_from(0, 100_000).size(), 1);
+        assert_eq!(
+            FlushSchedule::ramped_from(usize::MAX, 100_000).size(),
+            100_000
+        );
     }
 
     #[test]

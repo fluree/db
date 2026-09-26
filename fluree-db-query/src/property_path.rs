@@ -18,19 +18,18 @@
 //!
 //! # Correlated execution modes
 //!
-//! When both subject and object are variables, the operator requires correlated
-//! execution where at least one variable is bound by the upstream child operator:
+//! When both subject and object are variables, each input row is dispatched on
+//! which of them the upstream child operator bound:
 //!
 //! | Subject | Object | Behavior |
 //! |---------|--------|----------|
 //! | Bound   | Unbound | Forward traversal from subject, bind reachable to object |
 //! | Unbound | Bound   | Backward traversal to object, bind sources to subject |
 //! | Bound   | Bound   | Reachability filter: keep row only if path exists |
-//! | Unbound | Unbound | **Error**: requires at least one bound variable |
+//! | Unbound | Unbound | Full transitive closure of the path (`compute_closure`) |
 //!
-//! The "both unbound" case is intentionally an error to prevent accidental
-//! full-closure enumeration which can be extremely expensive. If full closure
-//! is needed, the query should explicitly bind one side first.
+//! The "both unbound" case materializes the whole closure and is not optimized;
+//! the bound-endpoint cases traverse from the bound side and stay cheap.
 
 use crate::binary_scan::BinaryScanOperator;
 use crate::binding::{Batch, Binding};

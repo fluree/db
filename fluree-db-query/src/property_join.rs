@@ -1404,7 +1404,9 @@ impl Operator for PropertyJoinOperator {
                 && ctx.binary_store.is_some()
                 && !replay;
             self.chunk_schedule = streamable.then(|| match self.row_budget {
-                Some(budget) => FlushSchedule::budgeted(budget, BATCHED_JOIN_SIZE),
+                // These probes visit only the chunk's subjects, so a small
+                // LIMIT need not pay for the general join's minimum window.
+                Some(budget) => FlushSchedule::ramped_from(budget, BATCHED_JOIN_SIZE),
                 None => FlushSchedule::ramped(BATCHED_JOIN_SIZE),
             });
             let mut driver = self.predicate_scan(ctx, driver_idx);

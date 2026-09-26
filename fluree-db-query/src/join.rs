@@ -13,12 +13,14 @@ use crate::fast_path_common::{
     object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
     RowFate,
 };
+use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{
-    compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
+    compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, CountGroup, Operator,
+    OperatorState,
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -35,6 +37,68 @@ use tracing::Instrument;
 /// work; the per-join success path is otherwise far too noisy for perf captures.
 const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
+
+fn checked_join_count(count: u64, additional: u64) -> Result<u64> {
+    count
+        .checked_add(additional)
+        .ok_or_else(|| QueryError::execution("COUNT(*) overflow in nested-loop join drain_count"))
+}
+
+/// Counts folded once per driving row, after all matching right rows have been
+/// checked. Runtime fallback batches use the same normalized group keys.
+struct GroupedCountDrain {
+    left_columns: Vec<usize>,
+    output_columns: Vec<usize>,
+    groups: hashbrown::HashMap<CompositeGroupKey, CountGroup, FxBuildHasher>,
+    key: CompositeGroupKey,
+    graph_view: Option<BinaryGraphView>,
+    counted_rows: u64,
+}
+
+impl GroupedCountDrain {
+    fn add_row(&mut self, batch: &Batch, row: usize, count: u64, from_left: bool) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let columns = if from_left {
+            &self.left_columns
+        } else {
+            &self.output_columns
+        };
+        self.key.0.clear();
+        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
+        self.key.0.extend(columns.iter().map(|&col| {
+            binding_to_group_key_normalized(
+                batch.get_by_col(row, col),
+                store,
+                self.graph_view.as_ref(),
+            )
+        }));
+        let (_, group) = self
+            .groups
+            .raw_entry_mut()
+            .from_key(&self.key)
+            .or_insert_with(|| {
+                (
+                    self.key.clone(),
+                    CountGroup {
+                        keys: columns
+                            .iter()
+                            .map(|&col| batch.get_by_col(row, col).clone())
+                            .collect(),
+                        count: 0,
+                    },
+                )
+            });
+        group.count = checked_join_count(group.count, count)?;
+        Ok(())
+    }
+
+    fn record_growth(&self, ctx: &ExecutionContext<'_>, groups_before: usize) -> Result<()> {
+        ctx.record_alloc((self.groups.len() - groups_before) * crate::context::GROUP_EST_BYTES);
+        ctx.checkpoint()
+    }
+}
 
 /// Prepared per-leaf inputs shared by the batched probe paths and the range
 /// semijoin walk. Owns the leaf blob, decoded header/dir, the leaf-id hash,
@@ -548,6 +612,11 @@ pub struct NestedLoopJoinOperator {
     stored_left_batches: Vec<Batch>,
     /// Pre-built output batches from the batched path, ready to emit
     batched_output: VecDeque<Batch>,
+    /// Present only during `drain_count`: matches counted without constructing
+    /// output batches. Runtime fallbacks still emit rows through `next_batch`.
+    count_only: Option<u64>,
+    /// Present during a grouped drain; only keys from the left are eligible.
+    grouped_count: Option<GroupedCountDrain>,
     /// Cached index into `stored_left_batches` for the currently active left batch.
     ///
     /// This prevents storing/cloning the same `current_left_batch` repeatedly.
@@ -835,6 +904,8 @@ impl NestedLoopJoinOperator {
             flush_schedule: FlushSchedule::fixed(BATCHED_JOIN_SIZE),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
+            count_only: None,
+            grouped_count: None,
             current_left_batch_stored_idx: None,
             inline_ops,
             right_scan_inline_ops,
@@ -1270,6 +1341,8 @@ impl Operator for NestedLoopJoinOperator {
 
         // Reset state for fresh execution
         self.pending_output.clear();
+        self.count_only = None;
+        self.grouped_count = None;
         self.pending_right_row = 0;
         self.current_left_batch = None;
         self.current_left_row = 0;
@@ -1576,6 +1649,111 @@ impl Operator for NestedLoopJoinOperator {
         }
     }
 
+    async fn drain_count(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        // Reuse the regular driver and all its runtime admission/fallback
+        // rules. Only subject probes without BIND on joined rows avoid emission.
+        if !self.state.can_next()
+            || !self.batched_eligible
+            || self.right_new_vars.is_empty()
+            || self.inline_has_bind()
+        {
+            return Ok(None);
+        }
+        self.count_only = Some(0);
+        let result: Result<u64> = async {
+            let mut materialized_rows = 0;
+            loop {
+                ctx.checkpoint()?;
+                match self.next_batch(ctx).await? {
+                    Some(batch) => {
+                        // Includes buffered output from an earlier next_batch
+                        // call and rows from any per-row runtime fallback.
+                        materialized_rows =
+                            checked_join_count(materialized_rows, batch.len() as u64)?;
+                    }
+                    None => break,
+                }
+            }
+            ctx.checkpoint()?;
+            Ok(materialized_rows)
+        }
+        .await;
+        // Clear the mode even on cancellation/error, before propagating it.
+        let counted_rows = self.count_only.take().expect("count drain mode");
+        let materialized_rows = result?;
+        let total = checked_join_count(counted_rows, materialized_rows)?;
+        tracing::debug!(
+            counted_rows,
+            materialized_rows,
+            "nested-loop count drain complete"
+        );
+        Ok(Some(total))
+    }
+
+    async fn drain_grouped_count(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        group_vars: &[VarId],
+    ) -> Result<Option<Vec<CountGroup>>> {
+        if !self.state.can_next()
+            || !self.batched_eligible
+            || self.right_new_vars.is_empty()
+            || self.inline_has_bind()
+            || group_vars.is_empty()
+        {
+            return Ok(None);
+        }
+        let left_columns: Option<Vec<_>> = group_vars
+            .iter()
+            .map(|var| self.left_schema.iter().position(|v| v == var))
+            .collect();
+        let output_columns: Option<Vec<_>> = group_vars
+            .iter()
+            .map(|var| self.schema().iter().position(|v| v == var))
+            .collect();
+        let (Some(left_columns), Some(output_columns)) = (left_columns, output_columns) else {
+            return Ok(None);
+        };
+        self.grouped_count = Some(GroupedCountDrain {
+            left_columns,
+            output_columns,
+            groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
+            key: CompositeGroupKey(Vec::with_capacity(group_vars.len())),
+            graph_view: ctx.graph_view(),
+            counted_rows: 0,
+        });
+        let result: Result<u64> = async {
+            let mut materialized_rows = 0;
+            loop {
+                ctx.checkpoint()?;
+                let Some(batch) = self.next_batch(ctx).await? else {
+                    break;
+                };
+                // Buffered output and runtime fallbacks contain fully unified
+                // bindings, including previously unbound left subject keys.
+                let groups = self.grouped_count.as_mut().expect("grouped drain mode");
+                let before = groups.groups.len();
+                for row in 0..batch.len() {
+                    groups.add_row(&batch, row, 1, false)?;
+                }
+                groups.record_growth(ctx, before)?;
+                materialized_rows = checked_join_count(materialized_rows, batch.len() as u64)?;
+            }
+            ctx.checkpoint()?;
+            Ok(materialized_rows)
+        }
+        .await;
+        let groups = self.grouped_count.take().expect("grouped drain mode");
+        let materialized_rows = result?;
+        tracing::debug!(
+            counted_rows = groups.counted_rows,
+            materialized_rows,
+            groups = groups.groups.len(),
+            "nested-loop grouped count drain complete"
+        );
+        Ok(Some(groups.groups.into_values().collect()))
+    }
+
     fn close(&mut self) {
         self.left.close();
         self.current_left_batch = None;
@@ -1590,6 +1768,8 @@ impl Operator for NestedLoopJoinOperator {
         self.batched_accumulator.clear();
         self.stored_left_batches.clear();
         self.batched_output.clear();
+        self.count_only = None;
+        self.grouped_count = None;
         self.state = OperatorState::Closed;
     }
 
@@ -1723,6 +1903,10 @@ impl NestedLoopJoinOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
     ) -> Result<()> {
+        tracing::debug!(
+            input_rows = self.batched_accumulator.len(),
+            "join batched probe input"
+        );
         if ctx.binary_store.is_none() {
             return Err(crate::error::QueryError::execution(
                 "binary_store is required for batched joins — no non-binary fallback exists",
@@ -2322,7 +2506,8 @@ impl NestedLoopJoinOperator {
         //    per accumulator slot). Inline FILTERs run against a `CombinedRowView`
         //    over the stored left row + right tail — no per-match `combined` Vec.
         //    `emit_right_scatter_to_output` writes left columns (cloned once) and
-        //    right tails directly into the output columns.
+        //    right tails directly into the output columns. During `drain_count`,
+        //    the same callback counts surviving matches without scatter/output.
         //  * Bind/general path: full combined rows scattered into
         //    `Vec<Vec<Vec<Binding>>>`, then transposed by `emit_scatter_to_output`.
         //    Binds may append or clobber columns, so the row must be materialized.
@@ -2330,7 +2515,20 @@ impl NestedLoopJoinOperator {
         if right_width >= 1 && !self.inline_has_bind() {
             let left_len = self.left_schema.len();
             let combined_schema = self.combined_schema.clone();
-            let mut scatter: Vec<Vec<Binding>> = vec![Vec::new(); self.batched_accumulator.len()];
+            let count_only = self.count_only.is_some();
+            let grouped_count = self.grouped_count.is_some();
+            let mut row_counts = if grouped_count {
+                vec![0u64; self.batched_accumulator.len()]
+            } else {
+                Vec::new()
+            };
+            let mut counted_rows = 0;
+            let mut scatter: Vec<Vec<Binding>> = if count_only || grouped_count {
+                ctx.checkpoint()?;
+                Vec::new()
+            } else {
+                vec![Vec::new(); self.batched_accumulator.len()]
+            };
             {
                 let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
                     // Right-side tail (object + any right-scan inline outputs) is
@@ -2340,6 +2538,11 @@ impl NestedLoopJoinOperator {
                         right_bindings.push(obj.clone());
                     }
                     if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                        return Ok(());
+                    }
+                    if count_only && self.inline_ops.is_empty() {
+                        counted_rows =
+                            checked_join_count(counted_rows, accum_indices.len() as u64)?;
                         return Ok(());
                     }
                     for &accum_idx in accum_indices {
@@ -2356,7 +2559,13 @@ impl NestedLoopJoinOperator {
                                 continue;
                             }
                         }
-                        scatter[accum_idx].extend(right_bindings.iter().cloned());
+                        if count_only {
+                            counted_rows = checked_join_count(counted_rows, 1)?;
+                        } else if grouped_count {
+                            row_counts[accum_idx] = checked_join_count(row_counts[accum_idx], 1)?;
+                        } else {
+                            scatter[accum_idx].extend(right_bindings.iter().cloned());
+                        }
                     }
                     Ok(())
                 };
@@ -2373,7 +2582,34 @@ impl NestedLoopJoinOperator {
                     &mut on_match,
                 )?;
             }
-            self.emit_right_scatter_to_output(scatter, right_width, ctx.batch_size)?;
+            if let Some(groups) = self.grouped_count.as_mut() {
+                // A flush may contain many input batches. Bound the interval
+                // between budget/deadline checks while growing the group map.
+                let batch_size = ctx.batch_size.max(1);
+                for (chunk_idx, counts) in row_counts.chunks(batch_size).enumerate() {
+                    let before = groups.groups.len();
+                    for (offset, &count) in counts.iter().enumerate() {
+                        let (batch_idx, row_idx, _) =
+                            self.batched_accumulator[chunk_idx * batch_size + offset];
+                        groups.add_row(
+                            &self.stored_left_batches[batch_idx],
+                            row_idx,
+                            count,
+                            true,
+                        )?;
+                        groups.counted_rows = checked_join_count(groups.counted_rows, count)?;
+                    }
+                    groups.record_growth(ctx, before)?;
+                }
+                self.clear_batched_state();
+            } else if let Some(total) = self.count_only.as_mut() {
+                ctx.checkpoint()?;
+                *total = checked_join_count(*total, counted_rows)?;
+                tracing::debug!(counted_rows, "join batched count flush complete");
+                self.clear_batched_state();
+            } else {
+                self.emit_right_scatter_to_output(scatter, right_width, ctx.batch_size)?;
+            }
         } else {
             let mut scatter: Vec<Vec<Vec<Binding>>> =
                 vec![Vec::new(); self.batched_accumulator.len()];
@@ -3596,6 +3832,234 @@ fn batched_subject_star_spot_uncharged(
 mod tests {
     use super::*;
     use fluree_db_core::Sid;
+
+    fn count_join(inline_ops: Vec<InlineOperator>, batches: Vec<Batch>) -> NestedLoopJoinOperator {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        NestedLoopJoinOperator::new(
+            Box::new(crate::seed::BatchReplayOperator::new(
+                schema.clone(),
+                batches,
+            )),
+            schema,
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "edge")),
+                Term::Var(VarId(1)),
+            ),
+            None,
+            inline_ops,
+            EmitMask::ALL,
+            crate::temporal_mode::TemporalMode::Current,
+        )
+    }
+
+    fn buffered_count_rows(join: &NestedLoopJoinOperator, rows: usize) -> Batch {
+        Batch::new(
+            join.combined_schema.clone(),
+            vec![vec![Binding::Unbound; rows]; join.combined_schema.len()],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn count_drain_counts_only_remaining_rows_and_exhausts() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[]));
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
+        join.open(&ctx).await.unwrap();
+        join.batched_output.push_back(buffered_count_rows(&join, 2));
+        join.batched_output.push_back(buffered_count_rows(&join, 3));
+        // COUNT must preserve the row count even after projection to no columns.
+        assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 2);
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), Some(3));
+        assert!(join.count_only.is_none());
+        assert!(join.next_batch(&ctx).await.unwrap().is_none());
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
+        assert_eq!(join.state, OperatorState::Exhausted);
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn count_drain_declines_bind_without_consuming_input() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut join = count_join(
+            vec![InlineOperator::Bind {
+                var: VarId(2),
+                expr: crate::ir::Expression::Var(VarId(1)),
+            }],
+            vec![],
+        );
+        join.open(&ctx).await.unwrap();
+        join.batched_output.push_back(buffered_count_rows(&join, 3));
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .is_none());
+        assert!(join.grouped_count.is_none());
+        assert!(join.count_only.is_none());
+        assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 3);
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn count_drain_skips_poisoned_and_invalid_subjects() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let batch = Batch::new(
+            Arc::from(vec![VarId(0)].into_boxed_slice()),
+            vec![vec![
+                Binding::Poisoned,
+                Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::xsd_integer()),
+            ]],
+        )
+        .unwrap();
+        let mut join = count_join(vec![], vec![batch]);
+        join.open(&ctx).await.unwrap();
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), Some(0));
+        assert!(join.count_only.is_none());
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn count_drain_checks_budgets_and_clears_mode_on_error() {
+        use fluree_db_core::{QueryCancellation, QueryCancellationReason};
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = crate::var_registry::VarRegistry::new();
+        for cancelled in [false, true] {
+            let cancellation = QueryCancellation::new();
+            if cancelled {
+                cancellation.cancel_with(QueryCancellationReason::Timeout);
+            } else {
+                cancellation.set_memory_limit(1);
+                cancellation.record_alloc(2);
+            }
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+            let mut join = count_join(vec![], vec![]);
+            join.open(&ctx).await.unwrap();
+            let err = join.drain_count(&ctx).await.unwrap_err();
+            if cancelled {
+                assert!(matches!(err, QueryError::Cancelled { .. }), "{err:?}");
+            } else {
+                assert!(
+                    matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+                    "{err:?}"
+                );
+            }
+            assert!(join.count_only.is_none());
+            join.close();
+        }
+        assert_eq!(checked_join_count(u64::MAX - 1, 1).unwrap(), u64::MAX);
+        assert!(checked_join_count(u64::MAX, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn grouped_drain_counts_remaining_rows_and_preserves_declined_input() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[VarId(0)]));
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .is_none());
+        join.open(&ctx).await.unwrap();
+        join.batched_output.push_back(buffered_count_rows(&join, 2));
+        let key = Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::xsd_integer());
+        join.batched_output.push_back(
+            Batch::new(
+                join.combined_schema.clone(),
+                vec![
+                    vec![key.clone(), Binding::Unbound, key.clone()],
+                    vec![Binding::Unbound; 3],
+                ],
+            )
+            .unwrap(),
+        );
+        // A key introduced on the right or absent after projection must decline
+        // without consuming even already-buffered output.
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(1)])
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 2);
+        let groups = join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .find(|g| g.keys == [key.clone()])
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .find(|g| g.keys == [Binding::Unbound])
+                .unwrap()
+                .count,
+            1
+        );
+        assert!(join.grouped_count.is_none());
+        assert!(join.next_batch(&ctx).await.unwrap().is_none());
+        join.close();
+        let mut join = count_join(vec![], vec![]);
+        join.open(&ctx).await.unwrap();
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn grouped_drain_checks_group_growth_and_cancellation() {
+        use fluree_db_core::{QueryCancellation, QueryCancellationReason};
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = crate::var_registry::VarRegistry::new();
+        for cancelled in [false, true] {
+            let cancellation = QueryCancellation::new();
+            if cancelled {
+                cancellation.cancel_with(QueryCancellationReason::Timeout);
+            } else {
+                cancellation.set_memory_limit(1);
+            }
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+            let mut join = count_join(vec![], vec![]);
+            join.open(&ctx).await.unwrap();
+            join.batched_output.push_back(buffered_count_rows(&join, 1));
+            let err = join
+                .drain_grouped_count(&ctx, &[VarId(0)])
+                .await
+                .unwrap_err();
+            if cancelled {
+                assert!(matches!(err, QueryError::Cancelled { .. }), "{err:?}");
+            } else {
+                assert!(
+                    matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+                    "{err:?}"
+                );
+                assert!(ctx.mem_used() >= crate::context::GROUP_EST_BYTES);
+            }
+            assert!(join.grouped_count.is_none());
+            join.close();
+        }
+    }
 
     #[test]
     fn test_bind_instruction_creation() {
