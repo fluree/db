@@ -11,6 +11,8 @@ Fluree implements the [W3C SPARQL 1.1 Graph Store HTTP Protocol](https://www.w3.
 
 `graph=` names a graph by its absolute IRI (percent-encode it). A bare `default` names the ledger's default graph. A request names exactly one of the two; neither or both is a `400`. The ledger's system graphs (`#txn-meta`, `#config`) cannot be addressed here.
 
+`GET` and `HEAD` read a past state when the ledger carries a time pin, in any form `/query/{ledger}` accepts: `/v1/fluree/data/mydb:main@t:5?graph={graph-iri}` returns the graph as it was at `t=5`, and a graph that did not exist yet is a `404`.
+
 This is the protocol's *indirect* graph identification. *Direct* identification, where the request URL is itself the graph IRI, is not supported: Fluree's graph IRIs are not URLs on the server.
 
 ## Methods
