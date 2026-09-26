@@ -417,7 +417,7 @@ pub async fn openapi_spec() -> Result<Json<serde_json::Value>> {
             "/v1/fluree/encryption/rotate/status": {
                 "get": {
                     "summary": "Rotation progress record (admin; any node)",
-                    "responses": {"200": {"description": "key_ids, current_key_id, progress, active_here, seconds_since_update, stalled"}}
+                    "responses": {"200": {"description": "key_ids, current_key_id, progress, active_here, seconds_since_update, stalled, released"}}
                 }
             },
             "/v1/fluree/encryption/rotate/pause": {

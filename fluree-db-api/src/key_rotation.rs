@@ -137,6 +137,11 @@ pub struct KeyRotationStatus {
     /// advancing it. A fresh heartbeat with frozen counters is reported the
     /// same way by the CLI.
     pub stalled: bool,
+    /// `Running` and released by its last holder (a leader that lost
+    /// leadership): the next leader normally takes it over at once. One
+    /// that stays released has not been picked up; `resume` takes it over.
+    #[serde(default)]
+    pub released: bool,
 }
 
 struct Control {
@@ -500,14 +505,18 @@ impl Fluree {
         };
         let now = now_secs();
         let seconds_since_update = progress.as_ref().map(|p| now.saturating_sub(p.updated_at));
-        // A released record (`updated_at == 0`) is mid-handover, about to be
-        // taken over by the next leader, not stalled.
-        let stalled = matches!(
-            (&progress, seconds_since_update),
-            (Some(p), Some(age)) if p.state == KeyRotationState::Running
-                && p.updated_at != 0
-                && age > STALE_AFTER.as_secs()
-        );
+        // A released record (`updated_at == 0`) is reported as released, not
+        // stalled: during a handover it is about to be taken over.
+        let released = !active_here
+            && progress
+                .as_ref()
+                .is_some_and(|p| p.state == KeyRotationState::Running && p.updated_at == 0);
+        let stalled = !released
+            && matches!(
+                (&progress, seconds_since_update),
+                (Some(p), Some(age)) if p.state == KeyRotationState::Running
+                    && age > STALE_AFTER.as_secs()
+            );
         Ok(KeyRotationStatus {
             key_ids: admin.key_ids(),
             current_key_id: admin.current_key_id(),
@@ -515,6 +524,7 @@ impl Fluree {
             active_here,
             seconds_since_update,
             stalled,
+            released,
         })
     }
 

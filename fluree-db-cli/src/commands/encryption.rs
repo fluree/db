@@ -324,7 +324,13 @@ async fn wait_for_stop(t: &Target, json_out: bool) -> CliResult<()> {
 
 fn progress_line(status: &Value) -> String {
     let p = &status["progress"];
-    let stalled = status["stalled"].as_bool().unwrap_or(false);
+    let flag = if status["stalled"].as_bool() == Some(true) {
+        " STALLED"
+    } else if status["released"].as_bool() == Some(true) {
+        " RELEASED"
+    } else {
+        ""
+    };
     format!(
         "{} units {}/{} scanned {} rewritten {} failed {}{}",
         p["state"].as_str().unwrap_or("?"),
@@ -333,7 +339,7 @@ fn progress_line(status: &Value) -> String {
         p["scanned"],
         p["rewritten"],
         p["failed"],
-        if stalled { " STALLED" } else { "" }
+        flag
     )
 }
 
@@ -352,6 +358,11 @@ fn print_status(status: &Value) {
         Ok(KeyRotationState::Completed) => "completed".green().bold(),
         Ok(KeyRotationState::Running) if status["stalled"].as_bool() == Some(true) => {
             "running (STALLED: no checkpoint recently)".red().bold()
+        }
+        Ok(KeyRotationState::Running) if status["released"].as_bool() == Some(true) => {
+            "running (RELEASED: waiting for the next holder; `resume` takes it over)"
+                .yellow()
+                .bold()
         }
         Ok(KeyRotationState::Running) => "running".cyan().bold(),
         Ok(KeyRotationState::Swept | KeyRotationState::Failed) => state.yellow().bold(),

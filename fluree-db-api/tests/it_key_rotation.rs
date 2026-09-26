@@ -272,6 +272,7 @@ async fn foreign_running_record_is_refused_while_fresh_and_taken_over_when_stale
         .unwrap();
     let status = fluree.key_rotation_status().await.unwrap();
     assert!(!status.stalled, "a released record is not stalled");
+    assert!(status.released, "it is reported as released");
 
     // Stale heartbeat: reported stalled, taken over, run to completion.
     storage
@@ -280,6 +281,7 @@ async fn foreign_running_record_is_refused_while_fresh_and_taken_over_when_stale
         .unwrap();
     let status = fluree.key_rotation_status().await.unwrap();
     assert!(status.stalled);
+    assert!(!status.released);
     let resumed = fluree
         .resume_pending_key_rotation("node-me")
         .await
