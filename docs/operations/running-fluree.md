@@ -21,7 +21,8 @@ The primary production deployment. Exposes a full REST API over HTTP.
 
 ### Starting the Server
 
-The server runs through the `fluree` CLI, which needs a project directory (`fluree init`):
+The server runs through the `fluree` CLI, which needs a project directory (`fluree init`)
+unless it keeps its data in memory (`--memory`):
 
 ```bash
 # One-time: create .fluree/ in the current directory
@@ -38,11 +39,39 @@ fluree server run --log-level debug
 
 # Pass any other server flag after `--`
 fluree server run -- --cache-max-mb 4096
+
+# Throwaway server: no .fluree/ needed, data lost on exit
+fluree server run --memory
 ```
 
 `fluree server start` runs the same server in the background. (The `fluree-db-server` crate
 also builds a standalone `fluree-server` binary that takes every server flag directly; the
 Raft cluster mode in [Raft clusters](raft-clusters.md) requires it.)
+
+### Throwaway server for tests and CI
+
+`fluree server run --memory` starts a server with no setup: it needs no `.fluree/` directory,
+writes nothing to the directory it runs in, and loses every ledger when it exits. That makes it a
+fresh database for each CI job, for example one that runs SPARQL tests against it:
+
+```bash
+fluree server run --memory --listen-addr 127.0.0.1:8090 &
+FLUREE_PID=$!
+curl -fsS --retry 30 --retry-connrefused --retry-delay 1 http://127.0.0.1:8090/health
+
+curl -fsS -X POST http://127.0.0.1:8090/v1/fluree/create \
+  -H 'Content-Type: application/json' -d '{"ledger": "test:main"}'
+# SPARQL query endpoint:  http://127.0.0.1:8090/v1/fluree/query/test:main
+# SPARQL update endpoint: http://127.0.0.1:8090/v1/fluree/update/test:main
+
+# ... run the tests ...
+
+kill $FLUREE_PID
+```
+
+`FLUREE_MEMORY_STORAGE=true` works in place of the flag. Memory mode is foreground-only
+(`fluree server start` does not support it), and since it writes no `server.meta.json`, CLI
+auto-routing does not see it.
 
 ### Configuration
 
@@ -58,7 +87,7 @@ Configuration is resolved in this precedence order (highest wins):
 
 | Backend | Flag / Config | Use Case |
 |---------|---------------|----------|
-| **Memory** | `--connection-config` with a memory storage node ([example](storage.md#memory-storage)) | Dev/testing — data lost on restart |
+| **Memory** | `--memory`, or `--connection-config` with a memory storage node ([details](storage.md#memory-storage)) | Dev/testing/CI — data lost on restart |
 | **File** | (default, `.fluree/storage`) or `--storage-path /path` | Single-machine persistence |
 | **AWS S3 + DynamoDB** | `aws` build feature + `--connection-config` | Distributed / cloud-native deployments |
 

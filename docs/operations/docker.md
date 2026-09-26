@@ -32,6 +32,12 @@ curl http://localhost:8090/health
 
 Data lives inside the container's writable layer here — fine for trying things out, lost when the container is removed. For anything beyond a smoke test, mount a volume.
 
+For a throwaway server (a CI service container, say), pass `--memory` to keep ledgers in memory instead; the entrypoint still runs `fluree init`, but the server stores nothing in `.fluree/storage/`:
+
+```bash
+docker run --rm -p 8090:8090 fluree/server:latest --memory
+```
+
 ## Persisting Data
 
 The image declares `VOLUME /var/lib/fluree`. Mount a host directory or named volume there:

@@ -65,7 +65,7 @@ curl http://localhost:8090/v1/fluree/stats
 | Field | Description |
 |-------|-------------|
 | `uptime_secs` | Server uptime in seconds |
-| `storage_type` | Storage mode (`memory` or `file`) |
+| `storage_type` | Storage mode (`file`, `memory`, `connection-config`, or `proxy`) |
 | `indexing_enabled` | Whether background indexing is enabled |
 | `cached_ledgers` | Number of ledgers currently cached |
 | `version` | Server version |

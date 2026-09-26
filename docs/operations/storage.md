@@ -6,8 +6,18 @@ Fluree supports four storage modes, each optimized for different deployment scen
 
 ### Memory Storage
 
-In-memory storage for development and testing. The server has no dedicated flag for it;
-point `--connection-config` at a connection config whose storage node has no backend fields:
+In-memory storage for development, testing, and CI. Start the server with `--memory`
+(or set `FLUREE_MEMORY_STORAGE=true`):
+
+```bash
+fluree server run --memory
+```
+
+The server needs no `.fluree/` directory, writes nothing to the directory it runs in, and loses
+every ledger when it exits. See
+[Throwaway server for tests and CI](running-fluree.md#throwaway-server-for-tests-and-ci).
+
+A connection config whose storage node has no backend fields also selects memory storage:
 
 ```json
 {
@@ -32,7 +42,7 @@ fluree server run --connection-config memory.jsonld
 
 **Use Cases:**
 - Local development
-- Unit testing
+- Tests and CI runs
 - Temporary/ephemeral databases
 - Prototyping
 

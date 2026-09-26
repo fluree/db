@@ -5,7 +5,8 @@ Fluree server is configured via a configuration file, command-line flags, and en
 Run the server with `fluree server run` (foreground) or `fluree server start` (background).
 Both need a Fluree project directory: a `.fluree/` found by walking up from the working
 directory (create one with `fluree init`), or the directory holding the file given to `--config`.
-`run` takes `--listen-addr`, `--storage-path`, `--connection-config`, `--log-level`,
+The exception is `run --memory` ([Memory Storage](#memory-storage)), which needs none.
+`run` takes `--listen-addr`, `--storage-path`, `--connection-config`, `--memory`, `--log-level`,
 `--bolt-listen-addr`, `--bolt-default-db`, `--profile`, and the CLI's `--config <file>`
 directly. Every other server flag in this document is passed through after `--`:
 
@@ -250,6 +251,29 @@ fluree server run --storage-path /var/lib/fluree
 # Default: uses .fluree/storage in the working directory
 fluree server run
 ```
+
+### Memory Storage
+
+Keep all ledgers in memory; every ledger is lost when the server stops, which suits tests and
+CI:
+
+| Flag       | Env Var                 | Default |
+| ---------- | ----------------------- | ------- |
+| `--memory` | `FLUREE_MEMORY_STORAGE` | `false` |
+
+```bash
+fluree server run --memory
+```
+
+`fluree server run --memory` needs no `.fluree/` directory and writes nothing to the directory it
+runs in, including `server.meta.json`, so CLI auto-routing does not see it. As in every storage
+mode, index builds use the system temp directory for scratch and cache
+files. `fluree server start` does not run in memory mode. There is no config file setting for it.
+
+`--memory` cannot be combined with `--storage-path` or `--connection-config`. It replaces a
+storage path or connection config set in the environment, a profile, or the config file.
+`FLUREE_MEMORY_STORAGE=true` does the same, except that a `--storage-path` or
+`--connection-config` flag beats it.
 
 ### Connection Configuration (S3, DynamoDB, etc.)
 
@@ -818,6 +842,7 @@ Storage proxy rejects fixed `fluree.policy` delegation and `"fluree.policy": "re
 
 ```bash
 fluree server run \
+  --memory \
   --log-level debug
 ```
 
@@ -946,6 +971,7 @@ fluree server run \
 | `FLUREE_LISTEN_ADDR`                    | Server address:port                             | `0.0.0.0:8090`                                                          |
 | `FLUREE_STORAGE_PATH`                   | File storage path                               | `.fluree/storage`                                                       |
 | `FLUREE_CONNECTION_CONFIG`              | JSON-LD connection config file path             | None                                                                    |
+| `FLUREE_MEMORY_STORAGE`                 | Keep all ledgers in memory (lost on exit)       | `false`                                                                 |
 | `FLUREE_CORS_ENABLED`                   | Enable CORS                                     | `true`                                                                  |
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100`                                                                   |
@@ -1042,7 +1068,7 @@ Memory storage is lost on restart:
 
 ```bash
 # Development only
-fluree server run
+fluree server run --memory
 
 # Production
 fluree server run --storage-path /var/lib/fluree
