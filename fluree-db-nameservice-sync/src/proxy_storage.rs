@@ -496,6 +496,10 @@ impl StorageRead for ProxyStorage {
         true
     }
 
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        None
+    }
+
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         match self.mode {
             // Raw mode: canonical CAS bytes, CID-verified client-side.

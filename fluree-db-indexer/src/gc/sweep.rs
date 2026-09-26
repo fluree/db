@@ -940,6 +940,10 @@ mod tests {
             self.inner.permits_plaintext_cache()
         }
 
+        fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+            self.inner.encryption_admin()
+        }
+
         async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
             if address == self.address {
                 return Err(fluree_db_core::error::Error::storage("transient failure"));

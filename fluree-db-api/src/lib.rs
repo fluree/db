@@ -78,6 +78,7 @@ mod indexer_fulltext_provider;
 mod inline_ontology;
 #[cfg(feature = "shacl")]
 mod inline_shapes;
+pub mod key_rotation;
 mod ledger;
 pub mod ledger_info;
 #[cfg(not(target_arch = "wasm32"))]
@@ -425,7 +426,7 @@ use fluree_db_nameservice::StorageNameService;
 use std::sync::Arc;
 
 // Re-export encryption types for convenient access
-pub use fluree_db_crypto::{EncryptedStorage, EncryptionKey, StaticKeyProvider};
+pub use fluree_db_crypto::{EncryptedStorage, EncryptionKey, MultiKeyProvider, StaticKeyProvider};
 pub use fluree_graph_json_ld::ParsedContext;
 // Appears in `ImportConfig` / `ImportBuilder::ndjson_first_line_context`, so
 // API consumers must be able to name it without a direct dependency on the
@@ -787,11 +788,57 @@ impl<S> TieredStorage<S> {
     }
 
     fn route_to_commit(address: &str) -> bool {
-        // Extract the path portion after :// if present (fluree:*://path)
-        let path = address.split("://").nth(1).unwrap_or(address);
+        tier_routes_to_commit(address)
+    }
+}
 
-        // Commit blobs + txn blobs go to commit storage.
-        path.contains("/commit/") || path.contains("/txn/")
+fn tier_routes_to_commit(address: &str) -> bool {
+    // Extract the path portion after :// if present (fluree:*://path)
+    let path = address.split("://").nth(1).unwrap_or(address);
+
+    // Commit blobs + txn blobs go to commit storage.
+    path.contains("/commit/") || path.contains("/txn/")
+}
+
+/// Encryption admin for a [`TieredStorage`] whose tiers both encrypt: each
+/// address goes to the tier that holds it, as reads and writes do.
+struct TieredEncryptionAdmin {
+    commit: Arc<dyn fluree_db_core::EncryptionAdmin>,
+    index: Arc<dyn fluree_db_core::EncryptionAdmin>,
+}
+
+impl TieredEncryptionAdmin {
+    fn tier(&self, address: &str) -> &Arc<dyn fluree_db_core::EncryptionAdmin> {
+        if tier_routes_to_commit(address) {
+            &self.commit
+        } else {
+            &self.index
+        }
+    }
+}
+
+#[async_trait]
+impl fluree_db_core::EncryptionAdmin for TieredEncryptionAdmin {
+    fn key_ids(&self) -> Vec<u32> {
+        self.commit.key_ids()
+    }
+
+    fn current_key_id(&self) -> u32 {
+        self.commit.current_key_id()
+    }
+
+    async fn key_id_at(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<u32>, fluree_db_core::Error> {
+        self.tier(address).key_id_at(address).await
+    }
+
+    async fn reencrypt(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<u64>, fluree_db_core::Error> {
+        self.tier(address).reencrypt(address).await
     }
 }
 
@@ -842,6 +889,19 @@ where
 
     fn permits_plaintext_cache(&self) -> bool {
         self.commit.permits_plaintext_cache() && self.index.permits_plaintext_cache()
+    }
+
+    /// Both tiers encrypted under the same key set rotate as one store.
+    /// Otherwise there is no single key set to rotate to: `None`. In-repo
+    /// builds encrypt above the tiers instead, where this is not consulted.
+    fn encryption_admin(&self) -> Option<Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        let commit = self.commit.encryption_admin()?;
+        let index = self.index.encryption_admin()?;
+        if commit.key_ids() != index.key_ids() || commit.current_key_id() != index.current_key_id()
+        {
+            return None;
+        }
+        Some(Arc::new(TieredEncryptionAdmin { commit, index }))
     }
 
     async fn exists(&self, address: &str) -> std::result::Result<bool, fluree_db_core::Error> {
@@ -1078,6 +1138,14 @@ impl StorageRead for AddressIdentifierResolverStorage {
                 .values()
                 .all(fluree_db_core::StorageRead::permits_plaintext_cache)
     }
+
+    /// The default storage's admin. Every write and every listing goes to
+    /// the default, so it is the whole of what this node can rotate. Routed
+    /// storages are read-only here and carry their own keys; a routing admin
+    /// would rewrite blobs in storage this node only reads.
+    fn encryption_admin(&self) -> Option<Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        self.default.encryption_admin()
+    }
 }
 
 #[async_trait]
@@ -1150,7 +1218,7 @@ pub type FlureeClient = Fluree;
 /// storage gets wrapped. A newtype so the builder stays `Debug` without
 /// ever printing key material.
 #[derive(Clone)]
-struct ConfiguredKey(Arc<StaticKeyProvider>);
+struct ConfiguredKey(Arc<MultiKeyProvider>);
 
 impl std::fmt::Debug for ConfiguredKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1160,14 +1228,49 @@ impl std::fmt::Debug for ConfiguredKey {
 
 impl ConfiguredKey {
     fn from_bytes(key: [u8; 32]) -> Self {
-        Self(Arc::new(StaticKeyProvider::new(EncryptionKey::new(key, 0))))
+        Self::from_keys(vec![EncryptionKey::new(key, 0)], 0).expect("one key, id 0, is current")
     }
 
     /// Base64 (standard or URL-safe), decoding to exactly 32 bytes.
     fn from_base64(key_str: &str) -> Result<Self> {
-        StaticKeyProvider::from_base64(key_str)
+        let key = EncryptionKey::from_base64(key_str, 0)
+            .map_err(|e| ApiError::config(format!("Invalid encryption key: {e}")))?;
+        Self::from_keys(vec![key], 0)
+    }
+
+    fn from_keys(keys: Vec<EncryptionKey>, current_id: u32) -> Result<Self> {
+        MultiKeyProvider::new(keys, current_id)
             .map(|provider| Self(Arc::new(provider)))
-            .map_err(|e| ApiError::config(format!("Invalid encryption key: {e}")))
+            .map_err(|e| ApiError::config(format!("Invalid encryption key set: {e}")))
+    }
+
+    /// The key or key set a storage config carries, already validated by
+    /// the config parser for exclusivity and a current id.
+    fn from_storage_config(
+        storage_config: &fluree_db_connection::config::StorageConfig,
+    ) -> Result<Option<Self>> {
+        if let Some(key_str) = storage_config.aes256_key.as_deref() {
+            return Self::from_base64(key_str).map(Some);
+        }
+        if storage_config.aes256_keys.is_empty() {
+            return Ok(None);
+        }
+        let mut keys = Vec::with_capacity(storage_config.aes256_keys.len());
+        for entry in &storage_config.aes256_keys {
+            keys.push(
+                EncryptionKey::from_base64(&entry.key, entry.id).map_err(|e| {
+                    ApiError::config(format!("Invalid encryption key {}: {e}", entry.id))
+                })?,
+            );
+        }
+        let current = storage_config
+            .aes256_current_key
+            .ok_or_else(|| ApiError::config("AES256Keys requires AES256CurrentKey"))?;
+        Self::from_keys(keys, current).map(Some)
+    }
+
+    fn key_ids(&self) -> Vec<u32> {
+        fluree_db_crypto::KeyProvider::key_ids(&*self.0)
     }
 
     fn wrap(&self, storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
@@ -1187,8 +1290,8 @@ fn encrypt_storage_from_config(
     storage: Arc<dyn Storage>,
     storage_config: &fluree_db_connection::config::StorageConfig,
 ) -> Result<Arc<dyn Storage>> {
-    match storage_config.aes256_key.as_deref() {
-        Some(key_str) => Ok(ConfiguredKey::from_base64(key_str)?.wrap(storage)),
+    match ConfiguredKey::from_storage_config(storage_config)? {
+        Some(key) => Ok(key.wrap(storage)),
         None => Ok(storage),
     }
 }
@@ -1710,6 +1813,8 @@ impl FlureeBuilder {
             storage_type: StorageType::S3(s3),
             path: None,
             aes256_key: None,
+            aes256_keys: Vec::new(),
+            aes256_current_key: None,
             address_identifier: None,
             durability: None,
         };
@@ -1869,6 +1974,36 @@ impl FlureeBuilder {
         Ok(self)
     }
 
+    /// Set a rotation key set: every key in `keys` decrypts, the one with
+    /// id `current_id` encrypts new writes. Ids are recorded in envelope
+    /// headers, so they must stay stable across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `keys` is empty, two keys share an id, or no key
+    /// has `current_id`.
+    pub fn with_encryption_keys(
+        mut self,
+        keys: Vec<(u32, [u8; 32])>,
+        current_id: u32,
+    ) -> Result<Self> {
+        let keys = keys
+            .into_iter()
+            .map(|(id, bytes)| EncryptionKey::new(bytes, id))
+            .collect();
+        self.encryption_key = Some(ConfiguredKey::from_keys(keys, current_id)?);
+        Ok(self)
+    }
+
+    /// Ids of the configured encryption keys, current first; empty when
+    /// the builder carries no key. Never the key material.
+    pub fn encryption_key_ids(&self) -> Vec<u32> {
+        self.encryption_key
+            .as_ref()
+            .map(ConfiguredKey::key_ids)
+            .unwrap_or_default()
+    }
+
     /// Create a builder from JSON-LD configuration.
     ///
     /// Parses a JSON-LD configuration document and extracts all settings including
@@ -1915,12 +2050,7 @@ impl FlureeBuilder {
             .as_ref()
             .map(std::string::ToString::to_string);
 
-        let encryption_key = config
-            .index_storage
-            .aes256_key
-            .as_deref()
-            .map(ConfiguredKey::from_base64)
-            .transpose()?;
+        let encryption_key = ConfiguredKey::from_storage_config(&config.index_storage)?;
 
         // Extract indexing config if enabled in JSON-LD defaults
         let indexing_config = if is_indexing_enabled(&config) {
@@ -3024,6 +3154,7 @@ impl FlureeBuilder {
             remote_service: build_remote_service(remote_connections),
             #[cfg(feature = "iceberg")]
             secret_resolver,
+            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
         }
     }
 
@@ -3381,6 +3512,8 @@ pub struct Fluree {
     /// resolver authorizes itself.
     #[cfg(feature = "iceberg")]
     secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
+    /// The key-rotation sweep running in this process, if any.
+    key_rotation: Arc<key_rotation::KeyRotationSlot>,
 }
 
 impl Fluree {
@@ -3420,6 +3553,7 @@ impl Fluree {
             remote_service: None,
             #[cfg(feature = "iceberg")]
             secret_resolver: None,
+            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
         }
     }
 
@@ -3445,6 +3579,7 @@ impl Fluree {
             remote_service: None,
             #[cfg(feature = "iceberg")]
             secret_resolver: None,
+            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
         }
     }
 

@@ -31,6 +31,15 @@ pub const FIELD_FILE_PATH: &str = "https://ns.flur.ee/system#filePath";
 /// AES-256 key field for file-based storage (optional)
 pub const FIELD_AES256_KEY: &str = "https://ns.flur.ee/system#AES256Key";
 
+/// A list of keyed AES-256 keys (`keyId` + `AES256Key` per node) for rotation
+pub const FIELD_AES256_KEYS: &str = "https://ns.flur.ee/system#AES256Keys";
+
+/// Which entry of `AES256Keys` encrypts new writes
+pub const FIELD_AES256_CURRENT_KEY: &str = "https://ns.flur.ee/system#AES256CurrentKey";
+
+/// Numeric id of one entry in `AES256Keys`; recorded in every envelope header
+pub const FIELD_KEY_ID: &str = "https://ns.flur.ee/system#keyId";
+
 /// Durability mode for file-based storage: `sync` or `page-cache` (optional)
 pub const FIELD_DURABILITY: &str = "https://ns.flur.ee/system#durability";
 

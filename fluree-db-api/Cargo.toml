@@ -489,6 +489,10 @@ name = "it_rebuild_staging_cleanup"
 path = "tests/it_rebuild_staging_cleanup.rs"
 
 [[test]]
+name = "it_key_rotation"
+path = "tests/it_key_rotation.rs"
+
+[[test]]
 name = "it_credential"
 path = "tests/it_credential.rs"
 required-features = ["credential"]

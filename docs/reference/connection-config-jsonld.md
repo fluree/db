@@ -121,18 +121,28 @@ Not yet supported (parsed/ignored or absent):
 Supported:
 - `AES256Key` (supports `ConfigurationValue`) — encrypts the in-memory blobs;
   mainly useful for testing an encrypted configuration without a filesystem
+- `AES256Keys` + `AES256CurrentKey` — a rotation key set; see
+  [Key Rotation](../security/encryption.md#key-rotation)
 
 ### File storage (requires `native`)
 
 Supported:
 - `filePath`
 - `AES256Key` (supports `ConfigurationValue`)
+- `AES256Keys` (list of `{keyId, AES256Key}` nodes) + `AES256CurrentKey` — a
+  rotation key set; mutually exclusive with `AES256Key`. See
+  [Key Rotation](../security/encryption.md#key-rotation)
 - `durability` — `"wal"` (default), `"sync"` or `"page-cache"`
 
 Notes:
-- Rust expects `AES256Key` to be **base64-encoded** and decode to exactly 32 bytes.
+- Rust expects `AES256Key` to be **base64-encoded** (standard or URL-safe) and decode to
+  exactly 32 bytes.
 - This encrypts the **index/commit blobs** written via the storage layer. The file-based
   nameservice remains plaintext, matching the existing builder behavior.
+- A key that is configured but does not resolve (an `envVar` that is unset or empty, with
+  no `defaultVal`) is a config error: the storage is never started unencrypted by accident.
+- Put the key on the `indexStorage` node. With a separate `commitStorage`, the
+  `indexStorage` key encrypts both; a `commitStorage` node with a different key is rejected.
 
 ```json
 {
@@ -170,6 +180,7 @@ Supported fields (parsed and **applied** by Rust):
 - `s3Prefix`
 - `AES256Key` (supports `ConfigurationValue`; see the file storage notes — the
   nameservice, whether DynamoDB or storage-backed, stays plaintext)
+- `AES256Keys` + `AES256CurrentKey` — a rotation key set, as for file storage
 - `s3Endpoint` (optional; recommended **only** for LocalStack/MinIO/custom endpoints)
 - `s3ForcePathStyle` (optional; `true` for MinIO-class endpoints without bucket-subdomain DNS)
 - `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`
