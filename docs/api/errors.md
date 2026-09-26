@@ -316,7 +316,8 @@ number of distinct datatypes its index can store. Fifteen common datatypes
 are reserved and never count, among them `xsd:string`, `xsd:integer`, and
 `rdf:langString`. A ledger holds at most 16,369 others, including other XSD
 types such as `xsd:int`. Each datatype IRI counts once, from the first write
-that uses it, and still counts after its data is retracted. The write is refused before anything is committed, so the ledger
+that uses it, and still counts after its data is retracted. See
+[Datatype Limit](../concepts/datatypes.md#datatype-limit). The write is refused before anything is committed, so the ledger
 is unchanged. Transactions, SPARQL updates, and pushed commits all return
 this code.
 
