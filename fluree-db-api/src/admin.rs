@@ -235,6 +235,20 @@ pub struct ReindexOptions {
     /// Indexer configuration (leaf/branch sizes, GC settings)
     /// If not specified, uses IndexerConfig::default()
     pub indexer_config: Option<fluree_db_indexer::IndexerConfig>,
+    /// Rebuild the annotation arena from currently-live annotations even
+    /// though the sticky `had_annotation_arena` bit is set.
+    ///
+    /// **Destructive in one case.** If an arena was previously sealed and
+    /// then dropped, its retraction history is discarded and cannot be
+    /// recovered. Safe when the arena was never sealed — which is the state
+    /// a ledger lands in after `fluree index` on releases before this one.
+    ///
+    /// The library takes this at face value: a programmatic caller setting a
+    /// typed option has already made the decision, and a library that refuses
+    /// its own option is an annoyance rather than a safeguard. The
+    /// acknowledgement gate lives at the CLI boundary
+    /// (`fluree reindex --rebuild-annotations --force`); do not move it here.
+    pub rebuild_annotations: bool,
 }
 
 impl ReindexOptions {
@@ -243,6 +257,13 @@ impl ReindexOptions {
     /// Controls leaf/branch node sizes in the resulting index.
     pub fn with_indexer_config(mut self, config: fluree_db_indexer::IndexerConfig) -> Self {
         self.indexer_config = Some(config);
+        self
+    }
+
+    /// Set [`Self::rebuild_annotations`]. Read its documentation first: in one
+    /// case this discards retraction history that cannot be recovered.
+    pub fn with_rebuild_annotations(mut self, rebuild: bool) -> Self {
+        self.rebuild_annotations = rebuild;
         self
     }
 }
@@ -2120,6 +2141,7 @@ impl crate::Fluree {
     /// - `ReindexConflict` (409) if ledger advanced during rebuild
     pub async fn reindex(&self, ledger_id: &str, opts: ReindexOptions) -> Result<ReindexResult> {
         let ledger_id = normalize_ledger_id(ledger_id);
+        let rebuild_annotations = opts.rebuild_annotations;
         info!(ledger_id = %ledger_id, "Starting reindex");
 
         // 1. Look up current state and capture commit_t for conflict detection
@@ -2240,8 +2262,11 @@ impl crate::Fluree {
                 if indexer_config.attachment_events.is_none() {
                     if let Some(state) = ledger_state.as_ref() {
                         indexer_config.attachment_events =
-                            crate::indexer_attachment_provider::attachment_events_from_state(state)
-                                .await;
+                            crate::indexer_attachment_provider::attachment_events_from_state(
+                                state,
+                                rebuild_annotations,
+                            )
+                            .await;
                     }
                 }
                 match indexer_config.attachment_events.as_ref() {

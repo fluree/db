@@ -268,8 +268,16 @@ async fn scan_base_index_for_attachment_events(
 
 /// True when `FLUREE_FORCE_ANNOTATION_BOOTSTRAP` asks to run the base-index
 /// bootstrap even though the sticky `had_annotation_arena` bit is set.
-/// EXPERIMENTAL — not a substitute for fixing the bit to track actual
-/// seals/retracts.
+///
+/// The supported form is `ReindexOptions::with_rebuild_annotations`; this
+/// env var predates it and stays for existing operator runbooks.
+///
+/// There is no "fix the bit to track actual seals/retracts" that removes the
+/// need for either. A retracted `f:reifies*` row leaves no trace in the index
+/// — not even an `op=false` row — so no pass can tell a ledger whose arena was
+/// never sealed from one whose arena was sealed and then dropped, and only the
+/// first is safe to rebuild from currently-live bundles. That is why the
+/// caller acknowledges the hazard rather than the code detecting it.
 #[cfg(not(target_arch = "wasm32"))]
 fn force_annotation_bootstrap() -> bool {
     std::env::var("FLUREE_FORCE_ANNOTATION_BOOTSTRAP")
@@ -289,6 +297,7 @@ fn force_annotation_bootstrap() -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn attachment_events_from_state(
     state: &fluree_db_ledger::LedgerState,
+    force_rebuild: bool,
 ) -> Option<AttachmentEventCoverage> {
     let events: Vec<_> = state.novelty.attachments.iter_event_pairs().collect();
     let snapshot = state.snapshot.as_ref();
@@ -305,7 +314,7 @@ pub(crate) async fn attachment_events_from_state(
     if events.is_empty() {
         let bootstrap_eligible = snapshot.has_annotations
             && snapshot.annotation_index.is_none()
-            && (force_annotation_bootstrap() || !snapshot.had_annotation_arena);
+            && (force_rebuild || force_annotation_bootstrap() || !snapshot.had_annotation_arena);
         if bootstrap_eligible {
             if let Some(events) = scan_base_index_for_attachment_events_in(
                 snapshot,
@@ -371,7 +380,59 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
     for (id, _) in snapshot.graph_registry.iter_entries() {
         graph_ids.insert(id);
     }
-    let graph_ids: Vec<fluree_db_core::GraphId> = graph_ids.into_iter().collect();
+
+    // Pair each graph with the `Sid` of its IRI, because the rows we are
+    // about to read will not carry one.
+    //
+    // The base-index reader does not put a graph on the flakes it decodes —
+    // the graph rides on the query's `g_id`, not the row, so
+    // `fluree-db-query`'s range decoder builds every `Flake` with `g: None`.
+    // `EdgeKey::from_reifies_facts` cross-checks the `f:reifiesGraph` object
+    // against the bundle's flake-level `g`, treating disagreement as a forged
+    // bundle. A named-graph bundle read from the base index therefore says
+    // "I reify g1" on one axis and "I live in the default graph" on the
+    // other, and is rejected as `GraphMismatch`.
+    //
+    // We know exactly which graph we asked for, so stamp it back on below
+    // before decoding. Doing it here rather than in the decoder keeps the
+    // cost on this scan instead of on every flake of every query, and leaves
+    // the decoder's tamper check intact: a bundle whose `f:reifiesGraph`
+    // names a *different* graph than the one it was read from still fails.
+    // The subject dictionary, for resolving a graph IRI to the Sid the write
+    // path actually stored. Same downcast `ledger_manager` uses; the provider
+    // is known present because this function returns early without one.
+    let store = snapshot
+        .range_provider
+        .as_ref()
+        .and_then(|rp| {
+            rp.as_any()
+                .downcast_ref::<fluree_db_query::BinaryRangeProvider>()
+        })
+        .map(|rp| rp.store().as_ref());
+
+    let graphs: Vec<(fluree_db_core::GraphId, Option<Sid>)> = graph_ids
+        .into_iter()
+        .map(|id| {
+            let graph_sid = (id != 0)
+                .then(|| snapshot.graph_registry.iri_for_graph_id(id))
+                .flatten()
+                .and_then(|iri| {
+                    // Prefer the *stored* Sid, the way
+                    // `ExportResolver::resolve_subject_sid` does, and fall
+                    // back to a fresh encode only when the store cannot
+                    // answer. `encode_iri` has no OVERFLOW branch: once the
+                    // namespace table has overflowed, the write path stores a
+                    // graph as `(OVERFLOW, iri)` while `encode_iri` returns
+                    // `(EMPTY, iri)` — same name, different namespace code.
+                    // Stamping the wrong one would have the decoder reject
+                    // the bundle for a second reason, silently.
+                    store
+                        .and_then(|s| s.find_subject_sid(iri).ok().flatten())
+                        .or_else(|| snapshot.encode_iri(iri))
+                });
+            (id, graph_sid)
+        })
+        .collect();
 
     // `to_t` is the caller's, deliberately un-clamped. It used to be
     // `t.max(snapshot.t)`, which is right for a seal pass — it wants the
@@ -386,7 +447,7 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
     let mut events: Vec<(EdgeKey, Sid, i64, bool)> = Vec::new();
     let mut seen: HashSet<(fluree_db_core::GraphId, Sid, i64)> = HashSet::new();
 
-    for g_id in graph_ids {
+    for (g_id, graph_sid) in graphs {
         // Collect every `f:reifies*` flake in this graph by walking
         // each reserved predicate in turn (PSOT). We group in
         // memory by annotation SID, which sidesteps a SPOT-scan
@@ -433,11 +494,16 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
                     return None;
                 }
             };
-            for f in flakes {
+            for mut f in flakes {
                 if !f.op {
                     // Skip retracted f:reifies* events: the seal pass
                     // only cares about currently-live bundles.
                     continue;
+                }
+                // Base-index rows arrive with no graph; overlay rows already
+                // carry the right one. Fill only what the reader omitted.
+                if f.g.is_none() {
+                    f.g = graph_sid.clone();
                 }
                 by_ann.entry((f.s.clone(), f.t)).or_default().push(f);
             }
@@ -456,8 +522,25 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
             // trustworthy on the arena's `t` axis without a separate
             // f:reifiesSubject lookup. The arena builder applies
             // (t, op) latest-wins across the emitted events.
-            let Ok(edge_key) = EdgeKey::from_reifies_facts(&bundle) else {
-                continue;
+            let edge_key = match EdgeKey::from_reifies_facts(&bundle) {
+                Ok(edge_key) => edge_key,
+                Err(e) => {
+                    // Every variant of this error means "malformed or
+                    // tampered bundle", and dropping it silently is how the
+                    // named-graph defect above stayed invisible. The rows
+                    // stay readable as ordinary RDF; what is lost is the
+                    // edge attachment, so say which annotation and why.
+                    tracing::warn!(
+                        error = %e,
+                        ?g_id,
+                        annotation = %ann_sid,
+                        t = group_t,
+                        "scan_base_index_for_attachment_events: skipping malformed \
+                         annotation bundle; its f:reifies* rows remain readable as \
+                         ordinary RDF but this edge attachment will not be sealed"
+                    );
+                    continue;
+                }
             };
             events.push((edge_key, ann_sid, group_t, /* op = */ true));
         }
