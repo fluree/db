@@ -14,6 +14,122 @@ use serde_json::{json, Value as JsonValue};
 /// Enough typed subjects for three chunks (1024, 8192, rest).
 const PEOPLE: usize = 12_000;
 
+/// DISTINCT must still let a chain emit before its large probe window fills.
+#[tokio::test]
+async fn distinct_limit_stops_a_chain_after_one_small_probe() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/chain-stream-limit:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let graph: Vec<JsonValue> = (0..PEOPLE)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:p{i}"),
+                "ex:knows": {"@id": format!("ex:p{}", (i + 1) % PEOPLE)},
+                "ex:bucket": i % 3,
+            })
+        })
+        .collect();
+    fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("seed chain");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let view = fluree.db(ledger_id).await.expect("view");
+    let query = "PREFIX ex: <http://example.org/ns/> SELECT DISTINCT ?p ?fof \
+                 WHERE { ?p ex:knows ?f . ?f ex:knows ?fof } LIMIT 1";
+    let plan = fluree.explain_sparql(&view, query).await.expect("explain");
+    assert!(
+        plan["plan"]["physical"]
+            .to_string()
+            .contains("NestedLoopJoinOperator"),
+        "{plan}"
+    );
+    let (spans, guard) = span_capture::init_test_tracing();
+    assert_eq!(rows(&fluree, &view, query).await.len(), 1);
+    drop(guard);
+    let events = spans.find_events("join batched probe input");
+    let input_rows: usize = events
+        .iter()
+        .map(|event| {
+            event.fields["input_rows"]
+                .parse::<usize>()
+                .expect("input rows")
+        })
+        .sum();
+    assert_eq!(events.len(), 1, "expected one probe: {events:?}");
+    assert!(
+        input_rows <= 1024,
+        "expected one small probe, consumed {input_rows} rows: {events:?}"
+    );
+
+    // The hint is a planning choice: full drains and blocking modifiers keep
+    // the hash join, including COUNT whose *output* has just one row.
+    let chain = "PREFIX ex: <http://example.org/ns/> SELECT DISTINCT ?p ?fof \
+                 WHERE { ?p ex:knows ?f . ?f ex:knows ?fof }";
+    for query in [
+        chain.to_string(),
+        format!("{chain} ORDER BY ?p LIMIT 1"),
+        format!("{chain} OFFSET 10000 LIMIT 1"),
+        "PREFIX ex: <http://example.org/ns/> SELECT (COUNT(*) AS ?n) \
+         WHERE { ?p ex:knows ?f . ?f ex:knows ?fof } LIMIT 1"
+            .to_string(),
+    ] {
+        let plan = fluree.explain_sparql(&view, &query).await.expect("explain");
+        assert!(
+            plan["plan"]["physical"]
+                .to_string()
+                .contains("HashJoinOperator"),
+            "{plan}"
+        );
+    }
+
+    // OFFSET slices the streaming result, and each returned pair follows the
+    // two edges. No reliance on the unrelated full-drain hash join's order.
+    let prefix = rows(&fluree, &view, &format!("{chain} LIMIT 20")).await;
+    assert_eq!(
+        rows(&fluree, &view, &format!("{chain} OFFSET 5 LIMIT 10")).await,
+        prefix[5..15]
+    );
+    for row in &prefix {
+        let p: usize = row[0]
+            .as_str()
+            .unwrap()
+            .strip_prefix("ex:p")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(row[1], format!("ex:p{}", (p + 2) % PEOPLE));
+    }
+
+    // Dedup collapses all 12,000 matches to three buckets, fewer than LIMIT.
+    // It must drain through every probe window and return the complete set.
+    let buckets = "PREFIX ex: <http://example.org/ns/> SELECT DISTINCT ?b \
+                   WHERE { ?p ex:knows ?f . ?f ex:bucket ?b } LIMIT 4";
+    let (spans, guard) = span_capture::init_test_tracing();
+    let mut got = rows(&fluree, &view, buckets).await;
+    drop(guard);
+    got.sort_by_key(ToString::to_string);
+    assert_eq!(got, vec![json!([0]), json!([1]), json!([2])]);
+    let inputs: Vec<usize> = spans
+        .find_events("join batched probe input")
+        .iter()
+        .map(|e| e.fields["input_rows"].parse().unwrap())
+        .collect();
+    assert_eq!(inputs, vec![1024, 8192, PEOPLE - 9216]);
+
+    let sparse = chain.replace(
+        "?f ex:knows ?fof }",
+        "?f ex:knows ?fof FILTER(STRENDS(STR(?p), \"p11999\")) }",
+    );
+    assert_eq!(
+        rows(&fluree, &view, &format!("{sparse} LIMIT 1")).await,
+        vec![json!(["ex:p11999", "ex:p1"])]
+    );
+}
+
 fn ctx() -> JsonValue {
     json!({"ex": "http://example.org/ns/"})
 }

@@ -2277,7 +2277,33 @@ pub fn build_operator_tree(
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
-    let planning = &planning.with_unmatched_optional(query.unmatched_optional);
+    // A small, unordered prefix benefits from streaming joins even when
+    // DISTINCT or FILTER prevents forwarding a source row budget. Restrict
+    // this startup hint to a simple join block; aggregates, sorting and
+    // compound patterns keep their existing throughput-oriented plans.
+    // Recompute at every query root so a subquery cannot inherit the hint.
+    let row_goal = if query.grouping.is_none()
+        && query.ordering.is_empty()
+        && query.order_binds.is_empty()
+        && query.post_values.is_none()
+        && query.patterns.iter().all(|p| {
+            matches!(
+                p,
+                Pattern::Triple(_)
+                    | Pattern::Filter(_)
+                    | Pattern::Bind { .. }
+                    | Pattern::Values { .. }
+            )
+        }) {
+        query
+            .limit
+            .map(|limit| limit.saturating_add(query.offset.unwrap_or(0)))
+    } else {
+        None
+    };
+    let planning = &planning
+        .with_unmatched_optional(query.unmatched_optional)
+        .with_row_goal(row_goal);
     // Convert single-triple OPTIONALs whose fresh var is error-rejected by a
     // same-group filter into required triples (well-formed left-join
     // simplification), so equality/range pushdown and selectivity estimation

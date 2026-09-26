@@ -348,6 +348,43 @@ builds from the small side and probes by scanning the large predicate's
 *contiguous* PSOT/POST partition exactly once — that scan alone is ~75 ms at
 100 M.
 
+For a simple join block with no sorting or aggregation, `LIMIT + OFFSET`
+also supplies a planning hint for startup cost. When this prefix is at most
+1,024 rows and the estimated build exceeds 8,192 rows, automatic planning
+prefers the streaming nested-loop join. EXPLAIN reports `small-row-goal` as
+the hash-join rejection reason. Explicit hash-join overrides still take
+precedence. The nested-loop join starts with a smaller probe window and grows
+subsequent windows eightfold toward 100,000 rows.
+
+This hint crosses `DISTINCT` and `FILTER` because it only changes the join
+choice and probe-window size. It never caps the rows read: if duplicates or
+filters consume a window, the join keeps reading. Source row budgets remain
+separate and are still absorbed at those operators. Sorting, aggregation,
+compound patterns, and large offsets retain the existing hash-join cost model.
+Queries without `ORDER BY` may return a different valid prefix when the join
+choice changes.
+
+The [`query_operator_probe`](../../fluree-db-api/examples/query_operator_probe.rs)
+example measures these chains alongside stars, anti-joins and aggregates on a
+deterministic people graph after an explicit reindex. Its timings cover query
+execution only; they exclude loading, response serialization and transport.
+
+On 2026-09-26, a local optimized (`dist` profile) run with 50,000 people and
+395,597 indexed facts measured the following medians over 20 repetitions,
+after one warmup per query. Both versions used the same generated graph and
+in-memory storage; the baseline was `ffeeec554`.
+
+| Query | Baseline | With startup planning | Speedup |
+|---|---:|---:|---:|
+| Two-hop `DISTINCT … LIMIT 1` | 20.491 ms | 1.643 ms | 12.5× |
+| Two-hop `LIMIT 1` | 20.281 ms | 1.497 ms | 13.5× |
+
+These are execution timings, not endpoint latency. The aggregate/count cases
+still consume the full qualifying stream; this startup change does not target
+their throughput. In the combined OPTIONAL/NOT EXISTS shape, an absent optional
+binding can also trigger the semijoin's per-row correlated fallback, a separate
+source of work.
+
 **`PropertyJoinOperator`** — fuses same-subject multi-predicate stars anchored by
 a bound object or a range filter (`?s a :Person ; :name ?n ; :email ?e`) instead
 of a join chain. One scan of the anchor seeds the subjects; the other predicates

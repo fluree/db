@@ -178,6 +178,8 @@ pub(crate) enum HashJoinReason {
     /// The object-join shape matched, but the build side is already a wider
     /// intermediate. Auto hash join would drain it in open() and can defeat LIMIT.
     BuildSideTooWide,
+    /// A small output prefix favors a streaming probe over an eager build.
+    SmallRowGoal,
     /// The subject (not the object) is bound from the left, so this is a forward
     /// join the object→subject hash can't replace. Reordering to drive the other
     /// end is what helps (the BSBM-BI bowtie case).
@@ -194,6 +196,7 @@ impl HashJoinReason {
             HashJoinReason::ScanRatioTooHigh => "scan-ratio-too-high",
             HashJoinReason::NoProbeStats => "no-probe-stats",
             HashJoinReason::BuildSideTooWide => "build-side-too-wide",
+            HashJoinReason::SmallRowGoal => "small-row-goal",
             HashJoinReason::SubjectDriven => "subject-driven-forward-join",
         }
     }
@@ -323,6 +326,7 @@ pub(crate) struct HashJoinPlanner<'a> {
     /// `before_step` runs with stats present, so single-pattern / stats-less callers
     /// never auto-fire (force-`On` still does).
     step_est: Option<f64>,
+    row_goal: Option<usize>,
 }
 
 impl<'a> HashJoinPlanner<'a> {
@@ -348,7 +352,13 @@ impl<'a> HashJoinPlanner<'a> {
             force: hash_join_force(),
             driving_est: 1.0,
             step_est: None,
+            row_goal: None,
         }
+    }
+
+    pub(crate) fn with_row_goal(mut self, row_goal: Option<usize>) -> Self {
+        self.row_goal = row_goal;
+        self
     }
 
     /// Seed the running driving estimate from the block's incoming LEFT operator
@@ -449,6 +459,26 @@ impl<'a> HashJoinPlanner<'a> {
             (Some(pc), Some(d)) => Some(pc as f64 / d.max(1.0)),
             _ => None,
         };
+
+        // A nested-loop join can emit after one small probe window. Keep the
+        // hash build for larger prefixes and small build sides; avoid draining
+        // a large build just to return a handful of rows. The goal is advisory:
+        // filters and dedup may require the streaming plan to read everything.
+        if self.force == HashJoinForce::Auto
+            && self
+                .row_goal
+                .is_some_and(|goal| goal <= crate::operator::flush::MIN_FLUSH)
+            && driving_est.is_some_and(|rows| rows > (crate::operator::flush::MIN_FLUSH * 8) as f64)
+        {
+            return Some(HashJoinDecision {
+                join_var: Some(join_var),
+                probe_count,
+                driving_est,
+                scan_ratio,
+                chosen: false,
+                reason: HashJoinReason::SmallRowGoal,
+            });
+        }
 
         let (chosen, reason) = match self.force {
             HashJoinForce::On => (true, HashJoinReason::ForcedOn),
@@ -1266,6 +1296,59 @@ mod tests {
     }
 
     #[test]
+    fn small_row_goal_avoids_a_large_build_but_respects_force_mode() {
+        let subject = VarId(0);
+        let object = VarId(1);
+        let predicate = Sid::new(1, "knows");
+        let triple = TriplePattern::new(
+            Ref::Var(subject),
+            Ref::Sid(predicate.clone()),
+            Term::Var(object),
+        );
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            predicate,
+            PropertyStatData {
+                count: 150_000,
+                ndv_values: 50_000,
+                ndv_subjects: 50_000,
+            },
+        );
+        let mut planner = HashJoinPlanner::new(Some(&stats));
+        planner.force = HashJoinForce::Auto;
+        planner.step_est = Some(150_000.0);
+        let decision = |p: &HashJoinPlanner<'_>| {
+            p.explain_object_hash_join(&[object], &triple, false, true)
+                .unwrap()
+        };
+        assert!(decision(&planner).chosen);
+        for goal in [1, 1024] {
+            planner.row_goal = Some(goal);
+            let d = decision(&planner);
+            assert!(!d.chosen);
+            assert_eq!(d.reason, HashJoinReason::SmallRowGoal);
+        }
+        planner.row_goal = Some(1025);
+        assert!(
+            decision(&planner).chosen,
+            "larger prefixes keep the cost model"
+        );
+        planner.row_goal = Some(1);
+        planner.step_est = Some(8192.0);
+        assert!(
+            decision(&planner).chosen,
+            "small builds keep the cost model"
+        );
+        planner.step_est = Some(150_000.0);
+        planner.force = HashJoinForce::On;
+        assert_eq!(decision(&planner).reason, HashJoinReason::ForcedOn);
+        assert!(decision(&planner).chosen);
+        planner.force = HashJoinForce::Off;
+        assert_eq!(decision(&planner).reason, HashJoinReason::ForcedOff);
+        assert!(!decision(&planner).chosen);
+    }
+
+    #[test]
     fn explains_subject_driven_forward_join() {
         // `?review rev:reviewer ?reviewer` with ?review bound from the left and
         // ?reviewer new is a forward (subject-driven) join — not an object→subject
@@ -1490,6 +1573,7 @@ mod tests {
         let planner = HashJoinPlanner {
             stats: Some(&stats),
             force: HashJoinForce::Auto,
+            row_goal: None,
             driving_est: 10_980.0,
             step_est: Some(10_980.0),
         };
@@ -1528,6 +1612,7 @@ mod tests {
         let planner = HashJoinPlanner {
             stats: Some(&stats),
             force: HashJoinForce::Auto,
+            row_goal: None,
             driving_est: 237_440.0,
             step_est: Some(237_440.0),
         };
@@ -1558,6 +1643,7 @@ mod tests {
         let planner = HashJoinPlanner {
             stats: Some(&stats),
             force: HashJoinForce::Auto,
+            row_goal: None,
             driving_est: 1_085_090.0,
             step_est: Some(1_085_090.0),
         };

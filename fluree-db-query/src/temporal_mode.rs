@@ -54,9 +54,7 @@ impl TemporalMode {
 /// Planning-time context threaded through the operator-tree builder.
 ///
 /// Carries decisions that must be made once at planning and captured at
-/// operator construction — never read again at runtime. Currently this
-/// is just [`TemporalMode`]; future planning inputs that want the same
-/// "decide once, capture at construction" discipline should land here.
+/// operator construction — never read again at runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct PlanningContext {
     /// Temporal mode for this query.
@@ -86,6 +84,11 @@ pub struct PlanningContext {
     /// surface language's null semantics. Folded in from `Query` at the plan
     /// root; defaults to SPARQL's `Unbound`.
     pub unmatched_optional: UnmatchedOptional,
+    /// Desired output prefix of a streaming join block. This is a startup-cost
+    /// hint, never a cap on input or output rows. Unlike a source row budget,
+    /// it remains useful through DISTINCT and FILTER. Blocking query modifiers
+    /// must clear it because they need the complete input.
+    pub row_goal: Option<usize>,
 }
 
 impl PlanningContext {
@@ -97,6 +100,7 @@ impl PlanningContext {
             allow_semantic_elision: false,
             multi_default_graph: false,
             unmatched_optional: UnmatchedOptional::Unbound,
+            row_goal: None,
         }
     }
 
@@ -108,6 +112,7 @@ impl PlanningContext {
             allow_semantic_elision: false,
             multi_default_graph: false,
             unmatched_optional: UnmatchedOptional::Unbound,
+            row_goal: None,
         }
     }
 
@@ -138,6 +143,11 @@ impl PlanningContext {
     #[inline]
     pub const fn with_unmatched_optional(mut self, unmatched: UnmatchedOptional) -> Self {
         self.unmatched_optional = unmatched;
+        self
+    }
+
+    pub(crate) const fn with_row_goal(mut self, goal: Option<usize>) -> Self {
+        self.row_goal = goal;
         self
     }
 

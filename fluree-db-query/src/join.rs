@@ -1723,6 +1723,10 @@ impl NestedLoopJoinOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
     ) -> Result<()> {
+        tracing::debug!(
+            input_rows = self.batched_accumulator.len(),
+            "join batched probe input"
+        );
         if ctx.binary_store.is_none() {
             return Err(crate::error::QueryError::execution(
                 "binary_store is required for batched joins — no non-binary fallback exists",
