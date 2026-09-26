@@ -1143,6 +1143,11 @@ pub async fn query_ledger(
         return Err(error);
     }
 
+    let path = PathLedger::parse(&ledger).inspect_err(|_| {
+        set_span_error_code(&span, "error:BadRequest");
+    })?;
+    let ledger = path.ledger.clone();
+
     let delimited = wants_delimited(&headers);
 
     // Handle SPARQL query - ledger is known from path
@@ -1161,12 +1166,13 @@ pub async fn query_ledger(
         }
 
         let identity = headers.identity.clone();
-        let min_t_requirements =
+        let mut min_t_requirements =
             collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
+        path.merge_pin_min_t(&mut min_t_requirements);
         await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
         return execute_sparql_ledger(
             &state,
-            &ledger,
+            &path,
             &sparql,
             identity.as_deref(),
             delimited,
@@ -1194,16 +1200,17 @@ pub async fn query_ledger(
 
         let identity = headers.identity.clone();
         // Honor the `Fluree-Min-T` read-your-writes freshness wait, same as the
-        // SPARQL/JSON-LD paths. Cypher has no FROM/dataset clause or `@t:` pin,
-        // so the header is the only requirement source, against this one ledger.
+        // SPARQL/JSON-LD paths. Cypher has no FROM/dataset clause, so the header
+        // and the path pin are the only requirement sources.
         let mut min_t_requirements = BTreeMap::new();
         if let Some(min_t) = headers.min_t {
             merge_min_t_requirement(&mut min_t_requirements, &ledger, min_t);
         }
+        path.merge_pin_min_t(&mut min_t_requirements);
         await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
         return execute_cypher_ledger(
             &state,
-            &ledger,
+            &path,
             &cypher,
             identity.as_deref(),
             &headers,
@@ -1238,6 +1245,7 @@ pub async fn query_ledger(
     // Ledger-scoped endpoint: allow `from` as a named-graph selector, but reject
     // attempts to target a different ledger than the URL.
     normalize_ledger_scoped_from(&ledger_id, &mut query_json)?;
+    pin_jsonld_dataset(&path, &mut query_json)?;
 
     // Inject header values into query opts
     inject_headers_into_query(&mut query_json, &headers);
@@ -1460,6 +1468,11 @@ pub async fn explain_ledger(
             return Err(error);
         }
 
+        let path = PathLedger::parse(&ledger).inspect_err(|_| {
+            set_span_error_code(&span, "error:BadRequest");
+        })?;
+        let ledger = path.ledger.clone();
+
         // Handle SPARQL explain
         if is_sparql_request(&headers, &credential, &params) {
             let sparql = resolve_sparql_text(&params, &credential)?;
@@ -1494,6 +1507,11 @@ pub async fn explain_ledger(
                         )));
                     }
                 }
+                if let Some(pin) = &path.pin {
+                    explain_from_carries_pin(&sparql, pin).inspect_err(|_| {
+                        set_span_error_code(&span, "error:BadRequest");
+                    })?;
+                }
 
                 let min_t_requirements =
                     collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
@@ -1514,8 +1532,9 @@ pub async fn explain_ledger(
                 return Ok(Json(result));
             }
 
-            let min_t_requirements =
+            let mut min_t_requirements =
                 collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
+            path.merge_pin_min_t(&mut min_t_requirements);
             await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
             let ledger_id = ledger.clone();
@@ -1524,7 +1543,14 @@ pub async fn explain_ledger(
             } else {
                 load_ledger_for_query(&state, &ledger_id, &span).await?
             };
-            let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
+            let db = match &path.pin {
+                None => fluree_db_api::GraphDb::from_ledger_state(&loaded),
+                Some(pin) => state
+                    .fluree
+                    .db_at(&ledger_id, pin.spec.clone())
+                    .await
+                    .map_err(ServerError::Api)?,
+            };
             let db = crate::routes::policy_auth::wrap_authorized_view(&state, db, &headers).await?;
             let result = state
                 .fluree
@@ -1554,13 +1580,19 @@ pub async fn explain_ledger(
             if let Some(min_t) = headers.min_t {
                 merge_min_t_requirement(&mut min_t_requirements, &ledger, min_t);
             }
+            path.merge_pin_min_t(&mut min_t_requirements);
             await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
-            let view = state
-                .fluree
-                .db_with_default_context(&ledger)
-                .await
-                .map_err(ServerError::Api)?;
+            let view = match &path.pin {
+                None => state.fluree.db_with_default_context(&ledger).await,
+                Some(pin) => {
+                    state
+                        .fluree
+                        .db_at_with_default_context(&ledger, pin.spec.clone())
+                        .await
+                }
+            }
+            .map_err(ServerError::Api)?;
             let view = crate::routes::policy_auth::wrap_authorized_view(&state, view, &headers).await?;
             let result = state
                 .fluree
@@ -1595,6 +1627,7 @@ pub async fn explain_ledger(
         // Ledger-scoped endpoint: allow `from` as a named-graph selector, but reject
         // attempts to target a different ledger than the URL.
         normalize_ledger_scoped_from(&ledger_id, &mut query_json)?;
+        pin_jsonld_dataset(&path, &mut query_json)?;
 
         // Inject header values into query opts
         inject_headers_into_query(&mut query_json, &headers);
@@ -1667,6 +1700,36 @@ pub async fn explain_ledger(
     }
     .instrument(span)
     .await
+}
+
+/// Explain plans a SPARQL `FROM`'s own snapshot, so on a pinned ledger path
+/// every `FROM` must carry the same pin.
+fn explain_from_carries_pin(sparql: &str, pin: &PathPin) -> Result<()> {
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    let clause = parsed.ast.as_ref().and_then(|ast| match &ast.body {
+        fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
+        fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
+        fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
+        fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
+        fluree_db_sparql::ast::QueryBody::Update(_) => None,
+    });
+    let Some(clause) = clause else {
+        return Ok(());
+    };
+    let spec = DatasetSpec::from_sparql_clause(clause)
+        .map_err(|e| ServerError::bad_request(e.to_string()))?;
+    for source in spec.default_graphs.iter().chain(&spec.named_graphs) {
+        let from = &source.identifier;
+        let Some(own) = &source.time_spec else {
+            return Err(ServerError::bad_request(format!(
+                "SPARQL FROM <{from}> names no time on a ledger path pinned at '@{}'; \
+                 repeat the pin on the FROM, or drop the FROM",
+                pin.raw
+            )));
+        };
+        pin.reconcile(own, || format!("SPARQL FROM <{from}>"))?;
+    }
+    Ok(())
 }
 
 /// Explain a query plan with ledger as greedy tail segment.
@@ -1807,6 +1870,253 @@ fn sparql_json_response_format(
             fluree_db_api::FormatterConfig::sparql_json(),
             "application/json",
         )
+    }
+}
+
+// ============================================================================
+// Time pin in the ledger path (`/query/<ledger>@t:5`)
+// ============================================================================
+
+/// The `<ledger...>` tail of a ledger-scoped query route, parsed once.
+pub(crate) struct PathLedger {
+    /// The ledger as the path spells it, minus any pin, so a pinned request
+    /// names its ledger downstream exactly as the unpinned one does.
+    pub(crate) ledger: String,
+    pub(crate) id: fluree_db_api::LedgerId,
+    /// Read the whole ledger, named graphs included, as of this point.
+    pub(crate) pin: Option<PathPin>,
+}
+
+pub(crate) struct PathPin {
+    /// As written after `@` (`t:5`, `time:2024-01-01T00:00:00Z`, ...).
+    pub(crate) raw: String,
+    pub(crate) spec: TimeSpec,
+}
+
+impl PathLedger {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        let parsed = fluree_db_api::LedgerRef::parse(raw)?;
+        let Some(at) = parsed.at else {
+            return Ok(Self {
+                ledger: raw.to_string(),
+                id: parsed.id,
+                pin: None,
+            });
+        };
+        if parsed.fragment.is_some() {
+            return Err(ServerError::bad_request(format!(
+                "Ledger path '{raw}' combines a time pin with a graph fragment; \
+                 select the graph in the query instead"
+            )));
+        }
+        // The grammar a body `from: "<ledger>@..."` is parsed with.
+        let spec = TimeSpec::parse_address_suffix(&at).map_err(|e| {
+            ServerError::bad_request(format!("Invalid time pin in ledger path '{raw}': {e}"))
+        })?;
+        // `LedgerRef` splits at the first `@`; with no fragment the pin runs to the end.
+        let ledger = raw[..raw.len() - at.len() - 1].to_string();
+        Ok(Self {
+            ledger,
+            id: parsed.id,
+            pin: Some(PathPin { raw: at, spec }),
+        })
+    }
+
+    /// Fold the pin's `t` into the read-after-write wait, as a body `@t:` pin is.
+    fn merge_pin_min_t(&self, requirements: &mut BTreeMap<String, i64>) {
+        if let Some(PathPin {
+            spec: TimeSpec::AtT(t),
+            ..
+        }) = &self.pin
+        {
+            merge_min_t_requirement(requirements, &self.ledger, *t);
+        }
+    }
+}
+
+impl PathPin {
+    /// A time the query names itself is accepted only when it agrees with the path.
+    fn reconcile(&self, own: &TimeSpec, source: impl FnOnce() -> String) -> Result<()> {
+        if *own == self.spec {
+            return Ok(());
+        }
+        Err(ServerError::bad_request(format!(
+            "Time pin conflict: the ledger path pins '@{}' but {} pins a different time; \
+             drop one of them or make them agree",
+            self.raw,
+            source()
+        )))
+    }
+
+    /// The pin as JSON-LD source fields. `t` keeps it visible to the min-t wait.
+    fn jsonld_field(&self) -> (&'static str, JsonValue) {
+        match self.spec {
+            TimeSpec::AtT(t) => ("t", JsonValue::from(t)),
+            _ => ("at", JsonValue::String(self.raw.clone())),
+        }
+    }
+}
+
+/// The path ledger at its pin, as a dataset: the pinned twin of a query with no
+/// dataset clause. A lone default graph keeps `GRAPH ?g` enumerating the
+/// ledger's own named graphs (the single-ledger dataset path).
+fn pinned_ledger_spec(ledger: &str, pin: &PathPin) -> DatasetSpec {
+    let mut spec = DatasetSpec::new();
+    spec.default_graphs
+        .push(GraphSource::new(ledger).with_time(pin.spec.clone()));
+    spec
+}
+
+/// Pin every JSON-LD dataset source that names the path's ledger, so the body
+/// reaches the engine as if it had been pinned by hand; a body naming no
+/// dataset gets the pinned ledger as its default graph. Run after
+/// [`normalize_ledger_scoped_from`].
+fn pin_jsonld_dataset(path: &PathLedger, query: &mut JsonValue) -> Result<()> {
+    let Some(pin) = &path.pin else {
+        return Ok(());
+    };
+    let Some(obj) = query.as_object_mut() else {
+        return Ok(());
+    };
+    if obj.contains_key("to") || obj.get("opts").and_then(|o| o.get("to")).is_some() {
+        return Err(ServerError::bad_request(
+            "A history query (`to`) names its own time range and cannot take a \
+             time pin in the ledger path",
+        ));
+    }
+
+    const DATASET_KEYS: [&str; 4] = ["from", "ledger", "fromNamed", "from-named"];
+    let mut names_dataset = false;
+    let mut pinned = 0;
+    for key in DATASET_KEYS {
+        if let Some(value) = obj.get_mut(key) {
+            names_dataset = true;
+            pinned += pin_jsonld_sources(value, key, path, pin)?;
+        }
+        if let Some(value) = obj.get_mut("opts").and_then(|o| o.get_mut(key)) {
+            names_dataset = true;
+            pinned += pin_jsonld_sources(value, key, path, pin)?;
+        }
+    }
+    if names_dataset && pinned == 0 {
+        return Err(ServerError::bad_request(format!(
+            "The ledger path pins '{}@{}', but the query's dataset does not read '{}'",
+            path.ledger, pin.raw, path.ledger
+        )));
+    }
+
+    // A top-level `from` is also what routes the body onto the dataset path.
+    if needs_default_graph_injection(query) {
+        let (key, value) = pin.jsonld_field();
+        if let Some(obj) = query.as_object_mut() {
+            let mut from = serde_json::Map::new();
+            from.insert("@id".to_string(), JsonValue::String(path.ledger.clone()));
+            from.insert(key.to_string(), value);
+            obj.insert("from".to_string(), JsonValue::Object(from));
+        }
+    }
+    Ok(())
+}
+
+/// Pin the sources in one `from` / `fromNamed` value; returns how many name the
+/// path's ledger.
+fn pin_jsonld_sources(
+    value: &mut JsonValue,
+    key: &str,
+    path: &PathLedger,
+    pin: &PathPin,
+) -> Result<usize> {
+    let mut pinned = 0;
+    match value {
+        JsonValue::Array(items) => {
+            for item in items {
+                pinned += pin_jsonld_source(item, key, path, pin)?;
+            }
+        }
+        // `fromNamed` object form maps aliases to sources.
+        JsonValue::Object(map) if matches!(key, "fromNamed" | "from-named") => {
+            for item in map.values_mut() {
+                pinned += pin_jsonld_source(item, key, path, pin)?;
+            }
+        }
+        other => pinned += pin_jsonld_source(other, key, path, pin)?,
+    }
+    Ok(pinned)
+}
+
+fn pin_jsonld_source(
+    source: &mut JsonValue,
+    key: &str,
+    path: &PathLedger,
+    pin: &PathPin,
+) -> Result<usize> {
+    let names_path_ledger = |id: &str| {
+        fluree_db_api::LedgerRef::parse(id)
+            .ok()
+            .filter(|r| r.id == path.id)
+    };
+    let invalid = |detail: String| {
+        ServerError::bad_request(format!("Invalid time pin in the query's `{key}`: {detail}"))
+    };
+    match source {
+        JsonValue::String(id) => {
+            let Some(r) = names_path_ledger(id) else {
+                return Ok(0);
+            };
+            match r.at {
+                Some(at) => {
+                    let own =
+                        TimeSpec::parse_address_suffix(&at).map_err(|e| invalid(e.to_string()))?;
+                    pin.reconcile(&own, || format!("the query's `{key}` '{id}'"))?;
+                }
+                None => {
+                    let (field, value) = pin.jsonld_field();
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("@id".to_string(), JsonValue::String(id.clone()));
+                    obj.insert(field.to_string(), value);
+                    *source = JsonValue::Object(obj);
+                }
+            }
+            Ok(1)
+        }
+        JsonValue::Object(obj) => {
+            let Some(id) = obj
+                .get("@id")
+                .or_else(|| obj.get("id"))
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+            else {
+                return Ok(0);
+            };
+            let Some(r) = names_path_ledger(&id) else {
+                return Ok(0);
+            };
+            let mut own = Vec::new();
+            if let Some(at) = &r.at {
+                own.push(TimeSpec::parse_address_suffix(at).map_err(|e| invalid(e.to_string()))?);
+            }
+            if let Some(t) = obj.get("t") {
+                let t = t
+                    .as_i64()
+                    .ok_or_else(|| invalid(format!("`t` must be an integer, got {t}")))?;
+                own.push(TimeSpec::AtT(t));
+            }
+            if let Some(at) = obj.get("at") {
+                let at = at
+                    .as_str()
+                    .ok_or_else(|| invalid(format!("`at` must be a string, got {at}")))?;
+                own.push(TimeSpec::parse_at(at).map_err(|e| invalid(e.to_string()))?);
+            }
+            for spec in &own {
+                pin.reconcile(spec, || format!("the query's `{key}` entry for '{id}'"))?;
+            }
+            if own.is_empty() {
+                let (field, value) = pin.jsonld_field();
+                obj.insert(field.to_string(), value);
+            }
+            Ok(1)
+        }
+        _ => Ok(0),
     }
 }
 
@@ -2241,6 +2551,80 @@ mod ledger_scoped_from_tests {
     }
 }
 
+#[cfg(test)]
+mod path_pin_tests {
+    use super::{pin_jsonld_dataset, PathLedger};
+    use fluree_db_api::TimeSpec;
+    use serde_json::json;
+
+    #[test]
+    fn path_keeps_its_spelling_minus_the_pin() {
+        let path = PathLedger::parse("books@t:5").unwrap();
+        assert_eq!(path.ledger, "books");
+        assert_eq!(path.id.as_str(), "books:main");
+        let pin = path.pin.unwrap();
+        assert_eq!((pin.raw.as_str(), pin.spec), ("t:5", TimeSpec::AtT(5)));
+
+        let path = PathLedger::parse("urn:fluree:books:dev@time:2024-01-01T00:00:00Z").unwrap();
+        assert_eq!(path.ledger, "urn:fluree:books:dev");
+        assert_eq!(
+            path.pin.unwrap().spec,
+            TimeSpec::AtTime("2024-01-01T00:00:00Z".into())
+        );
+
+        let path = PathLedger::parse("books:dev").unwrap();
+        assert_eq!(path.ledger, "books:dev");
+        assert!(path.pin.is_none());
+
+        for bad in ["books@t:x", "books@", "books@t:1#txn-meta"] {
+            assert!(PathLedger::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn opts_from_is_pinned_and_the_dataset_path_is_forced() {
+        let path = PathLedger::parse("books@t:5").unwrap();
+        let mut q = json!({"select": ["?s"], "where": [], "opts": {"from": "books:main"}});
+        pin_jsonld_dataset(&path, &mut q).unwrap();
+        assert_eq!(q["opts"]["from"], json!({"@id": "books:main", "t": 5}));
+        assert_eq!(q["from"], json!({"@id": "books", "t": 5}));
+    }
+
+    #[test]
+    fn named_sources_of_this_ledger_take_the_pin_and_others_do_not() {
+        let path = PathLedger::parse("books@commit:abcdef").unwrap();
+        let mut q = json!({
+            "fromNamed": ["books#http://ex.org/g", "other:main#http://ex.org/g"],
+            "from-named": {"g": {"@id": "books:main", "@graph": "http://ex.org/g"}}
+        });
+        pin_jsonld_dataset(&path, &mut q).unwrap();
+        assert_eq!(
+            q["fromNamed"],
+            json!([
+                {"@id": "books#http://ex.org/g", "at": "commit:abcdef"},
+                "other:main#http://ex.org/g"
+            ])
+        );
+        assert_eq!(q["from-named"]["g"]["at"], json!("commit:abcdef"));
+        assert!(
+            q.get("from").is_none(),
+            "fromNamed alone keeps an empty default graph"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_source_time_is_refused() {
+        let path = PathLedger::parse("books@t:5").unwrap();
+        for from in [
+            json!({"@id": "books", "t": "5"}),
+            json!({"@id": "books", "at": 5}),
+        ] {
+            let mut q = json!({ "from": from });
+            assert!(pin_jsonld_dataset(&path, &mut q).is_err(), "{from}");
+        }
+    }
+}
+
 /// Delimited format requested by the client (TSV or CSV).
 #[derive(Debug, Clone, Copy)]
 enum DelimitedFormat {
@@ -2580,17 +2964,38 @@ async fn execute_query_proxy(
 /// the embedded path. This function is only reached when the query carries a
 /// dataset clause, so a query with no `FROM`/`FROM NAMED` at all still reads
 /// the ledger's default graph as before.
+///
+/// `pin` is a time pin from the ledger path: it applies to every source that
+/// names no time of its own, and one that does must agree with it.
 pub(crate) fn ledger_scoped_sparql_dataset_spec(
     ledger_id: &str,
     dc: &fluree_db_sparql::ast::DatasetClause,
+    pin: Option<&PathPin>,
 ) -> Result<DatasetSpec> {
     let base_path = base_ledger_id(ledger_id)?;
     let mut spec = DatasetSpec::new();
+    let timed = |src: GraphSource, own: Option<TimeSpec>, raw: &str| -> Result<GraphSource> {
+        let time = match (own, pin) {
+            (Some(own), Some(pin)) => {
+                pin.reconcile(&own, || format!("SPARQL FROM <{raw}>"))?;
+                Some(own)
+            }
+            (None, Some(pin)) => Some(pin.spec.clone()),
+            (own, None) => own,
+        };
+        Ok(match time {
+            Some(ts) => src.with_time(ts),
+            None => src,
+        })
+    };
 
     let mut add_default = |raw: &str| -> Result<()> {
         if raw == ledger_id {
-            spec.default_graphs
-                .push(GraphSource::new(ledger_id).with_graph(GraphSelector::Default));
+            spec.default_graphs.push(timed(
+                GraphSource::new(ledger_id).with_graph(GraphSelector::Default),
+                None,
+                raw,
+            )?);
             return Ok(());
         }
         let looks_like_ledger_ref = raw.contains('@')
@@ -2607,20 +3012,20 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
                     "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM targets '{raw}'"
                 )));
             }
-            let time_spec = time.map(TimeSpec::from);
             let selector = frag
                 .map(GraphSelector::from_str)
                 .unwrap_or(GraphSelector::Default);
-            let mut src = GraphSource::new(ledger_id).with_graph(selector);
-            if let Some(ts) = time_spec {
-                src = src.with_time(ts);
-            }
-            spec.default_graphs.push(src);
+            let src = GraphSource::new(ledger_id).with_graph(selector);
+            spec.default_graphs
+                .push(timed(src, time.map(TimeSpec::from), raw)?);
             return Ok(());
         }
         let selector = GraphSelector::from_str(raw);
-        spec.default_graphs
-            .push(GraphSource::new(ledger_id).with_graph(selector));
+        spec.default_graphs.push(timed(
+            GraphSource::new(ledger_id).with_graph(selector),
+            None,
+            raw,
+        )?);
         Ok(())
     };
 
@@ -2639,25 +3044,24 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
                     "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM NAMED targets '{raw}'"
                 )));
             }
-            let time_spec = time.map(TimeSpec::from);
             let selector = frag
                 .map(GraphSelector::from_str)
                 .unwrap_or(GraphSelector::Default);
-            let mut src = GraphSource::new(ledger_id)
+            let src = GraphSource::new(ledger_id)
                 .with_graph(selector)
                 .with_alias(raw);
-            if let Some(ts) = time_spec {
-                src = src.with_time(ts);
-            }
-            spec.named_graphs.push(src);
+            spec.named_graphs
+                .push(timed(src, time.map(TimeSpec::from), raw)?);
             return Ok(());
         }
         let selector = GraphSelector::from_str(raw);
-        spec.named_graphs.push(
+        spec.named_graphs.push(timed(
             GraphSource::new(ledger_id)
                 .with_graph(selector)
                 .with_alias(raw),
-        );
+            None,
+            raw,
+        )?);
         Ok(())
     };
 
@@ -2856,12 +3260,13 @@ fn pattern_reads_default_graph(pattern: &fluree_db_sparql::ast::GraphPattern) ->
 
 async fn execute_cypher_ledger(
     state: &AppState,
-    ledger_id: &str,
+    path: &PathLedger,
     cypher: &str,
     identity: Option<&str>,
     headers: &FlureeHeaders,
     span: &tracing::Span,
 ) -> Result<Response> {
+    let ledger_id = path.ledger.as_str();
     let (cypher, params) = fluree_db_api::extract_cypher_envelope(cypher);
 
     // Build policy options from the resolved identity + headers. Cypher has no
@@ -2869,11 +3274,16 @@ async fn execute_cypher_ledger(
     // `policy`, `policy-values`, and `default-allow` (same as SPARQL).
     let qc_opts = crate::routes::policy_auth::bound_governance(identity, headers)?;
 
-    let view = state
-        .fluree
-        .db_with_default_context(ledger_id)
-        .await
-        .map_err(ServerError::Api)?;
+    let view = match &path.pin {
+        None => state.fluree.db_with_default_context(ledger_id).await,
+        Some(pin) => {
+            state
+                .fluree
+                .db_at_with_default_context(ledger_id, pin.spec.clone())
+                .await
+        }
+    }
+    .map_err(ServerError::Api)?;
     // Wrap the view with policy when any policy input is present (identity,
     // policy-class, inline policy, etc.), so restricted data is filtered.
     let view = if qc_opts.has_any_policy_inputs() {
@@ -2926,16 +3336,44 @@ async fn execute_cypher_ledger(
         .into_response())
 }
 
+/// The ledger endpoint's SPARQL dataset, policy-wrapped when the request
+/// carries policy. `default_context_ledger` attaches that ledger's stored
+/// default context to the default graph.
+async fn ledger_dataset_view(
+    state: &AppState,
+    spec: &DatasetSpec,
+    qc_opts: &fluree_db_api::GovernanceOptions,
+    default_context_ledger: Option<&str>,
+) -> Result<fluree_db_api::DataSetDb> {
+    let mut dataset = if qc_opts.has_any_policy_inputs() {
+        state
+            .fluree
+            .build_dataset_view_with_policy(spec, qc_opts)
+            .await
+    } else {
+        state
+            .fluree
+            .build_dataset_view_as(spec, qc_opts.server_identity.as_ref())
+            .await
+    }
+    .map_err(ServerError::Api)?;
+    if let (Some(ledger_id), Some(view)) = (default_context_ledger, dataset.default.first_mut()) {
+        *view = attach_default_context_to_graph(state, ledger_id, view.clone(), true).await?;
+    }
+    Ok(dataset)
+}
+
 /// Execute a SPARQL query against a specific ledger and return result
 async fn execute_sparql_ledger(
     state: &AppState,
-    ledger_id: &str,
+    path: &PathLedger,
     sparql: &str,
     identity: Option<&str>,
     delimited: Option<DelimitedFormat>,
     headers: &FlureeHeaders,
     use_default_context: bool,
 ) -> Result<Response> {
+    let (ledger_id, pin) = (path.ledger.as_str(), path.pin.as_ref());
     // Create span for peer mode loading
     let span = tracing::debug_span!(
         "sparql_execute",
@@ -2967,6 +3405,9 @@ async fn execute_sparql_ledger(
         let has_dataset_clause = dataset_clause
             .map(|d| !d.default_graphs.is_empty() || !d.named_graphs.is_empty() || d.to_graph.is_some())
             .unwrap_or(false);
+        // A time pin in the path reads through the dataset path, which is where
+        // a pinned ledger loads (as it does for `FROM <ledger@t:N>`).
+        let dataset_lane = has_dataset_clause || pin.is_some();
 
         // Build GovernanceOptions from the resolved identity plus header-supplied
         // policy fields. SPARQL has no body `opts` block, so headers are the only
@@ -2988,7 +3429,7 @@ async fn execute_sparql_ledger(
             sparql_json_response_format(parsed.ast.as_ref(), headers);
 
         // In proxy mode, use the unified Fluree method (returns pre-formatted JSON)
-        if state.config.is_proxy_storage_mode() && !has_dataset_clause {
+        if state.config.is_proxy_storage_mode() && !dataset_lane {
             if wants_sparql_xml {
                 return Err(ServerError::not_acceptable(
                     "SPARQL Results XML is not supported in proxy mode".to_string(),
@@ -3050,7 +3491,7 @@ async fn execute_sparql_ledger(
         // dataset clause go through the connection path (returns pre-formatted
         // JSON). Dataset-clause queries with policy are handled in the dataset
         // branch below via build_dataset_view_with_policy.
-        if qc_opts.has_any_policy_inputs() && !has_dataset_clause {
+        if qc_opts.has_any_policy_inputs() && !dataset_lane {
             if wants_sparql_xml {
                 return Err(ServerError::not_acceptable(
                     "SPARQL Results XML is not supported for identity-scoped SPARQL queries"
@@ -3101,22 +3542,20 @@ async fn execute_sparql_ledger(
                 .into_response());
         }
 
-        // Ledger-scoped SPARQL with dataset clauses (FROM/FROM NAMED): build a dataset
-        // of graphs within this ledger and execute as a dataset query.
-        if has_dataset_clause {
+        // Ledger-scoped SPARQL with dataset clauses (FROM/FROM NAMED) or a pinned
+        // path: build a dataset of graphs within this ledger and execute as a
+        // dataset query.
+        if dataset_lane {
             if let Some(fmt) = delimited {
                 return Err(ServerError::not_acceptable(format!(
-                    "{} format not supported for SPARQL dataset clauses on the ledger endpoint",
+                    "{} format not supported for SPARQL dataset clauses or a time-pinned \
+                     ledger path on the ledger endpoint",
                     fmt.name().to_uppercase()
                 )));
             }
 
-            let Some(dc) = dataset_clause else {
-                // Should be unreachable given has_dataset_clause
-                return Err(ServerError::bad_request("Invalid SPARQL dataset clause"));
-            };
-
-            if dc.to_graph.is_some() {
+            let dc = dataset_clause.filter(|_| has_dataset_clause);
+            if dc.is_some_and(|dc| dc.to_graph.is_some()) {
                 return Err(ServerError::bad_request(
                     "SPARQL history range (FROM <...> TO <...>) is not supported on the ledger-scoped endpoint; use /fluree/query instead",
                 ));
@@ -3140,8 +3579,20 @@ async fn execute_sparql_ledger(
                 }
             }
 
-            let spec = ledger_scoped_sparql_dataset_spec(ledger_id, dc)?;
-            let warn_headers = dataset_semantics_warning_headers(dc, parsed.ast.as_ref());
+            let spec = match (dc, pin) {
+                (Some(dc), _) => ledger_scoped_sparql_dataset_spec(ledger_id, dc, pin)?,
+                (None, Some(pin)) => pinned_ledger_spec(ledger_id, pin),
+                (None, None) => {
+                    return Err(ServerError::bad_request("Invalid SPARQL dataset clause"));
+                }
+            };
+            let warn_headers = dc
+                .map(|dc| dataset_semantics_warning_headers(dc, parsed.ast.as_ref()))
+                .unwrap_or_default();
+            // A pinned query with no dataset clause stands in for the
+            // single-graph path, which honours `default-context`.
+            let default_context_ledger =
+                (use_default_context && dc.is_none()).then_some(ledger_id);
 
             // Tracked dataset query: if tracking headers are present, use tracked path
             if headers.has_tracking() {
@@ -3157,15 +3608,8 @@ async fn execute_sparql_ledger(
                     )));
                 }
                 let tracking_opts = headers.to_tracking_options();
-                let dataset = if qc_opts.has_any_policy_inputs() {
-                    state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
-                } else {
-                    state
-                        .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
-                        .await
-                }
-                .map_err(ServerError::Api)?;
+                let dataset =
+                    ledger_dataset_view(state, &spec, &qc_opts, default_context_ledger).await?;
                 let response = dataset
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
@@ -3213,15 +3657,8 @@ async fn execute_sparql_ledger(
                             .to_string(),
                     ));
                 }
-                let dataset = if qc_opts.has_any_policy_inputs() {
-                    state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
-                } else {
-                    state
-                        .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
-                        .await
-                }
-                .map_err(ServerError::Api)?;
+                let dataset =
+                    ledger_dataset_view(state, &spec, &qc_opts, default_context_ledger).await?;
                 let xml = dataset
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
@@ -3241,15 +3678,8 @@ async fn execute_sparql_ledger(
 
             // Turtle / N-Triples / RDF/XML: a CONSTRUCT/DESCRIBE graph
             if let Some(fmt) = graph_format {
-                let dataset = if qc_opts.has_any_policy_inputs() {
-                    state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
-                } else {
-                    state
-                        .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
-                        .await
-                }
-                .map_err(ServerError::Api)?;
+                let dataset =
+                    ledger_dataset_view(state, &spec, &qc_opts, default_context_ledger).await?;
                 let body = dataset
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
@@ -3275,7 +3705,7 @@ async fn execute_sparql_ledger(
                             .to_string(),
                     ));
                 }
-                let from_count = dc.default_graphs.len();
+                let from_count = dc.map_or(0, |dc| dc.default_graphs.len());
                 let agent_ctx = fluree_db_api::AgentJsonContext {
                     sparql_text: Some(sparql.to_string()),
                     from_count,
@@ -3287,15 +3717,8 @@ async fn execute_sparql_ledger(
                 if let Some(max_bytes) = headers.max_bytes() {
                     config = config.with_max_bytes(max_bytes);
                 }
-                let dataset = if qc_opts.has_any_policy_inputs() {
-                    state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
-                } else {
-                    state
-                        .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
-                        .await
-                }
-                .map_err(ServerError::Api)?;
+                let dataset =
+                    ledger_dataset_view(state, &spec, &qc_opts, default_context_ledger).await?;
                 let result = dataset
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
@@ -3313,15 +3736,8 @@ async fn execute_sparql_ledger(
                     .into_response());
             }
 
-            let dataset = if qc_opts.has_any_policy_inputs() {
-                state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
-            } else {
-                state
-                    .fluree
-                    .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
-                    .await
-            }
-            .map_err(ServerError::Api)?;
+            let dataset =
+                ledger_dataset_view(state, &spec, &qc_opts, default_context_ledger).await?;
             let result = dataset
                 .query(state.fluree.as_ref())
                 .sparql(sparql)

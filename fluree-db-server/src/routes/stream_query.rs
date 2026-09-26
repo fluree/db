@@ -44,7 +44,7 @@ use crate::routes::query::{
     collect_sparql_min_t_requirements, enforce_bearer_dataset_scope, get_ledger_id,
     has_policy_opts, inject_default_context_if_requested, inject_headers_into_query,
     is_sparql_request, load_ledger_for_query, normalize_ledger_scoped_from,
-    requires_dataset_features, resolve_sparql_text, SparqlParams,
+    requires_dataset_features, resolve_sparql_text, PathLedger, SparqlParams,
 };
 use crate::state::AppState;
 
@@ -263,6 +263,15 @@ async fn stream_query_inner(
         ));
     }
 
+    // The streaming dataset path does not enumerate a ledger's named graphs
+    // under `GRAPH ?g`, so a pinned read here would silently drop them.
+    if PathLedger::parse(&ledger)?.pin.is_some() {
+        return Err(ServerError::bad_request(
+            "A time pin in the ledger path is not supported on the streaming endpoint; \
+             use /v1/fluree/query/<ledger>@<pin>",
+        ));
+    }
+
     // Resolve into one of two execution shapes, planned before the 200 stream
     // commits so parse errors / unsupported shapes return a clean 4xx:
     //  - Single: the lean single-ledger GraphDb path (common case).
@@ -325,7 +334,7 @@ async fn stream_query_inner(
                     dc,
                     parsed.ast.as_ref(),
                 );
-                crate::routes::query::ledger_scoped_sparql_dataset_spec(&ledger, dc)?
+                crate::routes::query::ledger_scoped_sparql_dataset_spec(&ledger, dc, None)?
             } else {
                 let mut spec = fluree_db_api::DatasetSpec::new();
                 spec.default_graphs.push(
