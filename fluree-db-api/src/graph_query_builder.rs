@@ -171,9 +171,9 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     };
                     // Unlike the `from`-driven builder, nothing downstream of this
                     // one wraps policy, so a governed source would otherwise be read
-                    // unfiltered. Gated on the request carrying a policy input, the
-                    // same rule `apply_source_or_global_policy` uses: a request with
-                    // none is unrestricted, exactly as for a native ledger.
+                    // unfiltered. Same rule as `apply_source_or_global_policy`: a
+                    // request's own policy inputs win, and a request without any
+                    // still gets the source's configured defaults.
                     let mut opts = match self.core.input.as_ref() {
                         Some(crate::view::QueryInput::JsonLd(json)) => {
                             crate::GovernanceOptions::from_json(json)
@@ -187,7 +187,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     if opts.has_any_policy_inputs() {
                         return self.graph.fluree.wrap_policy(db, &opts).await;
                     }
-                    return Ok(db);
+                    return self.graph.fluree.wrap_policy_defaults(db).await;
                 }
             }
         }

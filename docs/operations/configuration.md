@@ -705,6 +705,24 @@ fluree-server \
   --mcp-auth-trusted-issuer did:key:z6Mk...
 ```
 
+Whether `/mcp` requires a token follows the data API. With `--data-auth-mode none` (the
+default) and no MCP issuer configured (`--mcp-auth-trusted-issuer`, or the
+`--events-auth-trusted-issuer` fallback), `/mcp` is as open as the query API: no token is
+needed, any token sent is ignored, and every ledger is readable, governed by each ledger's
+policy defaults. Configuring an MCP issuer requires tokens regardless of data auth. With
+data auth `optional` or `required`, tokens are always required and the server will not
+start without an MCP issuer.
+
+Issuer trust admits a token; its ledger claims decide what it can reach. Both MCP tools
+authorize the requested ledger against `fluree.ledger.read.all` /
+`fluree.ledger.read.ledgers` (falling back to `fluree.storage.*`), the same claims the data
+API uses — see [Authentication](../security/authentication.md). A token with neither claim
+reaches no ledger; issue `"fluree.ledger.read.all": true` for an agent that should read
+everything.
+
+For a walkthrough from a local tryout to a scoped production setup, see
+[Connect an agent over MCP](../ai/mcp-server.md).
+
 ## Peer Mode Configuration
 
 ### Peer Subscription

@@ -29,6 +29,20 @@ fn extract_principal(context: &rmcp::service::RequestContext<RoleServer>) -> Opt
         .cloned()
 }
 
+/// The principal, if its ledger claims cover `ledger`.
+fn authorize(
+    context: &rmcp::service::RequestContext<RoleServer>,
+    ledger: &str,
+) -> Option<McpPrincipal> {
+    extract_principal(context)
+        .filter(|p| crate::error::scope_id(ledger).is_ok_and(|id| p.can_read(&id)))
+}
+
+/// What an unauthorized ledger gets: the same answer as one that does not exist.
+fn ledger_not_found() -> CallToolResult {
+    CallToolResult::error(vec![Content::text("Ledger not found")])
+}
+
 /// Request parameters for SPARQL query tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SparqlQueryRequest {
@@ -101,9 +115,11 @@ impl FlureeToolService {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = std::time::Instant::now();
 
-        // Extract identity from MCP principal for policy enforcement
-        let principal = extract_principal(&context);
-        let identity = principal.as_ref().and_then(|p| p.identity.as_deref());
+        let Some(principal) = authorize(&context, &req.ledger) else {
+            return Ok(ledger_not_found());
+        };
+        // The principal's identity drives policy enforcement.
+        let identity = principal.identity.as_deref();
 
         tracing::info!(
             ledger = %req.ledger,
@@ -198,44 +214,37 @@ impl FlureeToolService {
         // auth-layer verified: it gates `f:overrideControl` as well as policy.
         let server_identity = identity.clone().map(VerifiedIdentity::new);
         let mut envelope = run_query_task(timeout_ms, server_identity, move || async move {
-            let envelope = match identity.as_deref() {
+            let view = match identity.as_deref() {
                 Some(id) => {
                     let opts = fluree_db_api::GovernanceOptions {
                         identity: Some(id.to_string()),
                         server_identity: Some(VerifiedIdentity::new(id)),
                         ..Default::default()
                     };
-                    let view = match t {
+                    match t {
                         Some(t) => state.fluree.db_at_t_with_policy(&ledger, t, &opts).await?,
                         None => state.fluree.db_with_policy(&ledger, &opts).await?,
-                    };
-                    view.query(state.fluree.as_ref())
-                        .sparql(&query)
-                        .format(config)
-                        .execution_options(crate::query_control::current_query_execution_options(
-                            timeout_ms,
-                        ))
-                        .execute_formatted()
-                        .await?
+                    }
                 }
+                // No identity is an anonymous read: the ledger's configured
+                // policy defaults govern it, as on `/query`.
                 None => {
-                    let graph = match t {
-                        Some(t) => state
-                            .fluree
-                            .graph_at(&ledger, fluree_db_api::TimeSpec::AtT(t)),
-                        None => state.fluree.graph(&ledger),
+                    let view = match t {
+                        Some(t) => state.fluree.db_at_t(&ledger, t).await?,
+                        None => state.fluree.db(&ledger).await?,
                     };
-                    graph
-                        .query()
-                        .sparql(&query)
-                        .format(config)
-                        .execution_options(crate::query_control::current_query_execution_options(
-                            timeout_ms,
-                        ))
-                        .execute_formatted()
-                        .await?
+                    state.fluree.wrap_policy_defaults(view).await?
                 }
             };
+            let envelope = view
+                .query(state.fluree.as_ref())
+                .sparql(&query)
+                .format(config)
+                .execution_options(crate::query_control::current_query_execution_options(
+                    timeout_ms,
+                ))
+                .execute_formatted()
+                .await?;
             Ok(envelope)
         })
         .await
@@ -292,9 +301,12 @@ impl FlureeToolService {
     async fn get_data_model(
         &self,
         Parameters(req): Parameters<GetDataModelRequest>,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = std::time::Instant::now();
+        if authorize(&context, &req.ledger).is_none() {
+            return Ok(ledger_not_found());
+        }
 
         tracing::info!(
             ledger = %req.ledger,

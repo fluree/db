@@ -252,6 +252,8 @@ pub struct McpAuthConfig {
     /// DANGEROUS: Accept any valid signature regardless of issuer.
     /// Only for development/testing.
     pub insecure_accept_any_issuer: bool,
+    /// The data API's auth mode, which decides whether MCP may run tokenless.
+    pub data_auth_mode: DataAuthMode,
 }
 
 impl McpAuthConfig {
@@ -261,19 +263,29 @@ impl McpAuthConfig {
         mcp_enabled: bool,
         events_auth: &EventsAuthConfig,
     ) -> Result<(), String> {
-        if mcp_enabled {
-            // Must have some trusted issuers (own or from events_auth)
-            let has_trusted = !self.trusted_issuers.is_empty()
-                || !events_auth.trusted_issuers.is_empty()
+        if mcp_enabled && self.token_required(events_auth) {
+            let has_trusted = !self.effective_trusted_issuers(events_auth).is_empty()
                 || self.insecure_accept_any_issuer;
 
             if !has_trusted {
-                return Err("mcp_enabled requires --mcp-auth-trusted-issuer, \
-                     --events-auth-trusted-issuer, or --mcp-auth-insecure flag"
-                    .to_string());
+                return Err(
+                    "mcp_enabled with --data-auth-mode optional or required needs \
+                     --mcp-auth-trusted-issuer, --events-auth-trusted-issuer, or \
+                     --mcp-auth-insecure"
+                        .to_string(),
+                );
             }
         }
         Ok(())
+    }
+
+    /// Whether `/mcp` requests must carry a token. Without data auth and without
+    /// any MCP issuer configured, `/mcp` is as open as `/query` on the same
+    /// server; configuring an issuer turns tokens on regardless of data auth.
+    pub fn token_required(&self, events_auth: &EventsAuthConfig) -> bool {
+        self.data_auth_mode != DataAuthMode::None
+            || self.insecure_accept_any_issuer
+            || !self.effective_trusted_issuers(events_auth).is_empty()
     }
 
     /// Get effective trusted issuers (own list or fallback to events_auth)
@@ -1092,6 +1104,7 @@ impl ServerConfig {
         McpAuthConfig {
             trusted_issuers: self.mcp_auth_trusted_issuers.clone(),
             insecure_accept_any_issuer: self.mcp_auth_insecure_accept_any_issuer,
+            data_auth_mode: self.data_auth_mode,
         }
     }
 
@@ -1488,5 +1501,55 @@ mod policy_authority_tests {
         assert!(config.validate().is_err());
         config.audience = Some("production-data".into());
         assert!(config.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod mcp_auth_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_runs_tokenless_only_without_data_auth_or_an_mcp_issuer() {
+        let no_events = EventsAuthConfig::default();
+        let open = McpAuthConfig::default();
+        assert!(!open.token_required(&no_events));
+        assert!(
+            open.validate(true, &no_events).is_ok(),
+            "--mcp-enabled alone"
+        );
+
+        let with_issuer = McpAuthConfig {
+            trusted_issuers: vec!["did:key:mcp".into()],
+            ..Default::default()
+        };
+        assert!(with_issuer.token_required(&no_events));
+
+        let insecure = McpAuthConfig {
+            insecure_accept_any_issuer: true,
+            ..Default::default()
+        };
+        assert!(insecure.token_required(&no_events));
+
+        let events = EventsAuthConfig {
+            trusted_issuers: vec!["did:key:events".into()],
+            ..Default::default()
+        };
+        assert!(
+            open.token_required(&events),
+            "events issuers are MCP's fallback"
+        );
+
+        for mode in [DataAuthMode::Optional, DataAuthMode::Required] {
+            let guarded = McpAuthConfig {
+                data_auth_mode: mode,
+                ..Default::default()
+            };
+            assert!(guarded.token_required(&no_events));
+            assert!(
+                guarded.validate(true, &no_events).is_err(),
+                "{mode:?} data auth needs an MCP issuer"
+            );
+            assert!(guarded.validate(false, &no_events).is_ok());
+        }
     }
 }

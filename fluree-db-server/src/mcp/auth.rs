@@ -12,24 +12,53 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use fluree_db_api::LedgerId;
 use fluree_db_credential::{verify_jws, EventsTokenPayload};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Verified principal from MCP Bearer token
 #[derive(Debug, Clone)]
 pub struct McpPrincipal {
-    /// Issuer did:key (from iss claim, verified against signing key)
-    pub issuer: String,
+    /// Issuer did:key (from iss claim, verified against signing key); `None`
+    /// on a server that runs MCP without tokens.
+    pub issuer: Option<String>,
     /// Subject (from sub claim)
     pub subject: Option<String>,
     /// Resolved identity (fluree.identity ?? sub)
     pub identity: Option<String>,
+    /// Read access to all ledgers (`fluree.ledger.read.all`).
+    pub read_all: bool,
+    /// Ledgers this token may read (`fluree.ledger.read.ledgers`), parsed like
+    /// data API scopes: `mydb` means `mydb:main`.
+    pub read_ledgers: HashSet<LedgerId>,
+}
+
+impl McpPrincipal {
+    /// The principal of a tokenless request: every ledger, no identity, so
+    /// ledger policy defaults apply exactly as on the open data API.
+    fn open() -> Self {
+        Self {
+            issuer: None,
+            subject: None,
+            identity: None,
+            read_all: true,
+            read_ledgers: HashSet::new(),
+        }
+    }
+
+    /// Whether this token may read `ledger_id`. Issuer trust admits a token;
+    /// its ledger claims decide what it reaches.
+    pub fn can_read(&self, ledger_id: &LedgerId) -> bool {
+        self.read_all || self.read_ledgers.contains(ledger_id)
+    }
 }
 
 /// Middleware to validate MCP Bearer tokens.
 ///
-/// When MCP is enabled, all requests to /mcp must have a valid Bearer token
-/// from a trusted issuer.
+/// When tokens are required (see [`McpAuthConfig::token_required`]), every
+/// request to /mcp must carry a valid Bearer token from a trusted issuer.
+/// Otherwise any token is ignored, as the data API does in `none` mode.
 pub async fn validate_mcp_token(
     State(state): State<Arc<AppState>>,
     mut request: Request<Body>,
@@ -37,6 +66,11 @@ pub async fn validate_mcp_token(
 ) -> Response {
     let mcp_auth = state.config.mcp_auth();
     let events_auth = state.config.events_auth();
+
+    if !mcp_auth.token_required(&events_auth) {
+        request.extensions_mut().insert(McpPrincipal::open());
+        return next.run(request).await;
+    }
 
     // Extract Bearer token from Authorization header
     let token = match extract_bearer_token(request.headers()) {
@@ -62,7 +96,7 @@ pub async fn validate_mcp_token(
     };
 
     tracing::debug!(
-        issuer = %principal.issuer,
+        issuer = ?principal.issuer,
         identity = ?principal.identity,
         "MCP token verified"
     );
@@ -107,9 +141,12 @@ fn verify_mcp_token(
 
     // 5. Build principal
     let identity = payload.resolve_identity();
+    let (read_all, read_ledgers) = crate::extract::read_scopes(&payload);
     Ok(McpPrincipal {
-        issuer: payload.iss,
+        issuer: Some(payload.iss),
         subject: payload.sub,
         identity,
+        read_all,
+        read_ledgers,
     })
 }
