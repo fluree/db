@@ -757,6 +757,31 @@ case pulls them in; each has a workaround:
   `x.date.month`) and mixing `.*` with named selectors in a map projection.
 - `ORDER BY` over a list/map value, and `neo4j://` cluster routing (use
   `bolt://` direct).
+- **A read clause written after a write clause.** `MATCH`, `OPTIONAL MATCH`,
+  `WITH`, `UNWIND` and `CALL { … }` must all appear *before* the first
+  `CREATE` / `MERGE` / `SET` / `REMOVE` / `DELETE` / `FOREACH`. Put the reads
+  first (`MATCH … WITH … MERGE … SET …`), or split the statement in two.
+
+  This is stricter than openCypher, which lets reads and writes interleave, and
+  it is a **deliberate tightening of a shape that was previously accepted and
+  silently miscompiled**: the statement was rearranged so that every read ran
+  before every write, which is a different statement. What that cost depended
+  on the shape, and only two of the four classes failed loudly:
+
+  | Written | Before | Now |
+  |---|---|---|
+  | `MERGE (n) WITH n SET n.x = 1` | error blaming a policy that was not involved | clear error |
+  | `MERGE (n {name:"Z"}) WITH n.name AS nm SET n.marker = nm` | **committed wrong data** — one marker per *pre-`MERGE`* name, written onto the new node | clear error |
+  | `MATCH (n) SET n.a = 1 WITH n WHERE n.a = 1 SET n.b = 2` | **committed nothing, silently** — the filter ran before the `SET` it reads | clear error |
+  | `MATCH (n) SET n.a = 1 WITH n SET n.b = 2` | worked | clear error |
+
+  The last row is the one that will surprise people: it produced the right
+  answer, but only because that statement's reordering happened to be
+  unobservable. The row above it is the same shape with a `WHERE`, and it
+  silently wrote nothing. Since an author cannot tell from the statement which
+  of the two they have written, both are rejected rather than one being
+  blessed. `MATCH (n) SET n.a = 1 SET n.b = 2` — no read after the write — is
+  unaffected, as is every statement that already put its reads first.
 
 Everything else — the full clause/pattern/expression surface, the write path,
 procedures, and Bolt driver support — works; when in doubt, try it and read the
