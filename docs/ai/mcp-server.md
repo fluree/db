@@ -249,8 +249,8 @@ sensitive, keep it out of the token's read scope rather than relying on policy.
   that terminates TLS, since bearer tokens must not cross a network in the clear.
 - **Token types**: `/mcp` accepts Ed25519 `did:key` tokens, like the ones `fluree token`
   mints. OIDC/JWKS tokens that the data API accepts are not supported on `/mcp` yet.
-- **`--mcp-auth-insecure`** accepts a token signed by any key. It is for tests only and is
-  hidden from `--help` for that reason.
+- **`--mcp-auth-insecure-accept-any-issuer`** (`FLUREE_MCP_AUTH_INSECURE`) accepts a token
+  signed by any key. It is for tests only and is hidden from `--help` for that reason.
 
 ## Tuning
 
