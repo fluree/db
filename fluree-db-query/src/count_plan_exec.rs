@@ -1134,7 +1134,6 @@ fn merge_count_range_overlay(
     p_ids: &[u32],
     ops_per_pred: &[SharedOverlayOps],
     to_t: i64,
-    epoch: u64,
     cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
@@ -1151,7 +1150,6 @@ fn merge_count_range_overlay(
             hi,
             sliced,
             to_t,
-            epoch,
         ) else {
             return Ok(0); // PSOT branch absent => empty intersection
         };
@@ -1222,7 +1220,6 @@ fn sum_star_join_overlay_parallel(
         }
     }
     let to_t = ec.ctx.to_t;
-    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
 
     let driver_p = *p_ids
         .iter()
@@ -1248,7 +1245,6 @@ fn sum_star_join_overlay_parallel(
                 p_ids_ref,
                 ops_ref,
                 to_t,
-                epoch,
                 &ec.ctx.cancellation,
                 lo,
                 hi,
@@ -1360,7 +1356,6 @@ fn merge_optional_count_range_overlay(
     opt_groups: &[Vec<u32>],
     opt_ops: &[Vec<SharedOverlayOps>],
     to_t: i64,
-    epoch: u64,
     cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
@@ -1376,7 +1371,6 @@ fn merge_optional_count_range_overlay(
             hi,
             sliced,
             to_t,
-            epoch,
         )
         .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
@@ -1537,7 +1531,6 @@ fn sum_optional_join_overlay_parallel(
     }
 
     let to_t = ec.ctx.to_t;
-    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let driver_p = *req_pids
         .iter()
         .max_by_key(|&&p| {
@@ -1563,7 +1556,6 @@ fn sum_optional_join_overlay_parallel(
                 opt_groups,
                 opt_ops,
                 to_t,
-                epoch,
                 &ec.ctx.cancellation,
                 lo,
                 hi,
@@ -1785,7 +1777,6 @@ fn merge_modifier_intersect_range_overlay(
     inner_ops: &[SharedOverlayOps],
     is_anti: bool,
     to_t: i64,
-    epoch: u64,
     cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
@@ -1801,7 +1792,6 @@ fn merge_modifier_intersect_range_overlay(
             hi,
             sliced,
             to_t,
-            epoch,
         )
         .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
@@ -1901,7 +1891,6 @@ fn try_modifier_intersect_overlay_parallel(
     }
 
     let to_t = ec.ctx.to_t;
-    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let driver_p = std::iter::once(outer_pid)
         .chain(inner_pids.iter().copied())
         .max_by_key(|&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
@@ -1926,7 +1915,6 @@ fn try_modifier_intersect_overlay_parallel(
                 inner_ops,
                 is_anti,
                 to_t,
-                epoch,
                 &ec.ctx.cancellation,
                 lo,
                 hi,

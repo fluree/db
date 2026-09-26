@@ -452,7 +452,6 @@ fn merge_union_constraint_count_range_overlay(
     extra_pids: &[u32],
     extra_ops: &[SharedOverlayOps],
     to_t: i64,
-    epoch: u64,
     cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
@@ -468,7 +467,6 @@ fn merge_union_constraint_count_range_overlay(
             hi,
             sliced,
             to_t,
-            epoch,
         )
         .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
@@ -553,7 +551,6 @@ fn try_union_constraint_overlay_parallel(
     };
 
     let to_t = ctx.to_t;
-    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let driver_p = union_pids
         .iter()
         .chain(extra_pids.iter())
@@ -578,7 +575,6 @@ fn try_union_constraint_overlay_parallel(
                 extra_pids,
                 extra_ops,
                 to_t,
-                epoch,
                 &ctx.cancellation,
                 lo,
                 hi,

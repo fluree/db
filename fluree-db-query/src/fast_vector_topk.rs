@@ -686,10 +686,6 @@ fn scan_partitioned(
         need,
     } = scan;
     let to_t = ctx.to_t;
-    let epoch = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0);
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
@@ -749,7 +745,6 @@ fn scan_partitioned(
             hi,
             sliced,
             to_t,
-            epoch,
         ) else {
             return Ok(Some(Vec::new()));
         };
