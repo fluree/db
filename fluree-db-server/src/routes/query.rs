@@ -9,7 +9,8 @@
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
 use crate::extract::{
-    tracking_headers, FlureeHeaders, GraphFormat, MaybeCredential, MaybeDataBearer,
+    negotiate_graph_format, tracking_headers, FlureeHeaders, GraphFormat, MaybeCredential,
+    MaybeDataBearer,
 };
 // Note: NeedsRefresh is no longer used - replaced by FreshnessSource trait
 use crate::state::AppState;
@@ -17,7 +18,7 @@ use crate::telemetry::{
     create_request_span, extract_request_id, extract_trace_id, log_query_text, set_span_error_code,
     should_log_query_text,
 };
-use axum::extract::{Path, State};
+use axum::extract::{OriginalUri, Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -1273,6 +1274,91 @@ pub async fn query_ledger(
 /// GET /fluree/query/<ledger...>
 ///
 /// This avoids ambiguity when ledger names contain `/`.
+/// `GET /query`: a query, or, with no `query` parameter and no body, the
+/// endpoint's SPARQL service description.
+pub async fn query_get(
+    State(state): State<Arc<AppState>>,
+    OriginalUri(uri): OriginalUri,
+    params: SparqlParams,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+    credential: MaybeCredential,
+) -> Result<Response> {
+    if let Some(description) = service_description(&uri, &params, &credential)? {
+        return Ok(description);
+    }
+    query(State(state), params, headers, bearer, credential).await
+}
+
+/// `GET /query/<ledger...>`: as [`query_get`], for a ledger's endpoint.
+pub async fn query_ledger_get(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    params: SparqlParams,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+    credential: MaybeCredential,
+) -> Result<Response> {
+    if let Some(description) = service_description(&uri, &params, &credential)? {
+        return Ok(description);
+    }
+    query_ledger(
+        State(state),
+        Path(ledger),
+        params,
+        headers,
+        bearer,
+        credential,
+    )
+    .await
+    .map(IntoResponse::into_response)
+}
+
+/// SPARQL Service Description §2: a `GET` on a SPARQL endpoint with no query
+/// returns an RDF description of the service, in the graph format `Accept`
+/// asks for. `None` when the request carries a query. It describes the
+/// endpoint's capabilities, not data; it sits behind the same authentication
+/// as the endpoint, which the extractors apply before this runs.
+fn service_description(
+    uri: &axum::http::Uri,
+    params: &SparqlParams,
+    credential: &MaybeCredential,
+) -> Result<Option<Response>> {
+    if params.query.is_some() || !credential.body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let header = |name: &str| {
+        credential
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').next().unwrap_or(v).trim())
+            .filter(|v| !v.is_empty())
+    };
+    let format = negotiate_graph_format(header("accept")).ok_or_else(|| {
+        ServerError::not_acceptable(
+            "a service description is available as application/ld+json, text/turtle, \
+             application/n-triples or application/rdf+xml",
+        )
+    })?;
+    // `sd:endpoint` is the URL the client asked for, as it addressed us.
+    let scheme = header("x-forwarded-proto").unwrap_or("http");
+    let host = header("x-forwarded-host")
+        .or_else(|| header("host"))
+        .unwrap_or("localhost");
+    let endpoint = format!("{scheme}://{host}{}", uri.path());
+    let body = fluree_db_api::sparql_service_description(&endpoint, &format.formatter())
+        .map_err(|e| ServerError::internal(e.to_string()))?;
+    Ok(Some(
+        (
+            [(axum::http::header::CONTENT_TYPE, format.content_type())],
+            body,
+        )
+            .into_response(),
+    ))
+}
+
 pub async fn query_ledger_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,

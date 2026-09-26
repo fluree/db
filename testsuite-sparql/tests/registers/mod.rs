@@ -545,7 +545,9 @@ pub const SPARQL11_PROTOCOL: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/protocol/manifest#update_post_form",
 ];
 
-// Requires a running SPARQL server to introspect (audit §4.4).
+// Requires a running SPARQL server to introspect (audit §4.4). The server
+// serves the description; `fluree-db-server/tests/sparql_service_description.rs`
+// covers what these check (RDF returned, a matching `sd:endpoint`).
 pub const SPARQL11_SERVICE_DESCRIPTION: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/service-description/manifest#conforms-to-schema",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/service-description/manifest#has-endpoint-triple",

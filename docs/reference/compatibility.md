@@ -165,6 +165,20 @@ is not supported. See [Graph Store Protocol](../api/graph-store.md).
 
 **Specification:** https://www.w3.org/TR/sparql11-http-rdf-update/
 
+### SPARQL Service Description
+
+**Status:** Supported
+
+A `GET` on `/v1/fluree/query` or `/v1/fluree/query/{ledger}` with no `query`
+parameter returns a description of the endpoint in JSON-LD, Turtle, N-Triples
+or RDF/XML, chosen by `Accept`. It names the endpoint, the SPARQL query
+language (`sd:SPARQLQuery` at versions 1.0 through 1.2, and `sd:SPARQL11Query`
+for older clients), the result formats, and simple entailment. See
+[Service description](../api/endpoints.md#service-description).
+
+**Specification:** https://www.w3.org/TR/sparql11-service-description/ and the
+SPARQL 1.2 Service Description draft
+
 ### SPARQL 1.2
 
 **Status:** Partial support (annotations)

@@ -164,7 +164,10 @@ pub use fluree_db_core::{
     ConflictKey, QueryCancellation, QueryCancellationReason,
 };
 pub use fluree_db_core::{CommitId, ContentId};
-pub use format::{AgentJsonContext, FormatError, FormatterConfig, OutputFormat, QueryOutput};
+pub use format::{
+    sparql_service_description, AgentJsonContext, FormatError, FormatterConfig, OutputFormat,
+    QueryOutput,
+};
 pub use graph::Graph;
 pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, ResolvedValue};
 pub use graph_query_builder::{GraphQueryBuilder, GraphSnapshotQueryBuilder};

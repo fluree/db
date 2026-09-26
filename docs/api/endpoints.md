@@ -1447,6 +1447,32 @@ curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main" \
 
 Cypher responses default to `cypher-json`; request RDF JSON-LD with `Accept: application/ld+json`. The body may be raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the [Cypher reference](../query/cypher.md).
 
+### Service description
+
+A `GET` on `/query` or `/query/{ledger}` with no `query` parameter and no body returns the endpoint's [SPARQL Service Description](https://www.w3.org/TR/sparql11-service-description/): what a SPARQL client can discover about the endpoint without a trial query.
+
+```bash
+curl -H 'Accept: text/turtle' http://localhost:8090/v1/fluree/query/mydb:main
+```
+
+```turtle
+@prefix formats: <http://www.w3.org/ns/formats/> .
+@prefix sd: <http://www.w3.org/ns/sparql-service-description#> .
+@prefix sparql: <http://www.w3.org/ns/sparql#> .
+
+_:service a sd:Service ;
+    sd:defaultEntailmentRegime <http://www.w3.org/ns/entailment/Simple> ;
+    sd:endpoint <http://localhost:8090/v1/fluree/query/mydb:main> ;
+    sd:resultFormat formats:JSON-LD, formats:N-Triples, formats:RDF_XML, formats:SPARQL_Results_CSV, formats:SPARQL_Results_JSON, formats:SPARQL_Results_TSV, formats:SPARQL_Results_XML, formats:Turtle ;
+    sd:supportedLanguage sd:SPARQL11Query, sd:SPARQLQuery ;
+    sd:supportedVersion sparql:version-1.0, sparql:version-1.1, sparql:version-1.2, sparql:version-1.2-basic .
+```
+
+- **Format:** chosen by `Accept`: JSON-LD (the default), Turtle, N-Triples or RDF/XML. Any other `Accept` is a `406`.
+- **Endpoint IRI:** `sd:endpoint` is the URL the request addressed, taken from `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sets them, otherwise from `Host`.
+- **Auth:** the description sits behind the same authentication as the endpoint. With data auth required, a request without a credential is a `401`.
+- **Features:** no `sd:feature` is claimed. The default graph is not the union of the named graphs, and Fluree has no empty named graph.
+
 ### History Queries via POST /query
 
 Query the history of entities using the standard `/query` endpoint with `from` and `to` keys specifying the time range.

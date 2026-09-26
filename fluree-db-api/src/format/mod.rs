@@ -54,6 +54,7 @@ mod jsonld;
 mod materialize;
 pub mod ndjson_stream;
 mod rdf_xml;
+mod service_description;
 pub(crate) mod sparql;
 mod sparql_xml;
 mod typed;
@@ -84,6 +85,7 @@ mod xml_escape;
 
 pub use config::{AgentJsonContext, FormatterConfig, OutputFormat, QueryOutput};
 pub use iri::IriCompactor;
+pub use service_description::sparql_service_description;
 
 use crate::QueryResult;
 use fluree_db_core::LedgerSnapshot;

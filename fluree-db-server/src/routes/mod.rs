@@ -335,10 +335,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Merge leader-only routes (Raft-forwarded when applicable)
         .merge(v1_leader_only_routes)
         // Query endpoints
-        .route("/query", get(query::query).post(query::query))
+        .route("/query", get(query::query_get).post(query::query))
         .route(
             "/query/*ledger",
-            get(query::query_ledger_tail).post(query::query_ledger_tail),
+            get(query::query_ledger_get).post(query::query_ledger_tail),
         )
         .route("/multi-query", post(query::multi_query))
         .route("/data/*ledger", graph_store)
