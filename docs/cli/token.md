@@ -72,6 +72,10 @@ fluree token create --private-key @- \
   --audience https://api.example.com \
   --expires-in 7d
 
+# Token for an MCP agent: read-only, one ledger, policy identity from --subject
+fluree token create --private-key @~/.fluree/key \
+  --read-ledger mydb --subject agent:reporting --expires-in 30d
+
 # Output as curl command
 fluree token create --private-key 0x... --all --output curl
 

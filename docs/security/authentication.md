@@ -208,7 +208,9 @@ All Bearer-token-authenticated endpoints support both Ed25519 and OIDC verificat
 | Ledger listing (`GET /ledgers`) | `MaybeDataBearer` | `fluree.ledger.read.*` — lists only readable ledgers |
 | MCP tools | MCP issuer trust | `fluree.ledger.read.*` (then `fluree.storage.*`) |
 
-MCP endpoints currently use the Ed25519 path only.
+MCP endpoints currently use the Ed25519 path only. With data auth `none` and no MCP issuer
+configured, `/mcp` takes no token at all, matching the open data API; see
+[Connect an agent over MCP](../ai/mcp-server.md#when-mcp-needs-a-token).
 
 ## Security notes
 
