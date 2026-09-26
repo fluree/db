@@ -372,7 +372,7 @@ The W3C SPARQL 1.1 Graph Store HTTP Protocol: read (`GET`/`HEAD`), replace
 (`PUT`), add to (`POST`) or remove (`DELETE`) one graph, named by
 `?graph={iri}` or `?default`. `PUT` is [sync](../transactions/sync.md), so it
 commits only the difference. `PUT`/`POST` take Turtle, N-Triples, TriG or
-JSON-LD; `GET` returns JSON-LD or RDF/XML. See
+JSON-LD; `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML. See
 [Graph Store Protocol](graph-store.md) for status codes, formats and policy.
 
 ```bash
@@ -1317,29 +1317,32 @@ The full byte-format negotiation below is available on the **ledger-scoped**
 [`POST /query/{ledger}`](#post-queryledger) route. The **connection-scoped**
 `POST /query` route (SPARQL with `FROM <ledger>`) returns pre-formatted JSON only
 — it supports the JSON family (JSON-LD, SPARQL-results JSON, AgentJson) but not the
-byte formats; RDF/XML, SPARQL-results XML, and CSV/TSV require the ledger-scoped
-route (see the [connection-scoped note](#connection-scoped-sparql-output) below).
+byte formats; Turtle, N-Triples, RDF/XML, SPARQL-results XML, and CSV/TSV require
+the ledger-scoped route (see the [connection-scoped note](#connection-scoped-sparql-output) below).
 
-| Query form | Default (no/`*/*`/`application/json`) | `application/ld+json` | `application/rdf+xml` | `application/sparql-results+json` | `text/csv` / `text/tab-separated-values` | `application/sparql-results+xml` | `application/vnd.fluree.agent+json` |
+| Query form | Default (no/`*/*`/`application/json`) | `application/ld+json` | `text/turtle` / `application/n-triples` / `application/rdf+xml` | `application/sparql-results+json` | `text/csv` / `text/tab-separated-values` | `application/sparql-results+xml` | `application/vnd.fluree.agent+json` |
 |---|---|---|---|---|---|---|---|
 | `SELECT` / `ASK` | SPARQL-results JSON | JSON-LD | **406** | SPARQL-results JSON | CSV / TSV | SPARQL-results XML | AgentJson |
-| `CONSTRUCT` / `DESCRIBE` | **JSON-LD** | JSON-LD | RDF/XML | JSON-LD | **406** | **406** | **406** |
+| `CONSTRUCT` / `DESCRIBE` | **JSON-LD** | JSON-LD | Turtle / N-Triples / RDF/XML | JSON-LD | **406** | **406** | **406** |
 
 A `CONSTRUCT` / `DESCRIBE` produces an RDF graph, which has no solution/binding-table
-form, so it is always returned as **JSON-LD** (`Content-Type: application/ld+json`)
-unless `application/rdf+xml` is explicitly requested; the solution-table formats
+form. It is returned as **JSON-LD** (`Content-Type: application/ld+json`) unless
+`Accept` prefers one of the graph text formats: among `application/ld+json`,
+`application/json`, `text/turtle`, `application/n-triples` and `application/rdf+xml`
+the highest `q` wins (equal weights keep the header's order; `text/*` means Turtle).
+Turtle output declares the query's `PREFIX`es and uses them. The solution-table formats
 (SPARQL-results XML, CSV/TSV, AgentJson) are rejected with `406`. A `SELECT` / `ASK`
 defaults to SPARQL-results JSON and only switches to JSON-LD when `application/ld+json`
 is requested explicitly — a bare `application/json` keeps the SPARQL-results-JSON
-shape — and RDF/XML (a graph format) is rejected with `406`.
+shape — and an `Accept` that admits only graph formats is rejected with `406`.
 
 <a name="connection-scoped-sparql-output"></a>
 > **Connection-scoped `POST /query` (SPARQL):** this route returns pre-formatted
 > JSON only. The JSON-family columns above apply (CONSTRUCT/DESCRIBE → JSON-LD;
 > SELECT/ASK → SPARQL-results JSON, or JSON-LD with `Accept: application/ld+json`;
 > AgentJson via `application/vnd.fluree.agent+json`, rejected `406` for graph
-> queries). CSV/TSV are rejected with `406`, and `application/rdf+xml` /
-> `application/sparql-results+xml` are **not** negotiated here — use
+> queries). CSV/TSV, Turtle, N-Triples and RDF/XML are rejected with `406`, and
+> `application/sparql-results+xml` is **not** negotiated here — use
 > `POST /query/{ledger}` for those byte formats.
 
 **Status Codes:**
@@ -1347,7 +1350,7 @@ shape — and RDF/XML (a graph format) is rejected with `406`.
 - `400 Bad Request` - Invalid query syntax
 - `401 Unauthorized` - Authentication required
 - `404 Not Found` - Ledger not found
-- `406 Not Acceptable` - Requested output format is not available for this query form (e.g. RDF/XML for a `SELECT`)
+- `406 Not Acceptable` - Requested output format is not available for this query form (e.g. Turtle for a `SELECT`)
 - `413 Payload Too Large` - Query exceeds size limit
 - `500 Internal Server Error` - Server error
 - `503 Service Unavailable` - Query timeout or resource limit
@@ -1443,6 +1446,32 @@ curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main" \
 ```
 
 Cypher responses default to `cypher-json`; request RDF JSON-LD with `Accept: application/ld+json`. The body may be raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the [Cypher reference](../query/cypher.md).
+
+### Service description
+
+A `GET` on `/query` or `/query/{ledger}` with no `query` parameter and no body returns the endpoint's [SPARQL Service Description](https://www.w3.org/TR/sparql11-service-description/): what a SPARQL client can discover about the endpoint without a trial query.
+
+```bash
+curl -H 'Accept: text/turtle' http://localhost:8090/v1/fluree/query/mydb:main
+```
+
+```turtle
+@prefix formats: <http://www.w3.org/ns/formats/> .
+@prefix sd: <http://www.w3.org/ns/sparql-service-description#> .
+@prefix sparql: <http://www.w3.org/ns/sparql#> .
+
+_:service a sd:Service ;
+    sd:defaultEntailmentRegime <http://www.w3.org/ns/entailment/Simple> ;
+    sd:endpoint <http://localhost:8090/v1/fluree/query/mydb:main> ;
+    sd:resultFormat formats:JSON-LD, formats:N-Triples, formats:RDF_XML, formats:SPARQL_Results_CSV, formats:SPARQL_Results_JSON, formats:SPARQL_Results_TSV, formats:SPARQL_Results_XML, formats:Turtle ;
+    sd:supportedLanguage sd:SPARQL11Query, sd:SPARQLQuery ;
+    sd:supportedVersion sparql:version-1.0, sparql:version-1.1, sparql:version-1.2, sparql:version-1.2-basic .
+```
+
+- **Format:** chosen by `Accept`: JSON-LD (the default), Turtle, N-Triples or RDF/XML. Any other `Accept` is a `406`.
+- **Endpoint IRI:** `sd:endpoint` is the URL the request addressed, taken from `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sets them, otherwise from `Host`.
+- **Auth:** the description sits behind the same authentication as the endpoint. With data auth required, a request without a credential is a `401`.
+- **Features:** no `sd:feature` is claimed. The default graph is not the union of the named graphs, and Fluree has no empty named graph.
 
 ### History Queries via POST /query
 

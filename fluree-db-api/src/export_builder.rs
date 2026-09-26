@@ -302,7 +302,7 @@ impl<'a> ExportBuilder<'a> {
         match self.format {
             ExportFormat::Turtle => {
                 let prefixes = self.resolve_prefixes().await?;
-                export::write_prefix_declarations(&prefixes, writer).map_err(io_err)?;
+                prefixes.write_declarations(writer).map_err(io_err)?;
 
                 let config = ExportConfig {
                     g_id: target_graph.as_ref().map_or(0, |(g_id, _)| *g_id),
@@ -392,12 +392,12 @@ impl<'a> ExportBuilder<'a> {
 
             ExportFormat::TriG => {
                 let prefixes = self.resolve_prefixes().await?;
-                export::write_prefix_declarations(&prefixes, writer).map_err(io_err)?;
+                prefixes.write_declarations(writer).map_err(io_err)?;
 
                 if let Some((g_id, iri)) = &target_graph {
                     // Single named graph in GRAPH { } block
                     write!(writer, "GRAPH ").map_err(io_err)?;
-                    export::write_turtle_iri(writer, iri, &prefixes).map_err(io_err)?;
+                    prefixes.write_iri(writer, iri).map_err(io_err)?;
                     writeln!(writer, " {{").map_err(io_err)?;
 
                     let config = ExportConfig {
@@ -439,7 +439,7 @@ impl<'a> ExportBuilder<'a> {
                             self.selected_named_graphs(&ledger.snapshot.graph_registry)
                         {
                             write!(writer, "\nGRAPH ").map_err(io_err)?;
-                            export::write_turtle_iri(writer, iri, &prefixes).map_err(io_err)?;
+                            prefixes.write_iri(writer, iri).map_err(io_err)?;
                             writeln!(writer, " {{").map_err(io_err)?;
 
                             let config = ExportConfig {

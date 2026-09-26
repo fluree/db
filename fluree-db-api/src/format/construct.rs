@@ -10,7 +10,7 @@
 use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
-use fluree_db_core::FlakeValue;
+use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term};
 use fluree_db_query::ir::ConstructTemplate;
@@ -18,6 +18,7 @@ use fluree_db_query::{Batch, VarId};
 use fluree_graph_format::{format_jsonld, JsonLdFormatConfig};
 use fluree_graph_ir::{BlankId, Datatype, Graph, LiteralValue, Term as IrTerm, Triple};
 use fluree_vocab::{geo, rdf, xsd};
+use rustc_hash::FxHashMap;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -81,76 +82,107 @@ pub(super) fn instantiate_construct_graph(
         .construct_template()
         .ok_or_else(|| FormatError::InvalidBinding("CONSTRUCT missing template".into()))?;
 
+    let rows: usize = result.batches.iter().map(Batch::len).sum();
+    if rows == 0 {
+        return Ok(Graph::new());
+    }
+
+    let mut terms = TermResolver {
+        result,
+        compactor,
+        iris: FxHashMap::default(),
+        datatypes: FxHashMap::default(),
+    };
+    // Template constants resolve once, not once per solution row.
+    let patterns = template
+        .patterns
+        .iter()
+        .map(|pattern| {
+            let mut slot = |r: &Ref, position| match r {
+                Ref::Var(v) => Ok(terms_slot(template, *v)),
+                constant => terms.constant_ref(constant, position).map(Slot::Const),
+            };
+            let s = slot(&pattern.s, Position::Subject)?;
+            let p = slot(&pattern.p, Position::Predicate)?;
+            let o = match &pattern.o {
+                Term::Var(v) => terms_slot(template, *v),
+                constant => Slot::Const(terms.constant_object(constant, pattern.dtc.as_ref())?),
+            };
+            Ok([s, p, o])
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let mut graph = Graph::new();
+    graph.reserve(rows.saturating_mul(patterns.len()));
 
     // Monotonic counter for minting fresh per-solution template blank-node
     // labels; shared across all rows so the labels are globally distinct.
     let mut bnode_counter: usize = 0;
+    // Fresh blank node per template blank-node variable for ONE solution row:
+    // minted lazily on first use, shared by every template triple in the row,
+    // and — via the row-global `bnode_counter` — distinct from every other
+    // row's blanks.
+    let mut row_bnodes: HashMap<VarId, BlankId> = HashMap::new();
 
     for batch in &result.batches {
-        for row_idx in 0..batch.len() {
-            instantiate_row(
-                result,
-                template,
-                batch,
-                row_idx,
-                compactor,
-                &mut graph,
-                &mut bnode_counter,
-            )?;
+        for row in 0..batch.len() {
+            row_bnodes.clear();
+            'pattern: for slots in &patterns {
+                let mut triple: [Option<IrTerm>; 3] = [None, None, None];
+                for (i, (slot, position)) in slots.iter().zip(POSITIONS).enumerate() {
+                    let term = match slot {
+                        Slot::Const(term) => term.clone(),
+                        Slot::Blank(v) => Some(IrTerm::BlankNode(row_blank(
+                            *v,
+                            &mut row_bnodes,
+                            &mut bnode_counter,
+                        ))),
+                        Slot::Var(v) => match batch.get(row, *v) {
+                            Some(binding) => terms.binding(binding, position)?,
+                            None => None,
+                        },
+                    };
+                    // Skip if any term is unbound (incomplete triple)
+                    let Some(term) = term else {
+                        continue 'pattern;
+                    };
+                    triple[i] = Some(term);
+                }
+                let [Some(s), Some(p), Some(o)] = triple else {
+                    unreachable!("every position was filled above")
+                };
+                graph.add(Triple::new(s, p, o));
+            }
         }
     }
 
     Ok(graph)
 }
 
-/// Process a single result row through the template patterns
-fn instantiate_row(
-    result: &QueryResult,
-    template: &ConstructTemplate,
-    batch: &Batch,
-    row_idx: usize,
-    compactor: &IriCompactor,
-    graph: &mut Graph,
-    bnode_counter: &mut usize,
-) -> Result<()> {
-    // Fresh blank node per template blank-node variable for THIS solution row:
-    // minted lazily on first use, shared by every template triple in the row,
-    // and — via the row-global `bnode_counter` — distinct from every other
-    // row's blanks. `HashMap::new()` never allocates, and `has_bnodes` skips
-    // the per-term set probes entirely for the common blank-free template.
-    let has_bnodes = !template.bnode_vars.is_empty();
-    let mut row_bnodes: HashMap<VarId, BlankId> = HashMap::new();
-
-    for pattern in &template.patterns {
-        // Resolve template terms with bindings (all IRIs are EXPANDED). Subject
-        // and object positions redirect template blank-node vars to this row's
-        // freshly-minted blanks instead of the (absent) bindings; predicates can
-        // never be blank nodes, so they always resolve normally.
-        let subject = match &pattern.s {
-            Ref::Var(v) if has_bnodes && template.bnode_vars.contains(v) => Some(
-                IrTerm::BlankNode(row_blank(*v, &mut row_bnodes, bnode_counter)),
-            ),
-            s => resolve_subject_term(result, s, batch, row_idx, compactor)?,
-        };
-        let predicate = resolve_predicate_term(result, &pattern.p, batch, row_idx, compactor)?;
-        let object = match &pattern.o {
-            Term::Var(v) if has_bnodes && template.bnode_vars.contains(v) => Some(
-                IrTerm::BlankNode(row_blank(*v, &mut row_bnodes, bnode_counter)),
-            ),
-            o => resolve_object_term(result, o, batch, row_idx, compactor)?,
-        };
-
-        // Skip if any term is unbound (incomplete triple)
-        let (Some(s), Some(p), Some(o)) = (subject, predicate, object) else {
-            continue;
-        };
-
-        graph.add(Triple::new(s, p, o));
-    }
-
-    Ok(())
+/// A template position: a constant resolved up front, a variable bound per
+/// row, or a template blank node minted per row.
+enum Slot {
+    Const(Option<IrTerm>),
+    Var(VarId),
+    Blank(VarId),
 }
+
+fn terms_slot(template: &ConstructTemplate, v: VarId) -> Slot {
+    if template.bnode_vars.contains(&v) {
+        Slot::Blank(v)
+    } else {
+        Slot::Var(v)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Position {
+    Subject,
+    Predicate,
+    Object,
+}
+
+const POSITIONS: [Position; 3] = [Position::Subject, Position::Predicate, Position::Object];
 
 /// Mint (or reuse) the fresh blank node bound to a template blank-node variable
 /// within the current solution row.
@@ -190,490 +222,191 @@ fn row_blank(
     blank
 }
 
-/// Resolve a Ref to an IR Term for subject position
-///
-/// Subjects must be IRIs or blank nodes, never literals.
-/// Returns expanded IRI (via decode_sid, not compact_sid).
-fn resolve_subject_term(
-    result: &QueryResult,
-    term: &Ref,
-    batch: &Batch,
-    row_idx: usize,
-    compactor: &IriCompactor,
-) -> Result<Option<IrTerm>> {
-    match term {
-        Ref::Var(var_id) => match batch.get(row_idx, *var_id) {
-            Some(binding) => {
-                let materialized;
-                let binding = if binding.is_encoded() {
-                    materialized = super::materialize::materialize_binding(result, binding)?;
-                    &materialized
-                } else {
-                    binding
-                };
+/// Turns template constants and row bindings into IR terms, with EXPANDED
+/// IRIs (via Sid decoding, not compaction).
+struct TermResolver<'a> {
+    result: &'a QueryResult,
+    compactor: &'a IriCompactor,
+    /// Decoded IRIs by Sid: a subject, predicate or reference that recurs
+    /// across rows shares one `Arc<str>` instead of a fresh copy per use.
+    iris: FxHashMap<Sid, Arc<str>>,
+    datatypes: FxHashMap<Sid, Datatype>,
+}
 
-                match binding {
-                    Binding::Sid { sid, .. } => {
-                        let expanded_iri = compactor.decode_sid(sid)?;
-                        Ok(Some(IrTerm::iri(expanded_iri)))
-                    }
-                    Binding::IriMatch { iri, .. } => {
-                        // IriMatch: use canonical IRI (already decoded)
-                        if let Some(bnode_id) = iri.strip_prefix("_:") {
-                            Ok(Some(IrTerm::BlankNode(BlankId::new(bnode_id))))
-                        } else {
-                            Ok(Some(IrTerm::iri(iri)))
-                        }
-                    }
-                    Binding::Iri(iri) => {
-                        // Raw IRI from graph source - check for blank node prefix
-                        if let Some(bnode_id) = iri.strip_prefix("_:") {
-                            Ok(Some(IrTerm::BlankNode(BlankId::new(bnode_id))))
-                        } else {
-                            Ok(Some(IrTerm::iri(iri)))
-                        }
-                    }
-                    Binding::Unbound | Binding::Poisoned => Ok(None),
-                    Binding::Lit { .. } => Ok(None), // Literals can't be subjects
-                    Binding::EncodedLit { .. }
-                    | Binding::EncodedSid { .. }
-                    | Binding::EncodedPid { .. } => unreachable!(
-                        "Encoded bindings should have been materialized before CONSTRUCT subject resolution"
-                    ),
-                    Binding::Grouped(_) => Err(FormatError::InvalidBinding(
-                        "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)"
-                            .to_string(),
-                    )),
-                    Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(FormatError::InvalidBinding(
-                        "CONSTRUCT does not support path/list values".to_string(),
-                    )),
-                }
-            }
-            None => Ok(None),
-        },
-        Ref::Sid(sid) => {
-            let expanded_iri = compactor.decode_sid(sid)?;
-            Ok(Some(IrTerm::iri(expanded_iri)))
+impl TermResolver<'_> {
+    fn sid_iri(&mut self, sid: &Sid) -> Result<Arc<str>> {
+        if let Some(iri) = self.iris.get(sid) {
+            return Ok(Arc::clone(iri));
         }
-        Ref::Iri(iri) => {
-            // IRI term (from cross-ledger joins) - use directly
-            if let Some(bnode_id) = iri.strip_prefix("_:") {
-                Ok(Some(IrTerm::BlankNode(BlankId::new(bnode_id))))
-            } else {
-                Ok(Some(IrTerm::iri(iri)))
+        let iri = self.compactor.decode_sid_shared(sid)?;
+        self.iris.insert(sid.clone(), Arc::clone(&iri));
+        Ok(iri)
+    }
+
+    fn datatype(&mut self, sid: &Sid) -> Result<Datatype> {
+        if let Some(dt) = self.datatypes.get(sid) {
+            return Ok(dt.clone());
+        }
+        let dt = Datatype::from_iri(&*self.sid_iri(sid)?);
+        self.datatypes.insert(sid.clone(), dt.clone());
+        Ok(dt)
+    }
+
+    fn constant_ref(&mut self, r: &Ref, position: Position) -> Result<Option<IrTerm>> {
+        match r {
+            Ref::Var(_) => unreachable!("variables are not constants"),
+            Ref::Sid(sid) => Ok(Some(IrTerm::Iri(self.sid_iri(sid)?))),
+            Ref::Iri(iri) => Ok(named(iri, position)),
+        }
+    }
+
+    fn constant_object(
+        &mut self,
+        term: &Term,
+        dtc: Option<&DatatypeConstraint>,
+    ) -> Result<Option<IrTerm>> {
+        match term {
+            Term::Var(_) => unreachable!("variables are not constants"),
+            Term::Sid(sid) => Ok(Some(IrTerm::Iri(self.sid_iri(sid)?))),
+            Term::Iri(iri) => Ok(named(iri, Position::Object)),
+            // A typed or language-tagged template literal carries its
+            // datatype / tag in the pattern's constraint.
+            Term::Value(fv) => match dtc {
+                Some(dtc) => self.literal(fv, dtc),
+                None => flake_value_to_ir_term(fv),
+            },
+        }
+    }
+
+    /// A row binding at `position`: subjects and predicates take IRIs and
+    /// blank nodes only (predicates not even blank nodes), objects anything.
+    fn binding(&mut self, binding: &Binding, position: Position) -> Result<Option<IrTerm>> {
+        if binding.is_encoded() {
+            let materialized = super::materialize::materialize_binding(self.result, binding)?;
+            return self.binding(&materialized, position);
+        }
+        match binding {
+            Binding::Unbound | Binding::Poisoned => Ok(None),
+            Binding::Sid { sid, .. } => Ok(Some(IrTerm::Iri(self.sid_iri(sid)?))),
+            Binding::IriMatch { iri, .. } | Binding::Iri(iri) => Ok(named(iri, position)),
+            Binding::Lit { val, dtc, .. } => match position {
+                Position::Object => self.literal(val, dtc),
+                Position::Subject | Position::Predicate => Ok(None),
+            },
+            Binding::EncodedLit { .. }
+            | Binding::EncodedSid { .. }
+            | Binding::EncodedPid { .. } => {
+                unreachable!(
+                    "Encoded bindings should have been materialized before CONSTRUCT IR conversion"
+                )
+            }
+            // GROUP BY + CONSTRUCT is not supported (semantics undefined)
+            Binding::Grouped(_) => Err(FormatError::InvalidBinding(
+                "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)".to_string(),
+            )),
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+                Err(FormatError::InvalidBinding(
+                    "CONSTRUCT does not support path/list values".to_string(),
+                ))
             }
         }
+    }
+
+    fn literal(&mut self, val: &FlakeValue, dtc: &DatatypeConstraint) -> Result<Option<IrTerm>> {
+        let (datatype, language) = match (val, dtc.lang_tag()) {
+            (FlakeValue::String(_), Some(tag)) => {
+                (Datatype::rdf_lang_string(), Some(Arc::from(tag)))
+            }
+            // @json values are rdf:JSON whatever the constraint says.
+            (FlakeValue::Json(_), _) => (Datatype::from_iri(rdf::JSON), None),
+            _ => (self.datatype(dtc.datatype())?, None),
+        };
+        Ok(literal_value(val)?.map(|value| IrTerm::Literal {
+            value,
+            datatype,
+            language,
+        }))
     }
 }
 
-/// Resolve a Ref to an IR Term for predicate position
-///
-/// Predicates must be IRIs, never literals or blank nodes.
-/// Returns expanded IRI (via decode_sid, not compact_sid).
-fn resolve_predicate_term(
-    result: &QueryResult,
-    term: &Ref,
-    batch: &Batch,
-    row_idx: usize,
-    compactor: &IriCompactor,
-) -> Result<Option<IrTerm>> {
-    match term {
-        Ref::Var(var_id) => match batch.get(row_idx, *var_id) {
-            Some(binding) => {
-                let materialized;
-                let binding = if binding.is_encoded() {
-                    materialized = super::materialize::materialize_binding(result, binding)?;
-                    &materialized
-                } else {
-                    binding
-                };
-
-                match binding {
-                    Binding::Sid { sid, .. } => {
-                        let expanded_iri = compactor.decode_sid(sid)?;
-                        Ok(Some(IrTerm::iri(expanded_iri)))
-                    }
-                    Binding::IriMatch { iri, .. } => {
-                        // IriMatch: use canonical IRI - blank nodes not allowed as predicates
-                        if iri.starts_with("_:") {
-                            Ok(None)
-                        } else {
-                            Ok(Some(IrTerm::iri(iri)))
-                        }
-                    }
-                    Binding::Iri(iri) => {
-                        // Raw IRI from graph source - blank nodes not allowed as predicates
-                        if iri.starts_with("_:") {
-                            Ok(None)
-                        } else {
-                            Ok(Some(IrTerm::iri(iri)))
-                        }
-                    }
-                    Binding::Unbound | Binding::Poisoned => Ok(None),
-                    Binding::Lit { .. } => Ok(None), // Literals can't be predicates
-                    Binding::EncodedLit { .. }
-                    | Binding::EncodedSid { .. }
-                    | Binding::EncodedPid { .. } => unreachable!(
-                        "Encoded bindings should have been materialized before CONSTRUCT predicate resolution"
-                    ),
-                    Binding::Grouped(_) => Err(FormatError::InvalidBinding(
-                        "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)"
-                            .to_string(),
-                    )),
-                    Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(FormatError::InvalidBinding(
-                        "CONSTRUCT does not support path/list values".to_string(),
-                    )),
-                }
-            }
-            None => Ok(None),
-        },
-        Ref::Sid(sid) => {
-            let expanded_iri = compactor.decode_sid(sid)?;
-            Ok(Some(IrTerm::iri(expanded_iri)))
-        }
-        Ref::Iri(iri) => {
-            // IRI term (from cross-ledger joins) - blank nodes not allowed as predicates
-            if iri.starts_with("_:") {
-                Ok(None)
-            } else {
-                Ok(Some(IrTerm::iri(iri)))
-            }
-        }
+/// An IRI carried as text; `_:` marks a blank node, which cannot be a predicate.
+fn named(iri: &Arc<str>, position: Position) -> Option<IrTerm> {
+    match iri.strip_prefix("_:") {
+        Some(_) if position == Position::Predicate => None,
+        Some(label) => Some(IrTerm::BlankNode(BlankId::new(label))),
+        None => Some(IrTerm::Iri(Arc::clone(iri))),
     }
 }
 
-/// Resolve a Term to an IR Term for object position
-///
-/// Objects can be IRIs, blank nodes, or literals.
-/// Returns expanded IRI for references (via decode_sid, not compact_sid).
-fn resolve_object_term(
-    result: &QueryResult,
-    term: &Term,
-    batch: &Batch,
-    row_idx: usize,
-    compactor: &IriCompactor,
-) -> Result<Option<IrTerm>> {
-    match term {
-        Term::Var(var_id) => match batch.get(row_idx, *var_id) {
-            Some(binding) => binding_to_ir_term(result, binding, compactor),
-            None => Ok(None),
-        },
-        Term::Sid(sid) => {
-            let expanded_iri = compactor.decode_sid(sid)?;
-            Ok(Some(IrTerm::iri(expanded_iri)))
-        }
-        Term::Iri(iri) => {
-            // IRI term (from cross-ledger joins) - use directly
-            if let Some(bnode_id) = iri.strip_prefix("_:") {
-                Ok(Some(IrTerm::BlankNode(BlankId::new(bnode_id))))
-            } else {
-                Ok(Some(IrTerm::iri(iri)))
-            }
-        }
-        Term::Value(fv) => flake_value_to_ir_term(fv),
-    }
-}
-
-/// Convert a Binding to an IR Term
-fn binding_to_ir_term(
-    result: &QueryResult,
-    binding: &Binding,
-    compactor: &IriCompactor,
-) -> Result<Option<IrTerm>> {
-    if binding.is_encoded() {
-        let materialized = super::materialize::materialize_binding(result, binding)?;
-        return binding_to_ir_term(result, &materialized, compactor);
-    }
-
-    match binding {
-        Binding::Unbound | Binding::Poisoned => Ok(None),
-
-        // Reference - IRI (expanded)
-        Binding::Sid { sid, .. } => {
-            let expanded_iri = compactor.decode_sid(sid)?;
-            Ok(Some(IrTerm::iri(expanded_iri)))
-        }
-
-        // IriMatch: use canonical IRI (already decoded)
-        Binding::IriMatch { iri, .. } => {
-            if let Some(bnode_id) = iri.strip_prefix("_:") {
-                Ok(Some(IrTerm::BlankNode(BlankId::new(bnode_id))))
-            } else {
-                Ok(Some(IrTerm::iri(iri)))
-            }
-        }
-
-        // Raw IRI from graph source - check for blank node prefix
-        Binding::Iri(iri) => {
-            if let Some(bnode_id) = iri.strip_prefix("_:") {
-                Ok(Some(IrTerm::BlankNode(BlankId::new(bnode_id))))
-            } else {
-                Ok(Some(IrTerm::iri(iri)))
-            }
-        }
-
-        // Literal value with explicit datatype
-        Binding::Lit { val, dtc, .. } => {
-            let dt = dtc.datatype();
-            // Decode datatype SID to expanded IRI
-            let dt_iri = compactor.decode_sid(dt)?;
-
-            match val {
-                FlakeValue::String(s) => {
-                    if let Some(lang_tag) = dtc.lang_tag() {
-                        // Language-tagged string
-                        Ok(Some(IrTerm::Literal {
-                            value: LiteralValue::String(Arc::from(s.as_str())),
-                            datatype: Datatype::rdf_lang_string(),
-                            language: Some(Arc::from(lang_tag)),
-                        }))
-                    } else {
-                        // Plain or typed string
-                        Ok(Some(IrTerm::Literal {
-                            value: LiteralValue::String(Arc::from(s.as_str())),
-                            datatype: Datatype::from_iri(&dt_iri),
-                            language: None,
-                        }))
-                    }
-                }
-                FlakeValue::Long(n) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::Integer(*n),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::Double(d) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::Double(*d),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::Boolean(b) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::Boolean(*b),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::Vector(_) => Err(FormatError::InvalidBinding(
-                    "CONSTRUCT formatting does not support fluree:vector literals yet".to_string(),
-                )),
-                FlakeValue::Json(json_str) => {
-                    // @json datatype: format as string with @json datatype
-                    Ok(Some(IrTerm::Literal {
-                        value: LiteralValue::String(Arc::from(json_str.as_str())),
-                        datatype: Datatype::from_iri(rdf::JSON),
-                        language: None,
-                    }))
-                }
-                FlakeValue::Null => Ok(None),
-                // Invariant: Binding::Lit never contains FlakeValue::Ref
-                FlakeValue::Ref(_) => Err(FormatError::InvalidBinding(
-                    "Binding::Lit invariant violated: contains Ref".to_string(),
-                )),
-                // Extended numeric types - serialize as string with appropriate datatype
-                FlakeValue::BigInt(n) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(n.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::Decimal(d) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(d.to_plain_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                // Temporal types - serialize as original string with appropriate datatype
-                FlakeValue::DateTime(dt_val) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(dt_val.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::Date(d) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(d.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::Time(t) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(t.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                // Additional temporal types
-                FlakeValue::GYear(v) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(v.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::GYearMonth(v) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(v.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::GMonth(v) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(v.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::GDay(v) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(v.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::GMonthDay(v) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(v.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::YearMonthDuration(v) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(v.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::DayTimeDuration(v) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(v.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::Duration(v) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(v.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-                FlakeValue::GeoPoint(bits) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(bits.to_string())),
-                    datatype: Datatype::from_iri(&dt_iri),
-                    language: None,
-                })),
-            }
-        }
-
-        Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
-            unreachable!(
-                "Encoded bindings should have been materialized before CONSTRUCT IR conversion"
-            )
-        }
-
-        // GROUP BY + CONSTRUCT is not supported (semantics undefined)
-        Binding::Grouped(_) => Err(FormatError::InvalidBinding(
-            "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)".to_string(),
-        )),
-        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(
-            FormatError::InvalidBinding("CONSTRUCT does not support path/list values".to_string()),
-        ),
-    }
-}
-
-// NOTE: encoded binding materialization is centralized in `format::materialize`.
-
-/// Convert a FlakeValue constant to an IR Term
-fn flake_value_to_ir_term(val: &FlakeValue) -> Result<Option<IrTerm>> {
-    Ok(match val {
-        FlakeValue::String(s) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(s.as_str())),
-            datatype: Datatype::xsd_string(),
-            language: None,
-        }),
-        FlakeValue::Long(n) => Some(IrTerm::Literal {
-            value: LiteralValue::Integer(*n),
-            datatype: Datatype::xsd_integer(),
-            language: None,
-        }),
-        FlakeValue::Double(d) => Some(IrTerm::Literal {
-            value: LiteralValue::Double(*d),
-            datatype: Datatype::xsd_double(),
-            language: None,
-        }),
-        FlakeValue::Boolean(b) => Some(IrTerm::Literal {
-            value: LiteralValue::Boolean(*b),
-            datatype: Datatype::xsd_boolean(),
-            language: None,
-        }),
+/// The value half of a literal. Numbers and booleans keep their native form;
+/// everything else is its lexical string.
+fn literal_value(val: &FlakeValue) -> Result<Option<LiteralValue>> {
+    Ok(Some(match val {
+        FlakeValue::String(s) => LiteralValue::String(Arc::from(s.as_str())),
+        FlakeValue::Long(n) => LiteralValue::Integer(*n),
+        FlakeValue::Double(d) => LiteralValue::Double(*d),
+        FlakeValue::Boolean(b) => LiteralValue::Boolean(*b),
+        FlakeValue::Json(json) => LiteralValue::String(Arc::from(json.as_str())),
+        FlakeValue::Null => return Ok(None),
         FlakeValue::Vector(_) => {
             return Err(FormatError::InvalidBinding(
-                "Vector in constant term not supported".to_string(),
+                "CONSTRUCT formatting does not support fluree:vector literals yet".to_string(),
             ))
         }
-        FlakeValue::Json(json_str) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(json_str.as_str())),
-            datatype: Datatype::from_iri(rdf::JSON),
-            language: None,
-        }),
-        FlakeValue::Null => None,
+        // Invariant: a literal never holds a reference.
         FlakeValue::Ref(_) => {
             return Err(FormatError::InvalidBinding(
-                "Ref in constant term not supported".to_string(),
+                "a literal value cannot be a reference".to_string(),
             ))
         }
-        // Extended numeric types - serialize as string with XSD datatype
-        FlakeValue::BigInt(n) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(n.to_string())),
-            datatype: Datatype::xsd_integer(),
-            language: None,
-        }),
-        FlakeValue::Decimal(d) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(d.to_plain_string())),
-            datatype: Datatype::xsd_decimal(),
-            language: None,
-        }),
-        // Temporal types - serialize as original string with XSD datatype
-        FlakeValue::DateTime(dt) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(dt.to_string())),
-            datatype: Datatype::xsd_date_time(),
-            language: None,
-        }),
-        FlakeValue::Date(d) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(d.to_string())),
-            datatype: Datatype::xsd_date(),
-            language: None,
-        }),
-        FlakeValue::Time(t) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(t.to_string())),
-            datatype: Datatype::from_iri(xsd::TIME),
-            language: None,
-        }),
-        // Additional temporal types
-        FlakeValue::GYear(v) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(v.to_string())),
-            datatype: Datatype::from_iri(xsd::G_YEAR),
-            language: None,
-        }),
-        FlakeValue::GYearMonth(v) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(v.to_string())),
-            datatype: Datatype::from_iri(xsd::G_YEAR_MONTH),
-            language: None,
-        }),
-        FlakeValue::GMonth(v) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(v.to_string())),
-            datatype: Datatype::from_iri(xsd::G_MONTH),
-            language: None,
-        }),
-        FlakeValue::GDay(v) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(v.to_string())),
-            datatype: Datatype::from_iri(xsd::G_DAY),
-            language: None,
-        }),
-        FlakeValue::GMonthDay(v) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(v.to_string())),
-            datatype: Datatype::from_iri(xsd::G_MONTH_DAY),
-            language: None,
-        }),
-        FlakeValue::YearMonthDuration(v) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(v.to_string())),
-            datatype: Datatype::from_iri(xsd::YEAR_MONTH_DURATION),
-            language: None,
-        }),
-        FlakeValue::DayTimeDuration(v) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(v.to_string())),
-            datatype: Datatype::from_iri(xsd::DAY_TIME_DURATION),
-            language: None,
-        }),
-        FlakeValue::Duration(v) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(v.to_string())),
-            datatype: Datatype::from_iri(xsd::DURATION),
-            language: None,
-        }),
-        FlakeValue::GeoPoint(bits) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(bits.to_string())),
-            datatype: Datatype::from_iri(geo::WKT_LITERAL),
-            language: None,
-        }),
-    })
+        FlakeValue::BigInt(n) => LiteralValue::String(Arc::from(n.to_string())),
+        FlakeValue::Decimal(d) => LiteralValue::String(Arc::from(d.to_plain_string())),
+        FlakeValue::DateTime(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::Date(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::Time(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::GYear(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::GYearMonth(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::GMonth(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::GDay(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::GMonthDay(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::YearMonthDuration(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::DayTimeDuration(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::Duration(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::GeoPoint(v) => LiteralValue::String(Arc::from(v.to_string())),
+    }))
+}
+
+/// Convert an untyped FlakeValue constant to an IR Term, with the datatype
+/// its value implies.
+fn flake_value_to_ir_term(val: &FlakeValue) -> Result<Option<IrTerm>> {
+    let datatype = match val {
+        FlakeValue::String(_) => Datatype::xsd_string(),
+        FlakeValue::Long(_) | FlakeValue::BigInt(_) => Datatype::xsd_integer(),
+        FlakeValue::Double(_) => Datatype::xsd_double(),
+        FlakeValue::Boolean(_) => Datatype::xsd_boolean(),
+        FlakeValue::Json(_) => Datatype::from_iri(rdf::JSON),
+        FlakeValue::Decimal(_) => Datatype::xsd_decimal(),
+        FlakeValue::DateTime(_) => Datatype::xsd_date_time(),
+        FlakeValue::Date(_) => Datatype::xsd_date(),
+        FlakeValue::Time(_) => Datatype::from_iri(xsd::TIME),
+        FlakeValue::GYear(_) => Datatype::from_iri(xsd::G_YEAR),
+        FlakeValue::GYearMonth(_) => Datatype::from_iri(xsd::G_YEAR_MONTH),
+        FlakeValue::GMonth(_) => Datatype::from_iri(xsd::G_MONTH),
+        FlakeValue::GDay(_) => Datatype::from_iri(xsd::G_DAY),
+        FlakeValue::GMonthDay(_) => Datatype::from_iri(xsd::G_MONTH_DAY),
+        FlakeValue::YearMonthDuration(_) => Datatype::from_iri(xsd::YEAR_MONTH_DURATION),
+        FlakeValue::DayTimeDuration(_) => Datatype::from_iri(xsd::DAY_TIME_DURATION),
+        FlakeValue::Duration(_) => Datatype::from_iri(xsd::DURATION),
+        FlakeValue::GeoPoint(_) => Datatype::from_iri(geo::WKT_LITERAL),
+        FlakeValue::Vector(_) | FlakeValue::Null | FlakeValue::Ref(_) => {
+            return literal_value(val).map(|_| None)
+        }
+    };
+    Ok(literal_value(val)?.map(|value| IrTerm::Literal {
+        value,
+        datatype,
+        language: None,
+    }))
 }
 
 #[cfg(test)]

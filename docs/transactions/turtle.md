@@ -532,7 +532,7 @@ Rejected with a clear parse or stage error, never silently dropped:
 
 The RDF 1.2 version directive — `VERSION "1.2"` or `@version "1.2" .` — is accepted anywhere a directive may appear and ignored: the RDF 1.2 surface is always on. Base-direction language tags (`"…"@en--ltr`) are accepted; a direction other than `ltr` / `rtl` is a syntax error. They are stored as an `rdf:langString` whose language is the whole `en--ltr` string, not yet as `rdf:dirLangString` with a separate direction — so `LANG()` returns `en--ltr` and `langMatches(?l, "en")` will not match it.
 
-Turtle-star output is not produced yet: exports and CONSTRUCT emit annotations in JSON-LD only. For the SPARQL 1.2 UPDATE equivalents see [the cookbook](../guides/cookbook-edge-annotations.md#the-same-patterns-in-sparql-12); for the full model — `rdf:reifies` for annotation-rooted queries, the per-operation rules for SPARQL UPDATE templates, and the deferred shapes — see the [Edge annotations concept doc](../concepts/edge-annotations.md).
+Export writes annotations back out in RDF 1.2 syntax in every format (see [export](../cli/export.md#edge-annotations-rdf-12)). SPARQL CONSTRUCT and the Graph Store `GET` do not include them yet, in any format. For the SPARQL 1.2 UPDATE equivalents see [the cookbook](../guides/cookbook-edge-annotations.md#the-same-patterns-in-sparql-12); for the full model — `rdf:reifies` for annotation-rooted queries, the per-operation rules for SPARQL UPDATE templates, and the deferred shapes — see the [Edge annotations concept doc](../concepts/edge-annotations.md).
 
 ## Comparing Formats
 

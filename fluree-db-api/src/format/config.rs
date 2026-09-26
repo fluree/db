@@ -50,6 +50,17 @@ pub enum OutputFormat {
     /// query builder `.execute_formatted_string()`.
     RdfXml,
 
+    /// Turtle graph serialization (`text/turtle`)
+    ///
+    /// **Graph results only** (SPARQL CONSTRUCT / DESCRIBE). Produces `String`.
+    /// The query's prefixes become `@prefix` declarations and prefixed names.
+    Turtle,
+
+    /// N-Triples graph serialization (`application/n-triples`)
+    ///
+    /// **Graph results only** (SPARQL CONSTRUCT / DESCRIBE). Produces `String`.
+    NTriples,
+
     /// Typed JSON format
     ///
     /// Always includes explicit datatype (even for inferable types):
@@ -233,6 +244,31 @@ impl FormatterConfig {
             format: OutputFormat::RdfXml,
             ..Default::default()
         }
+    }
+
+    /// Create a Turtle config (graph results only: CONSTRUCT/DESCRIBE)
+    pub fn turtle() -> Self {
+        Self {
+            format: OutputFormat::Turtle,
+            ..Default::default()
+        }
+    }
+
+    /// Create an N-Triples config (graph results only: CONSTRUCT/DESCRIBE)
+    pub fn ntriples() -> Self {
+        Self {
+            format: OutputFormat::NTriples,
+            ..Default::default()
+        }
+    }
+
+    /// Whether this format serializes a graph to text (RDF/XML, Turtle,
+    /// N-Triples), and so only applies to CONSTRUCT / DESCRIBE results.
+    pub fn is_graph_text(&self) -> bool {
+        matches!(
+            self.format,
+            OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples
+        )
     }
 
     /// Create a TypedJson config

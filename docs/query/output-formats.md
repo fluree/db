@@ -192,6 +192,36 @@ Fluree-Max-Bytes: 32768
 
 **Byte budget:** Set via the `Fluree-Max-Bytes` header. When the cumulative serialized size of rows exceeds this limit, the formatter stops adding rows and sets `hasMore: true`. The budget applies to row data only (schema and envelope overhead are excluded from the count).
 
+### Graph Formats (CONSTRUCT / DESCRIBE)
+
+A `CONSTRUCT` or `DESCRIBE` result is an RDF graph rather than a table of solutions, so it has its own formats:
+
+| Format | HTTP `Accept` | Rust |
+|---|---|---|
+| JSON-LD (default) | `application/ld+json`, `application/json`, or none | `FormatterConfig::jsonld()` |
+| Turtle | `text/turtle` | `FormatterConfig::turtle()` |
+| N-Triples | `application/n-triples` | `FormatterConfig::ntriples()` |
+| RDF/XML | `application/rdf+xml` | `FormatterConfig::rdf_xml()` |
+
+Turtle, N-Triples and RDF/XML are strings: use `execute_formatted_string()` or `format_results_string()`. Every format sorts the graph and removes duplicate triples.
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+CONSTRUCT { ?p ex:label ?name } WHERE { ?p ex:name ?name }
+```
+
+As Turtle, the query's `PREFIX`es (or a JSON-LD query's `@context` prefixes) become `@prefix` declarations and prefixed names; each subject's triples are grouped, `rdf:type` is written `a`, and integers, decimals, doubles and booleans are written bare:
+
+```turtle
+@prefix ex: <http://example.org/ns/> .
+
+ex:alice ex:label "Alice" .
+
+ex:bob ex:label "Bob" .
+```
+
+N-Triples writes one triple per line with full IRIs. Both use the canonical N-Triples escapes for strings, and escape characters an IRI may not contain as `\uXXXX`, which reads back as the same IRI. Blank nodes keep their stored labels (`_:fdb-…`), so the output can be written back to the same nodes. RDF 1.2 edge annotations are not included in any graph format yet.
+
 ## Array Normalization
 
 By default, graph crawl results return single-valued properties as bare scalars and multi-valued properties as arrays:
@@ -370,6 +400,7 @@ Available format constructors:
 - `FormatterConfig::sparql_json()` — SPARQL 1.1 JSON Results (default for SPARQL queries)
 - `FormatterConfig::typed_json()` — Typed JSON with explicit datatypes on every value
 - `FormatterConfig::agent_json()` — Agent JSON envelope for LLM/agent consumers
+- `FormatterConfig::turtle()` / `ntriples()` / `rdf_xml()` — graph text formats for CONSTRUCT/DESCRIBE (see [Graph Formats](#graph-formats-construct--describe))
 
 Builder methods:
 - `.with_normalize_arrays()` — Force array wrapping for all graph crawl properties
@@ -424,6 +455,8 @@ fluree query --format typed-json --normalize-arrays '{"select": {"ex:alice": ["*
 - **Typed JSON** adds a constant-factor overhead per literal value (the `@value`/`@type` wrapper). Query execution is unaffected — only the formatting phase is slower.
 - **normalize_arrays** adds zero overhead when disabled (default). When enabled, it skips the `len() == 1` check — no additional allocations beyond the array wrapper.
 - **TSV/CSV** bypass JSON construction entirely for maximum throughput
+- **Turtle, N-Triples and RDF/XML** write the constructed graph straight into one output string, with no JSON DOM; decoded IRIs are shared across the triples that repeat them. They allocate far less than CONSTRUCT's JSON-LD, which builds a `serde_json::Value` DOM
+- **Graph output is not streamed or paged.** Every graph format builds the whole constructed graph, then the whole document, before the first byte is sent, so memory grows with the result. For a large graph, bound the CONSTRUCT with `LIMIT` / `OFFSET`, or export the ledger.
 
 ## Best Practices
 

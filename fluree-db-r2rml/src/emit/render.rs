@@ -136,40 +136,17 @@ fn curie(iri: &str, base: &str, vocab_prefix: &str) -> String {
 /// identifiers render byte-for-byte as before.
 fn escape_turtle_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7F => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
+    fluree_graph_ir::syntax::push_string(&mut out, s);
     out
 }
 
 /// Escape a string for use inside a Turtle `<...>` `IRIREF`: every character the
 /// grammar forbids raw (`< > " { } | ^ \` `` ` ``, space, and control chars)
-/// becomes a `\uXXXX` escape. An IRI free of these is returned unchanged.
+/// becomes a `\uXXXX` escape (see [`fluree_graph_ir::syntax::escape_iri`]). An
+/// IRI free of these is returned unchanged.
 fn escape_iri(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c if (c as u32) <= 0x20 || c as u32 == 0x7F => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
+    fluree_graph_ir::syntax::push_iri(&mut out, s);
     out
 }
 

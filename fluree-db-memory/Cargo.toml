@@ -15,6 +15,7 @@ fluree-db-api = { path = "../fluree-db-api", default-features = false }
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
 
+fluree-graph-ir = { path = "../fluree-graph-ir" }
 fluree-graph-turtle = { path = "../fluree-graph-turtle" }
 
 chrono.workspace = true
