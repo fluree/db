@@ -1963,3 +1963,39 @@ async fn merge_again_without_target_changes_reports_no_conflict() {
         ["d2", "x-second"]
     );
 }
+
+/// A sync that brought the target in must not carry the target's old values
+/// back when the branch is merged back.
+///
+/// dev syncs main in through a real merge commit, so that merge carries
+/// main's rename. main renames again afterwards. Merging dev back folds that
+/// merge, and its copy of main's earlier rename must not resurface.
+#[tokio::test]
+async fn merge_back_after_sync_keeps_the_targets_later_value() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    // A dev commit first, so the sync writes a merge commit rather than
+    // fast-forwarding.
+    insert_named(&fluree, "mydb:dev", "ex:d1", "d1").await;
+    rename_alice(&fluree, "mydb:main", "v1").await;
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    rename_alice(&fluree, "mydb:main", "v2").await;
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::Abort)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.conflict_count, 0,
+        "dev never touched alice, so the merge has nothing to resolve"
+    );
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, ["d1", "v2"]);
+}

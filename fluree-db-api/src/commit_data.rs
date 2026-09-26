@@ -9,9 +9,63 @@
 //! then restored folds to nothing. The netting contract is
 //! [`NetChangeAccumulator`]'s.
 
-use fluree_db_core::{Commit, Flake};
+use fluree_db_core::{Commit, ConflictKey, ContentId, Flake};
 use fluree_db_novelty::NetChangeAccumulator;
-use std::collections::HashMap;
+use rustc_hash::FxHashSet;
+use std::collections::{HashMap, HashSet};
+
+/// Which flakes on one side of a branch comparison are that side's own
+/// changes, tracked as its commits are walked oldest-first.
+///
+/// A merge whose merged-in history the other side already holds is not one
+/// of the side's own commits. Its flakes on keys this side never changed are
+/// copies of the other side's changes. Applying them again brings back
+/// values the other side has since replaced, and comparing them reports
+/// conflicts on keys this side never touched. Its flakes on keys this side
+/// did change are how that merge resolved the overlap, and dropping those
+/// would undo the resolution.
+pub(crate) struct OwnChanges<'a> {
+    own: HashSet<&'a ContentId>,
+    keys: FxHashSet<ConflictKey>,
+}
+
+impl<'a> OwnChanges<'a> {
+    /// `own` is the side's own commits, as [`BranchSide::own`] reports them.
+    ///
+    /// [`BranchSide::own`]: fluree_db_core::BranchSide::own
+    pub(crate) fn new(own: &'a [ContentId]) -> Self {
+        Self {
+            own: own.iter().collect(),
+            keys: FxHashSet::default(),
+        }
+    }
+
+    /// Whether the side made commit `cid` itself.
+    pub(crate) fn is_own(&self, cid: &ContentId) -> bool {
+        self.own.contains(cid)
+    }
+
+    /// Record `cid`'s changes, dropping the flakes that copy the other
+    /// side's. Commits must arrive oldest-first, because a merge's
+    /// resolution covers only keys the side changed before it.
+    pub(crate) fn retain_changes(&mut self, cid: &ContentId, flakes: &mut Vec<Flake>) {
+        if self.is_own(cid) {
+            self.keys.extend(flakes.iter().map(key_of));
+        } else {
+            flakes.retain(|flake| self.keys.contains(&key_of(flake)));
+        }
+    }
+
+    /// Every key the side has changed so far.
+    pub(crate) fn into_keys(self) -> FxHashSet<ConflictKey> {
+        self.keys
+    }
+}
+
+/// The (subject, predicate, graph) key `flake` changes.
+pub(crate) fn key_of(flake: &Flake) -> ConflictKey {
+    ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())
+}
 
 /// Flakes and metadata accumulated from a sequence of commits.
 #[derive(Default)]

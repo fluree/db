@@ -4,7 +4,7 @@
 //! merges (the target's head is on the source's first-parent line) and
 //! general merges with conflict resolution strategies.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold};
+use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold, OwnChanges};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::rebase::ConflictStrategy;
@@ -19,7 +19,6 @@ use fluree_db_novelty::delta_keys_of;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use rustc_hash::FxHashSet;
 use serde::Serialize;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -809,30 +808,27 @@ impl crate::Fluree {
     }
 }
 
-/// Collect the net flakes, namespace deltas, and graph deltas from commits
-/// between `head_id` and `stop_at_t` (exclusive). Walks the first-parent
-/// lineage (a merge commit on the source already carries the folded flakes
-/// of whatever it merged) then folds via [`collect_from_commits`] in
-/// oldest-first order so that earlier commits win on namespace and graph
-/// delta key collisions.
+/// Collect the net flakes, namespace deltas, and graph deltas the source
+/// applies, and the keys its own commits changed.
+///
+/// `cids` is the source's line, oldest first, `own` the commits on it that
+/// carry the source's own changes. A merge on the line keeps only the flakes
+/// that are its resolution; see [`OwnChanges`]. The fold runs oldest-first
+/// so that earlier commits win on namespace and graph delta key collisions.
 async fn collect_commit_data(
     store: &impl ContentStore,
     cids: &[ContentId],
     own: &[ContentId],
 ) -> Result<(CollectedCommitData, FxHashSet<ConflictKey>)> {
-    let own: HashSet<&ContentId> = own.iter().collect();
+    let mut changes = OwnChanges::new(own);
     let mut commits = Vec::with_capacity(cids.len());
-    let mut keys = FxHashSet::default();
     for cid in cids {
-        let commit = load_commit_by_id(store, cid).await?;
-        if own.contains(cid) {
-            keys.extend(
-                commit.flakes.iter().map(|flake| {
-                    ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())
-                }),
-            );
-        }
+        let mut commit = load_commit_by_id(store, cid).await?;
+        changes.retain_changes(cid, &mut commit.flakes);
         commits.push(commit);
     }
-    Ok((collect_from_commits(commits, Fold::Replay), keys))
+    Ok((
+        collect_from_commits(commits, Fold::Replay),
+        changes.into_keys(),
+    ))
 }

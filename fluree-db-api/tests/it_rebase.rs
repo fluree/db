@@ -816,3 +816,89 @@ async fn rebase_after_sync_detects_conflict() {
     assert_eq!(report.replayed, 1, "dev's own rename");
     assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["from-dev"]);
 }
+
+/// Set up a branch that synced its source in through a real merge commit,
+/// after which the source changed one of the synced facts again.
+///
+/// main holds `ex:alice`. dev commits `ex:d1` first, so the sync is a merge
+/// rather than a fast-forward, then syncs main's `v1` rename in. main then
+/// renames to `v2`.
+async fn sync_then_source_moves_on() -> support::MemoryFluree {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    let insert = |ledger: &'static str, id: &'static str, name: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let state = fluree.ledger(ledger).await.unwrap();
+            fluree
+                .insert(
+                    state,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [{"@id": id, "ex:name": name}]
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let rename = |ledger: &'static str, name: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let state = fluree.ledger(ledger).await.unwrap();
+            fluree
+                .update(
+                    state,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "where": {"@id": "ex:alice", "ex:name": "?old"},
+                        "delete": {"@id": "ex:alice", "ex:name": "?old"},
+                        "insert": {"@id": "ex:alice", "ex:name": name}
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    insert("mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    insert("mydb:dev", "ex:d1", "d1").await;
+    rename("mydb:main", "v1").await;
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    rename("mydb:main", "v2").await;
+    fluree
+}
+
+/// The sync's copy of the source's changes is not the branch's own change,
+/// so it cannot conflict with what the source did afterwards.
+#[tokio::test]
+async fn rebase_after_sync_does_not_conflict_on_the_syncs_copy() {
+    let fluree = sync_then_source_moves_on().await;
+
+    let report = fluree
+        .rebase_branch("mydb", "dev", ConflictStrategy::Abort)
+        .await
+        .expect("dev never touched alice, so there is nothing to conflict");
+    assert_eq!(report.replayed, 1, "dev's own commit");
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["d1", "v2"]);
+}
+
+/// Replaying the sync must not write the source's old value back over the
+/// value the source holds now.
+#[tokio::test]
+async fn rebase_after_sync_keeps_the_sources_later_value() {
+    let fluree = sync_then_source_moves_on().await;
+
+    fluree
+        .rebase_branch("mydb", "dev", ConflictStrategy::TakeBranch)
+        .await
+        .unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["d1", "v2"]);
+}
