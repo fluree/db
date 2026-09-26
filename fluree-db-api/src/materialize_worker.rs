@@ -141,6 +141,16 @@ pub struct MaterializeWorkerHandle {
     stats: Arc<Mutex<MaterializeWorkerStats>>,
 }
 
+/// Tracking key for a job: both sides canonical where they parse as ids, so
+/// `ds` and `ds:main` are one poller and either spelling untracks it. The job
+/// keeps the spelling it was tracked with — its persisted watermark subject is
+/// built from that spelling, and rewriting it would restart materialization.
+fn job_key(source: &str, target: &str) -> JobKey {
+    let canonical =
+        |s: &str| fluree_db_core::LedgerId::parse(s).map_or_else(|_| s.to_string(), String::from);
+    (canonical(source), canonical(target))
+}
+
 impl MaterializeWorkerHandle {
     /// Start tracking `source → target` (idempotent). `interval` is this job's
     /// own poll cadence; `None` uses the worker's configured default. Returns the
@@ -148,7 +158,7 @@ impl MaterializeWorkerHandle {
     /// typically runs an immediate first sync itself).
     pub fn track(&self, source: &str, target: &str, interval: Option<Duration>) -> Duration {
         let interval = interval.unwrap_or(self.default_interval);
-        let key = (source.to_string(), target.to_string());
+        let key = job_key(source, target);
         let mut tracked = self.tracked.lock().expect("materialize worker mutex");
         tracked.insert(
             key,
@@ -176,7 +186,7 @@ impl MaterializeWorkerHandle {
     /// already-materialized data and watermark in the target ledger are left
     /// untouched.
     pub fn untrack(&self, source: &str, target: &str) -> bool {
-        let key = (source.to_string(), target.to_string());
+        let key = job_key(source, target);
         let mut tracked = self.tracked.lock().expect("materialize worker mutex");
         let removed = tracked.remove(&key).is_some();
         let n = tracked.len();
@@ -444,6 +454,27 @@ impl MaterializeTrackingWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn handle() -> MaterializeWorkerHandle {
+        MaterializeWorkerHandle {
+            tracked: Arc::default(),
+            default_interval: Duration::from_secs(60),
+            stop: Arc::default(),
+            stats: Arc::default(),
+        }
+    }
+
+    /// Two spellings of one job are one poller, and either spelling untracks
+    /// it; the job keeps the spelling its persisted watermark is keyed by.
+    #[test]
+    fn spellings_of_one_job_are_one_tracked_poller() {
+        let h = handle();
+        h.track("ds", "twin", None);
+        h.track("ds:main", "twin:main", None);
+        assert_eq!(h.tracked_jobs().len(), 1);
+        assert!(h.untrack("ds", "twin:main"));
+        assert!(h.tracked_jobs().is_empty());
+    }
 
     /// The window that was misread in production: 21 of 22 targets committed.
     ///

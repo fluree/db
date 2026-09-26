@@ -25,10 +25,11 @@ async fn create_ledger_name_validation() {
     // Reject multiple colons (invalid alias format)
     let result = fluree.create_ledger("test:feature:v2").await;
     assert!(result.is_err(), "Should reject name with multiple colons");
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid ledger ID format"));
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("'test:feature:v2'") && msg.contains("branch cannot contain ':'"),
+        "error must name the input and the rule it broke: {msg}"
+    );
 
     // Test accepting valid ledger names
     let ledger = fluree.create_ledger("valid-name").await.unwrap();
@@ -59,21 +60,21 @@ async fn edge_case_validation() {
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("Invalid ledger ID format"));
+        .contains("Invalid ledger id"));
 
     let result = fluree.create_ledger(":branch").await;
     assert!(result.is_err(), "Should reject name starting with colon");
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("Invalid ledger ID format"));
+        .contains("Invalid ledger id"));
 
     let result = fluree.create_ledger("ledger:").await;
     assert!(result.is_err(), "Should reject name ending with colon");
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("Invalid ledger ID format"));
+        .contains("Invalid ledger id"));
 
     // Test special characters that ARE allowed
     let ledger = fluree.create_ledger("ledger.with.dots").await.unwrap();

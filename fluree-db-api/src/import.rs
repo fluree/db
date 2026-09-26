@@ -3558,8 +3558,10 @@ where
         // the SAME ledger, so they must salt blank-node ids identically —
         // otherwise re-importing under the other spelling would mint a
         // different id for every blank node in the source.
-        let normalized_alias = fluree_db_core::ledger_id::normalize_ledger_id(alias)
-            .unwrap_or_else(|_| alias.to_string());
+        let normalized_alias = fluree_db_core::LedgerId::parse(alias)
+            .and_then(|id| fluree_db_core::validate_ledger_name(id.name()).map(|()| id))
+            .map_err(|e| ImportError::Api(ApiError::from(e)))?
+            .to_string();
         let skolem_namespace = config
             .skolem_namespace
             .clone()

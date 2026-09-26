@@ -102,7 +102,7 @@ pub async fn push_commit_head(
 ) -> Result<Response, ServerError> {
     require_read_write_mode(&state)?;
 
-    if !principal.is_authorized_for_ledger(&alias) {
+    if !principal.is_authorized_for_ledger(&crate::error::scope_id(&alias)?) {
         return Err(ServerError::not_found("Ledger not found"));
     }
 
@@ -121,7 +121,7 @@ pub async fn push_index_head(
 ) -> Result<Response, ServerError> {
     require_read_write_mode(&state)?;
 
-    if !principal.is_authorized_for_ledger(&alias) {
+    if !principal.is_authorized_for_ledger(&crate::error::scope_id(&alias)?) {
         return Err(ServerError::not_found("Ledger not found"));
     }
 
@@ -175,7 +175,7 @@ pub async fn init_ledger(
 ) -> Result<Json<InitResponse>, ServerError> {
     require_read_write_mode(&state)?;
 
-    if !principal.is_authorized_for_ledger(&alias) {
+    if !principal.is_authorized_for_ledger(&crate::error::scope_id(&alias)?) {
         return Err(ServerError::not_found("Ledger not found"));
     }
 

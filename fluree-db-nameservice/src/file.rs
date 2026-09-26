@@ -36,8 +36,8 @@ use crate::{
     StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
-use fluree_db_core::{CasAction, CasOutcome, ContentId, FileStorage, StorageCas};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::{CasAction, CasOutcome, ContentId, FileStorage, LedgerId, StorageCas};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
@@ -266,9 +266,10 @@ impl FileNameService {
 
                 let file_name = entry.file_name().to_string_lossy().to_string();
 
-                if file_name.ends_with(".index.json")
-                    || file_name.ends_with(".snapshots.json")
-                    || file_name.ends_with(".lock")
+                // Sidecars (`.index.json`, `.snapshots.json`) are not skipped
+                // by name: a branch may be named `x.index`. `read_record_at`
+                // tells them apart by content.
+                if file_name.ends_with(".lock")
                     || file_name.ends_with(".tmp")
                     || !file_name.ends_with(".json")
                 {
@@ -304,9 +305,22 @@ impl FileNameService {
 
     /// Load and merge main record with index file
     async fn load_record(&self, ledger_name: &str, branch: &str) -> Result<Option<NsRecord>> {
+        let record = self
+            .read_record_at(&format!("{ledger_name}/{branch}"))
+            .await?;
+        // The file is authoritative for identity. A file whose name/branch
+        // differ from the requested ones belongs to another ledger that maps
+        // to the same path (`a:b/c` vs `a/b:c`), so this ledger does not exist.
+        Ok(record.filter(|r| r.name == ledger_name && r.branch == branch))
+    }
+
+    /// Read the ledger record stored at `ns@v2/{relative}.json`, taking its
+    /// identity from the file rather than the path: a path does not determine
+    /// `name:branch` once names and branches may both contain `/`.
+    async fn read_record_at(&self, relative: &str) -> Result<Option<NsRecord>> {
         use fluree_db_core::StorageRead;
-        let main_address = Self::ns_address(ledger_name, branch);
-        let index_address = Self::index_address(ledger_name, branch);
+        let main_address = format!("fluree:file://{NS_VERSION}/{relative}.json");
+        let index_address = format!("fluree:file://{NS_VERSION}/{relative}.index.json");
 
         // Read the main record bytes once.
         let main_bytes = match self.storage.read_bytes(&main_address).await {
@@ -326,6 +340,15 @@ impl FileNameService {
             return Ok(None);
         }
 
+        // Enumeration hands us sidecar keys too (`{branch}.index.json`,
+        // `{gs}.snapshots.json`): a branch may legitimately be named
+        // `x.index`, so the suffix alone cannot say which file this is.
+        if crate::ns_format::has_sidecar_suffix(&main_address)
+            && !crate::ns_format::is_ledger_main_record(&main_bytes)
+        {
+            return Ok(None);
+        }
+
         let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
 
         // Read index file (if exists)
@@ -333,7 +356,7 @@ impl FileNameService {
 
         // Convert to NsRecord
         let mut record = NsRecord {
-            ledger_id: format_ledger_id(ledger_name, branch),
+            ledger_id: LedgerId::from_parts(&main.ledger.id, &main.branch)?,
             name: main.ledger.id.clone(),
             branch: main.branch,
             commit_head_id: main
@@ -476,9 +499,14 @@ impl FileNameService {
             .map(|t| GraphSourceType::from_type_string(t))
             .unwrap_or(GraphSourceType::Unknown("unknown".to_string()));
 
-        // Convert to GraphSourceRecord
+        // Convert to GraphSourceRecord. The file is authoritative for
+        // identity; a different name/branch at this path is another source.
+        let graph_source_id = LedgerId::from_parts(&main.name, &main.branch)?;
+        if graph_source_id.name() != name || graph_source_id.branch() != branch {
+            return Ok(None);
+        }
         let mut record = GraphSourceRecord {
-            graph_source_id: format_ledger_id(name, branch),
+            graph_source_id,
             name: main.name,
             branch: main.branch,
             source_type,
@@ -522,14 +550,12 @@ impl crate::NameServiceLookup for FileNameService {
         let mut records = Vec::new();
 
         for relative in Self::walk_ns_json_files(&ledger_dir).await? {
-            let branch = relative
-                .to_string_lossy()
-                .trim_end_matches(".json")
-                .to_string();
-
-            // Graph-source records are skipped by `load_record` (returns Ok(None)).
-            if let Ok(Some(record)) = self.load_record(ledger_name, &branch).await {
-                if !record.retracted {
+            // Files under `{ledger_name}/` also include nested ledgers
+            // (`{ledger_name}/sub/main.json`); the record says which it is.
+            // Graph-source records are skipped by `read_record_at` (Ok(None)).
+            let relative = format!("{ledger_name}/{}", ns_record_stem(&relative));
+            if let Ok(Some(record)) = self.read_record_at(&relative).await {
+                if record.name == ledger_name && !record.retracted {
                     records.push(record);
                 }
             }
@@ -543,29 +569,32 @@ impl crate::NameServiceLookup for FileNameService {
         let mut records = Vec::new();
 
         for relative in Self::walk_ns_json_files(&ns_dir).await? {
-            let file_stem = relative
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let parent = relative
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if parent.is_empty() {
+            if relative.parent().is_none_or(|p| p.as_os_str().is_empty()) {
                 continue;
             }
-
-            // Graph-source records are skipped by `load_record` (returns Ok(None)).
+            // Graph-source records are skipped by `read_record_at` (Ok(None)).
             // A read failure must not silently shrink the result: callers
             // that decide what to delete treat a missing branch as one with
             // nothing to protect.
-            if let Some(record) = self.load_record(&parent, &file_stem).await? {
+            if let Some(record) = self.read_record_at(&ns_record_stem(&relative)).await? {
                 records.push(record);
             }
         }
 
         Ok(records)
     }
+}
+
+/// `a/b/main.json` → `a/b/main`, with `/` separators on every platform.
+fn ns_record_stem(relative: &std::path::Path) -> String {
+    let joined = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    joined
+        .strip_suffix(".json")
+        .map_or(joined.clone(), str::to_string)
 }
 
 #[async_trait]
@@ -984,7 +1013,7 @@ impl CommitPublisher for FileNameService {
 
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
         // File nameservice returns the normalized ledger ID for publishing
-        Some(normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string()))
+        LedgerId::parse(ledger_id).ok().map(String::from)
     }
 }
 
@@ -1824,6 +1853,61 @@ mod tests {
         let record = ns.lookup("mydb:main").await.unwrap().unwrap();
         assert_eq!(record.index_head_id, Some(index_new_cid));
         assert_eq!(record.index_t, 8);
+    }
+
+    /// Enumeration takes identity from each record, never from its path:
+    /// nested names, legacy `/` branches, and branches spelled like sidecar
+    /// files all round-trip (a record missing here reads as unprotected to GC).
+    #[tokio::test]
+    async fn test_file_ns_enumeration_round_trips_ambiguous_layouts() {
+        let (_temp, ns) = setup().await;
+        for id in [
+            "acme:main",
+            "acme/inventory:main",
+            "mydb:release/v1.0",
+            "mydb:feature.index",
+            "mydb:main.json",
+        ] {
+            ns.publish_commit(id, 1, &test_cid(id)).await.unwrap();
+        }
+
+        let mut all: Vec<String> = ns
+            .all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                assert_eq!(r.ledger_id, format!("{}:{}", r.name, r.branch));
+                r.ledger_id.to_string()
+            })
+            .collect();
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                "acme/inventory:main",
+                "acme:main",
+                "mydb:feature.index",
+                "mydb:main.json",
+                "mydb:release/v1.0"
+            ]
+        );
+
+        let acme: Vec<_> = ns.list_branches("acme").await.unwrap();
+        assert_eq!(acme.len(), 1, "nested ledger is not a branch: {acme:?}");
+        let mut mydb: Vec<String> = ns
+            .list_branches("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        mydb.sort();
+        assert_eq!(mydb, ["feature.index", "main.json", "release/v1.0"]);
+
+        // Same path, different identity: not this ledger.
+        assert!(ns.lookup("mydb/release:v1.0").await.unwrap().is_none());
+        assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
     }
 
     #[tokio::test]

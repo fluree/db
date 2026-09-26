@@ -54,7 +54,7 @@ pub use config::{
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
 pub use gc::{
-    clean_garbage, current_sibling_heads, execute_sweep, plan_garbage, plan_sweep,
+    clean_garbage, current_sibling_heads, execute_sweep, nested_ledgers, plan_garbage, plan_sweep,
     release_garbage_plan, shared_blob_policy_for, shared_refs_of_branches, siblings_of,
     write_garbage_record, BranchIndexHead, CleanGarbageConfig, CleanGarbageResult, GarbagePlan,
     GarbageRecord, SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_MAX_OLD_INDEXES,
@@ -92,7 +92,7 @@ pub struct IndexResult {
     /// Transaction time the index is current through
     pub index_t: i64,
     /// Ledger ID (name:branch format)
-    pub ledger_id: String,
+    pub ledger_id: fluree_db_core::LedgerId,
     /// Index build statistics
     pub stats: IndexStats,
     /// Total fuel charged for this build. `Some(_)` when fuel tracking was
@@ -203,7 +203,7 @@ pub async fn build_index_for_record_with_tracker(
                 return Ok(IndexResult {
                     root_id: root_id.clone(),
                     index_t: record.index_t,
-                    ledger_id: ledger_id.to_string(),
+                    ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
                     stats: IndexStats::default(),
                     fuel,
                 });
@@ -537,7 +537,7 @@ mod publish_barrier_tests {
         let result = IndexResult {
             root_id,
             index_t: 1,
-            ledger_id: "l:main".to_string(),
+            ledger_id: fluree_db_core::LedgerId::parse("l:main").unwrap(),
             stats: IndexStats::default(),
             fuel: None,
         };

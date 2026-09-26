@@ -224,7 +224,9 @@ async fn geo_search_time_travel_different_results_at_different_t() {
             let t2 = ledger.snapshot.t;
 
             // Trigger indexing to build binary index
-            let completion = handle.trigger(alias, t2).await;
+            let completion = handle
+                .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t2)
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -287,7 +289,9 @@ async fn geo_search_retraction_removes_point_from_results() {
             let t3 = ledger.snapshot.t;
 
             // Trigger indexing
-            let completion = handle.trigger(alias, t3).await;
+            let completion = handle
+                .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t3)
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -362,7 +366,9 @@ async fn geo_search_dedup_returns_min_distance_per_subject() {
             let t = ledger.snapshot.t;
 
             // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
+            let completion = handle
+                .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -433,7 +439,9 @@ async fn geo_search_returns_correct_distances() {
             let t = ledger.snapshot.t;
 
             // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
+            let completion = handle
+                .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -510,7 +518,9 @@ async fn geo_search_respects_limit_returns_nearest() {
             let t = ledger.snapshot.t;
 
             // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
+            let completion = handle
+                .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -653,7 +663,9 @@ async fn geo_search_respects_named_graph_boundaries() {
             let t = ledger.snapshot.t;
 
             // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
+            let completion = handle
+                .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -753,7 +765,9 @@ async fn sparql_geof_distance_uses_geo_index() {
             let t = ledger.snapshot.t;
 
             // Trigger indexing
-            let completion = handle.trigger(alias, t).await;
+            let completion = handle
+                .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),

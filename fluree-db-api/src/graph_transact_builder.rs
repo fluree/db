@@ -195,6 +195,24 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
         self.core.validate()
     }
 
+    /// Writes always apply at HEAD. A handle from `graph_at` names a past
+    /// state, so transacting through it would silently write somewhere other
+    /// than the state the caller pinned.
+    fn reject_time_pinned(&self) -> Result<()> {
+        if matches!(self.graph.time_spec, crate::dataset::TimeSpec::Latest) {
+            Ok(())
+        } else {
+            Err(ApiError::http(
+                400,
+                format!(
+                    "cannot transact through a time-pinned graph handle for '{}'; \
+                     use graph(..) (HEAD) for writes",
+                    self.graph.ledger_id
+                ),
+            ))
+        }
+    }
+
     /// Stage + commit the transaction against the latest ledger head.
     ///
     /// Loads the cached ledger handle, acquires a write lock, stages,
@@ -211,6 +229,7 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     ///     .await?;
     /// ```
     pub async fn commit(self) -> Result<TransactResultRef> {
+        self.reject_time_pinned()?;
         let handle = self
             .graph
             .fluree
@@ -239,6 +258,7 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     /// let preview = staged.query().jsonld(&q).execute().await?;
     /// ```
     pub async fn stage(self) -> Result<StagedGraph<'a>> {
+        self.reject_time_pinned()?;
         self.core.validate().map_err(ApiError::Builder)?;
 
         let index_config = self

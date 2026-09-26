@@ -1534,7 +1534,7 @@ impl Fluree {
         // version of M they're enforcing, even though they enter
         // through separate Rust API calls.
         let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
-            db.as_graph_db_ref().snapshot.ledger_id.as_str(),
+            &db.as_graph_db_ref().snapshot.ledger_id,
             self,
             (**db.cross_ledger_resolved_ts()).clone(),
         );

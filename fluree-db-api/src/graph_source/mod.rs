@@ -187,6 +187,7 @@ fn describe_source_time(time: Option<fluree_db_query::r2rml::SourceTime>) -> Str
 mod bm25;
 mod cache;
 mod config;
+pub(crate) mod dependency_index;
 mod helpers;
 mod provider;
 mod result;

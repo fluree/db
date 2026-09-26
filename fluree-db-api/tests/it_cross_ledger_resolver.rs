@@ -70,7 +70,9 @@ async fn resolves_policy_graph_from_model_ledger_into_term_neutral_wire() {
     let data_id = "test/cross-ledger/data:main";
     let _data = genesis_ledger(&fluree, data_id);
 
-    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+
+    let mut ctx = ResolveCtx::new(&data_id_ledger, &fluree);
     let graph_ref = cross_ref(model_id, policy_graph_iri);
 
     let resolved = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx)
@@ -184,7 +186,9 @@ async fn structural_detection_picks_up_custom_typed_policies() {
     let data_id = "test/cross-ledger/custom-typed-d:main";
     let _ = genesis_ledger(&fluree, data_id);
 
-    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+
+    let mut ctx = ResolveCtx::new(&data_id_ledger, &fluree);
     let graph_ref = cross_ref(model_id, policy_graph_iri);
 
     let resolved = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx)
@@ -248,7 +252,9 @@ async fn multiple_rdf_types_are_all_captured_in_policy_types() {
     let data_id = "test/cross-ledger/multi-typed-d:main";
     let _ = genesis_ledger(&fluree, data_id);
 
-    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+
+    let mut ctx = ResolveCtx::new(&data_id_ledger, &fluree);
     let resolved = resolve_graph_ref(
         &cross_ref(model_id, policy_graph_iri),
         ArtifactKind::PolicyRules,
@@ -319,7 +325,9 @@ async fn cross_ledger_schema_materializes_whitelisted_axioms() {
     let data_id = "test/cross-ledger/schema-d:main";
     let _ = genesis_ledger(&fluree, data_id);
 
-    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+
+    let mut ctx = ResolveCtx::new(&data_id_ledger, &fluree);
     let resolved = resolve_graph_ref(
         &cross_ref(model_id, schema_graph_iri),
         ArtifactKind::SchemaClosure,
@@ -405,7 +413,9 @@ async fn cross_ledger_schema_empty_graph_yields_empty_wire() {
     let data_id = "test/cross-ledger/schema-empty-d:main";
     let _ = genesis_ledger(&fluree, data_id);
 
-    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+
+    let mut ctx = ResolveCtx::new(&data_id_ledger, &fluree);
     let resolved = resolve_graph_ref(
         &cross_ref(model_id, graph_iri),
         ArtifactKind::SchemaClosure,
@@ -465,7 +475,9 @@ async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
     let data_id = "test/cross-ledger/missing-effect-d:main";
     let _ = genesis_ledger(&fluree, data_id);
 
-    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+
+    let mut ctx = ResolveCtx::new(&data_id_ledger, &fluree);
     let resolved = resolve_graph_ref(
         &cross_ref(model_id, policy_graph_iri),
         ArtifactKind::PolicyRules,
@@ -706,7 +718,8 @@ async fn single_resolution_t_is_stable_within_a_request() {
     // Single ResolveCtx = single request. Resolve A, advance M, then
     // resolve B. B's resolved_t must equal A's — captured once at the
     // first reference, not re-read between resolutions.
-    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+    let mut ctx = ResolveCtx::new(&data_id_ledger, &fluree);
 
     let resolved_a = resolve_graph_ref(
         &cross_ref(model_id, graph_a_iri),
@@ -751,14 +764,16 @@ async fn single_resolution_t_is_stable_within_a_request() {
     // is per-request, not per-instance.
     assert_eq!(ctx.resolved_ts.len(), 1);
     assert_eq!(
-        ctx.resolved_ts.get(model_id),
+        ctx.resolved_ts
+            .get(&fluree_db_api::LedgerId::parse(model_id).unwrap()),
         Some(&t_at_first_resolution),
         "resolved_ts must store the captured t once per canonical model id"
     );
 
     // Sanity: a new ResolveCtx against the same Fluree DOES re-capture
     // against M's current head.
-    let mut fresh_ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+    let mut fresh_ctx = ResolveCtx::new(&data_id_ledger, &fluree);
     let resolved_a_fresh = resolve_graph_ref(
         &cross_ref(model_id, graph_a_iri),
         ArtifactKind::PolicyRules,
@@ -819,7 +834,9 @@ async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() 
         "cache must start empty"
     );
 
-    let mut ctx_a = ResolveCtx::new(data_a, &fluree);
+    let data_a_ledger = fluree_db_api::LedgerId::parse(data_a).unwrap();
+
+    let mut ctx_a = ResolveCtx::new(&data_a_ledger, &fluree);
     let resolved_a = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx_a)
         .await
         .expect("first resolve populates cache");
@@ -832,7 +849,9 @@ async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() 
                                        // (sync_for_test would be ideal but Moka doesn't expose one;
                                        // the get below is the load-bearing check.)
 
-    let mut ctx_b = ResolveCtx::new(data_b, &fluree);
+    let data_b_ledger = fluree_db_api::LedgerId::parse(data_b).unwrap();
+
+    let mut ctx_b = ResolveCtx::new(&data_b_ledger, &fluree);
     let resolved_b = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx_b)
         .await
         .expect("second resolve hits cache");
@@ -846,7 +865,8 @@ async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() 
     // A new context against a third data ledger sees the same hit.
     let data_c = "test/cross-ledger/cache/d-c:main";
     let _ = genesis_ledger(&fluree, data_c);
-    let mut ctx_c = ResolveCtx::new(data_c, &fluree);
+    let data_c_ledger = fluree_db_api::LedgerId::parse(data_c).unwrap();
+    let mut ctx_c = ResolveCtx::new(&data_c_ledger, &fluree);
     let resolved_c = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx_c)
         .await
         .expect("third resolve also a cache hit");
@@ -881,7 +901,9 @@ async fn unknown_graph_on_model_ledger_surfaces_graph_missing_at_t() {
     let data_id = "test/cross-ledger/empty-data:main";
     let _ = genesis_ledger(&fluree, data_id);
 
-    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+
+    let mut ctx = ResolveCtx::new(&data_id_ledger, &fluree);
     let graph_ref = cross_ref(model_id, "http://example.org/never-created");
 
     let err = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx)
@@ -932,7 +954,9 @@ async fn empty_policy_graph_yields_empty_wire_artifact() {
     let data_id = "test/cross-ledger/no-policies-d:main";
     let _ = genesis_ledger(&fluree, data_id);
 
-    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
+
+    let mut ctx = ResolveCtx::new(&data_id_ledger, &fluree);
     let graph_ref = cross_ref(model_id, graph_iri);
 
     let resolved = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx)

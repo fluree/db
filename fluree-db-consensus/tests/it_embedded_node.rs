@@ -148,9 +148,10 @@ async fn an_embedder_can_stand_up_a_raft_node_and_write_through_it() {
     // 8. And the engine's own cache agrees — fed by the adapter's
     //    synchronous watermark on apply, which is what `attach` wired.
     let manager = fluree.ledger_manager().expect("ledger manager");
+    let cached_id = fluree_db_api::LedgerId::parse("embedded/db:main").unwrap();
     eventually(
         "the ledger cache to reach the replicated head",
-        async || manager.current_t("embedded/db:main").await == Some(receipt.commit.t),
+        async || manager.current_t(&cached_id).await == Some(receipt.commit.t),
     )
     .await;
 
@@ -341,7 +342,7 @@ async fn the_wait_ceiling_bounds_a_submission_before_its_next_probe() {
     let handle = fluree
         .ledger_manager()
         .expect("ledger manager")
-        .get_or_load(ledger_id)
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
         .await
         .expect("load ledger");
     let guard = handle.lock_for_write().await;

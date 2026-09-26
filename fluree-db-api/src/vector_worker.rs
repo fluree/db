@@ -29,7 +29,11 @@
 //! ```
 
 #[cfg(feature = "vector")]
+use crate::graph_source::dependency_index::{parse_dependencies, DependencyIndex};
+#[cfg(feature = "vector")]
 use crate::{ApiError, Result};
+#[cfg(feature = "vector")]
+use fluree_db_core::LedgerId;
 #[cfg(feature = "vector")]
 use fluree_db_nameservice::{GraphSourcePublisher, NameServiceEvent, NameServiceLookup};
 #[cfg(feature = "vector")]
@@ -37,7 +41,7 @@ use futures::StreamExt;
 #[cfg(feature = "vector")]
 use std::cell::RefCell;
 #[cfg(feature = "vector")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[cfg(feature = "vector")]
 use std::rc::Rc;
 #[cfg(feature = "vector")]
@@ -87,10 +91,7 @@ pub struct VectorWorkerStats {
 /// Uses `RefCell` for interior mutability to work in single-threaded contexts.
 #[cfg(feature = "vector")]
 pub struct VectorWorkerState {
-    /// Reverse dependency map: ledger_id -> set of graph source IDs.
-    ledger_to_graph_sources: HashMap<String, HashSet<String>>,
-    /// Forward map: graph_source_id -> set of ledger_ides (for unregistration).
-    gs_to_ledgers: HashMap<String, HashSet<String>>,
+    deps: DependencyIndex,
     /// Statistics.
     stats: VectorWorkerStats,
 }
@@ -100,72 +101,45 @@ impl VectorWorkerState {
     /// Create a new empty worker state.
     pub fn new() -> Self {
         Self {
-            ledger_to_graph_sources: HashMap::new(),
-            gs_to_ledgers: HashMap::new(),
+            deps: DependencyIndex::default(),
             stats: VectorWorkerStats::default(),
         }
     }
 
-    /// Register a graph source with its dependencies.
-    pub fn register_graph_source(&mut self, graph_source_id: &str, dependencies: &[String]) {
-        let deps_set: HashSet<String> = dependencies.iter().cloned().collect();
-
-        // Update forward map
-        self.gs_to_ledgers
-            .insert(graph_source_id.to_string(), deps_set.clone());
-
-        // Update reverse map
-        for ledger in &deps_set {
-            self.ledger_to_graph_sources
-                .entry(ledger.clone())
-                .or_default()
-                .insert(graph_source_id.to_string());
-        }
-
-        self.stats.registered_graph_sources = self.gs_to_ledgers.len();
+    /// Register (or re-register) a graph source with its dependencies.
+    pub fn register_graph_source(&mut self, graph_source_id: &LedgerId, dependencies: &[LedgerId]) {
+        self.deps.register(graph_source_id, dependencies);
+        self.stats.registered_graph_sources = self.deps.len();
         debug!(
-            graph_source_id,
+            graph_source_id = %graph_source_id,
             ?dependencies,
             "Registered vector graph source for maintenance"
         );
     }
 
     /// Unregister a graph source.
-    pub fn unregister_graph_source(&mut self, graph_source_id: &str) {
-        if let Some(ledgers) = self.gs_to_ledgers.remove(graph_source_id) {
-            // Remove from reverse map
-            for ledger in ledgers {
-                if let Some(graph_sources) = self.ledger_to_graph_sources.get_mut(&ledger) {
-                    graph_sources.remove(graph_source_id);
-                    if graph_sources.is_empty() {
-                        self.ledger_to_graph_sources.remove(&ledger);
-                    }
-                }
-            }
-        }
-        self.stats.registered_graph_sources = self.gs_to_ledgers.len();
+    pub fn unregister_graph_source(&mut self, graph_source_id: &LedgerId) {
+        self.deps.unregister(graph_source_id);
+        self.stats.registered_graph_sources = self.deps.len();
         debug!(
-            graph_source_id,
+            graph_source_id = %graph_source_id,
             "Unregistered vector graph source from maintenance"
         );
     }
 
     /// Get graph sources that depend on a ledger.
-    pub fn graph_sources_for_ledger(&self, ledger_id: &str) -> Vec<String> {
-        self.ledger_to_graph_sources
-            .get(ledger_id)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+    pub fn graph_sources_for_ledger(&self, ledger_id: &LedgerId) -> Vec<LedgerId> {
+        self.deps.sources_for(ledger_id)
     }
 
     /// Get all registered graph sources.
-    pub fn registered_graph_sources(&self) -> Vec<String> {
-        self.gs_to_ledgers.keys().cloned().collect()
+    pub fn registered_graph_sources(&self) -> Vec<LedgerId> {
+        self.deps.sources()
     }
 
     /// Get all watched ledgers.
-    pub fn watched_ledgers(&self) -> Vec<String> {
-        self.ledger_to_graph_sources.keys().cloned().collect()
+    pub fn watched_ledgers(&self) -> Vec<LedgerId> {
+        self.deps.ledgers()
     }
 
     /// Record a sync operation.
@@ -221,25 +195,34 @@ impl VectorWorkerHandle {
             .ok_or_else(|| {
                 ApiError::NotFound(format!("Graph source not found: {graph_source_id}"))
             })?;
+        let dependencies = parse_dependencies(&record.dependencies)?;
 
         self.state
             .borrow_mut()
-            .register_graph_source(graph_source_id, &record.dependencies);
+            .register_graph_source(&record.graph_source_id, &dependencies);
         Ok(())
     }
 
     /// Register a graph source with explicit dependencies (no nameservice lookup).
-    pub fn register_graph_source_with_deps(&self, graph_source_id: &str, dependencies: &[String]) {
+    pub fn register_graph_source_with_deps(
+        &self,
+        graph_source_id: &str,
+        dependencies: &[String],
+    ) -> Result<()> {
+        let graph_source_id = LedgerId::parse(graph_source_id)?;
+        let dependencies = parse_dependencies(dependencies)?;
         self.state
             .borrow_mut()
-            .register_graph_source(graph_source_id, dependencies);
+            .register_graph_source(&graph_source_id, &dependencies);
+        Ok(())
     }
 
     /// Unregister a graph source from automatic maintenance.
     pub fn unregister_graph_source(&self, graph_source_id: &str) {
-        self.state
-            .borrow_mut()
-            .unregister_graph_source(graph_source_id);
+        // An id that does not parse was never registered.
+        if let Ok(id) = LedgerId::parse(graph_source_id) {
+            self.state.borrow_mut().unregister_graph_source(&id);
+        }
     }
 
     /// Get current worker statistics.
@@ -248,7 +231,7 @@ impl VectorWorkerHandle {
     }
 
     /// Get all registered graph sources.
-    pub fn registered_graph_sources(&self) -> Vec<String> {
+    pub fn registered_graph_sources(&self) -> Vec<LedgerId> {
         self.state.borrow().registered_graph_sources()
     }
 
@@ -309,7 +292,7 @@ impl<'a> VectorMaintenanceWorker<'a> {
     /// Process a single nameservice event.
     ///
     /// Returns the list of graph source aliases that need syncing.
-    pub fn process_event(&self, event: &NameServiceEvent) -> Vec<String> {
+    pub fn process_event(&self, event: &NameServiceEvent) -> Vec<LedgerId> {
         self.state.borrow_mut().record_event();
 
         match event {
@@ -405,13 +388,13 @@ impl<'a> VectorMaintenanceWorker<'a> {
             .subscribe(fluree_db_nameservice::SubscriptionScope::All);
 
         // Debounced batching: we accumulate graph sources to sync and flush them after `debounce_ms`.
-        let mut pending: HashSet<String> = HashSet::new();
+        let mut pending: HashSet<LedgerId> = HashSet::new();
         let mut next_flush: Option<Instant> = None;
 
         // In-flight syncs (bounded by config.max_concurrent_syncs).
         #[allow(clippy::type_complexity)]
         let mut in_flight: futures::stream::FuturesUnordered<
-            std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<()>)>>>,
+            std::pin::Pin<Box<dyn std::future::Future<Output = (LedgerId, Result<()>)>>>,
         > = futures::stream::FuturesUnordered::new();
 
         loop {
@@ -501,30 +484,48 @@ impl<'a> VectorMaintenanceWorker<'a> {
 mod tests {
     use super::*;
 
+    fn id(s: &str) -> LedgerId {
+        LedgerId::parse(s).unwrap()
+    }
+
+    fn deps(ids: &[&str]) -> Vec<LedgerId> {
+        ids.iter().map(|s| id(s)).collect()
+    }
+
+    /// A vector index created with `ledger: "docs"` persists that spelling as
+    /// its dependency; commit events say `docs:main`. The worker parses the
+    /// persisted form at registration, so the commit wakes the index.
+    #[test]
+    fn a_branchless_dependency_is_woken_by_its_canonical_commit_event() {
+        let mut state = VectorWorkerState::new();
+        let parsed = parse_dependencies(&["docs".to_string()]).unwrap();
+        state.register_graph_source(&id("embeddings"), &parsed);
+        assert_eq!(
+            state.graph_sources_for_ledger(&id("docs:main")),
+            vec![id("embeddings:main")]
+        );
+    }
+
     #[test]
     fn test_worker_state_register_graph_source() {
         let mut state = VectorWorkerState::new();
 
         state.register_graph_source(
-            "embeddings:main",
-            &["ledger1:main".to_string(), "ledger2:main".to_string()],
+            &id("embeddings:main"),
+            &deps(&["ledger1:main", "ledger2:main"]),
         );
 
         assert_eq!(state.registered_graph_sources(), vec!["embeddings:main"]);
-        assert!(state
-            .watched_ledgers()
-            .contains(&"ledger1:main".to_string()));
-        assert!(state
-            .watched_ledgers()
-            .contains(&"ledger2:main".to_string()));
+        assert!(state.watched_ledgers().contains(&id("ledger1:main")));
+        assert!(state.watched_ledgers().contains(&id("ledger2:main")));
 
         // Graph sources for ledger
         assert_eq!(
-            state.graph_sources_for_ledger("ledger1:main"),
+            state.graph_sources_for_ledger(&id("ledger1:main")),
             vec!["embeddings:main"]
         );
         assert_eq!(
-            state.graph_sources_for_ledger("unknown:main"),
+            state.graph_sources_for_ledger(&id("unknown:main")),
             Vec::<String>::new()
         );
     }
@@ -533,10 +534,10 @@ mod tests {
     fn test_worker_state_unregister_graph_source() {
         let mut state = VectorWorkerState::new();
 
-        state.register_graph_source("embeddings:main", &["ledger:main".to_string()]);
+        state.register_graph_source(&id("embeddings:main"), &deps(&["ledger:main"]));
         assert_eq!(state.registered_graph_sources().len(), 1);
 
-        state.unregister_graph_source("embeddings:main");
+        state.unregister_graph_source(&id("embeddings:main"));
         assert_eq!(state.registered_graph_sources().len(), 0);
         assert_eq!(state.watched_ledgers().len(), 0);
     }
@@ -545,19 +546,19 @@ mod tests {
     fn test_worker_state_multiple_graph_sources() {
         let mut state = VectorWorkerState::new();
 
-        state.register_graph_source("gs1:main", &["ledger:main".to_string()]);
-        state.register_graph_source("gs2:main", &["ledger:main".to_string()]);
-        state.register_graph_source("gs3:main", &["other:main".to_string()]);
+        state.register_graph_source(&id("gs1:main"), &deps(&["ledger:main"]));
+        state.register_graph_source(&id("gs2:main"), &deps(&["ledger:main"]));
+        state.register_graph_source(&id("gs3:main"), &deps(&["other:main"]));
 
         // Both gs1 and gs2 depend on ledger:main
-        let graph_sources = state.graph_sources_for_ledger("ledger:main");
+        let graph_sources = state.graph_sources_for_ledger(&id("ledger:main"));
         assert_eq!(graph_sources.len(), 2);
-        assert!(graph_sources.contains(&"gs1:main".to_string()));
-        assert!(graph_sources.contains(&"gs2:main".to_string()));
+        assert!(graph_sources.contains(&id("gs1:main")));
+        assert!(graph_sources.contains(&id("gs2:main")));
 
         // Only gs3 depends on other:main
         assert_eq!(
-            state.graph_sources_for_ledger("other:main"),
+            state.graph_sources_for_ledger(&id("other:main")),
             vec!["gs3:main"]
         );
     }
@@ -566,7 +567,7 @@ mod tests {
     fn test_worker_state_stats() {
         let mut state = VectorWorkerState::new();
 
-        state.register_graph_source("gs:main", &["ledger:main".to_string()]);
+        state.register_graph_source(&id("gs:main"), &deps(&["ledger:main"]));
         assert_eq!(state.stats().registered_graph_sources, 1);
 
         state.record_event();

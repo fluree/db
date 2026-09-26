@@ -147,7 +147,7 @@ mod tests {
     }
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        LedgerSnapshot::genesis("test/main")
+        LedgerSnapshot::genesis("test:main")
     }
 
     #[tokio::test]

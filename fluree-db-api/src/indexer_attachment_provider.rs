@@ -31,6 +31,7 @@
 //! produce an authoritative event set without observing the
 //! ledger's running novelty.
 
+use fluree_db_core::LedgerId;
 use std::sync::{Arc, OnceLock};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -90,7 +91,7 @@ impl fluree_db_indexer::WarmCacheSource for LedgerManagerWarmCache {
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
-    async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {
+    async fn attachment_events(&self, ledger_id: &LedgerId) -> Option<AttachmentEventCoverage> {
         let manager = self.manager.get()?;
         // Coverage from LedgerManager: when snapshot.t==0 (no index
         // has ever run on this ledger), the AttachmentNovelty was
@@ -245,7 +246,7 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
 #[cfg(not(target_arch = "wasm32"))]
 async fn scan_base_index_for_attachment_events(
     manager: &LedgerManager,
-    ledger_id: &str,
+    ledger_id: &LedgerId,
 ) -> Option<
     Vec<(
         fluree_db_core::edge::EdgeKey,

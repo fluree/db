@@ -1291,8 +1291,9 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// Pins are keyed by the normalized `name:branch` id; the R2RML operator
     /// carries the GRAPH IRI as the user wrote it, which may omit the branch.
     fn pin_key(graph_source_id: &str) -> String {
-        fluree_db_core::normalize_ledger_id(graph_source_id)
-            .unwrap_or_else(|_| graph_source_id.to_string())
+        // A GRAPH IRI that is not a source id keys on itself and finds no pin.
+        fluree_db_core::LedgerId::parse(graph_source_id)
+            .map_or_else(|_| graph_source_id.to_string(), String::from)
     }
 
     /// This query's pin for `graph_source_id`, if any.

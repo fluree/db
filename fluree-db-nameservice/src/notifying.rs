@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, LedgerId};
 
 use crate::{
     event_bus::LedgerEventBus, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
@@ -111,7 +111,7 @@ where
         // their per-branch state. Without this notification the new
         // whole-ledger drop path would leave stale caches behind.
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: LedgerId::parse(ledger_id)?,
         });
         Ok(remaining)
     }
@@ -153,7 +153,7 @@ where
     async fn retract(&self, ledger_id: &str) -> Result<()> {
         self.inner.retract(ledger_id).await?;
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: LedgerId::parse(ledger_id)?,
         });
         Ok(())
     }
@@ -161,7 +161,7 @@ where
     async fn purge(&self, ledger_id: &str) -> Result<()> {
         self.inner.purge(ledger_id).await?;
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: LedgerId::parse(ledger_id)?,
         });
         Ok(())
     }
@@ -183,7 +183,7 @@ where
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerCommitPublished {
-                ledger_id: ledger_id.to_string(),
+                ledger_id: LedgerId::parse(ledger_id)?,
                 commit_id: commit_id.clone(),
                 commit_t,
             });
@@ -211,7 +211,7 @@ where
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerIndexPublished {
-                ledger_id: ledger_id.to_string(),
+                ledger_id: LedgerId::parse(ledger_id)?,
                 index_id: index_id.clone(),
                 index_t,
             });
@@ -239,7 +239,7 @@ where
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerIndexPublished {
-                ledger_id: ledger_id.to_string(),
+                ledger_id: LedgerId::parse(ledger_id)?,
                 index_id: index_id.clone(),
                 index_t,
             });
@@ -288,7 +288,7 @@ where
                     RefKind::CommitHead => {
                         self.event_bus
                             .notify(NameServiceEvent::LedgerCommitPublished {
-                                ledger_id: ledger_id.to_string(),
+                                ledger_id: LedgerId::parse(ledger_id)?,
                                 commit_id: cid.clone(),
                                 commit_t: new.t,
                             });
@@ -296,7 +296,7 @@ where
                     RefKind::IndexHead => {
                         self.event_bus
                             .notify(NameServiceEvent::LedgerIndexPublished {
-                                ledger_id: ledger_id.to_string(),
+                                ledger_id: LedgerId::parse(ledger_id)?,
                                 index_id: cid.clone(),
                                 index_t: new.t,
                             });
@@ -351,15 +351,19 @@ where
         config: &str,
         dependencies: &[String],
     ) -> Result<()> {
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
+        let canonical_deps = dependencies
+            .iter()
+            .map(|d| LedgerId::parse(d))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         self.inner
             .publish_graph_source(name, branch, source_type.clone(), config, dependencies)
             .await?;
-        let graph_source_id = format!("{name}:{branch}");
         self.event_bus
             .notify(NameServiceEvent::GraphSourceConfigPublished {
                 graph_source_id,
                 source_type,
-                dependencies: dependencies.to_vec(),
+                dependencies: canonical_deps,
             });
         Ok(())
     }
@@ -374,7 +378,7 @@ where
         self.inner
             .publish_graph_source_index(name, branch, index_id, index_t)
             .await?;
-        let graph_source_id = format!("{name}:{branch}");
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
         self.event_bus
             .notify(NameServiceEvent::GraphSourceIndexPublished {
                 graph_source_id,
@@ -386,7 +390,7 @@ where
 
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
         self.inner.retract_graph_source(name, branch).await?;
-        let graph_source_id = format!("{name}:{branch}");
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
         self.event_bus
             .notify(NameServiceEvent::GraphSourceRetracted { graph_source_id });
         Ok(())

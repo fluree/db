@@ -163,7 +163,9 @@ pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
     ConflictKey, QueryCancellation, QueryCancellationReason,
 };
-pub use fluree_db_core::{CommitId, ContentId};
+pub use fluree_db_core::{
+    CommitId, ContentId, LedgerId, LedgerIdParseError, LedgerName, LedgerRef,
+};
 pub use format::{
     sparql_service_description, AgentJsonContext, FormatError, FormatterConfig, OutputFormat,
     QueryOutput,
@@ -1689,10 +1691,10 @@ pub fn spawn_local_cache_event_listener(
 /// Reconcile one cached ledger against the current nameservice head.
 /// A no-op when the cache is already current or the ledger isn't
 /// loaded. Shared by the per-event path and the lag catch-up sweep.
-async fn reconcile_cached_ledger(ledger_manager: &LedgerManager, ledger_id: &str) {
+async fn reconcile_cached_ledger(ledger_manager: &LedgerManager, ledger_id: &LedgerId) {
     match ledger_manager
         .notify(NsNotify {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: ledger_id.clone(),
             record: None,
         })
         .await
@@ -4732,24 +4734,21 @@ impl Fluree {
     /// `FlureeBuilder::without_ledger_caching()`, returns an ephemeral
     /// handle that wraps a fresh load.
     pub async fn ledger_cached(&self, ledger_id: &str) -> Result<LedgerHandle> {
+        let ledger_id = LedgerId::parse(ledger_id)?;
         match &self.ledger_manager {
-            Some(mgr) => mgr.get_or_load(ledger_id).await,
+            Some(mgr) => mgr.get_or_load(&ledger_id).await,
             None => {
                 // Caching disabled: load fresh, wrap in ephemeral handle.
                 // Note: This handle is NOT cached; each call loads fresh.
                 // Extract the concrete BinaryIndexStore from the state's TypeErasedStore
                 // so the handle's binary_store stays coherent with db.range_provider.
-                let state = self.ledger(ledger_id).await?;
+                let state = self.ledger(&ledger_id).await?;
                 let binary_store = state.binary_store.as_ref().and_then(|te| {
                     te.0.clone()
                         .downcast::<fluree_db_binary_index::BinaryIndexStore>()
                         .ok()
                 });
-                Ok(LedgerHandle::new(
-                    ledger_id.to_string(),
-                    state,
-                    binary_store,
-                ))
+                Ok(LedgerHandle::new(ledger_id, state, binary_store))
             }
         }
     }
@@ -4782,8 +4781,9 @@ impl Fluree {
     /// let handle = fluree.ledger_cached("my/ledger").await?;
     /// ```
     pub async fn disconnect_ledger(&self, ledger_id: &str) {
-        if let Some(mgr) = &self.ledger_manager {
-            mgr.disconnect(ledger_id).await;
+        // An id that does not parse cannot have been cached.
+        if let (Some(mgr), Ok(ledger_id)) = (&self.ledger_manager, LedgerId::parse(ledger_id)) {
+            mgr.disconnect(&ledger_id).await;
         }
         // If caching is disabled, this is a no-op
     }
@@ -4916,9 +4916,11 @@ impl Fluree {
             }
         };
 
+        let ledger_id = LedgerId::parse(ledger_id)?;
+
         // Fast path: if min_t is set, check current cached t before hitting NS
         if let Some(min_t) = opts.min_t {
-            if let Some(current_t) = mgr.current_t(ledger_id).await {
+            if let Some(current_t) = mgr.current_t(&ledger_id).await {
                 if current_t >= min_t {
                     return Ok(Some(RefreshResult {
                         t: current_t,
@@ -4929,14 +4931,11 @@ impl Fluree {
         }
 
         // Step B: Lookup nameservice record
-        // The nameservice handles address resolution (mydb -> mydb:main, etc.)
-        let ns_record = match self.nameservice().lookup(ledger_id).await? {
+        let ns_record = match self.nameservice().lookup(&ledger_id).await? {
             Some(record) => record,
             None => return Ok(None), // Ledger doesn't exist in nameservice
         };
         // Step C: Use NsRecord.ledger_id as the cache key
-        // The ledger_id field contains the canonical form (e.g., "testdb:main")
-        // Note: NsRecord.name field only contains the name without branch, despite docs
         let canonical_alias = ns_record.ledger_id.clone();
 
         // Step D: Delegate to notify with the fresh record
@@ -5313,7 +5312,7 @@ impl Fluree {
                 ConfigCasResult::Updated => {
                     tracing::info!(
                         cid = %new_cid,
-                        ledger = canonical_id,
+                        ledger = %canonical_id,
                         "default context updated"
                     );
 
@@ -5339,7 +5338,7 @@ impl Fluree {
                 ConfigCasResult::Conflict { .. } => {
                     tracing::debug!(
                         attempt,
-                        ledger = canonical_id,
+                        ledger = %canonical_id,
                         "CAS conflict updating default context, retrying"
                     );
                     continue;

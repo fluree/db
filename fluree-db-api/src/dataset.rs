@@ -226,7 +226,7 @@ impl DatasetSpec {
             })?;
 
             // Verify same ledger
-            if from_source.identifier != to_identifier {
+            if !same_ledger(&from_source.identifier, &to_identifier) {
                 return Err(DatasetParseError::InvalidFrom(format!(
                     "FROM and TO must reference the same ledger: {} vs {}",
                     from_source.identifier, to_identifier
@@ -774,7 +774,7 @@ impl DatasetSpec {
             let to_source = parse_single_graph_source(to_val, "to")?;
 
             // Validate same ledger
-            if from_source.identifier != to_source.identifier {
+            if !same_ledger(&from_source.identifier, &to_source.identifier) {
                 return Err(DatasetParseError::InvalidFrom(format!(
                     "'from' and 'to' must reference the same ledger: '{}' vs '{}'",
                     from_source.identifier, to_source.identifier
@@ -872,7 +872,7 @@ impl DatasetSpec {
             let to_source = parse_single_graph_source(to_v, "to")?;
 
             // Validate same ledger
-            if from_source.identifier != to_source.identifier {
+            if !same_ledger(&from_source.identifier, &to_source.identifier) {
                 return Err(DatasetParseError::InvalidFrom(format!(
                     "'from' and 'to' must reference the same ledger: '{}' vs '{}'",
                     from_source.identifier, to_source.identifier
@@ -1164,6 +1164,19 @@ fn parse_ledger_id_time_travel(
     };
 
     Ok((format!("{identifier}{fragment_suffix}"), time_spec))
+}
+
+/// Whether two time-stripped identifiers name the same ledger and graph, so
+/// `mydb@t:1` → `mydb:main@t:5` is one ledger. Identifiers that do not parse
+/// compare as written and fail at load.
+fn same_ledger(a: &str, b: &str) -> bool {
+    match (
+        fluree_db_core::LedgerRef::parse(a),
+        fluree_db_core::LedgerRef::parse(b),
+    ) {
+        (Ok(a), Ok(b)) => a.id == b.id && a.fragment == b.fragment,
+        _ => a == b,
+    }
 }
 
 /// Parse graph sources from a JSON value

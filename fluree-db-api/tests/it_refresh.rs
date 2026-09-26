@@ -154,7 +154,9 @@ async fn current_t_returns_none_when_not_cached() {
         .ledger_manager()
         .expect("ledger_manager should be present");
 
-    let t = manager.current_t("nonexistent:main").await;
+    let t = manager
+        .current_t(&fluree_db_api::LedgerId::parse("nonexistent:main").unwrap())
+        .await;
     assert_eq!(t, None, "should return None for uncached ledger");
 }
 
@@ -172,10 +174,15 @@ async fn current_t_returns_correct_value_after_load() {
     let expected_t = ledger1.t();
 
     // Load into cache
-    let _handle = manager.get_or_load(ledger_id).await.expect("load");
+    let _handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load");
 
     // current_t should reflect the cached state
-    let t = manager.current_t(ledger_id).await;
+    let t = manager
+        .current_t(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await;
     assert_eq!(
         t,
         Some(expected_t),

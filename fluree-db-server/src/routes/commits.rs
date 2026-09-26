@@ -62,7 +62,7 @@ async fn commits_ledger_local(
         }
     })?;
 
-    if !principal.is_authorized_for_ledger(&ledger) {
+    if !principal.is_authorized_for_ledger(&crate::error::scope_id(&ledger)?) {
         return Err(ServerError::not_found("Ledger not found"));
     }
 

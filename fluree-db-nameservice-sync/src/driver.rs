@@ -6,6 +6,7 @@
 use crate::client::RemoteNameserviceClient;
 use crate::config::SyncConfigStore;
 use crate::error::{Result, SyncError};
+use fluree_db_core::LedgerId;
 use fluree_db_nameservice::{
     CasResult, RefKind, RefPublisher, RefValue, RemoteName, RemoteTrackingStore, TrackingRecord,
 };
@@ -17,9 +18,9 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct FetchResult {
     /// Ledger IDs whose tracking refs were updated
-    pub updated: Vec<(String, TrackingRecord)>,
+    pub updated: Vec<(LedgerId, TrackingRecord)>,
     /// Ledger IDs that were unchanged
-    pub unchanged: Vec<String>,
+    pub unchanged: Vec<LedgerId>,
 }
 
 /// Result of a pull operation
@@ -167,7 +168,10 @@ impl SyncDriver {
     ///
     /// Analogous to `git pull --ff-only`. Requires a prior `fetch_remote`.
     pub async fn pull_tracked(&self, local_alias: &str) -> Result<PullResult> {
-        let upstream = self.config.get_upstream(local_alias).await?;
+        let local_id =
+            LedgerId::parse(local_alias).map_err(|e| SyncError::Config(e.to_string()))?;
+        let local_alias = local_id.as_str();
+        let upstream = self.config.get_upstream(&local_id).await?;
         let Some(upstream) = upstream else {
             return Ok(PullResult::NoUpstream {
                 ledger_id: local_alias.to_string(),
@@ -337,7 +341,10 @@ impl SyncDriver {
     ///
     /// Analogous to `git push`. Uses CAS to ensure no concurrent changes.
     pub async fn push_tracked(&self, local_alias: &str) -> Result<PushResult> {
-        let upstream = self.config.get_upstream(local_alias).await?;
+        let local_id =
+            LedgerId::parse(local_alias).map_err(|e| SyncError::Config(e.to_string()))?;
+        let local_alias = local_id.as_str();
+        let upstream = self.config.get_upstream(&local_id).await?;
         let Some(upstream) = upstream else {
             return Ok(PushResult::NoUpstream {
                 ledger_id: local_alias.to_string(),
@@ -575,9 +582,9 @@ mod tests {
         // Setup upstream
         config
             .set_upstream(&UpstreamConfig {
-                local_alias: "mydb:main".to_string(),
+                local_alias: LedgerId::parse("mydb:main").unwrap(),
                 remote: origin(),
-                remote_alias: "mydb:main".to_string(),
+                remote_alias: LedgerId::parse("mydb:main").unwrap(),
                 auto_pull: false,
             })
             .await
@@ -623,9 +630,9 @@ mod tests {
 
         config
             .set_upstream(&UpstreamConfig {
-                local_alias: "mydb:main".to_string(),
+                local_alias: LedgerId::parse("mydb:main").unwrap(),
                 remote: origin(),
-                remote_alias: "mydb:main".to_string(),
+                remote_alias: LedgerId::parse("mydb:main").unwrap(),
                 auto_pull: false,
             })
             .await
@@ -656,9 +663,9 @@ mod tests {
 
         config
             .set_upstream(&UpstreamConfig {
-                local_alias: "mydb:main".to_string(),
+                local_alias: LedgerId::parse("mydb:main").unwrap(),
                 remote: origin(),
-                remote_alias: "mydb:main".to_string(),
+                remote_alias: LedgerId::parse("mydb:main").unwrap(),
                 auto_pull: false,
             })
             .await
@@ -708,9 +715,9 @@ mod tests {
 
         config
             .set_upstream(&UpstreamConfig {
-                local_alias: "mydb:main".to_string(),
+                local_alias: LedgerId::parse("mydb:main").unwrap(),
                 remote: origin(),
-                remote_alias: "mydb:main".to_string(),
+                remote_alias: LedgerId::parse("mydb:main").unwrap(),
                 auto_pull: false,
             })
             .await
@@ -735,9 +742,9 @@ mod tests {
 
         config
             .set_upstream(&UpstreamConfig {
-                local_alias: "mydb:main".to_string(),
+                local_alias: LedgerId::parse("mydb:main").unwrap(),
                 remote: origin(),
-                remote_alias: "mydb:main".to_string(),
+                remote_alias: LedgerId::parse("mydb:main").unwrap(),
                 auto_pull: false,
             })
             .await

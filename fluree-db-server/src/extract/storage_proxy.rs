@@ -34,8 +34,9 @@ pub struct StorageProxyPrincipal {
     pub identity: Option<String>,
     /// fluree.storage.all claim
     pub storage_all: bool,
-    /// fluree.storage.ledgers claim (HashSet for O(1) lookup)
-    pub storage_ledgers: HashSet<String>,
+    /// fluree.storage.ledgers claim, parsed like data scopes (bare `mydb` is
+    /// `mydb:main`).
+    pub storage_ledgers: HashSet<fluree_db_api::LedgerId>,
 }
 
 impl StorageProxyPrincipal {
@@ -45,7 +46,7 @@ impl StorageProxyPrincipal {
     }
 
     /// Check if principal is authorized for a specific ledger alias
-    pub fn is_authorized_for_ledger(&self, alias: &str) -> bool {
+    pub fn is_authorized_for_ledger(&self, alias: &fluree_db_api::LedgerId) -> bool {
         self.storage_all || self.storage_ledgers.contains(alias)
     }
 
@@ -120,12 +121,7 @@ fn build_principal(
         subject: payload.sub.clone(),
         identity: payload.resolve_identity(),
         storage_all: payload.storage_all.unwrap_or(false),
-        storage_ledgers: payload
-            .storage_ledgers
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
+        storage_ledgers: super::data_bearer::parse_scopes(payload.storage_ledgers.as_ref()),
     })
 }
 
@@ -240,15 +236,19 @@ mod tests {
             subject: Some("peer@example.com".to_string()),
             identity: Some("ex:PeerServiceAccount".to_string()),
             storage_all: false,
-            storage_ledgers: vec!["books:main".to_string(), "users:main".to_string()]
+            storage_ledgers: ["books:main", "users:main"]
                 .into_iter()
+                .map(|l| fluree_db_api::LedgerId::parse(l).unwrap())
                 .collect(),
         };
 
         assert!(principal.has_storage_permissions());
-        assert!(principal.is_authorized_for_ledger("books:main"));
-        assert!(principal.is_authorized_for_ledger("users:main"));
-        assert!(!principal.is_authorized_for_ledger("other:main"));
+        assert!(principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("books:main").unwrap()));
+        assert!(principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("users:main").unwrap()));
+        assert!(!principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("other:main").unwrap()));
     }
 
     #[test]
@@ -262,8 +262,10 @@ mod tests {
         };
 
         assert!(principal.has_storage_permissions());
-        assert!(principal.is_authorized_for_ledger("any:ledger"));
-        assert!(principal.is_authorized_for_ledger("books:main"));
+        assert!(principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("any:ledger").unwrap()));
+        assert!(principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("books:main").unwrap()));
     }
 
     #[test]
@@ -277,7 +279,8 @@ mod tests {
         };
 
         assert!(!principal.has_storage_permissions());
-        assert!(!principal.is_authorized_for_ledger("any:ledger"));
+        assert!(!principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("any:ledger").unwrap()));
     }
 }
 
@@ -396,9 +399,12 @@ mod tests_verify {
         assert!(result.is_ok());
         let StorageProxyBearer(principal) = result.unwrap();
         assert!(!principal.storage_all);
-        assert!(principal.is_authorized_for_ledger("books:main"));
-        assert!(principal.is_authorized_for_ledger("users:main"));
-        assert!(!principal.is_authorized_for_ledger("other:main"));
+        assert!(principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("books:main").unwrap()));
+        assert!(principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("users:main").unwrap()));
+        assert!(!principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("other:main").unwrap()));
     }
 
     #[test]
@@ -508,9 +514,12 @@ mod tests_verify_oidc {
         assert!(result.is_ok());
         let StorageProxyBearer(principal) = result.unwrap();
         assert!(!principal.storage_all);
-        assert!(principal.is_authorized_for_ledger("books:main"));
-        assert!(principal.is_authorized_for_ledger("users:main"));
-        assert!(!principal.is_authorized_for_ledger("other:main"));
+        assert!(principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("books:main").unwrap()));
+        assert!(principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("users:main").unwrap()));
+        assert!(!principal
+            .is_authorized_for_ledger(&fluree_db_api::LedgerId::parse("other:main").unwrap()));
     }
 
     #[tokio::test]

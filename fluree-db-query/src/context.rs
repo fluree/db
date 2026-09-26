@@ -1960,7 +1960,7 @@ mod budget_tests {
         let ceiling = per_query_memory_ceiling(full, 2); // 4 GiB each
         assert_eq!(ceiling, 4usize << 30);
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         // Two independent queries, each pinned to the divided ceiling as the runner
         // attach point does under FLUREE_QUERY_BUDGET_SHARE_DIV=2.

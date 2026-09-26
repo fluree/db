@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::ledger_view::CommitRef;
 use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result};
 use fluree_db_core::ContentStore;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId};
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 
@@ -33,7 +34,7 @@ impl Fluree {
     pub(crate) async fn refresh_index(&self, state: &mut LedgerState) -> Result<()> {
         if crate::ns_helpers::binary_store_missing_snapshot_namespaces(state) {
             tracing::debug!(
-                ledger_id = state.ledger_id(),
+                ledger_id = %state.ledger_id(),
                 "binary store predates snapshot namespaces; keeping existing store with snapshot namespace fallback"
             );
         }
@@ -136,12 +137,13 @@ impl Fluree {
     /// // Now you can transact: fluree.insert(ledger, &data).await?
     /// ```
     pub async fn create_ledger(&self, ledger_id: &str) -> Result<LedgerState> {
-        use fluree_db_core::ledger_id::normalize_ledger_id;
         use fluree_db_novelty::Novelty;
         use tracing::info;
 
-        // 1. Normalize ledger_id (ensure branch suffix)
-        let ledger_id = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        // 1. Parse (default branch applied) and apply the stricter rules for
+        //    new names, which existing ledgers are not held to.
+        let ledger_id = LedgerId::parse(ledger_id)?;
+        fluree_db_core::validate_ledger_name(ledger_id.name())?;
         info!(ledger_id = %ledger_id, "Creating ledger");
 
         // 2. Register in nameservice via the ledger-admin surface
@@ -198,7 +200,7 @@ impl Fluree {
         source_branch: Option<&str>,
         source_commit: Option<CommitRef>,
     ) -> Result<NsRecord> {
-        use fluree_db_core::ledger_id::{format_ledger_id, validate_branch_name};
+        use fluree_db_core::ledger_id::validate_branch_name;
         use tracing::info;
 
         validate_branch_name(new_branch).map_err(|e| ApiError::Http {
@@ -207,8 +209,8 @@ impl Fluree {
         })?;
 
         let source = source_branch.unwrap_or("main");
-        let source_id = format_ledger_id(ledger_name, source);
-        let new_id = format_ledger_id(ledger_name, new_branch);
+        let source_id = LedgerId::from_parts(ledger_name, source)?;
+        let new_id = LedgerId::from_parts(ledger_name, new_branch)?;
 
         info!(ledger_name, new_branch, source, "Creating branch");
 
@@ -217,7 +219,7 @@ impl Fluree {
             .nameservice()
             .lookup(&source_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(source_id.clone().to_string()))?;
 
         // Verify the source branch has a commit head before creating.
         let source_head = source_record.commit_head_id.clone().ok_or_else(|| {

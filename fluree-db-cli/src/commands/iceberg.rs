@@ -134,7 +134,7 @@ pub async fn run_iceberg_info(
     }
 
     let fluree = context::build_fluree(dirs)?;
-    let gs_id = context::to_ledger_id(name);
+    let gs_id = context::to_ledger_id(name)?;
     let gs = fluree
         .nameservice()
         .lookup_graph_source(&gs_id)
@@ -203,7 +203,7 @@ pub async fn run_iceberg_drop(
     }
 
     let fluree = context::build_fluree(dirs)?;
-    let gs_id = context::to_ledger_id(name);
+    let gs_id = context::to_ledger_id(name)?;
     let gs = fluree
         .nameservice()
         .lookup_graph_source(&gs_id)

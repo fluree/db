@@ -1381,7 +1381,7 @@ async fn main_with_adopted_feature_index() -> fluree_db_api::Fluree {
     fluree
         .ledger_manager()
         .unwrap()
-        .disconnect("mydb:main")
+        .disconnect(&fluree_db_api::LedgerId::parse("mydb:main").unwrap())
         .await;
     let cached = fluree
         .ledger_cached("mydb:main")

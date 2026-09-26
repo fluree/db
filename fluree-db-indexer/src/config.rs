@@ -95,7 +95,10 @@ pub enum AttachmentEventCoverage {
 /// defensive drop covers correctness.
 #[async_trait]
 pub trait AttachmentEventsProvider: std::fmt::Debug + Send + Sync {
-    async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage>;
+    async fn attachment_events(
+        &self,
+        ledger_id: &fluree_db_core::LedgerId,
+    ) -> Option<AttachmentEventCoverage>;
 }
 
 /// Scope of a configured full-text property entry.

@@ -452,7 +452,7 @@ pub async fn build_transact_policy_context(
         .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
     {
         Some(reasoning) => {
-            let ledger_id: String = snapshot.ledger_id.to_string();
+            let ledger_id = snapshot.ledger_id.clone();
             let mut schema_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
             crate::cross_ledger::resolve_schema_closure_bundle(reasoning, snapshot, &mut schema_ctx)
                 .await
@@ -466,7 +466,7 @@ pub async fn build_transact_policy_context(
     };
 
     if let Some(source) = source.filter(|s| s.ledger.is_some()) {
-        let ledger_id: String = snapshot.ledger_id.to_string();
+        let ledger_id = snapshot.ledger_id.clone();
         let mut ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
         let config_policy_class = resolved
             .as_ref()

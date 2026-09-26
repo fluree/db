@@ -14,11 +14,9 @@
 
 use crate::error::{ApiError, Result};
 use crate::Fluree;
-use fluree_db_core::address_path::shared_prefix_for_path;
 use fluree_db_core::storage::GRAPH_SOURCES_PATH_SEGMENT;
-use fluree_db_core::{
-    ledger_id_prefix_for_path, EncryptionAdmin, Storage, StorageMethod, StorageRead, StorageWrite,
-};
+use fluree_db_core::{EncryptionAdmin, Storage, StorageMethod, StorageRead, StorageWrite};
+use fluree_db_core::{LedgerId, LedgerName};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -259,30 +257,34 @@ impl Fluree {
     async fn key_rotation_units(&self, method: &str, scope: Option<&str>) -> Result<Vec<Unit>> {
         let mut records = self.nameservice().all_records().await?;
         records.sort_by(|a, b| a.ledger_id.cmp(&b.ledger_id));
-        let in_scope = |ledger_id: &str, name: &str| match scope {
+        // A bare name scopes the whole ledger; `name:branch` one branch.
+        let scope = scope
+            .map(|s| match LedgerName::parse(s) {
+                Ok(name) => Ok(Err(name)),
+                Err(_) => LedgerId::parse(s).map(Ok),
+            })
+            .transpose()?;
+        let in_scope = |id: &LedgerId| match &scope {
             None => true,
-            Some(s) if s.contains(':') => s == ledger_id,
-            Some(s) => s == name,
+            Some(Ok(branch)) => id == branch,
+            Some(Err(name)) => id.name() == name.as_str(),
         };
         let mut units = Vec::new();
         let mut shared = BTreeSet::new();
         for record in &records {
-            if !in_scope(&record.ledger_id, &record.name) {
+            if !in_scope(&record.ledger_id) {
                 continue;
             }
             units.push(Unit {
-                label: record.ledger_id.clone(),
-                prefix: format!(
-                    "fluree:{method}://{}/",
-                    ledger_id_prefix_for_path(&record.ledger_id)
-                ),
+                label: record.ledger_id.to_string(),
+                prefix: format!("fluree:{method}://{}/", record.ledger_id.path_prefix()),
             });
-            shared.insert(record.name.clone());
+            shared.insert(record.ledger_id.ledger_name());
         }
         for name in shared {
             units.push(Unit {
                 label: format!("{name} (shared dictionaries)"),
-                prefix: format!("fluree:{method}://{}/", shared_prefix_for_path(&name)),
+                prefix: format!("fluree:{method}://{}/", name.shared_prefix()),
             });
         }
         if scope.is_none() {

@@ -1041,7 +1041,7 @@ mod tests {
             yielded: Default::default(),
         };
 
-        let snapshot = crate::LedgerSnapshot::genesis("test/main");
+        let snapshot = crate::LedgerSnapshot::genesis("test:main");
         let out = range_with_overlay(
             &snapshot,
             0,

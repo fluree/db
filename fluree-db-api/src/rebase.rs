@@ -5,7 +5,7 @@
 //! upstream changes.
 
 use crate::error::{ApiError, Result};
-use fluree_db_core::ledger_id::format_ledger_id;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{
     range_with_overlay, ConflictKey, ContentId, Flake, IndexType, RangeMatch, RangeOptions,
     RangeTest, DEFAULT_GRAPH_ID,
@@ -143,11 +143,11 @@ pub struct StagedRebase {
     /// Branch being rebased (without ledger prefix).
     pub branch: String,
     /// Fully-qualified branch id (`"<ledger>:<branch>"`).
-    pub branch_id: String,
+    pub branch_id: LedgerId,
     /// Source branch name (without ledger prefix).
     pub source: String,
     /// Fully-qualified source id.
-    pub source_id: String,
+    pub source_id: LedgerId,
     /// Source's current head ref. For fast-forward, this is also
     /// what the branch's HEAD advances to (`new_head_*` reflects
     /// it).
@@ -312,12 +312,12 @@ impl crate::Fluree {
         branch: &str,
         strategy: ConflictStrategy,
     ) -> Result<StagedRebase> {
-        let branch_id = format_ledger_id(ledger_name, branch);
+        let branch_id = LedgerId::from_parts(ledger_name, branch)?;
         let branch_record = self
             .nameservice()
             .lookup(&branch_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(branch_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(branch_id.clone().to_string()))?;
 
         // Refuse the root structurally — there's nothing to rebase onto.
         // "main" carries no special meaning here; a ledger whose root is
@@ -330,12 +330,12 @@ impl crate::Fluree {
             ))
         })?;
 
-        let source_id = format_ledger_id(ledger_name, source_name);
+        let source_id = LedgerId::from_parts(ledger_name, source_name)?;
         let source_record = self
             .nameservice()
             .lookup(&source_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(source_id.clone().to_string()))?;
 
         let source_head_id = source_record.commit_head_id.clone().ok_or_else(|| {
             ApiError::internal(format!("Source branch {source_id} has no commit head"))

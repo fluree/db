@@ -176,7 +176,7 @@ async fn execute_mutation(
 ) -> Result<JsonValue> {
     // Writing needs write authority, which reading does not imply.
     if let Some(p) = bearer.0.as_ref() {
-        if !credential.is_signed() && !p.can_write(ledger) {
+        if !credential.is_signed() && !p.can_write(&crate::error::scope_id(ledger)?) {
             return Err(ServerError::not_found("Ledger not found"));
         }
     }
@@ -249,7 +249,7 @@ fn authorize_read(
         return Err(ServerError::unauthorized("Bearer token required"));
     }
     if let Some(p) = bearer.0.as_ref() {
-        if !credential.is_signed() && !p.can_read(ledger) {
+        if !credential.is_signed() && !p.can_read(&crate::error::scope_id(ledger)?) {
             // Not 403: whether a ledger exists is itself privileged.
             return Err(ServerError::not_found("Ledger not found"));
         }

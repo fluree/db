@@ -19,7 +19,7 @@ pub struct IndexOutcome {
 pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(ledger, dirs)?;
     let fluree = build_fluree(dirs)?;
-    let ledger_id = context::to_ledger_id(&alias);
+    let ledger_id = context::to_ledger_id(&alias)?;
 
     // Verify ledger exists
     if !fluree.ledger_exists(&ledger_id).await.unwrap_or(false) {
@@ -75,7 +75,7 @@ pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOu
         let ledger_has_annotations =
             view.snapshot.has_annotations || view.novelty.attachments.has_annotations();
         if ledger_has_annotations {
-            config.attachment_events = provider.attachment_events(ledger_id).await;
+            config.attachment_events = provider.attachment_events(handle.id()).await;
         }
     }
 
@@ -151,7 +151,7 @@ pub async fn run_reindex(
             print_reindex_result(&result);
         }
         LedgerMode::Local { fluree, alias } => {
-            let ledger_id = context::to_ledger_id(&alias);
+            let ledger_id = context::to_ledger_id(&alias)?;
 
             if !fluree.ledger_exists(&ledger_id).await.unwrap_or(false) {
                 return Err(CliError::NotFound(format!("ledger '{alias}' not found")));

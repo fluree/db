@@ -429,6 +429,21 @@ impl ServerError {
     }
 }
 
+impl From<fluree_db_api::LedgerIdParseError> for ServerError {
+    fn from(e: fluree_db_api::LedgerIdParseError) -> Self {
+        ServerError::bad_request(e.to_string())
+    }
+}
+
+/// The ledger id a request names, for authorizing it.
+///
+/// Accepts the full address grammar (`name[:branch][@t:..][#graph]`) and
+/// returns the id the API will resolve it to, so a scope check and the
+/// operation it guards cannot disagree about which ledger that is.
+pub(crate) fn scope_id(raw: &str) -> std::result::Result<fluree_db_api::LedgerId, ServerError> {
+    Ok(fluree_db_api::LedgerRef::parse(raw)?.id)
+}
+
 impl From<NameServiceError> for ServerError {
     fn from(e: NameServiceError) -> Self {
         // NameServiceError variants map to ApiError which maps to ServerError

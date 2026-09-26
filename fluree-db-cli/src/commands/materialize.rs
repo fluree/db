@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn blocking_existing_branch_refuses_a_live_non_target_branch() {
         // CRITICAL-1: the name-scoped gate-fail drop would purge this live 'main'.
-        let existing = vec![NsRecord::new("analytics-twin", "main")];
+        let existing = vec![NsRecord::new("analytics-twin:main")];
         let blocker = blocking_existing_branch(&existing, "v2");
         assert!(blocker.is_some(), "a live non-target branch must block");
         assert_eq!(blocker.unwrap().branch, "main");
@@ -426,11 +426,11 @@ mod tests {
         assert!(blocking_existing_branch(&[], "main").is_none());
         // Only the target branch present (governed by the build's own freshness
         // guard, and the drop can only hit what this build created) → no block.
-        let target_only = vec![NsRecord::new("dw-twin", "main")];
+        let target_only = vec![NsRecord::new("dw-twin:main")];
         assert!(blocking_existing_branch(&target_only, "main").is_none());
         // A RETRACTED non-target branch is already gone → purging it is no data
         // loss → no block.
-        let retracted_other = vec![retracted(NsRecord::new("dw-twin", "old"))];
+        let retracted_other = vec![retracted(NsRecord::new("dw-twin:old"))];
         assert!(blocking_existing_branch(&retracted_other, "main").is_none());
     }
 

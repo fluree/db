@@ -3626,7 +3626,7 @@ mod tests {
     use futures::stream;
 
     fn sample_ns_record() -> NsRecord {
-        let mut record = NsRecord::new("mydb".to_string(), "main".to_string());
+        let mut record = NsRecord::new("mydb:main");
         record.commit_head_id = Some(ContentId::new(ContentKind::Commit, b"head"));
         record.commit_t = 7;
         record.index_head_id = Some(ContentId::new(ContentKind::IndexRoot, b"idx"));

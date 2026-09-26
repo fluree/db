@@ -7,6 +7,7 @@
 use crate::backoff::Backoff;
 use crate::client::RemoteNameserviceClient;
 use crate::watch::RemoteEvent;
+use fluree_db_core::LedgerId;
 use fluree_db_nameservice::{GraphSourceRecord, NsRecord};
 use futures::Stream;
 use std::collections::HashMap;
@@ -37,8 +38,8 @@ impl crate::watch::RemoteWatch for PollRemoteWatch {
         let interval = self.interval;
 
         let stream = async_stream::stream! {
-            let mut prev_ledgers: HashMap<String, NsRecord> = HashMap::new();
-            let mut prev_graph_sources: HashMap<String, GraphSourceRecord> = HashMap::new();
+            let mut prev_ledgers: HashMap<LedgerId, NsRecord> = HashMap::new();
+            let mut prev_graph_sources: HashMap<LedgerId, GraphSourceRecord> = HashMap::new();
             let mut backoff = Backoff::new(1000, 60_000);
             let mut connected = false;
 
@@ -52,7 +53,7 @@ impl crate::watch::RemoteWatch for PollRemoteWatch {
                         }
 
                         // Diff ledgers
-                        let mut current_ledgers: HashMap<String, NsRecord> = HashMap::new();
+                        let mut current_ledgers: HashMap<LedgerId, NsRecord> = HashMap::new();
                         for record in snapshot.ledgers {
                             let key = record.ledger_id.clone();
                             if record.retracted {
@@ -84,7 +85,7 @@ impl crate::watch::RemoteWatch for PollRemoteWatch {
                         prev_ledgers = current_ledgers;
 
                         // Diff graph sources
-                        let mut current_graph_sources: HashMap<String, GraphSourceRecord> = HashMap::new();
+                        let mut current_graph_sources: HashMap<LedgerId, GraphSourceRecord> = HashMap::new();
                         for record in snapshot.graph_sources {
                             let key = record.graph_source_id.clone();
                             if record.retracted {
@@ -196,7 +197,7 @@ mod tests {
 
     fn make_record(ledger_name: &str, commit_t: i64) -> NsRecord {
         NsRecord {
-            ledger_id: format!("{ledger_name}:main"),
+            ledger_id: LedgerId::parse(&format!("{ledger_name}:main")).unwrap(),
             name: ledger_name.to_string(),
             branch: "main".to_string(),
             commit_head_id: None,
