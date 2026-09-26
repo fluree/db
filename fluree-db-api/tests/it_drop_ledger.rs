@@ -767,3 +767,52 @@ async fn hard_drop_of_nested_name_keeps_the_parent_named_ledgers_dicts() {
     let db = fluree.db("test").await.expect("load test");
     assert!(db.t > 0);
 }
+
+/// A legacy ledger whose name nests inside another ledger's storage
+/// (`a/main/index/child` lives under `a:main`'s `index/` directory) must
+/// survive a hard drop of `a` — its branches and its `@shared/` dictionaries.
+/// New names can no longer take a reserved layout segment, so the fixture is
+/// built the way such a ledger would already exist: without `create_ledger`.
+#[tokio::test]
+async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": "a string for the dicts"}]
+    });
+    let parent = fluree.create_ledger("a").await.expect("create a");
+    fluree.insert(parent, &txn).await.expect("insert a");
+    let child_id = "a/main/index/child:main";
+    let child = LedgerState::new(LedgerSnapshot::genesis(child_id), Novelty::new(0));
+    fluree.insert(child, &txn).await.expect("insert child");
+    for id in ["a", "a/main/index/child"] {
+        fluree
+            .reindex(id, fluree_db_api::ReindexOptions::default())
+            .await
+            .expect("reindex writes dict blobs");
+    }
+
+    let admin = fluree.admin_storage().expect("managed backend");
+    let child_root = "fluree:file://a/main/index/child/";
+    let before = admin.list_prefix(child_root).await.expect("list");
+    assert!(
+        before.iter().any(|f| f.contains("/@shared/dicts/"))
+            && before.iter().any(|f| f.contains("/main/commit/")),
+        "fixture: child must have commits and shared dicts: {before:?}"
+    );
+
+    fluree
+        .drop_ledger("a", DropMode::Hard)
+        .await
+        .expect("drop a");
+
+    let after = admin.list_prefix(child_root).await.expect("list");
+    assert_eq!(
+        after, before,
+        "dropping `a` deleted the nested ledger's files"
+    );
+    fluree.disconnect_ledger(child_id).await;
+    assert!(fluree.db(child_id).await.expect("child still loads").t > 0);
+}

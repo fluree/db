@@ -3559,7 +3559,11 @@ where
         // otherwise re-importing under the other spelling would mint a
         // different id for every blank node in the source.
         let normalized_alias = fluree_db_core::LedgerId::parse(alias)
-            .and_then(|id| fluree_db_core::validate_ledger_name(id.name()).map(|()| id))
+            .and_then(|id| {
+                fluree_db_core::validate_ledger_name(id.name())?;
+                fluree_db_core::validate_branch_name(id.branch())?;
+                Ok(id)
+            })
             .map_err(|e| ImportError::Api(ApiError::from(e)))?
             .to_string();
         let skolem_namespace = config

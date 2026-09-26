@@ -144,6 +144,7 @@ impl Fluree {
         //    new names, which existing ledgers are not held to.
         let ledger_id = LedgerId::parse(ledger_id)?;
         fluree_db_core::validate_ledger_name(ledger_id.name())?;
+        fluree_db_core::validate_branch_name(ledger_id.branch())?;
         info!(ledger_id = %ledger_id, "Creating ledger");
 
         // 2. Register in nameservice via the ledger-admin surface

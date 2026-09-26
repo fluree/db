@@ -387,7 +387,8 @@ where
     ));
     let foreign: Vec<String> = nested
         .iter()
-        .map(|id| format!("fluree:{method}://{}/", id.path_prefix()))
+        // The whole name: its branches and its `@shared/` namespace alike.
+        .map(|id| format!("fluree:{method}://{}/", id.name()))
         .collect();
 
     let mut scanned = HashSet::new();
@@ -546,19 +547,32 @@ mod tests {
         let child = LedgerId::parse("mydb/main/index/child:main").unwrap();
         let (_, child_commit) = cid_and_addr_for(&child, ContentKind::Commit, b"child commit");
         storage.write_bytes(&child_commit, b"commit").await.unwrap();
-        assert!(
-            child_commit.contains("mydb/main/index/"),
-            "fixture must sit under the swept prefix, or this test is vacuous: {child_commit}"
+        // Its shared dictionaries sit beside its branches, not under them.
+        let (_, child_dict) = cid_and_addr_for(
+            &child,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"child dict",
         );
+        storage.write_bytes(&child_dict, b"dict").await.unwrap();
+        for addr in [&child_commit, &child_dict] {
+            assert!(
+                addr.contains("mydb/main/index/"),
+                "fixture must sit under the swept prefix, or this test is vacuous: {addr}"
+            );
+        }
 
         let branches = heads(&[(MAIN, roots.last())]);
         let unaware = plan_sweep(&storage, &name(NAME), &branches, &[], None)
             .await
             .unwrap();
-        assert!(
-            unaware.orphans.contains(&child_commit),
-            "without ownership the nested ledger's commit reads as an orphan"
-        );
+        for addr in [&child_commit, &child_dict] {
+            assert!(
+                unaware.orphans.contains(addr),
+                "without ownership the nested ledger's file reads as an orphan: {addr}"
+            );
+        }
 
         let records = [
             fluree_db_nameservice::NsRecord::new(MAIN),
@@ -569,11 +583,12 @@ mod tests {
         let plan = plan_sweep(&storage, &name(NAME), &branches, &nested, None)
             .await
             .unwrap();
-        assert!(
-            !plan.orphans.contains(&child_commit),
-            "another ledger's file was planned for deletion: {:?}",
-            plan.orphans
-        );
+        for addr in [&child_commit, &child_dict] {
+            assert!(
+                !plan.orphans.contains(addr),
+                "another ledger's file was planned for deletion: {addr}"
+            );
+        }
     }
 
     /// Everything an intact chain references stays live, so a healthy ledger

@@ -1506,7 +1506,8 @@ impl crate::Fluree {
         let foreign: Vec<String> = match self.nameservice().all_records().await {
             Ok(records) => nested_ledgers(&records, &ledger_id.ledger_name())
                 .iter()
-                .map(|id| format!("fluree:{storage_method}://{}/", id.path_prefix()))
+                // The whole name: its branches and its `@shared/` namespace alike.
+                .map(|id| format!("fluree:{storage_method}://{}/", id.name()))
                 .collect(),
             Err(e) => {
                 warnings.push(format!(

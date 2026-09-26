@@ -49,6 +49,21 @@ async fn create_ledger_name_validation() {
     assert_eq!(ledger.ledger_id(), "auto-branch-test:main");
 }
 
+/// Creating a ledger names its initial branch too, and must apply the same
+/// rules as `create_branch`: `db:main.index` would share `db:main`'s
+/// nameservice index sidecar, and `/` makes storage paths ambiguous.
+#[tokio::test]
+async fn create_ledger_applies_branch_name_rules() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for id in ["db:main.index", "db:release/v1", "db:index", "db:a#b"] {
+        assert!(
+            fluree.create_ledger(id).await.is_err(),
+            "{id} must be refused at creation"
+        );
+    }
+    assert!(fluree.create_ledger("db:dev").await.is_ok());
+}
+
 /// Test edge cases for ledger name validation
 #[tokio::test]
 async fn edge_case_validation() {
