@@ -85,7 +85,7 @@ tail -f /var/log/fluree/server.log | grep WARN
 **Quick Checks:**
 ```bash
 # Is server running?
-ps aux | grep fluree-db-server
+ps aux | grep 'fluree server'
 
 # Is port listening?
 netstat -an | grep 8090
@@ -191,7 +191,7 @@ See [Common Errors](common-errors.md) for complete error code reference.
 ### Enable Debug Logging
 
 ```bash
-./fluree-db-server --log-level debug
+fluree server run --log-level debug
 ```
 
 Runtime log-level changes are not currently exposed through the standalone HTTP
@@ -239,7 +239,7 @@ When reporting issues, include:
 
 2. **Configuration:**
    ```bash
-   ./fluree-db-server --help
+   fluree server run -- --help
    # Include relevant config values
    ```
 

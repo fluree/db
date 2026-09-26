@@ -377,7 +377,7 @@ Common `401` error messages and their causes:
 | `Bearer token required` | No `Authorization: Bearer ...` header | `fluree auth login --remote <name>` |
 | `Invalid token` | Malformed JWT/JWS, bad signature | Re-issue token; check signing key |
 | `Token expired` | `exp` claim is in the past | Refresh or re-login |
-| `Untrusted issuer` | `iss` / signing key not in trusted list | Check `--trusted-issuer` / `--jwks-issuer` config |
+| `Untrusted issuer` | `iss` / signing key not in trusted list | Check `--data-auth-trusted-issuer` (or the events/admin equivalent) / `--jwks-issuer` config |
 | `OIDC issuer not configured` | Token has `kid` header but no JWKS configured | Add `--jwks-issuer` to server config |
 | `Token lacks storage proxy permissions` | Valid token but missing `fluree.storage.*` | Use operator token or `fluree track` instead |
 

@@ -395,7 +395,11 @@ for (let i = 0; i < entities.length; i += batchSize) {
 
 **Increase limits (if appropriate):**
 ```bash
-./fluree-db-server --max-transaction-size 20971520
+# Raise the request body limit (err:db/PayloadTooLarge); default 50 MB
+fluree server run -- --body-limit 104857600
+
+# Raise the novelty hard limit (err:db/NoveltyDeltaTooLarge)
+fluree server run -- --reindex-max-bytes 2147483648
 ```
 
 ## STORAGE_ERROR
@@ -467,7 +471,7 @@ curl http://localhost:8090/v1/fluree/info/mydb:main
 
 **Tune indexing:**
 ```bash
-fluree-server \
+fluree server run -- \
   --indexing-enabled \
   --reindex-min-bytes 100000 \
   --reindex-max-bytes 1000000

@@ -231,7 +231,7 @@ index_rate < transaction_rate
 ### Optimize for Write-Heavy Loads
 
 ```bash
-fluree-server \
+fluree server run -- \
   --indexing-enabled \
   --reindex-min-bytes 200000 \
   --reindex-max-bytes 2000000
@@ -242,7 +242,7 @@ Larger thresholds reduce indexing frequency (more novelty accumulation), trading
 ### Optimize for Read-Heavy Loads
 
 ```bash
-fluree-server \
+fluree server run -- \
   --indexing-enabled \
   --reindex-min-bytes 50000
 ```

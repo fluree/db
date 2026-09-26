@@ -320,8 +320,9 @@ fn find_config_in_dir(dir: &Path) -> Option<PathBuf> {
 /// Returns `None` if no config file is found (this is not an error).
 pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
-        // Explicit path: could be a file or a directory containing config
-        if p.is_dir() {
+        // Explicit path: a file, a directory containing config, or the
+        // parent of a .fluree/ directory.
+        if p.is_file() {
             return Some(p.to_path_buf());
         }
         if p.is_dir() {
@@ -329,14 +330,7 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
                 return Some(found);
             }
         }
-        // Try as parent of a .fluree/ directory
-        let fluree_subdir = p.join(FLUREE_DIR);
-        if let Some(found) = find_config_in_dir(&fluree_subdir) {
-            return Some(found);
-        }
-        // Explicit path not found — warn and continue without file config
-        warn!(path = %p.display(), "Config file not found at specified path");
-        return None;
+        return find_config_in_dir(&p.join(FLUREE_DIR));
     }
 
     // Walk up from cwd looking for .fluree/config.{toml,jsonld}
@@ -1038,6 +1032,15 @@ pub fn load_and_merge_config(
 ) -> Result<(), ConfigFileError> {
     let config_path = resolve_config_path(config.config_file.as_deref());
 
+    // A config file the caller named but that isn't there is an error, not a
+    // silent fall-back to defaults (callers treat it as fatal).
+    if let (None, Some(explicit)) = (&config_path, &config.config_file) {
+        return Err(ConfigFileError::Io {
+            path: explicit.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no config file found"),
+        });
+    }
+
     let Some(path) = config_path else {
         debug!("No config file found, using CLI args and defaults only");
         return Ok(());
@@ -1121,6 +1124,25 @@ mod tests {
             assert_eq!(data.trusted_issuers, ["did:key:file"]);
             assert!(data.validate().is_ok());
         }
+    }
+
+    /// An explicit `--config-file` is loaded (it was once ignored with a
+    /// warning), and one that doesn't exist is an error.
+    #[test]
+    fn explicit_config_file_is_loaded_or_fails() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("custom.toml");
+        std::fs::write(&path, "[server]\nstorage_path = \"/from/file\"\n").unwrap();
+        let load = |file: &Path| {
+            let args = ["fluree-server", "--config-file", file.to_str().unwrap()];
+            let matches = ServerConfig::command().try_get_matches_from(args).unwrap();
+            let mut config = ServerConfig::from_arg_matches(&matches).unwrap();
+            load_and_merge_config(&mut config, &matches).map(|()| config.storage_path)
+        };
+        assert_eq!(load(&path).unwrap(), Some(PathBuf::from("/from/file")));
+        assert!(load(&tmp.path().join("missing.toml")).is_err());
     }
 
     #[test]

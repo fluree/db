@@ -262,6 +262,11 @@ pub fn clear_active_ledger(fluree_dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
+/// The project's default storage directory, `<data dir>/storage`.
+pub fn default_storage_path(dirs: &FlureeDir) -> PathBuf {
+    dirs.data_dir().join(STORAGE_DIR)
+}
+
 /// Resolve the storage path for the Fluree instance.
 ///
 /// Checks the config file (`config.toml` / `config.jsonld`) in

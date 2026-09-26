@@ -11,7 +11,7 @@ Bolt is compiled in by default but binds only when an address is
 configured (conventional port 7687):
 
 ```bash
-fluree-server \
+fluree server run \
   --bolt-listen-addr 0.0.0.0:7687 \
   --bolt-default-db mydb:main
 ```

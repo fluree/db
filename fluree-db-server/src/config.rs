@@ -409,12 +409,32 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_CONNECTION_CONFIG")]
     pub connection_config: Option<PathBuf>,
 
-    /// Enable CORS (Cross-Origin Resource Sharing)
-    #[arg(long, env = "FLUREE_CORS_ENABLED", default_value_t = server_defaults::DEFAULT_CORS_ENABLED)]
+    /// Enable CORS (Cross-Origin Resource Sharing). On by default;
+    /// `--cors-enabled=false` turns it off.
+    #[arg(
+        long,
+        env = "FLUREE_CORS_ENABLED",
+        default_value_t = server_defaults::DEFAULT_CORS_ENABLED,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub cors_enabled: bool,
 
-    /// Enable background indexing
-    #[arg(long, env = "FLUREE_INDEXING_ENABLED", default_value_t = server_defaults::DEFAULT_INDEXING_ENABLED)]
+    /// Enable background indexing. On by default; `--indexing-enabled=false`
+    /// turns it off.
+    #[arg(
+        long,
+        env = "FLUREE_INDEXING_ENABLED",
+        default_value_t = server_defaults::DEFAULT_INDEXING_ENABLED,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub indexing_enabled: bool,
 
     /// Keep BM25 full-text indexes current automatically, syncing each one when
@@ -1417,6 +1437,32 @@ mod gc_retention_flag_tests {
     /// First hop of the env → `ServerConfig` → `FlureeBuilder` →
     /// `IndexerConfig` path: the flags parse, the ceiling is unset unless
     /// asked for, and each flag carries its documented env name.
+    /// The on-by-default switches can be turned off from the command line.
+    #[test]
+    fn default_on_switches_take_an_explicit_value() {
+        let parse = |args: &[&str]| {
+            let cfg = ServerConfig::try_parse_from(
+                std::iter::once("fluree-server").chain(args.iter().copied()),
+            )
+            .expect("flags parse");
+            (cfg.cors_enabled, cfg.indexing_enabled)
+        };
+        assert_eq!(parse(&[]), (true, true));
+        assert_eq!(
+            parse(&["--cors-enabled", "--indexing-enabled"]),
+            (true, true)
+        );
+        assert_eq!(
+            parse(&["--cors-enabled=false", "--indexing-enabled=off"]),
+            (false, false)
+        );
+        assert_eq!(
+            parse(&["--cors-enabled=0", "--indexing-enabled=true"]),
+            (false, true)
+        );
+        assert!(ServerConfig::try_parse_from(["fluree-server", "--cors-enabled=maybe"]).is_err());
+    }
+
     #[test]
     fn gc_retention_flags_parse_and_name_their_env_vars() {
         let cfg = ServerConfig::try_parse_from([
