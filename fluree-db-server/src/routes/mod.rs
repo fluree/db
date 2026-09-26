@@ -13,6 +13,7 @@ mod export;
 pub mod graphql;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+#[cfg(feature = "iceberg")]
 mod iceberg_ssrf;
 mod import;
 mod ledger;
@@ -24,6 +25,7 @@ mod push;
 pub(crate) mod query;
 pub(crate) mod serving;
 mod show;
+mod sparql_protocol;
 #[cfg(feature = "sql")]
 mod sql;
 mod storage_proxy;

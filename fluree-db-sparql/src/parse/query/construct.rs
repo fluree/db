@@ -82,7 +82,9 @@ impl super::Parser<'_> {
     /// Anything else (FILTER, GRAPH, OPTIONAL, BIND, UNION, nested groups) is a
     /// syntax error in this position.
     fn parse_construct_where_shorthand(&mut self) -> Option<WhereClause> {
-        let start = self.stream.current_span();
+        // The caller has just consumed WHERE; start the span there, as
+        // `parse_where_clause` does, so a dataset clause can be placed before it.
+        let start = self.stream.previous_span();
 
         if !self.stream.match_token(&TokenKind::LBrace) {
             self.stream.error_at_current("expected '{' after WHERE");

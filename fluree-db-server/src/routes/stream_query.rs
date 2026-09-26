@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -56,7 +56,7 @@ const STREAM_CHANNEL_DEPTH: usize = 64;
 pub async fn stream_query_ledger_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    Query(params): Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -74,7 +74,7 @@ pub async fn stream_query_ledger_tail(
 /// connection/dataset path — there is no single-ledger shortcut.
 pub async fn stream_query_connection(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -87,10 +87,10 @@ pub async fn stream_query_connection(
 
 async fn stream_query_connection_inner(
     state: Arc<AppState>,
-    params: SparqlParams,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -121,6 +121,8 @@ async fn stream_query_connection_inner(
     // only named graphs and then matches outside them (see `X_FDB_WARNING`).
     // Both branches below set it, so there is no default to fall back on.
     let warn_headers;
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
 
@@ -237,10 +239,10 @@ async fn stream_query_connection_inner(
 async fn stream_query_inner(
     state: Arc<AppState>,
     ledger: String,
-    params: SparqlParams,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -276,6 +278,8 @@ async fn stream_query_inner(
     // Advisory headers attached to the 200 — empty unless the request names
     // only named graphs and then matches outside them (see `X_FDB_WARNING`).
     let mut warn_headers = HeaderMap::new();
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
         if let Some(p) = bearer.0.as_ref() {

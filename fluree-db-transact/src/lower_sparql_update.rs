@@ -32,8 +32,8 @@
 //! by deferring WHERE lowering to staging time (when a ledger snapshot is available
 //! for IRI encoding) and reusing the shared query engine.
 //!
-//! Additional restrictions:
-//! - WITH/USING clauses are rejected
+//! `WITH`, `USING`, and `USING NAMED` scope the WHERE clause (and, for `WITH`,
+//! the templates) as SPARQL 1.1 Update §3.1.3 describes.
 
 use std::collections::BTreeSet;
 use std::mem;
@@ -734,7 +734,6 @@ struct LiteralResult {
 ///
 /// Returns `LowerError` if:
 /// - The AST body is not an UPDATE request (is a query)
-/// - WITH or USING clauses are present
 /// - Blank nodes appear in WHERE patterns
 /// - RDF-star quoted triples are used
 pub fn lower_sparql_update_request(
@@ -773,7 +772,6 @@ pub fn lower_sparql_update_request(
 /// Returns `LowerError` if:
 /// - The AST body is not an UPDATE request (is a query)
 /// - The request does not contain exactly one operation
-/// - WITH or USING clauses are present
 /// - Blank nodes appear in WHERE patterns
 /// - RDF-star quoted triples are used
 pub fn lower_sparql_update_ast(
@@ -818,7 +816,6 @@ pub fn lower_sparql_update_ast(
 /// # Errors
 ///
 /// Returns `LowerError` if:
-/// - WITH or USING clauses are present
 /// - Blank nodes appear in WHERE patterns
 /// - RDF-star quoted triples are used
 pub fn lower_sparql_update(
