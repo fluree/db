@@ -381,9 +381,7 @@ in-memory storage; the baseline was `ffeeec554`.
 
 These are execution timings, not endpoint latency. The aggregate/count cases
 still consume the full qualifying stream; this startup change does not target
-their throughput. In the combined OPTIONAL/NOT EXISTS shape, an absent optional
-binding can also trigger the semijoin's per-row correlated fallback, a separate
-source of work.
+their throughput.
 
 **`PropertyJoinOperator`** — fuses same-subject multi-predicate stars anchored by
 a bound object or a range filter (`?s a :Person ; :name ?n ; :email ?e`) instead
@@ -396,9 +394,37 @@ satisfied — including a `LIMIT` behind `DISTINCT`, which never passes a row
 budget down.
 
 **`SemijoinOperator`** — turns `EXISTS` / `NOT EXISTS` from per-row correlated
-subquery evaluation into a single uncorrelated build plus hash probes. Rows whose
-key variables are unbound or poisoned fall back to per-row correlated evaluation,
-preserving SPARQL substitution semantics.
+subquery evaluation into a single uncorrelated build plus hash probes. For an
+inner body containing only triple patterns, rows with unbound key variables use
+a lazily built projection of the inner keys onto the variables that are bound.
+For example, after `OPTIONAL { ?p :worksFor ?org }`, an unbound `?org` makes
+`EXISTS { ?p :knows ?x . ?x :worksFor ?org }` test whether `?p` knows anyone
+with an employer. The bound case still probes the full `(?p, ?org)` key.
+
+Each execution caches at most four distinct projections, reused across input
+batches. Construction checks cancellation and accounts retained key memory
+against the query budget. Poisoned bindings, inner expressions or compound
+patterns, and additional projection shapes retain per-row seeded evaluation.
+An entirely unbound row tests whether the inner solution set is nonempty.
+EXISTS and NOT EXISTS keep the original outer rows and their multiplicities;
+the projected keys only answer an existence question.
+
+On 2026-09-26, the same 50,000-person, 395,597-fact fixture measured the following
+execution medians over 20 repetitions after one warmup. Both builds used the
+optimized `dist` profile, explicit reindexing and in-memory storage. The baseline
+was `b8a38c0ef`; the runs were sequential, with no concurrent builds or tests.
+
+| Query | Baseline | With projected lookup | Speedup |
+|---|---:|---:|---:|
+| OPTIONAL employer + two-hop NOT EXISTS | 643.389 ms | 82.022 ms | 7.8× |
+
+All 40,150 result rows, including multiplicities, agreed with an independent
+seeded evaluation of the same query. Verification runs outside the timed region.
+To repeat this case and its result check:
+
+```bash
+PROBE_ONLY=optional_not_exists PROBE_VERIFY=1 cargo run -p fluree-db-api --profile dist --example query_operator_probe -- 50000 20
+```
 
 **`CyclicBgpOperator`** — a targeted operator for small cyclic fixed-predicate
 BGPs (triangles, 4-edge cycles over ref-valued joins) that otherwise fall through

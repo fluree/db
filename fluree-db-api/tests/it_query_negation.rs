@@ -580,7 +580,7 @@ async fn sparql_not_exists_treats_optional_unbound_var_as_free() {
 
     let cases = [
         // Pattern-level; correlated only via inner-produced vars (?p, ?org) →
-        // semijoin, whose unbound-key rows take the per-row seeded path.
+        // semijoin, whose unbound-key rows probe a projected key set.
         (
             "semijoin",
             r"PREFIX ex: <http://example.com/>
@@ -656,5 +656,237 @@ async fn jsonld_not_exists_treats_optional_unbound_var_as_free() {
     assert_eq!(
         normalize_rows(&rows),
         normalize_rows(&json!([["ex:carol", "ex:globex"], ["ex:dave", null]]))
+    );
+}
+
+/// A missing OPTIONAL binding must use a reusable existence lookup, while
+/// bound values still constrain the inner match and outer duplicates survive.
+#[tokio::test]
+async fn optional_exists_reuses_partial_keys_across_batches() {
+    use fluree_db_api::{QueryInput, ReindexOptions};
+    use support::span_capture;
+
+    const PEOPLE: usize = 1200;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "negation:optional-partial-keys";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let mut graph = vec![
+        json!({"@id": "ex:worker1", "ex:worksFor": {"@id": "ex:orgA"}}),
+        json!({"@id": "ex:worker2", "ex:worksFor": {"@id": "ex:orgA"}}),
+    ];
+    for i in 0..PEOPLE {
+        let mut node = json!({
+            "@id": format!("ex:p{i}"), "@type": "ex:Person",
+            "ex:knows": if i % 4 == 3 {
+                json!({"@id": "ex:worker3"})
+            } else {
+                json!([{"@id": "ex:worker1"}, {"@id": "ex:worker2"}])
+            }
+        });
+        if i % 4 == 1 {
+            node["ex:worksFor"] = json!({"@id": "ex:orgA"});
+        } else if i % 4 == 2 {
+            node["ex:worksFor"] = json!([{"@id": "ex:orgB"}, {"@id": "ex:orgC"}]);
+        }
+        graph.push(node);
+    }
+    let ledger = fluree
+        .insert(ledger, &json!({"@context": ctx_ex(), "@graph": graph}))
+        .await
+        .expect("seed")
+        .ledger;
+    let before_update = ledger.t();
+    let mut expected = Vec::new();
+    for i in 0..PEOPLE {
+        match i % 4 {
+            2 => {
+                for org in ["ex:orgB", "ex:orgC"] {
+                    expected.push(json!([format!("ex:p{i}"), org]));
+                }
+            }
+            3 => expected.push(json!([format!("ex:p{i}"), null])),
+            _ => {}
+        }
+    }
+    expected.sort_by_key(ToString::to_string);
+    let query = "PREFIX ex: <http://example.com/> SELECT ?p ?org WHERE { \
+        ?p a ex:Person OPTIONAL { ?p ex:worksFor ?org } \
+        FILTER NOT EXISTS { ?p ex:knows ?x . ?x ex:worksFor ?org } }";
+
+    // Live novelty, then the indexed view. Count uses the same lookup as rows.
+    for indexed in [false, true] {
+        if indexed {
+            fluree
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .expect("reindex");
+        }
+        let view = fluree.db(ledger_id).await.expect("view");
+        let (spans, guard) = span_capture::init_test_tracing();
+        let result = fluree
+            .query(&view, QueryInput::Sparql(query))
+            .await
+            .expect("query");
+        drop(guard);
+        assert_eq!(
+            normalize_rows(&result.to_jsonld(&view.snapshot).unwrap()),
+            expected
+        );
+        let builds = spans.find_events("semijoin partial-key lookup built");
+        assert_eq!(
+            builds.len(),
+            1,
+            "indexed={indexed}: expected one reused lookup"
+        );
+        let probes = spans.find_events("semijoin partial-key probes");
+        let projected: usize = probes
+            .iter()
+            .map(|e| e.fields["projected_rows"].parse::<usize>().unwrap())
+            .sum();
+        let correlated: usize = probes
+            .iter()
+            .map(|e| e.fields["correlated_rows"].parse::<usize>().unwrap())
+            .sum();
+        assert_eq!(projected, PEOPLE / 2);
+        assert_eq!(correlated, 0);
+
+        let count_query = query.replace("SELECT ?p ?org", "SELECT (COUNT(*) AS ?n)");
+        let count = fluree
+            .query(&view, QueryInput::Sparql(&count_query))
+            .await
+            .expect("count");
+        assert_eq!(
+            count.to_jsonld(&view.snapshot).unwrap(),
+            json!([[expected.len()]])
+        );
+
+        // Compound expression forces seeded evaluation as an independent oracle.
+        let control = query
+            .replace("FILTER NOT EXISTS", "FILTER (false || NOT EXISTS")
+            .replace("?x ex:worksFor ?org } }", "?x ex:worksFor ?org }) }");
+        let control = fluree
+            .query(&view, QueryInput::Sparql(&control))
+            .await
+            .expect("control");
+        assert_eq!(
+            normalize_rows(&control.to_jsonld(&view.snapshot).unwrap()),
+            expected
+        );
+
+        let exists = query.replace("NOT EXISTS", "EXISTS");
+        let result = fluree
+            .query(&view, QueryInput::Sparql(&exists))
+            .await
+            .expect("EXISTS");
+        let mut matches = Vec::new();
+        for i in 0..PEOPLE {
+            match i % 4 {
+                0 => matches.push(json!([format!("ex:p{i}"), null])),
+                1 => matches.push(json!([format!("ex:p{i}"), "ex:orgA"])),
+                _ => {}
+            }
+        }
+        matches.sort_by_key(ToString::to_string);
+        assert_eq!(
+            normalize_rows(&result.to_jsonld(&view.snapshot).unwrap()),
+            matches
+        );
+
+        if indexed {
+            // Expressions in the inner body deliberately keep the seeded
+            // fallback. This FILTER preserves this fixture's expected answer.
+            let filtered = query.replace(
+                "?x ex:worksFor ?org }",
+                "?x ex:worksFor ?org FILTER(?x != ex:nobody) }",
+            );
+            let (spans, guard) = span_capture::init_test_tracing();
+            let result = fluree
+                .query(&view, QueryInput::Sparql(&filtered))
+                .await
+                .expect("filtered body");
+            drop(guard);
+            assert_eq!(
+                normalize_rows(&result.to_jsonld(&view.snapshot).unwrap()),
+                expected
+            );
+            assert!(spans
+                .find_events("semijoin partial-key lookup built")
+                .is_empty());
+            let probes = spans.find_events("semijoin partial-key probes");
+            assert_eq!(
+                probes
+                    .iter()
+                    .map(|e| e.fields["correlated_rows"].parse::<usize>().unwrap())
+                    .sum::<usize>(),
+                PEOPLE / 2
+            );
+        }
+    }
+
+    // The lookup belongs to one execution: both an overlay and a historical
+    // view must build from their own visible facts.
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "delete": [
+                    {"@id": "ex:worker1", "ex:worksFor": {"@id": "ex:orgA"}},
+                    {"@id": "ex:worker2", "ex:worksFor": {"@id": "ex:orgA"}}
+                ],
+                "insert": {"@id": "ex:worker3", "ex:worksFor": {"@id": "ex:orgC"}}
+            }),
+        )
+        .await
+        .expect("change employers");
+    let view = fluree.db(ledger_id).await.expect("overlay view");
+    let result = fluree
+        .query(&view, QueryInput::Sparql(query))
+        .await
+        .expect("overlay query");
+    let mut updated = Vec::new();
+    for i in 0..PEOPLE {
+        match i % 4 {
+            0 => updated.push(json!([format!("ex:p{i}"), null])),
+            1 => updated.push(json!([format!("ex:p{i}"), "ex:orgA"])),
+            2 => {
+                for org in ["ex:orgB", "ex:orgC"] {
+                    updated.push(json!([format!("ex:p{i}"), org]));
+                }
+            }
+            _ => {}
+        }
+    }
+    updated.sort_by_key(ToString::to_string);
+    assert_eq!(
+        normalize_rows(&result.to_jsonld(&view.snapshot).unwrap()),
+        updated
+    );
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex updated");
+    let historical = fluree
+        .db_at_t(ledger_id, before_update)
+        .await
+        .expect("historical view");
+    let result = fluree
+        .query(&historical, QueryInput::Sparql(query))
+        .await
+        .expect("historical OPTIONAL");
+    assert_eq!(
+        normalize_rows(&result.to_jsonld(&historical.snapshot).unwrap()),
+        expected
+    );
+    let historical_query = "PREFIX ex: <http://example.com/> SELECT ?p ?org WHERE { \
+        VALUES (?p ?org) { (ex:p0 UNDEF) (ex:p1 ex:orgA) (ex:p2 ex:orgB) (ex:p3 UNDEF) } \
+        FILTER NOT EXISTS { ?p ex:knows ?x . ?x ex:worksFor ?org } }";
+    let result = fluree
+        .query(&historical, QueryInput::Sparql(historical_query))
+        .await
+        .expect("historical query");
+    assert_eq!(
+        normalize_rows(&result.to_jsonld(&historical.snapshot).unwrap()),
+        normalize_rows(&json!([["ex:p2", "ex:orgB"], ["ex:p3", null]]))
     );
 }

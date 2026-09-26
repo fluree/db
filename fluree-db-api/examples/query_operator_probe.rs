@@ -2,6 +2,8 @@
 //!
 //! `cargo run -p fluree-db-api --profile dev-fast --example query_operator_probe -- 50000 5`
 //! Arguments: people, measured repetitions. Set `PROBE_PLANS=1` to print plans.
+//! `PROBE_ONLY=optional_not_exists` selects a case; `PROBE_VERIFY=1` also checks
+//! that case against seeded per-row evaluation, outside the timed region.
 //! Measures query execution (without response serialization), with one warmup.
 
 use std::fmt::Write;
@@ -84,6 +86,9 @@ async fn main() {
     let view = fluree.db("operator-probe:main").await.expect("view");
     println!("people={people}, repetitions={reps}, indexed, execution only");
     for (name, query) in QUERIES {
+        if std::env::var("PROBE_ONLY").is_ok_and(|selected| selected != *name) {
+            continue;
+        }
         let query = format!("PREFIX ex: <http://example.org/>\n{query}");
         if std::env::var_os("PROBE_PLANS").is_some() {
             let plan = fluree.explain_sparql(&view, &query).await.expect("explain");
@@ -109,7 +114,37 @@ async fn main() {
             }
         }
         times.sort_by(f64::total_cmp);
-        let median = (times[(reps - 1) / 2] + times[reps / 2]) / 2.0;
+        let median = times[(reps - 1) / 2].midpoint(times[reps / 2]);
         println!("{name:24} {median:10.3} ms");
+        if *name == "optional_not_exists" && std::env::var_os("PROBE_VERIFY").is_some() {
+            let control = query
+                .replace("FILTER NOT EXISTS", "FILTER (false || NOT EXISTS")
+                .replace("?x ex:worksFor ?org } }", "?x ex:worksFor ?org }) }");
+            let result = fluree
+                .query(&view, QueryInput::Sparql(&control))
+                .await
+                .expect("seeded control");
+            let mut control_rows = result
+                .to_jsonld(&view.snapshot)
+                .expect("format control")
+                .as_array()
+                .expect("control rows")
+                .clone();
+            let mut actual_rows = expected
+                .expect("warmup result")
+                .as_array()
+                .expect("result rows")
+                .clone();
+            control_rows.sort_by_key(ToString::to_string);
+            actual_rows.sort_by_key(ToString::to_string);
+            assert_eq!(
+                actual_rows, control_rows,
+                "partial-key lookup differs from seeded evaluation"
+            );
+            println!(
+                "{name}: {} rows agree with seeded evaluation",
+                actual_rows.len()
+            );
+        }
     }
 }
