@@ -17,8 +17,8 @@ This is the protocol's *indirect* graph identification. *Direct* identification,
 
 | Method | Does | Success |
 |---|---|---|
-| `GET` | Returns the graph's triples | `200`; `404` if the graph does not exist |
-| `HEAD` | Same as `GET`, headers only | `200` / `404` |
+| `GET` | Returns the graph's triples, the whole graph in one response | `200`; `404` if the graph does not exist |
+| `HEAD` | Same status and `Content-Type` as `GET`, without building the graph | `200` / `404` |
 | `PUT` | Replaces the graph's contents with the body | `201` if this created the graph, otherwise `200` |
 | `POST` | Adds the body's triples to the graph | `201` if this created the graph, otherwise `200` |
 | `DELETE` | Removes the graph (the default graph is emptied) | `200`; `404` if the graph does not exist |
@@ -42,6 +42,10 @@ As the protocol specifies, an empty `PUT` body empties the graph. Unlike `/sync`
 ### Graph existence
 
 Fluree has no empty named graph: a named graph exists while it holds at least one triple. So after a `DELETE`, or a `PUT` with an empty body, `GET` on that graph is a `404`. The default graph always exists.
+
+For `GET` and `HEAD`, existence is as the caller sees it: a named graph with no triple the caller may read is a `404`, the same answer as a graph that isn't there. Authentication runs first, so an unauthenticated read is a `401` whether or not the graph exists.
+
+`GET` is not paged. It builds and serializes the whole graph before responding, so for a large graph, query it through `/query` with `LIMIT` / `OFFSET`, or export the ledger.
 
 ## Formats
 
@@ -69,7 +73,7 @@ Turtle and N-Triples output are not available yet; a `GET` that accepts only tho
 
 ## Auth and policy
 
-`GET` and `HEAD` run as a SPARQL `CONSTRUCT` of the graph through the query path, so read policy applies exactly as it does for `/query`: a restricted reader sees only what policy allows. Existence checks (the `404`) are not policy filtered.
+`GET` runs a SPARQL `CONSTRUCT` of the graph through the query path, and `HEAD` an `ASK`, so read policy applies exactly as it does for `/query`: a restricted reader sees only what policy allows, and the `404` follows what they can see.
 
 `PUT`, `POST` and `DELETE` need write access to the ledger, as `/insert` does. Modify policy applies to the staged changes. As with sync, the scan of a graph's current contents that `PUT` diffs against is not view-policy filtered.
 

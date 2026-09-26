@@ -2939,9 +2939,9 @@ async fn execute_sparql_ledger(
                         .to_string(),
                 ));
             }
-            if wants_rdf_xml {
+            if wants_rdf_xml && !is_graph_query(parsed.ast.as_ref()) {
                 return Err(ServerError::not_acceptable(
-                    "RDF/XML is not supported for identity-scoped SPARQL queries".to_string(),
+                    "RDF/XML is only available for SPARQL CONSTRUCT/DESCRIBE queries".to_string(),
                 ));
             }
             if let Some(fmt) = delimited {
@@ -2955,6 +2955,23 @@ async fn execute_sparql_ledger(
                 .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?;
             let view = attach_default_context_to_graph(state, ledger_id, view, use_default_context)
                 .await?;
+            if wants_rdf_xml {
+                let xml = view
+                    .query(state.fluree.as_ref())
+                    .sparql(sparql)
+                    .format(fluree_db_api::FormatterConfig::rdf_xml())
+                    .execution_options(query_execution_options(state))
+                    .execute_formatted_string()
+                    .await
+                    .inspect_err(|_| {
+                        set_span_error_code(&span, "error:QueryFailed");
+                    })?;
+                return Ok((
+                    [(axum::http::header::CONTENT_TYPE, "application/rdf+xml; charset=utf-8")],
+                    xml.into_bytes(),
+                )
+                    .into_response());
+            }
             let result = view.query(state.fluree.as_ref())
                 .sparql(sparql)
                 .format(json_fmt_config.clone())

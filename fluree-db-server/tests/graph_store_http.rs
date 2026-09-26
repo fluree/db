@@ -326,3 +326,180 @@ async fn request_errors() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// Authorization
+// ---------------------------------------------------------------------------
+
+/// An Ed25519-signed bearer token carrying `claims`.
+fn bearer(claims: serde_json::Value) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let mut claims = claims;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    claims["iss"] = fluree_db_credential::did_from_pubkey(&key.verifying_key().to_bytes()).into();
+    claims["iat"] = now.into();
+    claims["exp"] = (now + 3600).into();
+    let header = serde_json::json!({
+        "alg": "EdDSA",
+        "jwk": {"kty": "OKP", "crv": "Ed25519",
+                "x": URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())}
+    });
+    let signing_input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(header.to_string()),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    let signature = URL_SAFE_NO_PAD.encode(key.sign(signing_input.as_bytes()).to_bytes());
+    format!("Bearer {signing_input}.{signature}")
+}
+
+async fn send_as(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    auth: Option<&str>,
+    content_type: Option<&str>,
+    body: &str,
+    accept: Option<&str>,
+) -> (StatusCode, Option<String>, String) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(auth) = auth {
+        req = req.header("authorization", auth);
+    }
+    if let Some(ct) = content_type {
+        req = req.header("content-type", ct);
+    }
+    if let Some(accept) = accept {
+        req = req.header("accept", accept);
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, ct, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// With data auth required: every write verb needs a credential that may
+/// write the ledger, a read-only one gets the write routes' existence-hiding
+/// 404, and reads authenticate before saying whether a graph exists.
+#[tokio::test]
+async fn graph_store_requires_authorization() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        data_auth_mode: fluree_db_server::config::DataAuthMode::Required,
+        data_auth_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state);
+    let create = serde_json::json!({ "ledger": LEDGER }).to_string();
+    let (status, body) = send(&app, "POST", "/v1/fluree/create", JSON_LD, &create, None).await;
+    assert_eq!(status, StatusCode::CREATED, "create ledger: {body}");
+
+    let writer = bearer(serde_json::json!({
+        "fluree.ledger.read.ledgers": [LEDGER],
+        "fluree.ledger.write.ledgers": [LEDGER]
+    }));
+    let reader = bearer(serde_json::json!({ "fluree.ledger.read.ledgers": [LEDGER] }));
+    // An identity routes the read through the identity-scoped query path; a
+    // view policy (inserted below) lets it see the graph.
+    let identified = bearer(serde_json::json!({
+        "fluree.ledger.read.ledgers": [LEDGER],
+        "fluree.identity": "http://example.org/reader"
+    }));
+    let tools = named(TOOLS);
+    let absent = named(OTHER);
+    let ttl = r#"<urn:x> <http://example.org/name> "tool" ."#;
+
+    for (method, auth, expected) in [
+        ("PUT", None, StatusCode::UNAUTHORIZED),
+        ("POST", None, StatusCode::UNAUTHORIZED),
+        ("DELETE", None, StatusCode::UNAUTHORIZED),
+        ("PUT", Some(reader.as_str()), StatusCode::NOT_FOUND),
+        ("POST", Some(reader.as_str()), StatusCode::NOT_FOUND),
+    ] {
+        let (status, _, body) = send_as(&app, method, &tools, auth, TTL, ttl, None).await;
+        assert_eq!(status, expected, "{method} as {auth:?}: {body}");
+    }
+    let (status, _, body) = send_as(&app, "PUT", &tools, Some(&writer), TTL, ttl, None).await;
+    assert_eq!(status, StatusCode::CREATED, "authorized PUT: {body}");
+
+    // Against a graph that exists, so the refusal cannot be the absent-graph 404.
+    let (status, _, body) = send_as(&app, "DELETE", &tools, Some(&reader), None, "", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "DELETE as reader: {body}");
+    let (status, _, body) = send_as(&app, "HEAD", &tools, Some(&reader), None, "", None).await;
+    assert_eq!(status, StatusCode::OK, "the graph survives: {body}");
+
+    // Unauthenticated, a present and an absent graph answer alike.
+    for uri in [&tools, &absent] {
+        for method in ["GET", "HEAD"] {
+            let (status, _, body) = send_as(&app, method, uri, None, None, "", None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}: {body}");
+        }
+    }
+
+    let (status, _, body) = send_as(&app, "HEAD", &tools, Some(&reader), None, "", None).await;
+    assert_eq!(status, StatusCode::OK, "HEAD: {body}");
+    let (status, _, body) = send_as(&app, "HEAD", &absent, Some(&reader), None, "", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "HEAD absent: {body}");
+
+    let policy = serde_json::json!({
+        "@context": {"f": "https://ns.flur.ee/db#", "ex": "http://example.org/"},
+        "@graph": [
+            {
+                "@id": "ex:reader-policy",
+                "@type": ["f:AccessPolicy", "ex:ReaderClass"],
+                "f:action": [{"@id": "f:view"}],
+                "f:allow": true
+            },
+            {"@id": "http://example.org/reader", "f:policyClass": [{"@id": "ex:ReaderClass"}]}
+        ]
+    });
+    let (status, _, body) = send_as(
+        &app,
+        "POST",
+        &format!("/v1/fluree/insert/{LEDGER}"),
+        Some(&writer),
+        JSON_LD,
+        &policy.to_string(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "insert policy: {body}");
+
+    let (status, ct, body) = send_as(
+        &app,
+        "GET",
+        &tools,
+        Some(&identified),
+        None,
+        "",
+        Some("application/rdf+xml"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "identity-scoped RDF/XML GET: {body}"
+    );
+    assert_eq!(ct.as_deref(), Some("application/rdf+xml"));
+    assert!(body.contains("tool"), "{body}");
+}

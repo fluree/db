@@ -6,13 +6,14 @@
 //!
 //! | Method | Does | Built on |
 //! |---|---|---|
-//! | `GET` / `HEAD` | return the graph | a CONSTRUCT through the query route, so read policy applies |
+//! | `GET` / `HEAD` | return the graph | a CONSTRUCT (`HEAD`: an ASK) through the query route, so auth and read policy apply |
 //! | `PUT` | replace the graph | graph sync: one commit carrying only the delta |
 //! | `POST` | add triples to the graph | graph insert |
 //! | `DELETE` | remove the graph | `DROP GRAPH` / `CLEAR DEFAULT` |
 //!
 //! A named graph exists while it holds a triple (Fluree has no empty named
-//! graph); the default graph always exists. `PUT` and `POST` answer
+//! graph), and for a read, while it holds one the caller may see; the default
+//! graph always exists. `PUT` and `POST` answer
 //! `201 Created` when they bring a graph into existence and `200 OK`
 //! otherwise, with the usual transaction response as the body.
 
@@ -27,7 +28,7 @@ use crate::routes::transact::{
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Path, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use fluree_db_api::{GraphSel, TxnType};
 use std::sync::Arc;
@@ -35,8 +36,8 @@ use std::sync::Arc;
 /// Body formats `PUT` and `POST` accept.
 const JSON_LD_TYPES: [&str; 2] = ["application/ld+json", "application/json"];
 
-/// `GET /data/<ledger...>?graph=<iri>` (or `?default`); `HEAD` is answered
-/// from the same handler with the body dropped.
+/// `GET /data/<ledger...>?graph=<iri>` (or `?default`). `HEAD` shares the
+/// handler but answers from an `ASK`, without building the graph.
 pub async fn get(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
@@ -295,8 +296,36 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let format = negotiate(accept.as_deref())?;
-    if !state.fluree.graph_exists(&ledger, &graph).await? {
-        return Err(missing_graph(&graph));
+    let head = request.method() == Method::HEAD;
+    let (parts, _) = request.into_parts();
+
+    // Existence is asked through the query route, so authentication and read
+    // policy answer first: a graph with no triple the caller may see is
+    // indistinguishable from an absent one. `HEAD` stops here rather than
+    // serializing the graph. A plain `GET` of the default graph needs no probe;
+    // the CONSTRUCT is authorized the same way.
+    if head || matches!(graph, GraphSel::Graph(_)) {
+        let probe = match &graph {
+            GraphSel::Graph(iri) => format!("ASK {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"),
+            GraphSel::Default => "ASK { ?s ?p ?o }".to_string(),
+        };
+        let response = query_as_caller(
+            &state,
+            &ledger,
+            parts.clone(),
+            probe,
+            "application/sparql-results+json",
+        )
+        .await?;
+        if !response.status().is_success() {
+            return Ok(response);
+        }
+        if !ask_answer(response).await? && matches!(graph, GraphSel::Graph(_)) {
+            return Err(missing_graph(&graph));
+        }
+        if head {
+            return Ok(([(header::CONTENT_TYPE, format.media_type())], ()).into_response());
+        }
     }
 
     let sparql = match &graph {
@@ -305,38 +334,11 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
         }
         GraphSel::Default => "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }".to_string(),
     };
-
-    // Run the CONSTRUCT as the query route would a SPARQL request from the
-    // same caller: same auth headers and credential, so the same read policy.
-    let (mut parts, _) = request.into_parts();
-    parts.method = axum::http::Method::POST;
-    parts.uri = axum::http::Uri::from_static("/");
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/sparql-query"),
-    );
     let query_accept = match format {
         GraphFormat::JsonLd => "application/json",
         GraphFormat::RdfXml => "application/rdf+xml",
     };
-    parts
-        .headers
-        .insert(header::ACCEPT, HeaderValue::from_static(query_accept));
-    parts.headers.remove(header::CONTENT_LENGTH);
-    let params = SparqlParams::from_request_parts(&mut parts, &state).await?;
-    let headers = FlureeHeaders::from_request_parts(&mut parts, &state).await?;
-    let bearer = MaybeDataBearer::from_request_parts(&mut parts, &state).await?;
-    let credential =
-        MaybeCredential::extract(Request::from_parts(parts, Body::from(sparql))).await?;
-    let mut response = crate::routes::query::query_ledger(
-        State(state),
-        Path(ledger),
-        params,
-        headers,
-        bearer,
-        credential,
-    )
-    .await?;
+    let mut response = query_as_caller(&state, &ledger, parts, sparql, query_accept).await?;
     if response.status().is_success() {
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -344,6 +346,52 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
         );
     }
     Ok(response)
+}
+
+/// Run `sparql` through the query route as the caller would: same auth
+/// headers and credential, so the same read policy.
+async fn query_as_caller(
+    state: &Arc<AppState>,
+    ledger: &str,
+    mut parts: axum::http::request::Parts,
+    sparql: String,
+    accept: &'static str,
+) -> Result<Response> {
+    parts.method = Method::POST;
+    parts.uri = axum::http::Uri::from_static("/");
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/sparql-query"),
+    );
+    parts
+        .headers
+        .insert(header::ACCEPT, HeaderValue::from_static(accept));
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let params = SparqlParams::from_request_parts(&mut parts, state).await?;
+    let headers = FlureeHeaders::from_request_parts(&mut parts, state).await?;
+    let bearer = MaybeDataBearer::from_request_parts(&mut parts, state).await?;
+    let credential =
+        MaybeCredential::extract(Request::from_parts(parts, Body::from(sparql))).await?;
+    crate::routes::query::query_ledger(
+        State(state.clone()),
+        Path(ledger.to_string()),
+        params,
+        headers,
+        bearer,
+        credential,
+    )
+    .await
+}
+
+/// The boolean of a SPARQL JSON `ASK` result.
+async fn ask_answer(response: Response) -> Result<bool> {
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .map_err(|e| ServerError::internal(format!("reading ASK result: {e}")))?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get("boolean").and_then(serde_json::Value::as_bool))
+        .ok_or_else(|| ServerError::internal("ASK result has no boolean"))
 }
 
 fn missing_graph(graph: &GraphSel) -> ServerError {
