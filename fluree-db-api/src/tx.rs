@@ -2503,20 +2503,23 @@ impl crate::Fluree {
         let mut resolve_ctx =
             crate::cross_ledger::ResolveCtx::new(&ledger_id, self).with_data_state(ledger.clone());
 
+        // Boxed: every write entry point awaits this, and the staging future
+        // inlined into each of them overflows rustc's layout depth limit in
+        // callers that nest a few async layers deep.
         #[cfg(feature = "shacl")]
-        let staged = stage_with_config_shacl(
+        let staged = Box::pin(stage_with_config_shacl(
             ledger,
             txn,
             ns_registry,
             options,
             &mut resolve_ctx,
             txn_context,
-        )
+        ))
         .await;
         #[cfg(not(feature = "shacl"))]
         let staged = {
             let _ = txn_context;
-            stage_txn(ledger, txn, ns_registry, options)
+            Box::pin(stage_txn(ledger, txn, ns_registry, options))
                 .await
                 .map(|(view, ns_registry, graph_delta)| (view, ns_registry, false, graph_delta))
         };
