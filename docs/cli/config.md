@@ -19,7 +19,7 @@ fluree config <COMMAND>
 
 ## Description
 
-Manages configuration stored in `.fluree/config.toml`. Configuration uses dotted keys for nested values (e.g., `storage.path`).
+Manages configuration stored in `.fluree/config.toml`. Configuration uses dotted keys for nested values (e.g., `server.storage_path`).
 
 `list` masks credential values — remote access and refresh tokens, client secrets, passwords — as `[redacted]`, since the config carries live tokens after `auth login`. Pass `--reveal` to print them in the clear (prefer `fluree auth token` for scripting an access token; it never prints the refresh token). `get` on an explicit key still returns the raw value.
 
@@ -28,7 +28,7 @@ Manages configuration stored in `.fluree/config.toml`. Configuration uses dotted
 ### Get a value
 
 ```bash
-fluree config get storage.path
+fluree config get server.storage_path
 ```
 
 Output:
@@ -39,12 +39,12 @@ Output:
 ### Set a value
 
 ```bash
-fluree config set storage.path /custom/storage/path
+fluree config set server.storage_path /custom/storage/path
 ```
 
 Output:
 ```
-Set 'storage.path' = "/custom/storage/path"
+Set 'server.storage_path' = '/custom/storage/path'
 ```
 
 ### List all values
@@ -55,8 +55,7 @@ fluree config list
 
 Output:
 ```
-storage.path = "/custom/storage/path"
-storage.encryption = "aes256"
+server.storage_path = /custom/storage/path
 ```
 
 > **Credential note:** `config list` dumps the entire config file, including access **and refresh** tokens for every configured remote. For scripts that need a single access token (e.g. `.env` workflows), use [`fluree auth token`](auth.md#fluree-auth-token) instead — it prints exactly one token and never exposes refresh tokens.
@@ -71,10 +70,12 @@ If no configuration is set:
 Configuration is stored in `.fluree/config.toml`:
 
 ```toml
-[storage]
-path = "/custom/storage/path"
-encryption = "aes256"
+[server]
+storage_path = "/custom/storage/path"
 ```
+
+The CLI's local store is never encrypted. Encryption at rest is configured on a
+server's connection config; see [Storage Encryption](../security/encryption.md).
 
 ## Errors
 

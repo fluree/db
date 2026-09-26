@@ -135,9 +135,14 @@ Supported:
 - `durability` — `"wal"` (default), `"sync"` or `"page-cache"`
 
 Notes:
-- Rust expects `AES256Key` to be **base64-encoded** and decode to exactly 32 bytes.
+- Rust expects `AES256Key` to be **base64-encoded** (standard or URL-safe) and decode to
+  exactly 32 bytes.
 - This encrypts the **index/commit blobs** written via the storage layer. The file-based
   nameservice remains plaintext, matching the existing builder behavior.
+- A key that is configured but does not resolve (an `envVar` that is unset or empty, with
+  no `defaultVal`) is a config error: the storage is never started unencrypted by accident.
+- Put the key on the `indexStorage` node. With a separate `commitStorage`, the
+  `indexStorage` key encrypts both; a `commitStorage` node with a different key is rejected.
 
 ```json
 {

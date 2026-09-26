@@ -367,8 +367,10 @@ pub enum Commands {
         leaflets_per_leaf: usize,
 
         /// Create the ledger on a remote server (by remote name, e.g., "origin").
-        /// Only valid with empty creates — incompatible with --from/--memory.
-        /// Use `fluree publish` if you also need to push local commits.
+        /// Empty, or with `--from`: a `.flpack` archive is restored on the
+        /// server, and a single source file is imported there when the server
+        /// offers source uploads. Incompatible with `--memory`. Use
+        /// `fluree publish` if you also need to push local commits.
         #[arg(long)]
         remote: Option<String>,
     },
