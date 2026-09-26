@@ -112,11 +112,11 @@ pub enum TransactError {
         max_bytes: usize,
     },
 
-    /// The transaction would bring the ledger past the number of datatypes
-    /// its index can store. Not retryable: datatype IDs are never released.
+    /// The write would bring the ledger past the number of datatypes its
+    /// index can store. Not retryable: datatype IDs are never released.
     #[error(
-        "datatype limit exceeded: the ledger uses {used} of {max} non-reserved datatypes \
-         and this transaction adds {adding} new ones"
+        "datatype limit exceeded: the ledger holds {used} of at most {max} non-reserved \
+         datatypes, and this write would add {adding} more"
     )]
     DatatypeLimitExceeded {
         used: usize,

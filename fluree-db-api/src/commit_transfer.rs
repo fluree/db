@@ -591,7 +591,7 @@ impl Fluree {
             let adding =
                 datatype_limit::new_datatypes(&known_datatypes, all_flakes.iter().map(|f| &f.dt));
             datatype_limit::check_datatype_capacity(&known_datatypes, adding.len())
-                .map_err(|e| push_error_for_stage(e).into_api_error())?;
+                .map_err(ApiError::Transact)?;
             for dt in adding {
                 known_datatypes.assign_or_lookup_datatype(dt);
             }

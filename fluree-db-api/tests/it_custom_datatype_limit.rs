@@ -15,7 +15,8 @@
 
 use crate::support::{self, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::{
-    Base64Bytes, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerHandle, PushCommitsRequest,
+    ApiError, Base64Bytes, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerHandle,
+    PushCommitsRequest, TransactError,
 };
 use fluree_db_core::commit::codec::{read_commit, write_commit};
 use fluree_db_core::{plan_commit_transfer, DatatypeDictId, RuntimeSmallDicts, Sid};
@@ -197,14 +198,13 @@ async fn incremental_index_crosses_u8_custom_datatype_limit() {
     );
 }
 
-/// Assert that a write was refused for exceeding the datatype limit.
-fn assert_datatype_limit_rejection<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) {
+/// Assert that a write was refused with the typed datatype limit error,
+/// which the server maps to `err:db/DatatypeLimitExceeded`.
+fn assert_datatype_limit_rejection<T>(result: fluree_db_api::Result<T>, what: &str) {
     match result {
         Ok(_) => panic!("{what}: a write past the datatype limit was accepted"),
-        Err(e) => assert!(
-            e.to_string().contains("datatype limit"),
-            "{what}: expected a datatype limit error, got: {e}"
-        ),
+        Err(ApiError::Transact(TransactError::DatatypeLimitExceeded { .. })) => {}
+        Err(e) => panic!("{what}: expected a datatype limit error, got: {e}"),
     }
 }
 
@@ -604,16 +604,21 @@ async fn bulk_import_past_datatype_limit_is_rejected() {
         .build()
         .expect("build file-backed Fluree");
 
-    assert_datatype_limit_rejection(
-        import_datatypes(
-            &fluree,
-            data_dir.path(),
-            "custom-dt-limit:import-over",
-            CAPACITY + 1,
-        )
-        .await,
-        "import over the limit",
-    );
+    // Import reports its own error type, so only the message identifies it.
+    let over = import_datatypes(
+        &fluree,
+        data_dir.path(),
+        "custom-dt-limit:import-over",
+        CAPACITY + 1,
+    )
+    .await;
+    match over {
+        Ok(()) => panic!("an import past the datatype limit was accepted"),
+        Err(e) => assert!(
+            e.contains("datatype limit exceeded"),
+            "expected a datatype limit error, got: {e}"
+        ),
+    }
 
     let ledger_id = "custom-dt-limit:import-full";
     import_datatypes(&fluree, data_dir.path(), ledger_id, CAPACITY)

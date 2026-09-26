@@ -68,6 +68,13 @@ pub enum ServerError {
     /// `NoveltyBackpressure`.
     #[error("{0}")]
     NoveltyDeltaTooLarge(String),
+
+    /// The write would bring the ledger past the number of distinct
+    /// datatypes its index can store (422 + `err:db/DatatypeLimitExceeded`,
+    /// no `Retry-After`). Same consensus-boundary role as
+    /// `NoveltyBackpressure`.
+    #[error("{0}")]
+    DatatypeLimitExceeded(String),
 }
 
 impl ServerError {
@@ -195,6 +202,10 @@ impl ServerError {
                 | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
             ))
             | ServerError::NoveltyBackpressure(_) => errors::NOVELTY_AT_MAX,
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
+            ))
+            | ServerError::DatatypeLimitExceeded(_) => errors::DATATYPE_LIMIT_EXCEEDED,
             ServerError::Api(ApiError::Transact(_)) => errors::INVALID_TRANSACTION,
 
             // API-level errors
@@ -291,6 +302,14 @@ impl ServerError {
                 },
             )) if delta_bytes >= max_bytes => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::NoveltyDeltaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+
+            // 422 - well-formed, but the ledger has no room for the new
+            // datatypes. Permanent, so no `Retry-After`. MUST precede the
+            // generic `ApiError::Transact(_)` arm below.
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
+            ))
+            | ServerError::DatatypeLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
 
             // 503 - novelty backpressure. The same retryable capacity class
             // as `NoveltyDeferred` above: only the indexer draining clears
@@ -962,6 +981,34 @@ mod tests {
                     .get(axum::http::header::RETRY_AFTER)
                     .is_none(),
                 "413 must not invite a retry"
+            );
+        }
+    }
+
+    /// The datatype limit is a permanent refusal: 422 +
+    /// `err:db/DatatypeLimitExceeded` with no `Retry-After`, in both the
+    /// raw-variant and consensus-flattened shapes.
+    #[test]
+    fn datatype_limit_is_422_with_distinct_code_and_no_retry_after() {
+        let shapes = [
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::DatatypeLimitExceeded {
+                    used: 16_369,
+                    adding: 1,
+                    max: 16_369,
+                },
+            )),
+            ServerError::DatatypeLimitExceeded("datatype limit exceeded".into()),
+        ];
+        for se in shapes {
+            assert_eq!(se.status_code(), StatusCode::UNPROCESSABLE_ENTITY, "{se}");
+            assert_eq!(se.error_type(), errors::DATATYPE_LIMIT_EXCEEDED, "{se}");
+            let resp = se.into_response();
+            assert!(
+                resp.headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "422 must not invite a retry"
             );
         }
     }

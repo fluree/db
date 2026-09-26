@@ -192,6 +192,9 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
         SubmissionError::NoveltyDeltaTooLarge { message } => {
             return ServerError::NoveltyDeltaTooLarge(message.clone());
         }
+        SubmissionError::DatatypeLimitExceeded { message } => {
+            return ServerError::DatatypeLimitExceeded(message.clone());
+        }
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))
@@ -2365,6 +2368,9 @@ mod tests {
             SubmissionError::NoveltyDeltaTooLarge {
                 message: "Transaction would exceed novelty limit".into(),
             },
+            SubmissionError::DatatypeLimitExceeded {
+                message: "datatype limit exceeded".into(),
+            },
         ];
         for variant in variants {
             // (status, @type) each variant must surface as. No wildcard:
@@ -2380,6 +2386,9 @@ mod tests {
                 SubmissionError::NoveltyBackpressure { .. } => (503, errors::NOVELTY_AT_MAX),
                 SubmissionError::NoveltyDeltaTooLarge { .. } => {
                     (413, errors::NOVELTY_DELTA_TOO_LARGE)
+                }
+                SubmissionError::DatatypeLimitExceeded { .. } => {
+                    (422, errors::DATATYPE_LIMIT_EXCEEDED)
                 }
             };
             let se = submission_error_to_server_error(variant);

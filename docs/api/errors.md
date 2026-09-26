@@ -311,6 +311,27 @@ The request is well-formed but semantically invalid.
 - Check business rules
 - Review constraint requirements
 
+**`err:db/DatatypeLimitExceeded`**: the write would bring the ledger past the
+number of distinct datatypes its index can store. Fifteen common datatypes
+are reserved and never count, among them `xsd:string`, `xsd:integer`, and
+`rdf:langString`. A ledger holds at most 16,369 others, including other XSD
+types such as `xsd:int`. Each datatype IRI counts once, from the first write
+that uses it, and still counts after its data is retracted. The write is refused before anything is committed, so the ledger
+is unchanged. Transactions, SPARQL updates, and pushed commits all return
+this code.
+
+```json
+{
+  "error": "datatype limit exceeded: the ledger holds 16369 of at most 16369 non-reserved datatypes, and this write would add 1 more",
+  "status": 422,
+  "@type": "err:db/DatatypeLimitExceeded"
+}
+```
+
+Datatype IDs are never released, so retrying the same write cannot succeed,
+and the response carries no `Retry-After`. Fix: type the new values with
+datatypes the ledger already holds.
+
 #### 429 Too Many Requests
 
 Rate limit exceeded.

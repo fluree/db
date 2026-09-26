@@ -81,6 +81,14 @@ pub const NOVELTY_DELTA_TOO_LARGE: &str = "err:db/NoveltyDeltaTooLarge";
 /// or raise `reindex_max_bytes` there).
 pub const PAYLOAD_TOO_LARGE: &str = "err:db/PayloadTooLarge";
 
+/// The write would bring the ledger past the number of distinct datatypes
+/// its index can store.
+///
+/// A permanent refusal, surfaced as HTTP 422 with no `Retry-After`.
+/// Datatype IDs are never released, so neither retrying nor waiting for the
+/// indexer admits the write. The ledger is left unchanged.
+pub const DATATYPE_LIMIT_EXCEEDED: &str = "err:db/DatatypeLimitExceeded";
+
 /// Commit conflict (concurrent modification)
 pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
 
