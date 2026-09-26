@@ -100,6 +100,10 @@ Query at a specific commit using `@commit:` with a commit ContentId:
 }
 ```
 
+### Pinning the Ledger in the Request Path
+
+Over HTTP, the pin can go on the ledger in the path of a ledger-scoped query instead of in the body. `POST /v1/fluree/query/ledger:main@t:100` (or `@time:`, `@recorded:`, `@commit:`) reads the whole ledger as of that point, including its named graphs: `GRAPH ?g` enumerates the graphs that existed then. A time the body names for the same ledger must agree with the path's. See [`POST /query/{ledger}`](../api/endpoints.md#post-queryledger).
+
 ## Event Time: Backdated Commits
 
 Every commit carries an **event time** (`db:time` in the txn-meta graph) — the
