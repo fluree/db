@@ -778,9 +778,11 @@ pub async fn stage_with_graph_delta(
         // Graph-sync target: resolve the g_id + graph Sid now, before the
         // generator takes `ns_registry` mutably. An unregistered target is a
         // first population — nothing to retract (`None` scan). Reserved
-        // system graphs are refused the same way CLEAR refuses them.
-        let sync_scan: Option<(GraphId, Sid)> = match &txn.sync_graph {
-            Some(iri) => {
+        // system graphs are refused the same way CLEAR refuses them. The
+        // default graph is g_id 0, whose flakes carry no graph Sid.
+        let sync_scan: Option<(GraphId, Option<Sid>)> = match &txn.sync_graph {
+            Some(GraphSel::Default) => Some((0, None)),
+            Some(GraphSel::Graph(iri)) => {
                 // Guard the target by shape, independent of registration:
                 // every entry point (builder, consensus applier, HTTP) meets
                 // this check, so a malformed IRI can't be registered as a
@@ -802,7 +804,7 @@ pub async fn stage_with_graph_delta(
                             graph_iri: iri.clone(),
                         });
                     }
-                    Some(g_id) => Some((g_id, ns_registry.sid_for_iri(iri))),
+                    Some(g_id) => Some((g_id, Some(ns_registry.sid_for_iri(iri)))),
                     None => None,
                 }
             }
@@ -922,9 +924,13 @@ pub async fn stage_with_graph_delta(
             // The scan attributes every flake to the graph Sid, matching the
             // payload's assertions — both sides must agree on `flake.g` for
             // the accumulator's unchanged-fact cancellation to fire.
-            let mut sync_retractions =
-                scan_graph_flakes(&ledger, *sync_g_id, Some(sync_graph_sid), options.tracker)
-                    .await?;
+            let mut sync_retractions = scan_graph_flakes(
+                &ledger,
+                *sync_g_id,
+                sync_graph_sid.as_ref(),
+                options.tracker,
+            )
+            .await?;
             for f in &mut sync_retractions {
                 f.op = false;
                 f.t = new_t;

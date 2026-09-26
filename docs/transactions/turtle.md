@@ -30,6 +30,7 @@ Fluree supports Turtle and TriG on different endpoints with different semantics:
 | `/insert` | Supported (fast direct path) | Not supported (400 error) |
 | `/upsert` | Supported | Supported |
 | `/sync` | Supported | Supported (one graph per request) |
+| `/data` ([Graph Store](../api/graph-store.md) `PUT` / `POST`) | Supported | Supported (one graph per request) |
 
 - **Insert** (`/insert`): Pure insert semantics. Uses fast direct flake parsing. Will fail if subjects already exist with conflicting data. TriG is not supported because named graphs require the upsert path for GRAPH block extraction.
 - **Upsert** (`/upsert`): For each (subject, predicate) pair, existing values are retracted before new values are asserted. Supports TriG with GRAPH blocks for named graph ingestion.
@@ -614,7 +615,7 @@ curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
 
 TriG on the `/insert` endpoint will return a 400 error because named graph extraction requires the upsert path.
 
-**Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** on `/upsert` and bulk import, a `GRAPH` block's contents are read by a smaller parser that rejects anonymous blank nodes (`[ … ]`) and collections (`( … )`) with `expected object, found '['`. Triples outside blocks are unaffected. `/sync` reads block contents with the full Turtle parser, so it accepts both; for `/upsert`, use labeled blank nodes (`_:b1`) inside blocks.
+**Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** on `/upsert` and bulk import, a `GRAPH` block's contents are read by a smaller parser that rejects anonymous blank nodes (`[ … ]`) and collections (`( … )`) with `expected object, found '['`. Triples outside blocks are unaffected. `/sync` and the [Graph Store Protocol](../api/graph-store.md) read block contents with the full Turtle parser, so they accept both; for `/upsert`, use labeled blank nodes (`_:b1`) inside blocks.
 
 ### Querying Named Graphs
 

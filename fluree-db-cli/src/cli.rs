@@ -590,8 +590,8 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
-    /// Synchronize a named graph: make its contents exactly the supplied
-    /// data, committing only the delta.
+    /// Synchronize a graph: make its contents exactly the supplied data,
+    /// committing only the delta. Without --graph, the default graph.
     ///
     /// The target graph is the constant; the SOURCE of the desired contents
     /// is pluggable. Today the source is RDF text (Turtle or JSON-LD) from a
@@ -599,6 +599,7 @@ pub enum Commands {
     /// mapped sources (R2RML over Iceberg / CSV / Excel) will plug in.
     ///
     /// Examples:
+    ///   fluree sync mydb -f data.ttl
     ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl
     ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl --dry-run
     ///   cat export.jsonld | fluree sync --graph urn:example:ontology --remote origin
@@ -613,10 +614,10 @@ pub enum Commands {
         #[arg(short = 'l', long)]
         ledger: Option<String>,
 
-        /// Target named graph IRI — the sync scope. Required; the payload
-        /// never widens or narrows it.
+        /// Target named graph IRI — the sync scope; the payload never widens
+        /// or narrows it. Omit it to sync the default graph.
         #[arg(short = 'g', long)]
-        graph: String,
+        graph: Option<String>,
 
         /// Inline data expression (Turtle or JSON-LD).
         #[arg(short = 'e', long = "expr")]

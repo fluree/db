@@ -1,12 +1,12 @@
 # fluree sync
 
-Synchronize a named graph: make its contents exactly the supplied data,
+Synchronize a graph: make its contents exactly the supplied data,
 committing only the delta.
 
 ## Usage
 
 ```bash
-fluree sync [LEDGER] [DATA] --graph <IRI> [OPTIONS]
+fluree sync [LEDGER] [DATA] [--graph <IRI>] [OPTIONS]
 ```
 
 ## Arguments
@@ -21,7 +21,7 @@ fluree sync [LEDGER] [DATA] --graph <IRI> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-g, --graph <IRI>` | **Required.** Target named graph IRI — the sync scope. The payload never widens or narrows it. |
+| `-g, --graph <IRI>` | Target named graph IRI — the sync scope. The payload never widens or narrows it. Omit it to sync the default graph. |
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `-e, --expr <EXPR>` | Inline data expression (Turtle or JSON-LD) |
 | `-f, --file <FILE>` | Read data from a file |
@@ -71,6 +71,9 @@ same export is a no-op.
 ```bash
 # Sync an ontology from a Turtle export
 fluree sync mydb --graph urn:example:ontology -f ontology.ttl
+
+# Sync the default graph (no --graph)
+fluree sync mydb -f data.ttl
 
 # Pre-flight: what would change?
 fluree sync mydb --graph urn:example:ontology -f ontology.ttl --dry-run

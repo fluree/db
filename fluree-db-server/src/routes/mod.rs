@@ -11,6 +11,7 @@ mod encryption;
 mod events;
 pub(crate) use encryption::rotation_holder;
 mod export;
+mod graph_store;
 #[cfg(feature = "graphql")]
 pub mod graphql;
 #[cfg(feature = "iceberg")]
@@ -41,7 +42,7 @@ mod validate;
 use crate::state::AppState;
 use axum::{
     middleware,
-    routing::{get, post},
+    routing::{get, post, put, MethodRouter},
     Router,
 };
 use std::sync::Arc;
@@ -66,6 +67,36 @@ where
     } else {
         router
     }
+}
+
+/// [`apply_leader_forward`] for one route's method router.
+#[cfg(feature = "raft")]
+fn apply_leader_forward_methods<S>(
+    methods: MethodRouter<S>,
+    state: &Arc<AppState>,
+) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if let Some(integration) = &state.raft {
+        methods.layer(middleware::from_fn_with_state(
+            Arc::clone(&integration.forwarder),
+            fluree_db_consensus::raft::forward::forward_to_leader,
+        ))
+    } else {
+        methods
+    }
+}
+
+#[cfg(not(feature = "raft"))]
+fn apply_leader_forward_methods<S>(
+    methods: MethodRouter<S>,
+    _state: &Arc<AppState>,
+) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    methods
 }
 
 #[cfg(not(feature = "raft"))]
@@ -258,6 +289,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         );
     let v1_leader_only_routes = apply_leader_forward(v1_leader_only_routes, &state);
 
+    // Graph Store Protocol: reads run locally like `/query`; writes are
+    // leader-only like `/sync`. One path, so one method router (axum refuses
+    // a path registered in two merged routers).
+    let graph_store_writes = put(graph_store::put)
+        .post(graph_store::post)
+        .delete(graph_store::delete);
+    let graph_store =
+        get(graph_store::get).merge(apply_leader_forward_methods(graph_store_writes, &state));
+
     // Read-only routes that nonetheless need leader-forward because
     // their backing state lives in the leader's per-process caches.
     // Today: submission status, which reads from the
@@ -301,6 +341,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(query::query_ledger_tail).post(query::query_ledger_tail),
         )
         .route("/multi-query", post(query::multi_query))
+        .route("/data/*ledger", graph_store)
         // Streaming SELECT results as NDJSON. Separate route family so the
         // standard /query path is untouched. Connection-scoped (no path ledger)
         // and ledger-scoped (greedy tail) forms.

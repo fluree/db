@@ -90,7 +90,10 @@ defaults to `/v1/fluree`.
 - Insert or upsert data (JSON-LD and Turtle; TriG on upsert)
 
 **POST /sync**
-- Make one named graph's contents exactly the payload, committing only the difference (JSON-LD, Turtle, N-Triples or TriG)
+- Make one graph's contents exactly the payload, committing only the difference (JSON-LD, Turtle, N-Triples or TriG)
+
+**GET / HEAD / PUT / POST / DELETE /data**
+- W3C Graph Store Protocol: read, replace, add to or remove one graph ([Graph Store Protocol](graph-store.md))
 
 ### Query Endpoints
 

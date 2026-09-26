@@ -204,11 +204,10 @@ pub struct Txn {
     /// See [`GraphMgmtOp`] and `stage_graph_mgmt`.
     pub graph_mgmt: Option<GraphMgmtOp>,
 
-    /// Graph-synchronization directive: make the named graph's contents
-    /// exactly this transaction's insert templates, committing only the
-    /// delta.
+    /// Graph-synchronization directive: make the graph's contents exactly
+    /// this transaction's insert templates, committing only the delta.
     ///
-    /// When `Some(iri)`, staging adds a second wave after assertion
+    /// When `Some(graph)`, staging adds a second wave after assertion
     /// generation (like the upsert wave): every currently-asserted flake in
     /// the target graph is pushed as a retraction, and the mixed
     /// [`FlakeAccumulator`](crate::generate::FlakeAccumulator) nets
@@ -217,10 +216,10 @@ pub struct Txn {
     /// payload stages zero flakes (no commit).
     ///
     /// The transaction's insert templates must all target this graph (the
-    /// parser re-homes them) and the graph must be a user graph — reserved
-    /// system graphs and (for now) the default graph are rejected at
-    /// staging. `None` for every ordinary transaction.
-    pub sync_graph: Option<String>,
+    /// parser homes them there): the default graph or a user named graph.
+    /// Reserved system graphs are rejected at staging. `None` for every
+    /// ordinary transaction.
+    pub sync_graph: Option<GraphSel>,
 }
 
 /// A SPARQL graph-management operation, executed by whole-graph scan/re-home
@@ -412,8 +411,8 @@ impl Txn {
     }
 
     /// Set the graph-synchronization target (see [`Txn::sync_graph`]).
-    pub fn with_sync_graph(mut self, iri: impl Into<String>) -> Self {
-        self.sync_graph = Some(iri.into());
+    pub fn with_sync_graph(mut self, graph: GraphSel) -> Self {
+        self.sync_graph = Some(graph);
         self
     }
 

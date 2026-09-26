@@ -33,12 +33,13 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
-    with_index_request_correlation, ApiError, CommitOpts, Fluree, GovernanceOptions,
+    with_index_request_correlation, ApiError, CommitOpts, Fluree, GovernanceOptions, GraphSel,
     IndexRequestCorrelation, LedgerHandle, PolicyStats, TrackingOptions, TrackingTally, TxnOpts,
     TxnType,
 };
 use fluree_db_consensus::{
-    IdempotencyKey, SubmissionError, TransactionBody, TransactionReceipt, TransactionRequest,
+    GraphBody, IdempotencyKey, SubmissionError, TransactionBody, TransactionReceipt,
+    TransactionRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -51,8 +52,12 @@ use tracing::Instrument;
 pub struct TransactQueryParams {
     /// Target ledger (format: name:branch)
     pub ledger: Option<String>,
-    /// Sync target graph IRI (`/sync` only).
+    /// Sync target graph IRI (`/sync` only); absent means the default graph.
     pub graph: Option<String>,
+    /// Sync target is the default graph, said explicitly: a bare `default`
+    /// key (`/sync` only).
+    #[serde(skip)]
+    pub default_graph: bool,
     /// Sync: compute and report the delta without committing (`/sync` only).
     #[serde(rename = "dryRun", default)]
     pub dry_run: bool,
@@ -409,6 +414,7 @@ fn extract_query_params(request: &Request) -> Result<TransactQueryParams> {
         match key.as_str() {
             "ledger" => once(&mut params.ledger, key, value)?,
             "graph" => once(&mut params.graph, key, value)?,
+            "default" => params.default_graph = value.is_empty() || flag(key, value)?,
             "dryRun" => params.dry_run = flag(key, value)?,
             "allowEmpty" => params.allow_empty = flag(key, value)?,
             _ => {}
@@ -416,6 +422,39 @@ fn extract_query_params(request: &Request) -> Result<TransactQueryParams> {
     }
     params.using.extend_from_pairs(&pairs);
     Ok(params)
+}
+
+/// The one graph a sync or Graph Store request targets: `graph=<iri>` names
+/// a graph and a bare `default` key the default graph. Naming neither means
+/// the default graph unless `explicit` (the Graph Store Protocol requires one
+/// of the two).
+pub(crate) fn graph_target(
+    graph: Option<String>,
+    default_graph: bool,
+    explicit: bool,
+) -> Result<GraphSel> {
+    match (graph, default_graph) {
+        (Some(iri), false) => Ok(GraphSel::Graph(iri)),
+        (None, true) => Ok(GraphSel::Default),
+        (Some(_), true) => Err(ServerError::bad_request(
+            "pass either `graph=<iri>` or `default`, not both",
+        )),
+        (None, false) if !explicit => Ok(GraphSel::Default),
+        (None, false) => Err(ServerError::bad_request(
+            "the request must name its target graph: `graph=<iri>`, or `default` for the \
+             default graph",
+        )),
+    }
+}
+
+/// A write scoped to one graph (see [`fluree_db_api::GraphSel`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GraphWrite {
+    /// Make the graph's contents exactly the payload, committing only the
+    /// delta.
+    Sync,
+    /// Add the payload's triples to the graph.
+    Insert,
 }
 
 /// Check if the credential contains a W3C SPARQL Protocol form-encoded update
@@ -561,7 +600,7 @@ fn get_ledger_id(
 /// Precedence:
 /// 1) Signed request DID (credential)
 /// 2) Bearer token identity (fluree.identity ?? sub)
-fn effective_author(
+pub(crate) fn effective_author(
     credential: &MaybeCredential,
     bearer: Option<&crate::extract::DataPrincipal>,
 ) -> Option<String> {
@@ -574,7 +613,7 @@ fn effective_author(
 /// Enforce write authorization for a ledger according to `data_auth.mode`.
 ///
 /// Records `error_code` on the current span when access is denied.
-fn enforce_write_access(
+pub(crate) fn enforce_write_access(
     state: &AppState,
     ledger: &str,
     bearer: Option<&crate::extract::DataPrincipal>,
@@ -1248,10 +1287,11 @@ async fn upsert_local(
     .await
 }
 
-/// Synchronize a named graph: make its contents exactly the payload (JSON-LD,
-/// Turtle, N-Triples or TriG), committing only the delta.
+/// Synchronize a graph: make its contents exactly the payload (JSON-LD,
+/// Turtle, N-Triples or TriG), committing only the delta. Without `graph`,
+/// the default graph.
 ///
-/// POST /sync?ledger=name:branch&graph=<iri>[&dryRun=true][&allowEmpty=true]
+/// POST /sync?ledger=name:branch[&graph=<iri>][&dryRun=true][&allowEmpty=true]
 /// In peer mode, forwards the request to the transaction server.
 pub async fn sync(
     State(state): State<Arc<AppState>>,
@@ -1321,11 +1361,16 @@ async fn sync_local(
         let span = tracing::Span::current();
         tracing::info!(status = "start", "graph sync requested");
 
-        let Some(graph_iri) = query_params.graph.clone() else {
-            set_span_error_code(&span, "error:BadRequest");
-            return Err(ServerError::bad_request(
-                "sync requires a `graph` query parameter naming the target graph IRI",
-            ));
+        let graph = match graph_target(
+            query_params.graph.clone(),
+            query_params.default_graph,
+            false,
+        ) {
+            Ok(graph) => graph,
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(e);
+            }
         };
 
         if credential.is_turtle_or_trig() {
@@ -1338,8 +1383,9 @@ async fn sync_local(
             span.record("ledger_id", ledger_id.as_str());
             enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
             let author = effective_author(&credential, bearer.as_ref());
-            let op = TurtleOp::Sync {
-                graph_iri: &graph_iri,
+            let op = TurtleOp::Graph {
+                graph: &graph,
+                write: GraphWrite::Sync,
                 allow_empty: query_params.allow_empty,
             };
             if query_params.dry_run {
@@ -1352,11 +1398,8 @@ async fn sync_local(
                 let report = dry_run_sync(
                     &state,
                     &ledger_id,
-                    &graph_iri,
-                    fluree_db_api::SyncPayload::Rdf {
-                        text: &text,
-                        allow_empty: query_params.allow_empty,
-                    },
+                    &graph,
+                    fluree_db_api::GraphPayload::Rdf(&text),
                     query_params.allow_empty,
                     TxnOpts::default(),
                     &governance,
@@ -1413,8 +1456,8 @@ async fn sync_local(
             return dry_run_sync(
                 &state,
                 &ledger_id,
-                &graph_iri,
-                fluree_db_api::SyncPayload::JsonLd(&prepared.body),
+                &graph,
+                fluree_db_api::GraphPayload::JsonLd(&prepared.body),
                 query_params.allow_empty,
                 txn_opts,
                 &prepared.governance,
@@ -1426,7 +1469,7 @@ async fn sync_local(
             &state,
             &ledger_id,
             TxnType::Insert,
-            Some(&graph_iri),
+            Some((&graph, GraphWrite::Sync)),
             body_json,
             &credential,
             author.as_deref(),
@@ -1446,8 +1489,8 @@ async fn sync_local(
 async fn dry_run_sync(
     state: &AppState,
     ledger_id: &str,
-    graph_iri: &str,
-    payload: fluree_db_api::SyncPayload<'_>,
+    graph: &GraphSel,
+    payload: fluree_db_api::GraphPayload<'_>,
     allow_empty: bool,
     txn_opts: TxnOpts,
     governance: &fluree_db_api::GovernanceOptions,
@@ -1473,21 +1516,11 @@ async fn dry_run_sync(
         dry_run: true,
         allow_empty,
     };
-    let report = match payload {
-        fluree_db_api::SyncPayload::JsonLd(body) => {
-            state
-                .fluree
-                .sync_named_graph_with(ledger_id, graph_iri, body, opts, txn_opts, policy)
-                .await
-        }
-        fluree_db_api::SyncPayload::Rdf { text, .. } => {
-            state
-                .fluree
-                .sync_named_graph_rdf_with(ledger_id, graph_iri, text, opts, txn_opts, policy)
-                .await
-        }
-    }
-    .map_err(ServerError::from)?;
+    let report = state
+        .fluree
+        .sync_graph_with(ledger_id, graph, payload, opts, txn_opts, policy)
+        .await
+        .map_err(ServerError::from)?;
     Ok(axum::Json(serde_json::json!({
         "ledger": report.ledger_id,
         "graph": report.graph_iri,
@@ -1900,11 +1933,11 @@ fn txn_opts_from_body(body: &JsonValue, span: &tracing::Span) -> Result<TxnOpts>
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_transaction(
+pub(crate) async fn execute_transaction(
     state: &AppState,
     ledger_id: &str,
     txn_type: TxnType,
-    sync_graph: Option<&str>,
+    graph_op: Option<(&GraphSel, GraphWrite)>,
     body: JsonValue,
     credential: &MaybeCredential,
     author: Option<&str>,
@@ -1986,10 +2019,14 @@ async fn execute_transaction(
         // tracking, and execution are all handled by the submission layer;
         // policy is built there from the ledger state the transaction
         // actually stages against.
-        let body = match sync_graph {
-            Some(graph_iri) => TransactionBody::JsonLdGraphSync {
-                graph_iri: graph_iri.to_string(),
+        let body = match graph_op {
+            Some((graph, GraphWrite::Sync)) => TransactionBody::JsonLdGraphSync {
+                graph_iri: graph_iri(graph),
                 body: prepared_transaction.body,
+            },
+            Some((graph, GraphWrite::Insert)) => TransactionBody::GraphInsert {
+                graph_iri: graph_iri(graph),
+                payload: GraphBody::JsonLd(prepared_transaction.body),
             },
             None => match txn_type {
                 TxnType::Insert => TransactionBody::JsonLdInsert(prepared_transaction.body),
@@ -2026,14 +2063,25 @@ fn compute_tx_id_turtle(turtle: &str) -> String {
 /// (SPARQL UPDATE is the update path for RDF text), so the variant is
 /// excluded at the type level rather than checked at runtime.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TurtleOp<'a> {
+pub(crate) enum TurtleOp<'a> {
     Insert,
     Upsert,
-    /// Graph sync: `graph_iri`'s contents become exactly the body.
-    Sync {
-        graph_iri: &'a str,
+    /// A write scoped to one graph. `allow_empty` confirms that an empty
+    /// body clears the graph (sync only).
+    Graph {
+        graph: &'a GraphSel,
+        write: GraphWrite,
         allow_empty: bool,
     },
+}
+
+/// A graph target as the consensus bodies carry it: `None` is the default
+/// graph.
+fn graph_iri(graph: &GraphSel) -> Option<String> {
+    match graph {
+        GraphSel::Graph(iri) => Some(iri.clone()),
+        GraphSel::Default => None,
+    }
 }
 
 /// Execute a Turtle/TriG transaction
@@ -2051,9 +2099,9 @@ enum TurtleOp<'a> {
 /// - **Upsert with Turtle/TriG** (`/upsert`): Uses `upsert_turtle` which handles GRAPH blocks
 ///   and supports named graph ingestion. For each (subject, predicate) pair, existing values
 ///   are retracted before new values are asserted.
-/// - **Sync with Turtle/TriG** (`/sync`): the body becomes the target graph's whole contents,
-///   committing only the delta (see `fluree_db_api::SyncPayload::Rdf`).
-async fn execute_turtle_transaction(
+/// - **Graph writes with Turtle/TriG** (`/sync`, Graph Store `PUT`/`POST`): the body replaces
+///   or adds to one graph's contents (see `fluree_db_api::GraphPayload::Rdf`).
+pub(crate) async fn execute_turtle_transaction(
     state: &AppState,
     ledger_id: &str,
     op: TurtleOp<'_>,
@@ -2129,13 +2177,22 @@ async fn execute_turtle_transaction(
         // (TriG, Insert) was rejected above. Sync reads GRAPH blocks from
         // either content type.
         let body = match op {
-            TurtleOp::Sync {
-                graph_iri,
+            TurtleOp::Graph {
+                graph,
+                write: GraphWrite::Sync,
                 allow_empty,
             } => TransactionBody::RdfGraphSync {
-                graph_iri: graph_iri.to_string(),
+                graph_iri: graph_iri(graph),
                 text: turtle.to_string(),
                 allow_empty,
+            },
+            TurtleOp::Graph {
+                graph,
+                write: GraphWrite::Insert,
+                ..
+            } => TransactionBody::GraphInsert {
+                graph_iri: graph_iri(graph),
+                payload: GraphBody::Rdf(turtle.to_string()),
             },
             TurtleOp::Upsert if is_trig => TransactionBody::TrigUpsert(turtle.to_string()),
             TurtleOp::Upsert => TransactionBody::TurtleUpsert(turtle.to_string()),
@@ -2380,9 +2437,6 @@ async fn execute_sparql_update_request(
         tracing::warn!(error = %e, "invalid SPARQL Protocol USING parameters");
     })?;
 
-    // Compute tx-id from SPARQL string
-    let tx_id = compute_tx_id_sparql(&sparql);
-
     // Get ledger id from path, query param, or header (SPARQL UPDATE body doesn't contain ledger)
     let ledger_id = match path_ledger {
         Some(ledger) => ledger.to_string(),
@@ -2401,9 +2455,24 @@ async fn execute_sparql_update_request(
     // Enforce write access for unsigned requests when bearer is present/required
     enforce_write_access(state, &ledger_id, bearer, credential)?;
 
+    submit_sparql_update(state, &ledger_id, sparql, headers, credential, parent_span).await
+}
+
+/// Submit a SPARQL UPDATE through consensus, once the ledger and write access
+/// are settled. The text is parsed and lowered inside the consensus layer.
+pub(crate) async fn submit_sparql_update(
+    state: &AppState,
+    ledger_id: &str,
+    sparql: String,
+    headers: &FlureeHeaders,
+    credential: &MaybeCredential,
+    parent_span: &tracing::Span,
+) -> Result<Response> {
+    let tx_id = compute_tx_id_sparql(&sparql);
+
     // Resolve the ledger handle up front: a missing ledger surfaces as a 404
     // here, and the handle provides the canonical ledger ID for commit_opts.
-    let handle = match state.fluree.ledger_cached(&ledger_id).await {
+    let handle = match state.fluree.ledger_cached(ledger_id).await {
         Ok(handle) => handle,
         Err(e) => {
             let server_error = ServerError::Api(e);
@@ -2433,20 +2502,20 @@ async fn execute_sparql_update_request(
     let tracking = tracking_from_headers(headers);
     let request = TransactionRequest {
         idempotency_key: extract_idempotency_key(&credential.headers)?,
-        ledger_id: ledger_id.clone(),
+        ledger_id: ledger_id.to_string(),
         body: TransactionBody::Sparql(sparql),
         txn_opts: TxnOpts::default(),
         commit_opts,
         tracking,
         governance,
     };
-    transact_via_consensus(state, &ledger_id, request, tx_id, &credential.headers).await
+    transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
 }
 
 // ===== Peer mode forwarding =====
 
 /// Forward a transaction request to the transaction server (peer mode)
-async fn forward_write_request(state: &AppState, request: Request) -> Response {
+pub(crate) async fn forward_write_request(state: &AppState, request: Request) -> Response {
     let client = match state.forwarding_client.as_ref() {
         Some(c) => c,
         None => {

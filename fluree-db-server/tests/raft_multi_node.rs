@@ -933,6 +933,75 @@ async fn rdf_graph_sync_commits_through_the_raft_queue() {
     );
 }
 
+/// Graph Store Protocol writes sent to a follower are forwarded to the
+/// leader (the forwarding layer sits on the write methods only), and the
+/// graph-insert body stages through the leader's commit worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_store_writes_forward_through_the_raft_queue() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+
+    let follower = cluster.pick_follower().await;
+    let ledger = "raft:gsp";
+    cluster.create_ledger(follower, ledger).await;
+    let uri = format!(
+        "{}/v1/fluree/data/{ledger}?graph=urn:example:tools",
+        cluster.public_url(follower)
+    );
+    let send = |method: reqwest::Method, body: &'static str| {
+        let request = cluster
+            .client
+            .request(method, &uri)
+            .header("content-type", "text/turtle")
+            .body(body);
+        async move {
+            let resp = request.send().await.expect("graph store request");
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            (status, body)
+        }
+    };
+
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        "<http://example.org/search> <http://example.org/name> \"search\" .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "<http://example.org/fetch> <http://example.org/name> \"fetch\" .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for node in &cluster.nodes {
+        let url = format!(
+            "{}/v1/fluree/data/{ledger}?graph=urn:example:tools",
+            node.public_url
+        );
+        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            let resp = cluster.client.get(&url).send().await.expect("GET");
+            last = resp.text().await.unwrap_or_default();
+            if last.contains("fetch") && last.contains("search") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            last.contains("fetch") && last.contains("search"),
+            "node {}: {last}",
+            node.node_id
+        );
+    }
+
+    let (status, body) = send(reqwest::Method::DELETE, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 /// Build, in a local in-memory instance, a main branch that ends in a
 /// general merge of `dev`. Return the push a client would send for it: the
 /// first-parent line plus the commit `dev` made.

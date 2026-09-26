@@ -13,7 +13,9 @@
 
 use super::txn_meta::extract_txn_meta;
 use crate::error::{Result, TransactError};
-use crate::ir::{InlineValues, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+use crate::ir::{
+    GraphSel, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+};
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
@@ -167,21 +169,35 @@ pub fn parse_transaction(
 /// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
 ///
 /// The payload is an ordinary insert-shaped JSON-LD document describing the
-/// target graph's DESIRED full contents. Parsing is exactly insert parsing
-/// (same context handling, annotation lowering, txn-meta extraction), after
-/// which every template is re-homed onto `graph_iri` and the sync directive
-/// is stamped on the transaction.
-///
-/// Differences from insert:
-/// - an explicitly empty document (`"@graph": []`) is allowed — it means
-///   "the graph's desired contents are empty" (the API layer gates this
-///   behind an explicit opt-in before it becomes a whole-graph clear);
-/// - a payload that addresses named graphs itself (`@graph` with a graph
-///   `@id`) is rejected: the sync scope is exactly one graph, named by the
-///   caller, never inferred from the data.
+/// target graph's DESIRED full contents, parsed as [`parse_graph_insert`]
+/// does, with the sync directive stamped on the transaction. An explicitly
+/// empty document (`"@graph": []`) means "the graph's desired contents are
+/// empty"; the API layer gates that behind an explicit opt-in before it
+/// becomes a whole-graph clear.
 pub fn parse_sync_transaction(
     json: &Value,
-    graph_iri: &str,
+    graph: &GraphSel,
+    opts: TxnOpts,
+    ns_registry: &mut NamespaceRegistry,
+) -> Result<Txn> {
+    let mut txn = parse_graph_insert(json, graph, opts, ns_registry)?;
+    txn.sync_graph = Some(graph.clone());
+    Ok(txn)
+}
+
+/// Parse an insert whose triples all land in `graph`, the default graph or
+/// one named graph, named by the caller rather than by the payload.
+///
+/// Parsing is exactly insert parsing (same context handling, annotation
+/// lowering, txn-meta extraction), after which every template is homed on
+/// `graph`. Differences from insert:
+/// - an explicitly empty document (`"@graph": []`) parses to an empty
+///   transaction instead of an error;
+/// - a payload that addresses named graphs itself (`@graph` with a graph
+///   `@id`) is rejected: the scope is exactly one graph.
+pub fn parse_graph_insert(
+    json: &Value,
+    graph: &GraphSel,
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
 ) -> Result<Txn> {
@@ -196,20 +212,24 @@ pub fn parse_sync_transaction(
     };
     if !txn.write_graphs.is_empty() {
         return Err(TransactError::Parse(
-            "sync payload must not address named graphs; the target graph is the sync scope"
+            "payload must not address named graphs; the target graph is given by the request"
                 .to_string(),
         ));
     }
-    let sync_graph: Arc<str> = Arc::from(graph_iri);
+    // Parsed templates are already in the default graph.
+    let GraphSel::Graph(graph_iri) = graph else {
+        return Ok(txn);
+    };
+    let target: Arc<str> = Arc::from(graph_iri.as_str());
     for t in &mut txn.insert_templates {
-        t.graph = TemplateGraph::Iri(Arc::clone(&sync_graph));
+        t.graph = TemplateGraph::Iri(Arc::clone(&target));
     }
     // Edge annotations were lowered against a payload with no graph identity,
     // so their `f:reifies*` bundles carry no `f:reifiesGraph`. Re-homing the
     // bundle into the target graph without one produces a bundle whose
     // flake-level graph disagrees with the edge graph it encodes
     // (`EdgeKey::from_reifies_facts` → `GraphMismatch`, refused at stage).
-    // Anchor every reifier to the sync graph, exactly as the named-`@graph`
+    // Anchor every reifier to the target graph, exactly as the named-`@graph`
     // lowering does for an annotated edge written inside a graph block.
     let reifies_subject = fluree_db_core::Sid::new(
         fluree_vocab::namespaces::FLUREE_DB,
@@ -231,8 +251,7 @@ pub fn parse_sync_transaction(
         })
         .collect();
     txn.insert_templates.extend(anchors);
-    txn.write_graphs.insert(graph_iri.to_string());
-    txn.sync_graph = Some(graph_iri.to_string());
+    txn.write_graphs.insert(graph_iri.clone());
     Ok(txn)
 }
 

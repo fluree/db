@@ -24,8 +24,8 @@ use fluree_db_transact::stage_with_graph_delta as stage_txn;
 use fluree_db_transact::validate_view_with_shacl;
 use fluree_db_transact::{
     commit as commit_txn, parse_transaction, resolve_trig_meta, CommitOpts, CommitReceipt,
-    NamedGraphBlock, NamespaceRegistry, RawTrigMeta, StageOptions, TemplateTerm, TripleTemplate,
-    Txn, TxnOpts, TxnType,
+    GraphSel, NamedGraphBlock, NamespaceRegistry, RawTrigMeta, StageOptions, TemplateTerm,
+    TripleTemplate, Txn, TxnOpts, TxnType,
 };
 use fluree_vocab::config_iris;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -2102,7 +2102,7 @@ pub struct StageResult {
     /// [`fluree_db_transact::Txn::sync_graph`]). A sync that stages zero
     /// flakes is a legitimate no-change outcome, so the commit paths skip
     /// the commit for it exactly like a no-op update/upsert.
-    pub sync_graph: Option<String>,
+    pub sync_graph: Option<fluree_db_transact::GraphSel>,
 }
 
 impl StageResult {
@@ -2238,54 +2238,109 @@ fn write_scope(
     WriteScope::Subjects(subjects)
 }
 
-/// Build a graph-sync [`Txn`] from Turtle, N-Triples or TriG text (see
-/// [`crate::SyncPayload::Rdf`]), returning it with the JSON-LD it parsed to,
-/// which the staging tail reads limits from.
+/// What a graph-scoped payload is for: replacing the graph's contents, or
+/// adding triples to it.
+#[derive(Clone, Copy)]
+enum GraphOpMode {
+    /// Graph sync. `allow_empty` confirms that an empty RDF payload clears
+    /// the graph (a JSON-LD payload says so with `"@graph": []`, checked by
+    /// the API layer).
+    Sync { allow_empty: bool },
+    /// Graph insert: an empty payload has nothing to add, so it is refused.
+    Insert,
+}
+
+/// Build the [`Txn`] for a payload scoped to `graph` (see
+/// [`crate::GraphPayload`]), returning it with the JSON-LD it parsed from,
+/// which the staging tail reads limits and the SHACL context from.
 ///
-/// A TriG body's blocks are unwrapped in place and the whole body read by the
-/// Turtle parser, so block contents get the full Turtle grammar and every
-/// format converges on the JSON-LD sync path. Triples outside a block belong
-/// to TriG's default graph, which sync cannot write, so a body with both is
-/// refused rather than guessed at.
-fn parse_rdf_sync_transaction(
-    text: &str,
-    graph_iri: &str,
-    allow_empty: bool,
+/// RDF text: a TriG body's blocks are unwrapped in place and the whole body
+/// read by the Turtle parser, so block contents get the full Turtle grammar
+/// and every format converges on the JSON-LD path. Blocks must name `graph`,
+/// and triples outside a block belong to TriG's default graph, so for a named
+/// target a body with both is refused rather than guessed at. For the default
+/// graph, every block names some other graph.
+fn parse_graph_payload<'a>(
+    graph: &GraphSel,
+    payload: crate::GraphPayload<'a>,
+    mode: GraphOpMode,
     txn_opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
-) -> Result<(Txn, JsonValue)> {
+) -> Result<(Txn, std::borrow::Cow<'a, JsonValue>)> {
     let bad_request = |message: String| ApiError::Http {
         status: 400,
         message,
     };
-    let trig = fluree_db_transact::unwrap_trig_graph_blocks(text)?;
-    if let Some(other) = trig.graph_iris.iter().find(|iri| *iri != graph_iri) {
-        return Err(bad_request(format!(
-            "sync replaces one graph, <{graph_iri}>; the body also has a GRAPH block for <{other}>"
-        )));
-    }
-    if trig.mixes_default_and_named {
-        return Err(bad_request(format!(
-            "a TriG sync body holds <{graph_iri}>'s contents either in GRAPH <{graph_iri}> blocks \
-             or as default-graph triples, not both"
-        )));
-    }
-    let nodes = match fluree_graph_turtle::parse_to_json(&trig.turtle)? {
-        JsonValue::Array(nodes) => nodes,
-        node => vec![node],
+    let (txn_json, raw_meta) = match payload {
+        crate::GraphPayload::JsonLd(json) => (std::borrow::Cow::Borrowed(json), None),
+        crate::GraphPayload::Rdf(text) => {
+            let trig = fluree_db_transact::unwrap_trig_graph_blocks(text)?;
+            let target = match graph {
+                GraphSel::Graph(iri) => format!("<{iri}>"),
+                GraphSel::Default => "the default graph".to_string(),
+            };
+            let named = match graph {
+                GraphSel::Graph(iri) => Some(iri.as_str()),
+                GraphSel::Default => None,
+            };
+            if let Some(other) = trig
+                .graph_iris
+                .iter()
+                .find(|iri| Some(iri.as_str()) != named)
+            {
+                return Err(bad_request(format!(
+                    "the request targets one graph, {target}; the body also has a GRAPH block \
+                     for <{other}>"
+                )));
+            }
+            if trig.mixes_default_and_named {
+                return Err(bad_request(format!(
+                    "a TriG body holds {target}'s triples either in GRAPH {target} blocks or as \
+                     default-graph triples, not both"
+                )));
+            }
+            let nodes = match fluree_graph_turtle::parse_to_json(&trig.turtle)? {
+                JsonValue::Array(nodes) => nodes,
+                node => vec![node],
+            };
+            if nodes.is_empty() {
+                match mode {
+                    GraphOpMode::Sync { allow_empty: true } => {}
+                    GraphOpMode::Sync { allow_empty: false } => {
+                        return Err(bad_request(
+                            "sync payload is empty; this would clear the graph — set \
+                             allowEmpty to confirm"
+                                .to_string(),
+                        ))
+                    }
+                    GraphOpMode::Insert => {
+                        return Err(bad_request(
+                            "the payload has no triples; there is nothing to add".to_string(),
+                        ))
+                    }
+                }
+            }
+            // `"@graph": []` is the JSON-LD explicit-empty form.
+            let json = serde_json::json!({ "@graph": nodes });
+            (std::borrow::Cow::Owned(json), trig.raw_meta)
+        }
     };
-    if nodes.is_empty() && !allow_empty {
-        return Err(bad_request(
-            "sync payload is empty; this would clear the graph — set allowEmpty to confirm"
-                .to_string(),
-        ));
-    }
-
-    // `"@graph": []` is the JSON-LD sync path's explicit-empty form.
-    let txn_json = serde_json::json!({ "@graph": nodes });
-    let mut txn =
-        fluree_db_transact::parse_sync_transaction(&txn_json, graph_iri, txn_opts, ns_registry)?;
-    if let Some(raw_meta) = &trig.raw_meta {
+    let mut txn = match mode {
+        GraphOpMode::Sync { .. } => {
+            fluree_db_transact::parse_sync_transaction(&txn_json, graph, txn_opts, ns_registry)?
+        }
+        GraphOpMode::Insert => {
+            let txn =
+                fluree_db_transact::parse_graph_insert(&txn_json, graph, txn_opts, ns_registry)?;
+            if txn.insert_templates.is_empty() {
+                return Err(bad_request(
+                    "the payload has no triples; there is nothing to add".to_string(),
+                ));
+            }
+            txn
+        }
+    };
+    if let Some(raw_meta) = &raw_meta {
         txn.txn_meta
             .extend(resolve_trig_meta(raw_meta, ns_registry)?);
     }
@@ -2824,20 +2879,21 @@ impl crate::Fluree {
     /// Stage a graph-sync transaction (see
     /// [`fluree_db_transact::Txn::sync_graph`]): the payload is the target
     /// graph's desired full contents, parsed with the staging registry (same
-    /// namespace hand-off as any transaction) and re-homed onto `graph_iri`;
-    /// staging's sync wave turns it into a delta-only flake set.
+    /// namespace hand-off as any transaction) and homed on `graph`; staging's
+    /// sync wave turns it into a delta-only flake set. `allow_empty` confirms
+    /// that an empty RDF payload clears the graph.
     #[allow(clippy::too_many_arguments)]
     pub async fn stage_sync_transaction_tracked(
         &self,
         ledger: LedgerState,
-        graph_iri: &str,
-        payload: crate::SyncPayload<'_>,
+        graph: &GraphSel,
+        payload: crate::GraphPayload<'_>,
+        allow_empty: bool,
         txn_opts: TxnOpts,
         index_config: Option<&IndexConfig>,
         external_tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
-        let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         // Deterministic, graph-scoped blank-node identity: the payload is
         // the graph's authoritative document, so the same source label must
         // mint the same skolem IRI on every sync — otherwise every
@@ -2845,48 +2901,86 @@ impl crate::Fluree {
         // as retract+assert on each sync even when unchanged. Exporters
         // that regenerate labels per save (e.g. Protégé's genid) still
         // churn; structural (RDFC-style) canonicalization is the designed
-        // follow-up for those. A caller-supplied id wins.
+        // follow-up for those. A caller-supplied id wins. `@default` cannot
+        // collide with a named graph, whose IRI is absolute.
         let mut txn_opts = txn_opts;
         if txn_opts.skolem_txn_id.is_none() {
+            let key = match graph {
+                GraphSel::Graph(iri) => iri.as_str(),
+                GraphSel::Default => "@default",
+            };
             let scope = fluree_db_core::skolem::doc_scope(fluree_db_core::skolem::doc_id(
                 "fluree:graph-sync",
-                graph_iri,
+                key,
                 0,
             ));
             txn_opts.skolem_txn_id = Some(format!("sync{scope}"));
         }
-        let rdf_json;
+        let mode = GraphOpMode::Sync { allow_empty };
+        self.stage_graph_payload_tracked(
+            ledger,
+            graph,
+            payload,
+            mode,
+            txn_opts,
+            index_config,
+            external_tracker,
+            policy,
+        )
+        .await
+    }
+
+    /// Stage an insert of `payload`'s triples into `graph`, the default graph
+    /// or one named graph. Blank nodes are fresh per transaction, as for any
+    /// insert, so posting the same document twice adds two copies of its
+    /// blank-node structures (RDF merge). An empty payload is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_graph_insert_tracked(
+        &self,
+        ledger: LedgerState,
+        graph: &GraphSel,
+        payload: crate::GraphPayload<'_>,
+        txn_opts: TxnOpts,
+        index_config: Option<&IndexConfig>,
+        external_tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+    ) -> Result<StageResult> {
+        self.stage_graph_payload_tracked(
+            ledger,
+            graph,
+            payload,
+            GraphOpMode::Insert,
+            txn_opts,
+            index_config,
+            external_tracker,
+            policy,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_graph_payload_tracked(
+        &self,
+        ledger: LedgerState,
+        graph: &GraphSel,
+        payload: crate::GraphPayload<'_>,
+        mode: GraphOpMode,
+        txn_opts: TxnOpts,
+        index_config: Option<&IndexConfig>,
+        external_tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+    ) -> Result<StageResult> {
+        let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let (txn, txn_json) = {
-            let parse_span = tracing::debug_span!("txn_parse", txn_type = "sync");
+            let parse_span = tracing::debug_span!("txn_parse", txn_type = "graph");
             let _guard = parse_span.enter();
-            match payload {
-                crate::SyncPayload::JsonLd(txn_json) => (
-                    fluree_db_transact::parse_sync_transaction(
-                        txn_json,
-                        graph_iri,
-                        txn_opts,
-                        &mut ns_registry,
-                    )?,
-                    txn_json,
-                ),
-                crate::SyncPayload::Rdf { text, allow_empty } => {
-                    let txn;
-                    (txn, rdf_json) = parse_rdf_sync_transaction(
-                        text,
-                        graph_iri,
-                        allow_empty,
-                        txn_opts,
-                        &mut ns_registry,
-                    )?;
-                    (txn, &rdf_json)
-                }
-            }
+            parse_graph_payload(graph, payload, mode, txn_opts, &mut ns_registry)?
         };
         self.stage_built_txn_tracked(
             ledger,
             txn,
             ns_registry,
-            txn_json,
+            &txn_json,
             index_config,
             external_tracker,
             policy,
