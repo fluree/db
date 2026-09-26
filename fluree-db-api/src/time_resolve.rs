@@ -104,11 +104,12 @@ where
     };
     tracing::debug!(earliest_time, "datetime_to_t: earliest ledger#time");
 
-    // Check if target is before earliest commit
+    // A time before the ledger existed is the caller's mistake, not a fault:
+    // a 400 on every surface that resolves one (query, export, branch).
     if target_epoch_ms < earliest_time {
         let target_iso = epoch_ms_to_iso(target_epoch_ms);
         let earliest_iso = epoch_ms_to_iso(earliest_time);
-        return Err(ApiError::internal(format!(
+        return Err(ApiError::invalid_query(format!(
             "There is no data as of {target_iso} (earliest commit is at {earliest_iso})"
         )));
     }
@@ -258,7 +259,7 @@ where
             // before the earliest receivedAt.
             let target_iso = epoch_ms_to_iso(target_epoch_ms);
             let earliest_iso = epoch_ms_to_iso(earliest_recv);
-            return Err(ApiError::internal(format!(
+            return Err(ApiError::invalid_query(format!(
                 "There is no data recorded as of {target_iso} (earliest commit was recorded \
                  at {earliest_iso})"
             )));
