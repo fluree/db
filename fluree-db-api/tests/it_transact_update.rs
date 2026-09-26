@@ -3183,3 +3183,51 @@ async fn tracked_update_matching_nothing_is_a_noop() {
     assert_eq!(result.receipt.t, seeded_t, "no commit may be written");
     assert_eq!(result.receipt.flake_count, 0);
 }
+
+/// A no-match update whose INSERT template names a graph the ledger has not
+/// registered still commits, with zero flakes, so the registration persists.
+/// This is the rule the transaction builder always applied; `transact()` now
+/// shares it, where it used to skip the commit.
+#[tokio::test]
+async fn no_match_update_naming_a_new_graph_commits_its_registration() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/noop-update-new-graph:main";
+    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    let seeded = fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:p": "x"}),
+        )
+        .await
+        .expect("seed");
+    let seeded_t = seeded.receipt.t;
+
+    let new_graph = "http://example.org/graphs/brandnew";
+    let result = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": {"@id": "?s", "ex:absent": "?o"},
+                "insert": {"@id": "?s", "@graph": new_graph, "ex:q": "y"}
+            }),
+        )
+        .await
+        .expect("update");
+
+    assert_eq!(
+        result.receipt.t,
+        seeded_t + 1,
+        "a registration commit is written"
+    );
+    assert_eq!(result.receipt.flake_count, 0);
+    assert!(
+        result
+            .ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(new_graph)
+            .is_some(),
+        "the named graph is registered"
+    );
+}

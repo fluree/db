@@ -3149,8 +3149,9 @@ impl crate::Fluree {
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?
         };
 
-        // Extract txn_meta before staging consumes the Txn.
+        // Extract txn_meta and the sync target before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
+        let sync_graph = txn.sync_graph.clone();
 
         // Build stage options with policy and tracker
         let mut options = StageOptions::new()
@@ -3188,7 +3189,7 @@ impl crate::Fluree {
             scope: WriteScope::Unbounded,
             txn_meta,
             graph_delta: staged.graph_delta,
-            sync_graph: None,
+            sync_graph,
         })
     }
 
