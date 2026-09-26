@@ -471,6 +471,612 @@ async fn test_sparql_delete_where_named_graph_block() {
         .await;
 }
 
+/// Like [`run_sparql_update`], but returns the staging error instead of
+/// panicking on it.
+async fn try_sparql_update(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    sparql: &str,
+) -> fluree_db_api::Result<fluree_db_api::TransactResult> {
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    assert!(
+        !parsed.has_errors(),
+        "SPARQL parse errors: {:?}",
+        parsed.diagnostics
+    );
+    let ast = parsed.ast.expect("SPARQL AST");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &ast,
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower SPARQL UPDATE to Txn IR");
+    fluree.stage_owned(ledger).txn(txn).execute().await
+}
+
+/// Objects of `<s> <p> ?o` in one graph (`from` = ledger id, or
+/// `<ledger_id>#<graph-iri>` for a named graph), sorted.
+async fn graph_values(fluree: &fluree_db_api::Fluree, from: &str, s: &str, p: &str) -> Vec<String> {
+    let q = json!({
+        "from": from,
+        "select": "?o",
+        "where": {"@id": s, p: "?o"}
+    });
+    let ledger_id = from.split('#').next().expect("ledger id");
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let results = fluree.query_connection(&q).await.expect("query");
+    let arr = results.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let mut out: Vec<String> = arr
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|v| v.as_str().expect("string value").to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// User graph IRIs in the ledger's registry, sorted.
+async fn user_graph_iris(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Vec<String> {
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let mut out: Vec<String> = ledger
+        .snapshot
+        .graph_registry
+        .iter_entries()
+        .filter(|(g_id, _)| *g_id >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
+        .map(|(_, iri)| iri.to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn test_sparql_update_graph_variable_rewrites_in_place() {
+    // #1513: DELETE/INSERT with `GRAPH ?g` templates rewrites each match in
+    // the graph it was found in. The default graph holds the same "old"
+    // triple and must be untouched: `GRAPH ?g` ranges over named graphs only,
+    // and a default-graph row reaching the templates would register a
+    // spurious named graph.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/sparql-update-graph-var:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+            let insert = r#"
+                INSERT DATA {
+                    <https://example.org/a> <https://example.org/status> "old" .
+                    GRAPH <https://example.org/g/1> {
+                        <https://example.org/a> <https://example.org/status> "old" .
+                    }
+                    GRAPH <https://example.org/g/2> {
+                        <https://example.org/b> <https://example.org/status> "old" .
+                    }
+                    GRAPH <https://example.org/g/3> {
+                        <https://example.org/c> <https://example.org/status> "keep" .
+                    }
+                }
+            "#;
+            let r1 = run_sparql_update(&fluree, ledger, insert).await;
+            trigger_index_and_wait(&handle, ledger_id, r1.receipt.t).await;
+
+            let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+            let update = r#"
+                DELETE { GRAPH ?g { ?s <https://example.org/status> "old" } }
+                INSERT { GRAPH ?g { ?s <https://example.org/status> "new" } }
+                WHERE  { GRAPH ?g { ?s <https://example.org/status> "old" } }
+            "#;
+            let r2 = run_sparql_update(&fluree, ledger, update).await;
+            assert!(r2.receipt.t > r1.receipt.t, "update should commit");
+
+            let status = "https://example.org/status";
+            let g = |n: u8| format!("{ledger_id}#https://example.org/g/{n}");
+            assert_eq!(
+                graph_values(&fluree, &g(1), "https://example.org/a", status).await,
+                vec!["new"]
+            );
+            assert_eq!(
+                graph_values(&fluree, &g(2), "https://example.org/b", status).await,
+                vec!["new"]
+            );
+            assert_eq!(
+                graph_values(&fluree, &g(3), "https://example.org/c", status).await,
+                vec!["keep"]
+            );
+            assert_eq!(
+                graph_values(&fluree, ledger_id, "https://example.org/a", status).await,
+                vec!["old"],
+                "default graph must not be rewritten"
+            );
+            assert_eq!(
+                user_graph_iris(&fluree, ledger_id).await,
+                vec![
+                    "https://example.org/g/1",
+                    "https://example.org/g/2",
+                    "https://example.org/g/3"
+                ],
+                "no graph may be registered by the update"
+            );
+
+            // Same answers once the update is indexed.
+            trigger_index_and_wait(&handle, ledger_id, r2.receipt.t).await;
+            assert_eq!(
+                graph_values(&fluree, &g(1), "https://example.org/a", status).await,
+                vec!["new"]
+            );
+            assert_eq!(
+                graph_values(&fluree, &g(2), "https://example.org/b", status).await,
+                vec!["new"]
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_sparql_update_graph_variable_across_more_graphs_than_envelope_cap() {
+    // A commit lists only the graphs it registers. Listing every graph a
+    // `GRAPH ?g` update writes would exceed the envelope's graph-delta cap
+    // once the update spans more existing graphs than that.
+    const GRAPHS: usize = fluree_db_core::commit::codec::envelope::MAX_GRAPH_DELTA_ENTRIES + 44;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-update-graph-var-wide:main";
+    let mut ledger = genesis_ledger(&fluree, ledger_id);
+
+    // Seed in two commits so neither registers more graphs than the cap.
+    for half in [0..GRAPHS / 2, GRAPHS / 2..GRAPHS] {
+        let blocks: String = half
+            .map(|i| {
+                format!(
+                    r#"GRAPH <https://example.org/wide/{i}> {{ <https://example.org/s> <https://example.org/status> "old" }}
+"#
+                )
+            })
+            .collect();
+        run_sparql_update(&fluree, ledger, &format!("INSERT DATA {{ {blocks} }}")).await;
+        ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    }
+    assert_eq!(user_graph_iris(&fluree, ledger_id).await.len(), GRAPHS);
+
+    let update = r#"
+        DELETE { GRAPH ?g { ?s <https://example.org/status> "old" } }
+        INSERT { GRAPH ?g { ?s <https://example.org/status> "new" } }
+        WHERE  { GRAPH ?g { ?s <https://example.org/status> "old" } }
+    "#;
+    try_sparql_update(&fluree, ledger, update)
+        .await
+        .expect("an update over more existing graphs than the cap must commit");
+
+    for i in [0, GRAPHS - 1] {
+        assert_eq!(
+            graph_values(
+                &fluree,
+                &format!("{ledger_id}#https://example.org/wide/{i}"),
+                "https://example.org/s",
+                "https://example.org/status"
+            )
+            .await,
+            vec!["new"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_sparql_insert_graph_variable_registers_new_graphs() {
+    // `?g` may name a graph the ledger has never seen; the commit must
+    // register it so it is queryable afterwards, including after indexing.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/sparql-insert-graph-var-new:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+            let seed = r#"
+                INSERT DATA {
+                    <https://example.org/alice> <https://example.org/name> "alice" .
+                    <https://example.org/bob> <https://example.org/name> "bob" .
+                }
+            "#;
+            let r1 = run_sparql_update(&fluree, ledger, seed).await;
+
+            let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+            let update = r#"
+                INSERT { GRAPH ?g { ?s <https://example.org/name> ?n } }
+                WHERE {
+                    ?s <https://example.org/name> ?n
+                    BIND(IRI(CONCAT("https://example.org/people/", ?n)) AS ?g)
+                }
+            "#;
+            let r2 = run_sparql_update(&fluree, ledger, update).await;
+            assert!(r2.receipt.t > r1.receipt.t, "update should commit");
+
+            assert_eq!(
+                user_graph_iris(&fluree, ledger_id).await,
+                vec![
+                    "https://example.org/people/alice",
+                    "https://example.org/people/bob"
+                ]
+            );
+            let name = "https://example.org/name";
+            let alice_g = format!("{ledger_id}#https://example.org/people/alice");
+            let bob_g = format!("{ledger_id}#https://example.org/people/bob");
+            let check = || async {
+                assert_eq!(
+                    graph_values(&fluree, &alice_g, "https://example.org/alice", name).await,
+                    vec!["alice"]
+                );
+                assert!(
+                    graph_values(&fluree, &alice_g, "https://example.org/bob", name)
+                        .await
+                        .is_empty(),
+                    "bob must not land in alice's graph"
+                );
+                assert_eq!(
+                    graph_values(&fluree, &bob_g, "https://example.org/bob", name).await,
+                    vec!["bob"]
+                );
+            };
+            check().await;
+            trigger_index_and_wait(&handle, ledger_id, r2.receipt.t).await;
+            check().await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_sparql_delete_where_graph_variable() {
+    // DELETE WHERE { GRAPH ?g { … } } retracts matches from every named graph
+    // and leaves the default graph alone.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-delete-where-graph-var:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let insert = r#"
+        INSERT DATA {
+            <https://example.org/a> <https://example.org/knows> "default" .
+            GRAPH <https://example.org/g/1> {
+                <https://example.org/a> <https://example.org/knows> "b" .
+                <https://example.org/a> <https://example.org/name> "Alice" .
+            }
+            GRAPH <https://example.org/g/2> {
+                <https://example.org/a> <https://example.org/knows> "d" .
+            }
+        }
+    "#;
+    run_sparql_update(&fluree, ledger, insert).await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let delete = r"
+        DELETE WHERE {
+            GRAPH ?g { <https://example.org/a> <https://example.org/knows> ?o }
+        }
+    ";
+    run_sparql_update(&fluree, ledger, delete).await;
+
+    let knows = "https://example.org/knows";
+    let a = "https://example.org/a";
+    let g = |n: u8| format!("{ledger_id}#https://example.org/g/{n}");
+    assert!(graph_values(&fluree, &g(1), a, knows).await.is_empty());
+    assert!(graph_values(&fluree, &g(2), a, knows).await.is_empty());
+    assert_eq!(
+        graph_values(&fluree, &g(1), a, "https://example.org/name").await,
+        vec!["Alice"]
+    );
+    assert_eq!(
+        graph_values(&fluree, ledger_id, a, knows).await,
+        vec!["default"]
+    );
+}
+
+#[tokio::test]
+async fn test_sparql_insert_graph_variable_refuses_txn_meta() {
+    // A graph variable must not reach `#txn-meta` — the same refusal a
+    // literal `GRAPH <…#txn-meta>` target gets.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-insert-graph-var-txn-meta:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let txn_meta = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
+    let update = format!(
+        r#"INSERT {{ GRAPH ?g {{ <https://example.org/s> <https://example.org/p> "x" }} }}
+           WHERE {{ BIND(<{txn_meta}> AS ?g) }}"#
+    );
+    let err = try_sparql_update(&fluree, ledger, &update)
+        .await
+        .expect_err("write to #txn-meta through ?g must be refused");
+    assert!(
+        err.to_string().contains("txn-meta") || err.to_string().contains("reserved"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_sparql_update_graph_variable_bound_to_composite_key_writes_that_graph() {
+    // A `?g` bound to a graph's composite `<ledger_id>#<graph-iri>` key must
+    // write to that graph, as the WHERE read it, not register a second graph
+    // named after the key. The ledger id must itself parse as an IRI scheme
+    // (`books:`), or the key fails validation and the bug hides behind a 400.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "books:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r#"INSERT DATA { GRAPH <https://example.org/g/1> { <https://example.org/a> <https://example.org/p> "x" } }"#,
+    )
+    .await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            r"INSERT {{ GRAPH ?g {{ <https://example.org/a> <https://example.org/copied> ?o }} }}
+               WHERE {{ VALUES ?g {{ <{ledger_id}#https://example.org/g/1> }}
+                        GRAPH ?g {{ <https://example.org/a> <https://example.org/p> ?o }} }}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        user_graph_iris(&fluree, ledger_id).await,
+        vec!["https://example.org/g/1"]
+    );
+    assert_eq!(
+        graph_values(
+            &fluree,
+            &format!("{ledger_id}#https://example.org/g/1"),
+            "https://example.org/a",
+            "https://example.org/copied"
+        )
+        .await,
+        vec!["x"]
+    );
+}
+
+#[tokio::test]
+async fn test_sparql_insert_graph_variable_refuses_txn_meta_composite_key() {
+    // `#txn-meta`'s composite key is a name for `#txn-meta`, so it gets the
+    // same refusal as the IRI itself.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "books:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let txn_meta = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
+    let update = format!(
+        r#"INSERT {{ GRAPH ?g {{ <https://example.org/s> <https://example.org/p> "x" }} }}
+           WHERE {{ BIND(<{ledger_id}#{txn_meta}> AS ?g) }}"#
+    );
+    let err = try_sparql_update(&fluree, ledger, &update)
+        .await
+        .expect_err("write to #txn-meta through its composite key must be refused");
+    assert!(
+        err.to_string().contains("txn-meta") || err.to_string().contains("reserved"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_sparql_insert_graph_variable_literal_is_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-insert-graph-var-literal:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let update = r#"
+        INSERT { GRAPH ?g { <https://example.org/s> <https://example.org/p> "x" } }
+        WHERE { BIND("not-an-iri" AS ?g) }
+    "#;
+    let err = try_sparql_update(&fluree, ledger, update)
+        .await
+        .expect_err("a literal graph name must be refused");
+    assert!(
+        err.to_string().contains("GRAPH name must be an IRI"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_sparql_update_where_graph_variable_enumerates_user_graphs_once() {
+    // An update's WHERE registers each named graph under its IRI and under
+    // the composite `<ledger_id>#<iri>` key, and sees the reserved system
+    // graphs. `GRAPH ?g` must bind each user graph once, by IRI: a second
+    // binding doubles every solution (visible here as a second fresh blank
+    // node per match), and a composite or reserved binding would send a
+    // `GRAPH ?g` template to the wrong graph.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-update-graph-var-enum:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r#"INSERT DATA {
+            <https://example.org/a> <https://example.org/p> "default" .
+            GRAPH <https://example.org/g/1> { <https://example.org/a> <https://example.org/p> "x" }
+        }"#,
+    )
+    .await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"INSERT { _:m <https://example.org/matchedIn> ?s }
+           WHERE { GRAPH ?g { ?s ?p ?o } }",
+    )
+    .await;
+    let q = json!({
+        "from": ledger_id,
+        "select": "?m",
+        "where": {"@id": "?m", "https://example.org/matchedIn": "?s"}
+    });
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let rows = fluree
+        .query_connection(&q)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    assert_eq!(
+        rows.as_array().expect("array").len(),
+        1,
+        "one match in one user graph must yield one solution: {rows}"
+    );
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r#"INSERT { GRAPH ?g { <https://example.org/probe> <https://example.org/p> "seen" } }
+           WHERE { GRAPH ?g { ?s ?p ?o } }"#,
+    )
+    .await;
+    assert_eq!(
+        user_graph_iris(&fluree, ledger_id).await,
+        vec!["https://example.org/g/1"],
+        "no graph may be registered under an alias"
+    );
+    assert_eq!(
+        graph_values(
+            &fluree,
+            &format!("{ledger_id}#https://example.org/g/1"),
+            "https://example.org/probe",
+            "https://example.org/p"
+        )
+        .await,
+        vec!["seen"]
+    );
+}
+
+#[tokio::test]
+async fn test_jsonld_update_where_graph_variable_enumerates_user_graphs_once() {
+    // JSON-LD twin of the SPARQL enumeration test: both surfaces share the
+    // update WHERE dataset, so a `["graph", "?g", …]` match must also bind
+    // each user graph once.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/jsonld-update-graph-var-enum:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r#"INSERT DATA {
+            <https://example.org/a> <https://example.org/p> "default" .
+            GRAPH <https://example.org/g/1> { <https://example.org/a> <https://example.org/p> "x" }
+        }"#,
+    )
+    .await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let update = json!({
+        "where": [["graph", "?g", {"@id": "?s", "https://example.org/p": "?o"}]],
+        "insert": {"@id": "_:m", "https://example.org/matchedIn": {"@id": "?s"}}
+    });
+    fluree
+        .update(ledger, &update)
+        .await
+        .expect("JSON-LD update with a graph variable");
+
+    let q = json!({
+        "from": ledger_id,
+        "select": "?m",
+        "where": {"@id": "?m", "https://example.org/matchedIn": "?s"}
+    });
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let rows = fluree
+        .query_connection(&q)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    assert_eq!(
+        rows.as_array().expect("array").len(),
+        1,
+        "one match in one user graph must yield one solution: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn test_sparql_update_where_addresses_graph_by_composite_key_and_config_iri() {
+    // Names that `GRAPH ?g` does not enumerate stay addressable by
+    // `GRAPH <name>`: the composite key, and `#config` as in the documented
+    // config-maintenance update (docs/ledger-config/writing-config.md).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-update-where-aliases:main";
+    let config = fluree_db_core::graph_registry::config_graph_iri(ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            r#"INSERT DATA {{
+                GRAPH <https://example.org/g/1> {{ <https://example.org/a> <https://example.org/p> "x" }}
+                GRAPH <{config}> {{ <https://example.org/setting> <https://example.org/enabled> "no" }}
+            }}"#
+        ),
+    )
+    .await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            r"INSERT {{ <https://example.org/a> <https://example.org/copied> ?o }}
+               WHERE {{ GRAPH <{ledger_id}#https://example.org/g/1> {{ <https://example.org/a> <https://example.org/p> ?o }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        graph_values(
+            &fluree,
+            ledger_id,
+            "https://example.org/a",
+            "https://example.org/copied"
+        )
+        .await,
+        vec!["x"]
+    );
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            r#"DELETE {{ GRAPH <{config}> {{ ?s <https://example.org/enabled> "no" }} }}
+               INSERT {{ GRAPH <{config}> {{ ?s <https://example.org/enabled> "yes" }} }}
+               WHERE  {{ GRAPH <{config}> {{ ?s <https://example.org/enabled> "no" }} }}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        graph_values(
+            &fluree,
+            &format!("{ledger_id}#{config}"),
+            "https://example.org/setting",
+            "https://example.org/enabled"
+        )
+        .await,
+        vec!["yes"]
+    );
+}
+
 #[tokio::test]
 async fn test_jsonld_delete_where_named_graph_scoped() {
     // JSON-LD parity for DELETE WHERE { GRAPH <g> { ... } } (three-surface

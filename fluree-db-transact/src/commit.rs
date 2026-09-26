@@ -52,6 +52,20 @@ pub struct CommitReceipt {
     pub retract_count: usize,
 }
 
+impl CommitReceipt {
+    /// Receipt for a transaction that wrote nothing: no commit exists, and
+    /// the ledger stays at `t`.
+    pub fn no_op(t: i64) -> Self {
+        Self {
+            commit_id: ContentId::new(ContentKind::Commit, &[]),
+            t,
+            flake_count: 0,
+            assert_count: 0,
+            retract_count: 0,
+        }
+    }
+}
+
 /// Count `(asserts, retracts)` in a flake slice — the split every
 /// [`CommitReceipt`] carries alongside its total.
 pub fn count_ops(flakes: &[Flake]) -> (usize, usize) {
@@ -147,11 +161,10 @@ pub struct CommitOpts {
     /// Stored in the commit envelope and emitted to the txn-meta graph (`g_id=1`)
     /// during indexing. Each entry becomes a triple with the commit as subject.
     pub txn_meta: Vec<TxnMetaEntry>,
-    /// Named graph IRI to g_id mappings introduced by this transaction.
-    ///
-    /// Stored in the commit envelope for replay-safe persistence. The indexer
-    /// uses this to resolve graph IRIs to dictionary IDs when building the index.
-    pub graph_delta: std::collections::HashMap<u16, String>,
+    /// Named graphs the transaction writes, by IRI. The commit registers any
+    /// that are new and records, in the envelope's `graph_delta`, the graph
+    /// ids the ledger's registry assigns them.
+    pub graph_iris: Vec<String>,
     /// Namespace code delta to carry forward from original commits during rebase.
     ///
     /// When set, this overrides the `NamespaceRegistry::take_delta()` result,
@@ -201,7 +214,7 @@ impl std::fmt::Debug for CommitOpts {
                 &self.txn_signature.as_ref().map(|s| &s.signer),
             )
             .field("txn_meta_count", &self.txn_meta.len())
-            .field("graph_delta_count", &self.graph_delta.len())
+            .field("graph_iri_count", &self.graph_iris.len())
             .field(
                 "namespace_delta",
                 &self
@@ -230,7 +243,7 @@ impl Clone for CommitOpts {
             signing_key: self.signing_key.clone(),
             txn_signature: self.txn_signature.clone(),
             txn_meta: self.txn_meta.clone(),
-            graph_delta: self.graph_delta.clone(),
+            graph_iris: self.graph_iris.clone(),
             namespace_delta: self.namespace_delta.clone(),
             skip_backpressure: self.skip_backpressure,
             merge_parents: self.merge_parents.clone(),
@@ -295,9 +308,9 @@ impl CommitOpts {
         self
     }
 
-    /// Set the named graph delta (g_id -> IRI mappings)
-    pub fn with_graph_delta(mut self, graph_delta: std::collections::HashMap<u16, String>) -> Self {
-        self.graph_delta = graph_delta;
+    /// Set the named graphs the transaction writes, by IRI.
+    pub fn with_graph_iris(mut self, graph_iris: impl IntoIterator<Item = String>) -> Self {
+        self.graph_iris = graph_iris.into_iter().collect();
         self
     }
 
@@ -355,7 +368,7 @@ impl CommitOpts {
 /// - `raw_txn_upload` — runtime task; the leader awaits any pending
 ///   upload before enqueueing and carries the resolved CID via
 ///   `raw_txn_id`, so the worker doesn't re-do the upload.
-/// - `graph_delta` / `namespace_delta` / `skip_backpressure` /
+/// - `graph_iris` / `namespace_delta` / `skip_backpressure` /
 ///   `merge_parents` — populated during staging or reserved for the
 ///   rebase/merge paths, which carry their own request envelopes
 ///   when they join the queue.
@@ -393,7 +406,7 @@ impl CommitOptsRequest {
             signing_key: None,
             txn_signature: self.txn_signature,
             txn_meta: self.txn_meta,
-            graph_delta: HashMap::new(),
+            graph_iris: Vec::new(),
             namespace_delta: None,
             skip_backpressure: false,
             merge_parents: Vec::new(),
@@ -568,7 +581,7 @@ pub async fn build_commit(
         signing_key,
         txn_signature,
         mut txn_meta,
-        graph_delta,
+        graph_iris,
         namespace_delta: override_ns_delta,
         skip_backpressure,
         merge_parents,
@@ -620,9 +633,24 @@ pub async fn build_commit(
     //    stages no flakes (D-6: an empty graph has no representation) but
     //    must persist its graph_delta so the registry learns the IRI — O3's
     //    transfer source-existence check consults exactly that registration.
-    let registers_new_graph = graph_delta
-        .values()
-        .any(|iri| base.snapshot.graph_registry.graph_id_for_iri(iri).is_none());
+    //
+    //    An already-registered user graph is left out of the commit's
+    //    `graph_delta`: its registering commit already lists it, and listing
+    //    every graph written would hit the envelope's entry cap on a
+    //    `GRAPH ?g` update over many existing graphs. System graphs stay
+    //    listed — they are seeded in memory at genesis, so the commit that
+    //    writes one is the durable record the registration probe, merge and
+    //    config readers look for.
+    let registry = &base.snapshot.graph_registry;
+    let registers_new_graph = registry.has_unregistered(graph_iris.iter().map(String::as_str));
+    let mut graph_iris = graph_iris;
+    graph_iris.retain(|iri| {
+        registry
+            .graph_id_for_iri(iri)
+            .is_none_or(|g_id| g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
+    });
+    graph_iris.sort_unstable();
+    graph_iris.dedup();
     if flakes.is_empty() && merge_parents.is_empty() && !registers_new_graph {
         return Err(TransactError::EmptyTransaction);
     }
@@ -680,14 +708,14 @@ pub async fn build_commit(
         target: "fluree::cow_probe",
         snapshot_strong = Arc::strong_count(&base.snapshot),
         ns_delta = ns_delta.len(),
-        graph_delta = graph_delta.len(),
+        graph_iris = graph_iris.len(),
         "build_commit snapshot ownership before envelope apply"
     );
     // Nothing to apply is the common case, and `make_mut` on a snapshot
     // another holder shares (an index build in flight, a concurrent reader)
     // copies the whole snapshot, stats included — so an empty delta must
     // not touch it.
-    if !ns_delta.is_empty() || !graph_delta.is_empty() {
+    if !ns_delta.is_empty() || !graph_iris.is_empty() {
         // The binary range provider holds the namespace table as its
         // fallback, so with it attached — or merely alive — extending the
         // table copies it. Take its parts, drop it, extend in place, and
@@ -709,7 +737,7 @@ pub async fn build_commit(
         }
         let applied = Arc::make_mut(&mut base.snapshot).apply_envelope_deltas(
             &ns_delta,
-            graph_delta.values().map(std::string::String::as_str),
+            graph_iris.iter().map(std::string::String::as_str),
         );
         if let Some(provider) = put_back {
             Arc::make_mut(&mut base.snapshot).range_provider = Some(provider);
@@ -765,9 +793,24 @@ pub async fn build_commit(
     if !txn_meta.is_empty() {
         commit_record = commit_record.with_txn_meta(txn_meta);
     }
-    if !graph_delta.is_empty() {
-        commit_record.graph_delta = graph_delta;
-    }
+    // Keyed by the ids the registry now holds, so a commit's graph_delta is
+    // the ledger's own id -> IRI mapping. A written graph missing from the
+    // registry here would silently lose its registration, so it is an error.
+    commit_record.graph_delta = graph_iris
+        .into_iter()
+        .map(|iri| {
+            let g_id = base
+                .snapshot
+                .graph_registry
+                .graph_id_for_iri(&iri)
+                .ok_or_else(|| {
+                    TransactError::FlakeGeneration(format!(
+                        "graph <{iri}> was written but is not in the registry after apply"
+                    ))
+                })?;
+            Ok((g_id, iri))
+        })
+        .collect::<Result<_>>()?;
     if let Some(split_mode) = ns_split_mode_for_genesis {
         commit_record.ns_split_mode = Some(split_mode);
     }

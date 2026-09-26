@@ -18,6 +18,8 @@
 //!   `RangeOptions::history_mode` — published parameters for the
 //!   `range_with_overlay` core API, below the planner.
 
+use crate::binding::UnmatchedOptional;
+
 /// Whether a query is evaluating current state or full history.
 ///
 /// History queries return the merged stream of assert + retract events
@@ -80,6 +82,10 @@ pub struct PlanningContext {
     /// (which assume bag cardinality over the union). Only ever `true` in
     /// current mode — history datasets keep per-event (assert/retract) rows.
     pub multi_default_graph: bool,
+    /// What an unmatched OPTIONAL binds its optional-only variables to — the
+    /// surface language's null semantics. Folded in from `Query` at the plan
+    /// root; defaults to SPARQL's `Unbound`.
+    pub unmatched_optional: UnmatchedOptional,
 }
 
 impl PlanningContext {
@@ -90,6 +96,7 @@ impl PlanningContext {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            unmatched_optional: UnmatchedOptional::Unbound,
         }
     }
 
@@ -100,6 +107,7 @@ impl PlanningContext {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            unmatched_optional: UnmatchedOptional::Unbound,
         }
     }
 
@@ -122,6 +130,14 @@ impl PlanningContext {
     #[inline]
     pub const fn with_multi_default_graph(mut self, multi: bool) -> Self {
         self.multi_default_graph = multi && self.mode.is_current();
+        self
+    }
+
+    /// Set the surface language's OPTIONAL null semantics (see
+    /// [`Self::unmatched_optional`]).
+    #[inline]
+    pub const fn with_unmatched_optional(mut self, unmatched: UnmatchedOptional) -> Self {
+        self.unmatched_optional = unmatched;
         self
     }
 

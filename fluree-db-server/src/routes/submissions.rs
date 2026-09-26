@@ -249,6 +249,8 @@ fn body_kind_tag(kind: BodyKind) -> &'static str {
         | BodyKind::JsonLdUpsert
         | BodyKind::JsonLdUpdate
         | BodyKind::JsonLdGraphSync
+        | BodyKind::RdfGraphSync
+        | BodyKind::GraphInsert
         | BodyKind::TurtleInsert
         | BodyKind::TurtleUpsert
         | BodyKind::TrigUpsert

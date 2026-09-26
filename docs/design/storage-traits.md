@@ -79,6 +79,10 @@ pub trait ContentStore: Debug + Send + Sync {
 
     /// Check whether an object exists
     async fn has(&self, id: &ContentId) -> Result<bool>;
+
+    /// Whether bytes returned by `get` may be persisted unencrypted outside
+    /// this store (the binary-index disk cache). Required: see below.
+    fn permits_plaintext_cache(&self) -> bool;
 }
 ```
 
@@ -129,12 +133,43 @@ pub trait StorageRead: Debug + Send + Sync {
 
     /// Resolve a CAS address to a local filesystem path, if available.
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> { None }
+
+    /// Whether bytes read here may be persisted unencrypted outside this
+    /// storage. Plain backends answer `true`; `EncryptedStorage` answers
+    /// `false`; wrappers delegate.
+    fn permits_plaintext_cache(&self) -> bool;
+
+    /// The key-rotation surface when this storage encrypts at rest, else
+    /// `None`. Wrappers delegate; `EncryptedStorage` returns itself.
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>>;
 }
 
 /// `(address, size)` pair returned by `list_prefix_with_metadata`.
 pub struct RemoteObject {
     pub address: String,
     pub size_bytes: u64,
+}
+```
+
+`permits_plaintext_cache` and `encryption_admin` have no default on purpose. A
+wrapper that forgot to delegate would otherwise re-open a plaintext copy of an
+encrypted ledger in the disk cache, or report an encrypted store as plaintext
+(to the status endpoint and to key rotation). Every implementation has to
+answer, so the compiler catches a missing delegation.
+
+`EncryptionAdmin` is what key rotation drives:
+
+```rust
+#[async_trait]
+pub trait EncryptionAdmin: Send + Sync {
+    /// Ids of every key the storage can decrypt with, current first.
+    fn key_ids(&self) -> Vec<u32>;
+    /// Id of the key that encrypts new writes.
+    fn current_key_id(&self) -> u32;
+    /// The key id in the envelope at `address`, from its header alone.
+    async fn key_id_at(&self, address: &str) -> Result<Option<u32>>;
+    /// Re-envelope the blob at `address` under the current key, in place.
+    async fn reencrypt(&self, address: &str) -> Result<Option<u64>>;
 }
 ```
 
@@ -356,6 +391,14 @@ impl StorageRead for MyReadOnlyStorage {
     async fn list_prefix(&self, _prefix: &str) -> Result<Vec<String>> {
         Err(Error::storage("list_prefix not supported"))
     }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+        None
+    }
 }
 
 // Must also implement StorageWrite (with error stubs) and ContentAddressedWrite
@@ -389,6 +432,8 @@ impl StorageRead for MyStorage {
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> { ... }
     async fn exists(&self, address: &str) -> Result<bool> { ... }
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> { ... }
+    fn permits_plaintext_cache(&self) -> bool { true }
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> { None }
 }
 
 #[async_trait]
@@ -567,9 +612,13 @@ Adds transparent encryption:
 ```rust
 pub struct EncryptedStorage<S, K> {
     inner: S,
-    key_provider: K,
+    keys: Arc<K>,
 }
 ```
+
+Built with `EncryptedStorage::new(inner, keys)` or `with_arc_keys`. It answers
+`permits_plaintext_cache() == false` and implements `EncryptionAdmin` for key
+rotation.
 
 ### AddressIdentifierResolverStorage
 

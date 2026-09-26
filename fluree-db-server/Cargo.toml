@@ -190,6 +190,8 @@ indexmap = { workspace = true }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-test-support = { path = "../fluree-test-support" }
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
 
 [lints]
 workspace = true

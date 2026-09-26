@@ -4,8 +4,8 @@
 //! various output formats:
 //!
 //! - **JSON-LD**: `{"@context": ..., "@graph": [...]}`
-//! - **Turtle** (future): Compact, human-readable RDF syntax
-//! - **N-Quads** (future): Line-based RDF format
+//! - **Turtle**: subject-grouped, prefixed names from a [`PrefixMap`]
+//! - **N-Triples**: one triple per line, full IRIs
 //!
 //! # Example
 //!
@@ -29,6 +29,10 @@
 
 mod jsonld;
 mod policy;
+mod prefix;
+mod rdf_text;
 
 pub use jsonld::{format_jsonld, JsonLdFormatConfig};
 pub use policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
+pub use prefix::PrefixMap;
+pub use rdf_text::{format_ntriples, format_turtle, InvalidLangTag};

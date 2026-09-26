@@ -938,9 +938,11 @@ impl BinaryIndexStore {
         if let Some(cs) = self.cas.as_ref() {
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
             let mut local = cs.resolve_local_path(leaf_cid);
-            let promoted = self.cache_dir.join(leaf_cid.to_string());
-            if local.is_none() && promoted.exists() {
-                local = Some(promoted);
+            if local.is_none() && cs.permits_plaintext_cache() {
+                let promoted = self.cache_dir.join(leaf_cid.to_string());
+                if promoted.exists() {
+                    local = Some(promoted);
+                }
             }
             if let Some(path) = local {
                 let load = || -> io::Result<Arc<memmap2::Mmap>> {
@@ -998,19 +1000,24 @@ impl BinaryIndexStore {
             }
         }
 
-        // Check cache.
+        // Check cache. A store that decrypts on read gets no disk cache:
+        // nothing is written there, and nothing left there by an earlier run
+        // is consulted.
+        let persist = cs.permits_plaintext_cache();
         let cache_path = self.cache_dir.join(leaf_cid.to_string());
-        match std::fs::read(&cache_path) {
-            Ok(bytes) => return Ok(bytes),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
+        if persist {
+            match std::fs::read(&cache_path) {
+                Ok(bytes) => return Ok(bytes),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
         }
 
         // Fetch from CAS via sync bridge: capture the Tokio handle on the caller's
         // sync bridge: run the async CAS request without deadlocking current-thread runtimes.
         let cs = Arc::clone(cs);
         let cid = leaf_cid.clone();
-        let cache_path_owned = cache_path.clone();
+        let cache_path_owned = cache_path;
         let disk_cache = Arc::clone(&self.disk_cache);
         let timeout = cas_sync_timeout();
         run_sync_on_runtime(async move {
@@ -1030,7 +1037,9 @@ impl BinaryIndexStore {
                 fut.await
                     .map_err(|e| io::Error::other(format!("CAS fetch failed: {e}")))?
             };
-            disk_cache.best_effort_write(&cache_path_owned, &data);
+            if persist {
+                disk_cache.best_effort_write(&cache_path_owned, &data);
+            }
             Ok(data)
         })
     }
@@ -1121,11 +1130,14 @@ impl BinaryIndexStore {
 
         // Fast path 2: locally cached (remote-promoted) — same mmap path; a
         // missing cache file falls through to the range-read paths below.
-        let cache_path = self.cache_dir.join(leaf_cid.to_string());
-        match self.open_mmapped_leaf(&cache_path, leaf_id, sidecar_cid, need_replay) {
-            Ok(handle) => return Ok(handle),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
+        // Skipped for a store that forbids a plaintext copy outside it.
+        if cs.permits_plaintext_cache() {
+            let cache_path = self.cache_dir.join(leaf_cid.to_string());
+            match self.open_mmapped_leaf(&cache_path, leaf_id, sidecar_cid, need_replay) {
+                Ok(handle) => return Ok(handle),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
         }
 
         let touch_count = self.note_remote_leaf_open(leaf_cid);
@@ -3323,6 +3335,34 @@ async fn build_dictionary_set(
 // Arena loading (reuses V5 infrastructure)
 // ============================================================================
 
+/// Where a vector shard's bytes come from: its local CAS file when one
+/// exists, else the disk cache — which counts as present only when the store
+/// permits a plaintext copy outside it, so a stale shard left there by an
+/// earlier unencrypted run is fetched afresh rather than served.
+fn vector_shard_source(
+    cs: &dyn ContentStore,
+    shard_cid: &ContentId,
+    cache_dir: &Path,
+) -> crate::arena::vector::ShardSource {
+    let cid_hash = LeafletCache::cid_cache_key(&shard_cid.to_bytes());
+    if let Some(local) = cs.resolve_local_path(shard_cid) {
+        return crate::arena::vector::ShardSource {
+            cid_hash,
+            cid: None,
+            path: local,
+            on_disk: std::sync::atomic::AtomicBool::new(true),
+        };
+    }
+    let cache_path = cache_dir.join(format!("{shard_cid}.vas"));
+    let on_disk = cs.permits_plaintext_cache() && cache_path.exists();
+    crate::arena::vector::ShardSource {
+        cid_hash,
+        cid: Some(shard_cid.clone()),
+        path: cache_path,
+        on_disk: std::sync::atomic::AtomicBool::new(on_disk),
+    }
+}
+
 /// Per-graph arenas (before injection into GraphIndex).
 struct LoadedArenas {
     numbig: HashMap<u32, crate::arena::numbig::NumBigArena>,
@@ -3367,27 +3407,11 @@ async fn load_per_graph_arenas(
                 fetch_cached_bytes(cs.as_ref(), &entry.manifest, cache_dir, "vam").await?;
             let manifest = crate::arena::vector::read_vector_manifest(&manifest_bytes)?;
 
-            let mut shard_sources = Vec::with_capacity(entry.shards.len());
-            for shard_cid in &entry.shards {
-                let cid_hash = LeafletCache::cid_cache_key(&shard_cid.to_bytes());
-                if let Some(local) = cs.resolve_local_path(shard_cid) {
-                    shard_sources.push(crate::arena::vector::ShardSource {
-                        cid_hash,
-                        cid: None,
-                        path: local,
-                        on_disk: std::sync::atomic::AtomicBool::new(true),
-                    });
-                } else {
-                    let cache_path = cache_dir.join(format!("{shard_cid}.vas"));
-                    let exists = cache_path.exists();
-                    shard_sources.push(crate::arena::vector::ShardSource {
-                        cid_hash,
-                        cid: Some(shard_cid.clone()),
-                        path: cache_path,
-                        on_disk: std::sync::atomic::AtomicBool::new(exists),
-                    });
-                }
-            }
+            let shard_sources: Vec<_> = entry
+                .shards
+                .iter()
+                .map(|shard_cid| vector_shard_source(cs.as_ref(), shard_cid, cache_dir))
+                .collect();
 
             // LazyVectorArena needs a LeafletCache for shard caching and
             // an optional ContentStore for remote shard fetching.
@@ -3566,10 +3590,12 @@ impl ContentStoreRangeFetcher {
             }
         }
 
-        // Check cache.
-        let cache_path = self.cache_dir.join(id.to_string());
-        if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
-            return Ok(buf);
+        // Check cache, unless the store forbids a plaintext copy outside it.
+        if self.cs.permits_plaintext_cache() {
+            let cache_path = self.cache_dir.join(id.to_string());
+            if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
+                return Ok(buf);
+            }
         }
 
         // Remote CAS: use async get_range via sync bridge.
@@ -3622,6 +3648,7 @@ pub(crate) mod tests {
         inner: MemoryContentStore,
         get_calls: Arc<AtomicUsize>,
         range_calls: Arc<AtomicUsize>,
+        permits_plaintext_cache: bool,
     }
 
     impl CountingContentStore {
@@ -3630,6 +3657,15 @@ pub(crate) mod tests {
                 inner: MemoryContentStore::new(),
                 get_calls: Arc::new(AtomicUsize::new(0)),
                 range_calls: Arc::new(AtomicUsize::new(0)),
+                permits_plaintext_cache: true,
+            }
+        }
+
+        /// Answers like a store that decrypts on read.
+        fn forbidding_plaintext_cache() -> Self {
+            Self {
+                permits_plaintext_cache: false,
+                ..Self::new()
             }
         }
 
@@ -3672,6 +3708,10 @@ pub(crate) mod tests {
         ) -> fluree_db_core::Result<Vec<u8>> {
             self.range_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.get_range(id, range).await
+        }
+
+        fn permits_plaintext_cache(&self) -> bool {
+            self.permits_plaintext_cache
         }
     }
 
@@ -3816,6 +3856,10 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for FailNthContentStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
@@ -4259,6 +4303,82 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 
+    /// Each disk-cache read path, given a cache entry left by an earlier run
+    /// under the same CID: a permitting store serves it (the control that
+    /// makes the other half non-vacuous), a store that decrypts on read
+    /// ignores it and serves its own bytes.
+    #[test]
+    fn stale_cache_entries_are_served_only_when_plaintext_cache_permitted() {
+        use crate::read::leaf_access::RangeReadFetcher;
+        const STALE: &[u8] = b"stale plaintext left by an earlier run";
+
+        for permits in [true, false] {
+            let store = if permits {
+                CountingContentStore::new()
+            } else {
+                CountingContentStore::forbidding_plaintext_cache()
+            };
+            let leaf_bytes = build_test_leaf_bytes();
+            let leaf_cid = run_sync_on_runtime({
+                let store = store.clone();
+                let leaf_bytes = leaf_bytes.clone();
+                async move {
+                    store
+                        .put(ContentKind::IndexLeaf, &leaf_bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("store leaf bytes");
+            let cs: Arc<dyn ContentStore> = Arc::new(store.clone());
+            let cache_dir = temp_cache_dir();
+            std::fs::write(cache_dir.join(leaf_cid.to_string()), STALE).unwrap();
+            let shard_path = cache_dir.join(format!("{leaf_cid}.vas"));
+            std::fs::write(&shard_path, STALE).unwrap();
+            let binary_store = empty_store(Arc::clone(&cs), cache_dir.clone());
+            let expected: &[u8] = if permits { STALE } else { &leaf_bytes };
+
+            assert_eq!(
+                binary_store.get_leaf_bytes_sync(&leaf_cid).unwrap(),
+                expected,
+                "get_leaf_bytes_sync, permits={permits}"
+            );
+            assert_eq!(
+                &*binary_store.get_leaf_bytes_shared(&leaf_cid).unwrap(),
+                expected,
+                "get_leaf_bytes_shared, permits={permits}"
+            );
+            let fetcher = ContentStoreRangeFetcher::new(Arc::clone(&cs), cache_dir.clone());
+            assert_eq!(
+                fetcher.fetch_range(&leaf_cid, 0..8).unwrap(),
+                &expected[..8],
+                "range fetch, permits={permits}"
+            );
+            let shard = vector_shard_source(cs.as_ref(), &leaf_cid, &cache_dir);
+            assert_eq!(
+                shard.on_disk.load(AtomicOrdering::Acquire),
+                permits,
+                "vector shard counted as on disk, permits={permits}"
+            );
+            // The stale entry is not a valid leaf: a permitting store fails
+            // to open it, a forbidding one never looks and opens its own.
+            let opened = binary_store.open_leaf_handle(&leaf_cid, None, false);
+            assert_eq!(
+                opened.is_ok(),
+                !permits,
+                "open_leaf_handle, permits={permits}"
+            );
+            if !permits {
+                assert_eq!(
+                    std::fs::read(cache_dir.join(leaf_cid.to_string())).unwrap(),
+                    STALE,
+                    "a forbidding store must not overwrite the cache either"
+                );
+            }
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
+    }
+
     #[test]
     fn open_leaf_handle_caches_remote_metadata() {
         let store = CountingContentStore::new();
@@ -4456,6 +4576,10 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for LocalFileContentStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }

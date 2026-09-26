@@ -522,13 +522,13 @@ impl crate::Fluree {
         let source_fut = async {
             match &source_head {
                 Some(s_head) if need_changes || need_validation => {
-                    let (keys, net, ns_delta) = compute_delta_keys_and_changes(
+                    let (keys, net, ns_delta, graph_iris) = compute_delta_keys_and_changes(
                         source_store.clone(),
                         s_head.clone(),
                         stop_at_t,
                     )
                     .await?;
-                    Ok::<_, ApiError>((Some(keys), Some(net), Some(ns_delta)))
+                    Ok::<_, ApiError>((Some(keys), Some(net), Some((ns_delta, graph_iris))))
                 }
                 Some(s_head) if need_conflicts => {
                     let keys =
@@ -551,7 +551,7 @@ impl crate::Fluree {
                 _ => Ok(None),
             }
         };
-        let ((source_delta, net_flakes, source_ns_delta), target_delta) =
+        let ((source_delta, net_flakes, source_deltas), target_delta) =
             tokio::try_join!(source_fut, target_fut)?;
 
         // ---- Conflicts. ----------------------------------------------------
@@ -686,7 +686,7 @@ impl crate::Fluree {
                 // The change summary above borrowed it; nothing needs it
                 // after this, so hand it over.
                 let net = net_flakes.take();
-                let ns_delta = source_ns_delta.unwrap_or_default();
+                let (ns_delta, graph_iris) = source_deltas.unwrap_or_default();
                 let (_view, outcome) = self
                     .stage_merge(
                         target_state.clone(),
@@ -694,6 +694,7 @@ impl crate::Fluree {
                         &all_conflict_keys,
                         &opts.conflict_strategy,
                         &ns_delta,
+                        &graph_iris,
                     )
                     .await?;
                 Some(ValidationSummary {

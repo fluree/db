@@ -321,7 +321,7 @@ async fn payload_addressing_named_graphs_is_rejected() {
     });
     // The insert-shaped JSON-LD parse has no named-graph selector form, so
     // the nested-graph document fails parsing; if a future parser learns
-    // one, `parse_sync_transaction`'s graph_delta guard rejects it with
+    // one, `parse_sync_transaction`'s write_graphs guard rejects it with
     // "must not address named graphs". Either way: an error, no commit.
     fluree
         .sync_named_graph(ledger_id, ONT_IRI, &nested, SyncGraphOpts::default())

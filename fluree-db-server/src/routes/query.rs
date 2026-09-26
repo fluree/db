@@ -8,14 +8,17 @@
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
-use crate::extract::{tracking_headers, FlureeHeaders, MaybeCredential, MaybeDataBearer};
+use crate::extract::{
+    negotiate_graph_format, tracking_headers, FlureeHeaders, GraphFormat, MaybeCredential,
+    MaybeDataBearer,
+};
 // Note: NeedsRefresh is no longer used - replaced by FreshnessSource trait
 use crate::state::AppState;
 use crate::telemetry::{
     create_request_span, extract_request_id, extract_trace_id, log_query_text, set_span_error_code,
     should_log_query_text,
 };
-use axum::extract::{Path, Query, State};
+use axum::extract::{OriginalUri, Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -25,7 +28,6 @@ use fluree_db_api::{
     QueryExecutionOptions, RefreshOpts, TimeSpec, TrackingTally,
 };
 use rand::Rng;
-use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
@@ -210,13 +212,16 @@ async fn refresh_ledgers_without_min_t<I>(
 
 /// Optional URL query parameters for W3C SPARQL Protocol compliance.
 ///
-/// The SPARQL Protocol (RFC 3986) allows queries via:
-///   GET /sparql?query=SELECT+...&default-graph-uri=...
+/// The SPARQL Protocol allows queries via:
+///   GET /sparql?query=SELECT+...&default-graph-uri=...&named-graph-uri=...
 ///
 /// When `query` is present and the request body is empty, the query parameter
 /// value is used as the SPARQL query string.
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
+///
+/// Extracted by hand ([`SparqlParams::from_query_str`]) rather than through
+/// `Query<SparqlParams>`: the dataset parameters repeat once per graph, and
+/// `serde_urlencoded` rejects a repeated key in a struct as "duplicate field".
+#[derive(Debug, Default)]
 pub struct SparqlParams {
     /// The SPARQL query string (URL-encoded)
     pub query: Option<String>,
@@ -225,36 +230,171 @@ pub struct SparqlParams {
     /// Defaults to false. For JSON-LD, this injects the context only when the
     /// query omits `@context`/`context`. For ledger-scoped SPARQL, this makes
     /// default prefixes available when the query has no explicit `PREFIX`.
-    #[serde(
-        default,
-        alias = "default_context",
-        alias = "use-default-context",
-        alias = "use_default_context"
-    )]
+    /// Accepted as `default-context`, `default_context`, `use-default-context`,
+    /// or `use_default_context`.
     pub default_context: bool,
-    /// Optional default graph URI (part of W3C SPARQL Protocol).
-    // Kept for: full SPARQL Protocol compliance — BSBM and other tools may send this param.
-    // Use when: implementing default-graph-uri scoping in query execution.
-    #[expect(dead_code)]
-    pub default_graph_uri: Option<String>,
+    /// `default-graph-uri` values (Protocol §2.1.4): the query's default graph.
+    pub default_graph_uri: Vec<String>,
+    /// `named-graph-uri` values (Protocol §2.1.4): the query's named graphs.
+    pub named_graph_uri: Vec<String>,
+    /// Whether a default-context flag has been read, so a second is refused.
+    default_context_seen: bool,
+}
+
+impl SparqlParams {
+    /// Parse the request's query string. Unknown keys are ignored; `query` and
+    /// the default-context flag may appear at most once.
+    pub(crate) fn from_query_str(raw: &str) -> Result<Self> {
+        let mut params = SparqlParams::default();
+        params.apply_pairs(super::sparql_protocol::decode_pairs(raw)?)?;
+        Ok(params)
+    }
+
+    fn apply_pairs(&mut self, pairs: Vec<(String, String)>) -> Result<()> {
+        use super::sparql_protocol::{DEFAULT_GRAPH_URI, NAMED_GRAPH_URI};
+        for (key, value) in pairs {
+            match key.as_str() {
+                "query" => {
+                    if self.query.replace(value).is_some() {
+                        return Err(ServerError::bad_request(
+                            "the `query` parameter may appear only once",
+                        ));
+                    }
+                }
+                "default-context"
+                | "default_context"
+                | "use-default-context"
+                | "use_default_context" => {
+                    if std::mem::replace(&mut self.default_context_seen, true) {
+                        return Err(ServerError::bad_request(
+                            "the `default-context` parameter may appear only once",
+                        ));
+                    }
+                    self.default_context = match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        other => {
+                            return Err(ServerError::bad_request(format!(
+                                "`{key}` must be true or false; got {other:?}"
+                            )))
+                        }
+                    };
+                }
+                DEFAULT_GRAPH_URI => self.default_graph_uri.push(value),
+                NAMED_GRAPH_URI => self.named_graph_uri.push(value),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// W3C SPARQL Protocol query via POST with URL-encoded parameters (§2.1.2):
+    /// `Content-Type: application/x-www-form-urlencoded`, `query=<sparql>`, and
+    /// optionally the dataset parameters, all in the body.
+    ///
+    /// The body's parameters join the URL's, and the credential is rewritten so
+    /// the rest of the pipeline sees `application/sparql-query` with the query
+    /// text as its body. A form carrying `update=` is marked as an update, so
+    /// the query routes refuse it as they refuse any SPARQL UPDATE. Any other
+    /// form body is left alone.
+    pub(crate) fn absorb_form_body(&mut self, credential: &mut MaybeCredential) -> Result<()> {
+        if credential.is_sparql || credential.is_sparql_update || !is_form_encoded(credential) {
+            return Ok(());
+        }
+        let Ok(body) = std::str::from_utf8(&credential.body) else {
+            return Ok(());
+        };
+        let pairs = super::sparql_protocol::decode_pairs(body)?;
+        if pairs.iter().any(|(k, _)| k == "update") {
+            credential.is_sparql_update = true;
+            return Ok(());
+        }
+        if !pairs.iter().any(|(k, _)| k == "query") {
+            return Ok(());
+        }
+        self.apply_pairs(pairs)?;
+        let sparql = self.query.take().unwrap_or_default();
+        credential.body = axum::body::Bytes::from(sparql);
+        credential.is_sparql = true;
+        Ok(())
+    }
+
+    /// Whether the request names a dataset through protocol parameters.
+    pub(crate) fn has_dataset(&self) -> bool {
+        !self.default_graph_uri.is_empty() || !self.named_graph_uri.is_empty()
+    }
+
+    /// Dataset parameters only mean something for SPARQL; a JSON-LD query
+    /// names its dataset with `from` / `fromNamed`. Refuse rather than ignore.
+    pub(crate) fn reject_dataset_outside_sparql(&self, is_sparql: bool) -> Result<()> {
+        if is_sparql || !self.has_dataset() {
+            return Ok(());
+        }
+        Err(ServerError::bad_request(
+            "default-graph-uri / named-graph-uri apply only to SPARQL queries; \
+             a JSON-LD query names its dataset with `from` / `fromNamed`",
+        ))
+    }
+}
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for SparqlParams
+where
+    S: Send + Sync,
+{
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        SparqlParams::from_query_str(parts.uri.query().unwrap_or(""))
+    }
+}
+
+/// The SPARQL text of the request, with the protocol dataset applied.
+///
+fn is_form_encoded(credential: &MaybeCredential) -> bool {
+    credential
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("application/x-www-form-urlencoded"))
 }
 
 /// If a `?query=` URL parameter is present and the credential body is empty,
-/// return the query param value as the SPARQL string. Otherwise fall back to
-/// the credential body.
+/// the query param value is the SPARQL string; otherwise the credential body.
+/// `default-graph-uri` / `named-graph-uri` then replace the query's own
+/// `FROM` / `FROM NAMED` (Protocol §2.1.4: the protocol dataset takes
+/// precedence), so every consumer of the text — auth scoping, `min-t`, ledger
+/// refresh, execution — sees the same dataset.
 pub(crate) fn resolve_sparql_text(
     params: &SparqlParams,
     credential: &MaybeCredential,
 ) -> Result<String> {
     // Prefer ?query= parameter when body is empty (standard SPARQL Protocol GET)
-    if let Some(ref q) = params.query {
-        let body = credential.body_string().unwrap_or_default();
-        if body.trim().is_empty() {
-            return Ok(q.clone());
+    let sparql = match params.query {
+        Some(ref q)
+            if credential
+                .body_string()
+                .unwrap_or_default()
+                .trim()
+                .is_empty() =>
+        {
+            q.clone()
         }
+        // Fall back to request body
+        _ => credential.body_string()?,
+    };
+    match fluree_db_sparql::protocol::apply_query_dataset(
+        &sparql,
+        &params.default_graph_uri,
+        &params.named_graph_uri,
+    ) {
+        Ok(std::borrow::Cow::Borrowed(_)) => Ok(sparql),
+        Ok(std::borrow::Cow::Owned(rewritten)) => Ok(rewritten),
+        Err(e) => Err(ServerError::bad_request(e.to_string())),
     }
-    // Fall back to request body
-    credential.body_string()
 }
 
 /// Check if the request should be treated as SPARQL based on headers OR the
@@ -518,10 +658,10 @@ async fn attach_default_context_to_graph(
 ///   - Connection-scoped: requires FROM clause in SPARQL to specify ledger
 pub async fn query(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SparqlParams>,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -534,6 +674,8 @@ pub async fn query(
     let trace_id = extract_trace_id(&credential.headers);
 
     // Detect input format before span creation so otel.name is set at open time
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
     } else if headers.is_cypher_query() {
@@ -593,9 +735,10 @@ pub async fn query(
     // Handle SPARQL query
     if is_sparql_request(&headers, &credential, &params) {
         // Connection-scoped SPARQL returns pre-formatted JSON only. The byte
-        // formats (delimited, RDF/XML, SPARQL-results XML) are not negotiated on
-        // this route — reject with 406 rather than silently downgrading to JSON,
-        // and point callers at the ledger-scoped route which does serve them.
+        // formats (delimited, Turtle, N-Triples, RDF/XML, SPARQL-results XML) are
+        // not negotiated on this route — reject with 406 rather than silently
+        // downgrading to JSON, and point callers at the ledger-scoped route which
+        // does serve them.
         if let Some(fmt) = delimited {
             return Err(ServerError::not_acceptable(format!(
                 "{} format not supported for connection-scoped SPARQL queries. \
@@ -603,12 +746,15 @@ pub async fn query(
                 fmt.name().to_uppercase()
             )));
         }
-        if headers.wants_rdf_xml() {
-            return Err(ServerError::not_acceptable(
-                "RDF/XML is not supported for connection-scoped SPARQL queries. \
-                 Use the /:ledger/query endpoint instead."
-                    .to_string(),
-            ));
+        if let Some(fmt) = headers
+            .graph_format()
+            .filter(|f| *f != GraphFormat::JsonLd)
+        {
+            return Err(ServerError::not_acceptable(format!(
+                "{} is not supported for connection-scoped SPARQL queries. \
+                 Use the /:ledger/query endpoint instead.",
+                fmt.name()
+            )));
         }
         if headers.wants_sparql_results_xml() {
             return Err(ServerError::not_acceptable(
@@ -675,7 +821,7 @@ pub async fn query(
             if is_graph_query(parsed.ast.as_ref()) {
                 return Err(ServerError::not_acceptable(
                     "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
-                     use the default (JSON-LD) or Accept: application/rdf+xml"
+                     use the default JSON-LD, Turtle, N-Triples or RDF/XML"
                         .to_string(),
                 ));
             }
@@ -926,10 +1072,10 @@ pub async fn query(
 pub async fn query_ledger(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    Query(params): Query<SparqlParams>,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -941,6 +1087,8 @@ pub async fn query_ledger(
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
 
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
     } else {
@@ -1126,10 +1274,95 @@ pub async fn query_ledger(
 /// GET /fluree/query/<ledger...>
 ///
 /// This avoids ambiguity when ledger names contain `/`.
+/// `GET /query`: a query, or, with no `query` parameter and no body, the
+/// endpoint's SPARQL service description.
+pub async fn query_get(
+    State(state): State<Arc<AppState>>,
+    OriginalUri(uri): OriginalUri,
+    params: SparqlParams,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+    credential: MaybeCredential,
+) -> Result<Response> {
+    if let Some(description) = service_description(&uri, &params, &credential)? {
+        return Ok(description);
+    }
+    query(State(state), params, headers, bearer, credential).await
+}
+
+/// `GET /query/<ledger...>`: as [`query_get`], for a ledger's endpoint.
+pub async fn query_ledger_get(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    params: SparqlParams,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+    credential: MaybeCredential,
+) -> Result<Response> {
+    if let Some(description) = service_description(&uri, &params, &credential)? {
+        return Ok(description);
+    }
+    query_ledger(
+        State(state),
+        Path(ledger),
+        params,
+        headers,
+        bearer,
+        credential,
+    )
+    .await
+    .map(IntoResponse::into_response)
+}
+
+/// SPARQL Service Description §2: a `GET` on a SPARQL endpoint with no query
+/// returns an RDF description of the service, in the graph format `Accept`
+/// asks for. `None` when the request carries a query. It describes the
+/// endpoint's capabilities, not data; it sits behind the same authentication
+/// as the endpoint, which the extractors apply before this runs.
+fn service_description(
+    uri: &axum::http::Uri,
+    params: &SparqlParams,
+    credential: &MaybeCredential,
+) -> Result<Option<Response>> {
+    if params.query.is_some() || !credential.body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let header = |name: &str| {
+        credential
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').next().unwrap_or(v).trim())
+            .filter(|v| !v.is_empty())
+    };
+    let format = negotiate_graph_format(header("accept")).ok_or_else(|| {
+        ServerError::not_acceptable(
+            "a service description is available as application/ld+json, text/turtle, \
+             application/n-triples or application/rdf+xml",
+        )
+    })?;
+    // `sd:endpoint` is the URL the client asked for, as it addressed us.
+    let scheme = header("x-forwarded-proto").unwrap_or("http");
+    let host = header("x-forwarded-host")
+        .or_else(|| header("host"))
+        .unwrap_or("localhost");
+    let endpoint = format!("{scheme}://{host}{}", uri.path());
+    let body = fluree_db_api::sparql_service_description(&endpoint, &format.formatter())
+        .map_err(|e| ServerError::internal(e.to_string()))?;
+    Ok(Some(
+        (
+            [(axum::http::header::CONTENT_TYPE, format.content_type())],
+            body,
+        )
+            .into_response(),
+    ))
+}
+
 pub async fn query_ledger_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    params: Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -1157,10 +1390,10 @@ pub async fn query_ledger_tail(
 pub async fn explain_ledger(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    Query(params): Query<SparqlParams>,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Json<JsonValue>> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -1172,6 +1405,8 @@ pub async fn explain_ledger(
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
 
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
     } else if headers.is_cypher_query() {
@@ -1433,7 +1668,7 @@ pub async fn explain_ledger(
 pub async fn explain_ledger_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    params: Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -1506,7 +1741,7 @@ fn iri_to_string(iri: &fluree_db_sparql::ast::Iri) -> String {
 /// Whether a parsed SPARQL query is a graph query (CONSTRUCT / DESCRIBE), whose
 /// result is an RDF graph rather than a solution/binding table. Graph queries
 /// have no SPARQL-results-JSON / SPARQL-results-XML / AgentJson rendering; their
-/// only serializations are JSON-LD (default) and RDF/XML.
+/// serializations are JSON-LD (default), Turtle, N-Triples and RDF/XML.
 fn is_graph_query(ast: Option<&fluree_db_sparql::ast::SparqlAst>) -> bool {
     matches!(
         ast.map(|a| &a.body),
@@ -1515,6 +1750,26 @@ fn is_graph_query(ast: Option<&fluree_db_sparql::ast::SparqlAst>) -> bool {
                 | fluree_db_sparql::ast::QueryBody::Describe(_)
         )
     )
+}
+
+/// The byte serialization a SPARQL result gets: for a CONSTRUCT / DESCRIBE, the
+/// Turtle, N-Triples or RDF/XML that `Accept` prefers (JSON-LD stays on the
+/// JSON paths). A SELECT / ASK whose `Accept` admits only graph formats is a
+/// `406`.
+fn sparql_graph_format(
+    ast: Option<&fluree_db_sparql::ast::SparqlAst>,
+    headers: &FlureeHeaders,
+) -> Result<Option<GraphFormat>> {
+    if is_graph_query(ast) {
+        Ok(headers.graph_format().filter(|f| *f != GraphFormat::JsonLd))
+    } else if headers.accepts_only_graph_formats() {
+        Err(ServerError::not_acceptable(
+            "Turtle, N-Triples and RDF/XML are only available for SPARQL \
+             CONSTRUCT/DESCRIBE queries",
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Pick the formatter config and response `Content-Type` for a SPARQL query that
@@ -2711,14 +2966,9 @@ async fn execute_sparql_ledger(
             tracing::warn!(error = %e, "invalid fluree-policy-values header");
         })?;
 
-        let wants_sparql_xml = headers.wants_sparql_results_xml();
-        let wants_rdf_xml = headers.wants_rdf_xml();
-        if wants_sparql_xml && wants_rdf_xml {
-            return Err(ServerError::not_acceptable(
-                "Conflicting Accept headers: both SPARQL Results XML and RDF/XML requested"
-                    .to_string(),
-            ));
-        }
+        let graph_format = sparql_graph_format(parsed.ast.as_ref(), headers)?;
+        let wants_sparql_xml = graph_format.is_none() && headers.wants_sparql_results_xml();
+        let delimited = delimited.filter(|_| graph_format.is_none());
 
         // Formatter config + Content-Type for the JSON response paths below.
         // CONSTRUCT/DESCRIBE always render as JSON-LD; SELECT/ASK opt in via
@@ -2734,10 +2984,11 @@ async fn execute_sparql_ledger(
                     "SPARQL Results XML is not supported in proxy mode".to_string(),
                 ));
             }
-            if wants_rdf_xml {
-                return Err(ServerError::not_acceptable(
-                    "RDF/XML is not supported in proxy mode".to_string(),
-                ));
+            if let Some(fmt) = graph_format {
+                return Err(ServerError::not_acceptable(format!(
+                    "{} is not supported in proxy mode",
+                    fmt.name()
+                )));
             }
             if let Some(fmt) = delimited {
                 return Err(ServerError::not_acceptable(format!(
@@ -2796,11 +3047,6 @@ async fn execute_sparql_ledger(
                         .to_string(),
                 ));
             }
-            if wants_rdf_xml {
-                return Err(ServerError::not_acceptable(
-                    "RDF/XML is not supported for identity-scoped SPARQL queries".to_string(),
-                ));
-            }
             if let Some(fmt) = delimited {
                 return Err(ServerError::not_acceptable(format!(
                     "{} format not supported for identity-scoped SPARQL queries",
@@ -2812,6 +3058,23 @@ async fn execute_sparql_ledger(
                 .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?;
             let view = attach_default_context_to_graph(state, ledger_id, view, use_default_context)
                 .await?;
+            if let Some(fmt) = graph_format {
+                let body = view
+                    .query(state.fluree.as_ref())
+                    .sparql(sparql)
+                    .format(fmt.formatter())
+                    .execution_options(query_execution_options(state))
+                    .execute_formatted_string()
+                    .await
+                    .inspect_err(|_| {
+                        set_span_error_code(&span, "error:QueryFailed");
+                    })?;
+                return Ok((
+                    [(axum::http::header::CONTENT_TYPE, fmt.content_type())],
+                    body.into_bytes(),
+                )
+                    .into_response());
+            }
             let result = view.query(state.fluree.as_ref())
                 .sparql(sparql)
                 .format(json_fmt_config.clone())
@@ -2877,10 +3140,11 @@ async fn execute_sparql_ledger(
                         "SPARQL Results XML is not supported for tracked queries".to_string(),
                     ));
                 }
-                if wants_rdf_xml {
-                    return Err(ServerError::not_acceptable(
-                        "RDF/XML is not supported for tracked queries".to_string(),
-                    ));
+                if let Some(fmt) = graph_format {
+                    return Err(ServerError::not_acceptable(format!(
+                        "{} is not supported for tracked queries",
+                        fmt.name()
+                    )));
                 }
                 let tracking_opts = headers.to_tracking_options();
                 let dataset = if qc_opts.has_any_policy_inputs() {
@@ -2934,8 +3198,8 @@ async fn execute_sparql_ledger(
                 if is_graph_query(parsed.ast.as_ref()) {
                     return Err(ServerError::not_acceptable(
                         "SPARQL Results XML is only available for SPARQL SELECT/ASK queries; \
-                         CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD or \
-                         Accept: application/rdf+xml)"
+                         CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD, \
+                         Turtle, N-Triples or RDF/XML)"
                             .to_string(),
                     ));
                 }
@@ -2965,15 +3229,8 @@ async fn execute_sparql_ledger(
                     .into_response());
             }
 
-            // RDF/XML: execute and format graph results (CONSTRUCT/DESCRIBE only)
-            if wants_rdf_xml {
-                if !is_graph_query(parsed.ast.as_ref()) {
-                    return Err(ServerError::not_acceptable(
-                        "RDF/XML is only available for SPARQL CONSTRUCT/DESCRIBE queries"
-                            .to_string(),
-                    ));
-                }
-
+            // Turtle / N-Triples / RDF/XML: a CONSTRUCT/DESCRIBE graph
+            if let Some(fmt) = graph_format {
                 let dataset = if qc_opts.has_any_policy_inputs() {
                     state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
                 } else {
@@ -2983,19 +3240,18 @@ async fn execute_sparql_ledger(
                         .await
                 }
                 .map_err(ServerError::Api)?;
-                let xml = dataset
+                let body = dataset
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
-                    .format(fluree_db_api::FormatterConfig::rdf_xml())
+                    .format(fmt.formatter())
                     .execution_options(query_execution_options(state))
                     .execute_formatted_string()
                     .await
                     .map_err(ServerError::Api)?;
-                let content_type = "application/rdf+xml; charset=utf-8";
                 return Ok((
                     warn_headers,
-                    [(axum::http::header::CONTENT_TYPE, content_type)],
-                    xml.into_bytes(),
+                    [(axum::http::header::CONTENT_TYPE, fmt.content_type())],
+                    body.into_bytes(),
                 )
                     .into_response());
             }
@@ -3005,7 +3261,7 @@ async fn execute_sparql_ledger(
                 if is_graph_query(parsed.ast.as_ref()) {
                     return Err(ServerError::not_acceptable(
                         "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
-                         use the default (JSON-LD) or Accept: application/rdf+xml"
+                         use the default JSON-LD, Turtle, N-Triples or RDF/XML"
                             .to_string(),
                     ));
                 }
@@ -3092,7 +3348,7 @@ async fn execute_sparql_ledger(
                 // running via the R2RML-aware single-target path. A genuinely-
                 // missing ledger returns a clean NotFound.
                 if state.fluree.resolve_graph_source(ledger_id).await?.is_some() {
-                    if wants_sparql_xml || wants_rdf_xml {
+                    if wants_sparql_xml || graph_format.is_some() {
                         return Err(ServerError::not_acceptable(
                             "Only JSON output is supported for graph source queries".to_string(),
                         ));
@@ -3144,10 +3400,11 @@ async fn execute_sparql_ledger(
                     "SPARQL Results XML is not supported for tracked queries".to_string(),
                 ));
             }
-            if wants_rdf_xml {
-                return Err(ServerError::not_acceptable(
-                    "RDF/XML is not supported for tracked queries".to_string(),
-                ));
+            if let Some(fmt) = graph_format {
+                return Err(ServerError::not_acceptable(format!(
+                    "{} is not supported for tracked queries",
+                    fmt.name()
+                )));
             }
             if let Some(fmt) = delimited {
                 return Err(ServerError::not_acceptable(format!(
@@ -3206,8 +3463,8 @@ async fn execute_sparql_ledger(
             if is_graph_query(parsed.ast.as_ref()) {
                 return Err(ServerError::not_acceptable(format!(
                     "{} is only available for SPARQL SELECT/ASK queries; \
-                     CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD or \
-                     Accept: application/rdf+xml)",
+                     CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD, \
+                     Turtle, N-Triples or RDF/XML)",
                     fmt.name().to_uppercase()
                 )));
             }
@@ -3247,8 +3504,8 @@ async fn execute_sparql_ledger(
             if is_graph_query(parsed.ast.as_ref()) {
                 return Err(ServerError::not_acceptable(
                     "SPARQL Results XML is only available for SPARQL SELECT/ASK queries; \
-                     CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD or \
-                     Accept: application/rdf+xml)"
+                     CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD, \
+                     Turtle, N-Triples or RDF/XML)"
                         .to_string(),
                 ));
             }
@@ -3271,18 +3528,12 @@ async fn execute_sparql_ledger(
                 .into_response());
         }
 
-        // RDF/XML: execute and format graph results (CONSTRUCT/DESCRIBE only)
-        if wants_rdf_xml {
-            if !is_graph_query(parsed.ast.as_ref()) {
-                return Err(ServerError::not_acceptable(
-                    "RDF/XML is only available for SPARQL CONSTRUCT/DESCRIBE queries".to_string(),
-                ));
-            }
-
-            let xml = graph
+        // Turtle / N-Triples / RDF/XML: a CONSTRUCT/DESCRIBE graph
+        if let Some(fmt) = graph_format {
+            let body = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
-                .format(fluree_db_api::FormatterConfig::rdf_xml())
+                .format(fmt.formatter())
                 .execution_options(query_execution_options(state))
                 .execute_formatted_string()
                 .await
@@ -3290,10 +3541,9 @@ async fn execute_sparql_ledger(
                     set_span_error_code(&span, "error:QueryFailed");
                 })
                 .map_err(ServerError::Api)?;
-            let content_type = "application/rdf+xml; charset=utf-8";
             return Ok((
-                [(axum::http::header::CONTENT_TYPE, content_type)],
-                xml.into_bytes(),
+                [(axum::http::header::CONTENT_TYPE, fmt.content_type())],
+                body.into_bytes(),
             )
                 .into_response());
         }
@@ -3303,7 +3553,7 @@ async fn execute_sparql_ledger(
             if is_graph_query(parsed.ast.as_ref()) {
                 return Err(ServerError::not_acceptable(
                     "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
-                     use the default (JSON-LD) or Accept: application/rdf+xml"
+                     use the default JSON-LD, Turtle, N-Triples or RDF/XML"
                         .to_string(),
                 ));
             }
@@ -3369,10 +3619,10 @@ async fn execute_sparql_ledger(
 /// Supports signed requests (JWS/VC format).
 pub async fn explain(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SparqlParams>,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Json<JsonValue>> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -3384,6 +3634,8 @@ pub async fn explain(
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
 
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
     } else {
@@ -4297,16 +4549,18 @@ fn negotiate_multi_query_format(
 
     // No explicit Fluree-Output-Format — fall back to Accept negotiation.
     // Byte-shape values can't be embedded in the envelope's JSON results
-    // map, so a TSV/CSV/XML/RDF XML request without an explicit selector
+    // map, so a TSV/CSV/XML/RDF graph request without an explicit selector
     // is a clear "wrong endpoint" — return 406 with a clear error.
     if headers.wants_tsv()
         || headers.wants_csv()
         || headers.wants_sparql_results_xml()
-        || headers.wants_rdf_xml()
+        || headers
+            .graph_format()
+            .is_some_and(|f| f != GraphFormat::JsonLd)
     {
         return Err(ServerError::not_acceptable(
             "multi-query envelopes can only return JSON results; \
-             TSV / CSV / SPARQL XML / RDF XML are not supported here",
+             TSV / CSV / SPARQL XML / Turtle / N-Triples / RDF XML are not supported here",
         ));
     }
 

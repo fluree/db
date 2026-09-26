@@ -657,3 +657,103 @@ async fn list_all_keys(sdk_config: &aws_config::SdkConfig, bucket: &str) -> usiz
     }
     count
 }
+
+/// `build_client()` from a JSON-LD S3 config with `AES256Key`: every object
+/// the ledger writes to the bucket carries the encryption envelope, and a
+/// second client built from the same config reads it back.
+#[tokio::test]
+async fn s3_testcontainers_build_client_honours_aes256_key() {
+    use fluree_db_api::FlureeBuilder;
+
+    let (_lock, _container, endpoint) = start_localstack("s3,dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+
+    let bucket = "fluree-encrypted-test";
+    let table = "fluree-encrypted-test-ns";
+    ensure_bucket(&sdk_config, bucket).await;
+    ensure_dynamodb_table(&sdk_config, table).await;
+
+    let config = json!({
+        "@context": {
+            "@base": "https://ns.flur.ee/config/connection/",
+            "@vocab": "https://ns.flur.ee/system#"
+        },
+        "@graph": [
+            {
+                "@id": "storage",
+                "@type": "Storage",
+                "s3Bucket": bucket,
+                "s3Prefix": "enc",
+                "s3Endpoint": endpoint,
+                "s3ForcePathStyle": true,
+                "AES256Key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            },
+            {
+                "@id": "publisher",
+                "@type": "Publisher",
+                "dynamodbTable": table,
+                "dynamodbEndpoint": endpoint
+            },
+            {
+                "@id": "connection",
+                "@type": "Connection",
+                "indexStorage": {"@id": "storage"},
+                "primaryPublisher": {"@id": "publisher"}
+            }
+        ]
+    });
+    let build = || async {
+        let builder = FlureeBuilder::from_json_ld(&config).expect("config");
+        assert!(builder.has_encryption_key());
+        builder.build_client().await.expect("build_client")
+    };
+
+    let fluree = build().await;
+    let ledger_id = "encrypted-s3:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+    let tx = json!({
+        "@context": [support::default_context(), {"ex": "http://example.org/ns/"}],
+        "insert": [
+            {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
+            {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"}
+        ]
+    });
+    fluree.update(ledger0, &tx).await.expect("update");
+
+    let s3 = aws_sdk_s3::Client::new(&sdk_config);
+    let keys = list_object_keys(&sdk_config, bucket).await;
+    assert!(!keys.is_empty(), "expected objects in bucket after commit");
+    for key in &keys {
+        let body = s3
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("get_object")
+            .body
+            .collect()
+            .await
+            .expect("body")
+            .into_bytes();
+        assert!(
+            body.starts_with(b"FLU\x00"),
+            "plaintext object in bucket: {key}"
+        );
+    }
+
+    let fluree2 = build().await;
+    let reloaded = fluree2.ledger(ledger_id).await.expect("ledger reload");
+    let q = json!({
+        "@context": [support::default_context(), {"ex": "http://example.org/ns/"}],
+        "select": ["?s", "?name"],
+        "where": {"@id": "?s", "@type": "ex:Person", "ex:name": "?name"}
+    });
+    let results = support::query_jsonld(&fluree2, &reloaded, &q)
+        .await
+        .expect("query")
+        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+    assert_eq!(results, json!([["ex:alice", "Alice"], ["ex:bob", "Bob"]]));
+}

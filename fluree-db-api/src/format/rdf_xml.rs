@@ -1,40 +1,18 @@
 //! RDF/XML graph serializer (`application/rdf+xml`)
 //!
-//! This formatter is intended for SPARQL CONSTRUCT/DESCRIBE (graph results).
-//! It serializes the instantiated construct graph as RDF/XML.
+//! Serializes an instantiated CONSTRUCT / DESCRIBE graph; see
+//! [`super::graph_text`] for the entry point.
 
-use super::config::FormatterConfig;
-use super::construct::instantiate_construct_graph;
-use super::iri::IriCompactor;
 use super::{FormatError, Result};
-use crate::QueryResult;
 
-use fluree_graph_ir::{Graph, Term};
+use fluree_graph_ir::{push_canonical_xsd_double, Graph, LiteralValue, Term};
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
-pub fn format(
-    result: &QueryResult,
-    compactor: &IriCompactor,
-    _config: &FormatterConfig,
-) -> Result<String> {
-    if result.output.construct_template().is_none() {
-        return Err(FormatError::InvalidBinding(
-            "RDF/XML is only valid for graph results (SPARQL CONSTRUCT/DESCRIBE)".to_string(),
-        ));
-    }
-
-    let mut graph = instantiate_construct_graph(result, compactor)?;
-    // Sort for deterministic output, and apply RDF set semantics — see the
-    // matching call in `construct::format`. Without the dedupe this serializer
-    // emitted a repeated triple once per contributing solution row.
-    graph.canonicalize();
-    format_graph(&graph)
-}
-
-fn format_graph(graph: &Graph) -> Result<String> {
+pub(super) fn format_graph(graph: &Graph) -> Result<String> {
     // Collect namespaces from predicate IRIs and datatype IRIs.
     let mut namespaces: BTreeSet<String> = BTreeSet::new();
     namespaces.insert(RDF_NS.to_string());
@@ -101,8 +79,36 @@ fn format_graph(graph: &Graph) -> Result<String> {
     Ok(out)
 }
 
+/// `rdf:nodeID` takes an XML name. A label that is not one (ids minted by old
+/// imports contain `/` and `:`, and a Turtle label may start with a digit) is
+/// hex-encoded behind an `x`, as the Turtle and N-Triples writers do.
+fn push_node_id(label: &str, out: &mut String) {
+    let is_name = label
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if is_name {
+        out.push_str(label);
+    } else {
+        out.push('x');
+        for b in label.bytes() {
+            let _ = write!(out, "{b:02x}");
+        }
+    }
+}
+
 fn write_subject_attr(subject: &Term, out: &mut String) -> Result<()> {
     match subject {
+        // A stored blank node comes back as a `_:`-prefixed IRI.
+        Term::Iri(iri) if iri.starts_with("_:") => {
+            out.push_str(r#" rdf:nodeID=""#);
+            push_node_id(&iri[2..], out);
+            out.push('"');
+            Ok(())
+        }
         Term::Iri(iri) => {
             out.push_str(r#" rdf:about=""#);
             escape_attr_into(iri.as_ref(), out);
@@ -111,7 +117,7 @@ fn write_subject_attr(subject: &Term, out: &mut String) -> Result<()> {
         }
         Term::BlankNode(id) => {
             out.push_str(r#" rdf:nodeID=""#);
-            escape_attr_into(id.as_str(), out);
+            push_node_id(id.as_str(), out);
             out.push('"');
             Ok(())
         }
@@ -141,6 +147,12 @@ fn write_predicate_object(
     out.push_str(local);
 
     match object {
+        Term::Iri(iri) if iri.starts_with("_:") => {
+            out.push_str(r#" rdf:nodeID=""#);
+            push_node_id(&iri[2..], out);
+            out.push_str(r#""/>"#);
+            Ok(())
+        }
         Term::Iri(iri) => {
             out.push_str(r#" rdf:resource=""#);
             escape_attr_into(iri.as_ref(), out);
@@ -149,7 +161,7 @@ fn write_predicate_object(
         }
         Term::BlankNode(id) => {
             out.push_str(r#" rdf:nodeID=""#);
-            escape_attr_into(id.as_str(), out);
+            push_node_id(id.as_str(), out);
             out.push_str(r#""/>"#);
             Ok(())
         }
@@ -169,7 +181,15 @@ fn write_predicate_object(
             }
 
             out.push('>');
-            escape_text_into(&value.lexical(), out);
+            match value {
+                LiteralValue::String(s) | LiteralValue::Json(s) => escape_text_into(s, out),
+                // Numbers and booleans have nothing to escape.
+                LiteralValue::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
+                LiteralValue::Integer(i) => {
+                    let _ = write!(out, "{i}");
+                }
+                LiteralValue::Double(d) => push_canonical_xsd_double(out, *d),
+            }
             out.push_str("</");
             out.push_str(prefix);
             out.push(':');
@@ -253,5 +273,49 @@ mod tests {
             "{xml}"
         );
         assert!(xml.contains(">Alice<"), "{xml}");
+    }
+
+    /// Labels that are not XML names (legacy import ids with `/` and `:`, or a
+    /// leading digit) are hex-encoded, so `rdf:nodeID` stays valid.
+    #[test]
+    fn rdfxml_node_ids_are_xml_names() {
+        let mut g = Graph::new();
+        g.add(Triple::new(
+            Term::iri("_:old/ledger:1"),
+            Term::iri("http://example.org/knows"),
+            Term::blank("0"),
+        ));
+        g.sort();
+        let xml = format_graph(&g).unwrap();
+        assert!(
+            xml.contains(r#"rdf:nodeID="x6f6c642f6c65646765723a31""#),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"rdf:nodeID="x30""#), "{xml}");
+    }
+
+    #[test]
+    fn rdfxml_stored_blank_nodes_use_node_ids() {
+        let mut g = Graph::new();
+        g.add(Triple::new(
+            Term::iri("_:fdb-1"),
+            Term::iri("http://example.org/knows"),
+            Term::iri("_:fdb-2"),
+        ));
+        g.add(Triple::new(
+            Term::iri("_:fdb-1"),
+            Term::iri("http://example.org/age"),
+            Term::integer(42),
+        ));
+        g.sort();
+
+        let xml = format_graph(&g).unwrap();
+        assert!(
+            xml.contains(r#"<rdf:Description rdf:nodeID="fdb-1">"#),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"rdf:nodeID="fdb-2"/>"#), "{xml}");
+        assert!(!xml.contains("rdf:about"), "{xml}");
+        assert!(xml.contains(">42<"), "{xml}");
     }
 }

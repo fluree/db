@@ -1250,28 +1250,34 @@ impl RemoteLedgerClient {
     // Sync (graph synchronization)
     // =========================================================================
 
-    /// Synchronize a named graph: make its contents exactly `body`,
-    /// committing only the delta.
+    /// Synchronize a graph: make its contents exactly `body`, committing
+    /// only the delta. `graph: None` is the default graph.
     ///
-    /// `POST {base}/sync/{ledger}?graph=<iri>[&dryRun=true][&allowEmpty=true]`
+    /// `POST {base}/sync/{ledger}[?graph=<iri>][&dryRun=true][&allowEmpty=true]`
     /// with a JSON-LD body. A dry run answers with the delta report; a real
     /// run with the standard transact response.
     pub async fn sync_jsonld(
         &self,
         ledger: &str,
-        graph: &str,
+        graph: Option<&str>,
         body: &serde_json::Value,
         dry_run: bool,
         allow_empty: bool,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let mut url = self.op_url("sync", ledger);
-        url.push_str("?graph=");
-        url.push_str(&urlencoding::encode(graph));
+        let mut params = Vec::new();
+        if let Some(graph) = graph {
+            params.push(format!("graph={}", urlencoding::encode(graph)));
+        }
         if dry_run {
-            url.push_str("&dryRun=true");
+            params.push("dryRun=true".to_string());
         }
         if allow_empty {
-            url.push_str("&allowEmpty=true");
+            params.push("allowEmpty=true".to_string());
+        }
+        let mut url = self.op_url("sync", ledger);
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
         }
         self.send_json(
             reqwest::Method::POST,
@@ -2082,6 +2088,68 @@ impl RemoteLedgerClient {
             .await?;
         serde_json::from_value(raw)
             .map_err(|e| RemoteLedgerError::InvalidResponse(format!("{operation} response: {e}")))
+    }
+
+    // =========================================================================
+    // Encryption key rotation
+    // =========================================================================
+
+    /// Key ids the server holds: `GET {base_url}/encryption`.
+    pub async fn encryption_keys(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// The rotation progress record: `GET {base_url}/encryption/rotate/status`.
+    pub async fn encryption_rotate_status(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/status");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Start or resume a rotation: `POST {base_url}/encryption/rotate`.
+    pub async fn encryption_rotate(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Pause or cancel the sweep on the node that holds it:
+    /// `POST {base_url}/encryption/rotate/{signal}`.
+    pub async fn encryption_rotate_signal(
+        &self,
+        signal: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("encryption/rotate/{signal}"));
+        self.send_json(reqwest::Method::POST, &url, "application/json", None)
+            .await
+    }
+
+    /// Verify a rotation: `POST {base_url}/encryption/rotate/verify`. Shares
+    /// `REINDEX_TIMEOUT`: it reads every blob's header in the store.
+    pub async fn encryption_rotate_verify(
+        &self,
+        retire_key_id: u32,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/verify");
+        let body = serde_json::json!({ "retire_key_id": retire_key_id });
+        self.send_json_with_timeout(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+            Self::REINDEX_TIMEOUT,
+        )
+        .await
     }
 
     // =========================================================================

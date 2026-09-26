@@ -194,14 +194,60 @@ pub enum TransactionBody {
         /// object map, matching `fluree_db_cypher::ParamMap`.
         params: Option<serde_json::Map<String, JsonValue>>,
     },
-    /// JSON-LD document staged as a graph sync: `graph_iri`'s contents
+    /// JSON-LD document staged as a graph sync: the graph's contents
     /// become exactly the document, committing only the delta (whole-graph
-    /// retraction wave + accumulator cancellation).
+    /// retraction wave + accumulator cancellation). `graph_iri: None` is the
+    /// default graph; entries written before it could be `None` hold a
+    /// plain string, which decodes as `Some`.
     ///
     /// Appended last: the queue envelope and its [`BodyKind`] discriminator
     /// are postcard-encoded in persisted Raft state, where variant ordinals
     /// are positional — never insert a variant mid-enum.
-    JsonLdGraphSync { graph_iri: String, body: JsonValue },
+    JsonLdGraphSync {
+        graph_iri: Option<String>,
+        body: JsonValue,
+    },
+    /// Turtle, N-Triples or TriG text staged as a graph sync (see
+    /// `fluree_db_api::GraphPayload::Rdf`). `allow_empty` travels with the
+    /// text because an RDF body's emptiness is only known once staging
+    /// parses it.
+    ///
+    /// Appended last, for the same postcard-ordinal reason as
+    /// `JsonLdGraphSync`.
+    RdfGraphSync {
+        graph_iri: Option<String>,
+        text: String,
+        allow_empty: bool,
+    },
+    /// A graph insert: the payload's triples are added to the graph
+    /// (`graph_iri: None` is the default graph). Appended last, as above.
+    GraphInsert {
+        graph_iri: Option<String>,
+        payload: GraphBody,
+    },
+}
+
+/// The triples of a [`TransactionBody::GraphInsert`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GraphBody {
+    /// Insert-shaped JSON-LD.
+    JsonLd(JsonValue),
+    /// Turtle, N-Triples or TriG text.
+    Rdf(String),
+}
+
+/// The target graph of a graph-scoped body: `None` is the default graph.
+pub fn graph_sel(graph_iri: &Option<String>) -> fluree_db_api::GraphSel {
+    match graph_iri {
+        Some(iri) => fluree_db_api::GraphSel::Graph(iri.clone()),
+        None => fluree_db_api::GraphSel::Default,
+    }
+}
+
+/// A graph target's bytes for [`TransactionBody::body_hash`]. `@default`
+/// cannot collide with a named graph, whose IRI is absolute.
+fn graph_key(graph_iri: &Option<String>) -> &str {
+    graph_iri.as_deref().unwrap_or("@default")
 }
 
 impl TransactionBody {
@@ -213,7 +259,8 @@ impl TransactionBody {
             Self::JsonLdInsert(_) | Self::TurtleInsert(_) => "insert",
             Self::JsonLdUpsert(_) | Self::TurtleUpsert(_) | Self::TrigUpsert(_) => "upsert",
             Self::JsonLdUpdate(_) => "update",
-            Self::JsonLdGraphSync { .. } => "graph-sync",
+            Self::JsonLdGraphSync { .. } | Self::RdfGraphSync { .. } => "graph-sync",
+            Self::GraphInsert { .. } => "graph-insert",
             Self::Sparql(_) => "sparql-update",
             Self::Cypher { .. } => "cypher",
         }
@@ -248,9 +295,34 @@ impl TransactionBody {
             }
             Self::JsonLdGraphSync { graph_iri, body } => {
                 hasher.update(b"jsonld-graph-sync");
-                hasher.update(graph_iri.as_bytes());
+                hasher.update(graph_key(graph_iri).as_bytes());
                 hasher.update([0u8]);
                 hasher.update(body.to_string().as_bytes());
+            }
+            Self::RdfGraphSync {
+                graph_iri,
+                text,
+                allow_empty,
+            } => {
+                hasher.update(b"rdf-graph-sync");
+                hasher.update(graph_key(graph_iri).as_bytes());
+                hasher.update([0u8, u8::from(*allow_empty)]);
+                hasher.update(text.as_bytes());
+            }
+            Self::GraphInsert { graph_iri, payload } => {
+                hasher.update(b"graph-insert");
+                hasher.update(graph_key(graph_iri).as_bytes());
+                hasher.update([0u8]);
+                match payload {
+                    GraphBody::JsonLd(json) => {
+                        hasher.update(b"jsonld");
+                        hasher.update(json.to_string().as_bytes());
+                    }
+                    GraphBody::Rdf(text) => {
+                        hasher.update(b"rdf");
+                        hasher.update(text.as_bytes());
+                    }
+                }
             }
             Self::TurtleInsert(text) => {
                 hasher.update(b"turtle-insert");
@@ -288,7 +360,7 @@ impl TransactionBody {
 /// surface it on [`SubmissionState::Committed`] so clients can tell
 /// what kind of submission they're confirming.
 ///
-/// The eight transact variants mirror [`TransactionBody`]'s
+/// The transact variants mirror [`TransactionBody`]'s
 /// discriminators (and convert via [`From<&TransactionBody>`]).
 /// The remaining four match the non-transact `Committer` methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +397,10 @@ pub enum BodyKind {
     /// inserting mid-enum would make existing snapshots and mixed-version
     /// nodes decode every later variant as the wrong operation.
     JsonLdGraphSync,
+    /// RDF-text graph sync. Appended last (see `JsonLdGraphSync`).
+    RdfGraphSync,
+    /// Graph insert. Appended last (see `JsonLdGraphSync`).
+    GraphInsert,
 }
 
 impl From<&TransactionBody> for BodyKind {
@@ -334,6 +410,8 @@ impl From<&TransactionBody> for BodyKind {
             TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
             TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
             TransactionBody::JsonLdGraphSync { .. } => BodyKind::JsonLdGraphSync,
+            TransactionBody::RdfGraphSync { .. } => BodyKind::RdfGraphSync,
+            TransactionBody::GraphInsert { .. } => BodyKind::GraphInsert,
             TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
             TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
             TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
@@ -1031,6 +1109,90 @@ mod tests {
     }
 
     #[test]
+    fn rdf_graph_sync_round_trips_and_hashes_every_field() {
+        let body = |graph: &str, allow_empty: bool| TransactionBody::RdfGraphSync {
+            graph_iri: Some(graph.to_string()),
+            text: "<urn:s> <urn:p> <urn:o> .".to_string(),
+            allow_empty,
+        };
+        let queued = QueuedRequest::Transact(Box::new(QueuedTransact {
+            body: body("urn:g", true),
+            txn_opts: fluree_db_transact::TxnOpts::default(),
+            commit_opts: CommitOptsRequest::default(),
+            tracking: None,
+            governance: GovernanceOptions::default(),
+        }));
+        let decoded = QueuedRequest::from_bytes(&queued.to_bytes().expect("encode"));
+        match decoded.expect("decode") {
+            QueuedRequest::Transact(t) => {
+                assert!(matches!(
+                    &t.body,
+                    TransactionBody::RdfGraphSync { graph_iri: Some(g), allow_empty: true, .. }
+                        if g == "urn:g"
+                ));
+                assert_eq!(BodyKind::from(&t.body), BodyKind::RdfGraphSync);
+            }
+            other => panic!("expected Transact, got {other:?}"),
+        }
+
+        // A retry that changes the target graph or the empty opt-in is a
+        // different request, not a replay.
+        let hash = body("urn:g", true).body_hash();
+        assert_ne!(hash, body("urn:g", false).body_hash());
+        assert_ne!(hash, body("urn:h", true).body_hash());
+    }
+
+    /// A graph-sync body written before the default graph could be a target
+    /// carries a plain string; it must still decode, as that named graph.
+    #[test]
+    fn graph_sync_bodies_from_before_default_graph_targets_still_decode() {
+        let old: TransactionBody =
+            serde_json::from_str(r#"{"JsonLdGraphSync":{"graph_iri":"urn:g","body":{}}}"#)
+                .expect("decode a string graph_iri");
+        assert!(matches!(
+            old,
+            TransactionBody::JsonLdGraphSync { graph_iri: Some(ref g), .. } if g == "urn:g"
+        ));
+
+        let default = TransactionBody::JsonLdGraphSync {
+            graph_iri: None,
+            body: serde_json::json!({}),
+        };
+        let bytes = serde_json::to_vec(&default).expect("encode");
+        let decoded: TransactionBody = serde_json::from_slice(&bytes).expect("decode");
+        assert!(matches!(
+            decoded,
+            TransactionBody::JsonLdGraphSync {
+                graph_iri: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn graph_insert_round_trips_and_hashes_apart_from_sync() {
+        let insert = TransactionBody::GraphInsert {
+            graph_iri: None,
+            payload: GraphBody::Rdf("<urn:s> <urn:p> <urn:o> .".to_string()),
+        };
+        let bytes = serde_json::to_vec(&insert).expect("encode");
+        let decoded: TransactionBody = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(BodyKind::from(&decoded), BodyKind::GraphInsert);
+
+        let sync = TransactionBody::RdfGraphSync {
+            graph_iri: None,
+            text: "<urn:s> <urn:p> <urn:o> .".to_string(),
+            allow_empty: false,
+        };
+        assert_ne!(insert.body_hash(), sync.body_hash());
+        let named = TransactionBody::GraphInsert {
+            graph_iri: Some("urn:g".to_string()),
+            payload: GraphBody::Rdf("<urn:s> <urn:p> <urn:o> .".to_string()),
+        };
+        assert_ne!(insert.body_hash(), named.body_hash());
+    }
+
+    #[test]
     fn new_accepts_typical_lengths() {
         IdempotencyKey::new("01J5ULIDLOOKINGKEY").expect("ULID-shaped key fits cap");
         let max = "x".repeat(MAX_IDEMPOTENCY_KEY_LEN);
@@ -1076,6 +1238,8 @@ mod body_kind_wire_tests {
             (BodyKind::Merge, 10),
             (BodyKind::Rebase, 11),
             (BodyKind::JsonLdGraphSync, 12),
+            (BodyKind::RdfGraphSync, 13),
+            (BodyKind::GraphInsert, 14),
         ];
         for (kind, ordinal) in expected {
             let bytes = postcard::to_allocvec(&kind).expect("encode");
