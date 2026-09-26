@@ -905,6 +905,32 @@ async fn rdf_graph_sync_commits_through_the_raft_queue() {
 
     assert_eq!(sync(r#"ex:search ex:name "search""#).await, Some(2));
     names_everywhere(json!(["search"])).await;
+
+    // A block naming another graph fails identically on every attempt, so
+    // the worker poisons it at once instead of retrying, and the queue moves
+    // on to the next sync.
+    let resp = cluster
+        .client
+        .post(format!(
+            "{}/v1/fluree/sync/{ledger}?graph={graph}",
+            cluster.public_url(follower)
+        ))
+        .header("content-type", "application/trig")
+        .body("GRAPH <urn:example:other> { <urn:x> <urn:p> \"x\" }\n")
+        .send()
+        .await
+        .expect("refused sync request");
+    let status = resp.status();
+    let body = resp.text().await.expect("refused sync body");
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert!(
+        body.contains("BodyMalformed"),
+        "refused without the retry budget: {body}"
+    );
+    assert_eq!(
+        sync(r#"ex:search ex:name "search" ; ex:tag "t""#).await,
+        Some(3)
+    );
 }
 
 /// Build, in a local in-memory instance, a main branch that ends in a
