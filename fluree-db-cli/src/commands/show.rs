@@ -39,7 +39,7 @@ pub async fn run(
             println!("{json}");
         }
         LedgerMode::Local { fluree, alias } => {
-            let ledger_id = context::to_ledger_id(&alias);
+            let ledger_id = context::to_ledger_id(&alias)?;
 
             // Shared with `branch create --at` and `branch revert` (#1805) —
             // this used to be a private `t:`-or-prefix hand-roll, so `show 2`

@@ -244,7 +244,7 @@ async fn reindex_refuses_while_the_ledger_is_held_for_maintenance() {
 
             // Stand in for a sweep already holding the ledger.
             let _held = handle
-                .acquire_maintenance("holdtest:main")
+                .acquire_maintenance(&fluree_db_api::LedgerId::parse("holdtest:main").unwrap())
                 .expect("acquire succeeds");
 
             let err = fluree

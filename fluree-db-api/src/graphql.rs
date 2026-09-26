@@ -263,7 +263,7 @@ pub async fn derive_schema(db: &GraphDb) -> Arc<DerivedSchema> {
 /// Everything the derived schema depends on, reduced to something comparable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SchemaCacheKey {
-    ledger_id: String,
+    ledger_id: fluree_db_core::LedgerId,
     /// The indexed snapshot: its statistics are the schema's base.
     index_t: i64,
     /// The view's as-of time, which bounds the overlay half of the merge.
@@ -819,7 +819,7 @@ type ShapeCache =
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ShapeCacheKey {
-    ledger_id: String,
+    ledger_id: fluree_db_core::LedgerId,
     index_t: i64,
     shacl_epoch: u64,
     /// The compiled shapes bake in subclass expansion, so a hierarchy change

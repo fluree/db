@@ -70,7 +70,10 @@ mod support {
 
         #[async_trait]
         impl AttachmentEventsProvider for TestProvider {
-            async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {
+            async fn attachment_events(
+                &self,
+                ledger_id: &fluree_db_api::LedgerId,
+            ) -> Option<AttachmentEventCoverage> {
                 use fluree_db_api::ledger_manager::RunningCoverage;
                 let result = self
                     .manager
@@ -296,7 +299,12 @@ async fn seed_ledger_and_optionally_seal(n: usize, seal: bool) -> (fluree_db_api
     local
         .run_until(async {
             let _ = fluree.ledger_cached(&ledger_id).await.unwrap();
-            let completion = handle.trigger(&ledger_id, receipt_t).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
+                    receipt_t,
+                )
+                .await;
             let _ = completion.wait().await;
             support::wait_for_index_application(&fluree, &ledger_id, receipt_t).await;
         })

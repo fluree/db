@@ -242,6 +242,18 @@ pub(crate) struct BranchPointRef {
     pub t: i64,
 }
 
+/// Whether `bytes` hold a ledger's main ns record (as opposed to an index or
+/// snapshots sidecar, or a graph-source record): only main records carry
+/// `f:ledger`.
+pub(crate) fn is_ledger_main_record(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|v| v.get("f:ledger").is_some())
+}
+
+/// Keys that may be sidecars rather than main records.
+pub(crate) fn has_sidecar_suffix(key: &str) -> bool {
+    key.ends_with(".index.json") || key.ends_with(".snapshots.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

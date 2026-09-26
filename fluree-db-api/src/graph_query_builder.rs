@@ -151,8 +151,8 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                 .is_err_and(super::error::ApiError::is_not_found)
         {
             let ledger_id = &self.graph.ledger_id;
-            let gs_id = fluree_db_core::normalize_ledger_id(ledger_id)
-                .unwrap_or_else(|_| ledger_id.to_string());
+            // The id may carry a `#graph` fragment; the source is the id before it.
+            let gs_id = fluree_db_core::LedgerRef::parse(ledger_id)?.id.to_string();
 
             if let Some((r2rml, _)) = &self.core.r2rml {
                 if r2rml.has_r2rml_mapping(&gs_id).await {

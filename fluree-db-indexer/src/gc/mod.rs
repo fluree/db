@@ -139,7 +139,9 @@ pub use record::GarbageRecord;
 pub use siblings::{
     current_sibling_heads, shared_blob_policy_for, shared_refs_of_branches, siblings_of,
 };
-pub use sweep::{execute_sweep, plan_sweep, BranchIndexHead, SweepPlan, SweepResult};
+pub use sweep::{
+    execute_sweep, nested_ledgers, plan_sweep, BranchIndexHead, SweepPlan, SweepResult,
+};
 
 use crate::error::Result;
 use fluree_db_core::{ContentId, ContentKind, ContentStore};

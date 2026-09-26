@@ -81,7 +81,7 @@ impl Opened {
         match &source.kind {
             SourceKind::Ledger(alias) => {
                 let fluree = context::build_fluree(dirs)?;
-                let ledger_id = context::to_ledger_id(alias);
+                let ledger_id = context::to_ledger_id(alias)?;
                 if !fluree.ledger_exists(&ledger_id).await? {
                     return Err(CliError::NotFound(format!(
                         "{alias}: no such ledger (a file source needs a .ttl, .nt, .jsonld or .json extension)"
@@ -97,7 +97,9 @@ impl Opened {
                     .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
                 let fluree = FlureeBuilder::memory().build_memory();
                 let alias = "scratch:main".to_string();
-                fluree.create_ledger(&context::to_ledger_id(&alias)).await?;
+                fluree
+                    .create_ledger(&context::to_ledger_id(&alias)?)
+                    .await?;
                 let g = fluree.graph(&alias);
                 let ext = path
                     .extension()

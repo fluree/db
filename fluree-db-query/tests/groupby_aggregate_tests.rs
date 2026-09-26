@@ -61,7 +61,7 @@ fn implicit_grouping(aggregates: Vec<AggregateSpec>) -> Grouping {
 }
 
 fn make_test_snapshot() -> LedgerSnapshot {
-    LedgerSnapshot::genesis("test/main")
+    LedgerSnapshot::genesis("test:main")
 }
 
 fn xsd_long() -> Sid {

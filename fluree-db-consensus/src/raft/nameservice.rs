@@ -63,7 +63,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, LedgerId};
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
@@ -275,7 +275,7 @@ fn record_from_state(
     if !ledger.branches.iter().any(|b| b == branch) {
         return None;
     }
-    let mut record = NsRecord::new(ledger_name, branch);
+    let mut record = NsRecord::new(LedgerId::from_parts(ledger_name, branch).ok()?);
     let ref_key = RefKey::new(ledger_name, branch);
     if let Some(entry) = state.refs.get(&ref_key) {
         record.commit_head_id = Some(entry.head.clone());
@@ -1759,8 +1759,10 @@ impl GraphSourceLookup for RaftNameService {
         &self,
         graph_source_id: &str,
     ) -> Result<Option<GraphSourceRecord>> {
+        // Keyed by canonical `name:branch`, as every other backend resolves.
+        let key = LedgerId::parse(graph_source_id)?.to_string();
         let state = self.state.read().await;
-        Ok(state.graph_sources.get(graph_source_id).cloned())
+        Ok(state.graph_sources.get(&key).cloned())
     }
 
     /// Resolve `resource_id` against the ledger map first, then the
@@ -1770,8 +1772,9 @@ impl GraphSourceLookup for RaftNameService {
         if let Some(record) = self.lookup(resource_id).await? {
             return Ok(NsLookupResult::Ledger(record));
         }
+        let key = LedgerId::parse(resource_id)?.to_string();
         let state = self.state.read().await;
-        if let Some(record) = state.graph_sources.get(resource_id).cloned() {
+        if let Some(record) = state.graph_sources.get(&key).cloned() {
             return Ok(NsLookupResult::GraphSource(record));
         }
         Ok(NsLookupResult::NotFound)
@@ -3061,6 +3064,32 @@ mod tests {
         assert_eq!(record.commit_head_id, Some(cid(5)));
         assert_eq!(record.commit_t, 7);
         assert_eq!(record.index_head_id, None);
+    }
+
+    /// Graph sources are stored under canonical `name:branch`; a branchless
+    /// lookup must resolve like every other backend's, not miss on raft only.
+    #[tokio::test]
+    async fn graph_source_lookups_accept_the_branchless_spelling() {
+        let state = fresh_state();
+        apply_cmd(
+            &state,
+            Command::PublishGraphSource {
+                name: "search".into(),
+                branch: "main".into(),
+                source_type: GraphSourceType::Bm25,
+                config: "{}".into(),
+                dependencies: vec![],
+            },
+            1,
+        )
+        .await;
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
+        let record = ns.lookup_graph_source("search").await.unwrap();
+        assert_eq!(record.expect("found").graph_source_id, "search:main");
+        assert!(matches!(
+            ns.lookup_any("search").await.unwrap(),
+            NsLookupResult::GraphSource(_)
+        ));
     }
 
     #[tokio::test]

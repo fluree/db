@@ -111,9 +111,7 @@ fn request_graph(request: &Request, ledger: &str) -> Result<GraphSel> {
             config_graph_iri, txn_meta_graph_iri, validate_absolute_graph_iri,
         };
         validate_absolute_graph_iri(iri).map_err(ServerError::bad_request)?;
-        // An unparseable ledger id fails later as a missing ledger.
-        let ledger_id =
-            fluree_db_core::normalize_ledger_id(ledger).unwrap_or_else(|_| ledger.to_string());
+        let ledger_id = crate::error::scope_id(ledger)?;
         if *iri == txn_meta_graph_iri(&ledger_id) || *iri == config_graph_iri(&ledger_id) {
             return Err(ServerError::bad_request(format!(
                 "<{iri}> is a system graph; the Graph Store Protocol reads and writes user graphs"

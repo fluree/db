@@ -17,10 +17,8 @@ use aws_sdk_dynamodb::types::{
 };
 use aws_sdk_dynamodb::Client;
 use aws_smithy_types::timeout::TimeoutConfig;
-use fluree_db_core::ledger_id::{
-    format_ledger_id, normalize_ledger_id, split_ledger_id, DEFAULT_BRANCH,
-};
-use fluree_db_core::ContentId;
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, DEFAULT_BRANCH};
+use fluree_db_core::{ContentId, LedgerId};
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPayload, ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher,
@@ -106,9 +104,9 @@ impl DynamoDbNameService {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 impl DynamoDbNameService {
-    /// Normalize ledger ID to canonical `name:branch` form.
-    fn normalize(ledger_id: &str) -> String {
-        normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string())
+    /// Normalize ledger ID to canonical `name:branch` form (the partition key).
+    fn normalize(ledger_id: &str) -> std::result::Result<String, NameServiceError> {
+        Ok(LedgerId::parse(ledger_id)?.to_string())
     }
 
     /// Current epoch time in milliseconds.
@@ -300,10 +298,15 @@ impl DynamoDbNameService {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        // Identity from the name/branch attributes; `pk` only when an item
+        // predates them.
+        let ledger_id = LedgerId::from_parts(&name, &branch)
+            .or_else(|_| LedgerId::parse(pk))
+            .ok()?;
         Some(NsRecord {
-            ledger_id: pk.to_string(),
-            name,
-            branch,
+            name: ledger_id.name().to_string(),
+            branch: ledger_id.branch().to_string(),
+            ledger_id,
             commit_head_id,
             config_id: None,
             commit_t,
@@ -374,10 +377,14 @@ impl DynamoDbNameService {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        // Identity from the name/branch attributes, as for ledger records.
+        let graph_source_id = LedgerId::from_parts(&name, &branch)
+            .or_else(|_| LedgerId::parse(pk))
+            .ok()?;
         Some(GraphSourceRecord {
-            graph_source_id: pk.to_string(),
-            name,
-            branch,
+            name: graph_source_id.name().to_string(),
+            branch: graph_source_id.branch().to_string(),
+            graph_source_id,
             source_type,
             config,
             dependencies,
@@ -595,7 +602,7 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
         &self,
         ledger_id: &str,
     ) -> std::result::Result<Option<NsRecord>, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let items = self.query_metadata_items(&pk).await?;
         Ok(Self::items_to_ns_record(&pk, &items))
     }
@@ -607,7 +614,7 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
         &self,
         ledger_id: &str,
     ) -> std::result::Result<Option<LedgerHeads>, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let response = self
             .client
             .query()
@@ -840,7 +847,7 @@ impl BranchLifecycle for DynamoDbNameService {
         &self,
         ledger_id: &str,
     ) -> std::result::Result<Option<u32>, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
 
         // Read metadata rows for this branch to find the parent.
         let meta_items = self.query_metadata_items(&pk).await?;
@@ -922,7 +929,7 @@ impl BranchLifecycle for DynamoDbNameService {
         ledger_id: &str,
         snapshot: fluree_db_nameservice::NsRecordSnapshot,
     ) -> std::result::Result<(), NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
 
         // Build commit head update
@@ -988,7 +995,7 @@ impl BranchLifecycle for DynamoDbNameService {
         ledger_id: &str,
         since_t: i64,
     ) -> std::result::Result<Option<Vec<(i64, ContentId)>>, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         // Half-open range `(since_t, +inf)` over the `commit#` SK namespace:
         // BETWEEN the padded `since_t+1` and the all-9s upper bound.
         let lo = Self::commit_index_sk(since_t.saturating_add(1));
@@ -1053,7 +1060,7 @@ impl BranchLifecycle for DynamoDbNameService {
         ledger_id: &str,
         up_to_t: i64,
     ) -> std::result::Result<(), NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         // `commit#` items with t <= up_to_t: BETWEEN padded 0 and padded up_to_t.
         let lo = Self::commit_index_sk(0);
         let hi = Self::commit_index_sk(up_to_t);
@@ -1136,9 +1143,8 @@ impl BranchLifecycle for DynamoDbNameService {
 #[async_trait]
 impl LedgerLifecycle for DynamoDbNameService {
     async fn init(&self, ledger_id: &str) -> std::result::Result<(), NameServiceError> {
-        let pk = Self::normalize(ledger_id);
-        let (ledger_name, branch) = split_ledger_id(ledger_id)
-            .unwrap_or_else(|_| (ledger_id.to_string(), DEFAULT_BRANCH.to_string()));
+        let pk = Self::normalize(ledger_id)?;
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
         let sv = SCHEMA_VERSION.to_string();
 
@@ -1233,7 +1239,7 @@ impl LedgerLifecycle for DynamoDbNameService {
     }
 
     async fn retract(&self, ledger_id: &str) -> std::result::Result<(), NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
 
         self.client
@@ -1257,7 +1263,7 @@ impl LedgerLifecycle for DynamoDbNameService {
         // Hard drop: delete every row under this pk (meta/head/index/status/
         // config, plus any other ledger-level rows). Idempotent — if the
         // record is already gone we return Ok so repeated drops are safe.
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let items = self.query_all_items_paginated(&pk).await?;
         let _ = self.delete_all_rows_for_pk(&pk, &items).await?;
         Ok(())
@@ -1272,7 +1278,7 @@ impl CommitPublisher for DynamoDbNameService {
         commit_t: i64,
         commit_id: &ContentId,
     ) -> std::result::Result<(), NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
 
         let result = self
@@ -1315,7 +1321,7 @@ impl CommitPublisher for DynamoDbNameService {
     }
 
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        Some(Self::normalize(ledger_id))
+        Self::normalize(ledger_id).ok()
     }
 }
 
@@ -1447,7 +1453,7 @@ impl DynamoDbNameService {
         index_id: &ContentId,
         condition: &str,
     ) -> std::result::Result<(), NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
 
         // Guard: the ledger must be initialized (meta item must exist).
         if !self.meta_exists(&pk).await? {
@@ -1544,8 +1550,7 @@ impl DynamoDbNameService {
             )));
         }
 
-        let (ledger_name, branch) = split_ledger_id(ledger_id)
-            .unwrap_or_else(|_| (ledger_id.to_string(), DEFAULT_BRANCH.to_string()));
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
         let sv = SCHEMA_VERSION.to_string();
 
@@ -1699,7 +1704,7 @@ impl RefLookup for DynamoDbNameService {
         ledger_id: &str,
         kind: RefKind,
     ) -> std::result::Result<Option<RefValue>, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let sk = Self::ref_kind_sk(kind);
         let (id_attr, t_attr) = Self::ref_kind_attrs(kind);
 
@@ -1750,7 +1755,7 @@ impl RefPublisher for DynamoDbNameService {
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> std::result::Result<CasResult, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let sk = Self::ref_kind_sk(kind);
         let (id_attr, t_attr) = Self::ref_kind_attrs(kind);
 
@@ -2071,7 +2076,7 @@ impl GraphSourceLookup for DynamoDbNameService {
         &self,
         graph_source_id: &str,
     ) -> std::result::Result<Option<GraphSourceRecord>, NameServiceError> {
-        let pk = Self::normalize(graph_source_id);
+        let pk = Self::normalize(graph_source_id)?;
         let items = self.query_metadata_items(&pk).await?;
         Ok(Self::items_to_gs_record(&pk, &items))
     }
@@ -2080,7 +2085,7 @@ impl GraphSourceLookup for DynamoDbNameService {
         &self,
         resource_id: &str,
     ) -> std::result::Result<NsLookupResult, NameServiceError> {
-        let pk = Self::normalize(resource_id);
+        let pk = Self::normalize(resource_id)?;
         let items = self.query_metadata_items(&pk).await?;
 
         // Discriminate by meta.kind
@@ -2235,7 +2240,7 @@ impl StatusLookup for DynamoDbNameService {
         &self,
         ledger_id: &str,
     ) -> std::result::Result<Option<StatusValue>, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
 
         let response = self
             .client
@@ -2293,7 +2298,7 @@ impl StatusPublisher for DynamoDbNameService {
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> std::result::Result<StatusCasResult, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
 
         let Some(exp) = expected else {
@@ -2369,7 +2374,7 @@ impl ConfigLookup for DynamoDbNameService {
         &self,
         ledger_id: &str,
     ) -> std::result::Result<Option<ConfigValue>, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
 
         // Gate: only ledger configs — graph sources use GraphSourcePublisher.
         match self.meta_kind(&pk).await? {
@@ -2436,7 +2441,7 @@ impl ConfigPublisher for DynamoDbNameService {
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> std::result::Result<ConfigCasResult, NameServiceError> {
-        let pk = Self::normalize(ledger_id);
+        let pk = Self::normalize(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
 
         // Gate: only ledger configs.
@@ -2870,8 +2875,16 @@ mod tests {
 
     #[test]
     fn test_normalize() {
-        assert_eq!(DynamoDbNameService::normalize("mydb"), "mydb:main");
-        assert_eq!(DynamoDbNameService::normalize("mydb:dev"), "mydb:dev");
-        assert_eq!(DynamoDbNameService::normalize("mydb:main"), "mydb:main");
+        assert_eq!(DynamoDbNameService::normalize("mydb").unwrap(), "mydb:main");
+        assert_eq!(
+            DynamoDbNameService::normalize("mydb:dev").unwrap(),
+            "mydb:dev"
+        );
+        assert_eq!(
+            DynamoDbNameService::normalize("mydb:main").unwrap(),
+            "mydb:main"
+        );
+        // Invalid ids used to fall through as their own partition key.
+        assert!(DynamoDbNameService::normalize("a:b:c").is_err());
     }
 }

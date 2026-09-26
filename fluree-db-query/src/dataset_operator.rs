@@ -954,7 +954,7 @@ mod tests {
     async fn open_and_drain(op: &mut dyn Operator) {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::LedgerSnapshot;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         op.open(&ctx).await.unwrap();

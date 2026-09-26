@@ -210,7 +210,7 @@ impl crate::Fluree {
         }
 
         let base = view.base();
-        let ledger_id = base.snapshot.ledger_id.to_string();
+        let ledger_id = base.snapshot.ledger_id.clone();
 
         // Config from the target's pre-operation state, resolved once and
         // shared by the cross-ledger resolvers and the policy pass.

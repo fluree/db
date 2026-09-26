@@ -59,7 +59,6 @@ use crate::raft::state_machine::{self, Command, NameServiceState, RefKey, Respon
 use crate::raft::waiter::{AbortReason, WaiterMap};
 use crate::raft::TypeConfig;
 use fluree_db_api::LedgerManager;
-use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{LedgerEventBus, NameServiceEvent};
 use fluree_raft_core::node::NodeId;
@@ -166,7 +165,10 @@ pub enum Effect {
     Event(NameServiceEvent),
     /// A commit head restored in bulk by a snapshot install, which no
     /// per-entry apply will ever report.
-    HeadAdvance { ledger_id: String, commit_t: i64 },
+    HeadAdvance {
+        ledger_id: fluree_db_core::LedgerId,
+        commit_t: i64,
+    },
     /// Wake or bind a parked proposer.
     Waiter(WaiterResolution),
     /// Free an envelope blob the state machine has finished with.
@@ -312,9 +314,11 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
     ) {
         // A snapshot advances heads in bulk without per-entry applies,
         // so the per-apply watermark report never fires for them.
-        out.extend(state.refs.iter().map(|(key, entry)| Effect::HeadAdvance {
-            ledger_id: key.ledger_id(),
-            commit_t: entry.t,
+        out.extend(state.refs.iter().filter_map(|(key, entry)| {
+            Some(Effect::HeadAdvance {
+                ledger_id: event_ledger_id(&key.ledger_name, &key.branch)?,
+                commit_t: entry.t,
+            })
         }));
         if matches!(load, SnapshotLoad::LiveInstall) {
             // Only a live install can strand in-flight work. At boot
@@ -497,6 +501,22 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
 }
 
 /// Translate an apply-path `(Command, Response)` pair into the
+/// A state-machine ledger identity as an event id. The state machine only
+/// holds ids that passed validation on the way in; one that no longer parses
+/// is logged and its event dropped rather than broadcast under a key no
+/// consumer can match.
+fn event_ledger_id(name: &str, branch: &str) -> Option<fluree_db_core::LedgerId> {
+    fluree_db_core::LedgerId::from_parts(name, branch)
+        .inspect_err(|e| tracing::error!(error = %e, "raft state holds an invalid ledger id"))
+        .ok()
+}
+
+fn parsed_event_ledger_id(ledger_id: &str) -> Option<fluree_db_core::LedgerId> {
+    fluree_db_core::LedgerId::parse(ledger_id)
+        .inspect_err(|e| tracing::error!(error = %e, "raft state holds an invalid ledger id"))
+        .ok()
+}
+
 /// matching [`NameServiceEvent`]. Returns `None` for pairs that
 /// don't advance head state — desyncs, no-ops, idempotency hits.
 fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
@@ -509,7 +529,7 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
                 ..
             },
         ) => Some(NameServiceEvent::LedgerCommitPublished {
-            ledger_id: format_ledger_id(&args.ledger_id, &args.branch),
+            ledger_id: event_ledger_id(&args.ledger_id, &args.branch)?,
             commit_id: commit_id.clone(),
             commit_t: *commit_t,
         }),
@@ -520,7 +540,7 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
                 index_head,
             },
         ) => Some(NameServiceEvent::LedgerIndexPublished {
-            ledger_id: format_ledger_id(&args.ledger_id, &args.branch),
+            ledger_id: event_ledger_id(&args.ledger_id, &args.branch)?,
             index_id: index_head.clone(),
             index_t: *index_t,
         }),
@@ -528,12 +548,12 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
         | (Command::PurgeBranch { .. }, Response::Purged { ledger_id, .. })
         | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. }) => {
             Some(NameServiceEvent::LedgerRetracted {
-                ledger_id: ledger_id.clone(),
+                ledger_id: parsed_event_ledger_id(ledger_id)?,
             })
         }
         (Command::CreateBranch(_), Response::BranchCreated { ledger_id, head, t }) => {
             Some(NameServiceEvent::LedgerCommitPublished {
-                ledger_id: ledger_id.clone(),
+                ledger_id: parsed_event_ledger_id(ledger_id)?,
                 commit_id: head.clone(),
                 commit_t: *t,
             })
@@ -1161,7 +1181,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(manager.head_watermark("test/db:feature"), Some(10));
+        assert_eq!(
+            manager.head_watermark(&fluree_db_core::LedgerId::parse("test/db:feature").unwrap()),
+            Some(10)
+        );
     }
 
     #[tokio::test]
@@ -1189,7 +1212,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(manager.head_watermark("test/db:main"), Some(42));
+        assert_eq!(
+            manager.head_watermark(&fluree_db_core::LedgerId::parse("test/db:main").unwrap()),
+            Some(42)
+        );
     }
 
     #[tokio::test]
@@ -1486,23 +1512,32 @@ mod tests {
 
         observer.publish(vec![
             Effect::Event(NameServiceEvent::LedgerCommitPublished {
-                ledger_id: "a/db:main".into(),
+                ledger_id: fluree_db_core::LedgerId::parse("a/db:main").unwrap(),
                 commit_id: cid(1),
                 commit_t: 7,
             }),
             Effect::HeadAdvance {
-                ledger_id: "b/db:main".into(),
+                ledger_id: fluree_db_core::LedgerId::parse("b/db:main").unwrap(),
                 commit_t: 9,
             },
             // Carries no head; must not be mistaken for one.
             Effect::Event(NameServiceEvent::LedgerRetracted {
-                ledger_id: "c/db:main".into(),
+                ledger_id: fluree_db_core::LedgerId::parse("c/db:main").unwrap(),
             }),
         ]);
 
-        assert_eq!(manager.head_watermark("a/db:main"), Some(7));
-        assert_eq!(manager.head_watermark("b/db:main"), Some(9));
-        assert_eq!(manager.head_watermark("c/db:main"), None);
+        assert_eq!(
+            manager.head_watermark(&fluree_db_core::LedgerId::parse("a/db:main").unwrap()),
+            Some(7)
+        );
+        assert_eq!(
+            manager.head_watermark(&fluree_db_core::LedgerId::parse("b/db:main").unwrap()),
+            Some(9)
+        );
+        assert_eq!(
+            manager.head_watermark(&fluree_db_core::LedgerId::parse("c/db:main").unwrap()),
+            None
+        );
     }
 
     #[tokio::test]

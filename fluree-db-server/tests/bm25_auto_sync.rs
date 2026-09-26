@@ -113,7 +113,9 @@ async fn commit_advances_the_index_without_an_explicit_sync() {
     let handle = worker.handle();
     // Registration pass: the index already existed, so `auto_register` alone
     // would never have picked it up.
-    handle.register_graph_source_with_deps(&gs_id, &["docs:main".to_string()]);
+    handle
+        .register_graph_source_with_deps(&gs_id, &["docs:main".to_string()])
+        .expect("register");
     let task = tokio::spawn(async move { worker.run().await });
 
     insert_doc(&state, "ex:doc2", "Rust and WebAssembly").await;

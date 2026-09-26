@@ -138,6 +138,11 @@ impl RefKey {
     pub fn ledger_id(&self) -> String {
         format_ledger_id(&self.ledger_name, &self.branch)
     }
+
+    /// The same id, validated, for consumers keyed by [`LedgerId`].
+    pub fn id(&self) -> Result<fluree_db_core::LedgerId, fluree_db_core::LedgerIdParseError> {
+        fluree_db_core::LedgerId::from_parts(&self.ledger_name, &self.branch)
+    }
 }
 
 /// Latest published index for a branch: the content id of the

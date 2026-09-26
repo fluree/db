@@ -12,9 +12,7 @@ use crate::{
     StatusLookup, StatusPayload, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::format_ledger_id;
-use fluree_db_core::ledger_id as core_ledger_id;
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, LedgerId};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -26,13 +24,13 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct MemoryNameService {
     /// Ledger records keyed by canonical address (e.g., "mydb:main")
-    records: Arc<RwLock<HashMap<String, NsRecord>>>,
+    records: Arc<RwLock<HashMap<LedgerId, NsRecord>>>,
     /// Graph source records keyed by canonical address (e.g., "my-search:main")
-    graph_source_records: Arc<RwLock<HashMap<String, GraphSourceRecord>>>,
+    graph_source_records: Arc<RwLock<HashMap<LedgerId, GraphSourceRecord>>>,
     /// Status values keyed by canonical address (v2 extension)
-    status_values: Arc<RwLock<HashMap<String, StatusValue>>>,
+    status_values: Arc<RwLock<HashMap<LedgerId, StatusValue>>>,
     /// Config values keyed by canonical address (v2 extension)
-    config_values: Arc<RwLock<HashMap<String, ConfigValue>>>,
+    config_values: Arc<RwLock<HashMap<LedgerId, ConfigValue>>>,
 }
 
 impl Default for MemoryNameService {
@@ -71,40 +69,19 @@ impl MemoryNameService {
     ///
     /// This is a convenience method for tests to bootstrap a ledger.
     pub fn create_ledger(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
-        let record = NsRecord::new(ledger_name, branch);
+        let record = NsRecord::new(LedgerId::parse(ledger_id)?);
         self.records
             .write()
             .insert(record.ledger_id.clone(), record);
         Ok(())
-    }
-
-    /// Get a record by address (internal helper)
-    fn get_record(&self, ledger_id: &str) -> Option<NsRecord> {
-        // Try direct lookup first
-        if let Some(record) = self.records.read().get(ledger_id).cloned() {
-            return Some(record);
-        }
-
-        // Try with default branch
-        let with_branch = match core_ledger_id::normalize_ledger_id(ledger_id) {
-            Ok(value) => value,
-            Err(_) => return None,
-        };
-
-        self.records.read().get(&with_branch).cloned()
-    }
-
-    /// Normalize ledger ID to canonical form
-    fn normalize_ledger_id(&self, ledger_id: &str) -> String {
-        core_ledger_id::normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string())
     }
 }
 
 #[async_trait]
 impl crate::NameServiceLookup for MemoryNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        Ok(self.get_record(ledger_id))
+        let key = LedgerId::parse(ledger_id)?;
+        Ok(self.records.read().get(&key).cloned())
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
@@ -122,7 +99,7 @@ impl crate::NameServiceLookup for MemoryNameService {
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<crate::LedgerHeads>> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         Ok(self
             .records
             .read()
@@ -140,10 +117,8 @@ impl crate::BranchLifecycle for MemoryNameService {
         source_branch: &str,
         at_commit: Option<(ContentId, i64)>,
     ) -> Result<()> {
-        let new_id = format_ledger_id(ledger_name, new_branch);
-        let key = self.normalize_ledger_id(&new_id);
-
-        let source_key = self.normalize_ledger_id(&format_ledger_id(ledger_name, source_branch));
+        let key = LedgerId::from_parts(ledger_name, new_branch)?;
+        let source_key = LedgerId::from_parts(ledger_name, source_branch)?;
 
         let mut records = self.records.write();
 
@@ -165,7 +140,7 @@ impl crate::BranchLifecycle for MemoryNameService {
             None => (source.commit_head_id.clone(), source.commit_t),
         };
 
-        let mut record = NsRecord::new(ledger_name, new_branch);
+        let mut record = NsRecord::new(key.clone());
         record.commit_head_id = commit_head_id;
         record.commit_t = commit_t;
         record.source_branch = Some(source_branch.to_string());
@@ -175,7 +150,7 @@ impl crate::BranchLifecycle for MemoryNameService {
     }
 
     async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
 
         // Refuse a branch that still has children (see the guard in
@@ -197,8 +172,7 @@ impl crate::BranchLifecycle for MemoryNameService {
 
         // Decrement parent's child count if this branch had a parent
         let parent_new_count = record.source_branch.as_ref().and_then(|source| {
-            let parent_id = format_ledger_id(&record.name, source);
-            let parent_key = self.normalize_ledger_id(&parent_id);
+            let parent_key = record.ledger_id.with_branch(source).ok()?;
             let parent = records.get_mut(&parent_key)?;
             parent.branches = parent.branches.saturating_sub(1);
             Some(parent.branches)
@@ -208,7 +182,7 @@ impl crate::BranchLifecycle for MemoryNameService {
     }
 
     async fn reset_head(&self, ledger_id: &str, snapshot: crate::NsRecordSnapshot) -> Result<()> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
 
         let record = records
@@ -226,7 +200,7 @@ impl crate::BranchLifecycle for MemoryNameService {
 #[async_trait]
 impl LedgerLifecycle for MemoryNameService {
     async fn init(&self, ledger_id: &str) -> Result<()> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
 
         // Check if record already exists — reject even if retracted (soft-dropped).
         // A hard drop removes the record entirely, which is required to reuse the alias.
@@ -235,15 +209,14 @@ impl LedgerLifecycle for MemoryNameService {
         }
 
         // Create (or reset) to a fresh NsRecord
-        let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
-        let record = NsRecord::new(ledger_name, branch);
+        let record = NsRecord::new(key.clone());
         self.records.write().insert(key, record);
 
         Ok(())
     }
 
     async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         let mut did_update = false;
 
@@ -267,7 +240,7 @@ impl LedgerLifecycle for MemoryNameService {
     }
 
     async fn purge(&self, ledger_id: &str) -> Result<()> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         self.records.write().remove(&key);
         self.status_values.write().remove(&key);
         self.config_values.write().remove(&key);
@@ -283,7 +256,7 @@ impl CommitPublisher for MemoryNameService {
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
 
         if let Some(record) = records.get_mut(&key) {
@@ -295,8 +268,7 @@ impl CommitPublisher for MemoryNameService {
             // If commit_t <= existing, silently ignore (monotonic guarantee)
         } else {
             // Create new record
-            let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
-            let mut record = NsRecord::new(ledger_name, branch);
+            let mut record = NsRecord::new(key.clone());
             record.commit_head_id = Some(commit_id.clone());
             record.commit_t = commit_t;
             records.insert(key, record);
@@ -306,8 +278,7 @@ impl CommitPublisher for MemoryNameService {
     }
 
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        // Memory nameservice always returns the normalized ledger ID for publishing
-        Some(self.normalize_ledger_id(ledger_id))
+        LedgerId::parse(ledger_id).ok().map(String::from)
     }
 }
 
@@ -319,7 +290,7 @@ impl IndexPublisher for MemoryNameService {
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
 
         if let Some(record) = records.get_mut(&key) {
@@ -331,8 +302,7 @@ impl IndexPublisher for MemoryNameService {
             // If index_t <= existing, silently ignore (monotonic guarantee)
         } else {
             // Create new record
-            let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
-            let mut record = NsRecord::new(ledger_name, branch);
+            let mut record = NsRecord::new(key.clone());
             record.index_head_id = Some(index_id.clone());
             record.index_t = index_t;
             records.insert(key, record);
@@ -350,7 +320,7 @@ impl AdminPublisher for MemoryNameService {
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
 
         if let Some(record) = records.get_mut(&key) {
@@ -362,8 +332,7 @@ impl AdminPublisher for MemoryNameService {
             // If index_t < existing, silently ignore (protect time-travel invariants)
         } else {
             // Create new record (same as publish_index)
-            let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
-            let mut record = NsRecord::new(ledger_name, branch);
+            let mut record = NsRecord::new(key.clone());
             record.index_head_id = Some(index_id.clone());
             record.index_t = index_t;
             records.insert(key, record);
@@ -376,7 +345,7 @@ impl AdminPublisher for MemoryNameService {
 #[async_trait]
 impl RefLookup for MemoryNameService {
     async fn get_ref(&self, ledger_id: &str, kind: RefKind) -> Result<Option<RefValue>> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let records = self.records.read();
 
         match records.get(&key) {
@@ -404,7 +373,7 @@ impl RefPublisher for MemoryNameService {
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
 
         let current_ref = records.get(&key).map(|r| match kind {
@@ -423,8 +392,7 @@ impl RefPublisher for MemoryNameService {
             (None, None) => {
                 // Creating a new ref — record must not exist yet.
                 // Initialize the ledger record.
-                let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
-                let mut record = NsRecord::new(ledger_name, branch);
+                let mut record = NsRecord::new(key.clone());
                 match kind {
                     RefKind::CommitHead => {
                         record.commit_head_id = new.id.clone();
@@ -496,7 +464,7 @@ impl GraphSourcePublisher for MemoryNameService {
         config: &str,
         dependencies: &[String],
     ) -> Result<()> {
-        let key = core_ledger_id::format_ledger_id(name, branch);
+        let key = LedgerId::from_parts(name, branch)?;
         let mut graph_source_records = self.graph_source_records.write();
 
         if let Some(record) = graph_source_records.get_mut(&key) {
@@ -529,7 +497,7 @@ impl GraphSourcePublisher for MemoryNameService {
         index_id: &ContentId,
         index_t: i64,
     ) -> Result<()> {
-        let key = core_ledger_id::format_ledger_id(name, branch);
+        let key = LedgerId::from_parts(name, branch)?;
         let mut graph_source_records = self.graph_source_records.write();
 
         if let Some(record) = graph_source_records.get_mut(&key) {
@@ -545,7 +513,7 @@ impl GraphSourcePublisher for MemoryNameService {
     }
 
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
-        let key = core_ledger_id::format_ledger_id(name, branch);
+        let key = LedgerId::from_parts(name, branch)?;
         let mut graph_source_records = self.graph_source_records.write();
 
         if let Some(record) = graph_source_records.get_mut(&key) {
@@ -564,12 +532,12 @@ impl GraphSourceLookup for MemoryNameService {
         &self,
         graph_source_id: &str,
     ) -> Result<Option<GraphSourceRecord>> {
-        let key = self.normalize_ledger_id(graph_source_id);
+        let key = LedgerId::parse(graph_source_id)?;
         Ok(self.graph_source_records.read().get(&key).cloned())
     }
 
     async fn lookup_any(&self, resource_id: &str) -> Result<NsLookupResult> {
-        let key = self.normalize_ledger_id(resource_id);
+        let key = LedgerId::parse(resource_id)?;
 
         if let Some(record) = self.graph_source_records.read().get(&key).cloned() {
             return Ok(NsLookupResult::GraphSource(record));
@@ -590,7 +558,7 @@ impl GraphSourceLookup for MemoryNameService {
 #[async_trait]
 impl StatusLookup for MemoryNameService {
     async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let status_values = self.status_values.read();
 
         // If status exists, return it
@@ -617,7 +585,7 @@ impl StatusPublisher for MemoryNameService {
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
 
         // Get current status (or initial if record exists but no status)
         let current = {
@@ -660,7 +628,7 @@ impl StatusPublisher for MemoryNameService {
 #[async_trait]
 impl ConfigLookup for MemoryNameService {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
         let config_values = self.config_values.read();
 
         // If config exists, return it
@@ -687,7 +655,7 @@ impl ConfigPublisher for MemoryNameService {
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        let key = self.normalize_ledger_id(ledger_id);
+        let key = LedgerId::parse(ledger_id)?;
 
         // Get current config (or unborn if record exists but no config)
         let current = {

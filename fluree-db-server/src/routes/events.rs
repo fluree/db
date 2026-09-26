@@ -22,6 +22,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use chrono::Utc;
+use fluree_db_api::LedgerId;
 use fluree_db_nameservice::{
     GraphSourceRecord, NameServiceEvent, NameServiceLookup, NsRecord, SubscriptionScope,
 };
@@ -44,13 +45,14 @@ pub struct EventsQuery {
     #[serde(default)]
     pub all: bool,
 
-    /// Specific ledger aliases to subscribe to
+    /// Specific ledgers to subscribe to, canonical. Events carry canonical
+    /// ids, so `?ledger=mydb` must match `mydb:main` events.
     #[serde(default, rename = "ledger")]
-    pub ledgers: Vec<String>,
+    pub ledgers: Vec<LedgerId>,
 
-    /// Specific graph source aliases to subscribe to
+    /// Specific graph sources to subscribe to, canonical.
     #[serde(default, rename = "graph-source")]
-    pub graph_sources: Vec<String>,
+    pub graph_sources: Vec<LedgerId>,
 }
 
 impl EventsQuery {
@@ -115,12 +117,12 @@ impl EventsQuery {
                 "all" => query.all = parse_all(value.as_deref())?,
                 "ledger" => {
                     if let Some(v) = value.filter(|v| !v.is_empty()) {
-                        query.ledgers.push(v);
+                        query.ledgers.push(LedgerId::parse(&v)?);
                     }
                 }
                 "graph-source" => {
                     if let Some(v) = value.filter(|v| !v.is_empty()) {
-                        query.graph_sources.push(v);
+                        query.graph_sources.push(LedgerId::parse(&v)?);
                     }
                 }
                 _ => {}
@@ -252,7 +254,7 @@ fn ledger_to_sse_event(record: &NsRecord) -> Event {
     let data = NsRecordData {
         action: "ns-record",
         kind: SSE_KIND_LEDGER,
-        resource_id: ledger_id.clone(),
+        resource_id: ledger_id.clone().to_string(),
         record: serde_json::json!({
             "ledger_id": ledger_id,
             "branch": record.branch,
@@ -288,7 +290,7 @@ fn graph_source_to_sse_event(record: &GraphSourceRecord) -> Event {
     let data = NsRecordData {
         action: "ns-record",
         kind: SSE_KIND_GRAPH_SOURCE,
-        resource_id: graph_source_id.clone(),
+        resource_id: graph_source_id.clone().to_string(),
         record: serde_json::json!({
             "graph_source_id": graph_source_id,
             "name": record.name,
@@ -388,7 +390,7 @@ where
 }
 
 /// Extract the resource ID (ledger alias or graph source alias) from a NameServiceEvent
-fn event_resource_id(event: &NameServiceEvent) -> &str {
+fn event_resource_id(event: &NameServiceEvent) -> &LedgerId {
     match event {
         NameServiceEvent::LedgerCommitPublished { ledger_id, .. } => ledger_id,
         NameServiceEvent::LedgerIndexPublished { ledger_id, .. } => ledger_id,
@@ -481,7 +483,7 @@ fn filter_to_allowed(params: &EventsQuery, principal: &EventsPrincipal) -> Event
 
     // If request.all but token doesn't allow all, expand to allowed lists
     // This is equivalent to all=false with the token's allowed lists
-    let mut ledgers: Vec<String> = if params.all {
+    let mut ledgers: Vec<LedgerId> = if params.all {
         principal.allowed_ledgers.iter().cloned().collect()
     } else {
         params
@@ -492,7 +494,7 @@ fn filter_to_allowed(params: &EventsQuery, principal: &EventsPrincipal) -> Event
             .collect()
     };
 
-    let mut graph_sources: Vec<String> = if params.all {
+    let mut graph_sources: Vec<LedgerId> = if params.all {
         principal.allowed_graph_sources.iter().cloned().collect()
     } else {
         params
@@ -583,10 +585,8 @@ pub async fn events(
                             true
                         } else {
                             match kind {
-                                SSE_KIND_LEDGER => params.ledgers.iter().any(|l| l == resource_id),
-                                SSE_KIND_GRAPH_SOURCE => {
-                                    params.graph_sources.iter().any(|v| v == resource_id)
-                                }
+                                SSE_KIND_LEDGER => params.ledgers.contains(resource_id),
+                                SSE_KIND_GRAPH_SOURCE => params.graph_sources.contains(resource_id),
                                 _ => false,
                             }
                         };
@@ -632,6 +632,10 @@ pub async fn events(
 mod tests {
     use super::*;
 
+    fn id(s: &str) -> fluree_db_api::LedgerId {
+        fluree_db_api::LedgerId::parse(s).unwrap()
+    }
+
     #[test]
     fn test_sha256_short() {
         let hash = sha256_short("test config");
@@ -641,7 +645,7 @@ mod tests {
     #[test]
     fn test_ledger_event_id() {
         let record = NsRecord {
-            ledger_id: "test:main".to_string(),
+            ledger_id: id("test:main"),
             name: "test".to_string(),
             branch: "main".to_string(),
             commit_head_id: None,
@@ -668,8 +672,8 @@ mod tests {
     fn test_events_query_matches() {
         let query = EventsQuery {
             all: false,
-            ledgers: vec!["books:main".to_string(), "users:main".to_string()],
-            graph_sources: vec!["search:main".to_string()],
+            ledgers: vec![id("books:main"), id("users:main")],
+            graph_sources: vec![id("search:main")],
         };
 
         assert!(query.matches("books:main", "ledger"));
@@ -761,9 +765,19 @@ mod tests {
         assert_eq!(q.ledgers, vec!["books:main".to_string()]);
         assert!(q.matches("books:main", "ledger"));
 
-        // `+` is a space in both halves of the pair.
+        // `+` is a space in both halves of the pair; ids arrive canonical, so
+        // a bare subscription matches the `name:main` events it will receive.
         let spaced = parsed("ledger=a+b");
-        assert_eq!(spaced.ledgers, vec!["a b".to_string()]);
+        assert_eq!(spaced.ledgers, vec!["a b:main".to_string()]);
+    }
+
+    /// Events carry canonical ids. A subscription spelled without a branch
+    /// used to get its snapshot and then no live events, silently.
+    #[test]
+    fn a_branchless_subscription_matches_its_canonical_events() {
+        let q = parsed("ledger=mydb");
+        assert!(q.matches("mydb:main", "ledger"));
+        assert!(!q.matches("mydb:dev", "ledger"));
     }
 
     /// `?all=` is the whole subscription request. A value this parser does

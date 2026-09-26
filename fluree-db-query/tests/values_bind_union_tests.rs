@@ -21,7 +21,7 @@ use fluree_graph_json_ld::ParsedContext;
 use std::sync::Arc;
 
 fn make_test_snapshot() -> LedgerSnapshot {
-    LedgerSnapshot::genesis("test/main")
+    LedgerSnapshot::genesis("test:main")
 }
 
 fn make_triple_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {

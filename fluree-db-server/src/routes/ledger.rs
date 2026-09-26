@@ -702,7 +702,7 @@ pub async fn info(
             return Err(ServerError::unauthorized("Bearer token required"));
         }
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(alias) {
+            if !p.can_read(&crate::error::scope_id(alias)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 // Avoid existence leak
                 return Err(ServerError::not_found("Ledger not found"));
@@ -822,7 +822,7 @@ async fn info_simplified(state: &AppState, alias: &str, span: &tracing::Span) ->
                 "ledger info retrieved (simplified)"
             );
             return Ok(Json(LedgerInfoResponse {
-                ledger_id: record.ledger_id.clone(),
+                ledger_id: record.ledger_id.clone().to_string(),
                 t: record.commit_t,
                 commit_head_id: record.commit_head_id.clone(),
                 index_head_id: record.index_head_id.clone(),
@@ -934,7 +934,7 @@ pub async fn exists(
             return Err(ServerError::unauthorized("Bearer token required"));
         }
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&alias) {
+            if !p.can_read(&crate::error::scope_id(&alias)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 // Avoid existence leak
                 return Err(ServerError::not_found("Ledger not found"));
@@ -1105,7 +1105,7 @@ async fn create_branch_local(state: Arc<AppState>, request: Request) -> Result<i
         };
 
         let response = CreateBranchResponse {
-            ledger_id: record.ledger_id.clone(),
+            ledger_id: record.ledger_id.clone().to_string(),
             branch: record.branch.clone(),
             source: record.source_branch.unwrap_or_default(),
             t: record.commit_t,
@@ -1149,24 +1149,31 @@ pub async fn list_branches(
             set_span_error_code(&span, "error:Unauthorized");
             return Err(ServerError::unauthorized("Bearer token required"));
         }
-        if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&ledger) {
-                set_span_error_code(&span, "error:Forbidden");
-                return Err(ServerError::not_found("Ledger not found"));
-            }
-        }
-
         let records = state
             .fluree
             .list_branches(&ledger)
             .await
             .map_err(ServerError::Api)?;
 
+        // Scopes name branches, not ledgers: list only the branches this
+        // token may read, and don't reveal the ledger when that is none.
+        let records: Vec<_> = match bearer.0.as_ref() {
+            Some(p) => records
+                .into_iter()
+                .filter(|r| p.can_read(&r.ledger_id))
+                .collect(),
+            None => records,
+        };
+        if bearer.0.is_some() && records.is_empty() {
+            set_span_error_code(&span, "error:Forbidden");
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+
         let branches = records
             .into_iter()
             .map(|r| BranchInfo {
                 branch: r.branch,
-                ledger_id: r.ledger_id,
+                ledger_id: r.ledger_id.to_string(),
                 t: r.commit_t,
                 source: r.source_branch,
             })
@@ -2020,8 +2027,23 @@ pub async fn merge_preview(
             set_span_error_code(&span, "error:Unauthorized");
             return Err(ServerError::unauthorized("Bearer token required"));
         }
+        // Authorize every branch the preview reads: the source, and the
+        // target — explicit, or the source's parent the API defaults to.
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&ledger) {
+            let name = fluree_db_api::LedgerName::parse(&ledger)?;
+            let source = name.with_branch(&params.source)?;
+            let target = match params.target.as_deref() {
+                Some(t) => Some(name.with_branch(t)?),
+                None => state
+                    .fluree
+                    .nameservice()
+                    .lookup(&source)
+                    .await?
+                    .and_then(|r| r.source_branch)
+                    .map(|b| name.with_branch(&b))
+                    .transpose()?,
+            };
+            if !p.can_read(&source) || target.is_some_and(|t| !p.can_read(&t)) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
@@ -2177,8 +2199,10 @@ pub async fn revert_preview(
             set_span_error_code(&span, "error:Unauthorized");
             return Err(ServerError::unauthorized("Bearer token required"));
         }
+        // Authorize the branch the preview reads, not the bare ledger name.
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&ledger) {
+            let branch = fluree_db_api::LedgerName::parse(&ledger)?.with_branch(&params.branch)?;
+            if !p.can_read(&branch) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }

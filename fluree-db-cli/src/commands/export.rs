@@ -189,7 +189,7 @@ async fn run_ledger_archive(
         ));
     }
 
-    let local_ledger_id = context::to_ledger_id(alias);
+    let local_ledger_id = context::to_ledger_id(alias)?;
 
     if let Some(remote_name) = remote_flag {
         // When the alias is tracked AND points at this same remote, archive
@@ -199,9 +199,7 @@ async fn run_ledger_archive(
         // at a different remote (or the alias isn't tracked), fall back to
         // using the alias literally on that remote.
         let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-        let tracked = store
-            .get_tracked(alias)
-            .or_else(|| store.get_tracked(&local_ledger_id));
+        let tracked = store.get_tracked(&local_ledger_id);
         let remote_ledger_id = match tracked.as_ref() {
             Some(t) if t.remote == remote_name => t.remote_alias.clone(),
             _ => local_ledger_id.clone(),
@@ -220,7 +218,7 @@ async fn run_ledger_archive(
     let ledger_id = local_ledger_id;
 
     let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    if store.get_tracked(alias).is_some() || store.get_tracked(&ledger_id).is_some() {
+    if store.get_tracked(&ledger_id).is_some() {
         return Err(CliError::Usage(
             "this alias points at a tracked ledger (no local data); \
              pass `--remote <name>` to archive the upstream copy."
@@ -476,9 +474,7 @@ async fn run_local_rdf(
     dirs: &FlureeDir,
 ) -> CliResult<()> {
     let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    if store.get_tracked(alias).is_some()
-        || store.get_tracked(&context::to_ledger_id(alias)).is_some()
-    {
+    if store.get_tracked(&context::to_ledger_id(alias)?).is_some() {
         return Err(CliError::Usage(
             "export is not available for tracked ledgers (no local data); pass --remote <name> to export from the upstream."
                 .to_string(),

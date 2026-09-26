@@ -113,25 +113,6 @@ pub fn extract_identifier(address: &str) -> Option<&str> {
     parse_fluree_address(address)?.identifier
 }
 
-/// Extract the ledger path prefix from a Fluree content-addressed address.
-///
-/// For an address like `fluree:memory://mydb/main/commit/abc123.fcv2`,
-/// returns `Some("mydb/main")` — the portion before the content-type directory.
-///
-/// This is useful for constructing a `StorageContentStore` bridge that uses the
-/// same path layout as the original writes. The returned prefix is already in
-/// path form (no `:` colon), so it can be passed directly to `bridge_content_store`.
-pub fn extract_ledger_prefix(address: &str) -> Option<String> {
-    let parsed = parse_fluree_address(address)?;
-    // Content-type directory markers used by content_path()
-    for marker in ["/commit/", "/txn/", "/index/", "/blob/"] {
-        if let Some(pos) = parsed.path.find(marker) {
-            return Some(parsed.path[..pos].to_string());
-        }
-    }
-    None
-}
-
 /// Extract the path portion from a Fluree address.
 ///
 /// This returns the path after the `://` delimiter, regardless of whether

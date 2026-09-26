@@ -406,7 +406,7 @@ async fn resolve_block_ledger(
     fluree: &fluree_db_api::Fluree,
     kind: ContentKind,
     ledger: &str,
-) -> Result<Option<String>, ServerError> {
+) -> Result<Option<fluree_db_api::LedgerId>, ServerError> {
     let ns = fluree.nameservice();
     if let Some(record) = ns
         .lookup(ledger)
@@ -452,7 +452,7 @@ pub async fn get_ns_record(
     headers: HeaderMap,
 ) -> Result<Response, ServerError> {
     // Check authorization for this specific ledger
-    if !principal.is_authorized_for_ledger(&ledger_id) {
+    if !principal.is_authorized_for_ledger(&crate::error::scope_id(&ledger_id)?) {
         // Return 404 for unauthorized (no existence leak)
         return Err(ServerError::not_found("Ledger not found"));
     }
@@ -482,7 +482,7 @@ pub async fn get_ns_record(
         // IMPORTANT: this endpoint is consumed by `fluree-db-nameservice-sync` which
         // deserializes into `NsRecord`. Therefore we must include all required
         // `NsRecord` fields with matching names and semantics.
-        ledger_id: ns_record.ledger_id.clone(),
+        ledger_id: ns_record.ledger_id.clone().to_string(),
         name: ns_record.name.clone(),
         branch: ns_record.branch.clone(),
         commit_head_id: ns_record

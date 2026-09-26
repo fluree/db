@@ -495,7 +495,7 @@ async fn drop_unsupported_edges(
 
 async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(args.ledger.as_deref(), dirs)?;
-    let ledger_id = context::to_ledger_id(&alias);
+    let ledger_id = context::to_ledger_id(&alias)?;
     let config = resolve_config(dirs).await?;
 
     let inputs = collect_inputs(&args.paths)?;

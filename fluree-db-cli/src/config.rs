@@ -1,5 +1,6 @@
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::{self, ConfigFormat, FlureeDir, CONFIG_FILE_TOML, FLUREE_DIR};
+use fluree_db_api::LedgerId;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -479,9 +480,9 @@ use serde::{Deserialize, Serialize};
 /// remote for ref-level sync. The [`TrackMode`] selects how queries execute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedLedgerConfig {
-    pub local_alias: String,
+    pub local_alias: LedgerId,
     pub remote: String,
-    pub remote_alias: String,
+    pub remote_alias: LedgerId,
     /// How queries against this tracked ledger execute (default: proxy).
     #[serde(default)]
     pub mode: TrackMode,
@@ -851,13 +852,13 @@ impl SyncConfigStore for TomlSyncConfigStore {
 
     async fn get_upstream(
         &self,
-        local_alias: &str,
+        local_alias: &LedgerId,
     ) -> fluree_db_nameservice_sync::Result<Option<UpstreamConfig>> {
         let config = self.read_sync_config();
         Ok(config
             .upstreams
             .into_iter()
-            .find(|u| u.local_alias == local_alias))
+            .find(|u| u.local_alias == *local_alias))
     }
 
     async fn set_upstream(
@@ -881,9 +882,12 @@ impl SyncConfigStore for TomlSyncConfigStore {
             .map_err(|e| fluree_db_nameservice_sync::SyncError::Config(e.to_string()))
     }
 
-    async fn remove_upstream(&self, local_alias: &str) -> fluree_db_nameservice_sync::Result<()> {
+    async fn remove_upstream(
+        &self,
+        local_alias: &LedgerId,
+    ) -> fluree_db_nameservice_sync::Result<()> {
         let mut config = self.read_sync_config();
-        config.upstreams.retain(|u| u.local_alias != local_alias);
+        config.upstreams.retain(|u| u.local_alias != *local_alias);
         self.write_sync_config(&config)
             .map_err(|e| fluree_db_nameservice_sync::SyncError::Config(e.to_string()))
     }
@@ -903,11 +907,11 @@ impl TomlSyncConfigStore {
     }
 
     /// Get a tracked ledger by local name.
-    pub fn get_tracked(&self, local_alias: &str) -> Option<TrackedLedgerConfig> {
+    pub fn get_tracked(&self, local_alias: &LedgerId) -> Option<TrackedLedgerConfig> {
         self.read_sync_config()
             .tracked_ledgers
             .into_iter()
-            .find(|t| t.local_alias == local_alias)
+            .find(|t| t.local_alias == *local_alias)
     }
 
     /// Add a tracked ledger. Replaces if the name already exists.
@@ -928,12 +932,12 @@ impl TomlSyncConfigStore {
     }
 
     /// Remove a tracked ledger by local name. Returns true if it existed.
-    pub fn remove_tracked(&self, local_alias: &str) -> CliResult<bool> {
+    pub fn remove_tracked(&self, local_alias: &LedgerId) -> CliResult<bool> {
         let mut config = self.read_sync_config();
         let before = config.tracked_ledgers.len();
         config
             .tracked_ledgers
-            .retain(|t| t.local_alias != local_alias);
+            .retain(|t| t.local_alias != *local_alias);
         let removed = config.tracked_ledgers.len() < before;
         if removed {
             self.write_sync_config(&config)?;

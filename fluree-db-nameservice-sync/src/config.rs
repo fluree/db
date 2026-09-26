@@ -4,6 +4,7 @@
 
 use crate::error::Result;
 use async_trait::async_trait;
+use fluree_db_core::LedgerId;
 use fluree_db_nameservice::RemoteName;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -92,11 +93,11 @@ pub struct RemoteConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     /// Local ledger ID (e.g., "mydb:main")
-    pub local_alias: String,
+    pub local_alias: LedgerId,
     /// Which remote this tracks
     pub remote: RemoteName,
     /// Ledger ID on the remote (usually same as local_alias)
-    pub remote_alias: String,
+    pub remote_alias: LedgerId,
     /// Whether to automatically fast-forward local on fetch
     pub auto_pull: bool,
 }
@@ -109,9 +110,9 @@ pub trait SyncConfigStore: Debug + Send + Sync {
     async fn remove_remote(&self, name: &RemoteName) -> Result<()>;
     async fn list_remotes(&self) -> Result<Vec<RemoteConfig>>;
 
-    async fn get_upstream(&self, local_alias: &str) -> Result<Option<UpstreamConfig>>;
+    async fn get_upstream(&self, local_alias: &LedgerId) -> Result<Option<UpstreamConfig>>;
     async fn set_upstream(&self, config: &UpstreamConfig) -> Result<()>;
-    async fn remove_upstream(&self, local_alias: &str) -> Result<()>;
+    async fn remove_upstream(&self, local_alias: &LedgerId) -> Result<()>;
     async fn list_upstreams(&self) -> Result<Vec<UpstreamConfig>>;
 }
 
@@ -119,7 +120,7 @@ pub trait SyncConfigStore: Debug + Send + Sync {
 #[derive(Debug, Default)]
 pub struct MemorySyncConfigStore {
     remotes: parking_lot::RwLock<std::collections::HashMap<String, RemoteConfig>>,
-    upstreams: parking_lot::RwLock<std::collections::HashMap<String, UpstreamConfig>>,
+    upstreams: parking_lot::RwLock<std::collections::HashMap<LedgerId, UpstreamConfig>>,
 }
 
 impl MemorySyncConfigStore {
@@ -150,7 +151,7 @@ impl SyncConfigStore for MemorySyncConfigStore {
         Ok(self.remotes.read().values().cloned().collect())
     }
 
-    async fn get_upstream(&self, local_alias: &str) -> Result<Option<UpstreamConfig>> {
+    async fn get_upstream(&self, local_alias: &LedgerId) -> Result<Option<UpstreamConfig>> {
         Ok(self.upstreams.read().get(local_alias).cloned())
     }
 
@@ -161,7 +162,7 @@ impl SyncConfigStore for MemorySyncConfigStore {
         Ok(())
     }
 
-    async fn remove_upstream(&self, local_alias: &str) -> Result<()> {
+    async fn remove_upstream(&self, local_alias: &LedgerId) -> Result<()> {
         self.upstreams.write().remove(local_alias);
         Ok(())
     }
@@ -209,20 +210,31 @@ mod tests {
         let store = MemorySyncConfigStore::new();
 
         let config = UpstreamConfig {
-            local_alias: "mydb:main".to_string(),
+            local_alias: LedgerId::parse("mydb:main").unwrap(),
             remote: origin(),
-            remote_alias: "mydb:main".to_string(),
+            remote_alias: LedgerId::parse("mydb:main").unwrap(),
             auto_pull: true,
         };
 
         store.set_upstream(&config).await.unwrap();
 
-        let fetched = store.get_upstream("mydb:main").await.unwrap().unwrap();
+        let fetched = store
+            .get_upstream(&LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.remote, origin());
         assert!(fetched.auto_pull);
 
-        store.remove_upstream("mydb:main").await.unwrap();
-        assert!(store.get_upstream("mydb:main").await.unwrap().is_none());
+        store
+            .remove_upstream(&LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        assert!(store
+            .get_upstream(&LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]

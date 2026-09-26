@@ -363,7 +363,8 @@ impl crate::Fluree {
                 .and_then(|s| s.shapes_source.as_ref())
                 .is_some_and(|s| s.ledger.is_some());
             let cross = if is_cross_ledger {
-                let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(ledger_id, self);
+                let mut resolve_ctx =
+                    crate::cross_ledger::ResolveCtx::new(&view.snapshot.ledger_id, self);
                 crate::tx::open_cross_ledger_shapes_model(config.as_ref(), &mut resolve_ctx)
                     .await
                     .map_err(ApiError::from)?
@@ -551,7 +552,7 @@ async fn validate_view_inner(
             // `include_attached` is set, the attached shape dbs pushed above
             // contribute the union — never a double scan of graph 0.
             static NO_OVERLAY: NoOverlay = NoOverlay;
-            inline_snapshot = Some(LedgerSnapshot::genesis(ledger_id));
+            inline_snapshot = Some(LedgerSnapshot::genesis(&view.snapshot.ledger_id));
             inline_overlay = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
                 &NO_OVERLAY,
                 bundle,

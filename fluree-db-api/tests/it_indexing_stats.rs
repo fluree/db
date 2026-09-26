@@ -62,7 +62,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
     // Extract metadata from FIR6 root
     let root = fluree_db_binary_index::IndexRoot::decode(&bytes).expect("decode FIR6 root");
     let meta = LedgerSnapshotMetadata {
-        ledger_id: root.ledger_id,
+        ledger_id: fluree_db_api::LedgerId::parse(&root.ledger_id).unwrap(),
         t: root.index_t,
         base_t: root.base_t,
         namespace_codes: root.namespace_codes.into_iter().collect(),

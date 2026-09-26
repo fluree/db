@@ -10,6 +10,7 @@ use crate::graph_registry::GraphRegistry;
 use crate::ids::GraphId;
 use crate::index_schema::IndexSchema;
 use crate::index_stats::IndexStats;
+use crate::ledger_id::{IntoLedgerId, LedgerId};
 use crate::namespaces::default_namespace_codes;
 use crate::ns_encoding::{canonical_split, NsSplitMode};
 use crate::range_provider::RangeProvider;
@@ -27,7 +28,7 @@ use std::sync::Arc;
 /// for constructing a metadata-only `LedgerSnapshot`.
 pub struct LedgerSnapshotMetadata {
     /// Ledger ID (e.g., "mydb:main")
-    pub ledger_id: String,
+    pub ledger_id: LedgerId,
     /// Current transaction time (upper bound of index coverage).
     pub t: i64,
     /// Earliest transaction time covered by this index.
@@ -125,7 +126,7 @@ pub struct LedgerSnapshotMetadata {
 /// writing) happens at the call site, not inside `Db`.
 pub struct LedgerSnapshot {
     /// Ledger ID (e.g., "mydb:main")
-    pub ledger_id: String,
+    pub ledger_id: LedgerId,
     /// Current transaction time
     pub t: i64,
     /// Earliest transaction time covered by the underlying index.
@@ -307,11 +308,13 @@ impl LedgerSnapshot {
     /// Used when a nameservice has a commit but no index yet.
     /// The database starts at t=0 with no base data.  Queries against
     /// a genesis LedgerSnapshot return overlay (novelty) flakes only.
-    pub fn genesis(ledger_id: &str) -> Self {
+    pub fn genesis(ledger_id: impl IntoLedgerId) -> Self {
+        let ledger_id = ledger_id.into_ledger_id();
         let namespace_codes = default_namespace_codes();
         let namespace_reverse = build_namespace_reverse(&namespace_codes);
         Self {
-            ledger_id: ledger_id.to_string(),
+            graph_registry: GraphRegistry::new_for_ledger(&ledger_id),
+            ledger_id,
             t: 0,
             base_t: 0,
             version: 3,
@@ -324,7 +327,6 @@ impl LedgerSnapshot {
             subject_watermarks: Vec::new(),
             string_watermark: 0,
             range_provider: None,
-            graph_registry: GraphRegistry::new_for_ledger(ledger_id),
             has_annotations: false,
             annotation_index: None,
             had_annotation_arena: false,
@@ -888,8 +890,15 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     let index_t = read_i64(bytes, &mut pos)?;
     let base_t = read_i64(bytes, &mut pos)?;
 
-    // Ledger ID
-    let ledger_id = read_string(bytes, &mut pos)?;
+    // Ledger ID. Roots are re-stamped from the nameservice record on load,
+    // so this is provenance, not identity; roots written before
+    // canonicalization may carry a branchless id.
+    let ledger_id = LedgerId::parse(&read_string(bytes, &mut pos)?).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("index root ledger id: {e}"),
+        )
+    })?;
 
     // Subject ID encoding (skip; stored on FIR6 root only)
     let _subject_id_encoding = read_u8(bytes, &mut pos)?;
@@ -1168,7 +1177,7 @@ mod tests {
         ns.insert(0u16, String::new());
         ns.insert(100u16, "http://example.org/".to_string());
         let db = LedgerSnapshot::new_meta(LedgerSnapshotMetadata {
-            ledger_id: "test:main".into(),
+            ledger_id: LedgerId::parse("test:main").unwrap(),
             t: 1,
             base_t: 0,
             namespace_codes: ns,

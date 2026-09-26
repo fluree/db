@@ -128,7 +128,7 @@ mod wal;
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
 
-use crate::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};
+use crate::address_path::{storage_ledger_id, SHARED_NAMESPACE};
 use crate::error::Result;
 use async_trait::async_trait;
 use sha2::Digest;
@@ -828,6 +828,8 @@ pub struct StorageContentStore<S: Storage> {
     storage: S,
     ledger_id: String,
     method: String,
+    /// `(name/branch, name/@shared)`, derived once rather than per address.
+    prefixes: (String, String),
 }
 
 impl<S: Storage> StorageContentStore<S> {
@@ -839,10 +841,13 @@ impl<S: Storage> StorageContentStore<S> {
     /// * `ledger_id` - Ledger identifier (e.g., `"mydb:main"`)
     /// * `method` - Storage method name for address generation (e.g., `"file"`, `"memory"`)
     pub fn new(storage: S, ledger_id: impl Into<String>, method: impl Into<String>) -> Self {
+        let ledger_id = ledger_id.into();
+        let prefixes = storage_path_prefixes(&ledger_id);
         Self {
             storage,
-            ledger_id: ledger_id.into(),
+            ledger_id,
             method: method.into(),
+            prefixes,
         }
     }
 
@@ -851,9 +856,9 @@ impl<S: Storage> StorageContentStore<S> {
         let kind = id.content_kind().ok_or_else(|| {
             crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
         })?;
-        let hex_digest = id.digest_hex();
-        let addr = content_address(&self.method, kind, &self.ledger_id, &hex_digest);
-        Ok(addr)
+        let (prefix, shared) = &self.prefixes;
+        let path = content_path_from_prefixes(kind, prefix, shared, &id.digest_hex());
+        Ok(format!("fluree:{}://{path}", self.method))
     }
 
     /// For dict blobs, return the pre-global-dicts address where dicts lived
@@ -1477,11 +1482,24 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
-/// Convert a ledger ID to a path prefix.
-///
-/// Handles the standard ledger ID format (e.g., "mydb:main" -> "mydb/main").
+/// Convert a ledger ID to a path prefix (`"mydb:main"` -> `"mydb/main"`).
 pub fn ledger_id_prefix_for_path(ledger_id: &str) -> String {
-    ledger_id_to_path_prefix(ledger_id).unwrap_or_else(|_| ledger_id.replace(':', "/"))
+    storage_path_prefixes(ledger_id).0
+}
+
+/// `(name/branch, name/@shared)` for a ledger id a storage seam received.
+///
+/// An id that does not parse cannot have been created, so it cannot own
+/// content; its paths keep the pre-validation shape so a read of it misses
+/// rather than landing in another ledger's namespace.
+fn storage_path_prefixes(ledger_id: &str) -> (String, String) {
+    match storage_ledger_id(ledger_id, "a storage path") {
+        Ok(id) => (id.path_prefix(), id.shared_prefix()),
+        Err(_) => (
+            ledger_id.replace(':', "/"),
+            format!("{ledger_id}/{SHARED_NAMESPACE}").replace(':', "/"),
+        ),
+    }
 }
 
 /// Leading path segment under which graph-source artifacts (snapshots and
@@ -1501,7 +1519,16 @@ pub const GRAPH_SOURCES_PATH_SEGMENT: &str = "graph-sources";
 ///   (note: keyed by graph_source_id, not a ledger id)
 /// - etc.
 pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> String {
-    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let (prefix, shared) = storage_path_prefixes(ledger_id);
+    content_path_from_prefixes(kind, &prefix, &shared, hash_hex)
+}
+
+fn content_path_from_prefixes(
+    kind: ContentKind,
+    prefix: &str,
+    shared: &str,
+    hash_hex: &str,
+) -> String {
     match kind {
         ContentKind::Commit => format!("{prefix}/commit/{hash_hex}.fcv2"),
         ContentKind::Txn => format!("{prefix}/txn/{hash_hex}.json"),
@@ -1510,7 +1537,6 @@ pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> Strin
         ContentKind::DictBlob { dict } => {
             // Dictionaries are global per ledger — shared across all branches.
             // Use the @shared namespace (can't collide with branch names since @ is forbidden).
-            let shared = shared_prefix_for_path(ledger_id);
             let ext = dict_kind_extension(dict);
             format!("{shared}/dicts/{hash_hex}.{ext}")
         }

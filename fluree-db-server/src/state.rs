@@ -22,7 +22,6 @@ use crate::telemetry::TelemetryConfig;
 use dashmap::DashMap;
 use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, NameServiceMode};
 use fluree_db_consensus::{CachingCommitter, SubmittingCommitter};
-use fluree_db_core::ledger_id::normalize_ledger_id;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -87,7 +86,7 @@ pub struct AppState {
     /// This gates optional DynamoDB nameservice checks on long-running query
     /// servers. It stores attempts, not successes, to prevent bursty failures
     /// from stampeding the nameservice.
-    query_refresh_last_checked: DashMap<String, Instant>,
+    query_refresh_last_checked: DashMap<fluree_db_api::LedgerId, Instant>,
 
     /// Serving posture memo, keyed by ledger id with value `(t, posture)`.
     ///
@@ -342,7 +341,10 @@ impl AppState {
             return false;
         }
 
-        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        // An id that does not parse names no ledger to refresh.
+        let Ok(canonical) = fluree_db_api::LedgerId::parse(ledger_id) else {
+            return false;
+        };
         let now = Instant::now();
         let ttl = Duration::from_millis(self.config.query_refresh_ttl_ms);
 
@@ -368,9 +370,10 @@ impl AppState {
             return;
         }
 
-        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
-        self.query_refresh_last_checked
-            .insert(canonical, Instant::now());
+        if let Ok(canonical) = fluree_db_api::LedgerId::parse(ledger_id) {
+            self.query_refresh_last_checked
+                .insert(canonical, Instant::now());
+        }
     }
 
     /// Get server uptime in seconds

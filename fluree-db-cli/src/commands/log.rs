@@ -66,7 +66,7 @@ pub async fn run(
 
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
-        let ledger_id = context::to_ledger_id(&alias);
+        let ledger_id = context::to_ledger_id(&alias)?;
         let client = context::build_remote_client(remote_name, dirs).await?;
         let result = run_remote(&ledger_id, oneline, limit, &client).await;
         context::persist_refreshed_tokens(&client, remote_name, dirs).await;
@@ -76,7 +76,7 @@ pub async fn run(
     if !direct {
         if let Some(client) = context::try_server_route_client(dirs) {
             let alias = context::resolve_ledger(ledger, dirs)?;
-            let ledger_id = context::to_ledger_id(&alias);
+            let ledger_id = context::to_ledger_id(&alias)?;
             let result = run_remote(&ledger_id, oneline, limit, &client).await;
             context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
             return result;
@@ -159,9 +159,7 @@ async fn run_local(
     // Check for tracked ledger — log requires local commit chain access
     let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     let alias = context::resolve_ledger(ledger, dirs)?;
-    if store.get_tracked(&alias).is_some()
-        || store.get_tracked(&context::to_ledger_id(&alias)).is_some()
-    {
+    if store.get_tracked(&context::to_ledger_id(&alias)?).is_some() {
         return Err(CliError::Usage(
             "commit log is not available for tracked ledgers (no local commit chain).\n  \
              Use `fluree track status` to check remote state instead, or pass `--remote <name>`."
@@ -170,7 +168,7 @@ async fn run_local(
     }
 
     let fluree = context::build_fluree(dirs)?;
-    let ledger_id = context::to_ledger_id(&alias);
+    let ledger_id = context::to_ledger_id(&alias)?;
 
     // The same call the server's `GET /v1/fluree/log` makes, so `--direct` and
     // the auto-routed lane answer identically. It owns the nameservice lookup,

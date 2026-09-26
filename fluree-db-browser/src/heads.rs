@@ -193,7 +193,7 @@ impl HeadSink for PeerHeadSink {
             }
             RemoteEvent::LedgerUpdated(record) => {
                 let change = HeadChange {
-                    ledger_id: record.ledger_id.clone(),
+                    ledger_id: record.ledger_id.to_string(),
                     commit_t: record.commit_t,
                     index_t: record.index_t,
                 };

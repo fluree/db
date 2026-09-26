@@ -30,10 +30,10 @@ use crate::{
     StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
 use fluree_db_core::{
-    CasAction, CasOutcome, ContentId, Error as CoreError, StorageCas, StorageList, StorageRead,
-    StorageWrite,
+    CasAction, CasOutcome, ContentId, Error as CoreError, LedgerId, StorageCas, StorageList,
+    StorageRead, StorageWrite,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -290,9 +290,14 @@ where
             .map(|t| GraphSourceType::from_type_string(t))
             .unwrap_or(GraphSourceType::Unknown("unknown".to_string()));
 
-        // Convert to GraphSourceRecord
+        // Convert to GraphSourceRecord. The file is authoritative for
+        // identity; a different name/branch at this path is another source.
+        let graph_source_id = LedgerId::from_parts(&main.name, &main.branch)?;
+        if graph_source_id.name() != name || graph_source_id.branch() != branch {
+            return Ok(None);
+        }
         let mut record = GraphSourceRecord {
-            graph_source_id: format_ledger_id(name, branch),
+            graph_source_id,
             name: main.name,
             branch: main.branch,
             source_type,
@@ -351,11 +356,28 @@ where
 
     /// Load and merge main record with index file
     async fn load_record(&self, ledger_name: &str, branch: &str) -> Result<Option<NsRecord>> {
-        let main_key = self.ns_key(ledger_name, branch);
-        let index_key = self.index_key(ledger_name, branch);
+        let record = self
+            .read_record_at(&self.ns_key(ledger_name, branch))
+            .await?;
+        // The file is authoritative for identity. A file whose name/branch
+        // differ from the requested ones belongs to another ledger that maps
+        // to the same path (`a:b/c` vs `a/b:c`), so this ledger does not exist.
+        Ok(record.filter(|r| r.name == ledger_name && r.branch == branch))
+    }
+
+    /// Read the ledger record stored at `main_key`, taking its identity from
+    /// the file rather than the path: a path does not determine `name:branch`
+    /// once names and branches may both contain `/`.
+    async fn read_record_at(&self, main_key: &str) -> Result<Option<NsRecord>> {
+        let index_key = main_key
+            .strip_suffix(".json")
+            .map(|stem| format!("{stem}.index.json"))
+            .ok_or_else(|| {
+                NameServiceError::storage(format!("not an ns record key: {main_key}"))
+            })?;
 
         // Read the main record bytes once.
-        let main_bytes = match self.storage.read_bytes(&main_key).await {
+        let main_bytes = match self.storage.read_bytes(main_key).await {
             Ok(bytes) => bytes,
             Err(CoreError::NotFound(_)) => return Ok(None),
             Err(e) => {
@@ -375,6 +397,15 @@ where
             return Ok(None);
         }
 
+        // Enumeration hands us sidecar keys too (`{branch}.index.json`,
+        // `{gs}.snapshots.json`): a branch may legitimately be named
+        // `x.index`, so the suffix alone cannot say which file this is.
+        if crate::ns_format::has_sidecar_suffix(main_key)
+            && !crate::ns_format::is_ledger_main_record(&main_bytes)
+        {
+            return Ok(None);
+        }
+
         let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
 
         // Read index file (if exists)
@@ -382,7 +413,7 @@ where
 
         // Convert to NsRecord, parsing persisted CID strings
         let mut record = NsRecord {
-            ledger_id: format_ledger_id(ledger_name, branch),
+            ledger_id: LedgerId::from_parts(&main.ledger.id, &main.branch)?,
             name: main.ledger.id.clone(),
             branch: main.branch,
             commit_head_id: main
@@ -541,16 +572,14 @@ where
         let mut records = Vec::new();
 
         for key in keys {
-            if key.ends_with(".index.json") || !key.ends_with(".json") {
+            if !key.ends_with(".json") {
                 continue;
             }
 
-            // Extract branch name from the key suffix
-            let file_part = key.rsplit('/').next().unwrap_or("");
-            let branch = file_part.trim_end_matches(".json");
-
-            if let Ok(Some(record)) = self.load_record(ledger_name, branch).await {
-                if !record.retracted {
+            // Keys under `{ledger_name}/` also include nested ledgers
+            // (`{ledger_name}/sub/main.json`); the record says which it is.
+            if let Ok(Some(record)) = self.read_record_at(&key).await {
+                if record.name == ledger_name && !record.retracted {
                     records.push(record);
                 }
             }
@@ -574,38 +603,16 @@ where
         let mut records = Vec::new();
 
         for key in keys {
-            // Skip index files
-            if key.ends_with(".index.json") {
-                continue;
-            }
-
             if !key.ends_with(".json") {
                 continue;
             }
 
-            // Parse ledger name and branch from key
-            // Key format: {prefix}/ns@v2/{ledger-name}/{branch}.json
-            let path_part = if self.prefix.is_empty() {
-                key.strip_prefix(&format!("{NS_VERSION}/"))
-            } else {
-                key.strip_prefix(&format!("{}/{}/", self.prefix, NS_VERSION))
-            };
-
-            if let Some(path) = path_part {
-                // path is now "{ledger-name}/{branch}.json"
-                if let Some(slash_pos) = path.rfind('/') {
-                    let ledger_name = &path[..slash_pos];
-                    let branch = path[slash_pos + 1..].trim_end_matches(".json");
-
-                    // A read failure must not silently shrink the result:
-                    // callers that decide what to delete treat a missing
-                    // branch as one with nothing to protect. `Ok(None)` is a
-                    // legitimate skip (graph-source record, or a branch
-                    // dropped since the key listing).
-                    if let Some(record) = self.load_record(ledger_name, branch).await? {
-                        records.push(record);
-                    }
-                }
+            // A read failure must not silently shrink the result: callers
+            // that decide what to delete treat a missing branch as one with
+            // nothing to protect. `Ok(None)` is a legitimate skip
+            // (graph-source record, or a branch dropped since the listing).
+            if let Some(record) = self.read_record_at(&key).await? {
+                records.push(record);
             }
         }
 
@@ -896,7 +903,7 @@ where
 
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
         // Return normalized ledger ID for publishing
-        Some(normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string()))
+        LedgerId::parse(ledger_id).ok().map(String::from)
     }
 }
 
@@ -2098,6 +2105,61 @@ mod tests {
         let current = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert_eq!(current.v, 1);
         assert_eq!(current.payload.unwrap().default_context, Some(ctx_cid));
+    }
+
+    /// Enumeration takes identity from each record, never from its path:
+    /// nested names, legacy `/` branches, and branches spelled like sidecar
+    /// files all round-trip (a record missing here reads as unprotected to GC).
+    #[tokio::test]
+    async fn test_storage_ns_enumeration_round_trips_ambiguous_layouts() {
+        let ns = make_storage_ns();
+        for id in [
+            "acme:main",
+            "acme/inventory:main",
+            "mydb:release/v1.0",
+            "mydb:feature.index",
+            "mydb:main.json",
+        ] {
+            publish_commit(&ns, id, 1, &dummy_cid(id)).await;
+        }
+
+        let mut all: Vec<String> = ns
+            .all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                assert_eq!(r.ledger_id, format!("{}:{}", r.name, r.branch));
+                r.ledger_id.to_string()
+            })
+            .collect();
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                "acme/inventory:main",
+                "acme:main",
+                "mydb:feature.index",
+                "mydb:main.json",
+                "mydb:release/v1.0"
+            ]
+        );
+
+        let acme: Vec<_> = ns.list_branches("acme").await.unwrap();
+        assert_eq!(acme.len(), 1, "nested ledger is not a branch: {acme:?}");
+        let mut mydb: Vec<String> = ns
+            .list_branches("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        mydb.sort();
+        assert_eq!(mydb, ["feature.index", "main.json", "release/v1.0"]);
+
+        // Same path, different identity: not this ledger.
+        assert!(ns.lookup("mydb/release:v1.0").await.unwrap().is_none());
+        assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
     }
 
     #[tokio::test]

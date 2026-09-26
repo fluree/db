@@ -629,7 +629,7 @@ pub(crate) fn enforce_write_access(
                 "Authentication required (signed request or Bearer token)",
             ));
         };
-        if !p.can_write(ledger) {
+        if !p.can_write(&crate::error::scope_id(ledger)?) {
             set_span_error_code(&tracing::Span::current(), "error:Forbidden");
             // Avoid existence leak
             return Err(ServerError::not_found("Ledger not found"));
@@ -640,7 +640,7 @@ pub(crate) fn enforce_write_access(
     // In Optional/None mode: if a bearer token is present, it still limits access.
     if !credential.is_signed() {
         if let Some(p) = bearer {
-            if !p.can_write(ledger) {
+            if !p.can_write(&crate::error::scope_id(ledger)?) {
                 set_span_error_code(&tracing::Span::current(), "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }

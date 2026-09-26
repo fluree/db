@@ -174,7 +174,7 @@ pub async fn submission_status(
         return Err(ServerError::unauthorized("Bearer token required"));
     }
     if let Some(principal) = bearer.0.as_ref() {
-        if !principal.can_read(&params.ledger) {
+        if !principal.can_read(&crate::error::scope_id(&params.ledger)?) {
             // Match the existence-leak avoidance in `info`: out-of-scope and
             // missing-ledger return the same 404 so a caller can't use the
             // response to distinguish them.

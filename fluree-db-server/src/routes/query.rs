@@ -541,7 +541,7 @@ pub(crate) fn enforce_bearer_dataset_scope(
         .map_err(|e| ServerError::bad_request(e.to_string()))?;
     for source in spec.default_graphs.iter().chain(spec.named_graphs.iter()) {
         let base = base_ledger_id(&source.identifier)?;
-        if !principal.can_read(&base) {
+        if !principal.can_read(&crate::error::scope_id(&base)?) {
             set_span_error_code(span, "error:Forbidden");
             return Err(ServerError::not_found("Ledger not found"));
         }
@@ -644,6 +644,24 @@ async fn attach_default_context_to_graph(
         .await
         .map_err(ServerError::Api)?;
     Ok(graph.with_default_context(ctx))
+}
+
+/// Authorize every ledger a SPARQL dataset (FROM / FROM NAMED) names.
+///
+/// A dataset that does not parse is refused rather than skipped: the scope
+/// check must not accept less than the engine will go on to execute.
+pub(crate) fn authorize_sparql_dataset(
+    p: &crate::extract::DataPrincipal,
+    sparql: &str,
+) -> Result<()> {
+    let ledger_ids = fluree_db_api::sparql_dataset_ledger_ids(sparql)
+        .map_err(|e| ServerError::bad_request(e.to_string()))?;
+    for ledger_id in &ledger_ids {
+        if !p.can_read(&crate::error::scope_id(ledger_id)?) {
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+    }
+    Ok(())
 }
 
 /// Execute a query
@@ -777,15 +795,7 @@ pub async fn query(
         // Enforce bearer ledger scope for unsigned SPARQL requests
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() {
-                // Extract ledger IDs from FROM/FROM NAMED clauses.
-                // Parse failure → fall through (let the engine produce a proper error).
-                if let Ok(ledger_ids) = fluree_db_api::sparql_dataset_ledger_ids(&sparql) {
-                    for ledger_id in &ledger_ids {
-                        if !p.can_read(ledger_id) {
-                            return Err(ServerError::not_found("Ledger not found"));
-                        }
-                    }
-                }
+                authorize_sparql_dataset(p, &sparql)?;
             }
         }
 
@@ -1023,7 +1033,7 @@ pub async fn query(
 
         // Enforce bearer ledger scope for unsigned requests
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger_id) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger_id)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 // Avoid existence leak
                 return Err(ServerError::not_found("Ledger not found"));
@@ -1144,7 +1154,7 @@ pub async fn query_ledger(
 
         // Enforce bearer ledger scope for unsigned requests
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
@@ -1172,7 +1182,7 @@ pub async fn query_ledger(
     // the SPARQL/JSON-LD paths.
     if headers.is_cypher_query() {
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
@@ -1234,7 +1244,7 @@ pub async fn query_ledger(
 
     // Enforce bearer ledger scope for unsigned requests
     if let Some(p) = bearer.0.as_ref() {
-        if !credential.is_signed() && !p.can_read(&ledger) {
+        if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
             set_span_error_code(&span, "error:Forbidden");
             return Err(ServerError::not_found("Ledger not found"));
         }
@@ -1457,7 +1467,7 @@ pub async fn explain_ledger(
 
             // Enforce bearer ledger scope for unsigned requests
             if let Some(p) = bearer.0.as_ref() {
-                if !credential.is_signed() && !p.can_read(&ledger) {
+                if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                     set_span_error_code(&span, "error:Forbidden");
                     return Err(ServerError::not_found("Ledger not found"));
                 }
@@ -1474,9 +1484,9 @@ pub async fn explain_ledger(
                 .unwrap_or_default();
             let has_dataset_clauses = !from_ids.is_empty();
             if has_dataset_clauses {
-                let base_path = base_ledger_id(&ledger)?;
+                let base_path = crate::error::scope_id(&ledger)?;
                 for from in &from_ids {
-                    let base = base_ledger_id(from)?;
+                    let base = crate::error::scope_id(from)?;
                     if base != base_path {
                         set_span_error_code(&span, "error:BadRequest");
                         return Err(ServerError::bad_request(format!(
@@ -1531,7 +1541,7 @@ pub async fn explain_ledger(
         // query path, so the reported plan matches what /query would run.
         if headers.is_cypher_query() {
             if let Some(p) = bearer.0.as_ref() {
-                if !credential.is_signed() && !p.can_read(&ledger) {
+                if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                     set_span_error_code(&span, "error:Forbidden");
                     return Err(ServerError::not_found("Ledger not found"));
                 }
@@ -1592,7 +1602,7 @@ pub async fn explain_ledger(
 
         // Enforce bearer ledger scope for unsigned requests
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
@@ -3714,14 +3724,20 @@ pub async fn explain(
             let ledger_id = base_ledger_id(&ledger_id_raw)?;
             span.record("ledger_id", ledger_id.as_str());
 
-            // Enforce bearer ledger scope for unsigned requests. We compare
-            // against the *base* ledger id (sans `@t:` suffix) so scoped
-            // tokens authorize time-travel explains.
+            // Enforce bearer ledger scope for unsigned requests: the header
+            // ledger, and every FROM ledger — the dataset path below explains
+            // against FROM, so authorizing only the header would let a
+            // `fluree-ledger: allowed@t:1` header explain `FROM <secret>`.
             if let Some(p) = bearer.0.as_ref() {
-                if !credential.is_signed() && !p.can_read(&ledger_id) {
-                    set_span_error_code(&span, "error:Forbidden");
-                    // Avoid existence leak
-                    return Err(ServerError::not_found("Ledger not found"));
+                if !credential.is_signed() {
+                    if !p.can_read(&crate::error::scope_id(&ledger_id)?) {
+                        set_span_error_code(&span, "error:Forbidden");
+                        // Avoid existence leak
+                        return Err(ServerError::not_found("Ledger not found"));
+                    }
+                    authorize_sparql_dataset(p, &sparql).inspect_err(|_| {
+                        set_span_error_code(&span, "error:Forbidden");
+                    })?;
                 }
             }
 
@@ -3806,7 +3822,7 @@ pub async fn explain(
 
         // Enforce bearer ledger scope for unsigned requests (base id only).
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger_id) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger_id)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
@@ -3945,9 +3961,11 @@ pub(crate) async fn load_ledger_or_missing(
         .as_ref()
         .expect("peer_state should exist in peer mode");
 
-    // Check freshness using FreshnessSource trait
+    // Check freshness using FreshnessSource trait, keyed by the id the handle
+    // actually loaded: SSE watermarks carry canonical ids, and a request that
+    // spelled the ledger `mydb` would otherwise never find one.
     // If no watermark available (SSE hasn't seen ledger), treat as current (lenient policy)
-    if let Some(watermark) = peer_state.watermark(ledger_id) {
+    if let Some(watermark) = peer_state.watermark(handle.id()) {
         match handle.check_freshness(&watermark).await {
             FreshnessCheck::Stale => {
                 // Remote is ahead - reload ledger from shared storage
@@ -3959,7 +3977,7 @@ pub(crate) async fn load_ledger_or_missing(
                 );
 
                 if let Some(mgr) = fluree.ledger_manager() {
-                    mgr.reload(ledger_id).await.map_err(ServerError::Api)?;
+                    mgr.reload(handle.id()).await.map_err(ServerError::Api)?;
                     state.refresh_counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -4364,7 +4382,7 @@ pub async fn multi_query(
             if let Some(principal) = bearer.0.as_ref() {
                 if !credential.is_signed() {
                     for ledger_id in &distinct_ledgers {
-                        if !principal.can_read(ledger_id) {
+                        if !principal.can_read(&crate::error::scope_id(ledger_id)?) {
                             set_span_error_code(&span, "error:Forbidden");
                             return Err(ServerError::not_found("Ledger not found"));
                         }
