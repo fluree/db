@@ -1615,3 +1615,61 @@ async fn changes_multi_value_predicate_nets_independently() {
         "only the deleted value appears; the sibling value is untouched"
     );
 }
+
+/// A sync leaves the target's own changes out of the branch's change list.
+///
+/// dev commits first, so syncing main in writes a merge commit carrying
+/// main's changes. Previewing dev back into main must list dev's change
+/// alone: the rest came from main.
+#[tokio::test]
+async fn preview_after_sync_lists_only_the_branch_own_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    let insert = |ledger: String, id: String| {
+        let fluree = &fluree;
+        async move {
+            let state = fluree.ledger(&ledger).await.unwrap();
+            fluree
+                .insert(
+                    state,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [{"@id": format!("ex:{id}"), "ex:name": id}]
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    insert("mydb:main".into(), "a".into()).await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    insert("mydb:dev".into(), "d1".into()).await;
+    for n in 2..=4 {
+        insert("mydb:main".into(), format!("m{n}")).await;
+    }
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_changes: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let changes = preview.changes.expect("changes were requested");
+    let subjects: Vec<&str> = changes.entries.iter().map(|e| e.subject.as_str()).collect();
+    assert_eq!(subjects, ["http://example.org/ns/d1"]);
+}

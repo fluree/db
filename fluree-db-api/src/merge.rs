@@ -815,7 +815,7 @@ impl crate::Fluree {
 /// carry the source's own changes. A merge on the line keeps only the flakes
 /// that are its resolution; see [`OwnChanges`]. The fold runs oldest-first
 /// so that earlier commits win on namespace and graph delta key collisions.
-async fn collect_commit_data(
+pub(crate) async fn collect_commit_data(
     store: &impl ContentStore,
     cids: &[ContentId],
     own: &[ContentId],

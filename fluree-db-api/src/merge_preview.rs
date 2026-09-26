@@ -21,7 +21,7 @@ use fluree_db_core::{
     ContentStore, Flake,
 };
 use fluree_db_ledger::LedgerState;
-use fluree_db_novelty::{compute_delta_keys_and_changes, delta_keys_and_changes_of, delta_keys_of};
+use fluree_db_novelty::{compute_delta_keys_and_changes, delta_keys_of};
 use futures::{stream, StreamExt, TryStreamExt};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
@@ -512,27 +512,39 @@ impl crate::Fluree {
         let need_validation = opts.include_validation && !fast_forward && diff.is_some();
 
         // The change set folds every commit on the source's line, because a
-        // merge the source made carries how it resolved that merge. Conflict
-        // keys come from the source's own changes only.
+        // merge the source made carries how it resolved that merge. A merge
+        // that brought the target in keeps only its resolution, as in the
+        // merge this previews. Conflict keys come from the source's own
+        // changes only.
         let source_fut = async {
             match (&diff, &source_head) {
                 (Some(diff), _) => {
-                    let (_, net, ns_delta) = if need_changes || need_validation {
-                        delta_keys_and_changes_of(&source_store, &diff.source.commits, true).await?
+                    let want_keys = need_conflicts || need_validation;
+                    if need_changes || need_validation {
+                        // One walk serves both: folding the line yields the
+                        // change set, and the commits carrying the source's
+                        // own changes yield the conflict keys.
+                        let (data, keys) = crate::merge::collect_commit_data(
+                            &source_store,
+                            &diff.source.commits,
+                            &diff.source.own,
+                        )
+                        .await?;
+                        Ok::<_, ApiError>((
+                            want_keys.then_some(keys),
+                            Some(data.flakes),
+                            Some(data.namespace_delta),
+                        ))
                     } else {
-                        Default::default()
-                    };
-                    let keys = if need_conflicts || need_validation {
-                        Some(delta_keys_of(&source_store, &diff.source.own).await?)
-                    } else {
-                        None
-                    };
-                    let has_changes = need_changes || need_validation;
-                    Ok::<_, ApiError>((
-                        keys,
-                        has_changes.then_some(net),
-                        has_changes.then_some(ns_delta),
-                    ))
+                        // Keys alone. Only the source's own commits are
+                        // read, and nothing is folded.
+                        let keys = if want_keys {
+                            Some(delta_keys_of(&source_store, &diff.source.own).await?)
+                        } else {
+                            None
+                        };
+                        Ok((keys, None, None))
+                    }
                 }
                 // No target head: the change set is the source's whole
                 // history.

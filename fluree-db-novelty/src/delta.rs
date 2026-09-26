@@ -94,40 +94,17 @@ pub async fn delta_keys_of<C: ContentStore + ?Sized>(
     store: &C,
     cids: &[ContentId],
 ) -> Result<FxHashSet<ConflictKey>> {
-    Ok(delta_keys_and_changes_of(store, cids, false).await?.0)
-}
-
-/// [`delta_keys_of`], and also the net change those commits apply. See
-/// [`compute_delta_keys_and_changes`] for the netting contract.
-pub async fn delta_keys_and_changes_of<C: ContentStore + ?Sized>(
-    store: &C,
-    cids: &[ContentId],
-    with_changes: bool,
-) -> Result<(FxHashSet<ConflictKey>, Vec<Flake>, HashMap<u16, String>)> {
     let mut keys = FxHashSet::default();
-    let mut acc = NetChangeAccumulator::default();
-    let mut namespace_delta: HashMap<u16, String> = HashMap::new();
-
-    // Newest first, as the accumulator requires.
-    for cid in cids.iter().rev() {
+    for cid in cids {
         let commit = load_commit_by_id(store, cid).await?;
-        // A colliding namespace code keeps the oldest commit's prefix.
-        for (code, prefix) in commit.namespace_delta {
-            namespace_delta.insert(code, prefix);
-        }
-        for flake in commit.flakes.iter().rev() {
-            keys.insert(ConflictKey::new(
-                flake.s.clone(),
-                flake.p.clone(),
-                flake.g.clone(),
-            ));
-            if with_changes {
-                acc.push_newest_first(flake);
-            }
-        }
+        keys.extend(
+            commit
+                .flakes
+                .iter()
+                .map(|flake| ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())),
+        );
     }
-
-    Ok((keys, acc.finish(), namespace_delta))
+    Ok(keys)
 }
 
 /// Walk the first-parent lineage from `head_id` back to `stop_at_t`,
