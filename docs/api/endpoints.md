@@ -2190,7 +2190,7 @@ POST /branch
 | `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
 | `branch` | string | Yes | New branch name to create (e.g., "feature-x") |
 | `source` | string | No | Source branch to create from. Default: `"main"` |
-| `at` | string | No | Commit on the source branch to start from. `"t:N"` for a transaction number, or a hex digest / full CID for prefix resolution. When omitted, the branch starts at the source's current HEAD. `t:` / prefix resolution requires the source to be indexed. |
+| `at` | string | No | Point on the source branch to start from, in the same spellings as the `at` of `POST /export/*ledger`: `t:<N>`, `time:<ISO-8601>` (commit event time; `iso:` is an alias), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), `commit:<hex-prefix>`, `latest` / `t:latest`, or a bare transaction number, ISO-8601 timestamp, hex digest prefix or full CID. The branch starts at the commit a query at `@<at>` on the source would read, so `"time:2026-01-01T00:00:00Z"` branches from the data as of that instant. When omitted, the branch starts at the source's current HEAD. |
 
 **Response:**
 
@@ -2212,7 +2212,7 @@ POST /branch
 
 **Status Codes:**
 - `201 Created` - Branch created successfully
-- `400 Bad Request` - Invalid request body (including malformed `at` value), or the source branch has no commits yet
+- `400 Bad Request` - Invalid request body (including malformed `at` value), the source branch has no commits yet, or `at` names no commit on it: a time before its first commit, a malformed timestamp, or `snapshot:<id>` (a graph-source table snapshot)
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
 - `404 Not Found` - Source branch does not exist, or `at` commit is not reachable from source HEAD
 - `409 Conflict` - Branch already exists
@@ -2235,6 +2235,11 @@ curl -X POST http://localhost:8090/v1/fluree/branch \
 curl -X POST http://localhost:8090/v1/fluree/branch \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "branch": "rewind", "at": "t:5"}'
+
+# Branch from the data as of a point in time
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "q2", "at": "time:2026-07-01T00:00:00Z"}'
 ```
 
 ### GET /branch/{ledger-name}
