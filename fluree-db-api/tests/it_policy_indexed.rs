@@ -385,6 +385,14 @@ async fn policy_batched_join_lane_declines_index_only() {
                 json!([[1]]),
                 "join count must exclude the hidden SSN"
             );
+            count_query["select"] = json!(["?name", "(as (count *) ?n)"]);
+            count_query["groupBy"] = json!(["?name"]);
+            let grouped =
+                support::query_jsonld_with_policy(&fluree, &ledger_indexed, &count_query, &policy_ctx)
+                    .await
+                    .expect("grouped join count with policy");
+            let grouped = grouped.to_jsonld(&ledger_indexed.snapshot).expect("grouped jsonld");
+            assert_eq!(grouped, json!([[rows[0][0], 1]]));
         })
         .await;
 }

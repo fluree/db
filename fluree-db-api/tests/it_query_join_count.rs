@@ -4,6 +4,28 @@ use crate::support::{genesis_ledger, span_capture};
 use fluree_db_api::{FlureeBuilder, QueryInput, ReindexOptions};
 use serde_json::json;
 
+fn grouped_counts(rows: &serde_json::Value, columns: &[usize]) -> serde_json::Value {
+    let mut groups = std::collections::BTreeMap::new();
+    for row in rows.as_array().unwrap() {
+        let key: Vec<_> = columns.iter().map(|&col| row[col].clone()).collect();
+        let (_, count) = groups.entry(json!(key).to_string()).or_insert((key, 0));
+        *count += 1;
+    }
+    json!(groups
+        .into_values()
+        .map(|(mut key, count)| {
+            key.push(json!(count));
+            key
+        })
+        .collect::<Vec<_>>())
+}
+
+fn sorted_rows(rows: serde_json::Value) -> serde_json::Value {
+    let mut rows = rows.as_array().unwrap().clone();
+    rows.sort_by_key(ToString::to_string);
+    json!(rows)
+}
+
 #[tokio::test]
 async fn join_count_preserves_filters_multiplicity_and_visible_facts() {
     const PEOPLE: usize = 1200;
@@ -51,7 +73,28 @@ async fn join_count_preserves_filters_multiplicity_and_visible_facts() {
             .query(&view, QueryInput::Sparql(&query))
             .await
             .unwrap();
+        let grouped_query = format!("PREFIX ex: <http://example.org/> SELECT ?city (COUNT(*) AS ?n) WHERE {{ {path} {filter} }} GROUP BY ?city");
+        let grouped = fluree
+            .query(&view, QueryInput::Sparql(&grouped_query))
+            .await
+            .unwrap();
         drop(guard);
+        let grouped = grouped.to_jsonld(&view.snapshot).unwrap();
+        assert_eq!(grouped.as_array().unwrap().len(), 2);
+        assert!(grouped
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row[1] == json!(PEOPLE * 3)));
+        let grouped_drains = spans.find_events("nested-loop grouped count drain complete");
+        assert_eq!(grouped_drains.len(), 1, "indexed={indexed}");
+        if indexed {
+            assert_eq!(
+                grouped_drains[0].fields["counted_rows"],
+                (PEOPLE * 6).to_string()
+            );
+            assert_eq!(grouped_drains[0].fields["materialized_rows"], "0");
+        }
         assert_eq!(
             result.to_jsonld(&view.snapshot).unwrap(),
             json!([[PEOPLE * 6]])
@@ -109,6 +152,81 @@ async fn join_count_preserves_filters_multiplicity_and_visible_facts() {
                 expected,
                 "{rows}"
             );
+            let raw = result.to_jsonld(&view.snapshot).unwrap();
+            for (group_vars, columns) in [
+                ("?city", vec![1]),
+                ("?city ?f", vec![1, 2]),
+                ("?fof", vec![3]),
+            ] {
+                // Includes a right-side key, which must decline the drain and
+                // use ordinary grouping, plus a composite driving-side key.
+                let grouped_query = format!("PREFIX ex: <http://example.org/> SELECT {group_vars} (COUNT(*) AS ?n) WHERE {{ {body} }} GROUP BY {group_vars}");
+                let grouped = fluree
+                    .query(&view, QueryInput::Sparql(&grouped_query))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    sorted_rows(grouped.to_jsonld(&view.snapshot).unwrap()),
+                    sorted_rows(grouped_counts(&raw, &columns)),
+                    "indexed={indexed}: {grouped_query}"
+                );
+            }
+        }
+
+        for (body, group_vars, columns) in [
+            (
+                format!("VALUES ?tag {{ UNDEF 1 1 2 }} {path}"),
+                "?city ?tag",
+                vec![0, 1],
+            ),
+            // A shared subject left unbound by VALUES must be filled by the
+            // scan; grouping its original UNDEF would silently miscount.
+            (
+                "VALUES ?f { ex:a UNDEF } ?f ex:knows ?fof".into(),
+                "?f",
+                vec![0],
+            ),
+            (
+                format!("{{ SELECT DISTINCT ?city ?fof WHERE {{ {path} }} }}"),
+                "?city",
+                vec![0],
+            ),
+            (
+                format!("{{ SELECT ?city ?fof WHERE {{ {path} }} LIMIT 17 }}"),
+                "?city",
+                vec![0],
+            ),
+        ] {
+            let raw_query =
+                format!("PREFIX ex: <http://example.org/> SELECT {group_vars} WHERE {{ {body} }}");
+            let raw = fluree
+                .query(&view, QueryInput::Sparql(&raw_query))
+                .await
+                .unwrap();
+            let expected = sorted_rows(grouped_counts(
+                &raw.to_jsonld(&view.snapshot).unwrap(),
+                &columns,
+            ));
+            // Multiple COUNT(*) outputs may share the grouped drain. A mixed
+            // aggregate (COUNT(?fof)) must retain row consumption.
+            for other_count in ["COUNT(*)", "COUNT(?fof)"] {
+                let grouped_query = format!("PREFIX ex: <http://example.org/> SELECT {group_vars} (COUNT(*) AS ?n) ({other_count} AS ?m) WHERE {{ {body} }} GROUP BY {group_vars}");
+                let grouped = fluree
+                    .query(&view, QueryInput::Sparql(&grouped_query))
+                    .await
+                    .unwrap();
+                let mut grouped = grouped.to_jsonld(&view.snapshot).unwrap();
+                for row in grouped.as_array_mut().unwrap() {
+                    let row = row.as_array_mut().unwrap();
+                    let second_count = row.pop().unwrap();
+                    assert_eq!(row.last().unwrap(), &second_count, "{grouped_query}");
+                }
+                assert_eq!(
+                    sorted_rows(grouped),
+                    expected,
+                    "indexed={indexed}: {grouped_query}"
+                );
+            }
         }
     }
 
@@ -137,6 +255,24 @@ async fn join_count_preserves_filters_multiplicity_and_visible_facts() {
             result.to_jsonld(&view.snapshot).unwrap(),
             json!([[PEOPLE * 8 + 1]])
         );
+        let grouped_query = format!("PREFIX ex: <http://example.org/> SELECT ?city (COUNT(*) AS ?n) WHERE {{ {path} {filter} }} GROUP BY ?city");
+        let grouped = fluree
+            .query(&view, QueryInput::Sparql(&grouped_query))
+            .await
+            .unwrap();
+        let raw_query =
+            format!("PREFIX ex: <http://example.org/> SELECT ?city WHERE {{ {path} {filter} }}");
+        let raw = fluree
+            .query(&view, QueryInput::Sparql(&raw_query))
+            .await
+            .unwrap();
+        assert_eq!(
+            sorted_rows(grouped.to_jsonld(&view.snapshot).unwrap()),
+            sorted_rows(grouped_counts(
+                &raw.to_jsonld(&view.snapshot).unwrap(),
+                &[0]
+            ))
+        );
     }
     let historical = fluree.db_at_t(ledger_id, before_update).await.unwrap();
     let result = fluree
@@ -147,4 +283,16 @@ async fn join_count_preserves_filters_multiplicity_and_visible_facts() {
         result.to_jsonld(&historical.snapshot).unwrap(),
         json!([[PEOPLE * 6]])
     );
+    let grouped_query = format!("PREFIX ex: <http://example.org/> SELECT ?city (COUNT(*) AS ?n) WHERE {{ {path} {filter} }} GROUP BY ?city");
+    let grouped = fluree
+        .query(&historical, QueryInput::Sparql(&grouped_query))
+        .await
+        .unwrap();
+    let grouped = grouped.to_jsonld(&historical.snapshot).unwrap();
+    assert_eq!(grouped.as_array().unwrap().len(), 2);
+    assert!(grouped
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row[1] == json!(PEOPLE * 3)));
 }

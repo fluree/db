@@ -386,8 +386,14 @@ supports this on its batched subject-probe path: it counts matches after the
 ordinary scan and inline filters, preserving left-row multiplicity, without
 building output batches. It uses the same visibility, overlay, and history
 handling as the normal scan, and shapes it cannot count directly fall back to
-row execution. Grouped counts in the general operator tree still consume joined
-rows. The fast paths and count planner (Layer 5) apply the same idea more broadly.
+row execution. When every aggregate is `COUNT(*)` and all group keys come from
+the driving side of a batched subject join, a grouped drain counts matches per
+input row and folds those counts into normalized group keys. This avoids the
+join's output expansion and hashes each surviving input row once, regardless of
+its number of matches. Retained groups contribute to the query's memory estimate;
+keys introduced on the right, joined-row `BIND`, and mixed aggregates retain row
+consumption. The fast paths and count planner (Layer 5) apply the same idea more
+broadly.
 
 **Duplicate control.** Deep existential chains
 (`?a p1 ?b . ?b p2 ?c . ?c p3 ?x`) accumulate duplicate rows: once `?a` is no

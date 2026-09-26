@@ -7,6 +7,8 @@
 //! query rows, outside the timed region.
 //! Cases ending in `_drain` cannot reach their LIMIT on the default fixture.
 //! `PROBE_DRAIN_BASELINE=1` removes that LIMIT to compare throughput planning.
+//! `PROBE_GROUP_BASELINE=1` uses COUNT(?fof) for grouped COUNT(*) cases: ?fof is
+//! always bound, so results agree while consumption stays on the row path.
 //! `FLUREE_HASH_JOIN=1` forces eligible hash joins; inspect `PROBE_PLANS` as well.
 //! Measures query execution (without response serialization), with one warmup.
 
@@ -24,6 +26,8 @@ const QUERIES: &[(&str, &str)] = &[
     ("type_filter_count", "SELECT (COUNT(*) AS ?n) WHERE { ?p a ex:Person ; ex:age ?age FILTER(?age > 60) }"),
     ("chain_filter_count", "SELECT (COUNT(*) AS ?n) WHERE { ?p ex:livesIn ?city ; ex:knows ?f . ?f ex:knows ?fof FILTER(?fof != ?p) }"),
     ("group_count", "SELECT ?city (COUNT(*) AS ?n) WHERE { ?p ex:livesIn ?city ; ex:knows ?f . ?f ex:knows ?fof } GROUP BY ?city"),
+    ("group_filter_count", "SELECT ?city (COUNT(*) AS ?n) WHERE { ?p ex:livesIn ?city ; ex:knows ?f . ?f ex:knows ?fof FILTER(?fof != ?p) } GROUP BY ?city"),
+    ("group_person_count", "SELECT ?p (COUNT(*) AS ?n) WHERE { ?p ex:livesIn ?city ; ex:knows ?f . ?f ex:knows ?fof } GROUP BY ?p"),
     ("group_count_distinct", "SELECT ?city (COUNT(DISTINCT ?fof) AS ?n) WHERE { ?p ex:livesIn ?city ; ex:knows ?f . ?f ex:knows ?fof } GROUP BY ?city"),
     ("not_exists_count", "SELECT (COUNT(*) AS ?n) WHERE { ?p a ex:Person FILTER NOT EXISTS { ?p ex:worksFor ?org } }"),
     ("minus_count", "SELECT (COUNT(*) AS ?n) WHERE { ?p a ex:Person MINUS { ?p ex:worksFor ?org } }"),
@@ -114,6 +118,18 @@ async fn main() {
             continue;
         }
         let query = format!("PREFIX ex: <http://example.org/>\n{query}");
+        let query = if std::env::var_os("PROBE_GROUP_BASELINE").is_some() {
+            assert!(
+                matches!(
+                    *name,
+                    "group_count" | "group_filter_count" | "group_person_count"
+                ),
+                "PROBE_GROUP_BASELINE requires a grouped COUNT(*) case"
+            );
+            replace_once(&query, "COUNT(*)", "COUNT(?fof)")
+        } else {
+            query
+        };
         let full_drain = name.ends_with("_drain");
         let drain_baseline = std::env::var_os("PROBE_DRAIN_BASELINE").is_some();
         if drain_baseline {
@@ -195,31 +211,48 @@ async fn main() {
             );
             println!("{name}: {rows} rows agree with ordinary row execution");
         }
-        if matches!(*name, "two_hop_aggregate" | "group_count_distinct")
-            && std::env::var_os("PROBE_VERIFY").is_some()
+        if matches!(
+            *name,
+            "two_hop_aggregate"
+                | "group_count_distinct"
+                | "group_count"
+                | "group_filter_count"
+                | "group_person_count"
+        ) && std::env::var_os("PROBE_VERIFY").is_some()
         {
             // Fold the ordinary bag of joined rows independently of the
             // aggregate planner. Verify every group, before ORDER BY/LIMIT.
             let full_query = query.split(" ORDER BY ").next().unwrap();
             let (_, suffix) = full_query.split_once(" WHERE ").unwrap();
             let (body, _) = suffix.rsplit_once(" GROUP BY ").unwrap();
+            let key = if *name == "group_person_count" {
+                "?p"
+            } else {
+                "?city"
+            };
             let raw_query =
-                format!("PREFIX ex: <http://example.org/> SELECT ?city ?fof WHERE {body}");
+                format!("PREFIX ex: <http://example.org/> SELECT {key} ?fof WHERE {body}");
             let raw = fluree
                 .query(&view, QueryInput::Sparql(&raw_query))
                 .await
                 .expect("raw rows");
             let raw = raw.to_jsonld(&view.snapshot).expect("format raw rows");
             let mut groups = BTreeMap::new();
+            let distinct = matches!(*name, "two_hop_aggregate" | "group_count_distinct");
             for row in raw.as_array().expect("row array") {
-                let (_, values) = groups
+                let (_, count, values) = groups
                     .entry(row[0].to_string())
-                    .or_insert_with(|| (row[0].clone(), BTreeSet::new()));
-                values.insert(row[1].to_string());
+                    .or_insert_with(|| (row[0].clone(), 0usize, BTreeSet::new()));
+                *count += 1;
+                if distinct {
+                    values.insert(row[1].to_string());
+                }
             }
             let mut control_rows: Vec<_> = groups
                 .into_values()
-                .map(|(city, values)| serde_json::json!([city, values.len()]))
+                .map(|(city, count, values)| {
+                    serde_json::json!([city, if distinct { values.len() } else { count }])
+                })
                 .collect();
             let result = fluree
                 .query(&view, QueryInput::Sparql(full_query))
@@ -230,7 +263,7 @@ async fn main() {
             control_rows.sort_by_key(ToString::to_string);
             assert_eq!(
                 actual_rows, control_rows,
-                "distinct counts differ from raw rows"
+                "group counts differ from raw rows"
             );
             println!(
                 "{name}: {} groups agree with counts from raw rows",
