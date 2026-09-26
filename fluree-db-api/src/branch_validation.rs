@@ -138,7 +138,7 @@ impl crate::Fluree {
             .map(|(g_id, (_, iri))| (g_id, iri))
             .collect();
         let outcome = self
-            .validate_branch_op_view(&mut view, &reverse_graph, namespace_delta, &new_graph_iris)
+            .validate_branch_op_view(&mut view, namespace_delta, &new_graph_iris)
             .await?;
         Ok((view, outcome))
     }
@@ -190,13 +190,12 @@ impl crate::Fluree {
     }
 
     /// Validate a staged view against the target ledger's SHACL
-    /// configuration and shapes. `reverse_graph` is the map the view was
-    /// built with.
+    /// configuration and shapes. `new_graph_iris` names graphs the incoming
+    /// commits create, which the target's registry does not know yet.
     #[cfg(feature = "shacl")]
     async fn validate_branch_op_view(
         &self,
         view: &mut StagedLedger,
-        reverse_graph: &HashMap<Sid, GraphId>,
         namespace_delta: &HashMap<u16, String>,
         new_graph_iris: &HashMap<GraphId, String>,
     ) -> Result<BranchOpValidation> {
@@ -249,53 +248,32 @@ impl crate::Fluree {
                     "the source branch's namespace allocations conflict with the target's: {e}"
                 ))
             })?;
-        let cross_ledger_data_ns_map: Option<HashMap<u16, String>> =
-            cross_ledger_shapes.as_ref().map(|_| {
-                staged_ns
-                    .all_codes()
-                    .into_iter()
-                    .filter_map(|code| staged_ns.get_prefix(code).map(|p| (code, p.to_string())))
-                    .collect()
-            });
-        let cross_ledger_membership = match (&cross_ledger_shapes, &cross_ledger_data_ns_map) {
-            (Some(model), Some(ns_map)) => Some(fluree_db_shacl::CrossLedgerMembership {
-                model_db: fluree_db_core::GraphDbRef::new(
-                    &model.model_db.snapshot,
-                    model.model_g_id,
-                    model.model_db.overlay.as_ref(),
-                    model.model_db.t,
-                ),
-                data_ns_map: ns_map,
-                same_term_space: false,
-            }),
-            _ => None,
-        };
+        let cross_ledger_data_ns_map = cross_ledger_shapes
+            .as_ref()
+            .map(|_| crate::tx::namespace_prefix_map(&staged_ns));
+        let cross_ledger_membership = cross_ledger_shapes
+            .as_ref()
+            .zip(cross_ledger_data_ns_map.as_ref())
+            .map(|(model, ns_map)| model.membership(ns_map));
 
         // Graph routing for the staged flakes: every named graph they touch,
         // with its IRI for per-graph config resolution. The default graph
         // always gets the ledger-wide policy.
-        let graph_sids: HashMap<GraphId, Sid> = reverse_graph
-            .iter()
-            .map(|(sid, g_id)| (*g_id, sid.clone()))
-            .collect();
         let mut graph_delta: rustc_hash::FxHashMap<u16, String> = rustc_hash::FxHashMap::default();
-        for g_sid in view.staged_flakes().iter().filter_map(|f| f.g.as_ref()) {
-            if let Some(&g_id) = reverse_graph.get(g_sid) {
-                let iri = base
-                    .snapshot
-                    .graph_registry
-                    .iri_for_graph_id(g_id)
-                    .map(str::to_string)
-                    .or_else(|| new_graph_iris.get(&g_id).cloned());
-                if let Some(iri) = iri {
-                    graph_delta.entry(g_id).or_insert(iri);
-                }
+        for (g_id, _) in view.staged_flakes_by_graph().filter(|(g_id, _)| *g_id != 0) {
+            let iri = base
+                .snapshot
+                .graph_registry
+                .iri_for_graph_id(g_id)
+                .map(str::to_string)
+                .or_else(|| new_graph_iris.get(&g_id).cloned());
+            if let Some(iri) = iri {
+                graph_delta.entry(g_id).or_insert(iri);
             }
         }
 
         let ctx = StagedShaclContext {
             graph_delta: Some(&graph_delta),
-            graph_sids: Some(&graph_sids),
             tracker: None,
             cross_ledger_shapes: cross_ledger_shapes.as_ref().and_then(|m| m.wire()),
             staged_ns: Some(&staged_ns),
@@ -328,7 +306,6 @@ impl crate::Fluree {
     async fn validate_branch_op_view(
         &self,
         _view: &mut StagedLedger,
-        _reverse_graph: &HashMap<Sid, GraphId>,
         _namespace_delta: &HashMap<u16, String>,
         _new_graph_iris: &HashMap<GraphId, String>,
     ) -> Result<BranchOpValidation> {

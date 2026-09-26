@@ -86,8 +86,6 @@ pub use staged_dicts::{
 };
 
 #[cfg(feature = "shacl")]
-pub use stage::{
-    stage_with_shacl, validate_view_with_shacl, ShaclGraphPolicy, ShaclValidationOutcome,
-};
+pub use stage::{validate_view_with_shacl, ShaclGraphPolicy, ShaclValidationOutcome};
 
 pub mod commit_v2;

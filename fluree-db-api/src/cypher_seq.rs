@@ -425,19 +425,7 @@ impl Fluree {
                 flakes.is_empty(),
                 "no-op sequential write with staged flakes"
             );
-            (
-                fluree_db_transact::CommitReceipt {
-                    commit_id: fluree_db_core::ContentId::new(
-                        fluree_db_core::ContentKind::Commit,
-                        &[],
-                    ),
-                    t: base.t(),
-                    flake_count: 0,
-                    assert_count: 0,
-                    retract_count: 0,
-                },
-                base,
-            )
+            (fluree_db_transact::CommitReceipt::no_op(base.t()), base)
         } else {
             self.commit_staged(view, ns_registry, index_config, commit_opts)
                 .await?

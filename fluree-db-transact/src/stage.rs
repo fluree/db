@@ -5,9 +5,8 @@
 //!
 //! ## SHACL Validation
 //!
-//! When the `shacl` feature is enabled, you can use [`stage_with_shacl`] to validate
-//! staged flakes against SHACL shapes before returning the view. This ensures that
-//! data conforms to the defined shape constraints.
+//! When the `shacl` feature is enabled, [`validate_view_with_shacl`] validates a
+//! staged view against SHACL shapes.
 
 use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
@@ -3624,90 +3623,6 @@ fn query_novelty_for_graph(
         Err(_) => Vec::new(),
     }
 }
-/// Stage a transaction with SHACL validation
-///
-/// This is the same as [`stage`], but additionally validates the staged flakes
-/// against SHACL shapes compiled from the database. If validation fails, the
-/// function returns an error with the validation report.
-///
-/// # Arguments
-///
-/// * `ledger` - The ledger state (consumed by value)
-/// * `txn` - The parsed transaction IR
-/// * `ns_registry` - Namespace registry for IRI resolution
-/// * `options` - Optional configuration for backpressure, policy, and tracking
-/// * `shacl_cache` - Compiled SHACL shapes for validation
-///
-/// # Returns
-///
-/// Returns `(StagedLedger, NamespaceRegistry)` if staging and validation succeed.
-/// Returns `TransactError::ShaclViolation` if SHACL validation fails.
-#[cfg(feature = "shacl")]
-pub async fn stage_with_shacl(
-    ledger: LedgerState,
-    txn: Txn,
-    ns_registry: NamespaceRegistry,
-    options: StageOptions<'_>,
-    shacl_cache: &ShaclCache,
-) -> Result<(StagedLedger, NamespaceRegistry)> {
-    let tracker = options.tracker;
-
-    // First, perform regular staging
-    let (mut view, mut ns_registry, graph_delta) =
-        stage_with_graph_delta(ledger, txn, ns_registry, options).await?;
-
-    // Fast path: if there are no SHACL shapes, elide validation entirely.
-    // This ensures SHACL has *zero* transaction-time overhead unless rules exist.
-    if shacl_cache.is_empty() {
-        return Ok((view, ns_registry));
-    }
-
-    // Validation reads the staged view on the binary lane; its dictionaries
-    // must cover the subjects this transaction introduces.
-    crate::staged_dicts::attach_staged_dicts(&mut view)?;
-
-    // Rebuild graph_sids from the cloned graph_delta + returned ns_registry.
-    // These IRIs were already resolved during stage(), so sid_for_iri will find
-    // the prefix already registered — no new allocations.
-    let graph_sids: HashMap<GraphId, Sid> = graph_delta
-        .iter()
-        .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
-        .collect();
-
-    // Create SHACL engine from cache, with the current (novelty-aware) RDFS
-    // hierarchy so subproperty/subclass entailment applies on this legacy
-    // path too.
-    let base = view.base();
-    let hierarchy = base
-        .schema_hierarchy_cache
-        .current(
-            &base.snapshot,
-            base.novelty.as_ref(),
-            base.t(),
-            base.novelty.schema_epoch,
-        )
-        .await?;
-    let engine =
-        ShaclEngine::from_shared_cache(std::sync::Arc::new(shacl_cache.clone()), hierarchy);
-
-    // Validate staged flakes against shapes (per graph). `None` for
-    // `enabled_graphs` means "validate every graph with staged flakes" —
-    // this legacy path doesn't consult per-graph config.
-    let report =
-        validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None, None).await?;
-
-    // Reject on violations only — spec-level `conforms` is also false for
-    // warnings/infos, which must not block a commit.
-    if report.violation_count() > 0 {
-        return Err(TransactError::ShaclViolation(format_shacl_report(
-            &report,
-            &base.snapshot,
-            &ns_registry,
-        )));
-    }
-
-    Ok((view, ns_registry))
-}
 
 /// Per-graph SHACL policy — how a specific graph's violations should be
 /// treated at transaction time.
@@ -3740,12 +3655,8 @@ impl ShaclValidationOutcome {
     }
 }
 
-/// Validate a staged [`StagedLedger`] against SHACL shapes.
-///
-/// `graph_sids` provides the `GraphId → Sid` mapping for per-graph validation.
-/// Pass `None` when the mapping is unavailable (e.g., commit-transfer path
-/// with no per-graph routing yet) — validation falls back to the default
-/// graph (g_id=0).
+/// Validate a staged [`StagedLedger`] against SHACL shapes, each focus node
+/// in the graph staging routed its flakes to.
 ///
 /// `per_graph_policy`:
 /// - `None` = treat every graph containing staged flakes as `Reject` mode
@@ -3762,7 +3673,6 @@ pub async fn validate_view_with_shacl(
     view: &StagedLedger,
     shacl_cache: std::sync::Arc<ShaclCache>,
     hierarchy: Option<fluree_db_core::SchemaHierarchy>,
-    graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
     membership_g_ids: &[GraphId],
@@ -3787,7 +3697,6 @@ pub async fn validate_view_with_shacl(
     let report = validate_staged_nodes(
         view,
         &engine,
-        graph_sids,
         tracker,
         enabled_graphs.as_ref(),
         cross_ledger,
@@ -3830,15 +3739,10 @@ pub async fn validate_view_with_shacl(
 /// — this loop only drives per-graph *validation*. `sh:class` value membership
 /// additionally consults the engine's `membership_g_ids` (the `f:shapesSource`
 /// vocabulary graph[s]) unioned with each focus node's own data graph.
-///
-/// When `graph_sids` is `None` (e.g., commit-transfer path where the txn
-/// context is unavailable), falls back to validating all subjects against
-/// the default graph (g_id=0) — matching the previous behavior.
 #[cfg(feature = "shacl")]
 async fn validate_staged_nodes(
     view: &StagedLedger,
     engine: &ShaclEngine,
-    graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     enabled_graphs: Option<&HashSet<GraphId>>,
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
@@ -3871,14 +3775,8 @@ async fn validate_staged_nodes(
     // because hints derived from staged flakes miss the "base edge persists,
     // node touched for an unrelated reason" case — e.g., alice already has
     // `ex:ssn` in the base DB, and this txn retracts `ex:name`.
-    let reverse_graph = graph_sids.map(build_reverse_graph_lookup);
     let mut subjects_by_graph: HashMap<GraphId, HashSet<Sid>> = HashMap::new();
-    for flake in view.staged_flakes() {
-        let g_id = match &reverse_graph {
-            Some(rev) => resolve_flake_graph_id(flake, rev)?,
-            // No reverse map (commit-transfer path): fall back to default graph
-            None => 0,
-        };
+    for (g_id, flake) in view.staged_flakes_by_graph() {
         // Subject is always a focus (including for retractions — validators
         // must still see retracted-on subjects so class/node-targeted shapes
         // can re-check cardinality, and so the engine's post-state check can
@@ -3973,40 +3871,6 @@ async fn validate_staged_nodes(
         conforms,
         results: all_results,
     })
-}
-
-/// Format a SHACL validation report as a human-readable string.
-///
-/// Supplies the resolution the shared layout cannot do for itself: Sids decode
-/// against the snapshot's namespaces, falling back to `ns_registry` for
-/// prefixes this transaction registered — a property the transaction itself
-/// introduced is absent from the snapshot until it commits.
-///
-/// Reports full IRIs, unlike the api layer's caller: this crate cannot see the
-/// transaction's JSON-LD context, so there are no author-supplied prefixes to
-/// compact against.
-#[cfg(feature = "shacl")]
-fn format_shacl_report(
-    report: &ValidationReport,
-    snapshot: &fluree_db_core::LedgerSnapshot,
-    ns_registry: &NamespaceRegistry,
-) -> String {
-    let violations = fluree_db_shacl::violations_of(&report.results);
-
-    fluree_db_shacl::format_violations(
-        &violations,
-        |sid| {
-            snapshot
-                .decode_sid(sid)
-                .or_else(|| {
-                    ns_registry
-                        .get_prefix(sid.namespace_code)
-                        .map(|prefix| format!("{prefix}{}", sid.name))
-                })
-                .unwrap_or_else(|| fluree_db_shacl::unresolved_sid(sid))
-        },
-        str::to_string,
-    )
 }
 
 #[cfg(test)]

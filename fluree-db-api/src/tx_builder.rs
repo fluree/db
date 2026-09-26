@@ -29,7 +29,7 @@ use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
     Tracker, TrackingOptions, TrackingTally,
 };
-use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot, Sid, TxnMetaValue};
+use fluree_db_core::{ContentId, ContentStore, LedgerSnapshot, Sid, TxnMetaValue};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
@@ -803,14 +803,7 @@ impl<'a> OwnedTransactBuilder<'a> {
                 .clone()
                 .map(Tracker::new)
                 .unwrap_or_default();
-            let StageResult {
-                view,
-                ns_registry,
-                txn_meta,
-                graph_delta,
-                sync_graph,
-                scope: _,
-            } = if let Some(followup) = self.core.pre_built_txn_followup {
+            let staged = if let Some(followup) = self.core.pre_built_txn_followup {
                 // Per-row relationship MERGE … ON MATCH SET: both branches stage
                 // into one commit, or an error returns with nothing committed.
                 self.fluree
@@ -835,58 +828,10 @@ impl<'a> OwnedTransactBuilder<'a> {
                     .await?
             };
 
-            // A registration-only transaction (CREATE GRAPH: zero staged
-            // flakes, but a graph_delta IRI the registry doesn't know yet)
-            // must still COMMIT so the registration persists — only a no-op
-            // whose delta is already fully registered may skip the commit.
-            let registers_new_graph = graph_delta.values().any(|iri| {
-                view.base()
-                    .snapshot
-                    .graph_registry
-                    .graph_id_for_iri(iri)
-                    .is_none()
-            });
-
-            // Add extracted transaction metadata and graph delta to commit opts
-            let commit_opts = self
-                .core
-                .commit_opts
-                .with_txn_meta(txn_meta)
-                .with_graph_iris(graph_delta.into_values());
-
-            // No-op updates: return success without committing.
-            let (receipt, ledger) = if !view.has_staged()
-                && !registers_new_graph
-                && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
-                    // A sync that stages zero flakes is a no-change outcome,
-                    // not an empty insert.
-                    || sync_graph.is_some())
-            {
-                let (base, flakes) = view.into_parts();
-                debug_assert!(
-                    flakes.is_empty(),
-                    "no-op transaction path requires zero staged flakes"
-                );
-                (
-                    fluree_db_transact::CommitReceipt {
-                        commit_id: ContentId::new(ContentKind::Commit, &[]),
-                        t: base.t(),
-                        flake_count: 0,
-                        assert_count: 0,
-                        retract_count: 0,
-                    },
-                    base,
-                )
-            } else {
-                self.fluree
-                    .commit_staged(view, ns_registry, &index_config, commit_opts)
-                    .await?
-            };
-
-            return Ok(self
+            return self
                 .fluree
-                .finalize_owned_commit(receipt, ledger, &index_config)
-                .await);
+                .commit_stage_result(staged, txn_type, self.core.commit_opts, &index_config)
+                .await;
         }
 
         let op = self.core.operation.unwrap_or_else(|| {
@@ -931,51 +876,15 @@ impl<'a> OwnedTransactBuilder<'a> {
                     self.core.policy.as_ref(),
                 )
                 .await?;
-            let StageResult {
-                view,
-                ns_registry,
-                txn_meta,
-                graph_delta,
-                sync_graph: _,
-                scope: _,
-            } = stage_result;
-            let registers_new_graph = graph_delta.values().any(|iri| {
-                view.base()
-                    .snapshot
-                    .graph_registry
-                    .graph_id_for_iri(iri)
-                    .is_none()
-            });
-            let commit_opts = self
-                .core
-                .commit_opts
-                .with_txn_meta(txn_meta)
-                .with_graph_iris(graph_delta.into_values());
-            let (receipt, ledger) = if !view.has_staged() && !registers_new_graph {
-                let (base, flakes) = view.into_parts();
-                debug_assert!(
-                    flakes.is_empty(),
-                    "no-op sync path requires zero staged flakes"
-                );
-                (
-                    fluree_db_transact::CommitReceipt {
-                        commit_id: ContentId::new(ContentKind::Commit, &[]),
-                        t: base.t(),
-                        flake_count: 0,
-                        assert_count: 0,
-                        retract_count: 0,
-                    },
-                    base,
-                )
-            } else {
-                self.fluree
-                    .commit_staged(view, ns_registry, &index_config, commit_opts)
-                    .await?
-            };
-            return Ok(self
+            return self
                 .fluree
-                .finalize_owned_commit(receipt, ledger, &index_config)
-                .await);
+                .commit_stage_result(
+                    stage_result,
+                    TxnType::Insert,
+                    self.core.commit_opts,
+                    &index_config,
+                )
+                .await;
         }
         let txn_type = op.txn_type();
         // Parse transaction, extracting TriG metadata and named graphs for Turtle inputs
@@ -1851,7 +1760,7 @@ impl Fluree {
     /// Commit a staged result and finalize the cache. Shared tail between
     /// the fast and optimistic paths in [`commit_with_handle`].
     ///
-    /// Short-circuits no-op update/upsert (staged no flakes) without
+    /// Short-circuits a no-op stage ([`StageResult::is_noop`]) without
     /// touching the cache or triggering indexing.
     #[allow(clippy::too_many_arguments)]
     async fn commit_and_finalize(
@@ -1864,23 +1773,14 @@ impl Fluree {
         tally: Option<TrackingTally>,
         cypher_return: Option<JsonValue>,
     ) -> Result<TransactResultRef> {
+        let noop = stage_result.is_noop(txn_type);
         let StageResult {
             view,
             ns_registry,
             txn_meta,
             graph_delta,
-            sync_graph,
-            scope: _,
+            ..
         } = stage_result;
-        // See the pre_built_txn path: a registration-only commit (new graph
-        // IRI in the delta, zero flakes) must not take the no-op shortcut.
-        let registers_new_graph = graph_delta.values().any(|iri| {
-            view.base()
-                .snapshot
-                .graph_registry
-                .graph_id_for_iri(iri)
-                .is_none()
-        });
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
             .with_graph_iris(graph_delta.into_values());
@@ -1907,22 +1807,10 @@ impl Fluree {
             && staged.len() <= crate::ledger_manager::MAX_FOOTPRINT_FLAKES)
             .then(|| Arc::new(staged.iter().map(|flake| flake.s.clone()).collect()));
 
-        if !view.has_staged()
-            && !registers_new_graph
-            && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
-                // A sync that stages zero flakes is a no-change outcome,
-                // not an empty insert.
-                || sync_graph.is_some())
-        {
+        if noop {
             let (base, _) = view.into_parts();
             return Ok(TransactResultRef {
-                receipt: fluree_db_transact::CommitReceipt {
-                    commit_id: ContentId::new(ContentKind::Commit, &[]),
-                    t: base.t(),
-                    flake_count: 0,
-                    assert_count: 0,
-                    retract_count: 0,
-                },
+                receipt: fluree_db_transact::CommitReceipt::no_op(base.t()),
                 indexing: IndexingStatus {
                     enabled: self.indexing_mode.is_enabled(),
                     needed: false,
@@ -2357,30 +2245,16 @@ impl Fluree {
             )
             .await?;
 
+        if stage_result.is_noop(txn_type) {
+            return Ok(None);
+        }
         let StageResult {
             mut view,
             ns_registry,
             txn_meta,
             graph_delta,
-            sync_graph,
-            scope: _,
+            ..
         } = stage_result;
-        // Same no-op rule as `commit_and_finalize`: a registration-only
-        // transaction must still build a commit; a zero-flake
-        // update/upsert/sync that registers nothing is a no-change outcome.
-        let registers_new_graph = graph_delta.values().any(|iri| {
-            view.base()
-                .snapshot
-                .graph_registry
-                .graph_id_for_iri(iri)
-                .is_none()
-        });
-        if !view.has_staged()
-            && !registers_new_graph
-            && (matches!(txn_type, TxnType::Update | TxnType::Upsert) || sync_graph.is_some())
-        {
-            return Ok(None);
-        }
         let mut commit_opts = commit_opts
             .with_txn_meta(txn_meta)
             .with_graph_iris(graph_delta.into_values());

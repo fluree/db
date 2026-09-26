@@ -52,6 +52,20 @@ pub struct CommitReceipt {
     pub retract_count: usize,
 }
 
+impl CommitReceipt {
+    /// Receipt for a transaction that wrote nothing: no commit exists, and
+    /// the ledger stays at `t`.
+    pub fn no_op(t: i64) -> Self {
+        Self {
+            commit_id: ContentId::new(ContentKind::Commit, &[]),
+            t,
+            flake_count: 0,
+            assert_count: 0,
+            retract_count: 0,
+        }
+    }
+}
+
 /// Count `(asserts, retracts)` in a flake slice — the split every
 /// [`CommitReceipt`] carries alongside its total.
 pub fn count_ops(flakes: &[Flake]) -> (usize, usize) {
@@ -628,9 +642,7 @@ pub async fn build_commit(
     //    writes one is the durable record the registration probe, merge and
     //    config readers look for.
     let registry = &base.snapshot.graph_registry;
-    let registers_new_graph = graph_iris
-        .iter()
-        .any(|iri| registry.graph_id_for_iri(iri).is_none());
+    let registers_new_graph = registry.has_unregistered(graph_iris.iter().map(String::as_str));
     let mut graph_iris = graph_iris;
     graph_iris.retain(|iri| {
         registry
