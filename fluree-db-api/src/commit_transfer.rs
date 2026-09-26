@@ -39,6 +39,7 @@ use fluree_db_novelty::{
     warn_if_forged_commit_flakes_dropped, Novelty,
 };
 use fluree_db_policy::PolicyContext;
+use fluree_db_transact::datatype_limit;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -425,6 +426,10 @@ impl Fluree {
         // including ones an earlier commit of the same push introduced.
         let mut pushed_namespaces: HashMap<u16, String> = HashMap::new();
 
+        // Datatypes the ledger holds, grown by each accepted commit so every
+        // commit is checked against the base plus the commits before it.
+        let mut known_datatypes = datatype_limit::known_datatypes(&base_state).into_owned();
+
         for c in &decoded {
             // Current state is base db + evolving novelty.
             let current_t = base_state.snapshot.t.max(evolving_novelty.t);
@@ -580,6 +585,16 @@ impl Fluree {
                 stamp_graph_on_commit_flakes(&mut meta_flakes, &g_sid);
             }
             all_flakes.extend(meta_flakes);
+
+            // 4.6 Datatype limit. A sender that does not enforce it can push
+            // commits the index could never hold.
+            let adding =
+                datatype_limit::new_datatypes(&known_datatypes, all_flakes.iter().map(|f| &f.dt));
+            datatype_limit::check_datatype_capacity(&known_datatypes, adding.len())
+                .map_err(|e| push_error_for_stage(e).into_api_error())?;
+            for dt in adding {
+                known_datatypes.assign_or_lookup_datatype(dt);
+            }
 
             // Note: Novelty::apply_commit bumps to max(commit_t) internally.
             evolving_novelty
@@ -1416,6 +1431,10 @@ fn apply_pushed_commits_to_state(
     // the subjects and strings these commits introduce.
     let provider_store = fluree_db_transact::detach_binary_provider(&mut base);
     let mut dict_novelty = base.dict_novelty.clone();
+    // Like the commit path, extend the runtime dictionaries with every
+    // predicate and datatype these commits introduce. Queries resolve through
+    // them, and the datatype limit counts them.
+    let mut runtime_small_dicts = base.runtime_small_dicts.clone();
 
     let store_opt: Option<&BinaryIndexStore> = base
         .binary_store
@@ -1432,6 +1451,7 @@ fn apply_pushed_commits_to_state(
         .map_err(|e| {
             PushError::Internal(format!("populate_dict_novelty_safe failed at t={t}: {e}"))
         })?;
+        Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(flakes);
         // Apply to novelty.
         novelty
             .apply_commit(flakes.clone(), *t, &reverse_graph)
@@ -1442,6 +1462,7 @@ fn apply_pushed_commits_to_state(
 
     base.novelty = Arc::new(novelty);
     base.dict_novelty = dict_novelty;
+    base.runtime_small_dicts = runtime_small_dicts;
     if let Some(store) = provider_store {
         fluree_db_transact::attach_binary_provider(&mut base, store);
     }

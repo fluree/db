@@ -24,12 +24,7 @@ use crate::namespace::NamespaceRegistry;
 use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::datatypes::is_reserved_datatype;
-use fluree_db_core::ids::RuntimeDatatypeId;
-use fluree_db_core::{
-    ContentId, ContentKind, ContentStore, DatatypeDictId, DictNovelty, Flake, RuntimeSmallDicts,
-    Sid, TXN_META_GRAPH_ID,
-};
+use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, TXN_META_GRAPH_ID};
 use fluree_db_ledger::{HeadTemporal, IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher, RefValue};
 use fluree_db_novelty::{
@@ -37,9 +32,7 @@ use fluree_db_novelty::{
 };
 use fluree_db_novelty::{Commit, SigningKey, TxnMetaEntry, TxnMetaValue, TxnSignature};
 use fluree_db_query::BinaryRangeProvider;
-use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -536,7 +529,7 @@ fn resolve_commit_times(
 
 /// The binary index store behind `state`: the one its range provider reads,
 /// or else the type-erased `binary_store`.
-fn binary_store(state: &LedgerState) -> Option<Arc<BinaryIndexStore>> {
+pub(crate) fn binary_store(state: &LedgerState) -> Option<Arc<BinaryIndexStore>> {
     state
         .snapshot
         .range_provider
@@ -549,81 +542,6 @@ fn binary_store(state: &LedgerState) -> Option<Arc<BinaryIndexStore>> {
                 .as_ref()
                 .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok())
         })
-}
-
-/// Refuse a commit whose new datatypes would not fit in the datatype
-/// dictionary.
-///
-/// Every datatype outside [`DatatypeDictId::RESERVED_IRIS`] takes a
-/// dictionary ID the first time a ledger uses it, and IDs are never
-/// released. A ledger with more than the index can store can never be
-/// indexed again, so the limit is enforced at commit, where a refusal is
-/// still recoverable. This runs under the ledger's write lock against the
-/// authoritative base, so writes re-based over one another cannot jointly
-/// cross the limit.
-fn check_datatype_limit(
-    base: &LedgerState,
-    flakes: &[Flake],
-    txn_meta: &[TxnMetaEntry],
-) -> Result<()> {
-    let known = known_datatypes(base);
-    let meta_datatypes: Vec<Sid> = txn_meta
-        .iter()
-        .filter_map(|entry| match &entry.value {
-            TxnMetaValue::TypedLiteral { dt_ns, dt_name, .. } => Some(Sid::new(*dt_ns, dt_name)),
-            _ => None,
-        })
-        .collect();
-
-    let mut adding: FxHashSet<&Sid> = FxHashSet::default();
-    let mut last = None;
-    for dt in flakes.iter().map(|f| &f.dt).chain(&meta_datatypes) {
-        // Runs of one datatype are common; skip them before any lookup.
-        if last == Some(dt) {
-            continue;
-        }
-        last = Some(dt);
-        if !is_reserved_datatype(dt) && known.datatype_id(dt).is_none() {
-            adding.insert(dt);
-        }
-    }
-    if adding.is_empty() {
-        return Ok(());
-    }
-
-    let max = usize::from(DatatypeDictId::MAX - DatatypeDictId::RESERVED_COUNT) + 1;
-    let used = known.non_reserved_datatype_count();
-    if used + adding.len() > max {
-        return Err(TransactError::DatatypeLimitExceeded {
-            used,
-            adding: adding.len(),
-            max,
-        });
-    }
-    Ok(())
-}
-
-/// Every datatype `state` holds, in its index and in its novelty.
-///
-/// `state.runtime_small_dicts` is normally seeded from the attached index
-/// store and extended by every commit since. When it was not seeded from
-/// that store, a copy is seeded here so datatypes that exist only in the
-/// index still count.
-fn known_datatypes(state: &LedgerState) -> Cow<'_, RuntimeSmallDicts> {
-    let dicts = &*state.runtime_small_dicts;
-    match binary_store(state) {
-        Some(store) if usize::from(dicts.persisted_datatype_count()) != store.dt_sids().len() => {
-            let mut seeded =
-                RuntimeSmallDicts::from_seeded_sids([], store.dt_sids().iter().cloned());
-            for id in 0..dicts.datatype_count() {
-                if let Some(sid) = dicts.datatype_sid(RuntimeDatatypeId::from_u16(id)) {
-                    seeded.assign_or_lookup_datatype(sid);
-                }
-            }
-            Cow::Owned(seeded)
-        }
-        _ => Cow::Borrowed(dicts),
-    }
 }
 
 /// Commit a staged transaction
@@ -748,7 +666,7 @@ pub async fn build_commit(
 
     // 4b. Datatype dictionary limit. Not subject to `skip_backpressure`:
     //     draining novelty never frees a datatype ID.
-    check_datatype_limit(&base, &flakes, &txn_meta)?;
+    crate::datatype_limit::check_commit(&base, &flakes, &txn_meta)?;
 
     // 5. Build commit record
     //    (sequencing verification + nameservice lookup are the

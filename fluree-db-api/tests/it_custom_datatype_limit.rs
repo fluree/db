@@ -14,9 +14,13 @@
 #![cfg(feature = "native")]
 
 use crate::support::{self, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
-use fluree_db_api::FlureeBuilder;
-use fluree_db_core::{DatatypeDictId, RuntimeSmallDicts};
+use fluree_db_api::{
+    Base64Bytes, FlureeBuilder, GovernanceOptions, IndexConfig, PushCommitsRequest,
+};
+use fluree_db_core::commit::codec::{read_commit, write_commit};
+use fluree_db_core::{plan_commit_transfer, DatatypeDictId, RuntimeSmallDicts, Sid};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Comfortably past the old boundary of 241 custom datatypes.
@@ -358,4 +362,213 @@ async fn concurrent_inserts_cannot_jointly_pass_datatype_limit() {
     );
 
     support::rebuild_and_publish_index(&fluree, ledger_id).await;
+}
+
+/// A pushed commit, with the txn blob it references.
+struct PushedCommit {
+    bytes: Vec<u8>,
+    txn_blob: Option<(String, Vec<u8>)>,
+}
+
+/// The commits on `ledger_id`'s line, oldest first.
+async fn line_commits(fluree: &MemoryFluree, ledger_id: &str) -> Vec<PushedCommit> {
+    let store = fluree.branched_content_store(ledger_id).await.unwrap();
+    let head = fluree
+        .ledger(ledger_id)
+        .await
+        .unwrap()
+        .head_commit_id
+        .expect("ledger has a head");
+    let plan = plan_commit_transfer(store.as_ref(), &head, None)
+        .await
+        .unwrap()
+        .expect("a full line");
+    let mut out = Vec::new();
+    for cid in &plan.lineage {
+        let bytes = store.get(cid).await.unwrap();
+        let txn_blob = match read_commit(&bytes).unwrap().txn {
+            Some(txn) => Some((txn.to_string(), store.get(&txn).await.unwrap())),
+            None => None,
+        };
+        out.push(PushedCommit { bytes, txn_blob });
+    }
+    out
+}
+
+async fn push(
+    fluree: &MemoryFluree,
+    ledger_id: &str,
+    commits: &[&PushedCommit],
+) -> fluree_db_api::Result<()> {
+    let request = PushCommitsRequest {
+        commits: commits
+            .iter()
+            .map(|c| Base64Bytes(c.bytes.clone()))
+            .collect(),
+        blobs: commits
+            .iter()
+            .filter_map(|c| c.txn_blob.clone())
+            .map(|(cid, bytes)| (cid, Base64Bytes(bytes)))
+            .collect::<HashMap<_, _>>(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+    let index_config = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    fluree
+        .push_commits(
+            ledger_id,
+            request,
+            &GovernanceOptions::default(),
+            &index_config,
+        )
+        .await
+        .map(|_| ())
+}
+
+/// A sender that does not enforce the datatype limit can push commits past
+/// it. The receiver refuses them, whether the datatypes they collide with
+/// arrived in the same push or are already in the ledger.
+#[tokio::test]
+async fn push_past_datatype_limit_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let sender = "custom-dt-limit:push-sender";
+    let ledger0 = genesis_ledger(&fluree, sender);
+    let full = fluree
+        .insert(ledger0, &insert_range(0..CAPACITY))
+        .await
+        .expect("filling the datatype dictionary exactly is allowed")
+        .ledger;
+    fluree
+        .insert(full, &insert_known_datatype())
+        .await
+        .expect("a datatype the ledger already holds is accepted");
+    let [fill, known]: [PushedCommit; 2] = line_commits(&fluree, sender)
+        .await
+        .try_into()
+        .unwrap_or_else(|_| panic!("the sender has two commits"));
+
+    // What an older client could send: the second commit, retyped with a
+    // datatype the ledger has no room for.
+    let mut commit = read_commit(&known.bytes).unwrap();
+    for flake in &mut commit.flakes {
+        if flake.dt.name_str() == "U0" {
+            flake.dt = Sid::new(flake.dt.namespace_code, format!("U{CAPACITY}"));
+        }
+    }
+    let over = PushedCommit {
+        bytes: write_commit(&commit, false, None).unwrap().bytes,
+        txn_blob: known.txn_blob.clone(),
+    };
+
+    let control = "custom-dt-limit:push-control";
+    fluree.create_ledger(control).await.unwrap();
+    push(&fluree, control, &[&fill, &known])
+        .await
+        .expect("the sender's own commits are accepted");
+
+    let same_push = "custom-dt-limit:push-same";
+    fluree.create_ledger(same_push).await.unwrap();
+    assert_datatype_limit_rejection(
+        push(&fluree, same_push, &[&fill, &over]).await,
+        "datatypes filled earlier in the same push",
+    );
+
+    let later_push = "custom-dt-limit:push-later";
+    fluree.create_ledger(later_push).await.unwrap();
+    push(&fluree, later_push, &[&fill])
+        .await
+        .expect("filling the datatype dictionary exactly is allowed");
+    // Through the cached state push updated, as the server's writes are.
+    let handle = fluree.ledger_cached(later_push).await.unwrap();
+    assert_datatype_limit_rejection(
+        fluree
+            .stage(&handle)
+            .insert(&insert_range(CAPACITY..CAPACITY + 1))
+            .execute()
+            .await,
+        "a transaction over pushed datatypes",
+    );
+    assert_datatype_limit_rejection(
+        push(&fluree, later_push, &[&over]).await,
+        "datatypes already in the ledger",
+    );
+}
+
+/// Import `count` distinct custom datatypes, `ex:s{i} ex:p "v{i}"^^ex:U{i}`,
+/// into a new file-backed ledger.
+async fn import_datatypes(
+    fluree: &fluree_db_api::Fluree,
+    data_dir: &std::path::Path,
+    ledger_id: &str,
+    count: usize,
+) -> Result<(), String> {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..count {
+        ttl.push_str(&format!("ex:s{i} ex:p \"v{i}\"^^ex:U{i} .\n"));
+    }
+    let path = data_dir.join(format!("{count}.ttl"));
+    std::fs::write(&path, ttl).unwrap();
+    fluree
+        .create(ledger_id)
+        .import(&path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Bulk import assigns datatype IDs directly, not through a commit, so it
+/// enforces the limit itself.
+#[tokio::test]
+async fn bulk_import_past_datatype_limit_is_rejected() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    assert_datatype_limit_rejection(
+        import_datatypes(
+            &fluree,
+            data_dir.path(),
+            "custom-dt-limit:import-over",
+            CAPACITY + 1,
+        )
+        .await,
+        "import over the limit",
+    );
+
+    let ledger_id = "custom-dt-limit:import-full";
+    import_datatypes(&fluree, data_dir.path(), ledger_id, CAPACITY)
+        .await
+        .expect("importing exactly as many datatypes as fit is allowed");
+    let imported = load_indexed(&fluree, ledger_id).await;
+    let last = CAPACITY - 1;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?v"],
+        "where": {"@id": format!("ex:s{last}"), "ex:p": "?v"}
+    });
+    let rows = support::query_jsonld(&fluree, &imported, &q)
+        .await
+        .expect("query should succeed")
+        .to_jsonld(&imported.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([[{"@value": format!("v{last}"), "@type": format!("ex:U{last}")}]])),
+        "the last datatype id round-trips through the imported index"
+    );
+
+    assert_datatype_limit_rejection(
+        fluree
+            .insert(imported, &insert_range(CAPACITY..CAPACITY + 1))
+            .await,
+        "a transaction over imported datatypes",
+    );
 }
