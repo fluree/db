@@ -409,6 +409,21 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_CONNECTION_CONFIG")]
     pub connection_config: Option<PathBuf>,
 
+    /// Keep all ledgers in memory; they are lost when the server stops.
+    /// Takes the place of a storage path or connection config from a
+    /// lower-precedence source.
+    #[arg(
+        long,
+        env = "FLUREE_MEMORY_STORAGE",
+        default_value_t = false,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub memory: bool,
+
     /// Enable CORS (Cross-Origin Resource Sharing). On by default;
     /// `--cors-enabled=false` turns it off.
     #[arg(
@@ -909,6 +924,7 @@ impl Default for ServerConfig {
             listen_addr: server_defaults::DEFAULT_LISTEN_ADDR.parse().unwrap(),
             storage_path: None,
             connection_config: None,
+            memory: false,
             iceberg_local_roots: None,
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
             indexing_enabled: server_defaults::DEFAULT_INDEXING_ENABLED,
@@ -1019,14 +1035,18 @@ impl ServerConfig {
         self.connection_config.is_some()
     }
 
-    /// Get storage type string for logging
+    /// The storage the server builds from this config, for logs and
+    /// `/v1/fluree/stats`. Checked in the order `build_default_fluree` picks.
     pub fn storage_type_str(&self) -> &'static str {
-        if self.connection_config.is_some() {
-            "connection-config"
-        } else if self.storage_path.is_some() {
-            "file"
-        } else {
+        if self.is_proxy_storage_mode() {
+            "proxy"
+        } else if self.memory {
             "memory"
+        } else if self.connection_config.is_some() {
+            "connection-config"
+        } else {
+            // With no path the server uses `.fluree/storage`.
+            "file"
         }
     }
 
@@ -1157,6 +1177,15 @@ impl ServerConfig {
                     path.display()
                 ));
             }
+        }
+
+        // `load_and_merge_config` settles `--memory` against a storage path or
+        // connection config from other sources; two flags remain a conflict.
+        if self.memory && (self.storage_path.is_some() || self.connection_config.is_some()) {
+            return Err(
+                "--memory cannot be combined with --storage-path or --connection-config"
+                    .to_string(),
+            );
         }
 
         // Warn if both connection_config and storage_path are set
@@ -1502,6 +1531,70 @@ mod gc_retention_flag_tests {
             env_of("gc_hard_max_old_indexes").as_deref(),
             Some("FLUREE_GC_HARD_MAX_OLD_INDEXES")
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_selection_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Names the storage `build_default_fluree` builds: memory only with
+    /// `--memory`, and file storage when no path is given.
+    #[test]
+    fn storage_type_str_names_the_built_storage() {
+        let with = |set: fn(&mut ServerConfig)| {
+            let mut config = ServerConfig::default();
+            set(&mut config);
+            config.storage_type_str()
+        };
+        assert_eq!(with(|_| {}), "file");
+        assert_eq!(with(|c| c.storage_path = Some("/data".into())), "file");
+        assert_eq!(
+            with(|c| c.connection_config = Some("/conn.jsonld".into())),
+            "connection-config"
+        );
+        assert_eq!(with(|c| c.memory = true), "memory");
+        assert_eq!(
+            with(|c| {
+                c.server_role = ServerRole::Peer;
+                c.storage_access_mode = StorageAccessMode::Proxy;
+            }),
+            "proxy"
+        );
+    }
+
+    #[test]
+    fn memory_flag_parses_and_names_its_env_var() {
+        let parse = |args: &[&str]| {
+            ServerConfig::try_parse_from(
+                std::iter::once("fluree-server").chain(args.iter().copied()),
+            )
+            .expect("flags parse")
+            .memory
+        };
+        assert!(!parse(&[]));
+        assert!(parse(&["--memory"]));
+        assert!(!parse(&["--memory=false"]));
+
+        let cmd = ServerConfig::command();
+        let env = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "memory")
+            .and_then(|a| a.get_env())
+            .map(|e| e.to_string_lossy().into_owned());
+        assert_eq!(env.as_deref(), Some("FLUREE_MEMORY_STORAGE"));
+    }
+
+    #[test]
+    fn memory_with_a_storage_path_does_not_validate() {
+        let config = ServerConfig {
+            memory: true,
+            storage_path: Some("/data".into()),
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("contradictory storage");
+        assert!(err.contains("--memory"), "{err}");
     }
 }
 
