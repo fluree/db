@@ -1006,11 +1006,14 @@ pub struct CreateBranchRequest {
     /// Source branch to create from (defaults to "main")
     #[serde(default)]
     pub source: Option<String>,
-    /// Optional commit reference to branch at.
+    /// Optional point on the source branch to branch at.
     ///
-    /// Accepts `"t:N"` for a transaction number or a hex digest / full CID
-    /// for prefix resolution. When omitted, the branch starts at the source
-    /// branch's current HEAD.
+    /// The same spellings as export's and a query's `at`
+    /// ([`fluree_db_api::TimeSpec::parse_at`]): `t:N`, `time:<ISO-8601>`
+    /// (alias `iso:`), `recorded:<ISO-8601>`, `commit:<prefix>`, `latest`, or a
+    /// bare transaction number, timestamp, hex digest prefix or full CID. The
+    /// branch starts at the commit a query pinned at `@<at>` would read. When
+    /// omitted (or `latest`), the branch starts at the source's current HEAD.
     #[serde(default)]
     pub at: Option<String>,
 }
@@ -1036,10 +1039,11 @@ pub struct CreateBranchResponse {
 /// - `ledger`: Ledger name (e.g., "mydb")
 /// - `branch`: New branch name (e.g., "feature-x")
 /// - `source`: Source branch (optional, defaults to "main")
+/// - `at`: Point on the source to branch at (optional, defaults to its HEAD)
 ///
 /// Returns 201 Created on success, 409 Conflict if branch already exists,
 /// 404 Not Found if source branch does not exist, 400 Bad Request if the
-/// source branch has no commits.
+/// source branch has no commits or `at` names no commit on it.
 pub async fn create_branch(State(state): State<Arc<AppState>>, request: Request) -> Response {
     if state.config.server_role == ServerRole::Peer {
         return forward_write_request(&state, request).await;
@@ -1062,13 +1066,11 @@ async fn create_branch_local(state: Arc<AppState>, request: Request) -> Result<i
     let ledger = req.ledger;
     let branch = req.branch;
 
-    let at_commit = match req.at.as_deref() {
-        Some(s) => Some(
-            fluree_db_api::CommitRef::parse(s)
-                .map_err(|e| ServerError::bad_request(e.to_string()))?,
-        ),
-        None => None,
-    };
+    let at = req
+        .at
+        .as_deref()
+        .map(super::export::parse_time_spec)
+        .transpose()?;
 
     let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
     let trace_id = extract_trace_id(&headers.raw);
@@ -1093,7 +1095,7 @@ async fn create_branch_local(state: Arc<AppState>, request: Request) -> Result<i
 
         let record = match state
             .fluree
-            .create_branch(&ledger, &branch, Some(&source), at_commit)
+            .create_branch(&ledger, &branch, Some(&source), at)
             .await
         {
             Ok(record) => record,

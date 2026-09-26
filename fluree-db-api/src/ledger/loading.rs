@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
-use crate::ledger_view::CommitRef;
-use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result};
+use crate::ledger_view::{CommitRef, LedgerView};
+use crate::time_resolve;
+use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result, TimeSpec};
 use fluree_db_core::ContentStore;
-use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId};
+use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId, ContentId};
 use fluree_db_nameservice::{NameServiceError, NsRecord};
+use fluree_db_query::QueryError;
 
 impl Fluree {
     /// Attach the binary index store and range provider to an already-loaded
@@ -172,15 +174,19 @@ impl Fluree {
     /// Looks up the source branch to capture its current commit state, then
     /// creates a new [`NsRecord`] for `ledger_name:new_branch`.
     ///
-    /// When `source_commit` is `None`, the new branch starts at the source's
-    /// current HEAD and inherits its index (copied into the new branch's
-    /// storage namespace so it's safe from GC on the source). This is the
-    /// default behavior.
+    /// When `at` is `None` or [`TimeSpec::Latest`], the new branch starts at
+    /// the source's current HEAD and inherits its index (copied into the new
+    /// branch's storage namespace so it's safe from GC on the source). This is
+    /// the default behavior.
     ///
-    /// When `source_commit` is `Some(ref)`, the ref is resolved to a canonical
-    /// [`CommitId`] against the source branch, verified to be reachable from
-    /// the source HEAD, and becomes the new branch's head. The index is not
-    /// copied — the index at the source HEAD is typically too fresh for a
+    /// Any other `at` names a point on the source branch, read exactly as a
+    /// query pinned at `@<at>` on the source reads it: the new branch's head is
+    /// the commit that query would see as its head. `AtTime` / `AtRecorded`
+    /// resolve through the same timestamp resolver queries use, `AtT` names
+    /// that transaction, and `AtCommit` names that commit (a hex digest prefix,
+    /// with or without `sha256:` / `fluree:commit:`, or a full CID). The
+    /// commit is verified to be on the source's line of commits. The index is
+    /// not copied — the index at the source HEAD is typically too fresh for a
     /// historical branch point, so the new branch replays from genesis.
     ///
     /// Commits themselves are **not** copied — the branch's content store
@@ -189,15 +195,18 @@ impl Fluree {
     /// # Errors
     ///
     /// - [`ApiError::LedgerExists`] if the branch already exists
-    /// - [`ApiError::InvalidBranch`] if the source branch has no commits
+    /// - [`ApiError::InvalidBranch`] if the source branch has no commits, or
+    ///   `at` is a malformed timestamp, a time before the source's first
+    ///   commit, or an `AtSnapshot` (a graph-source table snapshot, never a
+    ///   commit on a ledger)
     /// - [`ApiError::NotFound`] if the source branch does not exist, or if
-    ///   `source_commit` resolves to a commit not reachable from source HEAD
+    ///   `at` resolves to a commit not reachable from source HEAD
     pub async fn create_branch(
         &self,
         ledger_name: &str,
         new_branch: &str,
         source_branch: Option<&str>,
-        source_commit: Option<CommitRef>,
+        at: Option<TimeSpec>,
     ) -> Result<NsRecord> {
         use fluree_db_core::ledger_id::{format_ledger_id, validate_branch_name};
         use tracing::info;
@@ -228,15 +237,15 @@ impl Fluree {
             ))
         })?;
 
-        // If the caller specified a historical commit, resolve it and verify
+        // If the caller specified a historical point, resolve it and verify
         // it's reachable from source HEAD before we touch the nameservice.
-        // A ref that resolves to the source head itself is collapsed to the
+        // A point that resolves to the source head itself is collapsed to the
         // default (None) path so the user still gets an index copy — otherwise
         // `--at <head-cid>` would silently produce a slower branch than
         // omitting `--at` entirely.
-        let at_commit = if let Some(commit_ref) = source_commit {
+        let at_commit = if let Some(at) = at {
             let view = self.ledger_cached(&source_id).await?.snapshot().await;
-            let resolved = view.resolve_commit(commit_ref).await?;
+            let resolved = branch_point_commit(view, &source_id, at).await?;
             if resolved == source_head {
                 None
             } else {
@@ -421,6 +430,35 @@ impl Fluree {
     pub async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         Ok(self.nameservice().list_branches(ledger_name).await?)
     }
+}
+
+/// The commit a query pinned at `@<at>` on the source reads as its head.
+///
+/// Everything but a commit spelling goes through
+/// [`time_resolve::resolve_time_spec`], the resolver queries and export use,
+/// so a branch at `time:X` and a query at `@time:X` cannot disagree.
+async fn branch_point_commit(view: LedgerView, source_id: &str, at: TimeSpec) -> Result<CommitId> {
+    if let TimeSpec::AtCommit(spelling) = at {
+        // Resolved directly rather than through its `t`: a CID stays exact, so
+        // an off-line commit reaches `verify_ancestor`'s explanation.
+        let commit_ref = match ContentId::parse_canonical(&spelling) {
+            Some(cid) => CommitRef::Exact(cid),
+            None => CommitRef::Prefix(spelling),
+        };
+        return view.resolve_commit(commit_ref).await;
+    }
+    let state = view.to_ledger_state();
+    let t = time_resolve::resolve_time_spec(&state, &at)
+        .await
+        .map_err(|e| match e {
+            ApiError::Query(QueryError::InvalidQuery(msg)) => {
+                ApiError::InvalidBranch(format!("Cannot branch from '{source_id}': {msg}"))
+            }
+            other => other,
+        })?;
+    LedgerView::from_state(&state)
+        .resolve_commit(CommitRef::T(t))
+        .await
 }
 
 /// Verify `target` is on the source branch's line of commits, and return
