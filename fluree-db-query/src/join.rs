@@ -2020,10 +2020,10 @@ impl NestedLoopJoinOperator {
                         } else {
                             let o_i = batch.o_i.get_or(row, u32::MAX);
                             let t = batch.t.get_or(row, 0) as i64;
-                            self.build_batched_object_binding(
+                            build_probe_object_binding(
                                 ctx,
                                 store,
-                                dict_overlay,
+                                dict_overlay.as_ref(),
                                 p_id,
                                 o_type_val,
                                 o_key_val,
@@ -2063,10 +2063,10 @@ impl NestedLoopJoinOperator {
                     {
                         Binding::encoded_sid(op.o_key)
                     } else {
-                        self.build_batched_object_binding(
+                        build_probe_object_binding(
                             ctx,
                             store,
-                            dict_overlay,
+                            dict_overlay.as_ref(),
                             p_id,
                             op.o_type,
                             op.o_key,
@@ -2131,163 +2131,6 @@ impl NestedLoopJoinOperator {
         };
         let val = decode_overlay_object(ctx, store, dict_overlay.as_ref(), p_id, o_type, o_key)?;
         Ok(bounds.matches(&val))
-    }
-
-    /// Build the late-materialized object binding for one non-ref matched row.
-    ///
-    /// Shared by base leaflet rows in `scan_matches` and by injected novelty
-    /// asserts (whose `o_type`/`o_key`/`o_i`/`t` come from the overlay op), so
-    /// both produce identical binding representations. Novelty-minted
-    /// string/subject ids resolve through `dict_overlay`.
-    #[allow(clippy::too_many_arguments)]
-    fn build_batched_object_binding(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        store: &BinaryIndexStore,
-        dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
-        p_id: u32,
-        o_type_val: u16,
-        o_key_val: u64,
-        o_i: u32,
-        t: i64,
-    ) -> Result<Binding> {
-        use fluree_db_core::o_type::OType;
-        let ot = OType::from_u16(o_type_val);
-        Ok(
-            // Prefer a stable EncodedLit representation when possible so that
-            // formatters can materialize using the root's canonical datatype table.
-            match ot.decode_kind() {
-                fluree_db_core::o_type::DecodeKind::StringDict => {
-                    use fluree_db_core::ids::DatatypeDictId;
-                    use fluree_db_core::value_id::ObjKind;
-
-                    let (dt_id, lang_id) = if ot.is_lang_string() {
-                        (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
-                    } else if o_type_val == OType::FULLTEXT.as_u16() {
-                        (DatatypeDictId::FULL_TEXT.as_u16(), 0)
-                    } else {
-                        (DatatypeDictId::STRING.as_u16(), 0)
-                    };
-
-                    Binding::EncodedLit {
-                        o_kind: ObjKind::LEX_ID.as_u8(),
-                        o_key: o_key_val,
-                        p_id,
-                        dt_id,
-                        lang_id,
-                        i_val: if o_i == u32::MAX {
-                            i32::MIN
-                        } else {
-                            o_i as i32
-                        },
-                        t,
-                    }
-                }
-                fluree_db_core::o_type::DecodeKind::JsonArena => {
-                    use fluree_db_core::ids::DatatypeDictId;
-                    use fluree_db_core::value_id::ObjKind;
-                    Binding::EncodedLit {
-                        o_kind: ObjKind::JSON_ID.as_u8(),
-                        o_key: o_key_val,
-                        p_id,
-                        dt_id: DatatypeDictId::JSON.as_u16(),
-                        lang_id: 0,
-                        i_val: if o_i == u32::MAX {
-                            i32::MIN
-                        } else {
-                            o_i as i32
-                        },
-                        t,
-                    }
-                }
-                fluree_db_core::o_type::DecodeKind::VectorArena => {
-                    use fluree_db_core::ids::DatatypeDictId;
-                    use fluree_db_core::value_id::ObjKind;
-                    Binding::EncodedLit {
-                        o_kind: ObjKind::VECTOR_ID.as_u8(),
-                        o_key: o_key_val,
-                        p_id,
-                        dt_id: DatatypeDictId::VECTOR.as_u16(),
-                        lang_id: 0,
-                        i_val: if o_i == u32::MAX {
-                            i32::MIN
-                        } else {
-                            o_i as i32
-                        },
-                        t,
-                    }
-                }
-                fluree_db_core::o_type::DecodeKind::NumBigArena => {
-                    use fluree_db_core::ids::DatatypeDictId;
-                    use fluree_db_core::value_id::ObjKind;
-                    Binding::EncodedLit {
-                        o_kind: ObjKind::NUM_BIG.as_u8(),
-                        o_key: o_key_val,
-                        p_id,
-                        dt_id: DatatypeDictId::DECIMAL.as_u16(),
-                        lang_id: 0,
-                        i_val: if o_i == u32::MAX {
-                            i32::MIN
-                        } else {
-                            o_i as i32
-                        },
-                        t,
-                    }
-                }
-                _ => {
-                    // Inline numerics with a reserved dict id stay encoded
-                    // (cheap through DISTINCT/joins, materialized at projection);
-                    // everything else decodes eagerly via DictOverlay.
-                    if let Some(encoded) = crate::object_binding::inline_numeric_encoded_lit(
-                        o_type_val, o_key_val, p_id, o_i, t,
-                    ) {
-                        encoded
-                    } else {
-                        // Fallback: decode eagerly, using DictOverlay for
-                        // novelty-aware resolution of string/subject IDs.
-                        use fluree_db_core::o_type::{DecodeKind, OType as OT};
-                        let ot = OT::from_u16(o_type_val);
-                        let val: fluree_db_core::FlakeValue =
-                            match (ot.decode_kind(), dict_overlay.as_ref()) {
-                                (DecodeKind::IriRef, Some(ov)) => {
-                                    let iri = ov.resolve_subject_iri(o_key_val).map_err(|e| {
-                                        crate::error::QueryError::Internal(format!(
-                                            "resolve_subject_iri (batched join): {e}"
-                                        ))
-                                    })?;
-                                    fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
-                                }
-                                (DecodeKind::StringDict, Some(ov)) => {
-                                    let s =
-                                        ov.resolve_string_value(o_key_val as u32).map_err(|e| {
-                                            crate::error::QueryError::Internal(format!(
-                                                "resolve_string_value (batched join): {e}"
-                                            ))
-                                        })?;
-                                    fluree_db_core::FlakeValue::String(s)
-                                }
-                                (DecodeKind::JsonArena, Some(ov)) => {
-                                    let s =
-                                        ov.resolve_string_value(o_key_val as u32).map_err(|e| {
-                                            crate::error::QueryError::Internal(format!(
-                                                "resolve_string_value (batched join json): {e}"
-                                            ))
-                                        })?;
-                                    fluree_db_core::FlakeValue::Json(s)
-                                }
-                                _ => store
-                                    .decode_value_v3(o_type_val, o_key_val, p_id, ctx.binary_g_id)
-                                    .map_err(|e| {
-                                        crate::error::QueryError::Internal(format!(
-                                            "decode_value_v3 (batched join): {e}"
-                                        ))
-                                    })?,
-                            };
-                        materialized_object_binding(store, o_type_val, p_id, val, Some(t), None)
-                    }
-                }
-            },
-        )
     }
 
     /// Phase 5: Assemble scattered results into output batches in left-row order.
@@ -3100,6 +2943,9 @@ fn term_matches_probe_value(
     }
 }
 
+/// Object binding for a non-ref row matched on a batched lane: the scan's
+/// late-materialized form when it has one, so every lane keys a literal
+/// alike, else the decoded value (novelty ids resolve through `dict_overlay`).
 #[allow(clippy::too_many_arguments)]
 fn build_probe_object_binding(
     ctx: &ExecutionContext<'_>,
