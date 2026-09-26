@@ -524,3 +524,19 @@ async fn graph_store_requires_authorization() {
     );
     assert!(body.contains("tool"), "{body}");
 }
+
+/// A language tag that is not a `LANGTAG` would end the literal in Turtle or
+/// N-Triples output and forge triples, so writing one is a 400.
+#[tokio::test]
+async fn invalid_language_tag_is_refused_on_write() {
+    let (_tmp, app) = seeded_app().await;
+    let body = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:alice",
+        "ex:label": {"@value": "hi", "@language": "en . <urn:injected> <urn:p> \"pwned\" . #"}
+    })
+    .to_string();
+    let (status, body) = send(&app, "PUT", &named(TOOLS), JSON_LD, &body, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid language tag"), "{body}");
+}

@@ -297,7 +297,13 @@ fn turtle_value_term(value: &JsonValue) -> String {
                 return turtle_term(iri);
             }
             if let Some(lex) = obj.get("@value").and_then(|v| v.as_str()) {
-                if let Some(lang) = obj.get("@language").and_then(|v| v.as_str()) {
+                // A tag has no escape form; an invalid one would end the
+                // literal and forge triples, so the report drops it.
+                if let Some(lang) = obj
+                    .get("@language")
+                    .and_then(|v| v.as_str())
+                    .filter(|lang| fluree_graph_ir::syntax::is_lang_tag(lang))
+                {
                     return format!("{}@{lang}", turtle_string(lex));
                 }
                 if let Some(dt) = obj.get("@type").and_then(|v| v.as_str()) {

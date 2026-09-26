@@ -35,4 +35,4 @@ mod rdf_text;
 pub use jsonld::{format_jsonld, JsonLdFormatConfig};
 pub use policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
 pub use prefix::PrefixMap;
-pub use rdf_text::{format_ntriples, format_turtle, push_nt_term};
+pub use rdf_text::{format_ntriples, format_turtle, InvalidLangTag};

@@ -111,18 +111,6 @@ impl<'a> StreamingLexer<'a> {
     }
 }
 
-/// Whether the tag half of a `LANGTAG` is well-formed.
-///
-/// `LANGTAG ::= '@' [a-zA-Z]+ ('-' [a-zA-Z0-9]+)*` — the first subtag is
-/// letters only, later ones may include digits, and none may be empty.
-fn lang_tag_body_ok(tag: &str) -> bool {
-    tag.split('-').enumerate().all(|(i, part)| {
-        !part.is_empty()
-            && part.chars().all(|c| c.is_ascii_alphanumeric())
-            && (i > 0 || part.chars().all(|c| c.is_ascii_alphabetic()))
-    })
-}
-
 /// Explain a rejected `@`-word, when the rejection was about a language tag.
 ///
 /// The generic lexer error reports the token's start position but names the
@@ -145,7 +133,7 @@ fn lang_tag_error_message(source: &str, position: usize) -> Option<String> {
         Some((tag, dir)) => (tag, Some(dir)),
         None => (word.as_str(), None),
     };
-    if !lang_tag_body_ok(tag) {
+    if !fluree_graph_ir::syntax::is_lang_tag_body(tag) {
         return Some(format!(
             "invalid language tag `@{word}`: a language tag starts with a letter and \
              continues as `-`-separated alphanumeric subtags (for example `@en` or `@en-GB`)"
@@ -388,7 +376,7 @@ fn parse_at_directive(input: &mut Input<'_>) -> ModalResult<TokenKind> {
                 Some((tag, dir)) => (tag, Some(dir)),
                 None => (word, None),
             };
-            let tag_ok = lang_tag_body_ok(tag);
+            let tag_ok = fluree_graph_ir::syntax::is_lang_tag_body(tag);
             let dir_ok = matches!(direction, None | Some("ltr" | "rtl"));
             if tag_ok && dir_ok {
                 Ok(TokenKind::LangTag)

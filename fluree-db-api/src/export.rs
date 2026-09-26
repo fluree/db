@@ -1649,6 +1649,19 @@ fn write_iri_or_bnode<W: Write>(w: &mut W, iri: &str) -> io::Result<()> {
 }
 
 /// Write an object value as an N-Triples term.
+/// `@tag` after a literal. A tag has no escape form, so an invalid one would
+/// end the literal and read back as more triples: refuse it instead.
+fn write_lang_tag<W: Write>(w: &mut W, lang: &str) -> io::Result<()> {
+    if !syntax::is_lang_tag(lang) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("language tag {lang:?} cannot be written as Turtle or N-Triples"),
+        ));
+    }
+    w.write_all(b"\"@")?;
+    w.write_all(lang.as_bytes())
+}
+
 fn write_object<W: Write>(
     w: &mut W,
     value: &FlakeValue,
@@ -1668,8 +1681,7 @@ fn write_object<W: Write>(
             if let Some(lang) = store.resolve_lang_tag(o_type) {
                 w.write_all(b"\"")?;
                 syntax::write_string(w, s)?;
-                w.write_all(b"\"@")?;
-                w.write_all(lang.as_bytes())?;
+                write_lang_tag(w, lang)?;
                 return Ok(());
             }
 
@@ -1870,8 +1882,7 @@ fn write_raw_object<W: Write>(
             if let Some(lang) = lang {
                 w.write_all(b"\"")?;
                 syntax::write_string(w, s)?;
-                w.write_all(b"\"@")?;
-                w.write_all(lang.as_bytes())?;
+                write_lang_tag(w, lang)?;
             } else {
                 w.write_all(b"\"")?;
                 syntax::write_string(w, s)?;

@@ -1743,6 +1743,20 @@ fn parse_expanded_value(
     out
 }
 
+/// Refuse a language tag that is not a `LANGTAG` (optionally with an RDF 1.2
+/// base direction). Turtle and N-Triples have no escape for a tag, so an
+/// invalid one would end the literal in every text serialization of it.
+pub(crate) fn check_lang_tag(lang: &str) -> Result<()> {
+    if fluree_graph_ir::syntax::is_lang_tag(lang) {
+        Ok(())
+    } else {
+        Err(TransactError::Parse(format!(
+            "invalid language tag {lang:?}: a language tag starts with a letter and \
+             continues as `-`-separated alphanumeric subtags (for example \"en\" or \"en-GB\")"
+        )))
+    }
+}
+
 /// Parse a literal value with optional @type or @language, returning full metadata
 #[allow(clippy::too_many_arguments)]
 fn parse_literal_value_with_meta(
@@ -1806,6 +1820,7 @@ fn parse_literal_value_with_meta(
             // Check for @language
             if let Some(lang_val) = obj.get("@language") {
                 if let Some(lang) = lang_val.as_str() {
+                    check_lang_tag(lang)?;
                     return Ok(ParsedValue::new(TemplateTerm::Value(FlakeValue::String(
                         s.clone(),
                     )))
@@ -2455,6 +2470,37 @@ mod tests {
         let dtc = result.dtc.as_ref().expect("should have dtc");
         assert_eq!(dtc.datatype().namespace_code, 2);
         assert_eq!(dtc.datatype().name.as_ref(), "string");
+    }
+
+    /// An `@language` that is not a `LANGTAG` is refused at ingest: no text
+    /// serialization could write it without it ending the literal.
+    #[test]
+    fn test_parse_invalid_language_tag_is_rejected() {
+        let mut vars = VarRegistry::new();
+        let mut ns_registry = test_registry();
+        let mut templates: Vec<TripleTemplate> = Vec::new();
+        let ctx = ParsedContext::new();
+        let mut write_graphs = WriteGraphs::new();
+        let mut blank_counter: usize = 0;
+        let mut parse = |lang: &str| {
+            parse_expanded_value(
+                &json!({"@value": "hi", "@language": lang}),
+                &ctx,
+                &mut vars,
+                &mut ns_registry,
+                &mut templates,
+                true,
+                &mut write_graphs,
+                None,
+                &HashMap::new(),
+                &mut blank_counter,
+            )
+        };
+        let err = parse("en . <urn:injected> <urn:p> \"pwned\" . #")
+            .err()
+            .expect("invalid tag must be refused");
+        assert!(err.to_string().contains("invalid language tag"), "{err}");
+        assert!(parse("en--ltr").is_ok());
     }
 
     #[test]

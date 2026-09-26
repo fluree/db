@@ -13,6 +13,10 @@
 //! old imports contain `/` and `:`) is hex-encoded behind an `x` so the
 //! document still parses.
 //!
+//! A language tag has no escape form, so a graph holding one that is not a
+//! valid `LANGTAG` is refused rather than written: `"hi"@en . <s> <p> <o>`
+//! would read back as a second triple.
+//!
 //! RDF 1.2 reifications ([`Graph::reifications`]) are not written.
 
 use crate::PrefixMap;
@@ -20,11 +24,39 @@ use fluree_graph_ir::datatype::iri as dt_iri;
 use fluree_graph_ir::{push_canonical_xsd_double, syntax, Datatype, Graph, LiteralValue, Term};
 use std::fmt::Write as _;
 
+/// A literal's language tag is not a valid `LANGTAG`, so it cannot be written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidLangTag(pub String);
+
+impl std::fmt::Display for InvalidLangTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "language tag {:?} cannot be written as RDF text", self.0)
+    }
+}
+
+impl std::error::Error for InvalidLangTag {}
+
+fn check_lang_tags(graph: &Graph) -> Result<(), InvalidLangTag> {
+    for t in graph.iter() {
+        if let Term::Literal {
+            language: Some(lang),
+            ..
+        } = t.object()
+        {
+            if !syntax::is_lang_tag(lang) {
+                return Err(InvalidLangTag(lang.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Rough bytes per triple, for the up-front reservation.
 const BYTES_PER_TRIPLE: usize = 96;
 
 /// Write `graph` as N-Triples: one `s p o .` line per triple, full IRIs.
-pub fn format_ntriples(graph: &Graph) -> String {
+pub fn format_ntriples(graph: &Graph) -> Result<String, InvalidLangTag> {
+    check_lang_tags(graph)?;
     let mut out = String::with_capacity(graph.len() * BYTES_PER_TRIPLE);
     for t in graph.iter() {
         push_nt_term(&mut out, t.subject());
@@ -34,14 +66,15 @@ pub fn format_ntriples(graph: &Graph) -> String {
         push_nt_term(&mut out, t.object());
         out.push_str(" .\n");
     }
-    out
+    Ok(out)
 }
 
 /// Write `graph` as Turtle: `@prefix` declarations from `prefixes`, then one
 /// block per subject, with `;` between predicates, `,` between the objects of
 /// one predicate, `a` for `rdf:type` (listed first), and prefixed names and
 /// numeric/boolean shorthands wherever they read back to the same term.
-pub fn format_turtle(graph: &Graph, prefixes: &PrefixMap) -> String {
+pub fn format_turtle(graph: &Graph, prefixes: &PrefixMap) -> Result<String, InvalidLangTag> {
+    check_lang_tags(graph)?;
     let mut out = String::with_capacity(graph.len() * BYTES_PER_TRIPLE / 2);
     prefixes.push_declarations(&mut out);
     let triples = graph.triples();
@@ -82,11 +115,12 @@ pub fn format_turtle(graph: &Graph, prefixes: &PrefixMap) -> String {
         out.push_str(" .\n");
         start = end;
     }
-    out
+    Ok(out)
 }
 
-/// Append one term in N-Triples syntax.
-pub fn push_nt_term(out: &mut String, term: &Term) {
+/// Append one term in N-Triples syntax. The caller has checked its language
+/// tag ([`check_lang_tags`]).
+fn push_nt_term(out: &mut String, term: &Term) {
     match term {
         Term::Iri(iri) => match iri.strip_prefix("_:") {
             Some(label) => push_blank(out, label),
@@ -246,9 +280,34 @@ mod tests {
         g
     }
 
+    /// A tag has no escape form: a crafted one would end the literal and read
+    /// back as extra triples, so the writers refuse it.
+    #[test]
+    fn invalid_language_tag_is_refused_not_written() {
+        let tag = "en . <urn:injected> <urn:p> \"pwned\" . #";
+        let mut g = Graph::new();
+        g.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://example.org/label"),
+            Term::Literal {
+                value: LiteralValue::string("hi"),
+                datatype: Datatype::rdf_lang_string(),
+                language: Some(tag.into()),
+            },
+        );
+        assert_eq!(format_ntriples(&g), Err(InvalidLangTag(tag.to_string())));
+        assert_eq!(
+            format_turtle(&g, &PrefixMap::default()),
+            Err(InvalidLangTag(tag.to_string()))
+        );
+        // `Display` cannot fail, so it %-encodes: never parseable as a triple.
+        let shown = g.iter().next().unwrap().to_string();
+        assert!(!shown.contains("<urn:injected>"), "{shown}");
+    }
+
     #[test]
     fn ntriples_lines() {
-        let nt = format_ntriples(&sample());
+        let nt = format_ntriples(&sample()).unwrap();
         let x = "http://www.w3.org/2001/XMLSchema#";
         let expected = [
             format!("<{EX}alice> <{EX}knows> _:b1 ."),
@@ -274,7 +333,7 @@ mod tests {
             "ex": EX,
             "xsd": "http://www.w3.org/2001/XMLSchema#"
         }));
-        let ttl = format_turtle(&sample(), &prefixes);
+        let ttl = format_turtle(&sample(), &prefixes).unwrap();
         let alice = ttl
             .split("\n\n")
             .find(|block| block.starts_with("ex:alice"))
@@ -316,8 +375,8 @@ mod tests {
         let prefixes = PrefixMap::from_context(&json!({ "ex": EX }));
 
         for (format, text) in [
-            ("N-Triples", format_ntriples(&g)),
-            ("Turtle", format_turtle(&g, &prefixes)),
+            ("N-Triples", format_ntriples(&g).unwrap()),
+            ("Turtle", format_turtle(&g, &prefixes).unwrap()),
         ] {
             let mut sink = fluree_graph_ir::GraphCollectorSink::new();
             fluree_graph_turtle::parse(&text, &mut sink)
@@ -325,7 +384,11 @@ mod tests {
             // Stored blank nodes come back as blank-node terms, which sort
             // apart from the `_:` IRIs they were written from: compare lines.
             let lines = |g: &Graph| {
-                let mut lines: Vec<String> = format_ntriples(g).lines().map(String::from).collect();
+                let mut lines: Vec<String> = format_ntriples(g)
+                    .unwrap()
+                    .lines()
+                    .map(String::from)
+                    .collect();
                 lines.sort();
                 lines
             };
@@ -339,7 +402,10 @@ mod tests {
 
     #[test]
     fn empty_graph() {
-        assert_eq!(format_ntriples(&Graph::new()), "");
-        assert_eq!(format_turtle(&Graph::new(), &PrefixMap::default()), "");
+        assert_eq!(format_ntriples(&Graph::new()).unwrap(), "");
+        assert_eq!(
+            format_turtle(&Graph::new(), &PrefixMap::default()).unwrap(),
+            ""
+        );
     }
 }

@@ -481,7 +481,20 @@ impl std::fmt::Display for Term {
                 crate::syntax::escape_string(&value.lexical(), |seg| f.write_str(seg))?;
                 f.write_str("\"")?;
                 if let Some(lang) = language {
-                    write!(f, "@{lang}")
+                    f.write_str("@")?;
+                    if crate::syntax::is_lang_tag(lang) {
+                        f.write_str(lang)
+                    } else {
+                        // No escape form exists; %-encoding keeps a bad tag
+                        // from ending the literal and reading as more triples.
+                        lang.bytes().try_for_each(|b| {
+                            if b.is_ascii_alphanumeric() || b == b'-' {
+                                std::fmt::Write::write_char(f, b as char)
+                            } else {
+                                write!(f, "%{b:02X}")
+                            }
+                        })
+                    }
                 } else if !datatype.is_xsd_string() {
                     f.write_str("^^<")?;
                     crate::syntax::escape_iri(datatype.as_iri(), |seg| f.write_str(seg))?;

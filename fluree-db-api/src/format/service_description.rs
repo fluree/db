@@ -84,9 +84,11 @@ pub fn sparql_service_description(endpoint: &str, config: &FormatterConfig) -> R
                 "formats": FORMATS,
                 "sparql": SPARQL
             }));
-            Ok(format_turtle(&graph, &prefixes))
+            format_turtle(&graph, &prefixes).map_err(|e| FormatError::InvalidBinding(e.to_string()))
         }
-        OutputFormat::NTriples => Ok(format_ntriples(&graph)),
+        OutputFormat::NTriples => {
+            format_ntriples(&graph).map_err(|e| FormatError::InvalidBinding(e.to_string()))
+        }
         OutputFormat::RdfXml => rdf_xml::format_graph(&graph),
         other => Err(FormatError::InvalidBinding(format!(
             "a service description is an RDF graph; {other:?} is not a graph format"

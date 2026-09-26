@@ -40,8 +40,8 @@ pub fn format(
                 .as_ref()
                 .map(PrefixMap::from_context)
                 .unwrap_or_default();
-            Ok(format_turtle(&graph, &prefixes))
+            format_turtle(&graph, &prefixes).map_err(|e| FormatError::InvalidBinding(e.to_string()))
         }
-        _ => Ok(format_ntriples(&graph)),
+        _ => format_ntriples(&graph).map_err(|e| FormatError::InvalidBinding(e.to_string())),
     }
 }

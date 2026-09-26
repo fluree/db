@@ -227,6 +227,28 @@ pub fn is_blank_node_label(label: &str) -> bool {
     )
 }
 
+/// Whether `tag` is a language tag proper: `[a-zA-Z]+ ('-' [a-zA-Z0-9]+)*`,
+/// the first subtag letters only and no subtag empty.
+pub fn is_lang_tag_body(tag: &str) -> bool {
+    tag.split('-').enumerate().all(|(i, part)| {
+        !part.is_empty()
+            && part.chars().all(|c| c.is_ascii_alphanumeric())
+            && (i > 0 || part.chars().all(|c| c.is_ascii_alphabetic()))
+    })
+}
+
+/// Whether `tag` can follow `@` in Turtle or N-Triples: a [language tag
+/// body](is_lang_tag_body), optionally with an RDF 1.2 base direction
+/// (`--ltr` / `--rtl`). A `LANGTAG` has no escape form, so a writer given
+/// anything else cannot write it without changing what the document says.
+pub fn is_lang_tag(tag: &str) -> bool {
+    let (body, direction) = match tag.split_once("--") {
+        Some((body, direction)) => (body, Some(direction)),
+        None => (tag, None),
+    };
+    is_lang_tag_body(body) && matches!(direction, None | Some("ltr" | "rtl"))
+}
+
 /// Whether `lexical` is a Turtle `INTEGER` (so `xsd:integer` can be written bare).
 pub fn is_turtle_integer(lexical: &str) -> bool {
     let digits = lexical.strip_prefix(['+', '-']).unwrap_or(lexical);
@@ -328,6 +350,24 @@ mod tests {
         }
         for bad in ["-a", ".a", "a.", "a/b", "a#b", "a%2", "a%zz", "a b", "(a)"] {
             assert!(!is_pn_local(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn lang_tags() {
+        for ok in ["en", "en-GB", "zh-Hant-TW", "x-1", "en--ltr", "ar--rtl"] {
+            assert!(is_lang_tag(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "1en",
+            "en-",
+            "en_GB",
+            "en--up",
+            "en--ltr--rtl",
+            "en . <urn:x> <urn:p> \"o\" . #",
+        ] {
+            assert!(!is_lang_tag(bad), "{bad:?}");
         }
     }
 
