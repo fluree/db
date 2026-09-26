@@ -1741,9 +1741,8 @@ fn values_optional_barrier_indices(
 /// it is written, so an OPTIONAL after it must not be held behind it.
 ///
 /// Only an OPTIONAL anchors an edge. MINUS, EXISTS and NOT EXISTS are
-/// order-sensitive too, but `reorder_patterns` already defers each until every
-/// variable produced by the patterns written before it is bound, which keeps
-/// it behind them.
+/// order-sensitive too, but `reorder_patterns` already gives each positional
+/// dependencies on the preceding binding-producing patterns.
 fn left_join_order_barriers(
     patterns: &[Pattern],
     initial_bound_vars: &HashSet<VarId>,
@@ -1894,8 +1893,11 @@ pub fn reorder_patterns(
     for (i, pattern) in patterns.iter().enumerate() {
         // MINUS, EXISTS, and NOT EXISTS are order-sensitive: they operate on
         // the solution produced by ALL preceding patterns. Treat them as
-        // deferred with required_vars = variables from all preceding patterns
-        // so the reorder cannot hoist them above sources that feed them.
+        // deferred until the preceding binding-producing patterns are placed.
+        // Variable readiness alone is insufficient: VALUES/OPTIONAL may leave
+        // a shared variable unbound, and a later triple fills it in without
+        // adding a new schema variable. Hoisting negation ahead of that triple
+        // changes which mappings it can remove.
         if matches!(
             pattern,
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_)
@@ -1915,7 +1917,9 @@ pub fn reorder_patterns(
                 required_vars: required,
                 pattern: pattern.clone(),
                 nestable: true,
-                after_indices: Vec::new(),
+                after_indices: (0..i)
+                    .filter(|&j| !patterns[j].produced_vars().is_empty())
+                    .collect(),
             });
             continue;
         }
@@ -5367,6 +5371,38 @@ mod tests {
             "MINUS should be placed after sources, got: {:?}",
             reordered[2]
         );
+    }
+
+    #[test]
+    fn negation_waits_for_preceding_patterns_even_when_schema_is_already_bound() {
+        let p = VarId(0);
+        let values = Pattern::Values {
+            vars: vec![p],
+            rows: vec![vec![crate::binding::Binding::Unbound]],
+        };
+        // This triple supplies the value missing from VALUES, but produces
+        // no new schema variable. A variable-readiness check alone is unsound.
+        let person = Pattern::Triple(TriplePattern::new(
+            Ref::Var(p),
+            Ref::Sid(Sid::new(100, "type")),
+            Term::Sid(Sid::new(100, "Person")),
+        ));
+        let inner = vec![triple(p, "worksFor", VarId(1))];
+        for negation in [
+            Pattern::Minus(inner.clone()),
+            Pattern::Exists(inner.clone()),
+            Pattern::NotExists(inner),
+        ] {
+            let patterns = vec![values.clone(), person.clone(), negation.clone()];
+            for seed in [HashSet::new(), HashSet::from([p])] {
+                let reordered = reorder_patterns(&patterns, None, &seed);
+                assert_eq!(
+                    format!("{:?}", reordered.last().unwrap()),
+                    format!("{negation:?}"),
+                    "negation must follow both binders: {reordered:?}"
+                );
+            }
+        }
     }
 
     #[test]
