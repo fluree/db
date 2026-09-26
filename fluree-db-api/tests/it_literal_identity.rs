@@ -534,19 +534,54 @@ async fn string_dict_datatypes_keep_their_identity_through_a_subject_join() {
 /// groups, and survived its own MINUS.
 #[tokio::test]
 async fn temporal_literals_keep_one_key_across_join_lanes() {
-    let fluree = FlureeBuilder::memory().build_memory();
-    let id = "it/temporal-join-lanes:main";
-    let ledger = fluree.create_ledger(id).await.unwrap();
     let typed = |value: &str, dt: &str| json!({"@value": value, "@type": format!("http://www.w3.org/2001/XMLSchema#{dt}")});
+    assert_one_key_across_join_lanes(
+        "it/temporal-join-lanes:main",
+        &[
+            typed("2024-01-01", "date"),
+            typed("2024-01-01T10:00:00Z", "dateTime"),
+            typed("10:00:00", "time"),
+        ],
+    )
+    .await;
+}
+
+/// The rest of what the scan keeps encoded — `xsd:float`, `@fulltext` and
+/// `@json` — under the same lanes and surfaces as the temporal types.
+#[tokio::test]
+async fn scan_encoded_literals_keep_one_key_across_join_lanes() {
+    let float = |v: &str| json!({"@value": v, "@type": "http://www.w3.org/2001/XMLSchema#float"});
+    assert_one_key_across_join_lanes(
+        "it/float-join-lanes:main",
+        &[float("1.5"), float("2.5"), float("-3.25")],
+    )
+    .await;
+    let fulltext = |v: &str| json!({"@value": v, "@type": "@fulltext"});
+    assert_one_key_across_join_lanes(
+        "it/fulltext-join-lanes:main",
+        &[fulltext("red fox"), fulltext("blue fox"), fulltext("fox")],
+    )
+    .await;
+    let json_lit = |v: Value| json!({"@value": v, "@type": "@json"});
+    assert_one_key_across_join_lanes(
+        "it/json-join-lanes:main",
+        &[
+            json_lit(json!({"a": 1, "b": [true, "x"]})),
+            json_lit(json!([1, 2])),
+            json_lit(json!("s")),
+        ],
+    )
+    .await;
+}
+
+/// Stores each of three distinct `values` twice, then checks every equality
+/// surface keeps one key per value across a UNION of each batched lane with a
+/// plain scan, indexed and with novelty over the index.
+async fn assert_one_key_across_join_lanes(id: &str, values: &[Value; 3]) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger(id).await.unwrap();
     // Each value twice, so a split key shows as a doubled count.
-    let whens = [
-        typed("2024-01-01", "date"),
-        typed("2024-01-01", "date"),
-        typed("2024-01-01T10:00:00Z", "dateTime"),
-        typed("2024-01-01T10:00:00Z", "dateTime"),
-        typed("10:00:00", "time"),
-        typed("10:00:00", "time"),
-    ];
+    let whens: Vec<&Value> = values.iter().flat_map(|v| [v, v]).collect();
     let mut graph: Vec<Value> = whens
         .iter()
         .enumerate()
@@ -586,7 +621,7 @@ async fn temporal_literals_keep_one_key_across_join_lanes() {
             (BATCHED_JOIN_LANE, "join", via_join),
             (BATCHED_OPTIONAL_LANE, "optional", via_optional),
         ] {
-            let what = format!("{phase}: {lane_name}");
+            let what = format!("{id} {phase}: {lane_name}");
             let q =
                 format!("SELECT (COUNT(DISTINCT ?d) AS ?c) WHERE {{ {branch} UNION {via_scan} }}");
             let got = served_by(lane, &what, sparql(&fluree, &view, &q)).await;
@@ -618,7 +653,7 @@ async fn temporal_literals_keep_one_key_across_join_lanes() {
         assert_eq!(
             got,
             json!([[3]]),
-            "{phase}: json-ld count-distinct across lanes"
+            "{id} {phase}: json-ld count-distinct across lanes"
         );
     }
 }
