@@ -2507,6 +2507,38 @@ mod tests {
         ));
     }
 
+    /// FROM and TO spelling one ledger two ways (`ledger` vs `ledger:main`)
+    /// are the same ledger; two different ledgers still aren't. JSON-LD and
+    /// SPARQL both check this.
+    #[test]
+    fn history_range_accepts_two_spellings_of_one_ledger() {
+        let json_spec = |from: &str, to: &str| {
+            DatasetSpec::from_json(&json!({
+                "from": from,
+                "to": to,
+                "select": ["?s"],
+                "where": {"@id": "?s"}
+            }))
+        };
+        let sparql_spec = |from: &str, to: &str| {
+            DatasetSpec::from_sparql_clause(&SparqlDatasetClause {
+                default_graphs: vec![Iri::full(from, make_span())],
+                named_graphs: vec![],
+                to_graph: Some(Iri::full(to, make_span())),
+                span: make_span(),
+            })
+        };
+
+        for spec in [
+            json_spec("ledger@t:1", "ledger:main@t:latest"),
+            sparql_spec("ledger@t:1", "ledger:main@t:latest"),
+        ] {
+            assert!(spec.expect("same ledger").is_history_mode());
+        }
+        assert!(json_spec("ledger@t:1", "other:main@t:latest").is_err());
+        assert!(sparql_spec("ledger@t:1", "ledger:dev@t:latest").is_err());
+    }
+
     #[test]
     fn test_from_sparql_clause_to_graph_history_range() {
         // FROM <ledger:main@t:1> TO <ledger:main@t:latest>
