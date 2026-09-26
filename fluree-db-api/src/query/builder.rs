@@ -18,6 +18,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::{BuilderError, BuilderErrors};
 use crate::format::FormatterConfig;
+use crate::query::connection::FormatTarget;
+#[cfg(feature = "iceberg")]
 use crate::query::helpers::parse_dataset_spec;
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -1159,42 +1161,39 @@ impl<'a> FromQueryBuilder<'a> {
             QueryInput::JsonLd(json) => {
                 let policy = self.policy.as_deref();
                 let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
-                let (result, dataset) = self
+                let (result, target) = self
                     .fluree
-                    .query_connection_jsonld_returning_dataset_with_options(
+                    .query_connection_jsonld_returning_target_with_options(
                         json,
                         policy,
                         r2rml_pair,
                         execution.clone(),
                     )
                     .await?;
-                match dataset {
+                match target {
                     // Multi-ledger: format hydration per home-ledger view so
                     // cross-graph IRIs/properties decode correctly (issue #1259).
-                    Some(dataset) => Ok(crate::format::format_results_async_dataset(
+                    FormatTarget::Dataset(dataset) => {
+                        Ok(crate::format::format_results_async_dataset(
+                            &result,
+                            &result.context,
+                            &dataset,
+                            &format_config,
+                            None,
+                        )
+                        .await?)
+                    }
+                    // Single-ledger: the view the query ran on, so hydration is
+                    // filtered by the policy that filtered the rows.
+                    FormatTarget::Single(view) => Ok(crate::format::format_results_async(
                         &result,
                         &result.context,
-                        &dataset,
+                        view.as_graph_db_ref(),
                         &format_config,
+                        view.policy(),
                         None,
                     )
                     .await?),
-                    // Single-ledger: format against the sole view (today's path).
-                    None => {
-                        let (spec, _) = parse_dataset_spec(json)?;
-                        let alias = spec
-                            .default_graphs
-                            .first()
-                            .or_else(|| spec.named_graphs.first())
-                            .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
-                        let view = self
-                            .fluree
-                            .db_or_graph_source(alias.identifier.as_str())
-                            .await?;
-                        Ok(result
-                            .format_async(view.as_graph_db_ref(), &format_config)
-                            .await?)
-                    }
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -1338,48 +1337,39 @@ impl<'a> FromQueryBuilder<'a> {
             QueryInput::JsonLd(json) => {
                 let policy = self.policy.as_deref();
                 let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
-                let (result, dataset) = self
+                let (result, target) = self
                     .fluree
-                    .query_connection_jsonld_returning_dataset_with_options(
+                    .query_connection_jsonld_returning_target_with_options(
                         json,
                         policy,
                         r2rml_pair,
                         execution.clone(),
                     )
                     .await?;
-                match dataset {
+                match target {
                     // Multi-ledger: dataset-aware string formatting (issue #1259).
-                    Some(dataset) => crate::format::format_results_string_async_dataset(
-                        &result,
-                        &result.context,
-                        &dataset,
-                        &format_config,
-                        None,
-                    )
-                    .await
-                    .map_err(ApiError::from),
-                    // Single-ledger: format against the sole view (today's path).
-                    None => {
-                        let (spec, _) = parse_dataset_spec(json)?;
-                        let alias = spec
-                            .default_graphs
-                            .first()
-                            .or_else(|| spec.named_graphs.first())
-                            .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
-                        let view = self
-                            .fluree
-                            .db_or_graph_source(alias.identifier.as_str())
-                            .await?;
-                        crate::format::format_results_string_async(
+                    FormatTarget::Dataset(dataset) => {
+                        crate::format::format_results_string_async_dataset(
                             &result,
                             &result.context,
-                            view.as_graph_db_ref(),
+                            &dataset,
                             &format_config,
                             None,
                         )
                         .await
                         .map_err(ApiError::from)
                     }
+                    // Single-ledger: the view the query ran on, so hydration is
+                    // filtered by the policy that filtered the rows.
+                    FormatTarget::Single(view) => crate::format::format_results_string_async(
+                        &result,
+                        &result.context,
+                        view.as_graph_db_ref(),
+                        &format_config,
+                        view.policy(),
+                    )
+                    .await
+                    .map_err(ApiError::from),
                 }
             }
             QueryInput::Sparql(sparql) => {

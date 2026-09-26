@@ -131,7 +131,39 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         }
     }
 
-    /// Load the view, using graph source fallback when enabled.
+    /// Wrap a loaded view in the request's policy.
+    ///
+    /// A request selecting any policy is wrapped with it, gated on
+    /// `has_any_policy_inputs` as on the `from`-driven path. One selecting nothing
+    /// leaves the ledger's or source's configured defaults in force, and those
+    /// leave an unconfigured ledger untouched.
+    ///
+    /// SPARQL has nowhere to carry an `opts` block, so only configured defaults
+    /// can govern it. The verified identity does not arrive in the body either:
+    /// it rides the builder's execution options from the auth layer, and without
+    /// it an `f:IdentityRestricted` override control refuses a request the config
+    /// would permit.
+    async fn wrap_request_policy(&self, view: GraphDb) -> Result<GraphDb> {
+        let mut opts = match self.core.input.as_ref() {
+            Some(crate::view::QueryInput::JsonLd(json)) => {
+                crate::GovernanceOptions::from_json(json)
+                    .map_err(|e| ApiError::query(e.to_string()))?
+            }
+            _ => crate::GovernanceOptions::default(),
+        };
+        opts.server_identity = self.core.execution.server_identity.clone();
+        if opts.has_any_policy_inputs() {
+            self.graph.fluree.wrap_policy(view, &opts).await
+        } else {
+            self.graph.fluree.wrap_policy_defaults(view).await
+        }
+    }
+
+    /// Load the view for this handle's ledger and time, falling back to a graph
+    /// source when enabled, and return it wrapped in the request's policy.
+    ///
+    /// Execution receives the view already wrapped and does not wrap it again.
+    /// See [`Self::wrap_request_policy`] for which requests engage enforcement.
     async fn load_view(&self) -> Result<crate::view::GraphDb> {
         let result = self
             .graph
@@ -169,30 +201,14 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     else {
                         return result;
                     };
-                    // Unlike the `from`-driven builder, nothing downstream of this
-                    // one wraps policy, so a governed source would otherwise be read
-                    // unfiltered. Gated on the request carrying a policy input, the
-                    // same rule `apply_source_or_global_policy` uses: a request with
-                    // none is unrestricted, exactly as for a native ledger.
-                    let mut opts = match self.core.input.as_ref() {
-                        Some(crate::view::QueryInput::JsonLd(json)) => {
-                            crate::GovernanceOptions::from_json(json)
-                                .map_err(|e| ApiError::query(e.to_string()))?
-                        }
-                        _ => crate::GovernanceOptions::default(),
-                    };
-                    // The body never carries the verified identity; it rides
-                    // the builder's execution options from the auth layer.
-                    opts.server_identity = self.core.execution.server_identity.clone();
-                    if opts.has_any_policy_inputs() {
-                        return self.graph.fluree.wrap_policy(db, &opts).await;
-                    }
-                    return Ok(db);
+                    // A governed source's configured defaults are its model's
+                    // policy, resolved onto the view above.
+                    return self.wrap_request_policy(db).await;
                 }
             }
         }
 
-        result
+        self.wrap_request_policy(result?).await
     }
 
     /// Execute the query and return raw [`QueryResult`].

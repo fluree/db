@@ -986,8 +986,8 @@ async fn source_default_allow_keeps_model_less_source_readable() {
 }
 
 /// The graph-scoped builder (`fluree.graph(id).query()`, which the server's
-/// proxy-mode query route uses) must enforce a governed source's model, not
-/// just the `from`-driven builder.
+/// SPARQL graph-source fallback uses) must enforce a governed source's model,
+/// not just the `from`-driven builder.
 ///
 /// Nothing downstream of `GraphQueryBuilder` wraps policy, so attaching the
 /// model's `resolved_config` alone left the source readable.
@@ -1059,17 +1059,50 @@ async fn graph_scoped_builder_enforces_governed_source() {
         .expect("from-driven query");
     assert_eq!(rows(&via_from), 0, "{via_from}");
 
-    // Control: with no policy input on the request the source stays readable,
-    // so the assertion above cannot pass by denying everything unconditionally.
-    let open = json!({ "@context": context(), "select": sel, "where": wh });
+    // A request selecting no policy is governed by the model all the same, which
+    // is what `apply_source_or_global_policy` has always done for the
+    // `from`-driven builder. This assertion used to expect 5: the graph-scoped
+    // builder returned the source unwrapped when the request carried no policy
+    // input, so a bare read bypassed the model entirely.
+    let open = json!({ "@context": context(), "select": sel.clone(), "where": wh.clone() });
     let via_graph_open = fluree
         .graph(GOVERNED)
         .query()
         .jsonld(&open)
         .execute_formatted()
         .await
-        .expect("ungoverned query");
-    assert_eq!(rows(&via_graph_open), 5, "{via_graph_open}");
+        .expect("bare graph-scoped query");
+    assert_eq!(rows(&via_graph_open), 0, "{via_graph_open}");
+
+    let mut open_from = open.clone();
+    open_from["from"] = json!(GOVERNED);
+    let via_from_open = fluree
+        .query_from()
+        .jsonld(&open_from)
+        .execute_formatted()
+        .await
+        .expect("bare from-driven query");
+    assert_eq!(rows(&via_from_open), 0, "{via_from_open}");
+
+    // Control: the same bare request against a source with no model stays
+    // readable. Without it the two assertions above could pass on a builder that
+    // denied every bare read rather than applying the model.
+    const UNGOVERNED: &str = "local-open-gsb:main";
+    let cfg = R2rmlCreateConfig::new_direct("local-open-gsb", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("model-less source");
+    let ungoverned = json!({ "@context": context(), "select": sel, "where": wh });
+    let via_graph_ungoverned = fluree
+        .graph(UNGOVERNED)
+        .query()
+        .jsonld(&ungoverned)
+        .execute_formatted()
+        .await
+        .expect("model-less graph-scoped query");
+    assert_eq!(rows(&via_graph_ungoverned), 5, "{via_graph_ungoverned}");
 }
 
 /// `ORDER BY … LIMIT k` must not push a scan-side top-k under a view policy.
