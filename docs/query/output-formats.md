@@ -456,6 +456,7 @@ fluree query --format typed-json --normalize-arrays '{"select": {"ex:alice": ["*
 - **normalize_arrays** adds zero overhead when disabled (default). When enabled, it skips the `len() == 1` check — no additional allocations beyond the array wrapper.
 - **TSV/CSV** bypass JSON construction entirely for maximum throughput
 - **Turtle, N-Triples and RDF/XML** write the constructed graph straight into one output string, with no JSON DOM; decoded IRIs are shared across the triples that repeat them. They allocate far less than CONSTRUCT's JSON-LD, which builds a `serde_json::Value` DOM
+- **Graph output is not streamed or paged.** Every graph format builds the whole constructed graph, then the whole document, before the first byte is sent, so memory grows with the result. For a large graph, bound the CONSTRUCT with `LIMIT` / `OFFSET`, or export the ledger.
 
 ## Best Practices
 

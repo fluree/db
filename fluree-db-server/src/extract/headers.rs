@@ -92,7 +92,9 @@ impl GraphFormat {
 }
 
 /// `(q, media type)` for each range in an `Accept` value, weight-zero ranges
-/// dropped, highest `q` first; equal weights keep the header's order.
+/// dropped, highest `q` first. Within a weight, a type beats `type/*`, which
+/// beats `*/*` (the more specific range is the client's real preference);
+/// otherwise the header's order is kept.
 fn media_ranges(accept: &str) -> impl Iterator<Item = (f32, &str)> {
     let mut ranges: Vec<(f32, &str)> = accept
         .split(',')
@@ -106,7 +108,15 @@ fn media_ranges(accept: &str) -> impl Iterator<Item = (f32, &str)> {
         })
         .filter(|(q, _)| *q > 0.0)
         .collect();
-    ranges.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let specificity = |media: &str| match media {
+        "*/*" => 0,
+        m if m.ends_with("/*") => 1,
+        _ => 2,
+    };
+    ranges.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| specificity(b.1).cmp(&specificity(a.1)))
+    });
     ranges.into_iter()
 }
 
@@ -671,6 +681,15 @@ mod tests {
             n(Some("application/n-triples, text/turtle")),
             Some(GraphFormat::NTriples),
             "equal weights keep the header's order"
+        );
+        assert_eq!(
+            n(Some("*/*, text/turtle")),
+            Some(GraphFormat::Turtle),
+            "a type beats a wildcard at equal weight"
+        );
+        assert_eq!(
+            n(Some("text/*, application/rdf+xml")),
+            Some(GraphFormat::RdfXml)
         );
         assert_eq!(n(Some("application/sparql-results+json")), None);
         assert_eq!(n(Some("text/turtle;q=0")), None);

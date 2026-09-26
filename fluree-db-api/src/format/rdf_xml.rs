@@ -79,12 +79,33 @@ pub(super) fn format_graph(graph: &Graph) -> Result<String> {
     Ok(out)
 }
 
+/// `rdf:nodeID` takes an XML name. A label that is not one (ids minted by old
+/// imports contain `/` and `:`, and a Turtle label may start with a digit) is
+/// hex-encoded behind an `x`, as the Turtle and N-Triples writers do.
+fn push_node_id(label: &str, out: &mut String) {
+    let is_name = label
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if is_name {
+        out.push_str(label);
+    } else {
+        out.push('x');
+        for b in label.bytes() {
+            let _ = write!(out, "{b:02x}");
+        }
+    }
+}
+
 fn write_subject_attr(subject: &Term, out: &mut String) -> Result<()> {
     match subject {
         // A stored blank node comes back as a `_:`-prefixed IRI.
         Term::Iri(iri) if iri.starts_with("_:") => {
             out.push_str(r#" rdf:nodeID=""#);
-            escape_attr_into(&iri[2..], out);
+            push_node_id(&iri[2..], out);
             out.push('"');
             Ok(())
         }
@@ -96,7 +117,7 @@ fn write_subject_attr(subject: &Term, out: &mut String) -> Result<()> {
         }
         Term::BlankNode(id) => {
             out.push_str(r#" rdf:nodeID=""#);
-            escape_attr_into(id.as_str(), out);
+            push_node_id(id.as_str(), out);
             out.push('"');
             Ok(())
         }
@@ -128,7 +149,7 @@ fn write_predicate_object(
     match object {
         Term::Iri(iri) if iri.starts_with("_:") => {
             out.push_str(r#" rdf:nodeID=""#);
-            escape_attr_into(&iri[2..], out);
+            push_node_id(&iri[2..], out);
             out.push_str(r#""/>"#);
             Ok(())
         }
@@ -140,7 +161,7 @@ fn write_predicate_object(
         }
         Term::BlankNode(id) => {
             out.push_str(r#" rdf:nodeID=""#);
-            escape_attr_into(id.as_str(), out);
+            push_node_id(id.as_str(), out);
             out.push_str(r#""/>"#);
             Ok(())
         }
@@ -252,6 +273,25 @@ mod tests {
             "{xml}"
         );
         assert!(xml.contains(">Alice<"), "{xml}");
+    }
+
+    /// Labels that are not XML names (legacy import ids with `/` and `:`, or a
+    /// leading digit) are hex-encoded, so `rdf:nodeID` stays valid.
+    #[test]
+    fn rdfxml_node_ids_are_xml_names() {
+        let mut g = Graph::new();
+        g.add(Triple::new(
+            Term::iri("_:old/ledger:1"),
+            Term::iri("http://example.org/knows"),
+            Term::blank("0"),
+        ));
+        g.sort();
+        let xml = format_graph(&g).unwrap();
+        assert!(
+            xml.contains(r#"rdf:nodeID="x6f6c642f6c65646765723a31""#),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"rdf:nodeID="x30""#), "{xml}");
     }
 
     #[test]
