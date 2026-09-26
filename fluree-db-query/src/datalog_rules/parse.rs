@@ -215,6 +215,13 @@ pub(super) fn parse_sparql_rule(
             "the CONSTRUCT template has no triple patterns",
         ));
     }
+    if template.names_graphs() || !template.reifications.is_empty() {
+        return Err(invalid(
+            &label,
+            "the CONSTRUCT template writes into a named graph or annotates an edge; a rule \
+             head can only infer default-graph triples",
+        ));
+    }
     let heads = template
         .patterns
         .iter()

@@ -496,6 +496,23 @@ SELECT ?person ?org WHERE {
 
 Sibling triples about the reifier (here `?ann ex:role "Engineer"`) live in the surrounding scope and join via the standard executor — they do **not** need to live inside the `<<( ... )>>` term.
 
+#### Annotations in `CONSTRUCT` output
+
+A `CONSTRUCT` template can carry annotations into its result, written the same two ways:
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+CONSTRUCT { ?person ex:worksFor ?org ~ ?ann }
+WHERE {
+  ?person ex:worksFor ?org
+  OPTIONAL { ?ann rdf:reifies <<( ?person ex:worksFor ?org )>> }
+}
+```
+
+Every result format carries the link: `o ~ r` in Turtle and TriG, an `r rdf:reifies <<( s p o )>>` line in N-Triples and N-Quads, `@annotation` in JSON-LD, the `rdf:annotation` attribute in RDF/XML. A [Graph Store `GET`](../api/graph-store.md) returns a graph's annotations the same way, so a graph read and put back unchanged commits nothing. See [CONSTRUCT](../query/construct.md#edge-annotations-in-the-template) for template blocks and fresh reifiers.
+
 #### Blank nodes in `WHERE` clauses
 
 Per SPARQL §4.1.4, a blank-node label in a `WHERE` clause is a **non-distinguished variable** — bindable inside the BGP but not exposable via `SELECT`. The same rule applies to reifiers: `?p ex:worksFor ex:acme ~ _:ann { ... }` lets `_:ann` join across the BGP but does not surface in the result.
@@ -520,7 +537,7 @@ These produce a clear error with a span pointing at the offending construct:
 - **Annotation on a property-path triple.** `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — the grammar only attaches annotations to simple-predicate triples.
 - **Annotation tail inside an explicit `GRAPH { }` block.** `INSERT DATA { GRAPH <g> { :s :p :o {| ... |} } }` is rejected. SPARQL UPDATE annotations are **default-graph only** in v1 — the SPARQL surface doesn't carry the enclosing graph's identity into the stored annotation. Use the JSON-LD `@annotation` surface or a TriG `GRAPH { }` block to annotate an edge inside a named graph.
 - **Annotation tail under a `WITH <g>` template.** `WITH <g> INSERT { :s :p :o {| ... |} } WHERE { ... }` is rejected for the same reason: the annotation would land in `<g>` without recording that graph as the edge's identity, yielding a default-graph edge identity in a named graph. Again, use the JSON-LD surface for named-graph edge annotations.
-- **SPARQL `CONSTRUCT` template projecting annotation metadata.** Until the Turtle-star vs RDF 1.2 reifier output decision lands, a CONSTRUCT template containing an annotation tail or `rdf:reifies` returns `UnsupportedFeature`. CONSTRUCT *without* annotation in the template still works even when the WHERE pattern uses annotations to filter.
+- **Property paths and nested triple terms in a `CONSTRUCT` template's annotation.** A template annotation block (`{| ... |}`) takes simple predicates only, and a template triple term (`?r rdf:reifies <<( ... )>>`) cannot nest.
 
 Annotations on literal-valued objects (plain, typed, and language-tagged) are supported on **both** the JSON-LD and SPARQL UPDATE write surfaces — the SPARQL path records the language tag for language-tagged objects so the stored annotation matches the base edge.
 
@@ -550,7 +567,6 @@ Today's surface covers the common LPG / RDF-star use cases. The following are no
 - **Reifiers for unasserted triples.** `@reifies` must point at an asserted edge. Pure-proposition reification (claims about triples that are not in the graph) is deferred.
 - **Reifiers for multiple triples.** One annotation subject corresponds to one edge. Reifying several unrelated triples from a single annotation isn't allowed.
 - **Triple terms as values.** `ex:doc ex:mentions <<( ex:s ex:p ex:o )>>` is not a representable value on any surface (JSON-LD, SPARQL, Turtle): the only accepted position for `<<( ... )>>` is the object of `rdf:reifies`, where it names an edge rather than storing a triple. Binding a whole triple to a variable (`BIND(<<( ?s ?p ?o )>> AS ?t)`, `VALUES ?t { <<( ... )>> }`) and returning one in a result set are the same gap. Use a separate annotation subject.
-- **Annotations in CONSTRUCT output.** JSON-LD query results carry `@annotation`, and [export](../cli/export.md#edge-annotations-rdf-12) writes annotations in RDF 1.2 syntax in every format. SPARQL CONSTRUCT does not: an annotation tail in a CONSTRUCT template is rejected with `UnsupportedFeature`, and a CONSTRUCT result (JSON-LD, Turtle, N-Triples or RDF/XML), like a [Graph Store `GET`](../api/graph-store.md), includes a reifier's own triples but not its link to the edge. The natural output form is the one export uses, `r rdf:reifies <<( s p o )>>`.
 - **SPARQL 1.2 triple-term functions and constructor.** `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` triple-term constructor parse (with arity checks) but fail at lowering with a `not_implemented` error — they presuppose triple terms as first-class values, which v1's LPG model does not represent.
 - **SPARQL UPDATE annotations inside named graphs.** Annotation tails under `GRAPH { }` / `WITH <g>` in SPARQL UPDATE are rejected; write named-graph annotations with JSON-LD `@annotation` or TriG-star.
 - **Unasserted reified triples.** RDF 1.2's `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do not assert `s p o`; Fluree's do (the reifier is lifecycle-coupled to a live edge). A W3C test that depends on a reifier existing for a triple that is *not* in the graph therefore diverges.

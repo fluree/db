@@ -15,8 +15,8 @@ use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term};
 use fluree_db_query::ir::ConstructTemplate;
 use fluree_db_query::{Batch, VarId};
-use fluree_graph_format::{format_jsonld, JsonLdFormatConfig};
-use fluree_graph_ir::{BlankId, Datatype, Graph, LiteralValue, Term as IrTerm, Triple};
+use fluree_graph_format::{format_jsonld_dataset, JsonLdFormatConfig};
+use fluree_graph_ir::{BlankId, Dataset, Datatype, LiteralValue, Term as IrTerm, Triple};
 use fluree_vocab::{geo, rdf, xsd};
 use rustc_hash::FxHashMap;
 use serde_json::Value as JsonValue;
@@ -38,8 +38,8 @@ use std::sync::Arc;
 ///
 /// JSON-LD graph: `{"@context": ..., "@graph": [...]}`
 pub fn format(result: &QueryResult, compactor: &IriCompactor) -> Result<JsonValue> {
-    // 1. Build Graph from template instantiation
-    let mut graph = instantiate_construct_graph(result, compactor)?;
+    // 1. Build the dataset from template instantiation
+    let mut dataset = instantiate_construct_graph(result, compactor)?;
 
     // Sort for deterministic output, and apply RDF set semantics: a CONSTRUCT
     // result is a graph, so a template instantiated to the same (s, p, o) by
@@ -48,7 +48,7 @@ pub fn format(result: &QueryResult, compactor: &IriCompactor) -> Result<JsonValu
     // RDF term identity — `"1"^^xsd:integer` and `"1"^^xsd:string` stay
     // distinct. Caveat: a NaN `xsd:double` object never compares equal to
     // itself, so repeated NaN triples are not collapsed.
-    graph.canonicalize();
+    dataset.canonicalize();
 
     // 2. Format to JSON-LD using CONSTRUCT parity settings.
     //    Use the precomputed ContextCompactor so we don't rebuild the
@@ -66,17 +66,19 @@ pub fn format(result: &QueryResult, compactor: &IriCompactor) -> Result<JsonValu
     // CONSTRUCT output singleton wrapping isn't semantically important for us.
     // We keep a single consistent policy (currently: always use arrays).
 
-    Ok(format_jsonld(&graph, &config))
+    Ok(format_jsonld_dataset(&dataset, &config))
 }
 
 /// Instantiate CONSTRUCT template patterns with query bindings.
 ///
-/// Produces a Graph with EXPANDED IRIs (not compact). Compaction/serialization is done
-/// at the final output step, not here.
+/// Produces a Dataset with EXPANDED IRIs (not compact): the default graph,
+/// plus a named graph for each graph a template `GRAPH` block writes into,
+/// each carrying the reifier attachments of its triples. Compaction and
+/// serialization happen at the final output step, not here.
 pub(super) fn instantiate_construct_graph(
     result: &QueryResult,
     compactor: &IriCompactor,
-) -> Result<Graph> {
+) -> Result<Dataset> {
     let template = result
         .output
         .construct_template()
@@ -84,7 +86,7 @@ pub(super) fn instantiate_construct_graph(
 
     let rows: usize = result.batches.iter().map(Batch::len).sum();
     if rows == 0 {
-        return Ok(Graph::new());
+        return Ok(Dataset::new());
     }
 
     let mut terms = TermResolver {
@@ -94,26 +96,34 @@ pub(super) fn instantiate_construct_graph(
         datatypes: FxHashMap::default(),
     };
     // Template constants resolve once, not once per solution row.
-    let patterns = template
-        .patterns
-        .iter()
-        .map(|pattern| {
-            let mut slot = |r: &Ref, position| match r {
-                Ref::Var(v) => Ok(terms_slot(template, *v)),
-                constant => terms.constant_ref(constant, position).map(Slot::Const),
-            };
-            let s = slot(&pattern.s, Position::Subject)?;
-            let p = slot(&pattern.p, Position::Predicate)?;
-            let o = match &pattern.o {
-                Term::Var(v) => terms_slot(template, *v),
-                constant => Slot::Const(terms.constant_object(constant, pattern.dtc.as_ref())?),
-            };
-            Ok([s, p, o])
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let slot_of = |terms: &mut TermResolver<'_>, r: &Ref, position| match r {
+        Ref::Var(v) => Ok(terms_slot(template, *v)),
+        constant => terms.constant_ref(constant, position).map(Slot::Const),
+    };
+    // Each pattern's slots, graph, and the reifiers attached to it.
+    let mut patterns = Vec::with_capacity(template.patterns.len());
+    for (i, pattern) in template.patterns.iter().enumerate() {
+        let s = slot_of(&mut terms, &pattern.s, Position::Subject)?;
+        let p = slot_of(&mut terms, &pattern.p, Position::Predicate)?;
+        let o = match &pattern.o {
+            Term::Var(v) => terms_slot(template, *v),
+            constant => Slot::Const(terms.constant_object(constant, pattern.dtc.as_ref())?),
+        };
+        let graph = match template.graph(i) {
+            Some(g) => Some(slot_of(&mut terms, g, Position::Graph)?),
+            None => None,
+        };
+        patterns.push(([s, p, o], graph, Vec::new()));
+    }
+    for r in &template.reifications {
+        let reifier = slot_of(&mut terms, &r.reifier, Position::Subject)?;
+        patterns[r.triple].2.push(reifier);
+    }
 
-    let mut graph = Graph::new();
-    graph.reserve(rows.saturating_mul(patterns.len()));
+    let mut dataset = Dataset::new();
+    if !template.names_graphs() {
+        dataset.default.reserve(rows.saturating_mul(patterns.len()));
+    }
 
     // Monotonic counter for minting fresh per-solution template blank-node
     // labels; shared across all rows so the labels are globally distinct.
@@ -123,27 +133,30 @@ pub(super) fn instantiate_construct_graph(
     // and — via the row-global `bnode_counter` — distinct from every other
     // row's blanks.
     let mut row_bnodes: HashMap<VarId, BlankId> = HashMap::new();
+    let mut reifiers: Vec<IrTerm> = Vec::new();
 
     for batch in &result.batches {
         for row in 0..batch.len() {
             row_bnodes.clear();
-            'pattern: for slots in &patterns {
+            let mut resolve = |slot: &Slot, position| -> Result<Option<IrTerm>> {
+                Ok(match slot {
+                    Slot::Const(term) => term.clone(),
+                    Slot::Blank(v) => Some(IrTerm::BlankNode(row_blank(
+                        *v,
+                        &mut row_bnodes,
+                        &mut bnode_counter,
+                    ))),
+                    Slot::Var(v) => match batch.get(row, *v) {
+                        Some(binding) => terms.binding(binding, position)?,
+                        None => None,
+                    },
+                })
+            };
+            'pattern: for (slots, graph_slot, reifier_slots) in &patterns {
                 let mut triple: [Option<IrTerm>; 3] = [None, None, None];
                 for (i, (slot, position)) in slots.iter().zip(POSITIONS).enumerate() {
-                    let term = match slot {
-                        Slot::Const(term) => term.clone(),
-                        Slot::Blank(v) => Some(IrTerm::BlankNode(row_blank(
-                            *v,
-                            &mut row_bnodes,
-                            &mut bnode_counter,
-                        ))),
-                        Slot::Var(v) => match batch.get(row, *v) {
-                            Some(binding) => terms.binding(binding, position)?,
-                            None => None,
-                        },
-                    };
                     // Skip if any term is unbound (incomplete triple)
-                    let Some(term) = term else {
+                    let Some(term) = resolve(slot, position)? else {
                         continue 'pattern;
                     };
                     triple[i] = Some(term);
@@ -151,12 +164,35 @@ pub(super) fn instantiate_construct_graph(
                 let [Some(s), Some(p), Some(o)] = triple else {
                     unreachable!("every position was filled above")
                 };
-                graph.add(Triple::new(s, p, o));
+                if graph_slot.is_none() && reifier_slots.is_empty() {
+                    dataset.default.add(Triple::new(s, p, o));
+                    continue;
+                }
+                let graph = match graph_slot {
+                    Some(slot) => match resolve(slot, Position::Graph)? {
+                        Some(name) => Some(name),
+                        // An unbound graph name writes nothing.
+                        None => continue 'pattern,
+                    },
+                    None => None,
+                };
+                // Reifiers bound on this row; an unbound one attaches nothing.
+                reifiers.clear();
+                for slot in reifier_slots {
+                    if let Some(r) = resolve(slot, Position::Subject)? {
+                        reifiers.push(r);
+                    }
+                }
+                let g = dataset.graph_mut(graph.as_ref());
+                for r in reifiers.drain(..) {
+                    g.add_reification(s.clone(), p.clone(), o.clone(), r);
+                }
+                g.add(Triple::new(s, p, o));
             }
         }
     }
 
-    Ok(graph)
+    Ok(dataset)
 }
 
 /// A template position: a constant resolved up front, a variable bound per
@@ -180,6 +216,8 @@ enum Position {
     Subject,
     Predicate,
     Object,
+    /// A template graph name: an IRI or blank node, like a subject.
+    Graph,
 }
 
 const POSITIONS: [Position; 3] = [Position::Subject, Position::Predicate, Position::Object];
@@ -291,7 +329,7 @@ impl TermResolver<'_> {
             Binding::IriMatch { iri, .. } | Binding::Iri(iri) => Ok(named(iri, position)),
             Binding::Lit { val, dtc, .. } => match position {
                 Position::Object => self.literal(val, dtc),
-                Position::Subject | Position::Predicate => Ok(None),
+                Position::Subject | Position::Predicate | Position::Graph => Ok(None),
             },
             Binding::EncodedLit { .. }
             | Binding::EncodedSid { .. }

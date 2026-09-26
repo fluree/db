@@ -99,7 +99,8 @@ Supported SPARQL features:
 - Property paths (`+`, `*`, `?`, `^`, `|`, `/`, `!` negated sets, and transitive over a sequence including inverse steps `(^a/b)+`; see [SPARQL docs](../query/sparql.md#property-paths))
 - MINUS, VALUES, and FILTER EXISTS / NOT EXISTS
 - SERVICE against local ledgers (`fluree:ledger:<name>`); remote HTTP endpoints are not supported
-- Result formats: SELECT/ASK as SPARQL-results JSON or XML, CSV or TSV; CONSTRUCT/DESCRIBE as JSON-LD, Turtle, N-Triples or RDF/XML (see [SPARQL output negotiation](../api/endpoints.md#post-queryledger))
+- Result formats: SELECT/ASK as SPARQL-results JSON or XML, CSV or TSV; CONSTRUCT/DESCRIBE as JSON-LD, Turtle, N-Triples, RDF/XML, TriG or N-Quads (see [SPARQL output negotiation](../api/endpoints.md#post-queryledger))
+- `GRAPH` blocks in a CONSTRUCT template, writing into named graphs (an extension, as in Apache Jena ARQ; see [CONSTRUCT](../query/construct.md#named-graphs-in-the-template))
 
 **Aggregate result types:** COUNT and SUM of integers return `xsd:integer` (per W3C spec), not `xsd:long`. SUM of mixed types and AVG return `xsd:double`.
 
@@ -188,12 +189,14 @@ Supported query and update annotation syntax:
 - Named reifiers: `?s ?p ?o ~ ?r {| ... |}` (IRI, blank-node, or variable reifier)
 - `rdf:reifies` form with `<<( s p o )>>` triple terms
 - Annotations in `INSERT DATA` / `DELETE DATA`
+- Annotations in `CONSTRUCT` templates (`~ ?r`, `{| ... |}`, and `?r rdf:reifies <<( s p o )>>`),
+  written by every result format
 
 Not yet supported:
 - Triple-term accessor functions: `TRIPLE()`, `SUBJECT()`, `PREDICATE()`,
   `OBJECT()`, `isTRIPLE()`
-- Triple terms as arbitrary values, in `CONSTRUCT` patterns, or in subject
-  position; multi-triple and nested annotations
+- Triple terms as arbitrary values (a `CONSTRUCT` template accepts one only as the object of
+  `rdf:reifies`) or in subject position; multi-triple and nested annotations
 - Named-graph edge annotations in SPARQL UPDATE (default graph only)
 - W3C SPARQL 1.2 test-suite execution (manifests present but not yet run)
 
@@ -383,8 +386,8 @@ Supported SPARQL versions:
 | JSON-LD | Yes | Yes |
 | Turtle | Yes | Yes (export, CONSTRUCT/DESCRIBE results, Graph Store `GET`) |
 | N-Triples | Yes | Yes (export, CONSTRUCT/DESCRIBE results, Graph Store `GET`) |
-| N-Quads | Yes | Yes |
-| TriG | Yes | Yes |
+| N-Quads | Yes | Yes (export, CONSTRUCT/DESCRIBE results) |
+| TriG | Yes | Yes (export, CONSTRUCT/DESCRIBE results) |
 | RDF/XML | No | CONSTRUCT/DESCRIBE results and Graph Store `GET` only |
 
 Import accepts `.ttl`, `.nt`, `.nq`, `.trig`, and `.jsonld`/`.jsonl` files, each
@@ -470,7 +473,7 @@ Fluree can import from:
 
 Export Fluree data to:
 - Turtle, N-Triples, N-Quads, TriG or JSON-LD, with `fluree export` or the export endpoint
-- SPARQL CONSTRUCT / DESCRIBE results as JSON-LD, Turtle, N-Triples or RDF/XML
+- SPARQL CONSTRUCT / DESCRIBE results as JSON-LD, Turtle, N-Triples, RDF/XML, TriG or N-Quads
 - One graph at a time through the Graph Store Protocol
 
 ## Feature Roadmap
@@ -482,7 +485,7 @@ Export Fluree data to:
 - SPARQL 1.1 Federation: remote `SERVICE` endpoints (local-ledger `SERVICE` is supported)
 - Remote `LOAD` in SPARQL UPDATE
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
-- RDF 1.2 / SPARQL 1.2: triple terms as values and the triple-term accessor functions; edge annotations in CONSTRUCT and Graph Store `GET` output (export already writes them); the RDF 1.2 Turtle evaluation suite (blocked on triple terms)
+- RDF 1.2 / SPARQL 1.2: triple terms as values and the triple-term accessor functions; the RDF 1.2 Turtle evaluation suite (blocked on triple terms)
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)

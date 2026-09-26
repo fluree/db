@@ -284,7 +284,7 @@ non-JSON formats are rejected up front:
 | SPARQL Results JSON | `FormatterConfig::sparql_json()` | applies | **applies** (cross-language SPARQL Results shape) |
 | Agent JSON | `FormatterConfig::agent_json()` | applies | **applies** (cross-language agent envelope; honours `with_max_bytes(...)`) |
 | JSON-LD | `FormatterConfig::jsonld()` | applies | **skipped** — SPARQL Results JSON default kept |
-| TSV / CSV / SPARQL XML / Turtle / N-Triples / RDF/XML | (any non-JSON `OutputFormat`) | rejected at `.execute()` with `MultiQueryError::UnsupportedFormat` | rejected |
+| TSV / CSV / SPARQL XML / Turtle / N-Triples / RDF/XML / TriG / N-Quads | (any non-JSON `OutputFormat`) | rejected at `.execute()` with `MultiQueryError::UnsupportedFormat` | rejected |
 
 The "JSON-LD applies only to JSON-LD aliases" rule keeps `--normalize-arrays`
 (which builds `FormatterConfig::jsonld().with_normalize_arrays()`) from
@@ -292,7 +292,7 @@ silently coercing SPARQL `SELECT` results out of SPARQL Results JSON. If
 you want a unified shape across both languages, pick `TypedJson`,
 `SparqlJson`, or `AgentJson` instead.
 
-Non-JSON formats (TSV, CSV, SPARQL XML, Turtle, N-Triples, RDF/XML) are rejected at
+Non-JSON formats (TSV, CSV, SPARQL XML, Turtle, N-Triples, RDF/XML, TriG, N-Quads) are rejected at
 `.execute()` time with `MultiQueryError::UnsupportedFormat` — a multi-query
 envelope can't embed byte/string payloads inside its JSON `results` map.
 
@@ -315,7 +315,8 @@ order (most specific wins):
 
 `Accept` values that produce byte/string payloads — `text/tab-separated-values`,
 `text/csv`, `application/sparql-results+xml`, and a preferred graph text format
-(`text/turtle`, `application/n-triples`, `application/rdf+xml`) —
+(`text/turtle`, `application/n-triples`, `application/rdf+xml`, `application/trig`,
+`application/n-quads`) —
 are rejected with **406 Not Acceptable** since they can't be embedded
 inside the envelope's JSON `results` map.
 
@@ -519,7 +520,7 @@ The following are not supported and produce documented behaviour rather than sil
 - **`opts.t` is rejected at every level inside the envelope.** Pin time via `from` (e.g., `from: "ledger@t:42"`) or envelope `asOf`.
 - **Response size cap is enforced at assembly, not throughout dispatch.** Each sub-query result is checked against the per-sub-query cap once after it returns, and the assembler enforces the envelope-level cap as it stitches the response. Peak memory during dispatch is bounded by `max_concurrency × max_subquery_response_bytes`, which can exceed the envelope cap while individual sub-queries are running.
 - **SPARQL sub-queries do not consume merged policy opts (identity, policy-class, policy, policy-values, default-allow).** The headers ride through the transport, the server folds them into the envelope's top-level `opts`, and the envelope → sub-query opts merge carries them into each sub-query's opts — but the connection-scoped SPARQL dispatch path (`query_from().sparql()`) does not read body opts. JSON-LD sub-queries get full policy threading via `apply_auth_identity_to_opts`; SPARQL sub-queries observe bearer ledger-scope only. This is the same gap that exists for single-query connection-scoped SPARQL (`POST /query` with `Content-Type: application/sparql-query` and an inline `FROM`).
-- **Output formats are limited to JSON-producing shapes.** The envelope always assembles a JSON response body, so TSV, CSV, SPARQL Results XML, Turtle, N-Triples, and RDF/XML are not available per-alias. Use single queries against `/query` when you need a byte/string payload.
+- **Output formats are limited to JSON-producing shapes.** The envelope always assembles a JSON response body, so TSV, CSV, SPARQL Results XML, Turtle, N-Triples, RDF/XML, TriG, and N-Quads are not available per-alias. Use single queries against `/query` when you need a byte/string payload.
 
 ---
 

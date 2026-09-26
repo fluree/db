@@ -5,7 +5,7 @@
 //! solution modifiers (ORDER BY, LIMIT, OFFSET), and update operations.
 
 use super::expr::Expression;
-use super::pattern::{GraphPattern, TriplePattern};
+use super::pattern::{GraphName, GraphPattern, TriplePattern};
 use super::term::{Iri, Var};
 use super::update::UpdateRequest;
 use crate::span::SourceSpan;
@@ -520,6 +520,11 @@ impl ConstructQuery {
 pub struct ConstructTemplate {
     /// Triple patterns in the template
     pub triples: Vec<TriplePattern>,
+    /// The `GRAPH` block each triple sits in, parallel to `triples` (`None`:
+    /// outside any block). Empty when the template has no `GRAPH` blocks.
+    /// `GRAPH` in a CONSTRUCT template is an extension (as in Jena ARQ); it
+    /// makes the result a dataset.
+    pub graphs: Vec<Option<GraphName>>,
     /// Source span (including braces)
     pub span: SourceSpan,
 }
@@ -527,7 +532,21 @@ pub struct ConstructTemplate {
 impl ConstructTemplate {
     /// Create a new construct template.
     pub fn new(triples: Vec<TriplePattern>, span: SourceSpan) -> Self {
-        Self { triples, span }
+        Self {
+            triples,
+            graphs: Vec::new(),
+            span,
+        }
+    }
+
+    /// The `GRAPH` block `triples[i]` sits in.
+    pub fn graph(&self, i: usize) -> Option<&GraphName> {
+        self.graphs.get(i).and_then(Option::as_ref)
+    }
+
+    /// Whether any triple sits in a `GRAPH` block.
+    pub fn names_graphs(&self) -> bool {
+        self.graphs.iter().any(Option::is_some)
     }
 }
 

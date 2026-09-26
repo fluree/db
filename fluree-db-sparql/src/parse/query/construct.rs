@@ -1,6 +1,8 @@
 //! CONSTRUCT query parsing.
 
-use crate::ast::{ConstructQuery, ConstructTemplate, GraphPattern, TriplePattern, WhereClause};
+use crate::ast::{
+    ConstructQuery, ConstructTemplate, GraphName, GraphPattern, TriplePattern, WhereClause,
+};
 use crate::lex::TokenKind;
 
 impl super::Parser<'_> {
@@ -155,7 +157,9 @@ impl super::Parser<'_> {
         Some(WhereClause::new(pattern, true, span))
     }
 
-    /// Parse a CONSTRUCT template (the triples to build).
+    /// Parse a CONSTRUCT template (the triples to build), including `GRAPH`
+    /// blocks: `GRAPH <iri> { ... }` or `GRAPH ?g { ... }` (an extension, as in
+    /// Jena ARQ, that makes the result a dataset).
     fn parse_construct_template(&mut self) -> Option<ConstructTemplate> {
         let start = self.stream.current_span();
 
@@ -166,29 +170,25 @@ impl super::Parser<'_> {
             return None;
         }
 
-        // Parse triple patterns (simple triples only, no property paths in templates)
         let mut triples: Vec<TriplePattern> = Vec::new();
+        let mut graphs: Vec<Option<GraphName>> = Vec::new();
 
         while !self.stream.check(&TokenKind::RBrace) && !self.stream.is_eof() {
-            // Parse subject
-            let subject = match self.parse_subject() {
-                Some(s) => s,
-                None => {
-                    if self.stream.check(&TokenKind::RBrace) {
-                        break; // Empty template is allowed
-                    }
+            if self.stream.match_keyword(TokenKind::KwGraph) {
+                let name = self.parse_graph_block_start()?;
+                let before = triples.len();
+                self.parse_template_triples(&mut triples, true)?;
+                if !self.stream.match_token(&TokenKind::RBrace) {
                     self.stream
-                        .error_at_current("expected subject in CONSTRUCT template");
+                        .error_at_current("expected '}' after GRAPH block");
                     return None;
                 }
-            };
-
-            // Parse predicate-object list (folding in any blank-node
-            // property-list triples the subject produced).
-            self.parse_template_triples_for_subject(&subject, &mut triples)?;
-
-            // Optional dot
-            self.stream.match_token(&TokenKind::Dot);
+                graphs.resize(before, None);
+                graphs.resize(triples.len(), Some(name));
+                self.stream.match_token(&TokenKind::Dot);
+                continue;
+            }
+            self.parse_template_triples(&mut triples, false)?;
         }
 
         // Expect closing brace
@@ -199,7 +199,43 @@ impl super::Parser<'_> {
         }
 
         let span = start.union(self.stream.previous_span());
+        let mut template = ConstructTemplate::new(triples, span);
+        if graphs.iter().any(Option::is_some) {
+            graphs.resize(template.triples.len(), None);
+            template.graphs = graphs;
+        }
+        Some(template)
+    }
 
-        Some(ConstructTemplate::new(triples, span))
+    /// Parse template triples up to the closing `}` (not consumed) or, outside
+    /// a `GRAPH` block, up to the next `GRAPH` keyword.
+    fn parse_template_triples(
+        &mut self,
+        triples: &mut Vec<TriplePattern>,
+        in_graph: bool,
+    ) -> Option<()> {
+        while !self.stream.check(&TokenKind::RBrace) && !self.stream.is_eof() {
+            if self.stream.check_keyword(TokenKind::KwGraph) {
+                if in_graph {
+                    self.stream
+                        .error_at_current("GRAPH blocks cannot nest in a CONSTRUCT template");
+                    return None;
+                }
+                return Some(());
+            }
+            let Some(subject) = self.parse_subject() else {
+                if self.stream.check(&TokenKind::RBrace) {
+                    break; // Empty template is allowed
+                }
+                self.stream
+                    .error_at_current("expected subject in CONSTRUCT template");
+                return None;
+            };
+            // Parse predicate-object list (folding in any blank-node
+            // property-list triples the subject produced).
+            self.parse_template_triples_for_subject(&subject, triples)?;
+            self.stream.match_token(&TokenKind::Dot);
+        }
+        Some(())
     }
 }
