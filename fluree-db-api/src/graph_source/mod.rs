@@ -187,6 +187,8 @@ fn describe_source_time(time: Option<fluree_db_query::r2rml::SourceTime>) -> Str
 mod bm25;
 mod cache;
 mod config;
+// The maintenance workers are native-only.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod dependency_index;
 mod helpers;
 mod provider;

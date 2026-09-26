@@ -31,6 +31,7 @@
 //! produce an authoritative event set without observing the
 //! ledger's running novelty.
 
+#[cfg(not(target_arch = "wasm32"))]
 use fluree_db_core::LedgerId;
 use std::sync::{Arc, OnceLock};
 
