@@ -835,7 +835,8 @@ async fn flpack_restore_restamps_index_root_ledger_id() {
 }
 
 /// A truncated archive (missing the End frame) must fail and leave no ledger
-/// behind — the half-created ledger is rolled back.
+/// behind — the half-created ledger is rolled back, and the restore can be
+/// retried under the same name.
 #[tokio::test]
 async fn flpack_restore_rolls_back_on_truncated_stream() {
     let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
@@ -854,29 +855,85 @@ async fn flpack_restore_rolls_back_on_truncated_stream() {
     });
     src_fluree.insert(src_state, &insert).await.expect("insert");
 
-    let mut pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+    let full_pack = export_ledger_to_bytes(&src_fluree, src_ledger).await;
     // Lop off the trailing End frame (and a bit more) to simulate truncation.
-    pack_bytes.truncate(pack_bytes.len() / 2);
+    let truncated = full_pack[..full_pack.len() / 2].to_vec();
 
     let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
         .build()
         .expect("build destination");
-    let mut reader = std::io::Cursor::new(pack_bytes);
+    let mut reader = std::io::Cursor::new(truncated);
     let err = dst_fluree.restore_ledger(dst_ledger, &mut reader).await;
     assert!(err.is_err(), "truncated archive should fail");
 
-    // Rollback hard-drops the half-created ledger. A drop leaves a retracted
-    // tombstone rather than purging the nameservice entry, so the guarantee is
-    // "no live ledger": the record is either absent or marked retracted (never
-    // a queryable head pointing at partially-ingested data).
+    // Rollback purges the half-created record rather than retracting it, so
+    // nothing reserves the name.
     let record = dst_fluree
         .nameservice()
         .lookup(dst_ledger)
         .await
         .expect("lookup");
     assert!(
-        record.is_none_or(|r| r.retracted),
-        "failed restore must leave no live ledger (rolled back / retracted)"
+        record.is_none(),
+        "failed restore must leave no record behind: {record:?}"
+    );
+
+    let mut reader = std::io::Cursor::new(full_pack);
+    dst_fluree
+        .restore_ledger(dst_ledger, &mut reader)
+        .await
+        .expect("retrying the restore under the same name must succeed");
+    assert!(dst_fluree.ledger_exists(dst_ledger).await.expect("exists"));
+}
+
+/// A restore into a name that already holds a live ledger on another branch
+/// is refused, and the live ledger is untouched. Before, the restore created a
+/// second root branch under the name, and when it failed its rollback dropped
+/// the whole name, taking the live ledger with it.
+#[tokio::test]
+async fn flpack_restore_refuses_name_held_on_another_branch() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let live = "flpack-test/held:main";
+    let target = "flpack-test/held:other";
+
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let db = fluree_db_core::LedgerSnapshot::genesis(live);
+    let state = fluree_db_api::LedgerState::new(db, fluree_db_api::Novelty::new(0));
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:test", "ex:value": "hello"
+    });
+    fluree.insert(state, &insert).await.expect("insert");
+
+    // Truncated, so a restore that got past the name check would fail and
+    // exercise the rollback.
+    let mut pack_bytes = export_ledger_to_bytes(&fluree, live).await;
+    pack_bytes.truncate(pack_bytes.len() / 2);
+
+    let mut reader = std::io::Cursor::new(pack_bytes);
+    let err = fluree
+        .restore_ledger(target, &mut reader)
+        .await
+        .expect_err("a name held by a live ledger must be refused");
+    assert!(
+        matches!(err, fluree_db_api::ApiError::LedgerExists(_)),
+        "expected LedgerExists, got: {err}"
+    );
+
+    assert!(
+        fluree.ledger_exists(live).await.expect("exists"),
+        "the live ledger must survive a refused restore"
+    );
+    assert!(
+        fluree
+            .nameservice()
+            .lookup(target)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "a refused restore must not register the target"
     );
 }
 

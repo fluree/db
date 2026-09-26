@@ -2012,9 +2012,12 @@ impl Fluree {
     /// The new name is independent of the source ledger's name — CAS objects
     /// are content-addressed, so only the nameservice pointer uses the name.
     ///
-    /// On any failure after the empty ledger is created, the half-created
-    /// ledger is hard-dropped so a partial restore never leaves a head
-    /// pointing at incompletely-ingested data.
+    /// Returns [`ApiError::LedgerExists`] if the name already holds a live
+    /// ledger on any branch.
+    ///
+    /// On any failure after the empty ledger is created, its record is
+    /// purged, so a partial restore never leaves a head pointing at
+    /// incompletely-ingested data and the restore can be retried.
     pub async fn restore_ledger<R>(
         &self,
         new_ledger_id: &str,
@@ -2028,56 +2031,60 @@ impl Fluree {
         // callers may pass a bare `name` (the CLI does), which `create_ledger`
         // would register as `name:main` while raw-id storage writes would land
         // in the wrong namespace.
-        let new_ledger_id = LedgerId::parse(new_ledger_id)?.to_string();
-        let new_ledger_id = new_ledger_id.as_str();
+        let new_ledger_id = LedgerId::parse(new_ledger_id)?;
+
+        // A restore brings in a whole ledger, so the name must be free on
+        // every branch: restoring `mydb:other` while `mydb:main` is live would
+        // put two unrelated ledgers under one name, sharing its `@shared/`
+        // dictionaries.
+        if let Some(existing) = self
+            .nameservice()
+            .list_branches(new_ledger_id.name())
+            .await?
+            .first()
+        {
+            return Err(ApiError::ledger_exists(existing.ledger_id.to_string()));
+        }
 
         // Create the empty target first. `create_ledger` errors if the name is
         // already taken — callers map that to a 409 / usage error.
-        self.create_ledger(new_ledger_id).await?;
+        self.create_ledger(&new_ledger_id).await?;
 
-        match self.restore_into_created(new_ledger_id, reader).await {
+        match self.restore_into_created(&new_ledger_id, reader).await {
             Ok(result) => Ok(result),
             Err(e) => {
                 // Roll back so we never leave a ledger whose head points at
-                // partially-ingested data. `restore_ledger` only reaches here
-                // after `create_ledger` succeeded, which means the name did not
-                // previously exist — so dropping the whole name removes only
-                // what this restore created, never a pre-existing sibling.
-                // Soft drop (retract the nameservice pointer) is the right
-                // rollback: it cannot fail on file deletion, and any CAS blobs
-                // already written are harmless content-addressed orphans (a
-                // retry rewrites identical bytes; GC reclaims them otherwise).
-                // `drop_ledger` takes the bare name, so strip the branch suffix.
-                // (admin::drop_ledger is native-only; on wasm32 the orphaned
-                // name is left for the server/external admin to reap.)
-                #[cfg(target_arch = "wasm32")]
-                error!(
-                    ledger = %new_ledger_id,
-                    "restore rollback (drop_ledger) unavailable on wasm32"
-                );
-                #[cfg(not(target_arch = "wasm32"))]
-                match fluree_db_core::ledger_id::split_ledger_id(new_ledger_id) {
-                    Ok((name, _branch)) => {
-                        if let Err(drop_err) = self.drop_ledger(&name, crate::DropMode::Soft).await
-                        {
-                            error!(
-                                ledger = %new_ledger_id,
-                                error = %drop_err,
-                                "failed to roll back partially-restored ledger after restore error"
-                            );
-                        }
-                    }
-                    Err(parse_err) => {
-                        error!(
-                            ledger = %new_ledger_id,
-                            error = %parse_err,
-                            "could not parse ledger id to roll back partially-restored ledger"
-                        );
-                    }
+                // partially-ingested data. Only the record this restore
+                // created: anything else under the name, such as a ledger
+                // created concurrently on another branch, is not ours to
+                // drop. Any CAS blobs already written are harmless
+                // content-addressed orphans (a retry rewrites identical
+                // bytes; GC reclaims them otherwise).
+                if let Err(rollback_err) = self.discard_restored(&new_ledger_id).await {
+                    error!(
+                        ledger = %new_ledger_id,
+                        error = %rollback_err,
+                        "failed to roll back partially-restored ledger after restore error"
+                    );
                 }
                 Err(e)
             }
         }
+    }
+
+    /// Remove the ledger a failed restore created: stop its indexing, purge
+    /// its record, and evict it from the cache. Purge rather than retract, so
+    /// the restore can be retried under the same name.
+    async fn discard_restored(&self, ledger_id: &LedgerId) -> Result<()> {
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            handle.cancel(ledger_id).await;
+            handle.wait_for_idle(ledger_id).await;
+        }
+        let purged = self.ledger_admin()?.purge(ledger_id).await;
+        if let Some(mgr) = &self.ledger_manager {
+            mgr.disconnect(ledger_id).await;
+        }
+        Ok(purged?)
     }
 
     /// Stream-decode a `.flpack` into the already-created `new_ledger_id` and

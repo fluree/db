@@ -839,11 +839,13 @@ Authorization: Bearer <token>   (admin token when configured)
 
 - `201 Created`: ledger restored
 - `400 Bad Request`: malformed archive (bad preamble/frame, missing manifest, or a manifest head CID not present in the archive)
-- `409 Conflict`: a ledger with that name already exists
+- `409 Conflict`: a ledger with that name already exists, on any branch
 - `401 Unauthorized`: missing or invalid admin token
 
 On any mid-stream failure the partially-created ledger is rolled back, so a
-failed import never leaves a live, half-ingested ledger behind.
+failed import never leaves a live, half-ingested ledger behind. The rollback
+removes only the ledger the import created, and the import can be retried
+under the same name.
 
 **Example:**
 
