@@ -347,7 +347,12 @@ mod inner {
                 .get(&code)
                 .map(std::string::String::as_str)
                 .unwrap_or("");
-            self.datatypes.get_or_insert_parts(prefix, &sid.name) as u16
+            let id = self.datatypes.get_or_insert_parts(prefix, &sid.name);
+            // Convert the ID to a `u16`, using `u16::MAX` when it does not fit.
+            // `u16::MAX` is past `DatatypeDictId::MAX`, so it never names a
+            // real datatype. The import refuses IDs past the maximum before
+            // any record reaches an `OType`.
+            u16::try_from(id).unwrap_or(u16::MAX)
         }
 
         /// Assign a chunk-local string ID via `ChunkStringDict`.
