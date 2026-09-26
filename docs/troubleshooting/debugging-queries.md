@@ -232,6 +232,25 @@ Look for:
    - Subject-based patterns use SPOT (fast)
    - Broad patterns may scan many triples (slow)
 
+### Isolating an Optimizer Change
+
+If a query returns a different answer, or runs slower, than you expect, these
+environment variables restore the plan an optimization replaced so the two can
+be compared. Setting a variable enables it; any value, including `0`, counts.
+
+| Variable | Effect | Read |
+|---|---|---|
+| `FLUREE_DISABLE_QUERY_FAST_PATHS` | Generic pipeline instead of fused fast paths, the count planner, the membership and range semijoin lanes, and the SQL pushdown lane. Does not affect the aggregate complement rewrites | Once per process |
+| `FLUREE_DISABLE_AGG_COMPLEMENT_FOLD` | Disables both aggregate complement rewrites | Per query |
+| `FLUREE_DISABLE_AGG_COMPLEMENT_SHARING` | Disables only aggregate sharing; the complement fold still applies | Per query |
+| `FLUREE_DISABLE_DECIMAL_SEEKS` | A scan with a bound decimal object uses the general numeric matcher instead of a point lookup in the predicate's decimal arena. The scan still leads with the predicate | Once per process |
+
+The planner switches apply to EXPLAIN as well as execution, so compare plans
+with the same environment the query runs in. `FLUREE_DISABLE_DECIMAL_SEEKS`
+acts when a scan opens and does not change the plan; compare fuel or timing
+instead. See [Performance architecture](../design/performance.md) for what each
+optimization does.
+
 ## Query Optimization
 
 ### Automatic Pattern Reordering
