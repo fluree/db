@@ -3,8 +3,13 @@
 //! Every datatype outside [`DatatypeDictId::RESERVED_IRIS`] takes a
 //! dictionary ID the first time a ledger uses it, and IDs are never
 //! released. A ledger with more than the index can store can never be
-//! indexed again, so every path that writes commits checks the limit before
-//! the write, where a refusal is still recoverable.
+//! indexed again. Every path that creates new commits checks the limit
+//! before the write, where a refusal is still recoverable: `build_commit`,
+//! push, and bulk import.
+//!
+//! Pull and clone do not check it. They copy a history that already exists
+//! on the remote. If that history is past the limit, the remote cannot be
+//! indexed either, and refusing the copy would not change that.
 
 use crate::commit::binary_store;
 use crate::error::{Result, TransactError};
@@ -14,7 +19,7 @@ use fluree_db_core::{DatatypeDictId, Flake, RuntimeSmallDicts, Sid};
 use fluree_db_ledger::LedgerState;
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue};
 use rustc_hash::FxHashSet;
-use std::borrow::Cow;
+use std::sync::Arc;
 
 /// Non-reserved datatypes a ledger can hold: every datatype dictionary ID
 /// from `RESERVED_COUNT` through `MAX`.
@@ -44,8 +49,8 @@ pub fn check_commit(base: &LedgerState, flakes: &[Flake], txn_meta: &[TxnMetaEnt
 /// store and extended by every commit since. When it was not seeded from
 /// that store, a copy is seeded here so datatypes that exist only in the
 /// index still count.
-pub fn known_datatypes(state: &LedgerState) -> Cow<'_, RuntimeSmallDicts> {
-    let dicts = &*state.runtime_small_dicts;
+pub fn known_datatypes(state: &LedgerState) -> Arc<RuntimeSmallDicts> {
+    let dicts = &state.runtime_small_dicts;
     match binary_store(state) {
         Some(store) if usize::from(dicts.persisted_datatype_count()) != store.dt_sids().len() => {
             let mut seeded =
@@ -55,9 +60,9 @@ pub fn known_datatypes(state: &LedgerState) -> Cow<'_, RuntimeSmallDicts> {
                     seeded.assign_or_lookup_datatype(sid);
                 }
             }
-            Cow::Owned(seeded)
+            Arc::new(seeded)
         }
-        _ => Cow::Borrowed(dicts),
+        _ => Arc::clone(dicts),
     }
 }
 
