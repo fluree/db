@@ -34,6 +34,20 @@ use fluree_vocab::{db, fluree};
 /// the two sites are asserted in sync by the debug_assert in emit paths.
 const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_DB, FLUREE_COMMIT, FLUREE_URN];
 
+/// Narrow a datatype dictionary ID to the width the index stores.
+///
+/// Returns an error message naming the limit if the ID does not fit.
+fn checked_dt_id(dt_id: u32) -> Result<u16, String> {
+    DatatypeDictId::try_from_dict_id(dt_id)
+        .map(DatatypeDictId::as_u16)
+        .ok_or_else(|| {
+            format!(
+                "datatype dict overflow (dt_id={dt_id} exceeds the maximum of {})",
+                DatatypeDictId::MAX
+            )
+        })
+}
+
 /// System-injected txn-meta predicates that legitimately live in a reserved
 /// namespace: `build_commit` strips any user-supplied claim for these and
 /// injects the system-controlled value (`f:identity` for provenance,
@@ -617,18 +631,9 @@ impl CommitResolver {
                 let str_id = dicts.strings.get_or_insert(value)?;
                 let dt_prefix = self.lookup_prefix(*dt_ns);
                 let dt_id = dicts.datatypes.get_or_insert_parts(dt_prefix, dt_name);
-                // Match resolve_single_op()'s u8 constraint for format consistency
-                if dt_id > u8::MAX as u32 {
-                    return Err(ResolverError::Resolve(format!(
-                        "txn_meta datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-                    )));
-                }
-                Ok((
-                    ObjKind::LEX_ID,
-                    ObjKey::encode_u32_id(str_id),
-                    dt_id as u16,
-                    0,
-                ))
+                let dt_id = checked_dt_id(dt_id)
+                    .map_err(|e| ResolverError::Resolve(format!("txn_meta {e}")))?;
+                Ok((ObjKind::LEX_ID, ObjKey::encode_u32_id(str_id), dt_id, 0))
             }
         }
     }
@@ -663,14 +668,7 @@ impl CommitResolver {
         // way, `(op.dt_ns_code, op.dt_name)` here is guaranteed canonical.
         let prefix = self.lookup_prefix(op.dt_ns_code);
         let dt_id = dicts.datatypes.get_or_insert_parts(prefix, op.dt_name);
-        // Bulk import path: enforce u8 dt ids for now (imports are allowed to error here).
-        // Operationally, the binary format supports widening dt to u16.
-        if dt_id > u8::MAX as u32 {
-            return Err(CommitCodecError::InvalidOp(format!(
-                "import not available: datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-            )));
-        }
-        let dt_id = dt_id as u16;
+        let dt_id = checked_dt_id(dt_id).map_err(CommitCodecError::InvalidOp)?;
 
         // 5. List index (convert Option<i32> to u32 with sentinel) — needed
         // by vector fact-identity lookup before object encode.
@@ -1529,12 +1527,7 @@ impl SharedResolverState {
 
         // 4. Resolve datatype (global, with ValueTypeTag capture)
         let dt_id = self.resolve_datatype(op.dt_ns_code, op.dt_name);
-        if dt_id > u8::MAX as u32 {
-            return Err(CommitCodecError::InvalidOp(format!(
-                "datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-            )));
-        }
-        let dt_id = dt_id as u16;
+        let dt_id = checked_dt_id(dt_id).map_err(CommitCodecError::InvalidOp)?;
 
         // 5. List index — needed by vector fact-identity lookup before object encode.
         self.saw_list_meta |= op.i.is_some();
@@ -2110,17 +2103,9 @@ impl SharedResolverState {
             } => {
                 let str_id = chunk.strings.get_or_insert(value.as_bytes());
                 let dt_id = self.resolve_datatype(*dt_ns, dt_name);
-                if dt_id > u8::MAX as u32 {
-                    return Err(ResolverError::Resolve(format!(
-                        "txn_meta datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-                    )));
-                }
-                Ok((
-                    ObjKind::LEX_ID,
-                    ObjKey::encode_u32_id(str_id),
-                    dt_id as u16,
-                    0,
-                ))
+                let dt_id = checked_dt_id(dt_id)
+                    .map_err(|e| ResolverError::Resolve(format!("txn_meta {e}")))?;
+                Ok((ObjKind::LEX_ID, ObjKey::encode_u32_id(str_id), dt_id, 0))
             }
         }
     }

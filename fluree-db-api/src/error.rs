@@ -697,6 +697,11 @@ impl ApiError {
                 fluree_db_transact::TransactError::NoveltyAtMax
                 | fluree_db_transact::TransactError::NoveltyWouldExceed { .. },
             ) => 503,
+            // 422: well-formed, but the ledger has no room for its new
+            // datatypes. Permanent: datatype IDs are never released.
+            ApiError::Transact(fluree_db_transact::TransactError::DatatypeLimitExceeded {
+                ..
+            }) => 422,
             // Other transaction errors are usually validation failures
             ApiError::Transact(_) => 400,
             // Cross-ledger model dependency could not be resolved /

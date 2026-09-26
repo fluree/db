@@ -12,6 +12,9 @@ use std::collections::HashMap;
 pub struct RuntimeSmallDicts {
     predicates: RuntimeSidDict<RuntimePredicateId>,
     datatypes: RuntimeSidDict<RuntimeDatatypeId>,
+    /// How many of `datatypes` are reserved (see
+    /// [`crate::datatypes::is_reserved_datatype`]).
+    reserved_datatypes: usize,
 }
 
 impl RuntimeSmallDicts {
@@ -28,7 +31,7 @@ impl RuntimeSmallDicts {
             dicts.predicates.seed(sid, RuntimePredicateId::from_u32);
         }
         for sid in datatype_sids {
-            dicts.datatypes.seed(sid, runtime_datatype_id_from_index);
+            dicts.add_datatype(&sid, true);
         }
         dicts
     }
@@ -58,8 +61,22 @@ impl RuntimeSmallDicts {
     }
 
     pub fn assign_or_lookup_datatype(&mut self, sid: &Sid) -> RuntimeDatatypeId {
-        self.datatypes
-            .assign_or_lookup(sid, runtime_datatype_id_from_index)
+        self.add_datatype(sid, false)
+    }
+
+    fn add_datatype(&mut self, sid: &Sid, persisted: bool) -> RuntimeDatatypeId {
+        let before = self.datatypes.len();
+        let id = if persisted {
+            self.datatypes
+                .seed(sid.clone(), runtime_datatype_id_from_index)
+        } else {
+            self.datatypes
+                .assign_or_lookup(sid, runtime_datatype_id_from_index)
+        };
+        if self.datatypes.len() > before && crate::datatypes::is_reserved_datatype(sid) {
+            self.reserved_datatypes += 1;
+        }
+        id
     }
 
     pub fn predicate_sid(&self, id: RuntimePredicateId) -> Option<&Sid> {
@@ -80,6 +97,12 @@ impl RuntimeSmallDicts {
 
     pub fn persisted_predicate_count(&self) -> u32 {
         self.predicates.persisted_len() as u32
+    }
+
+    /// Datatypes held that are not reserved. Each one takes a datatype
+    /// dictionary ID above the reserved range.
+    pub fn non_reserved_datatype_count(&self) -> usize {
+        self.datatypes.len() - self.reserved_datatypes
     }
 
     pub fn persisted_datatype_count(&self) -> u16 {
@@ -230,5 +253,21 @@ mod tests {
             Some(RuntimeDatatypeId::from_u16(1))
         );
         assert!(!dicts.is_persisted_predicate_id(RuntimePredicateId::from_u32(1)));
+    }
+
+    #[test]
+    fn non_reserved_count_skips_reserved_and_repeated_datatypes() {
+        use fluree_vocab::namespaces::{USER_START, XSD};
+        let mut dicts = RuntimeSmallDicts::from_seeded_sids(
+            [],
+            [sid(XSD, "string"), sid(XSD, "int"), sid(USER_START, "U0")],
+        );
+        assert_eq!(dicts.non_reserved_datatype_count(), 2);
+
+        for dt in [sid(XSD, "long"), sid(XSD, "int"), sid(USER_START, "U1")] {
+            dicts.assign_or_lookup_datatype(&dt);
+        }
+        assert_eq!(dicts.datatype_count(), 5);
+        assert_eq!(dicts.non_reserved_datatype_count(), 3);
     }
 }

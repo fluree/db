@@ -317,6 +317,52 @@ Without this type annotation, strings are stored as plain `xsd:string` values an
 
 See [Inline Fulltext Search](../indexing-and-search/fulltext.md) for complete documentation.
 
+## Custom Datatypes
+
+Any IRI can serve as a datatype. A literal with a datatype Fluree does not
+recognize is stored with that datatype and returned exactly as written.
+
+```json
+{
+  "@context": {"unit": "http://example.org/unit/"},
+  "@id": "ex:room1",
+  "ex:area": {"@value": "42.5", "@type": "unit:SquareMetre"}
+}
+```
+
+In Turtle and SPARQL, use the `^^` syntax: `"42.5"^^unit:SquareMetre`.
+
+### Datatype Limit
+
+A ledger holds at most 16,369 distinct datatypes, plus 15 reserved ones that
+never count toward the limit. The reserved datatypes are `@id`,
+`xsd:string`, `xsd:boolean`, `xsd:integer`, `xsd:long`, `xsd:decimal`,
+`xsd:double`, `xsd:float`, `xsd:dateTime`, `xsd:date`, `xsd:time`,
+`rdf:langString`, `rdf:JSON`, `@vector`, and `@fulltext`. Every other
+datatype counts, including other XSD types such as `xsd:int` and
+`xsd:anyURI`.
+
+A datatype counts from the first write that uses it. It still counts after
+its data is retracted, because the index never releases a datatype's ID.
+
+A write that would pass the limit is refused, and the ledger is left
+unchanged:
+
+- Transactions and SPARQL updates fail with HTTP 422 and
+  `err:db/DatatypeLimitExceeded`. See [Common Errors](../troubleshooting/common-errors.md#datatype_limit_exceeded).
+- Pushed commits are refused with the same error.
+- A bulk import (`fluree create --from`) fails with a "datatype limit
+  exceeded" error.
+
+Vocabularies of units or currencies can define hundreds of datatypes. If
+data needs more distinct datatypes than the limit allows, record the unit
+in its own property instead of in the datatype:
+
+```turtle
+ex:room1 ex:area "42.5"^^xsd:decimal ;
+         ex:areaUnit unit:SquareMetre .
+```
+
 ## Type Coercion and Compatibility
 
 ### Automatic Type Promotion
@@ -369,7 +415,8 @@ WHERE {
    - String types support text search
 
 3. **Standards Alignment**: Use standard datatypes where possible
-   - Prefer XSD types over custom types
+   - Prefer XSD types over custom types; a ledger has a
+     [limit on distinct datatypes](#datatype-limit)
    - Use established vocabularies with well-defined ranges
 
 ### Type Consistency

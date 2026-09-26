@@ -4044,14 +4044,30 @@ where
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    /// The custom datatype IRIs allocated so far, or an error once there
+    /// are more than the index can store.
+    ///
+    /// Import assigns datatype IDs directly rather than through a commit, so
+    /// the limit is enforced here, before any of them reaches an `OType`.
     fn current_custom_datatype_iris(
         datatype_alloc: &fluree_db_indexer::run_index::global_dict::SharedDictAllocator,
-    ) -> Vec<String> {
+    ) -> std::io::Result<Vec<String>> {
+        use fluree_db_transact::datatype_limit::MAX_NON_RESERVED_DATATYPES;
         let dict = datatype_alloc.to_predicate_dict();
         let reserved = fluree_db_core::DatatypeDictId::RESERVED_COUNT as u32;
-        (reserved..dict.len())
+        let custom = dict.len().saturating_sub(reserved) as usize;
+        if custom > MAX_NON_RESERVED_DATATYPES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "datatype limit exceeded: the import uses {custom} non-reserved datatypes \
+                     and a ledger can hold at most {MAX_NON_RESERVED_DATATYPES}"
+                ),
+            ));
+        }
+        Ok((reserved..dict.len())
             .filter_map(|id| dict.resolve(id).map(String::from))
-            .collect()
+            .collect())
     }
 
     async fn spawn_sorted_commit_write(
@@ -4089,7 +4105,7 @@ where
             let _guard = parent_span.enter();
             let task_start = std::time::Instant::now();
             tracing::info!(chunk = ci, record_count, "starting sorted-commit write");
-            let custom_datatype_iris = current_custom_datatype_iris(&datatype_alloc);
+            let custom_datatype_iris = current_custom_datatype_iris(&datatype_alloc)?;
             let otype_registry = fluree_db_core::OTypeRegistry::new(&custom_datatype_iris);
             let r = fluree_db_indexer::run_index::spool::sort_remap_and_write_sorted_commit(
                 sr.records,
@@ -5622,7 +5638,7 @@ where
             std::fs::write(&lang_voc_path, &lang_bytes)?;
 
             let meta_custom_datatype_iris =
-                current_custom_datatype_iris(&meta_spool_config.datatype_alloc);
+                current_custom_datatype_iris(&meta_spool_config.datatype_alloc)?;
             let meta_otype_registry =
                 fluree_db_core::OTypeRegistry::new(&meta_custom_datatype_iris);
             let meta_sorted_info = sort_remap_and_write_sorted_commit(

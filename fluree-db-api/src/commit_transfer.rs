@@ -39,6 +39,7 @@ use fluree_db_novelty::{
     warn_if_forged_commit_flakes_dropped, Novelty,
 };
 use fluree_db_policy::PolicyContext;
+use fluree_db_transact::datatype_limit;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -425,6 +426,11 @@ impl Fluree {
         // including ones an earlier commit of the same push introduced.
         let mut pushed_namespaces: HashMap<u16, String> = HashMap::new();
 
+        // Datatypes the ledger holds, and those earlier commits of this push
+        // add, so every commit is checked against both.
+        let base_datatypes = datatype_limit::known_datatypes(&base_state);
+        let mut pushed_datatypes: HashSet<Sid> = HashSet::new();
+
         for c in &decoded {
             // Current state is base db + evolving novelty.
             let current_t = base_state.snapshot.t.max(evolving_novelty.t);
@@ -453,6 +459,41 @@ impl Fluree {
                     .set_ns_split_mode(mode, c.commit.t)
                     .map_err(|e| PushError::Invalid(e.to_string()).into_api_error())?;
             }
+
+            // 4.0.2 This commit's flakes plus its derived metadata flakes.
+            //
+            // These commits come from a peer, so the blob's flakes are screened
+            // before they reach novelty: a flake claiming commit provenance
+            // cannot have come from any legitimate writer, since genuine commit
+            // records are derived from the envelope just below and never ride
+            // the flake stream. Without this an ingested ledger serves forged
+            // commit records until it is indexed (#1846).
+            let mut all_flakes = c.commit.flakes.clone();
+            let mut meta_flakes =
+                generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
+            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
+            if let Some(g_sid) = base_state.snapshot.encode_iri(&txn_meta_iri) {
+                let dropped = drop_forged_commit_flakes(&mut all_flakes, &g_sid);
+                warn_if_forged_commit_flakes_dropped(dropped, base_state.ledger_id(), c.commit.t);
+                stamp_graph_on_commit_flakes(&mut meta_flakes, &g_sid);
+            }
+            all_flakes.extend(meta_flakes);
+
+            // 4.0.3 Datatype limit, ahead of the costlier validation below. A
+            // sender that does not enforce it can push commits the index could
+            // never hold.
+            let adding: Vec<Sid> =
+                datatype_limit::new_datatypes(&base_datatypes, all_flakes.iter().map(|f| &f.dt))
+                    .into_iter()
+                    .filter(|dt| !pushed_datatypes.contains(*dt))
+                    .cloned()
+                    .collect();
+            datatype_limit::check_datatype_capacity(
+                &base_datatypes,
+                pushed_datatypes.len() + adding.len(),
+            )
+            .map_err(ApiError::Transact)?;
+            pushed_datatypes.extend(adding);
 
             // 4.1 Retraction invariant (strict).
             assert_retractions_exist(
@@ -561,25 +602,7 @@ impl Fluree {
                 let _ = &staged_view;
             }
 
-            // 4.5 Advance evolving novelty with this commit's flakes + derived metadata flakes.
-            //
-            // These commits come from a peer, so the blob's flakes are screened
-            // before they reach novelty: a flake claiming commit provenance
-            // cannot have come from any legitimate writer, since genuine commit
-            // records are derived from the envelope just below and never ride
-            // the flake stream. Without this an ingested ledger serves forged
-            // commit records until it is indexed (#1846).
-            let mut all_flakes = c.commit.flakes.clone();
-            let mut meta_flakes =
-                generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
-            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
-            if let Some(g_sid) = base_state.snapshot.encode_iri(&txn_meta_iri) {
-                let dropped = drop_forged_commit_flakes(&mut all_flakes, &g_sid);
-                warn_if_forged_commit_flakes_dropped(dropped, base_state.ledger_id(), c.commit.t);
-                stamp_graph_on_commit_flakes(&mut meta_flakes, &g_sid);
-            }
-            all_flakes.extend(meta_flakes);
-
+            // 4.5 Advance evolving novelty.
             // Note: Novelty::apply_commit bumps to max(commit_t) internally.
             evolving_novelty
                 .apply_commit(all_flakes.clone(), c.commit.t, &reverse_graph)
@@ -1415,6 +1438,10 @@ fn apply_pushed_commits_to_state(
     // the subjects and strings these commits introduce.
     let provider_store = fluree_db_transact::detach_binary_provider(&mut base);
     let mut dict_novelty = base.dict_novelty.clone();
+    // Like the commit path, extend the runtime dictionaries with every
+    // predicate and datatype these commits introduce. Queries resolve through
+    // them, and the datatype limit counts them.
+    let mut runtime_small_dicts = base.runtime_small_dicts.clone();
 
     let store_opt: Option<&BinaryIndexStore> = base
         .binary_store
@@ -1431,6 +1458,7 @@ fn apply_pushed_commits_to_state(
         .map_err(|e| {
             PushError::Internal(format!("populate_dict_novelty_safe failed at t={t}: {e}"))
         })?;
+        Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(flakes);
         // Apply to novelty.
         novelty
             .apply_commit(flakes.clone(), *t, &reverse_graph)
@@ -1441,6 +1469,7 @@ fn apply_pushed_commits_to_state(
 
     base.novelty = Arc::new(novelty);
     base.dict_novelty = dict_novelty;
+    base.runtime_small_dicts = runtime_small_dicts;
     if let Some(store) = provider_store {
         fluree_db_transact::attach_binary_provider(&mut base, store);
     }

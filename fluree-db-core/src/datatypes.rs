@@ -2,6 +2,7 @@
 //!
 //! Centralizes datatype matching semantics shared across query execution paths.
 
+use crate::ids::DatatypeDictId;
 use crate::Sid;
 use fluree_vocab::namespaces::XSD;
 use fluree_vocab::xsd_names;
@@ -32,6 +33,28 @@ pub fn dt_compatible(expected: &Sid, actual: &Sid) -> bool {
         xsd_names::DOUBLE => matches!(actual.name.as_ref(), xsd_names::DOUBLE | xsd_names::FLOAT),
         _ => false,
     }
+}
+
+/// Whether `dt` is one of the reserved datatypes in
+/// [`DatatypeDictId::RESERVED_IRIS`].
+///
+/// Reserved datatypes hold fixed dictionary IDs. Every other datatype takes
+/// a new ID the first time a ledger uses it, up to [`DatatypeDictId::MAX`].
+pub fn is_reserved_datatype(dt: &Sid) -> bool {
+    use fluree_vocab::{fluree, namespaces, rdf, xsd};
+    let prefix = match dt.namespace_code {
+        namespaces::JSON_LD => "@",
+        namespaces::XSD => xsd::NS,
+        namespaces::RDF => rdf::NS,
+        namespaces::FLUREE_DB => fluree::DB,
+        // The full IRI lives in `name` for these two.
+        namespaces::EMPTY | namespaces::OVERFLOW => "",
+        _ => return false,
+    };
+    let name = dt.name_str();
+    DatatypeDictId::RESERVED_IRIS
+        .iter()
+        .any(|iri| iri.strip_prefix(prefix) == Some(name))
 }
 
 /// Whether literals of this datatype are interned in the shared **string
@@ -91,6 +114,54 @@ mod tests {
 
     fn xsd(name: &str) -> Sid {
         Sid::new(namespaces::XSD, name)
+    }
+
+    #[test]
+    fn reserved_datatypes_are_recognized_in_every_sid_form() {
+        let local = |iri: &str, prefix: &str| iri.strip_prefix(prefix).unwrap().to_string();
+        let reserved = [
+            crate::id_datatype_sid(),
+            xsd(xsd_names::STRING),
+            xsd(xsd_names::BOOLEAN),
+            xsd(xsd_names::INTEGER),
+            xsd(xsd_names::LONG),
+            xsd(xsd_names::DECIMAL),
+            xsd(xsd_names::DOUBLE),
+            xsd(xsd_names::FLOAT),
+            xsd(xsd_names::DATE_TIME),
+            xsd(xsd_names::DATE),
+            xsd(xsd_names::TIME),
+            Sid::new(namespaces::RDF, rdf_names::LANG_STRING),
+            Sid::new(namespaces::RDF, rdf_names::JSON),
+            Sid::new(
+                namespaces::FLUREE_DB,
+                local(fluree::EMBEDDING_VECTOR, fluree::DB),
+            ),
+            Sid::new(namespaces::FLUREE_DB, local(fluree::FULL_TEXT, fluree::DB)),
+        ];
+        assert_eq!(reserved.len(), DatatypeDictId::RESERVED_IRIS.len());
+        for dt in &reserved {
+            assert!(is_reserved_datatype(dt), "{dt} should be reserved");
+        }
+        for iri in DatatypeDictId::RESERVED_IRIS {
+            assert!(is_reserved_datatype(&Sid::new(namespaces::EMPTY, iri)));
+            assert!(is_reserved_datatype(&Sid::new(namespaces::OVERFLOW, iri)));
+        }
+    }
+
+    #[test]
+    fn other_datatypes_are_not_reserved() {
+        for dt in [
+            xsd(xsd_names::INT),
+            xsd(xsd_names::ANY_URI),
+            xsd("stringy"),
+            Sid::new(namespaces::RDF, "HTML"),
+            Sid::new(namespaces::JSON_LD, "type"),
+            Sid::new(namespaces::USER_START, xsd_names::STRING),
+            Sid::new(namespaces::EMPTY, "string"),
+        ] {
+            assert!(!is_reserved_datatype(&dt), "{dt} should not be reserved");
+        }
     }
 
     #[test]

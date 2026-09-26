@@ -1022,38 +1022,20 @@ impl Default for LanguageTagDict {
 // Datatype dict constants (dt_ids)
 // ============================================================================
 
-/// Reserved datatype dictionary IDs.
+/// Create a new datatype dict with the reserved entries pre-inserted.
 ///
-/// These constants are defined in `fluree_db_core::DatatypeDictId`.
-/// Only types with special encoding/coercion rules get reserved IDs.
-/// Everything else is dynamically assigned (ID 14+).
-///
-/// Type is `u16` to match `RunRecord.dt` — most datasets use ≤255 types
-/// (encoded as u8 in leaf Region 2), but u16 supports up to 65535 distinct
-/// datatype IRIs in a single import.
-///
-/// Create a new datatype dict with reserved entries pre-inserted.
-///
-/// Order matters: `get_or_insert` returns sequential IDs starting at 0.
-/// Only types with special encoding/coercion rules are reserved.
+/// The reserved entries come from `DatatypeDictId::RESERVED_IRIS`, in ID
+/// order. Every other datatype is assigned the next ID the first time it
+/// is seen, from `RESERVED_COUNT` up to `DatatypeDictId::MAX`.
 pub(crate) fn new_datatype_dict() -> PredicateDict {
     let mut d = PredicateDict::new();
-    d.get_or_insert("@id"); // 0
-    d.get_or_insert(fluree_vocab::xsd::STRING); // 1
-    d.get_or_insert(fluree_vocab::xsd::BOOLEAN); // 2
-    d.get_or_insert(fluree_vocab::xsd::INTEGER); // 3
-    d.get_or_insert(fluree_vocab::xsd::LONG); // 4
-    d.get_or_insert(fluree_vocab::xsd::DECIMAL); // 5
-    d.get_or_insert(fluree_vocab::xsd::DOUBLE); // 6
-    d.get_or_insert(fluree_vocab::xsd::FLOAT); // 7
-    d.get_or_insert(fluree_vocab::xsd::DATE_TIME); // 8
-    d.get_or_insert(fluree_vocab::xsd::DATE); // 9
-    d.get_or_insert(fluree_vocab::xsd::TIME); // 10
-    d.get_or_insert(fluree_vocab::rdf::LANG_STRING); // 11
-    d.get_or_insert(fluree_vocab::rdf::JSON); // 12
-    d.get_or_insert(fluree_vocab::fluree::EMBEDDING_VECTOR); // 13
-    d.get_or_insert(fluree_vocab::fluree::FULL_TEXT); // 14
-    debug_assert_eq!(d.len(), 15);
+    for iri in fluree_db_core::DatatypeDictId::RESERVED_IRIS {
+        d.get_or_insert(iri);
+    }
+    debug_assert_eq!(
+        d.len(),
+        u32::from(fluree_db_core::DatatypeDictId::RESERVED_COUNT)
+    );
     d
 }
 

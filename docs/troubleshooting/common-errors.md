@@ -398,6 +398,40 @@ for (let i = 0; i < entities.length; i += batchSize) {
 ./fluree-db-server --max-transaction-size 20971520
 ```
 
+## DATATYPE_LIMIT_EXCEEDED
+
+```json
+{
+  "error": "datatype limit exceeded: the ledger holds 16369 of at most 16369 non-reserved datatypes, and this write would add 1 more",
+  "status": 422,
+  "@type": "err:db/DatatypeLimitExceeded"
+}
+```
+
+### Causes
+
+The write uses datatypes the ledger has not seen before, and the ledger has
+no room for them. A ledger holds at most 16,369 distinct datatypes beyond
+15 reserved ones. Every datatype counts from its first use, even after its
+data is retracted. See [Datatype Limit](../concepts/datatypes.md#datatype-limit)
+for which datatypes count.
+
+The write was refused before anything was committed, so the ledger is
+unchanged. Retrying the same write cannot succeed.
+
+### Solutions
+
+**Reuse datatypes the ledger already holds.** Values typed with an existing
+datatype are always accepted.
+
+**Move the varying part out of the datatype.** Unit and currency vocabularies
+often use one datatype per unit. Record the unit in its own property instead:
+
+```turtle
+ex:room1 ex:area "42.5"^^xsd:decimal ;
+         ex:areaUnit unit:SquareMetre .
+```
+
 ## STORAGE_ERROR
 
 ```json

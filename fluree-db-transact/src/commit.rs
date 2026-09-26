@@ -540,6 +540,23 @@ fn resolve_commit_times(
     Ok((timestamp, received_at_ms))
 }
 
+/// The binary index store behind `state`: the one its range provider reads,
+/// or else the type-erased `binary_store`.
+pub(crate) fn binary_store(state: &LedgerState) -> Option<Arc<BinaryIndexStore>> {
+    state
+        .snapshot
+        .range_provider
+        .as_ref()
+        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
+        .map(|brp| Arc::clone(brp.store()))
+        .or_else(|| {
+            state
+                .binary_store
+                .as_ref()
+                .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok())
+        })
+}
+
 /// Commit a staged transaction
 ///
 /// This function:
@@ -674,6 +691,10 @@ pub async fn build_commit(
             max_bytes,
         });
     }
+
+    // 4b. Datatype dictionary limit. Not subject to `skip_backpressure`:
+    //     draining novelty never frees a datatype ID.
+    crate::datatype_limit::check_commit(&base, &flakes, &txn_meta)?;
 
     // 5. Build commit record
     //    (sequencing verification + nameservice lookup are the
@@ -1065,25 +1086,16 @@ fn finalize_state_with_base(
     // per-commit cost that returns right after the first reindex. Detaching
     // first restores unique ownership so `make_mut` mutates in place; the
     // provider is rebuilt with the updated dicts after mutation.
-    let mut snapshot = base.snapshot;
-
+    //
     // Extract the BinaryIndexStore (needed both to dedup new dict entries against
     // the persisted tree and to rebuild the provider) before dropping the
-    // provider; fall back to the type-erased `binary_store` on `base`.
+    // provider.
+    let store = binary_store(&base);
+    let mut snapshot = base.snapshot;
     let had_binary_provider = snapshot
         .range_provider
         .as_ref()
         .is_some_and(|rp| rp.as_any().is::<BinaryRangeProvider>());
-    let store: Option<Arc<BinaryIndexStore>> = snapshot
-        .range_provider
-        .as_ref()
-        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
-        .map(|brp| Arc::clone(brp.store()))
-        .or_else(|| {
-            base.binary_store
-                .as_ref()
-                .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok())
-        });
 
     // Detach the provider so its Arc clones of the dicts are released before the
     // `make_mut` calls (rebuilt + reattached after mutation, below).

@@ -250,7 +250,8 @@ fn weigh_submission_error(err: &SubmissionError) -> usize {
     match err {
         SubmissionError::Execution { message, .. }
         | SubmissionError::NoveltyBackpressure { message }
-        | SubmissionError::NoveltyDeltaTooLarge { message } => message.capacity(),
+        | SubmissionError::NoveltyDeltaTooLarge { message }
+        | SubmissionError::DatatypeLimitExceeded { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,
@@ -1571,6 +1572,11 @@ mod tests {
             message: "n".into()
         }
         .is_settled());
+        // Decided before commit construction, and permanent.
+        assert!(SubmissionError::DatatypeLimitExceeded {
+            message: "d".into()
+        }
+        .is_settled());
     }
 
     /// The `execution_failure` flattening must route novelty refusals by
@@ -1602,6 +1608,14 @@ mod tests {
                 max_bytes: 100
             })),
             SubmissionError::NoveltyDeltaTooLarge { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::DatatypeLimitExceeded {
+                used: 16_369,
+                adding: 1,
+                max: 16_369
+            })),
+            SubmissionError::DatatypeLimitExceeded { .. }
         ));
         assert!(matches!(
             f(ApiError::Transact(TransactError::EmptyTransaction)),

@@ -914,6 +914,14 @@ pub enum SubmissionError {
     #[error("{message}")]
     NoveltyDeltaTooLarge { message: String },
 
+    /// The transaction would bring the ledger past the number of distinct
+    /// datatypes its index can store (HTTP 422,
+    /// `err:db/DatatypeLimitExceeded`). Permanent, because datatype IDs are
+    /// never released. Typed so the HTTP layer can surface the dedicated
+    /// code; an `Execution` status alone cannot carry it.
+    #[error("{message}")]
+    DatatypeLimitExceeded { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -952,6 +960,8 @@ impl SubmissionError {
             // pinning the slot so every keyed retry gets
             // `AlreadyInFlight` (409) for the full cache TTL.
             Self::NoveltyBackpressure { .. } | Self::NoveltyDeltaTooLarge { .. } => true,
+            // Decided before commit construction, like the novelty refusals.
+            Self::DatatypeLimitExceeded { .. } => true,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }
