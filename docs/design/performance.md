@@ -342,11 +342,14 @@ by batched PSOT probes or a single SPOT walk.
 
 **`SemijoinOperator`** evaluates `EXISTS` / `NOT EXISTS` with a single
 uncorrelated build followed by hash probes, instead of evaluating a correlated
-subquery per row. Outer rows whose key variables are only partly bound, typically
-after an `OPTIONAL`, probe a lazily built projection of the inner keys onto the
-bound variables rather than falling back to per-row evaluation. Outer rows and
-their multiplicities are passed through unchanged; the keys are used only to
-answer the existence test.
+subquery per row. For inner bodies consisting only of triple patterns, outer
+rows whose key variables are partly unbound, typically after an `OPTIONAL`, can
+probe a lazily built projection of the inner keys onto the bound variables.
+Compound inner patterns and poisoned bindings retain per-row evaluation.
+Surviving outer rows retain their multiplicities; the keys are used only to
+answer the existence test. Each execution caches at most four projection shapes,
+with further shapes using per-row evaluation. Both the base and projected key
+sets contribute to the query's retained-memory estimate and budget checks.
 
 **`CyclicBgpOperator`** handles small cyclic fixed-predicate BGPs (triangles and
 4-edge cycles over reference-valued joins) that would otherwise run as left-deep
@@ -371,14 +374,20 @@ and `FILTER`: if those operators consume a window, the join continues reading.
 A query without `ORDER BY` may return a different, equally valid set of rows
 when the join choice changes.
 
+Startup cost matters less when the query must consume its entire input. If
+statistics estimate that a `DISTINCT` projection has fewer rows than
+`LIMIT + OFFSET`, the planner retains the throughput cost model. Unknown
+estimates, including computed projections, keep the startup hint. Sparse filters
+can still require a full drain, so probe windows grow to amortize repeated work.
+
 **Count-only consumption.** An ungrouped `COUNT(*)` requests a count from its
 input through `drain_count` instead of consuming rows. The nested-loop join
 supports this on its batched subject-probe path: it counts matches after the
 ordinary scan and inline filters, preserving left-row multiplicity, without
 building output batches. It uses the same visibility, overlay, and history
 handling as the normal scan, and shapes it cannot count directly fall back to
-row execution. The fast paths and count planner (Layer 5) apply the same idea
-more broadly.
+row execution. Grouped counts in the general operator tree still consume joined
+rows. The fast paths and count planner (Layer 5) apply the same idea more broadly.
 
 **Duplicate control.** Deep existential chains
 (`?a p1 ?b . ?b p2 ?c . ?c p3 ?x`) accumulate duplicate rows: once `?a` is no

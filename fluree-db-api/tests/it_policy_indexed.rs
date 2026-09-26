@@ -371,6 +371,20 @@ async fn policy_batched_join_lane_declines_index_only() {
                     && !rows[0].to_string().contains("222-22-2222"),
                 "index-only policy view must hide Bob's SSN, got: {jsonld:#?}"
             );
+
+            // COUNT(*) over the same join must respect the restricted view,
+            // including when a count drain attempts the batched subject lane.
+            let mut count_query = query.clone();
+            count_query["select"] = json!(["(as (count *) ?n)"]);
+            let count =
+                support::query_jsonld_with_policy(&fluree, &ledger_indexed, &count_query, &policy_ctx)
+                    .await
+                    .expect("join count with policy");
+            assert_eq!(
+                count.to_jsonld(&ledger_indexed.snapshot).expect("count jsonld"),
+                json!([[1]]),
+                "join count must exclude the hidden SSN"
+            );
         })
         .await;
 }

@@ -34,6 +34,12 @@ use std::sync::Arc;
 /// masks use the existing seeded evaluation; cached masks remain reusable.
 const MAX_PARTIAL_KEY_SETS: usize = 4;
 
+/// Approximate retained key storage, shared by the base and projected sets.
+/// Counts the tuple and its cells; excludes table slack and shared payloads.
+fn key_entry_bytes(width: usize) -> usize {
+    std::mem::size_of::<CompositeGroupKey>() + width * std::mem::size_of::<GroupKeyOwned>()
+}
+
 pub struct SemijoinOperator {
     /// Child operator providing outer solutions.
     child: BoxedOperator,
@@ -138,8 +144,7 @@ impl SemijoinOperator {
                 return Ok(None);
             }
             let mut projected = FxHashSet::default();
-            let entry_bytes = std::mem::size_of::<CompositeGroupKey>()
-                + positions.len() * std::mem::size_of::<GroupKeyOwned>();
+            let entry_bytes = key_entry_bytes(positions.len());
             let mut charged_rows = 0;
             for (i, key) in self.key_set.iter().enumerate() {
                 if i.is_multiple_of(1024) {
@@ -267,14 +272,26 @@ impl Operator for SemijoinOperator {
 
         inner_op.open(ctx).await?;
 
-        while let Some(batch) = inner_op.next_batch(ctx).await? {
-            ctx.check_cancelled()?;
-            for row_idx in 0..batch.len() {
-                let key = row_key(&batch, row_idx, &inner_key_col_indices, &self.norm);
-                self.key_set.insert(key);
+        let build_result: Result<()> = async {
+            ctx.checkpoint()?;
+            let entry_bytes = key_entry_bytes(self.key_vars.len());
+            while let Some(batch) = inner_op.next_batch(ctx).await? {
+                ctx.checkpoint()?;
+                let previous_keys = self.key_set.len();
+                for row_idx in 0..batch.len() {
+                    let key = row_key(&batch, row_idx, &inner_key_col_indices, &self.norm);
+                    self.key_set.insert(key);
+                }
+                // Charge only new retained keys, not duplicate inner solutions.
+                ctx.record_alloc((self.key_set.len() - previous_keys) * entry_bytes);
+                ctx.checkpoint()?;
             }
+            Ok(())
         }
+        .await;
+        // Also close the inner plan when its build exceeds the budget.
         inner_op.close();
+        build_result?;
 
         // Compute key column indices for the child (outer) schema.
         let child_schema = self.child.schema().to_vec();
@@ -552,5 +569,51 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, QueryError::Cancelled { .. }), "{err:?}");
         assert!(op.partial_key_sets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn base_lookup_charges_only_distinct_keys_and_enforces_budget() {
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let expected_bytes = 2 * key_entry_bytes(2);
+        for budget in [expected_bytes, expected_bytes - 1] {
+            let cancellation = QueryCancellation::new();
+            cancellation.set_memory_limit(budget);
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+            let child = Box::new(BatchSeedOperator::from_batch(batch(vec![vec![
+                Binding::encoded_sid(1),
+                Binding::encoded_sid(2),
+                Binding::Unbound,
+            ]])));
+            let mut op = SemijoinOperator::new(
+                child,
+                vec![Pattern::Values {
+                    vars: vec![VarId(0), VarId(1)],
+                    rows: vec![
+                        vec![Binding::encoded_sid(1), Binding::encoded_sid(2)],
+                        vec![Binding::encoded_sid(1), Binding::encoded_sid(2)],
+                        vec![Binding::encoded_sid(2), Binding::encoded_sid(3)],
+                    ],
+                }],
+                vec![VarId(0), VarId(1)],
+                false,
+                None,
+                PlanningContext::current(),
+            );
+            let result = op.open(&ctx).await;
+            assert_eq!(ctx.mem_used(), expected_bytes);
+            assert_eq!(op.key_set.len(), 2);
+            if budget == expected_bytes {
+                result.unwrap();
+                assert_eq!(op.next_batch(&ctx).await.unwrap().unwrap().len(), 1);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(QueryError::MemoryBudgetExceeded { .. })
+                ));
+                assert_eq!(op.state, OperatorState::Created);
+            }
+            op.close();
+        }
     }
 }

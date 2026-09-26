@@ -3,8 +3,11 @@
 //! `cargo run -p fluree-db-api --profile dev-fast --example query_operator_probe -- 50000 5`
 //! Arguments: people, measured repetitions. Set `PROBE_PLANS=1` to print plans.
 //! `PROBE_ONLY=optional_not_exists` selects a case. `PROBE_VERIFY=1` checks the
-//! OPTIONAL case against seeded evaluation and the distinct aggregates against
-//! counts computed from raw query rows, outside the timed region.
+//! OPTIONAL case against seeded evaluation and aggregate counts against raw
+//! query rows, outside the timed region.
+//! Cases ending in `_drain` cannot reach their LIMIT on the default fixture.
+//! `PROBE_DRAIN_BASELINE=1` removes that LIMIT to compare throughput planning.
+//! `FLUREE_HASH_JOIN=1` forces eligible hash joins; inspect `PROBE_PLANS` as well.
 //! Measures query execution (without response serialization), with one warmup.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,9 +29,28 @@ const QUERIES: &[(&str, &str)] = &[
     ("minus_count", "SELECT (COUNT(*) AS ?n) WHERE { ?p a ex:Person MINUS { ?p ex:worksFor ?org } }"),
     ("chain_distinct_limit", "SELECT DISTINCT ?p ?fof WHERE { ?p ex:knows ?f . ?f ex:knows ?fof } LIMIT 1"),
     ("chain_limit", "SELECT ?p ?fof WHERE { ?p ex:knows ?f . ?f ex:knows ?fof } LIMIT 1"),
+    ("chain_distinct_drain", "SELECT DISTINCT ?city WHERE { ?p ex:knows ?f . ?f ex:livesIn ?city } LIMIT 1000"),
+    ("long_chain_distinct_drain", "SELECT DISTINCT ?city WHERE { ?p ex:knows ?f . ?f ex:knows ?fof . ?fof ex:livesIn ?city } LIMIT 1000"),
+    ("chain_sparse_drain", "SELECT ?p ?fof WHERE { ?p ex:knows ?f . ?f ex:knows ?fof FILTER(CONTAINS(LCASE(CONCAT(STR(?p), STR(?fof))), \"/absent/\")) } LIMIT 100"),
+    ("long_chain_sparse_drain", "SELECT ?p ?end WHERE { ?p ex:knows ?f . ?f ex:knows ?fof . ?fof ex:knows ?end FILTER(CONTAINS(LCASE(CONCAT(STR(?p), STR(?end))), \"/absent/\")) } LIMIT 100"),
     ("star_limit", "SELECT ?p ?n WHERE { ?p a ex:Person ; ex:name ?n ; ex:age ?a } LIMIT 10"),
     ("construct_transform", "CONSTRUCT { ?org ex:employs ?p . ?p ex:label ?name } WHERE { ?p ex:worksFor ?org ; ex:name ?name }"),
 ];
+
+fn sorted_rows(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut rows = value.as_array().expect("row array").clone();
+    rows.sort_by_key(ToString::to_string);
+    rows
+}
+
+fn replace_once(query: &str, from: &str, to: &str) -> String {
+    assert_eq!(
+        query.matches(from).count(),
+        1,
+        "reference rewrite must match once: {from}"
+    );
+    query.replacen(from, to, 1)
+}
 
 fn people_graph(people: usize) -> String {
     let mut rng = StdRng::seed_from_u64(42);
@@ -92,6 +114,23 @@ async fn main() {
             continue;
         }
         let query = format!("PREFIX ex: <http://example.org/>\n{query}");
+        let full_drain = name.ends_with("_drain");
+        let drain_baseline = std::env::var_os("PROBE_DRAIN_BASELINE").is_some();
+        if drain_baseline {
+            assert!(
+                full_drain,
+                "PROBE_DRAIN_BASELINE requires PROBE_ONLY selecting a _drain case"
+            );
+        }
+        let query = if drain_baseline {
+            query
+                .rsplit_once(" LIMIT ")
+                .expect("drain limit")
+                .0
+                .to_string()
+        } else {
+            query
+        };
         if std::env::var_os("PROBE_PLANS").is_some() {
             let plan = fluree.explain_sparql(&view, &query).await.expect("explain");
             println!("{name}: {plan}");
@@ -118,6 +157,44 @@ async fn main() {
         times.sort_by(f64::total_cmp);
         let median = times[(reps - 1) / 2].midpoint(times[reps / 2]);
         println!("{name:24} {median:10.3} ms");
+        if full_drain && std::env::var_os("PROBE_VERIFY").is_some() {
+            let limit = if name.contains("distinct") { 1000 } else { 100 };
+            let actual = sorted_rows(expected.as_ref().expect("warmup result"));
+            assert!(
+                actual.len() < limit,
+                "fixture must exhaust before reaching LIMIT"
+            );
+            let full_query = query
+                .rsplit_once(" LIMIT ")
+                .map_or(query.as_str(), |(q, _)| q);
+            let full = fluree
+                .query(&view, QueryInput::Sparql(full_query))
+                .await
+                .expect("full drain");
+            assert_eq!(
+                actual,
+                sorted_rows(&full.to_jsonld(&view.snapshot).expect("format full drain"))
+            );
+            println!(
+                "{name}: {} rows agree with the unlimited query",
+                actual.len()
+            );
+        }
+        if *name == "chain_filter_count" && std::env::var_os("PROBE_VERIFY").is_some() {
+            let raw_query =
+                replace_once(&query, "SELECT (COUNT(*) AS ?n)", "SELECT ?p ?city ?f ?fof");
+            let raw = fluree
+                .query(&view, QueryInput::Sparql(&raw_query))
+                .await
+                .expect("raw count rows");
+            let rows: usize = raw.batches.iter().map(fluree_db_api::Batch::len).sum();
+            assert_eq!(
+                expected.as_ref().unwrap(),
+                &serde_json::json!([[rows]]),
+                "join count differs from raw rows"
+            );
+            println!("{name}: {rows} rows agree with ordinary row execution");
+        }
         if matches!(*name, "two_hop_aggregate" | "group_count_distinct")
             && std::env::var_os("PROBE_VERIFY").is_some()
         {
@@ -148,14 +225,9 @@ async fn main() {
                 .query(&view, QueryInput::Sparql(full_query))
                 .await
                 .expect("all groups");
-            let mut actual_rows = result
-                .to_jsonld(&view.snapshot)
-                .expect("format groups")
-                .as_array()
-                .expect("group rows")
-                .clone();
+            let actual_rows =
+                sorted_rows(&result.to_jsonld(&view.snapshot).expect("format groups"));
             control_rows.sort_by_key(ToString::to_string);
-            actual_rows.sort_by_key(ToString::to_string);
             assert_eq!(
                 actual_rows, control_rows,
                 "distinct counts differ from raw rows"
@@ -166,26 +238,19 @@ async fn main() {
             );
         }
         if *name == "optional_not_exists" && std::env::var_os("PROBE_VERIFY").is_some() {
-            let control = query
-                .replace("FILTER NOT EXISTS", "FILTER (false || NOT EXISTS")
-                .replace("?x ex:worksFor ?org } }", "?x ex:worksFor ?org }) }");
+            let control = replace_once(&query, "FILTER NOT EXISTS", "FILTER (false || NOT EXISTS");
+            let control = replace_once(
+                &control,
+                "?x ex:worksFor ?org } }",
+                "?x ex:worksFor ?org }) }",
+            );
             let result = fluree
                 .query(&view, QueryInput::Sparql(&control))
                 .await
                 .expect("seeded control");
-            let mut control_rows = result
-                .to_jsonld(&view.snapshot)
-                .expect("format control")
-                .as_array()
-                .expect("control rows")
-                .clone();
-            let mut actual_rows = expected
-                .expect("warmup result")
-                .as_array()
-                .expect("result rows")
-                .clone();
-            control_rows.sort_by_key(ToString::to_string);
-            actual_rows.sort_by_key(ToString::to_string);
+            let control_rows =
+                sorted_rows(&result.to_jsonld(&view.snapshot).expect("format control"));
+            let actual_rows = sorted_rows(&expected.expect("warmup result"));
             assert_eq!(
                 actual_rows, control_rows,
                 "partial-key lookup differs from seeded evaluation"

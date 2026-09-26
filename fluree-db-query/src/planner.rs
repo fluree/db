@@ -133,6 +133,53 @@ fn property_stats<'a>(stats: &'a StatsView, pred: &Ref) -> Option<&'a PropertySt
     None
 }
 
+/// Estimate the size of a DISTINCT projection from mandatory triple domains.
+/// Their NDVs are approximate: use this only for costing, never to cap results.
+/// Multiplying the per-variable domains avoids assuming independence/selectivity
+/// will reduce the projection. Missing domains and computed bindings stay unknown.
+pub(crate) fn estimate_projected_distinct_rows(
+    patterns: &[Pattern],
+    vars: &[VarId],
+    stats: &StatsView,
+) -> Option<f64> {
+    if vars.is_empty()
+        || !patterns.iter().all(|p| {
+            matches!(
+                p,
+                Pattern::Triple(_) | Pattern::Filter(_) | Pattern::Values { .. }
+            )
+        })
+    {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut rows = 1.0;
+    for &var in vars {
+        if !seen.insert(var) {
+            continue;
+        }
+        let ndv = patterns
+            .iter()
+            .filter_map(|pattern| {
+                let Pattern::Triple(tp) = pattern else {
+                    return None;
+                };
+                let prop = property_stats(stats, &tp.p)?;
+                [
+                    (tp.s.as_var() == Some(var)).then_some(prop.ndv_subjects),
+                    (tp.o.as_var() == Some(var)).then_some(prop.ndv_values),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|&n| n > 0)
+                .min()
+            })
+            .min()?;
+        rows *= ndv as f64;
+    }
+    Some(rows)
+}
+
 fn property_known_absent(stats: &StatsView, pred: &Ref) -> bool {
     stats.has_property_stats()
         && match pred {
@@ -3177,6 +3224,89 @@ mod tests {
             );
         }
         stats
+    }
+
+    #[test]
+    fn projected_distinct_estimate_uses_domains_without_collapsing_columns() {
+        let s = VarId(0);
+        let city = VarId(1);
+        let category = VarId(2);
+        let mut stats = stats_with(&[("city", 50_000, 500), ("category", 50_000, 10)]);
+        stats
+            .properties
+            .get_mut(&Sid::new(100, "city"))
+            .unwrap()
+            .ndv_subjects = 50_000;
+        let patterns = vec![
+            Pattern::Triple(make_pattern(s, "city", city)),
+            Pattern::Triple(make_pattern(s, "category", category)),
+        ];
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city], &stats),
+            Some(500.0)
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city, category], &stats),
+            Some(5000.0)
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city, city], &stats),
+            Some(500.0)
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns[..1], &[s], &stats),
+            Some(50_000.0)
+        );
+
+        // A second mandatory domain can tighten the estimate of the same var.
+        let constrained = vec![
+            patterns[0].clone(),
+            Pattern::Triple(make_pattern(s, "category", city)),
+        ];
+        assert_eq!(
+            estimate_projected_distinct_rows(&constrained, &[city], &stats),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn projected_distinct_estimate_keeps_unknown_and_computed_domains_unknown() {
+        let s = VarId(0);
+        let city = VarId(1);
+        let stats = stats_with(&[("city", 50_000, 500)]);
+        let mut patterns = vec![Pattern::Triple(make_pattern(s, "city", city))];
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city], &StatsView::default()),
+            None
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city, VarId(2)], &stats),
+            None
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(
+                &patterns,
+                &[city],
+                &stats_with(&[("city", 50_000, 0)])
+            ),
+            None
+        );
+        patterns.push(Pattern::Bind {
+            var: city,
+            expr: crate::ir::Expression::Var(s),
+        });
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city], &stats),
+            None
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(
+                &[Pattern::Optional(vec![patterns[0].clone()])],
+                &[city],
+                &stats
+            ),
+            None
+        );
     }
 
     /// A `GRAPH <iri>` block naming one of this ledger's own named graphs must

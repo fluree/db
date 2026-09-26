@@ -1739,6 +1739,14 @@ pub(crate) struct TriplePlanContext<'a> {
     stats: Option<&'a StatsView>,
 }
 
+impl<'a> TriplePlanContext<'a> {
+    fn hash_planner(&self, left: &Option<BoxedOperator>) -> HashJoinPlanner<'a> {
+        HashJoinPlanner::new(self.stats)
+            .with_row_goal(self.planning.row_goal)
+            .with_left_estimate(left.as_ref().and_then(|op| op.estimated_rows()))
+    }
+}
+
 /// Build an operator tree for a sequential scan/join block of triples.
 ///
 /// Applies VALUES first (if any), then iterates triples building scan/join
@@ -1774,9 +1782,7 @@ fn build_sequential_join_block(
     // Seed it from the incoming LEFT operator's estimate (e.g. a subquery producing
     // `WITH DISTINCT friend`) so the first probe is costed against the producer size,
     // not 1 — otherwise a large object predicate falsely trips scan-ratio-too-high.
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
-        .with_row_goal(ctx.planning.row_goal)
-        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
+    let mut hash_planner = ctx.hash_planner(&operator);
     let mut dead_before_step = 0usize;
     let mut folded = vec![false; triples.len()];
     for (k, tp) in triples.iter().enumerate() {
@@ -3521,9 +3527,7 @@ fn build_sequential_triple_chain(
     // friend` subquery's ~producer size) — otherwise the first probe is weighed
     // against 1 and a large object predicate falsely trips scan-ratio-too-high.
     let mut seen_vars: HashSet<VarId> = bound_vars_from_operator(&operator);
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
-        .with_row_goal(ctx.planning.row_goal)
-        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
+    let mut hash_planner = ctx.hash_planner(&operator);
     let mut dead_before_step = 0usize;
     for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);

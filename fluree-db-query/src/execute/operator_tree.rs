@@ -2301,6 +2301,20 @@ pub fn build_operator_tree(
     } else {
         None
     };
+    // DISTINCT may exhaust a large join before producing the requested prefix.
+    // When every projected variable has a known domain and its estimated product
+    // is smaller than the goal, retain throughput planning. Sketch estimates only
+    // change the plan: they never bound how many rows execution may produce.
+    let row_goal = row_goal.filter(|&goal| {
+        if !query.output.is_distinct() {
+            return true;
+        }
+        let (Some(stats), Some(vars)) = (stats.as_deref(), query.output.projected_vars()) else {
+            return true;
+        };
+        crate::planner::estimate_projected_distinct_rows(&query.patterns, &vars, stats)
+            .is_none_or(|rows| rows >= goal as f64)
+    });
     let planning = &planning
         .with_unmatched_optional(query.unmatched_optional)
         .with_row_goal(row_goal);

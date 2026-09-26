@@ -761,9 +761,11 @@ async fn optional_exists_reuses_partial_keys_across_batches() {
         );
 
         // Compound expression forces seeded evaluation as an independent oracle.
+        assert_eq!(query.matches("FILTER NOT EXISTS").count(), 1);
+        assert_eq!(query.matches("?x ex:worksFor ?org } }").count(), 1);
         let control = query
-            .replace("FILTER NOT EXISTS", "FILTER (false || NOT EXISTS")
-            .replace("?x ex:worksFor ?org } }", "?x ex:worksFor ?org }) }");
+            .replacen("FILTER NOT EXISTS", "FILTER (false || NOT EXISTS", 1)
+            .replacen("?x ex:worksFor ?org } }", "?x ex:worksFor ?org }) }", 1);
         let control = fluree
             .query(&view, QueryInput::Sparql(&control))
             .await

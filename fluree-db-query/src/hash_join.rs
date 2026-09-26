@@ -130,6 +130,12 @@ const HASH_JOIN_MEDIUM_BUILD_MAX: f64 = 250_000.0;
 /// build side in `open()`, so a wide, high-row intermediate can defeat outer
 /// LIMIT.
 const HASH_JOIN_AUTO_NARROW_BUILD_SCHEMA: usize = 2;
+/// Largest requested prefix for preferring startup latency over a hash build.
+/// Matches the minimum batched probe window.
+const ROW_GOAL_MAX: usize = crate::operator::flush::MIN_FLUSH;
+/// Small builds still use the throughput cost model. Keep this tied to the
+/// first expansion of the probe window rather than a separate tuning value.
+const ROW_GOAL_MIN_BUILD: usize = ROW_GOAL_MAX * crate::operator::flush::FLUSH_GROWTH;
 /// Don't scan a probe predicate more than this many times the driving-set size —
 /// a guard against the pathological "scan a huge predicate for a handful of driving
 /// rows" case. It is deliberately loose: the alternative we replace is the scattered
@@ -465,10 +471,8 @@ impl<'a> HashJoinPlanner<'a> {
         // a large build just to return a handful of rows. The goal is advisory:
         // filters and dedup may require the streaming plan to read everything.
         if self.force == HashJoinForce::Auto
-            && self
-                .row_goal
-                .is_some_and(|goal| goal <= crate::operator::flush::MIN_FLUSH)
-            && driving_est.is_some_and(|rows| rows > (crate::operator::flush::MIN_FLUSH * 8) as f64)
+            && self.row_goal.is_some_and(|goal| goal <= ROW_GOAL_MAX)
+            && driving_est.is_some_and(|rows| rows > ROW_GOAL_MIN_BUILD as f64)
         {
             return Some(HashJoinDecision {
                 join_var: Some(join_var),

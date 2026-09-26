@@ -104,12 +104,36 @@ async fn distinct_limit_stops_a_chain_after_one_small_probe() {
         assert_eq!(row[1], format!("ex:p{}", (p + 2) % PEOPLE));
     }
 
-    // Dedup collapses all 12,000 matches to three buckets, fewer than LIMIT.
-    // It must drain through every probe window and return the complete set.
+    // Known low-cardinality projections cannot fill LIMIT: keep throughput
+    // planning rather than replacing the hash join for an unattainable prefix.
     let buckets = "PREFIX ex: <http://example.org/ns/> SELECT DISTINCT ?b \
                    WHERE { ?p ex:knows ?f . ?f ex:bucket ?b } LIMIT 4";
-    let (spans, guard) = span_capture::init_test_tracing();
+    let plan = fluree.explain_sparql(&view, buckets).await.unwrap();
+    assert!(
+        plan["plan"]["physical"]
+            .to_string()
+            .contains("HashJoinOperator"),
+        "{plan}"
+    );
     let mut got = rows(&fluree, &view, buckets).await;
+    got.sort_by_key(ToString::to_string);
+    assert_eq!(got, vec![json!([0]), json!([1]), json!([2])]);
+
+    let offset_buckets = buckets.replace("LIMIT 4", "OFFSET 3 LIMIT 1");
+    let plan = fluree.explain_sparql(&view, &offset_buckets).await.unwrap();
+    assert!(
+        plan["plan"]["physical"]
+            .to_string()
+            .contains("HashJoinOperator"),
+        "OFFSET must contribute to the requested prefix: {plan}"
+    );
+    assert!(rows(&fluree, &view, &offset_buckets).await.is_empty());
+
+    // A computed projection has no NDV estimate, so it keeps the startup hint.
+    // It must still drain all windows when only three distinct rows survive.
+    let computed_buckets = buckets.replace("SELECT DISTINCT ?b", "SELECT DISTINCT (?b + 0 AS ?c)");
+    let (spans, guard) = span_capture::init_test_tracing();
+    let mut got = rows(&fluree, &view, &computed_buckets).await;
     drop(guard);
     got.sort_by_key(ToString::to_string);
     assert_eq!(got, vec![json!([0]), json!([1]), json!([2])]);
