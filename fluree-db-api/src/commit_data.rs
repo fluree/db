@@ -30,9 +30,7 @@ pub(crate) struct OwnChanges<'a> {
 }
 
 impl<'a> OwnChanges<'a> {
-    /// `own` is the side's own commits, as [`BranchSide::own`] reports them.
-    ///
-    /// [`BranchSide::own`]: fluree_db_core::BranchSide::own
+    /// `own` is the side's own commits, as `BranchSide::own` reports them.
     pub(crate) fn new(own: &'a [ContentId]) -> Self {
         Self {
             own: own.iter().collect(),

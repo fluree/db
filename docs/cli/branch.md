@@ -203,7 +203,7 @@ fluree branch rebase <NAME> [OPTIONS]
 
 Replays a branch's unique commits on top of the source branch's current HEAD. This brings the branch up to date with upstream changes, and rewrites the branch's commits to do it. To keep the branch's commits as they are, merge the source into the branch instead. The `main` branch cannot be rebased.
 
-A branch that already merged its source in is rebased on its own commits only. The merge that brought the source in is left out, because its changes came from the source.
+A branch that already merged its source in is rebased on its own commits, and that merge is replayed among them. Only the edits that resolved the overlap between the two sides are replayed with it. Everything else it carries came from the source, which already holds it.
 
 If the branch has no unique commits, a fast-forward rebase is performed — the branch point is simply updated to the source's current HEAD.
 
@@ -326,7 +326,7 @@ When `--target` is omitted, the target is the branch the source was created from
 
 The merge fast-forwards when the target's head is on the source's line of commits, which means the source continues where the target left off. The target then adopts the source's head. Otherwise the merge folds the source's changes into one commit on the target, and `--strategy` controls how conflicting edits are resolved (mirroring `branch rebase`).
 
-Each branch numbers its commits from its own fork point, so the two branches' `t` values cannot be compared. The merge finds what each side changed by commit identity instead. A branch that already merged the other in keeps that merge out of its own changes, because those changes came from the other side to begin with.
+Each branch numbers its commits from its own fork point, so the two branches' `t` values cannot be compared. The merge finds what each side changed by commit identity instead. A branch that already merged the other in does not count that merge as its own change, because those changes came from the other side to begin with. The edits that resolved the overlap are its own, so merging back does not undo a resolution.
 
 After a successful merge, the source branch remains intact and can continue to receive new transactions and be merged again. Only the new commits since the last merge (or branch creation) are copied.
 

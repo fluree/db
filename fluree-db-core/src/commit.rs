@@ -983,9 +983,11 @@ pub struct BranchSide {
     /// because its changes came from that side. This is what conflict
     /// detection compares.
     ///
-    /// Such a merge stays in `commits`. Its flakes are the strategy's
-    /// resolution, not a copy of what it merged, and dropping them would
-    /// undo that resolution.
+    /// Such a merge stays in `commits`, because part of what it carries is
+    /// its own: its flakes on keys the branch changed earlier are how it
+    /// resolved that overlap, and dropping them would undo the resolution.
+    /// Its remaining flakes copy the other side's changes, so a caller that
+    /// folds or replays `commits` must leave those out.
     pub own: Vec<ContentId>,
 }
 

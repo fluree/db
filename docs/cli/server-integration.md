@@ -875,8 +875,14 @@ These rules are not negotiable; the CLI and other clients depend on them:
    Compute each side's commits by identity: its line of first parents down
    to the first commit the other side already holds. A side "holds" a commit
    when it is on its own line, or when one of its merges brought that commit
-   in. Leave out merge commits whose merged-in history the other side
-   already holds, since such a commit carries only changes that side has.
+   in.
+
+   A merge commit whose merged-in history the other side already holds is
+   not one of the side's own changes. Keep only its flakes on keys the side
+   changed in an earlier commit of its own, which are how that merge
+   resolved the overlap. Its other flakes copy the other side's changes.
+   Applying them again brings back values that side has since replaced, and
+   comparing them reports conflicts on keys this side never touched.
 
    `ancestor` is the most recent commit both sides hold. It lies on one
    side's line, and reached the other through a merge; without such a merge
@@ -1603,8 +1609,9 @@ is no `target` field in the request.
 - If the branch has no commits of its own to replay, the operation is a
   fast-forward: the branch's HEAD is advanced to the source HEAD with no
   replay, and `fast_forward: true` is returned. A branch that merged its
-  source in earlier still has its own commits, and that merge is not one of
-  them: its changes came from the source.
+  source in earlier still has commits of its own, so it is not a
+  fast-forward. That merge is replayed among them, carrying only its
+  resolution, per the divergence rules under `POST /merge`.
 - If `strategy == "abort"` and **any** branch commit conflicts with the source
   delta, the rebase aborts up-front with `409 BranchConflict`. No commits are
   written.
@@ -1705,7 +1712,8 @@ Admin-protected (same bracket as `/branch`, `/drop-branch`, `/rebase`,
   the divergence, resolves keys both sides changed via `strategy`, and
   writes a single new commit on the target. The fold includes merges the
   source itself made, because such a commit carries how that merge was
-  resolved. `fast_forward: false` is
+  resolved. A merge that brought the target in contributes only that
+  resolution, since its other flakes copy the target's own changes. `fast_forward: false` is
   reported. If `strategy == "abort"` and conflicts exist, the merge fails
   with `409 BranchConflict` and the target is rolled back to its
   pre-merge nameservice snapshot.
