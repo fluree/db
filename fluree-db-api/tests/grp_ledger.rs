@@ -11,6 +11,8 @@ mod it_branch_time_travel;
 mod it_drop_ledger;
 #[path = "it_drop_named_graph.rs"]
 mod it_drop_named_graph;
+#[path = "it_graph_scoped_writes.rs"]
+mod it_graph_scoped_writes;
 #[path = "it_json_canonicalization.rs"]
 mod it_json_canonicalization;
 #[path = "it_ledger_info_named_graphs.rs"]
@@ -39,3 +41,5 @@ mod it_revert_preview;
 mod it_stable_hashes;
 #[path = "it_sync_graph.rs"]
 mod it_sync_graph;
+#[path = "it_sync_graph_rdf.rs"]
+mod it_sync_graph_rdf;

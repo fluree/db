@@ -2,7 +2,8 @@
 //!
 //! This module provides `OptionalOperator` which implements left outer join
 //! (OPTIONAL) semantics. When the optional pattern has no matches, the operator
-//! emits `Binding::Poisoned` for optional-only variables rather than dropping the row.
+//! keeps the row and fills optional-only variables per the query's
+//! [`UnmatchedOptional`] mode.
 //!
 //! # Correlated Optional Builder
 //!
@@ -13,17 +14,16 @@
 //! - Multi-pattern OPTIONAL clauses with joins, filters, property-joins
 //! - Arbitrary operator subtrees planned from `Vec<Pattern>`
 //!
-//! # Poison Binding Semantics
+//! # Unmatched-variable semantics
 //!
-//! A key feature of this implementation is `Binding::Poisoned`:
-//! - When an OPTIONAL clause has no matches, variables that are unique to
-//!   the optional side are marked as Poisoned (not Unbound)
-//! - Poisoned bindings **block** future pattern matching - any pattern that
-//!   uses a Poisoned variable yields no matches (not "match anything")
-//! - This matches SPARQL OPTIONAL semantics where unbound optional vars
-//!   prevent subsequent patterns from matching
+//! What an unmatched OPTIONAL writes depends on the surface language
+//! ([`PlanningContext::unmatched_optional`]):
+//! - SPARQL / JSON-LD write `Binding::Unbound` (§18.2.4). An unbound variable
+//!   is compatible with anything, so a later OPTIONAL or join may still bind it.
+//! - Cypher writes `Binding::Poisoned`, its null: any later pattern that uses
+//!   the variable matches nothing.
 
-use crate::binding::{Batch, Binding};
+use crate::binding::{Batch, Binding, UnmatchedOptional};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
@@ -157,6 +157,9 @@ pub trait OptionalBuilder: Send + Sync {
 
     /// Get instructions for unification checks on shared vars
     fn unify_instructions(&self) -> &[UnifyInstruction];
+
+    /// What optional-only variables are bound to when nothing matches.
+    fn unmatched_optional(&self) -> UnmatchedOptional;
 }
 
 /// Encoded id of a subject binding, for the batched probes; `None` when the
@@ -747,6 +750,10 @@ impl OptionalBuilder for PatternOptionalBuilder {
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         &self.unify_instructions
     }
+
+    fn unmatched_optional(&self) -> UnmatchedOptional {
+        self.planning.unmatched_optional
+    }
 }
 
 /// Builder for a grouped chain of independent single-triple OPTIONALs that all
@@ -862,7 +869,7 @@ impl GroupedPatternOptionalBuilder {
         Ok(Some(op))
     }
 
-    fn generate_rows(values_per_pred: &[Vec<Binding>]) -> Vec<Vec<Binding>> {
+    fn generate_rows(values_per_pred: &[Vec<Binding>], unmatched: &Binding) -> Vec<Vec<Binding>> {
         if values_per_pred.is_empty() {
             return vec![Vec::new()];
         }
@@ -877,7 +884,7 @@ impl GroupedPatternOptionalBuilder {
             let mut row = Vec::with_capacity(values_per_pred.len());
             for (pred_idx, values) in values_per_pred.iter().enumerate() {
                 if values.is_empty() {
-                    row.push(Binding::Poisoned);
+                    row.push(unmatched.clone());
                 } else {
                     row.push(values[indices[pred_idx]].clone());
                 }
@@ -1095,9 +1102,10 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
         }
 
         let schema = self.grouped_schema();
+        let unmatched = self.planning.unmatched_optional.binding();
         let mut pending = Vec::with_capacity(row_values.len());
         for (slot, values_per_pred) in row_values.into_iter().enumerate() {
-            let rows = Self::generate_rows(&values_per_pred);
+            let rows = Self::generate_rows(&values_per_pred, &unmatched);
             let optional_batches = if rows.is_empty() {
                 Vec::new()
             } else {
@@ -1167,6 +1175,10 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
 
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         &self.unify_instructions
+    }
+
+    fn unmatched_optional(&self) -> UnmatchedOptional {
+        self.planning.unmatched_optional
     }
 }
 
@@ -1669,6 +1681,10 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         &self.unify_instructions
     }
+
+    fn unmatched_optional(&self) -> UnmatchedOptional {
+        self.planning.unmatched_optional
+    }
 }
 
 /// Whether a FILTER expression could still evaluate to `true` with one of its
@@ -2064,6 +2080,10 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         self.fallback.unify_instructions()
     }
+
+    fn unmatched_optional(&self) -> UnmatchedOptional {
+        self.planning.unmatched_optional
+    }
 }
 
 /// True iff `v` occurs in the inner patterns ONLY as the object of one or more
@@ -2245,6 +2265,8 @@ pub struct OptionalOperator {
     /// Empty vec means no matches for that required row.
     /// The batch_idx and row_idx track progress for resuming when batch_size limit is hit.
     pending_output: VecDeque<PendingOptionalMatch>,
+    /// Binding written for optional-only vars when nothing matches.
+    unmatched: Binding,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
     /// Required columns holding a variable the optional side can also bind,
@@ -2380,12 +2402,15 @@ impl OptionalOperator {
             })
             .collect();
 
+        let unmatched = optional_builder.unmatched_optional().binding();
+
         Self {
             required,
             optional_builder,
             required_schema,
             combined_schema,
             shared_merge_cols,
+            unmatched,
             state: OperatorState::Created,
             current_required_batch: None,
             current_required_row: 0,
@@ -2424,8 +2449,9 @@ impl OptionalOperator {
         Self::with_builder(required, required_schema, Box::new(builder))
     }
 
-    /// Create a row with Poisoned bindings for optional-only vars
-    fn create_poisoned_row(&self, required_batch: &Batch, required_row: usize) -> Vec<Binding> {
+    /// Create a no-match row: required columns plus the unmatched binding for
+    /// each optional-only var.
+    fn create_unmatched_row(&self, required_batch: &Batch, required_row: usize) -> Vec<Binding> {
         let mut result = Vec::with_capacity(self.combined_schema.len());
 
         // Copy all required columns
@@ -2433,9 +2459,8 @@ impl OptionalOperator {
             result.push(required_batch.get_by_col(required_row, col).clone());
         }
 
-        // Add Poisoned for optional-only vars
         for _ in self.optional_builder.optional_only_vars() {
-            result.push(Binding::Poisoned);
+            result.push(self.unmatched.clone());
         }
 
         result
@@ -2524,8 +2549,8 @@ impl OptionalOperator {
             if let Some(opt_col) = optional_schema.iter().position(|v| v == var) {
                 result.push(optional_batch.get_by_col(optional_row, opt_col).clone());
             } else {
-                // Shouldn't happen, but fallback to Poisoned
-                result.push(Binding::Poisoned);
+                // Shouldn't happen, but fall back to the no-match binding.
+                result.push(self.unmatched.clone());
             }
         }
 
@@ -2624,8 +2649,8 @@ impl Operator for OptionalOperator {
                     };
 
                     if is_empty {
-                        // No matches - emit row with Poisoned for optional-only vars
-                        let row = self.create_poisoned_row(required_batch, required_row);
+                        // No matches - emit the no-match row
+                        let row = self.create_unmatched_row(required_batch, required_row);
                         for (col, val) in row.into_iter().enumerate() {
                             output_columns[col].push(val);
                         }
@@ -2813,8 +2838,8 @@ impl Operator for OptionalOperator {
                 {
                     None => {
                         builder_none += 1;
-                        // Builder returned None (e.g., poisoned correlation var)
-                        // Emit with Poisoned for optional-only vars
+                        // Builder returned None (e.g., poisoned correlation var):
+                        // emit the no-match row
                         self.pending_output.push_back(PendingOptionalMatch {
                             required_row,
                             optional_batches: Vec::new(),
@@ -3727,7 +3752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_poisoned_row() {
+    fn test_create_unmatched_row() {
         use fluree_db_core::FlakeValue;
 
         let required_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
@@ -3748,13 +3773,6 @@ mod tests {
             fn close(&mut self) {}
         }
 
-        let op = OptionalOperator::new(
-            Box::new(MockOp),
-            required_schema.clone(),
-            optional_pattern,
-            crate::temporal_mode::PlanningContext::current(),
-        );
-
         // Create a required batch with one row
         let columns = vec![
             vec![Binding::sid(Sid::new(1, "alice"))],
@@ -3763,15 +3781,24 @@ mod tests {
                 Sid::new(2, "string"),
             )],
         ];
-        let batch = Batch::new(required_schema, columns).unwrap();
+        let batch = Batch::new(required_schema.clone(), columns).unwrap();
 
-        let row = op.create_poisoned_row(&batch, 0);
+        for unmatched in [UnmatchedOptional::Unbound, UnmatchedOptional::Poisoned] {
+            let op = OptionalOperator::new(
+                Box::new(MockOp),
+                required_schema.clone(),
+                optional_pattern.clone(),
+                crate::temporal_mode::PlanningContext::current().with_unmatched_optional(unmatched),
+            );
 
-        // Should have 3 columns: ?s, ?name, ?email (Poisoned)
-        assert_eq!(row.len(), 3);
-        assert!(row[0].is_sid()); // ?s
-        assert!(row[1].is_lit()); // ?name
-        assert!(row[2].is_poisoned()); // ?email
+            let row = op.create_unmatched_row(&batch, 0);
+
+            // Should have 3 columns: ?s, ?name, ?email (the no-match binding)
+            assert_eq!(row.len(), 3);
+            assert!(row[0].is_sid()); // ?s
+            assert!(row[1].is_lit()); // ?name
+            assert_eq!(row[2], unmatched.binding()); // ?email
+        }
     }
 
     #[test]
@@ -3885,6 +3912,10 @@ mod tests {
         }
         fn unify_instructions(&self) -> &[UnifyInstruction] {
             &[]
+        }
+
+        fn unmatched_optional(&self) -> UnmatchedOptional {
+            UnmatchedOptional::default()
         }
     }
 

@@ -10930,3 +10930,129 @@ async fn cypher_var_length_probes_of_different_types_do_not_share_a_drain() {
         vec![json!([[0.9], [0.1]])],
     );
 }
+
+/// Alice and Carol work somewhere located somewhere; Bob works nowhere.
+async fn seed_works_for_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let l = genesis_ledger(fluree, ledger_id);
+    fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:Person {name: "Alice"})-[:WORKS_FOR]->(:Company {name: "Acme"})
+                        -[:LOCATED_IN]->(:City {name: "NYC"}),
+                      (:Person {name: "Bob"}),
+                      (:Person {name: "Carol"})-[:WORKS_FOR]->(:Company {name: "Globex"})
+                        -[:LOCATED_IN]->(:City {name: "SF"})"#,
+        )
+        .await
+        .expect("seed works-for graph")
+        .ledger
+}
+
+#[tokio::test]
+async fn cypher_null_from_optional_match_matches_nothing_in_later_match() {
+    // A null never matches, so Bob — whose `o` the OPTIONAL MATCH left null —
+    // drops out of the later MATCH instead of joining every located company.
+    // (SPARQL's unbound would be compatible with both.) Nor may the planner
+    // hoist the MATCH above the OPTIONAL MATCH: that seeded `o` with every
+    // located company and returned all six person×city pairs (#1924).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-later-match").await;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person)
+           OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+           MATCH (o)-[:LOCATED_IN]->(c)
+           RETURN p.name AS person, c.name AS city ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(rows, vec![json!(["Alice", "NYC"]), json!(["Carol", "SF"])]);
+}
+
+#[tokio::test]
+async fn cypher_null_from_optional_match_stays_null_in_later_optional_match() {
+    // Bob's null `o` must not let the second OPTIONAL MATCH bind it to every
+    // located company: he keeps one row with a null city.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-later-optional").await;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person)
+           OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+           OPTIONAL MATCH (o)-[:LOCATED_IN]->(c)
+           RETURN p.name AS person, c.name AS city ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", "NYC"]),
+            json!(["Bob", null]),
+            json!(["Carol", "SF"])
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cypher_write_where_null_from_optional_match_stays_null() {
+    // The write path plans its WHERE separately from reads, so it needs the
+    // same null semantics: Bob's null `o` must not bind the second OPTIONAL
+    // MATCH to every located company and SET both cities on him.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-write-where").await;
+    let ledger = fluree
+        .transact_cypher(
+            ledger,
+            r#"MATCH (p:Person)
+               OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+               OPTIONAL MATCH (o)-[:LOCATED_IN]->(c)
+               WITH p, c.name AS cityName
+               SET p.city = cityName"#,
+        )
+        .await
+        .expect("set city")
+        .ledger;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person) RETURN p.name AS person, p.city AS city ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", "NYC"]),
+            json!(["Bob", null]),
+            json!(["Carol", "SF"])
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cypher_null_from_optional_match_matches_nothing_inside_exists() {
+    // Cypher's null semantics hold inside an EXISTS body too: Bob's null `o`
+    // must not act as a free variable that finds some located company.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-exists").await;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person)
+           OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+           RETURN p.name AS person, EXISTS { (o)-[:LOCATED_IN]->(:City) } AS located
+           ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", true]),
+            json!(["Bob", false]),
+            json!(["Carol", true])
+        ]
+    );
+}

@@ -90,6 +90,12 @@ jobs:
       - name: Check (default features)
         run: cargo check --workspace --all-targets --locked
 
+      # The server's optional features (sql, iceberg, delta, ...) are all on in
+      # the steps above, so a module gated by the wrong `#[cfg]` stays
+      # invisible. Build it with none of them.
+      - name: Check (server, no optional features)
+        run: cargo check -p fluree-db-server --no-default-features --features native --locked
+
   test:
     # 8 cores / 32 GB: the workspace compile and nextest run are the CI critical path.
     runs-on: ci-cd-large

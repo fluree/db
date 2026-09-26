@@ -49,7 +49,7 @@ use async_trait::async_trait;
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::Instrument;
@@ -696,7 +696,7 @@ pub struct GroupAggregateOperator {
     /// Aggregate specifications
     agg_specs: Vec<StreamingAggSpec>,
     /// Accumulated groups: composite_key -> group_state
-    groups: FxHashMap<CompositeGroupKey, GroupState>,
+    groups: hashbrown::HashMap<CompositeGroupKey, GroupState, FxBuildHasher>,
     /// If true, input is already partitioned by the GROUP BY key(s), so we can
     /// aggregate per-run without hashing each row into a map.
     partitioned: bool,
@@ -721,7 +721,7 @@ pub struct GroupAggregateOperator {
 }
 
 enum GroupEmitIter {
-    Hash(std::collections::hash_map::IntoIter<CompositeGroupKey, GroupState>),
+    Hash(hashbrown::hash_map::IntoIter<CompositeGroupKey, GroupState>),
     Vec(std::vec::IntoIter<GroupState>),
 }
 
@@ -784,7 +784,7 @@ impl GroupAggregateOperator {
             state: OperatorState::Created,
             group_key_indices,
             agg_specs,
-            groups: FxHashMap::default(),
+            groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
             partitioned,
             partitioned_groups: Vec::new(),
             emit_iter: None,
@@ -1094,21 +1094,29 @@ impl Operator for GroupAggregateOperator {
                         // it here too — before the group state is borrowed.
                         let row_keys = self.extract_row_keys(&batch, row_idx);
 
-                        if !self.groups.contains_key(&group_key) {
-                            let state = GroupState {
-                                key_bindings: self.extract_key_bindings(&batch, row_idx),
-                                agg_states: self
-                                    .agg_specs
-                                    .iter()
-                                    .map(|spec| AggState::new(&spec.function))
-                                    .collect(),
-                            };
-                            self.groups.insert(group_key.clone(), state);
-                        }
-                        let group_state = self
+                        // One hash per row; the key is cloned out of the
+                        // buffer only when it opens a new group. The closure
+                        // captures fields, not `self`, so it can run while
+                        // `groups` is borrowed.
+                        let (_, group_state) = self
                             .groups
-                            .get_mut(&group_key)
-                            .expect("group inserted above");
+                            .raw_entry_mut()
+                            .from_key(&group_key)
+                            .or_insert_with(|| {
+                                let state = GroupState {
+                                    key_bindings: self
+                                        .group_key_indices
+                                        .iter()
+                                        .map(|&col_idx| batch.get_by_col(row_idx, col_idx).clone())
+                                        .collect(),
+                                    agg_states: self
+                                        .agg_specs
+                                        .iter()
+                                        .map(|spec| AggState::new(&spec.function))
+                                        .collect(),
+                                };
+                                (group_key.clone(), state)
+                            });
 
                         // Update each aggregate with this row's values
                         let gv_ref = self.graph_view.as_ref();

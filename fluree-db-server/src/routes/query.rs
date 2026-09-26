@@ -15,7 +15,7 @@ use crate::telemetry::{
     create_request_span, extract_request_id, extract_trace_id, log_query_text, set_span_error_code,
     should_log_query_text,
 };
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -25,7 +25,6 @@ use fluree_db_api::{
     QueryExecutionOptions, RefreshOpts, TimeSpec, TrackingTally,
 };
 use rand::Rng;
-use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
@@ -210,13 +209,16 @@ async fn refresh_ledgers_without_min_t<I>(
 
 /// Optional URL query parameters for W3C SPARQL Protocol compliance.
 ///
-/// The SPARQL Protocol (RFC 3986) allows queries via:
-///   GET /sparql?query=SELECT+...&default-graph-uri=...
+/// The SPARQL Protocol allows queries via:
+///   GET /sparql?query=SELECT+...&default-graph-uri=...&named-graph-uri=...
 ///
 /// When `query` is present and the request body is empty, the query parameter
 /// value is used as the SPARQL query string.
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
+///
+/// Extracted by hand ([`SparqlParams::from_query_str`]) rather than through
+/// `Query<SparqlParams>`: the dataset parameters repeat once per graph, and
+/// `serde_urlencoded` rejects a repeated key in a struct as "duplicate field".
+#[derive(Debug, Default)]
 pub struct SparqlParams {
     /// The SPARQL query string (URL-encoded)
     pub query: Option<String>,
@@ -225,36 +227,171 @@ pub struct SparqlParams {
     /// Defaults to false. For JSON-LD, this injects the context only when the
     /// query omits `@context`/`context`. For ledger-scoped SPARQL, this makes
     /// default prefixes available when the query has no explicit `PREFIX`.
-    #[serde(
-        default,
-        alias = "default_context",
-        alias = "use-default-context",
-        alias = "use_default_context"
-    )]
+    /// Accepted as `default-context`, `default_context`, `use-default-context`,
+    /// or `use_default_context`.
     pub default_context: bool,
-    /// Optional default graph URI (part of W3C SPARQL Protocol).
-    // Kept for: full SPARQL Protocol compliance — BSBM and other tools may send this param.
-    // Use when: implementing default-graph-uri scoping in query execution.
-    #[expect(dead_code)]
-    pub default_graph_uri: Option<String>,
+    /// `default-graph-uri` values (Protocol §2.1.4): the query's default graph.
+    pub default_graph_uri: Vec<String>,
+    /// `named-graph-uri` values (Protocol §2.1.4): the query's named graphs.
+    pub named_graph_uri: Vec<String>,
+    /// Whether a default-context flag has been read, so a second is refused.
+    default_context_seen: bool,
+}
+
+impl SparqlParams {
+    /// Parse the request's query string. Unknown keys are ignored; `query` and
+    /// the default-context flag may appear at most once.
+    pub(crate) fn from_query_str(raw: &str) -> Result<Self> {
+        let mut params = SparqlParams::default();
+        params.apply_pairs(super::sparql_protocol::decode_pairs(raw)?)?;
+        Ok(params)
+    }
+
+    fn apply_pairs(&mut self, pairs: Vec<(String, String)>) -> Result<()> {
+        use super::sparql_protocol::{DEFAULT_GRAPH_URI, NAMED_GRAPH_URI};
+        for (key, value) in pairs {
+            match key.as_str() {
+                "query" => {
+                    if self.query.replace(value).is_some() {
+                        return Err(ServerError::bad_request(
+                            "the `query` parameter may appear only once",
+                        ));
+                    }
+                }
+                "default-context"
+                | "default_context"
+                | "use-default-context"
+                | "use_default_context" => {
+                    if std::mem::replace(&mut self.default_context_seen, true) {
+                        return Err(ServerError::bad_request(
+                            "the `default-context` parameter may appear only once",
+                        ));
+                    }
+                    self.default_context = match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        other => {
+                            return Err(ServerError::bad_request(format!(
+                                "`{key}` must be true or false; got {other:?}"
+                            )))
+                        }
+                    };
+                }
+                DEFAULT_GRAPH_URI => self.default_graph_uri.push(value),
+                NAMED_GRAPH_URI => self.named_graph_uri.push(value),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// W3C SPARQL Protocol query via POST with URL-encoded parameters (§2.1.2):
+    /// `Content-Type: application/x-www-form-urlencoded`, `query=<sparql>`, and
+    /// optionally the dataset parameters, all in the body.
+    ///
+    /// The body's parameters join the URL's, and the credential is rewritten so
+    /// the rest of the pipeline sees `application/sparql-query` with the query
+    /// text as its body. A form carrying `update=` is marked as an update, so
+    /// the query routes refuse it as they refuse any SPARQL UPDATE. Any other
+    /// form body is left alone.
+    pub(crate) fn absorb_form_body(&mut self, credential: &mut MaybeCredential) -> Result<()> {
+        if credential.is_sparql || credential.is_sparql_update || !is_form_encoded(credential) {
+            return Ok(());
+        }
+        let Ok(body) = std::str::from_utf8(&credential.body) else {
+            return Ok(());
+        };
+        let pairs = super::sparql_protocol::decode_pairs(body)?;
+        if pairs.iter().any(|(k, _)| k == "update") {
+            credential.is_sparql_update = true;
+            return Ok(());
+        }
+        if !pairs.iter().any(|(k, _)| k == "query") {
+            return Ok(());
+        }
+        self.apply_pairs(pairs)?;
+        let sparql = self.query.take().unwrap_or_default();
+        credential.body = axum::body::Bytes::from(sparql);
+        credential.is_sparql = true;
+        Ok(())
+    }
+
+    /// Whether the request names a dataset through protocol parameters.
+    pub(crate) fn has_dataset(&self) -> bool {
+        !self.default_graph_uri.is_empty() || !self.named_graph_uri.is_empty()
+    }
+
+    /// Dataset parameters only mean something for SPARQL; a JSON-LD query
+    /// names its dataset with `from` / `fromNamed`. Refuse rather than ignore.
+    pub(crate) fn reject_dataset_outside_sparql(&self, is_sparql: bool) -> Result<()> {
+        if is_sparql || !self.has_dataset() {
+            return Ok(());
+        }
+        Err(ServerError::bad_request(
+            "default-graph-uri / named-graph-uri apply only to SPARQL queries; \
+             a JSON-LD query names its dataset with `from` / `fromNamed`",
+        ))
+    }
+}
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for SparqlParams
+where
+    S: Send + Sync,
+{
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        SparqlParams::from_query_str(parts.uri.query().unwrap_or(""))
+    }
+}
+
+/// The SPARQL text of the request, with the protocol dataset applied.
+///
+fn is_form_encoded(credential: &MaybeCredential) -> bool {
+    credential
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("application/x-www-form-urlencoded"))
 }
 
 /// If a `?query=` URL parameter is present and the credential body is empty,
-/// return the query param value as the SPARQL string. Otherwise fall back to
-/// the credential body.
+/// the query param value is the SPARQL string; otherwise the credential body.
+/// `default-graph-uri` / `named-graph-uri` then replace the query's own
+/// `FROM` / `FROM NAMED` (Protocol §2.1.4: the protocol dataset takes
+/// precedence), so every consumer of the text — auth scoping, `min-t`, ledger
+/// refresh, execution — sees the same dataset.
 pub(crate) fn resolve_sparql_text(
     params: &SparqlParams,
     credential: &MaybeCredential,
 ) -> Result<String> {
     // Prefer ?query= parameter when body is empty (standard SPARQL Protocol GET)
-    if let Some(ref q) = params.query {
-        let body = credential.body_string().unwrap_or_default();
-        if body.trim().is_empty() {
-            return Ok(q.clone());
+    let sparql = match params.query {
+        Some(ref q)
+            if credential
+                .body_string()
+                .unwrap_or_default()
+                .trim()
+                .is_empty() =>
+        {
+            q.clone()
         }
+        // Fall back to request body
+        _ => credential.body_string()?,
+    };
+    match fluree_db_sparql::protocol::apply_query_dataset(
+        &sparql,
+        &params.default_graph_uri,
+        &params.named_graph_uri,
+    ) {
+        Ok(std::borrow::Cow::Borrowed(_)) => Ok(sparql),
+        Ok(std::borrow::Cow::Owned(rewritten)) => Ok(rewritten),
+        Err(e) => Err(ServerError::bad_request(e.to_string())),
     }
-    // Fall back to request body
-    credential.body_string()
 }
 
 /// Check if the request should be treated as SPARQL based on headers OR the
@@ -518,10 +655,10 @@ async fn attach_default_context_to_graph(
 ///   - Connection-scoped: requires FROM clause in SPARQL to specify ledger
 pub async fn query(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SparqlParams>,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -534,6 +671,8 @@ pub async fn query(
     let trace_id = extract_trace_id(&credential.headers);
 
     // Detect input format before span creation so otel.name is set at open time
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
     } else if headers.is_cypher_query() {
@@ -926,10 +1065,10 @@ pub async fn query(
 pub async fn query_ledger(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    Query(params): Query<SparqlParams>,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -941,6 +1080,8 @@ pub async fn query_ledger(
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
 
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
     } else {
@@ -1129,7 +1270,7 @@ pub async fn query_ledger(
 pub async fn query_ledger_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    params: Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -1157,10 +1298,10 @@ pub async fn query_ledger_tail(
 pub async fn explain_ledger(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    Query(params): Query<SparqlParams>,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Json<JsonValue>> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -1172,6 +1313,8 @@ pub async fn explain_ledger(
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
 
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
     } else if headers.is_cypher_query() {
@@ -1433,7 +1576,7 @@ pub async fn explain_ledger(
 pub async fn explain_ledger_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    params: Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -2796,9 +2939,9 @@ async fn execute_sparql_ledger(
                         .to_string(),
                 ));
             }
-            if wants_rdf_xml {
+            if wants_rdf_xml && !is_graph_query(parsed.ast.as_ref()) {
                 return Err(ServerError::not_acceptable(
-                    "RDF/XML is not supported for identity-scoped SPARQL queries".to_string(),
+                    "RDF/XML is only available for SPARQL CONSTRUCT/DESCRIBE queries".to_string(),
                 ));
             }
             if let Some(fmt) = delimited {
@@ -2812,6 +2955,23 @@ async fn execute_sparql_ledger(
                 .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?;
             let view = attach_default_context_to_graph(state, ledger_id, view, use_default_context)
                 .await?;
+            if wants_rdf_xml {
+                let xml = view
+                    .query(state.fluree.as_ref())
+                    .sparql(sparql)
+                    .format(fluree_db_api::FormatterConfig::rdf_xml())
+                    .execution_options(query_execution_options(state))
+                    .execute_formatted_string()
+                    .await
+                    .inspect_err(|_| {
+                        set_span_error_code(&span, "error:QueryFailed");
+                    })?;
+                return Ok((
+                    [(axum::http::header::CONTENT_TYPE, "application/rdf+xml; charset=utf-8")],
+                    xml.into_bytes(),
+                )
+                    .into_response());
+            }
             let result = view.query(state.fluree.as_ref())
                 .sparql(sparql)
                 .format(json_fmt_config.clone())
@@ -3369,10 +3529,10 @@ async fn execute_sparql_ledger(
 /// Supports signed requests (JWS/VC format).
 pub async fn explain(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SparqlParams>,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Json<JsonValue>> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -3384,6 +3544,8 @@ pub async fn explain(
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
 
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
     } else {

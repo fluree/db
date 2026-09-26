@@ -33,7 +33,7 @@ assert/retract introspection.
 Turtle 1.2 annotation syntax is accepted on ingest — `{| ... |}` annotation
 tails, the `~` reifier, `<< s p o >>` reified triples and
 `r rdf:reifies <<( s p o )>>` — on every Turtle write path (insert, upsert,
-import, graph sync), inside TriG `GRAPH { }` blocks, and in N-Triples and
+import, graph sync over the CLI or `/sync`), inside TriG `GRAPH { }` blocks, and in N-Triples and
 N-Quads files. All forms assert the base triple: Fluree reifies asserted
 edges, so `<< s p o >>` is asserting here where RDF 1.2 makes it
 non-asserting. The `VERSION "1.2"` / `@version`
@@ -146,6 +146,18 @@ Not yet supported:
 JSON-LD transactions remain available as an alternative write surface.
 
 **Specification:** https://www.w3.org/TR/sparql11-update/
+
+### SPARQL 1.1 Graph Store HTTP Protocol
+
+**Status:** Supported, indirect graph identification
+
+`GET`, `HEAD`, `PUT`, `POST` and `DELETE` on `/v1/fluree/data/{ledger}` with
+`?graph={iri}` or `?default`. `PUT` commits only the difference from the
+graph's current contents. `GET` returns JSON-LD or RDF/XML (not yet Turtle or
+N-Triples). Direct graph identification (the request URL as the graph IRI)
+is not supported. See [Graph Store Protocol](../api/graph-store.md).
+
+**Specification:** https://www.w3.org/TR/sparql11-http-rdf-update/
 
 ### SPARQL 1.2
 

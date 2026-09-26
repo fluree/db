@@ -363,6 +363,13 @@ impl GraphRegistry {
         self.iri_to_id.get(iri).copied()
     }
 
+    /// Whether any of `iris` is not yet registered — that is, whether a
+    /// commit writing to them would register a graph.
+    pub fn has_unregistered<'a>(&self, iris: impl IntoIterator<Item = &'a str>) -> bool {
+        iris.into_iter()
+            .any(|iri| !self.iri_to_id.contains_key(iri))
+    }
+
     /// Reverse lookup: GraphId → IRI.
     pub fn iri_for_graph_id(&self, g_id: GraphId) -> Option<&str> {
         self.id_to_iri

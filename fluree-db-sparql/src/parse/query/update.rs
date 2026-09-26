@@ -424,6 +424,7 @@ impl super::Parser<'_> {
         let using = self.parse_using_clause();
 
         // Parse WHERE clause
+        let where_keyword = self.stream.current_span();
         let where_pattern = self.parse_update_where_clause()?;
 
         let span = start.union(self.stream.previous_span());
@@ -434,6 +435,7 @@ impl super::Parser<'_> {
         if let Some(u) = using {
             modify = modify.with_using(u);
         }
+        modify = modify.with_where_keyword(where_keyword);
 
         Some(UpdateOperation::Modify(Box::new(modify)))
     }
@@ -459,6 +461,7 @@ impl super::Parser<'_> {
         let using = self.parse_using_clause();
 
         // Parse WHERE clause
+        let where_keyword = self.stream.current_span();
         let where_pattern = self.parse_update_where_clause()?;
 
         let span = start.union(self.stream.previous_span());
@@ -469,6 +472,7 @@ impl super::Parser<'_> {
         if let Some(u) = using {
             modify = modify.with_using(u);
         }
+        modify = modify.with_where_keyword(where_keyword);
 
         Some(UpdateOperation::Modify(Box::new(modify)))
     }

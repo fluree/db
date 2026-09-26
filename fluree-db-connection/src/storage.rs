@@ -89,6 +89,8 @@ mod tests {
             storage_type: StorageType::File,
             path: Some(Arc::from("/tmp/test")),
             aes256_key: None,
+            aes256_keys: Vec::new(),
+            aes256_current_key: None,
             address_identifier: None,
             durability: None,
         };
@@ -104,6 +106,8 @@ mod tests {
             storage_type: StorageType::File,
             path: None,
             aes256_key: None,
+            aes256_keys: Vec::new(),
+            aes256_current_key: None,
             address_identifier: None,
             durability: None,
         };
@@ -122,6 +126,8 @@ mod tests {
             },
             path: None,
             aes256_key: None,
+            aes256_keys: Vec::new(),
+            aes256_current_key: None,
             address_identifier: None,
             durability: None,
         };

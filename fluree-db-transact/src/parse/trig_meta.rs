@@ -216,6 +216,73 @@ pub fn parse_trig_phase1(input: &str) -> Result<TrigPhase1Result> {
     parser.extract_phase1()
 }
 
+/// A TriG document read as one graph's Turtle (see [`unwrap_trig_graph_blocks`]).
+#[derive(Debug, Clone)]
+pub struct UnwrappedTrig {
+    /// The document as Turtle: labeled graph block delimiters blanked out, so
+    /// block triples stay in place in document order, and the txn-meta block
+    /// blanked out entirely. Every edit is same-length, so a Turtle parse
+    /// error's line and column still point into the original document.
+    pub turtle: String,
+    /// Labels of the unwrapped blocks, in document order (repeats kept).
+    pub graph_iris: Vec<String>,
+    /// Whether the document has default-graph triples beside its blocks.
+    /// In TriG those belong to a different graph than any block's.
+    pub mixes_default_and_named: bool,
+    /// The txn-meta block, as [`parse_trig_phase1`] reports it.
+    pub raw_meta: Option<RawTrigMeta>,
+}
+
+/// Unwrap a TriG document's labeled graph blocks in place, leaving Turtle
+/// the full Turtle parser reads — anonymous `[ … ]` nodes, collections and
+/// every RDF 1.2 form included, none of which [`parse_trig_phase1`]'s block
+/// parser accepts. The labels are reported, not applied: this is for a caller
+/// that writes the document to one graph, and must check they name it.
+///
+/// Blank-node labels are document-scoped in TriG, so one label in two blocks
+/// is one node here too.
+pub fn unwrap_trig_graph_blocks(input: &str) -> Result<UnwrappedTrig> {
+    if !might_contain_graph_block(input) {
+        return Ok(UnwrappedTrig {
+            turtle: input.to_string(),
+            graph_iris: Vec::new(),
+            mixes_default_and_named: false,
+            raw_meta: None,
+        });
+    }
+    let tokens = tokenize(input).map_err(|e| TransactError::Parse(e.to_string()))?;
+    let mut parser = TrigMetaParser::new(input, &tokens);
+    parser.unwrap_blocks = true;
+    parser.parse()?;
+
+    let mut turtle = input.as_bytes().to_vec();
+    let blank = |bytes: &mut [u8]| {
+        for b in bytes.iter_mut().filter(|b| !matches!(b, b'\n' | b'\r')) {
+            *b = b' ';
+        }
+    };
+    for block in &parser.unwrapped {
+        blank(&mut turtle[block.header.0..block.header.1]);
+        // A block's last triple may omit its `.`; Turtle's may not.
+        turtle[block.close] = if block.needs_dot { b'.' } else { b' ' };
+    }
+    for &(start, end) in &parser.excised {
+        blank(&mut turtle[start..end]);
+    }
+    let turtle = String::from_utf8(turtle).expect("only ASCII bytes replaced ASCII bytes");
+
+    let mixes_default_and_named =
+        !parser.default_triples.is_empty() && !parser.unwrapped.is_empty();
+    let graph_iris = parser.unwrapped.iter().map(|b| b.iri.clone()).collect();
+    let raw_meta = parser.extract_phase1()?.raw_meta;
+    Ok(UnwrappedTrig {
+        turtle,
+        graph_iris,
+        mixes_default_and_named,
+        raw_meta,
+    })
+}
+
 /// Phase 2: Resolve raw TriG metadata to TxnMetaEntry using namespace registry.
 ///
 /// This converts the intermediate `RawTrigMeta` representation to final
@@ -410,6 +477,23 @@ struct TrigMetaParser<'a> {
     /// Non-zero while parsing a `{| … |}` body: star constructs there are
     /// the deferred annotation-of-annotation shape.
     annotation_depth: u32,
+    /// Skip labeled blocks' contents, recording where their delimiters are
+    /// (see [`unwrap_trig_graph_blocks`]).
+    unwrap_blocks: bool,
+    unwrapped: Vec<UnwrappedBlock>,
+    /// Byte ranges of txn-meta blocks, when unwrapping.
+    excised: Vec<(usize, usize)>,
+}
+
+/// Where a skipped labeled block's delimiters are.
+struct UnwrappedBlock {
+    iri: String,
+    /// `GRAPH <iri> {` (or `<iri> {`), as a byte range.
+    header: (usize, usize),
+    /// Byte offset of the closing `}`.
+    close: usize,
+    /// Whether the block's last triple ends without a `.`.
+    needs_dot: bool,
 }
 
 /// Information about a GRAPH block.
@@ -493,6 +577,9 @@ impl<'a> TrigMetaParser<'a> {
             anon_reifiers: 0,
             star_depth: 0,
             annotation_depth: 0,
+            unwrap_blocks: false,
+            unwrapped: Vec::new(),
+            excised: Vec::new(),
         }
     }
 
@@ -566,7 +653,7 @@ impl<'a> TrigMetaParser<'a> {
             }
             TokenKind::KwGraph => {
                 self.advance(); // consume the GRAPH keyword
-                self.parse_graph_block()?;
+                self.parse_graph_block(start_pos)?;
             }
             // W3C-compliant compact graph block: `<iri> { ... }` or
             // `prefix:name { ... }` (the GRAPH keyword is optional per the TriG
@@ -579,7 +666,7 @@ impl<'a> TrigMetaParser<'a> {
             | TokenKind::PrefixedNameNs
                 if matches!(self.peek_kind(1), Some(TokenKind::LBrace)) =>
             {
-                self.parse_graph_block()?;
+                self.parse_graph_block(start_pos)?;
             }
             // Anonymous default-graph wrapped block `{ ... }`. Valid W3C TriG
             // (it denotes the default graph), but unsupported here: this parser
@@ -734,7 +821,7 @@ impl<'a> TrigMetaParser<'a> {
     /// Parse a graph block starting at the graph label (the optional `GRAPH`
     /// keyword, if present, must already be consumed by the caller). Handles
     /// both `GRAPH <iri> { ... }` and the compact `<iri> { ... }` form.
-    fn parse_graph_block(&mut self) -> Result<()> {
+    fn parse_graph_block(&mut self, start_pos: usize) -> Result<()> {
         // Parse graph IRI
         let graph_iri = match self.current().kind.clone() {
             TokenKind::Iri => {
@@ -772,6 +859,10 @@ impl<'a> TrigMetaParser<'a> {
         }
         self.advance();
 
+        if self.unwrap_blocks && graph_iri != TXN_META_GRAPH_IRI {
+            return self.skip_graph_block(graph_iri, start_pos);
+        }
+
         // Parse triples inside the GRAPH block
         let mut triples = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
@@ -798,6 +889,11 @@ impl<'a> TrigMetaParser<'a> {
             ));
         }
 
+        if self.unwrap_blocks {
+            let end = self.tokens[self.pos - 1].end as usize;
+            self.excised.push((start_pos, end));
+        }
+
         // Store the graph block (supports multiple GRAPH blocks)
         self.graph_blocks.push(GraphBlock {
             iri: graph_iri,
@@ -805,6 +901,32 @@ impl<'a> TrigMetaParser<'a> {
             reified,
         });
 
+        Ok(())
+    }
+
+    /// Skip a labeled block's contents (positioned just past its `{`),
+    /// recording its delimiters. The contents are left for the Turtle parser,
+    /// which also reports their errors.
+    fn skip_graph_block(&mut self, iri: String, start_pos: usize) -> Result<()> {
+        let header = (start_pos, self.tokens[self.pos - 1].end as usize);
+        let mut needs_dot = false;
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            needs_dot = !self.check(&TokenKind::Dot);
+            self.advance();
+        }
+        if !self.check(&TokenKind::RBrace) {
+            return Err(TransactError::Parse(
+                "expected '}' to close GRAPH block".to_string(),
+            ));
+        }
+        let close = self.current().start as usize;
+        self.advance();
+        self.unwrapped.push(UnwrappedBlock {
+            iri,
+            header,
+            close,
+            needs_dot,
+        });
         Ok(())
     }
 
@@ -2620,5 +2742,54 @@ ex:alice ex:note "value with a { brace" .
             .expect_err("unquoted version specifier")
             .to_string();
         assert!(err.contains("version specifier"), "{err}");
+    }
+
+    #[test]
+    fn unwrap_keeps_block_triples_in_place() {
+        let input = "@prefix ex: <http://example.org/> .\n\
+                     GRAPH ex:g { ex:a ex:p [ ex:q \"}\" ] }\n\
+                     GRAPH <#txn-meta> { <fluree:commit:this> ex:m \"x\" . }\n\
+                     <http://example.org/g> {\n  ex:b ex:p ( 1 2 ) .\n}\n";
+        let unwrapped = unwrap_trig_graph_blocks(input).unwrap();
+        assert_eq!(unwrapped.turtle.len(), input.len(), "edits are same-length");
+        assert_eq!(
+            unwrapped.turtle.lines().count(),
+            input.lines().count(),
+            "newlines survive"
+        );
+        assert_eq!(
+            unwrapped.graph_iris,
+            ["http://example.org/g", "http://example.org/g"]
+        );
+        assert!(!unwrapped.mixes_default_and_named);
+        assert_eq!(unwrapped.raw_meta.map(|m| m.triples.len()), Some(1));
+
+        let lines: Vec<&str> = unwrapped.turtle.lines().map(str::trim).collect();
+        // The `}` in the string literal is left alone; the block's own `}`
+        // becomes the missing `.`.
+        assert_eq!(lines[1], "ex:a ex:p [ ex:q \"}\" ] .");
+        assert_eq!(lines[2], "", "the txn-meta block is removed");
+        assert_eq!(lines[3], "");
+        assert_eq!(lines[4], "ex:b ex:p ( 1 2 ) .");
+        assert_eq!(lines[5], "", "a block ending in `.` needs no second one");
+    }
+
+    #[test]
+    fn unwrap_reports_default_triples_beside_blocks() {
+        let input = "@prefix ex: <http://example.org/> .\n\
+                     ex:a ex:p ex:o .\nGRAPH ex:g { ex:b ex:p ex:o . }\n";
+        assert!(
+            unwrap_trig_graph_blocks(input)
+                .unwrap()
+                .mixes_default_and_named
+        );
+    }
+
+    #[test]
+    fn unwrap_passes_plain_turtle_through() {
+        let input = "@prefix ex: <http://example.org/> .\nex:a ex:p ex:o .\n";
+        let unwrapped = unwrap_trig_graph_blocks(input).unwrap();
+        assert_eq!(unwrapped.turtle, input);
+        assert!(unwrapped.graph_iris.is_empty());
     }
 }

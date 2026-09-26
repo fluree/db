@@ -71,6 +71,7 @@ impl super::Parser<'_> {
 
             DescribeTarget::Resources(resources)
         };
+        let dataset_offset = self.stream.previous_span().end;
 
         // Parse optional dataset clause
         let dataset = self.parse_dataset_clause();
@@ -94,6 +95,7 @@ impl super::Parser<'_> {
             dataset,
             where_clause,
             modifiers,
+            dataset_offset,
             span,
         })
     }

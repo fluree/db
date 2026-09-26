@@ -73,10 +73,31 @@ pub struct DefaultsConfig {
     pub indexing: Option<IndexingDefaults>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IdentityDefaults {
     pub public_key: Option<Arc<str>>,
     pub private_key: Option<Arc<str>>,
+}
+
+impl std::fmt::Debug for IdentityDefaults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityDefaults")
+            .field("public_key", &self.public_key)
+            .field("private_key", &Redacted(&self.private_key))
+            .finish()
+    }
+}
+
+/// `Debug` for a secret: shows whether one is set, never its value.
+struct Redacted<'a>(&'a Option<Arc<str>>);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("Some(<redacted>)"),
+            None => f.write_str("None"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,8 +145,25 @@ pub enum StorageType {
     Unsupported { type_iri: String, raw: JsonValue },
 }
 
+/// One entry of a rotation key set: a base64 AES-256 key and the id the
+/// envelope header records for it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyedAes256Key {
+    pub id: u32,
+    pub key: Arc<str>,
+}
+
+impl std::fmt::Debug for KeyedAes256Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyedAes256Key")
+            .field("id", &self.id)
+            .field("key", &format_args!("<redacted>"))
+            .finish()
+    }
+}
+
 /// Storage configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StorageConfig {
     /// Optional identifier for the storage
     pub id: Option<Arc<str>>,
@@ -133,13 +171,35 @@ pub struct StorageConfig {
     pub storage_type: StorageType,
     /// Base path for file storage
     pub path: Option<Arc<str>>,
-    /// Optional AES-256 encryption key (works with any storage backend: file, S3, memory)
+    /// Optional AES-256 encryption key (works with any storage backend: file, S3, memory).
+    /// A single key with id 0. Mutually exclusive with `aes256_keys`.
     pub aes256_key: Option<Arc<str>>,
+    /// Keyed AES-256 keys for rotation: every listed key decrypts, the one
+    /// named by `aes256_current_key` encrypts new writes.
+    pub aes256_keys: Vec<KeyedAes256Key>,
+    /// Id of the entry in `aes256_keys` that encrypts new writes. Required
+    /// when `aes256_keys` is non-empty.
+    pub aes256_current_key: Option<u32>,
     /// Optional address identifier
     pub address_identifier: Option<Arc<str>>,
     /// Optional durability mode for file storage. `None` leaves the choice to
     /// `FLUREE_STORAGE_FSYNC` and the built-in default.
     pub durability: Option<Durability>,
+}
+
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("id", &self.id)
+            .field("storage_type", &self.storage_type)
+            .field("path", &self.path)
+            .field("aes256_key", &Redacted(&self.aes256_key))
+            .field("aes256_keys", &self.aes256_keys)
+            .field("aes256_current_key", &self.aes256_current_key)
+            .field("address_identifier", &self.address_identifier)
+            .field("durability", &self.durability)
+            .finish()
+    }
 }
 
 impl Default for StorageConfig {
@@ -149,6 +209,8 @@ impl Default for StorageConfig {
             storage_type: StorageType::Memory,
             path: None,
             aes256_key: None,
+            aes256_keys: Vec::new(),
+            aes256_current_key: None,
             address_identifier: None,
             durability: None,
         }
@@ -231,6 +293,8 @@ impl ConnectionConfig {
                 storage_type: StorageType::File,
                 path: Some(base_path.into()),
                 aes256_key: None,
+                aes256_keys: Vec::new(),
+                aes256_current_key: None,
                 address_identifier: None,
                 durability: None,
             },
@@ -293,6 +357,7 @@ impl ConnectionConfig {
             }
         }
 
+        validate_commit_storage_keys(&config.index_storage, config.commit_storage.as_ref())?;
         Ok(config)
     }
 
@@ -374,13 +439,16 @@ impl ConnectionConfig {
         // 8. Parse addressIdentifiers map (identifier -> StorageConfig)
         let address_identifiers = parse_address_identifiers_map(&graph, conn_node)?;
 
+        let index_storage = index_storage.ok_or_else(|| {
+            ConnectionError::invalid_config("indexStorage required in Connection config")
+        })?;
+        validate_commit_storage_keys(&index_storage, commit_storage.as_ref())?;
+
         Ok(ConnectionConfig {
             id: get_id(conn_node),
             parallelism,
             cache: CacheConfig::with_max_mb(cache_max_mb),
-            index_storage: index_storage.ok_or_else(|| {
-                ConnectionError::invalid_config("indexStorage required in Connection config")
-            })?,
+            index_storage,
             commit_storage,
             primary_publisher,
             defaults,
@@ -389,10 +457,55 @@ impl ConnectionConfig {
     }
 }
 
+/// The key on `indexStorage` encrypts commit storage too, so a key found
+/// only on `commitStorage` would be ignored and leave the store unencrypted.
+/// `commitStorage` may repeat the index key (for example by naming the same
+/// storage node); anything else is rejected.
+fn validate_commit_storage_keys(
+    index: &StorageConfig,
+    commit: Option<&StorageConfig>,
+) -> Result<()> {
+    let Some(commit) = commit else {
+        return Ok(());
+    };
+    let has_key = commit.aes256_key.is_some() || !commit.aes256_keys.is_empty();
+    let matches_index = commit.aes256_key == index.aes256_key
+        && commit.aes256_keys == index.aes256_keys
+        && commit.aes256_current_key == index.aes256_current_key;
+    if has_key && !matches_index {
+        return Err(ConnectionError::invalid_config(
+            "commitStorage carries an encryption key that indexStorage does not. The \
+             indexStorage key encrypts commit storage too: put the key on indexStorage.",
+        ));
+    }
+    Ok(())
+}
+
 /// Parse storage config from a resolved JSON-LD node
 fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageConfig> {
     let address_identifier =
         resolve_string(graph, node, vocab::FIELD_ADDRESS_IDENTIFIER).map(Arc::from);
+
+    // Encryption keys belong to the storage node, not to one backend: every
+    // branch below carries them through. A key that is configured but does
+    // not resolve (an unset `envVar` with no `defaultVal`) fails closed: the
+    // alternative is an unencrypted store that looks configured.
+    let aes256_key = resolve_string(graph, node, vocab::FIELD_AES256_KEY).map(Arc::from);
+    if aes256_key.is_none() && node.get(vocab::FIELD_AES256_KEY).is_some() {
+        return Err(ConnectionError::invalid_config(
+            "AES256Key is configured but did not resolve to a key: its envVar is unset or \
+             empty and it has no defaultVal. Refusing to start the storage unencrypted.",
+        ));
+    }
+    let aes256_keys = parse_keyed_aes256_keys(graph, node)?;
+    let aes256_current_key = resolve_u64(graph, node, vocab::FIELD_AES256_CURRENT_KEY)
+        .map(|id| {
+            u32::try_from(id).map_err(|_| {
+                ConnectionError::invalid_config("AES256CurrentKey must fit in 32 bits")
+            })
+        })
+        .transpose()?;
+    validate_aes256_key_set(&aes256_key, &aes256_keys, aes256_current_key)?;
 
     // Determine storage type from properties (not hardcoded strings)
     if node.get(vocab::FIELD_S3_BUCKET).is_some() {
@@ -423,7 +536,9 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
             id: get_id(node),
             storage_type: StorageType::S3(s3),
             path: None,
-            aes256_key: None,
+            aes256_key: aes256_key.clone(),
+            aes256_keys: aes256_keys.clone(),
+            aes256_current_key,
             address_identifier,
             durability: None,
         });
@@ -431,7 +546,6 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
 
     if node.get(vocab::FIELD_FILE_PATH).is_some() {
         let path = resolve_string(graph, node, vocab::FIELD_FILE_PATH).map(Arc::from);
-        let aes256_key = resolve_string(graph, node, vocab::FIELD_AES256_KEY).map(Arc::from);
         let durability = match resolve_string(graph, node, vocab::FIELD_DURABILITY) {
             None => None,
             Some(v) => Some(Durability::from_mode_name(&v).ok_or_else(|| {
@@ -444,7 +558,9 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
             id: get_id(node),
             storage_type: StorageType::File,
             path,
-            aes256_key,
+            aes256_key: aes256_key.clone(),
+            aes256_keys: aes256_keys.clone(),
+            aes256_current_key,
             address_identifier,
             durability,
         });
@@ -455,10 +571,74 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
         id: get_id(node),
         storage_type: StorageType::Memory,
         path: None,
-        aes256_key: None,
+        aes256_key,
+        aes256_keys,
+        aes256_current_key,
         address_identifier,
         durability: None,
     })
+}
+
+/// Parse the `AES256Keys` list: each entry a node with `keyId` and `AES256Key`.
+fn parse_keyed_aes256_keys(graph: &ConfigGraph, node: &JsonValue) -> Result<Vec<KeyedAes256Key>> {
+    let Some(raw) = node.get(vocab::FIELD_AES256_KEYS) else {
+        return Ok(Vec::new());
+    };
+    let mut keys = Vec::new();
+    for entry in graph.resolve_all(raw) {
+        let id = resolve_u64(graph, entry, vocab::FIELD_KEY_ID)
+            .ok_or_else(|| ConnectionError::invalid_config("AES256Keys entry requires keyId"))?;
+        let id = u32::try_from(id)
+            .map_err(|_| ConnectionError::invalid_config("keyId must fit in 32 bits"))?;
+        let key = resolve_string(graph, entry, vocab::FIELD_AES256_KEY).ok_or_else(|| {
+            ConnectionError::invalid_config("AES256Keys entry requires AES256Key")
+        })?;
+        keys.push(KeyedAes256Key {
+            id,
+            key: Arc::from(key),
+        });
+    }
+    Ok(keys)
+}
+
+/// The rules both parsers enforce on a storage node's encryption keys.
+fn validate_aes256_key_set(
+    single: &Option<Arc<str>>,
+    keys: &[KeyedAes256Key],
+    current: Option<u32>,
+) -> Result<()> {
+    if single.is_some() && !keys.is_empty() {
+        return Err(ConnectionError::invalid_config(
+            "AES256Key and AES256Keys are mutually exclusive; list the single key in AES256Keys",
+        ));
+    }
+    if keys.is_empty() {
+        if current.is_some() {
+            return Err(ConnectionError::invalid_config(
+                "AES256CurrentKey given without AES256Keys",
+            ));
+        }
+        return Ok(());
+    }
+    for (i, k) in keys.iter().enumerate() {
+        if keys[..i].iter().any(|other| other.id == k.id) {
+            return Err(ConnectionError::invalid_config(format!(
+                "duplicate keyId {} in AES256Keys",
+                k.id
+            )));
+        }
+    }
+    let Some(current) = current else {
+        return Err(ConnectionError::invalid_config(
+            "AES256Keys requires AES256CurrentKey naming the key that encrypts new writes",
+        ));
+    };
+    if !keys.iter().any(|k| k.id == current) {
+        return Err(ConnectionError::invalid_config(format!(
+            "AES256CurrentKey {current} is not among the AES256Keys ids"
+        )));
+    }
+    Ok(())
 }
 
 /// Parse defaults config from a resolved JSON-LD node
@@ -776,6 +956,8 @@ impl StorageConfig {
             storage_type,
             path: None,
             aes256_key: None,
+            aes256_keys: Vec::new(),
+            aes256_current_key: None,
             address_identifier: None,
             durability: None,
         };
@@ -797,9 +979,54 @@ impl StorageConfig {
                     }
                 }
                 "AES256Key" | "aes256Key" | "aes256_key" => {
-                    if let Some(s) = value.as_str() {
-                        config.aes256_key = Some(Arc::from(s));
+                    let s = value.as_str().ok_or_else(|| {
+                        ConnectionError::invalid_config(
+                            "AES256Key must be a base64 string in the flat config form; \
+                             envVar indirection needs the JSON-LD form",
+                        )
+                    })?;
+                    config.aes256_key = Some(Arc::from(s));
+                }
+                "AES256Keys" | "aes256Keys" | "aes256_keys" => {
+                    let entries = value.as_array().ok_or_else(|| {
+                        ConnectionError::invalid_config("AES256Keys must be a list")
+                    })?;
+                    for entry in entries {
+                        let id = entry
+                            .get("keyId")
+                            .or_else(|| entry.get("id"))
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|id| u32::try_from(id).ok())
+                            .ok_or_else(|| {
+                                ConnectionError::invalid_config(
+                                    "AES256Keys entry requires a numeric keyId",
+                                )
+                            })?;
+                        let key = entry
+                            .get("AES256Key")
+                            .or_else(|| entry.get("key"))
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                ConnectionError::invalid_config(
+                                    "AES256Keys entry requires AES256Key",
+                                )
+                            })?;
+                        config.aes256_keys.push(KeyedAes256Key {
+                            id,
+                            key: Arc::from(key),
+                        });
                     }
+                }
+                "AES256CurrentKey" | "aes256CurrentKey" | "aes256_current_key" => {
+                    config.aes256_current_key = value
+                        .as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .map(Some)
+                        .ok_or_else(|| {
+                            ConnectionError::invalid_config(
+                                "AES256CurrentKey must be a numeric key id",
+                            )
+                        })?;
                 }
                 "addressIdentifier" | "address_identifier" => {
                     if let Some(s) = value.as_str() {
@@ -827,6 +1054,11 @@ impl StorageConfig {
             }
         }
 
+        validate_aes256_key_set(
+            &config.aes256_key,
+            &config.aes256_keys,
+            config.aes256_current_key,
+        )?;
         Ok(config)
     }
 }
@@ -1157,6 +1389,270 @@ mod tests {
             parsed.index_storage.storage_type,
             StorageType::Memory
         ));
+    }
+
+    /// A rotation key set: every entry carries its id, the current id is
+    /// checked against the set, and the single-key form cannot be mixed in.
+    #[test]
+    fn test_jsonld_aes256_key_set_parsed_and_validated() {
+        let k1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let k2 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let with_storage = |storage: serde_json::Value| {
+            json!({
+                "@context": {
+                    "@base": "https://ns.flur.ee/config/connection/",
+                    "@vocab": "https://ns.flur.ee/system#"
+                },
+                "@graph": [
+                    storage,
+                    {
+                        "@id": "connection",
+                        "@type": "Connection",
+                        "indexStorage": {"@id": "storage"}
+                    }
+                ]
+            })
+        };
+
+        let parsed = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@id": "storage",
+            "@type": "Storage",
+            "filePath": "/data/fluree",
+            "AES256Keys": [
+                {"keyId": 1, "AES256Key": k1},
+                {"keyId": 2, "AES256Key": k2}
+            ],
+            "AES256CurrentKey": 2
+        })))
+        .expect("key set parses");
+        assert_eq!(parsed.index_storage.aes256_key, None);
+        assert_eq!(parsed.index_storage.aes256_current_key, Some(2));
+        assert_eq!(
+            parsed.index_storage.aes256_keys,
+            vec![
+                KeyedAes256Key {
+                    id: 1,
+                    key: Arc::from(k1)
+                },
+                KeyedAes256Key {
+                    id: 2,
+                    key: Arc::from(k2)
+                },
+            ]
+        );
+
+        let missing_current = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@id": "storage",
+            "@type": "Storage",
+            "AES256Keys": [{"keyId": 1, "AES256Key": k1}]
+        })));
+        assert!(missing_current.is_err());
+
+        let unknown_current = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@id": "storage",
+            "@type": "Storage",
+            "AES256Keys": [{"keyId": 1, "AES256Key": k1}],
+            "AES256CurrentKey": 9
+        })));
+        assert!(unknown_current.is_err());
+
+        let duplicate = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@id": "storage",
+            "@type": "Storage",
+            "AES256Keys": [
+                {"keyId": 1, "AES256Key": k1},
+                {"keyId": 1, "AES256Key": k2}
+            ],
+            "AES256CurrentKey": 1
+        })));
+        assert!(duplicate.is_err());
+
+        let mixed = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@id": "storage",
+            "@type": "Storage",
+            "AES256Key": k1,
+            "AES256Keys": [{"keyId": 1, "AES256Key": k1}],
+            "AES256CurrentKey": 1
+        })));
+        assert!(mixed.is_err());
+    }
+
+    #[test]
+    fn test_flat_aes256_key_set_parsed() {
+        let k1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = ConnectionConfig::from_json(&json!({
+            "indexStorage": {
+                "@type": "FileStorage",
+                "path": "/data/fluree",
+                "AES256Keys": [{"keyId": 3, "AES256Key": k1}],
+                "AES256CurrentKey": 3
+            }
+        }))
+        .expect("flat key set parses");
+        assert_eq!(config.index_storage.aes256_current_key, Some(3));
+        assert_eq!(config.index_storage.aes256_keys.len(), 1);
+    }
+
+    /// `AES256Key` is a storage-node field: the S3 and memory branches must
+    /// carry it exactly as the file branch does, or a documented encrypted
+    /// S3 deployment silently writes plaintext.
+    #[test]
+    fn debug_never_prints_secrets() {
+        let config = ConnectionConfig {
+            index_storage: StorageConfig {
+                aes256_key: Some(Arc::from("c2VjcmV0LWFlcy1rZXk=")),
+                aes256_keys: vec![KeyedAes256Key {
+                    id: 7,
+                    key: Arc::from("cm90YXRpb24ta2V5LXNlY3JldA=="),
+                }],
+                aes256_current_key: Some(7),
+                ..Default::default()
+            },
+            defaults: Some(DefaultsConfig {
+                identity: Some(IdentityDefaults {
+                    public_key: Some(Arc::from("public-key")),
+                    private_key: Some(Arc::from("secret-private-key")),
+                }),
+                indexing: None,
+            }),
+            ..Default::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("c2VjcmV0LWFlcy1rZXk="), "{rendered}");
+        assert!(
+            !rendered.contains("cm90YXRpb24ta2V5LXNlY3JldA=="),
+            "{rendered}"
+        );
+        assert!(rendered.contains("id: 7"), "{rendered}");
+        assert!(!rendered.contains("secret-private-key"), "{rendered}");
+        assert!(rendered.contains("public-key"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn test_jsonld_aes256_key_parsed_for_every_storage_type() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let with_storage = |mut storage: serde_json::Value| {
+            storage["@id"] = json!("storage");
+            json!({
+                "@context": {
+                    "@base": "https://ns.flur.ee/config/connection/",
+                    "@vocab": "https://ns.flur.ee/system#"
+                },
+                "@graph": [
+                    storage,
+                    {
+                        "@id": "connection",
+                        "@type": "Connection",
+                        "indexStorage": {"@id": "storage"}
+                    }
+                ]
+            })
+        };
+
+        let s3 = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@type": "Storage",
+            "s3Bucket": "my-bucket",
+            "AES256Key": key
+        })))
+        .expect("s3 config parses");
+        assert!(matches!(s3.index_storage.storage_type, StorageType::S3(_)));
+        assert_eq!(s3.index_storage.aes256_key.as_deref(), Some(key));
+
+        let memory = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@type": "Storage",
+            "AES256Key": key
+        })))
+        .expect("memory config parses");
+        assert!(matches!(
+            memory.index_storage.storage_type,
+            StorageType::Memory
+        ));
+        assert_eq!(memory.index_storage.aes256_key.as_deref(), Some(key));
+
+        let file = ConnectionConfig::from_json_ld(&with_storage(json!({
+            "@type": "Storage",
+            "filePath": "/data/fluree",
+            "AES256Key": key
+        })))
+        .expect("file config parses");
+        assert_eq!(file.index_storage.aes256_key.as_deref(), Some(key));
+    }
+
+    /// A configured key that does not resolve fails to load rather than
+    /// yielding an unencrypted store that looks configured.
+    #[test]
+    fn unresolved_or_misplaced_keys_fail_closed() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let unset = "FLUREE_TEST_ENCRYPTION_KEY_NEVER_SET_7F3A";
+        assert!(std::env::var_os(unset).is_none());
+        let jsonld = |storage: serde_json::Value, connection_extra: serde_json::Value| {
+            let mut connection = json!({
+                "@id": "connection",
+                "@type": "Connection",
+                "indexStorage": {"@id": "storage"}
+            });
+            for (k, v) in connection_extra.as_object().unwrap() {
+                connection[k] = v.clone();
+            }
+            json!({
+                "@context": {
+                    "@base": "https://ns.flur.ee/config/connection/",
+                    "@vocab": "https://ns.flur.ee/system#"
+                },
+                "@graph": [
+                    storage,
+                    {"@id": "commits", "@type": "Storage", "s3Bucket": "commits", "AES256Key": key},
+                    connection
+                ]
+            })
+        };
+
+        // Unset envVar, no defaultVal: rejected.
+        let err = ConnectionConfig::from_json_ld(&jsonld(
+            json!({"@id": "storage", "@type": "Storage", "filePath": "/d",
+                   "AES256Key": {"envVar": unset}}),
+            json!({}),
+        ))
+        .expect_err("an unresolved key must not load");
+        assert!(err.to_string().contains("did not resolve"), "{err}");
+
+        // The same envVar with a defaultVal resolves to it.
+        let config = ConnectionConfig::from_json_ld(&jsonld(
+            json!({"@id": "storage", "@type": "Storage", "filePath": "/d",
+                   "AES256Key": {"envVar": unset, "defaultVal": key}}),
+            json!({}),
+        ))
+        .expect("defaultVal resolves");
+        assert_eq!(config.index_storage.aes256_key.as_deref(), Some(key));
+
+        // A key only on commitStorage would be ignored: rejected.
+        let err = ConnectionConfig::from_json_ld(&jsonld(
+            json!({"@id": "storage", "@type": "Storage", "s3Bucket": "index"}),
+            json!({"commitStorage": {"@id": "commits"}}),
+        ))
+        .expect_err("a commitStorage-only key must not load");
+        assert!(err.to_string().contains("commitStorage"), "{err}");
+
+        // commitStorage naming the index storage node repeats its key: fine.
+        ConnectionConfig::from_json_ld(&jsonld(
+            json!({"@id": "storage", "@type": "Storage", "s3Bucket": "index", "AES256Key": key}),
+            json!({"commitStorage": {"@id": "storage"}}),
+        ))
+        .expect("commitStorage may repeat the index key");
+
+        // Flat form: a non-string key is rejected, not skipped.
+        let err = ConnectionConfig::from_json(&json!({
+            "indexStorage": {"type": "memory", "AES256Key": {"envVar": unset}}
+        }))
+        .expect_err("a non-string flat key must not load");
+        assert!(err.to_string().contains("base64 string"), "{err}");
+        let err = ConnectionConfig::from_json(&json!({
+            "indexStorage": {"type": "memory"},
+            "commitStorage": {"type": "memory", "AES256Key": key}
+        }))
+        .expect_err("a flat commitStorage-only key must not load");
+        assert!(err.to_string().contains("commitStorage"), "{err}");
     }
 
     #[test]

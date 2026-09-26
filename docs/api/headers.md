@@ -41,7 +41,7 @@ For Turtle RDF format transactions. Supported on `/insert` (fast direct path) an
 ```http
 Content-Type: application/trig
 ```
-For TriG format transactions with named graphs (GRAPH blocks). **Only supported on `/upsert`** - returns 400 error on `/insert` because named graph ingestion requires the upsert path.
+For TriG format transactions with named graphs (GRAPH blocks). Supported on `/upsert` and on `/sync` (one graph per request); returns 400 error on `/insert` because named graph ingestion requires the upsert path.
 
 ```http
 Content-Type: application/n-triples

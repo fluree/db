@@ -41,6 +41,14 @@ impl CountingStorage {
 
 #[async_trait]
 impl fluree_db_core::StorageRead for CountingStorage {
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        self.inner.encryption_admin()
+    }
+
     async fn read_bytes(&self, address: &str) -> fluree_db_core::error::Result<Vec<u8>> {
         self.inner.read_bytes(address).await
     }

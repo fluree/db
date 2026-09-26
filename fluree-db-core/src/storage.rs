@@ -233,6 +233,26 @@ pub trait StorageRead: Debug + Send + Sync {
         None
     }
 
+    /// Whether bytes read from this storage may be persisted unencrypted
+    /// outside it. The binary-index disk cache spills fetched leaves,
+    /// branches and dictionaries to a local directory as a read-through
+    /// cache; a storage that decrypts on read must answer `false`, or that
+    /// cache becomes a plaintext copy of the ledger. Storages whose reads
+    /// return exactly the bytes at rest answer `true`; wrappers delegate to
+    /// what they wrap.
+    ///
+    /// Deliberately without a default: a wrapper that forgot to delegate
+    /// would silently re-open the plaintext leak, so every implementation
+    /// has to answer.
+    fn permits_plaintext_cache(&self) -> bool;
+
+    /// The encryption administration surface, when this storage encrypts
+    /// at rest. `None` for plaintext storages; wrappers delegate to what
+    /// they wrap. Required for the same reason as
+    /// [`Self::permits_plaintext_cache`]: a wrapper that answered `None` by
+    /// default would report an encrypted store as plaintext.
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>>;
+
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
     /// Mirror of [`ContentStore::resolve_cached_bytes`] for address-keyed
@@ -463,6 +483,29 @@ pub trait StorageMethod {
 ///
 /// Used for type erasure in `AnyStorage`.
 pub trait Storage: StorageRead + ContentAddressedWrite + StorageMethod {}
+
+/// What a key rotation needs from an encrypting storage.
+///
+/// Addresses are hashes of plaintext, so re-enveloping a blob under a new
+/// key is an in-place overwrite at the same address: no pointer changes,
+/// and a crash between blobs leaves each one on exactly one key.
+#[async_trait]
+pub trait EncryptionAdmin: Send + Sync {
+    /// Ids of every key the storage can decrypt with, current first.
+    fn key_ids(&self) -> Vec<u32>;
+
+    /// Id of the key that encrypts new writes.
+    fn current_key_id(&self) -> u32;
+
+    /// The key id recorded in the envelope at `address`, read from its
+    /// header alone. `None` when the bytes there are not an envelope.
+    async fn key_id_at(&self, address: &str) -> Result<Option<u32>>;
+
+    /// Re-envelope the blob at `address` under the current key, verifying
+    /// the result reads back. Returns the plaintext size rewritten, or
+    /// `None` when the blob was already on the current key.
+    async fn reencrypt(&self, address: &str) -> Result<Option<u64>>;
+}
 impl<T: StorageRead + ContentAddressedWrite + StorageMethod> Storage for T {}
 
 // ============================================================================
@@ -501,6 +544,14 @@ impl StorageRead for Arc<dyn Storage> {
 
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         self.as_ref().resolve_local_path(address)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+        self.as_ref().encryption_admin()
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
@@ -599,6 +650,12 @@ pub trait ContentStore: Debug + Send + Sync {
         let _ = id;
         None
     }
+
+    /// Whether bytes returned by [`Self::get`] may be persisted unencrypted
+    /// outside this store — see [`StorageRead::permits_plaintext_cache`],
+    /// including why there is no default. The disk artifact cache consults
+    /// this before reading or writing an artifact in its directory.
+    fn permits_plaintext_cache(&self) -> bool;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
@@ -722,6 +779,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
         self.as_ref().resolve_local_path(id)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
@@ -1000,6 +1061,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // A resident tier indexes by CID regardless of which (current or
         // legacy) address the bytes were fetched from.
         self.storage.resolve_cached_bytes(id)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.storage.permits_plaintext_cache()
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
@@ -1341,6 +1406,16 @@ impl ContentStore for BranchedContentStore {
         self.branch_store
             .resolve_cached_bytes(id)
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_cached_bytes(id)))
+    }
+
+    /// A read may be served by any ancestor, so every store in the
+    /// ancestry must permit the spill.
+    fn permits_plaintext_cache(&self) -> bool {
+        self.branch_store.permits_plaintext_cache()
+            && self
+                .parents
+                .iter()
+                .all(ContentStore::permits_plaintext_cache)
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {

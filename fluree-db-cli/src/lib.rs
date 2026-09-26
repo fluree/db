@@ -189,6 +189,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         #[cfg(feature = "server")]
         Commands::Cluster { action } => commands::cluster::run(action).await,
 
+        Commands::Encryption { action } => commands::encryption::run(action, config_path).await,
+
         Commands::Drop {
             name,
             force,
@@ -321,7 +323,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::graph_sync::run(commands::graph_sync::SyncArgs {
                 args: &args,
                 ledger: ledger.as_deref(),
-                graph: &graph,
+                graph: graph.as_deref(),
                 expr: expr.as_deref(),
                 file: file.as_deref(),
                 format: format.as_deref(),

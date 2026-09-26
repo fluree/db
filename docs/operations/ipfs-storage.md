@@ -244,7 +244,7 @@ Writes go through the Kubo HTTP RPC API, adding HTTP overhead compared to direct
 
 ### No Encryption
 
-The IPFS storage backend does not currently support Fluree's `AES256Key` encryption. Blocks are stored unencrypted in IPFS. If encryption is needed, use a separate encryption layer or a private IPFS network.
+IPFS storage cannot be encrypted at rest. `build_ipfs()` returns an error when the builder carries a key (`AES256Key` or `AES256Keys`), rather than publishing plaintext to a content-addressed network. For confidentiality, use another storage backend.
 
 ## Storage Addresses
 

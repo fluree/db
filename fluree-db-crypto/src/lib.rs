@@ -95,11 +95,12 @@ mod key;
 // Re-export main types
 pub use encrypted::EncryptedStorage;
 pub use error::{EncryptionError, Result};
-pub use key::{EncryptionKey, KeyProvider, StaticKeyProvider};
+pub use key::{EncryptionKey, KeyProvider, MultiKeyProvider, StaticKeyProvider};
 
 // Re-export envelope constants for advanced use cases
 pub use envelope::{
-    ALG_AES256_GCM, HEADER_LEN, KEY_LEN, MAGIC, MIN_ENVELOPE_LEN, NONCE_LEN, TAG_LEN, VERSION,
+    key_id_of_header, ALG_AES256_GCM, HEADER_LEN, KEY_LEN, MAGIC, MIN_ENVELOPE_LEN, NONCE_LEN,
+    TAG_LEN, VERSION,
 };
 
 #[cfg(test)]

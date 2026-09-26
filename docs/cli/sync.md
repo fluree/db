@@ -1,12 +1,12 @@
 # fluree sync
 
-Synchronize a named graph: make its contents exactly the supplied data,
+Synchronize a graph: make its contents exactly the supplied data,
 committing only the delta.
 
 ## Usage
 
 ```bash
-fluree sync [LEDGER] [DATA] --graph <IRI> [OPTIONS]
+fluree sync [LEDGER] [DATA] [--graph <IRI>] [OPTIONS]
 ```
 
 ## Arguments
@@ -21,7 +21,7 @@ fluree sync [LEDGER] [DATA] --graph <IRI> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-g, --graph <IRI>` | **Required.** Target named graph IRI — the sync scope. The payload never widens or narrows it. |
+| `-g, --graph <IRI>` | Target named graph IRI — the sync scope. The payload never widens or narrows it. Omit it to sync the default graph. |
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `-e, --expr <EXPR>` | Inline data expression (Turtle or JSON-LD) |
 | `-f, --file <FILE>` | Read data from a file |
@@ -44,7 +44,9 @@ for the full semantics, safety rails, and blank-node behavior.
 
 Turtle input is converted to JSON-LD client-side before submission, so a
 Turtle export works against any server that implements the `/sync`
-endpoint (which is JSON-LD only).
+endpoint, including servers from before it accepted Turtle bodies. The CLI
+does not read TriG yet; `POST` a TriG file to
+[`/sync`](../transactions/sync.md#payload-formats) directly.
 
 ### Sources
 
@@ -69,6 +71,9 @@ same export is a no-op.
 ```bash
 # Sync an ontology from a Turtle export
 fluree sync mydb --graph urn:example:ontology -f ontology.ttl
+
+# Sync the default graph (no --graph)
+fluree sync mydb -f data.ttl
 
 # Pre-flight: what would change?
 fluree sync mydb --graph urn:example:ontology -f ontology.ttl --dry-run

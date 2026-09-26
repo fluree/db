@@ -3989,14 +3989,10 @@ async fn sync_route_contract() {
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(2));
 
-    // Guards: missing graph, empty payload without allowEmpty, malformed
-    // graph IRI, and a Turtle body are all 400s.
+    // Guards: empty payload without allowEmpty and a malformed graph IRI
+    // are 400s. (A missing `graph` targets the default graph; see
+    // `sync_route_targets_the_default_graph`.)
     for (uri, body, ct) in [
-        (
-            "/v1/fluree/sync/sync:test".to_string(),
-            v1.clone(),
-            "application/json",
-        ),
         (
             format!("/v1/fluree/sync/sync:test?graph={graph}"),
             serde_json::json!({ "@graph": [] }).to_string(),
@@ -4006,11 +4002,6 @@ async fn sync_route_contract() {
             "/v1/fluree/sync/sync:test?graph=relative%2Fgraph".to_string(),
             v1.clone(),
             "application/json",
-        ),
-        (
-            format!("/v1/fluree/sync/sync:test?graph={graph}"),
-            "@prefix ex: <http://example.org/> . ex:a ex:b \"c\" .".to_string(),
-            "text/turtle",
         ),
     ] {
         let (status, json) = json_body(
@@ -4037,6 +4028,173 @@ async fn sync_route_contract() {
     .await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(3));
+}
+
+/// `/sync` with Turtle, N-Triples and TriG bodies: the same delta contract as
+/// JSON-LD, one graph per request, and the RDF-specific 400s.
+#[tokio::test]
+async fn sync_route_accepts_rdf_bodies() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "sync:rdf" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let graph = "urn:example:tools";
+    let sync = |query: &str, body: String, ct: &'static str| {
+        let app = app.clone();
+        let uri = format!("/v1/fluree/sync?ledger=sync:rdf&graph={graph}{query}");
+        async move {
+            json_body(
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", ct)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+    let prefixes = "@prefix ex: <http://example.org/> .\n";
+    let spec = "ex:search ex:name \"search\" ;\n  \
+                ex:param [ ex:name \"q\" ; ex:required true ] .\n";
+    let turtle = format!("{prefixes}{spec}");
+    let t_of = |json: &serde_json::Value| json.get("t").and_then(serde_json::Value::as_i64);
+
+    let (status, json) = sync("", turtle.clone(), "text/turtle").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(t_of(&json), Some(1));
+
+    // The same graph as TriG is identical, so it does not commit.
+    let trig = format!("{prefixes}GRAPH <{graph}> {{\n{spec}}}\n");
+    let (status, json) = sync("", trig.clone(), "application/trig").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        t_of(&json),
+        Some(1),
+        "identical TriG must not commit: {json}"
+    );
+
+    // N-Triples keeping only the name drops the param link and the param
+    // node's two triples.
+    let nt = "<http://example.org/search> <http://example.org/name> \"search\" .\n";
+    let (status, json) = sync("&dryRun=true", nt.to_string(), "application/n-triples").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["asserted"], 0);
+    assert_eq!(json["retracted"], 3, "{json}");
+    assert_eq!(json["committed"], false);
+    assert_eq!(json["t"], 1);
+
+    // Refusals, none of which commits.
+    let other_block = format!("{prefixes}GRAPH <urn:example:other> {{ {spec} }}\n");
+    let mixed = format!("{prefixes}ex:stray ex:p \"x\" .\nGRAPH <{graph}> {{ {spec} }}\n");
+    for (body, ct, expect) in [
+        (other_block, "application/trig", "urn:example:other"),
+        (mixed, "application/trig", "not both"),
+        (prefixes.to_string(), "text/turtle", "allowEmpty"),
+        (format!("{prefixes}ex:a ex:b"), "text/turtle", ""),
+    ] {
+        let (status, json) = sync("", body.clone(), ct).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+        assert!(json.to_string().contains(expect), "{body}: {json}");
+    }
+
+    let (status, json) = sync("&allowEmpty=true", prefixes.to_string(), "text/turtle").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(t_of(&json), Some(2), "allowEmpty clears the graph: {json}");
+}
+
+/// `/sync` without `graph` replaces the default graph, as does an explicit
+/// `?default`; naming both is a 400.
+#[tokio::test]
+async fn sync_route_targets_the_default_graph() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+    let post = |uri: String, body: String, ct: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", ct)
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/fluree/create".to_string(),
+            serde_json::json!({ "ledger": "sync:default" }).to_string(),
+            "application/json",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let seed = "@prefix ex: <http://example.org/> .\n\
+                ex:old ex:name \"Old\" .\n\
+                <urn:example:g> { ex:kept ex:name \"Kept\" . }\n";
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/fluree/upsert/sync:default".to_string(),
+            seed.to_string(),
+            "application/trig",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = "@prefix ex: <http://example.org/> .\nex:new ex:name \"New\" .\n";
+    for query in ["?dryRun=true", "?default&dryRun=true"] {
+        let (status, json) = json_body(
+            app.clone()
+                .oneshot(post(
+                    format!("/v1/fluree/sync/sync:default{query}"),
+                    body.to_string(),
+                    "text/turtle",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}: {json}");
+        // Replaces the default graph's one triple; the named graph's is kept.
+        assert_eq!(
+            (json["asserted"].as_i64(), json["retracted"].as_i64()),
+            (Some(1), Some(1)),
+            "{query}: {json}"
+        );
+        assert_eq!(json["graph"], serde_json::Value::Null);
+    }
+
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                "/v1/fluree/sync/sync:default?graph=urn:example:g&default".to_string(),
+                body.to_string(),
+                "text/turtle",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
 }
 
 // ============================================================================

@@ -47,6 +47,10 @@ pub enum ServerError {
     #[error("{0}")]
     NotAcceptable(String),
 
+    /// Unsupported Media Type (415) - request body format not accepted
+    #[error("{0}")]
+    UnsupportedMediaType(String),
+
     /// SPARQL UPDATE lowering error
     #[error("SPARQL UPDATE error: {0}")]
     SparqlUpdateLower(#[from] SparqlUpdateLowerError),
@@ -205,6 +209,7 @@ impl ServerError {
             ServerError::Unauthorized(_) => errors::UNAUTHORIZED,
             ServerError::NotFound(_) => errors::NOT_FOUND,
             ServerError::NotAcceptable(_) => errors::NOT_ACCEPTABLE,
+            ServerError::UnsupportedMediaType(_) => errors::UNSUPPORTED_MEDIA_TYPE,
             ServerError::SparqlUpdateLower(_) => errors::SPARQL_LOWER,
 
             // Auth/Policy (requires credential feature)
@@ -352,6 +357,7 @@ impl ServerError {
 
             // 406 - Not Acceptable (content negotiation failure)
             ServerError::NotAcceptable(_) => StatusCode::NOT_ACCEPTABLE,
+            ServerError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             #[cfg(feature = "credential")]
             ServerError::Api(ApiError::Credential(_)) => StatusCode::UNAUTHORIZED,
 
@@ -415,6 +421,11 @@ impl ServerError {
     /// Create a not acceptable error (406)
     pub fn not_acceptable(msg: impl Into<String>) -> Self {
         ServerError::NotAcceptable(msg.into())
+    }
+
+    /// Create an unsupported media type error (415)
+    pub fn unsupported_media_type(msg: impl Into<String>) -> Self {
+        ServerError::UnsupportedMediaType(msg.into())
     }
 }
 

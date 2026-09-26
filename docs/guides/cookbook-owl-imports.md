@@ -327,6 +327,11 @@ curl -X POST 'http://localhost:8090/v1/fluree/upsert/demo:main' \
 The same TriG `GRAPH` blocks land in the same named graphs as via the CLI;
 nothing else changes about the reasoning wiring.
 
+To reload an edited ontology later, `POST /sync?graph=<ontology graph IRI>`
+with the new file replaces that one graph and commits only what changed.
+Sync takes one graph per request, so send each graph's block separately
+(see [Sync](../transactions/sync.md#payload-formats)).
+
 See [HTTP endpoints](../api/endpoints.md) for the full surface area and
 [Datasets and named graphs](../concepts/datasets-and-named-graphs.md) for
 how named graphs participate in queries.
