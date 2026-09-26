@@ -15,7 +15,7 @@
 
 use crate::support::{self, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::{
-    Base64Bytes, FlureeBuilder, GovernanceOptions, IndexConfig, PushCommitsRequest,
+    Base64Bytes, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerHandle, PushCommitsRequest,
 };
 use fluree_db_core::commit::codec::{read_commit, write_commit};
 use fluree_db_core::{plan_commit_transfer, DatatypeDictId, RuntimeSmallDicts, Sid};
@@ -303,6 +303,78 @@ async fn datatype_limit_counts_index_when_runtime_dict_is_unseeded() {
         .insert(unseeded, &insert_known_datatype())
         .await
         .expect("a datatype only the index holds is still known");
+}
+
+async fn sparql_update(
+    fluree: &MemoryFluree,
+    handle: &LedgerHandle,
+    body: &str,
+) -> fluree_db_api::Result<()> {
+    fluree
+        .stage(handle)
+        .sparql_update(&format!("PREFIX ex: <http://example.org/> {body}"))
+        .execute()
+        .await
+        .map(|_| ())
+}
+
+/// SPARQL twin of the insert rejection tests. A new datatype is refused
+/// whether the update states it as data or computes it in a binding.
+#[tokio::test]
+async fn sparql_update_past_datatype_limit_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "custom-dt-limit:reject-sparql";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .insert(&insert_range(0..CAPACITY))
+        .execute()
+        .await
+        .expect("filling the datatype dictionary exactly is allowed");
+
+    assert_datatype_limit_rejection(
+        sparql_update(
+            &fluree,
+            &handle,
+            &format!(r#"INSERT DATA {{ ex:new ex:p "x"^^ex:U{CAPACITY} }}"#),
+        )
+        .await,
+        "INSERT DATA with a new datatype",
+    );
+    assert_datatype_limit_rejection(
+        sparql_update(
+            &fluree,
+            &handle,
+            &format!(
+                r#"INSERT {{ ex:derived ex:p ?v }}
+                   WHERE {{ ex:s0 ex:p ?o BIND(STRDT("y", ex:U{CAPACITY}) AS ?v) }}"#
+            ),
+        )
+        .await,
+        "INSERT WHERE computing a new datatype",
+    );
+
+    sparql_update(
+        &fluree,
+        &handle,
+        r#"INSERT DATA { ex:known ex:p "known"^^ex:U0 }"#,
+    )
+    .await
+    .expect("INSERT DATA with a datatype the ledger holds is accepted");
+    sparql_update(
+        &fluree,
+        &handle,
+        r#"INSERT { ex:derived ex:p ?v }
+           WHERE { ex:s0 ex:p ?o BIND(STRDT("y", ex:U1) AS ?v) }"#,
+    )
+    .await
+    .expect("INSERT WHERE computing a datatype the ledger holds is accepted");
+    assert_eq!(
+        handle.t().await,
+        3,
+        "only the fill and the two known-datatype updates committed"
+    );
 }
 
 /// A single transaction that brings more new datatypes than the ledger has
