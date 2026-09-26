@@ -229,6 +229,74 @@ async fn driver_revisiting_a_subject_joins_it_once() {
     assert_eq!(got, expected);
 }
 
+/// Subjects deleted after `t` have the highest ids, so after a reindex their
+/// rows live only in the last leaflet's history, past its last live row. The
+/// star walk's leaflet skip must still find them at `t`. Two things keep it
+/// sound: index writers widen a leaflet's keys over its history, and the walk
+/// never skips a leaflet it has to replay. This fails only with both removed.
+#[tokio::test]
+async fn historical_star_walk_finds_subjects_deleted_since() {
+    const RETIRED: usize = 5;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/pj-stream-history:main";
+    let ledger = seed_people(&fluree, ledger_id).await;
+    let retired: Vec<JsonValue> = (0..RETIRED)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:r{i}"),
+                "@type": "ex:Retired",
+                "ex:name": format!("Retired {i}"),
+            })
+        })
+        .collect();
+    let ledger = fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": retired}))
+        .await
+        .expect("insert retired")
+        .ledger;
+    let before_delete = ledger.t();
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "where": {"@id": "?r", "@type": "ex:Retired", "ex:name": "?n"},
+                "delete": {"@id": "?r", "@type": "ex:Retired", "ex:name": "?n"}
+            }),
+        )
+        .await
+        .expect("delete retired");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let star = "PREFIX ex: <http://example.org/ns/>\n\
+                SELECT ?r ?n WHERE { ?r a ex:Retired ; ex:name ?n }";
+    let current = fluree.db(ledger_id).await.expect("current view");
+    assert!(rows(&fluree, &current, star).await.is_empty());
+
+    let historical = fluree
+        .db_at_t(ledger_id, before_delete)
+        .await
+        .expect("historical view");
+    assert_property_join(&fluree, &historical, star).await;
+    let (spans, guard) = span_capture::init_test_tracing();
+    let mut got = rows(&fluree, &historical, star).await;
+    drop(guard);
+    let events = spans.find_events("property_join: complete");
+    let [event] = events.as_slice() else {
+        panic!("expected one property join, got {events:?}");
+    };
+    assert_eq!(event.fields["used_spot_star_walk"], "true");
+
+    got.sort_by_key(ToString::to_string);
+    let expected: Vec<JsonValue> = (0..RETIRED)
+        .map(|i| json!([format!("ex:r{i}"), format!("Retired {i}")]))
+        .collect();
+    assert_eq!(got, expected);
+}
+
 /// Novelty on subjects that land in later chunks: retracts, re-asserted
 /// values, and a subject that exists only in novelty.
 #[tokio::test]

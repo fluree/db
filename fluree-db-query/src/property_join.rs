@@ -185,6 +185,12 @@ pub struct PropertyJoinOperator {
 }
 
 /// How the non-driver predicates are read for a chunk of driver subjects.
+///
+/// A lane's `probe_ops` reconciler is shared across driver chunks and probe
+/// sub-chunks. That is sound only because every subject lands in exactly one
+/// driver chunk (a subject the driver repeats is already in the map and
+/// joins no later chunk), so the reconciler is never asked about a subject
+/// twice.
 enum ChunkLanes {
     /// One SPOT walk over the chunk's subjects covers every predicate.
     SpotStar {
@@ -1323,6 +1329,9 @@ impl Operator for PropertyJoinOperator {
             has_bounds = !self.object_bounds.is_empty(),
         );
         async {
+            if let Some(mut driver) = self.driver.take() {
+                driver.close();
+            }
             self.state = OperatorState::Open;
             self.subject_values.clear();
             self.subject_idx = 0;
