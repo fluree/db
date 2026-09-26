@@ -38,6 +38,7 @@ const QUERIES: &[(&str, &str)] = &[
     ("chain_sparse_drain", "SELECT ?p ?fof WHERE { ?p ex:knows ?f . ?f ex:knows ?fof FILTER(CONTAINS(LCASE(CONCAT(STR(?p), STR(?fof))), \"/absent/\")) } LIMIT 100"),
     ("long_chain_sparse_drain", "SELECT ?p ?end WHERE { ?p ex:knows ?f . ?f ex:knows ?fof . ?fof ex:knows ?end FILTER(CONTAINS(LCASE(CONCAT(STR(?p), STR(?end))), \"/absent/\")) } LIMIT 100"),
     ("star_limit", "SELECT ?p ?n WHERE { ?p a ex:Person ; ex:name ?n ; ex:age ?a } LIMIT 10"),
+    ("star_sparse_limit", "SELECT ?p ?n WHERE { ?p a ex:Person ; ex:name ?n ; ex:age ?a FILTER(STRENDS(?n, \"999\")) } LIMIT 10"),
     ("construct_transform", "CONSTRUCT { ?org ex:employs ?p . ?p ex:label ?name } WHERE { ?p ex:worksFor ?org ; ex:name ?name }"),
 ];
 
@@ -173,6 +174,25 @@ async fn main() {
         times.sort_by(f64::total_cmp);
         let median = times[(reps - 1) / 2].midpoint(times[reps / 2]);
         println!("{name:24} {median:10.3} ms");
+        if matches!(*name, "star_limit" | "star_sparse_limit")
+            && std::env::var_os("PROBE_VERIFY").is_some()
+        {
+            let full_query = replace_once(&query, " LIMIT 10", "");
+            let full = fluree
+                .query(&view, QueryInput::Sparql(&full_query))
+                .await
+                .expect("full star");
+            let full = full.to_jsonld(&view.snapshot).expect("format full star");
+            let prefix: Vec<_> = full
+                .as_array()
+                .expect("star rows")
+                .iter()
+                .take(10)
+                .cloned()
+                .collect();
+            assert_eq!(expected.as_ref().unwrap(), &serde_json::json!(prefix));
+            println!("{name}: prefix agrees with the full drain");
+        }
         if full_drain && std::env::var_os("PROBE_VERIFY").is_some() {
             let limit = if name.contains("distinct") { 1000 } else { 100 };
             let actual = sorted_rows(expected.as_ref().expect("warmup result"));
@@ -196,9 +216,15 @@ async fn main() {
                 actual.len()
             );
         }
-        if *name == "chain_filter_count" && std::env::var_os("PROBE_VERIFY").is_some() {
-            let raw_query =
-                replace_once(&query, "SELECT (COUNT(*) AS ?n)", "SELECT ?p ?city ?f ?fof");
+        if matches!(*name, "chain_filter_count" | "minus_count")
+            && std::env::var_os("PROBE_VERIFY").is_some()
+        {
+            let projection = if *name == "minus_count" {
+                "SELECT ?p"
+            } else {
+                "SELECT ?p ?city ?f ?fof"
+            };
+            let raw_query = replace_once(&query, "SELECT (COUNT(*) AS ?n)", projection);
             let raw = fluree
                 .query(&view, QueryInput::Sparql(&raw_query))
                 .await
@@ -210,6 +236,20 @@ async fn main() {
                 "join count differs from raw rows"
             );
             println!("{name}: {rows} rows agree with ordinary row execution");
+            if *name == "minus_count" {
+                // The mandatory triple binds ?p, so this fixture's MINUS and
+                // NOT EXISTS have identical semantics and independent matching.
+                let control = replace_once(&query, "MINUS", "FILTER NOT EXISTS");
+                let result = fluree
+                    .query(&view, QueryInput::Sparql(&control))
+                    .await
+                    .expect("existence control");
+                assert_eq!(
+                    expected.as_ref().unwrap(),
+                    &result.to_jsonld(&view.snapshot).unwrap()
+                );
+                println!("{name}: count agrees with the existence control");
+            }
         }
         if matches!(
             *name,

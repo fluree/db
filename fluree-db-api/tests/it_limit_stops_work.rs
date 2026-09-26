@@ -265,6 +265,15 @@ async fn limit_stops_the_driver_after_one_chunk() {
         driver_read(&fluree, &view, &star("SELECT ?p ?n", dense, "")).await,
         (PEOPLE, true)
     );
+    for (modifiers, expected_subjects) in
+        [("LIMIT 1", 1), ("LIMIT 10", 10), ("OFFSET 5 LIMIT 10", 15)]
+    {
+        assert_eq!(
+            driver_read(&fluree, &view, &star("SELECT ?p ?n", dense, modifiers)).await,
+            (expected_subjects, false),
+            "dense star should probe only its requested prefix: {modifiers}"
+        );
+    }
     // DISTINCT absorbs the row budget, so it relies on the chunk schedule
     // alone. The sparse star's whole result is smaller than one output batch,
     // so it relies on rows being handed over as each chunk finishes.
@@ -316,7 +325,14 @@ async fn chunked_rows_match_the_full_drain() {
     // Each window starts the join over with a different first chunk; the
     // pages must still line up with the full drain row for row.
     let mut paged = Vec::new();
-    for (offset, limit) in [(0, 300), (300, 1500), (1800, 3000), (4800, 100_000)] {
+    for (offset, limit) in [
+        (0, 1),
+        (1, 9),
+        (10, 290),
+        (300, 1500),
+        (1800, 3000),
+        (4800, 100_000),
+    ] {
         paged.extend(
             rows(
                 &fluree,

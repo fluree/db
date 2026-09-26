@@ -340,6 +340,13 @@ single operator rather than a join chain. One scan of the anchor produces the
 subjects, and the remaining predicates are looked up for those subjects only,
 by batched PSOT probes or a single SPOT walk.
 
+**`MinusOperator`** builds its exclusion set once in a fresh scope, allowing the
+inner patterns to use ordinary scan and star planning. A single shared encoded
+reference uses a compact subject-ID set; other terms retain normalized binding
+equality, and composite keys retain wildcard compatibility checks. Unbound keys
+cannot eliminate a row without at least one shared bound variable. Retained keys
+contribute to the query's memory estimate and budget checks.
+
 **`SemijoinOperator`** evaluates `EXISTS` / `NOT EXISTS` with a single
 uncorrelated build followed by hash probes, instead of evaluating a correlated
 subquery per row. For inner bodies consisting only of triple patterns, outer
@@ -368,7 +375,10 @@ streaming nested-loop join to building a large hash table first (EXPLAIN reports
 the rejected hash join as `small-row-goal`), and probe windows start small and
 grow geometrically. `PropertyJoinOperator` similarly reads a bound-object anchor
 in growing chunks and emits each chunk's rows before reading the next, so an
-outer `LIMIT` can stop it early. The hint affects operator choice and batch size
+outer `LIMIT` can stop it early. When a row budget reaches this subject-probe
+path, its first window uses `LIMIT + OFFSET` without the general join's minimum
+window; absent that budget, it keeps the default ramped schedule. The hint affects
+operator choice and batch size
 but never caps the number of rows read, so it can be passed through `DISTINCT`
 and `FILTER`: if those operators consume a window, the join continues reading.
 A query without `ORDER BY` may return a different, equally valid set of rows

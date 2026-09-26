@@ -393,6 +393,21 @@ async fn policy_batched_join_lane_declines_index_only() {
                     .expect("grouped join count with policy");
             let grouped = grouped.to_jsonld(&ledger_indexed.snapshot).expect("grouped jsonld");
             assert_eq!(grouped, json!([[rows[0][0], 1]]));
+            let mut minus_query = json!({
+                "select": ["?name"],
+                "where": [
+                    {"@id":"?u", "http://schema.org/name":"?name"},
+                    ["minus", {"@id":"?u", "http://schema.org/ssn":"?ssn"}]
+                ]
+            });
+            let minus = support::query_jsonld_with_policy(&fluree, &ledger_indexed, &minus_query, &policy_ctx)
+                .await.expect("MINUS with policy");
+            assert_eq!(minus.to_jsonld(&ledger_indexed.snapshot).unwrap(), json!([["Bob"]]),
+                "a hidden fact must not eliminate its subject through MINUS");
+            minus_query["select"] = json!(["(as (count *) ?n)"]);
+            let count = support::query_jsonld_with_policy(&fluree, &ledger_indexed, &minus_query, &policy_ctx)
+                .await.expect("MINUS count with policy");
+            assert_eq!(count.to_jsonld(&ledger_indexed.snapshot).unwrap(), json!([[1]]));
         })
         .await;
 }

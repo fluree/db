@@ -7,6 +7,124 @@ use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger}
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
+async fn assert_minus_count(
+    fluree: &fluree_db_api::Fluree,
+    view: &fluree_db_api::GraphDb,
+    body: &str,
+    expected: usize,
+) {
+    use fluree_db_api::QueryInput;
+    let count_query =
+        format!("PREFIX ex: <http://example.com/> SELECT (COUNT(*) AS ?n) WHERE {{ {body} }}");
+    let count = fluree
+        .query(view, QueryInput::Sparql(&count_query))
+        .await
+        .unwrap();
+    assert_eq!(
+        count.to_jsonld(&view.snapshot).unwrap(),
+        json!([[expected]]),
+        "{count_query}"
+    );
+    let row_query = count_query.replacen("SELECT (COUNT(*) AS ?n)", "SELECT ?p", 1);
+    let rows = fluree
+        .query(view, QueryInput::Sparql(&row_query))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.batches
+            .iter()
+            .map(fluree_db_api::Batch::len)
+            .sum::<usize>(),
+        expected,
+        "{row_query}"
+    );
+}
+
+#[tokio::test]
+async fn minus_single_key_preserves_mixed_bindings_and_visible_facts() {
+    use fluree_db_api::{QueryInput, ReindexOptions};
+    const PEOPLE: usize = 1200;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "minus-single-key:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let graph: Vec<_> = (0..PEOPLE)
+        .map(|i| {
+            let mut person =
+                json!({"@id": format!("ex:p{i}"), "@type": "ex:Person", "ex:tag": i % 4});
+            if i % 3 == 0 {
+                person["ex:worksFor"] = json!([{"@id":"ex:org1"}, {"@id":"ex:org2"}]);
+            }
+            person
+        })
+        .collect();
+    let ledger = fluree
+        .insert(ledger, &json!({"@context": ctx_ex(), "@graph": graph}))
+        .await
+        .unwrap()
+        .ledger;
+    let body = "?p a ex:Person MINUS { ?p ex:worksFor ?org }";
+    for indexed in [false, true] {
+        if indexed {
+            fluree
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .unwrap();
+        }
+        let view = fluree.db(ledger_id).await.unwrap();
+        let (spans, guard) = support::span_capture::init_test_tracing();
+        let query =
+            format!("PREFIX ex: <http://example.com/> SELECT (COUNT(*) AS ?n) WHERE {{ {body} }}");
+        let result = fluree
+            .query(&view, QueryInput::Sparql(&query))
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(result.to_jsonld(&view.snapshot).unwrap(), json!([[800]]));
+        if indexed {
+            let events = spans.find_events("minus index built");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].fields["subject_keys"], "400");
+            assert_eq!(events[0].fields["tuple_keys"], "0");
+        }
+        for (body, expected) in [
+            (body, 800),
+            ("VALUES ?p { ex:p0 ex:p1 ex:p1 UNDEF } MINUS { ?p ex:worksFor ?org }", 3),
+            ("?p a ex:Person MINUS { VALUES ?p { ex:p0 UNDEF } }", PEOPLE - 1),
+            ("?p a ex:Person MINUS { VALUES ?p { UNDEF } }", PEOPLE),
+            ("?p a ex:Person MINUS { ?other ex:worksFor ?org }", PEOPLE),
+            ("?p a ex:Person MINUS { ?p ex:missing ?value }", PEOPLE),
+            ("?p a ex:Person ; ex:tag ?tag MINUS { ?p ex:worksFor ?org ; ex:tag ?tag }", 800),
+            ("?p a ex:Person ; ex:tag ?tag MINUS { ?p ex:worksFor ?org OPTIONAL { ?p ex:missing ?tag } }", 800),
+        ] {
+            assert_minus_count(&fluree, &view, body, expected).await;
+        }
+    }
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "delete": {"@id":"ex:p0", "ex:worksFor":[{"@id":"ex:org1"}, {"@id":"ex:org2"}]},
+                "insert": [
+                    {"@id":"ex:p1", "ex:worksFor":{"@id":"ex:org1"}},
+            {"@id":"ex:new", "@type":"ex:Person", "ex:tag":0}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    for indexed in [false, true] {
+        if indexed {
+            fluree
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .unwrap();
+        }
+        let view = fluree.db(ledger_id).await.unwrap();
+        assert_minus_count(&fluree, &view, body, 801).await;
+    }
+}
+
 fn ctx_ex() -> serde_json::Value {
     // Match the minimal {"ex" "http://example.com/"} context and include xsd/schema for safety.
     json!({
