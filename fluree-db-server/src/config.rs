@@ -271,7 +271,7 @@ impl McpAuthConfig {
                 return Err(
                     "mcp_enabled with --data-auth-mode optional or required needs \
                      --mcp-auth-trusted-issuer, --events-auth-trusted-issuer, or \
-                     --mcp-auth-insecure"
+                     --mcp-auth-insecure-accept-any-issuer"
                         .to_string(),
                 );
             }
