@@ -438,6 +438,36 @@ the redundancy. The planner inserts streaming distincts between joins after
 computing live-variable sets. This is soundness-gated — only legal when every
 aggregate is duplicate-insensitive or the query is `SELECT DISTINCT`.
 
+At the aggregate boundary, a streaming group whose aggregate functions are all
+`COUNT(DISTINCT ?v)` or `COUNT(DISTINCT *)` removes a directly adjacent DISTINCT.
+The aggregate's own sets already perform the required deduplication, so the
+extra operator only repeats hashing and retains another set of row keys.
+Intermediate DISTINCT operators remain between joins to reduce fan-out. The
+removal does not cross other operators, and mixed aggregates or grouped-list
+output retain the original plan. EXPLAIN shows the resulting operator tree.
+
+On 2026-09-26, isolated before/after pairs on the same 50,000-person indexed
+fixture produced the following execution medians. Each query ran 20 measured
+repetitions after one warmup, using the optimized `dist` profile and in-memory
+storage; the baseline was `450058c75`. Loading, serialization and transport are
+excluded. Each pair selected just one query with `PROBE_ONLY` because an earlier
+whole-suite run showed timing variation in unchanged queries.
+
+| Query | Baseline | Without terminal DISTINCT | Speedup |
+|---|---:|---:|---:|
+| Two-hop filtered COUNT(DISTINCT), grouped and ordered with LIMIT 10 | 164.236 ms | 108.844 ms | 1.5× |
+| Two-hop GROUP BY + COUNT(DISTINCT) | 166.734 ms | 101.424 ms | 1.6× |
+
+For each query, all 500 group counts matched an independent fold of the raw
+joined rows. `PROBE_VERIFY=1` checks every group before ORDER BY/LIMIT, outside
+the timed region. Repeat the grouped case with:
+
+```bash
+PROBE_ONLY=group_count_distinct PROBE_VERIFY=1 cargo run -p fluree-db-api --profile dist --example query_operator_probe -- 50000 20
+```
+
+Use `PROBE_ONLY=two_hop_aggregate` for the filtered case.
+
 ## Layer 5: Fast-path operators
 
 Sixteen operators recognize specific query shapes and answer them by fusing scan

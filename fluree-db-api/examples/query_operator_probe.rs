@@ -2,10 +2,12 @@
 //!
 //! `cargo run -p fluree-db-api --profile dev-fast --example query_operator_probe -- 50000 5`
 //! Arguments: people, measured repetitions. Set `PROBE_PLANS=1` to print plans.
-//! `PROBE_ONLY=optional_not_exists` selects a case; `PROBE_VERIFY=1` also checks
-//! that case against seeded per-row evaluation, outside the timed region.
+//! `PROBE_ONLY=optional_not_exists` selects a case. `PROBE_VERIFY=1` checks the
+//! OPTIONAL case against seeded evaluation and the distinct aggregates against
+//! counts computed from raw query rows, outside the timed region.
 //! Measures query execution (without response serialization), with one warmup.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::time::Instant;
 
@@ -116,6 +118,53 @@ async fn main() {
         times.sort_by(f64::total_cmp);
         let median = times[(reps - 1) / 2].midpoint(times[reps / 2]);
         println!("{name:24} {median:10.3} ms");
+        if matches!(*name, "two_hop_aggregate" | "group_count_distinct")
+            && std::env::var_os("PROBE_VERIFY").is_some()
+        {
+            // Fold the ordinary bag of joined rows independently of the
+            // aggregate planner. Verify every group, before ORDER BY/LIMIT.
+            let full_query = query.split(" ORDER BY ").next().unwrap();
+            let (_, suffix) = full_query.split_once(" WHERE ").unwrap();
+            let (body, _) = suffix.rsplit_once(" GROUP BY ").unwrap();
+            let raw_query =
+                format!("PREFIX ex: <http://example.org/> SELECT ?city ?fof WHERE {body}");
+            let raw = fluree
+                .query(&view, QueryInput::Sparql(&raw_query))
+                .await
+                .expect("raw rows");
+            let raw = raw.to_jsonld(&view.snapshot).expect("format raw rows");
+            let mut groups = BTreeMap::new();
+            for row in raw.as_array().expect("row array") {
+                let (_, values) = groups
+                    .entry(row[0].to_string())
+                    .or_insert_with(|| (row[0].clone(), BTreeSet::new()));
+                values.insert(row[1].to_string());
+            }
+            let mut control_rows: Vec<_> = groups
+                .into_values()
+                .map(|(city, values)| serde_json::json!([city, values.len()]))
+                .collect();
+            let result = fluree
+                .query(&view, QueryInput::Sparql(full_query))
+                .await
+                .expect("all groups");
+            let mut actual_rows = result
+                .to_jsonld(&view.snapshot)
+                .expect("format groups")
+                .as_array()
+                .expect("group rows")
+                .clone();
+            control_rows.sort_by_key(ToString::to_string);
+            actual_rows.sort_by_key(ToString::to_string);
+            assert_eq!(
+                actual_rows, control_rows,
+                "distinct counts differ from raw rows"
+            );
+            println!(
+                "{name}: {} groups agree with counts from raw rows",
+                actual_rows.len()
+            );
+        }
         if *name == "optional_not_exists" && std::env::var_os("PROBE_VERIFY").is_some() {
             let control = query
                 .replace("FILTER NOT EXISTS", "FILTER (false || NOT EXISTS")

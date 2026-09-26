@@ -3581,6 +3581,22 @@ pub(crate) fn apply_solution_modifiers(
             && !select_needs_grouped_vars;
 
         if use_streaming {
+            // COUNT(DISTINCT) already deduplicates its input within each group.
+            // A DISTINCT directly below it repeats that work across the full
+            // group/input tuple. Remove only this terminal wrapper: earlier
+            // dedup between joins still limits fan-out. Mixed aggregates and
+            // grouped-list output retain their original multiplicities.
+            if aggregates_vec.iter().all(|spec| {
+                matches!(
+                    spec.function,
+                    AggregateFn::CountDistinct(_) | AggregateFn::CountDistinctAll(_)
+                )
+            }) {
+                if let Some(input) = operator.take_distinct_input() {
+                    operator = input;
+                    tracing::debug!("elided terminal DISTINCT before distinct counts");
+                }
+            }
             // Streaming path: O(groups) memory
             tracing::debug!(
                 group_by_count = group_by_vec.len(),
@@ -3890,6 +3906,168 @@ mod tests {
     use crate::sort::SortSpec;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
+
+    #[tokio::test]
+    async fn distinct_counts_remove_only_the_terminal_distinct() {
+        use crate::binding::{Batch, Binding};
+        use crate::context::ExecutionContext;
+        use crate::seed::BatchSeedOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+
+        fn distincts(node: &crate::plan_node::PlanNode) -> usize {
+            usize::from(node.op == "DistinctOperator")
+                + node
+                    .children
+                    .iter()
+                    .map(|c| distincts(&c.node))
+                    .sum::<usize>()
+        }
+
+        let value = VarId(0);
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        for planning in [PlanningContext::current(), PlanningContext::history()] {
+            for (functions, removes) in [
+                (vec![AggregateFn::CountDistinct(value)], true),
+                (vec![AggregateFn::CountDistinctAll(vec![value])], true),
+                (vec![AggregateFn::CountAll], false),
+                (vec![AggregateFn::Count(value)], false),
+                (
+                    vec![AggregateFn::CountDistinct(value), AggregateFn::CountAll],
+                    false,
+                ),
+            ] {
+                // If removal leaks through LIMIT, [1,1,2] LIMIT 2 collapses
+                // to one value. The inner DISTINCT must first produce [1,2].
+                for limited in [false, true] {
+                    let batch = Batch::new(
+                        Arc::from(vec![value].into_boxed_slice()),
+                        vec![vec![1, 1, 2]
+                            .into_iter()
+                            .map(|n| Binding::lit(FlakeValue::Long(n), Sid::xsd_integer()))
+                            .collect()],
+                    )
+                    .unwrap();
+                    let mut input: BoxedOperator = Box::new(DistinctOperator::new(Box::new(
+                        BatchSeedOperator::from_batch(batch),
+                    )));
+                    if limited {
+                        input = Box::new(DistinctOperator::new(Box::new(LimitOperator::new(
+                            input, 2,
+                        ))));
+                    }
+                    let outputs: Vec<VarId> =
+                        (1..=functions.len()).map(|i| VarId(i as u16)).collect();
+                    let grouping = Grouping::assemble(
+                        vec![],
+                        functions
+                            .iter()
+                            .cloned()
+                            .zip(&outputs)
+                            .map(|(function, &output_var)| AggregateSpec {
+                                function,
+                                output_var,
+                            })
+                            .collect(),
+                        vec![],
+                        None,
+                    );
+                    let mut op = apply_solution_modifiers(
+                        input,
+                        grouping.as_ref(),
+                        &[],
+                        &[],
+                        Some(&outputs),
+                        false,
+                        None,
+                        None,
+                        false,
+                        None,
+                        &planning,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        distincts(&op.describe()),
+                        usize::from(!removes) + usize::from(limited)
+                    );
+                    op.open(&ctx).await.unwrap();
+                    let batch = op.next_batch(&ctx).await.unwrap().unwrap();
+                    assert_eq!(batch.len(), 1);
+                    for col in 0..outputs.len() {
+                        assert_eq!(
+                            batch.get_by_col(0, col),
+                            &Binding::lit(FlakeValue::Long(2), Sid::xsd_integer()),
+                        );
+                    }
+                    assert!(op.next_batch(&ctx).await.unwrap().is_none());
+                    op.close();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_count_with_grouped_list_keeps_terminal_distinct() {
+        use crate::binding::{Batch, Binding};
+        use crate::context::ExecutionContext;
+        use crate::seed::BatchSeedOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+
+        let value = VarId(0);
+        let count = VarId(1);
+        let one = Binding::lit(FlakeValue::Long(1), Sid::xsd_integer());
+        let two = Binding::lit(FlakeValue::Long(2), Sid::xsd_integer());
+        let batch = Batch::new(
+            Arc::from(vec![value].into_boxed_slice()),
+            vec![vec![one.clone(), one.clone(), two.clone()]],
+        )
+        .unwrap();
+        let input = Box::new(DistinctOperator::new(Box::new(
+            BatchSeedOperator::from_batch(batch),
+        )));
+        let grouping = Grouping::assemble(
+            vec![],
+            vec![AggregateSpec {
+                function: AggregateFn::CountDistinct(value),
+                output_var: count,
+            }],
+            vec![],
+            None,
+        );
+        let mut op = apply_solution_modifiers(
+            input,
+            grouping.as_ref(),
+            &[],
+            &[],
+            Some(&[value, count]),
+            false,
+            None,
+            None,
+            false,
+            None,
+            &PlanningContext::current(),
+        )
+        .unwrap();
+        let plan = serde_json::to_string(&op.describe()).unwrap();
+        assert!(
+            plan.contains("GroupByOperator") && plan.contains("DistinctOperator"),
+            "{plan}"
+        );
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        op.open(&ctx).await.unwrap();
+        let batch = op.next_batch(&ctx).await.unwrap().unwrap();
+        assert_eq!(
+            batch.get_by_col(0, 0),
+            &Binding::Grouped(vec![one, two.clone()])
+        );
+        assert_eq!(batch.get_by_col(0, 1), &two);
+        op.close();
+    }
 
     /// PR-5: the scan-side top-k directive offered to the child must carry
     /// `k = LIMIT + OFFSET`, not `LIMIT` — the scan has to retain enough rows for
