@@ -15,8 +15,9 @@
 
 use crate::support::{self, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
-use fluree_db_core::DatatypeDictId;
+use fluree_db_core::{DatatypeDictId, RuntimeSmallDicts};
 use serde_json::json;
+use std::sync::Arc;
 
 /// Comfortably past the old boundary of 241 custom datatypes.
 const N: usize = 300;
@@ -238,31 +239,66 @@ async fn insert_past_datatype_limit_is_rejected_from_novelty() {
     support::rebuild_and_publish_index(&fluree, ledger_id).await;
 }
 
-/// The ledger is full and every existing datatype is in the index.
+/// Every existing datatype but the last is in the index. The last free ID
+/// is still granted, so the index's datatypes are counted exactly, not
+/// over-counted.
 #[tokio::test]
 async fn insert_past_datatype_limit_is_rejected_from_index() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "custom-dt-limit:reject-indexed";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
     fluree
-        .insert(ledger0, &insert_range(0..CAPACITY))
+        .insert(ledger0, &insert_range(0..CAPACITY - 1))
         .await
-        .expect("filling the datatype dictionary exactly is allowed");
+        .expect("filling all but one datatype id is allowed");
     support::rebuild_and_publish_index(&fluree, ledger_id).await;
     let indexed = load_indexed(&fluree, ledger_id).await;
+    let full = fluree
+        .insert(indexed, &insert_range(CAPACITY - 1..CAPACITY))
+        .await
+        .expect("the last datatype id is granted over the index")
+        .ledger;
 
     assert_datatype_limit_rejection(
         fluree
-            .insert(indexed.clone(), &insert_range(CAPACITY..CAPACITY + 1))
+            .insert(full.clone(), &insert_range(CAPACITY..CAPACITY + 1))
             .await,
         "new datatype over the index",
     );
     fluree
-        .insert(indexed, &insert_known_datatype())
+        .insert(full, &insert_known_datatype())
         .await
         .expect("a datatype the ledger already holds is still accepted");
 
     support::build_and_publish_index(&fluree, ledger_id).await;
+}
+
+/// The ledger is full in its index, but the state's runtime dictionary was
+/// never seeded from that index. The limit still counts the indexed
+/// datatypes rather than trusting the dictionary.
+#[tokio::test]
+async fn datatype_limit_counts_index_when_runtime_dict_is_unseeded() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "custom-dt-limit:reject-unseeded";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    fluree
+        .insert(ledger0, &insert_range(0..CAPACITY))
+        .await
+        .expect("filling the datatype dictionary exactly is allowed");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let mut unseeded = load_indexed(&fluree, ledger_id).await;
+    unseeded.runtime_small_dicts = Arc::new(RuntimeSmallDicts::new());
+
+    assert_datatype_limit_rejection(
+        fluree
+            .insert(unseeded.clone(), &insert_range(CAPACITY..CAPACITY + 1))
+            .await,
+        "new datatype over an unseeded runtime dictionary",
+    );
+    fluree
+        .insert(unseeded, &insert_known_datatype())
+        .await
+        .expect("a datatype only the index holds is still known");
 }
 
 /// A single transaction that brings more new datatypes than the ledger has

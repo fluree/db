@@ -264,6 +264,24 @@ impl DatatypeDictId {
     pub const FULL_TEXT: Self = Self(14);
     /// Number of reserved well-known datatype dictionary IDs.
     pub const RESERVED_COUNT: u16 = 15;
+    /// IRIs of the reserved datatypes, in dictionary ID order.
+    pub const RESERVED_IRIS: [&'static str; Self::RESERVED_COUNT as usize] = [
+        "@id",
+        fluree_vocab::xsd::STRING,
+        fluree_vocab::xsd::BOOLEAN,
+        fluree_vocab::xsd::INTEGER,
+        fluree_vocab::xsd::LONG,
+        fluree_vocab::xsd::DECIMAL,
+        fluree_vocab::xsd::DOUBLE,
+        fluree_vocab::xsd::FLOAT,
+        fluree_vocab::xsd::DATE_TIME,
+        fluree_vocab::xsd::DATE,
+        fluree_vocab::xsd::TIME,
+        fluree_vocab::rdf::LANG_STRING,
+        fluree_vocab::rdf::JSON,
+        fluree_vocab::fluree::EMBEDDING_VECTOR,
+        fluree_vocab::fluree::FULL_TEXT,
+    ];
     /// Largest datatype dictionary ID the index can store.
     ///
     /// A custom datatype is persisted as `OType::customer_datatype(id)`,

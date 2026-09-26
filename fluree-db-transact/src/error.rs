@@ -112,6 +112,18 @@ pub enum TransactError {
         max_bytes: usize,
     },
 
+    /// The transaction would bring the ledger past the number of datatypes
+    /// its index can store. Not retryable: datatype IDs are never released.
+    #[error(
+        "datatype limit exceeded: the ledger uses {used} of {max} non-reserved datatypes \
+         and this transaction adds {adding} new ones"
+    )]
+    DatatypeLimitExceeded {
+        used: usize,
+        adding: usize,
+        max: usize,
+    },
+
     /// Whole-graph scan larger than the memory backstop
     #[error(
         "whole-graph operation would materialize more than {limit} currently-asserted flakes; \
