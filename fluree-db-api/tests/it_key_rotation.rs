@@ -37,7 +37,16 @@ fn config(path: &Path, keys: &[(u32, &str)], current: u32) -> serde_json::Value 
                 "AES256Keys": keys,
                 "AES256CurrentKey": current
             },
-            {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "storage"}}
+            {
+                "@id": "connection",
+                "@type": "Connection",
+                "indexStorage": {"@id": "storage"},
+                // Tests build indexes explicitly. A background indexer on the
+                // seeding client (the default threshold is 100 bytes) would
+                // keep writing blobs under the old key after that client is
+                // dropped, racing the sweep into `swept`.
+                "defaults": {"indexing": {"indexingEnabled": false}}
+            }
         ]
     })
 }
