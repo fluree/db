@@ -29,6 +29,20 @@ fn extract_principal(context: &rmcp::service::RequestContext<RoleServer>) -> Opt
         .cloned()
 }
 
+/// The principal, if its ledger claims cover `ledger`.
+fn authorize(
+    context: &rmcp::service::RequestContext<RoleServer>,
+    ledger: &str,
+) -> Option<McpPrincipal> {
+    extract_principal(context)
+        .filter(|p| crate::error::scope_id(ledger).is_ok_and(|id| p.can_read(&id)))
+}
+
+/// What an unauthorized ledger gets: the same answer as one that does not exist.
+fn ledger_not_found() -> CallToolResult {
+    CallToolResult::error(vec![Content::text("Ledger not found")])
+}
+
 /// Request parameters for SPARQL query tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SparqlQueryRequest {
@@ -101,9 +115,11 @@ impl FlureeToolService {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = std::time::Instant::now();
 
-        // Extract identity from MCP principal for policy enforcement
-        let principal = extract_principal(&context);
-        let identity = principal.as_ref().and_then(|p| p.identity.as_deref());
+        let Some(principal) = authorize(&context, &req.ledger) else {
+            return Ok(ledger_not_found());
+        };
+        // The principal's identity drives policy enforcement.
+        let identity = principal.identity.as_deref();
 
         tracing::info!(
             ledger = %req.ledger,
@@ -292,9 +308,12 @@ impl FlureeToolService {
     async fn get_data_model(
         &self,
         Parameters(req): Parameters<GetDataModelRequest>,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = std::time::Instant::now();
+        if authorize(&context, &req.ledger).is_none() {
+            return Ok(ledger_not_found());
+        }
 
         tracing::info!(
             ledger = %req.ledger,
