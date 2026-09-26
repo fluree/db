@@ -28,7 +28,7 @@ contents. SHACL validation, modify-policy enforcement, and novelty
 backpressure apply exactly as for any other transaction.
 
 The scope is **exactly one named graph**, named by the caller — never
-inferred from the payload. The payload may not address named graphs itself,
+inferred from the payload. The payload may not address other named graphs,
 and reserved system graphs (and, for now, the default graph) are rejected.
 
 ## HTTP endpoint
@@ -52,14 +52,42 @@ Query parameters:
 | `ledger` | Target ledger (`name:branch`) |
 | `graph` | **Required.** Target graph IRI — the sync scope |
 | `dryRun=true` | Stage and report the delta (`asserted`/`retracted` counts) without committing — under the same policy, header, and inline-constraint inputs the real run uses, so it reports what the real run would do (or fails the way it would) |
-| `allowEmpty=true` | Confirm an explicitly empty payload (`"@graph": []`), which clears the graph |
+| `allowEmpty=true` | Confirm an empty payload (`"@graph": []`, or an RDF document with no triples), which clears the graph |
 
-The payload is JSON-LD (`application/json`). Convert Turtle exports
-client-side (e.g. `fluree-graph-turtle`'s `parse_to_json`, which is what
-`fluree sync -f export.ttl` does) for now. The conversion carries RDF 1.2
-annotations (`{| … |}`, `~ reifier`, `<< s p o >>`) as `@annotation` blocks,
-and sync anchors each reifier bundle to the target graph, so a claims file
-syncs like any other Turtle.
+### Payload formats
+
+| Content-Type | Payload |
+|---|---|
+| `application/json` | Insert-shaped JSON-LD |
+| `text/turtle` | Turtle: its triples are the graph's contents |
+| `application/n-triples` | N-Triples (read as Turtle, of which it is a subset) |
+| `application/trig` | TriG: the graph's contents in `GRAPH <graph> { … }` (or `<graph> { … }`) blocks, or as default-graph triples |
+
+All four stage the same flakes for the same triples, so a graph loaded from
+one format and resynced from another commits nothing. RDF 1.2 annotations
+(`{| … |}`, `~ reifier`, `<< s p o >>`) sync in every format, and sync
+anchors each reifier bundle to the target graph, so a claims file syncs like
+any other data.
+
+A TriG body is still one graph's contents:
+
+- Every block must name the `graph` parameter's IRI. A block for another
+  graph is a `400`. Several blocks for the target are fine; their triples are
+  combined, and a blank-node label shared between them is one node.
+- Default-graph triples beside a block are a `400`. In TriG they belong to the
+  default graph, which sync does not write.
+- A `GRAPH <#txn-meta> { … }` block annotates the commit, as on `/upsert`.
+- Block contents get the full Turtle grammar, including `[ … ]` blank nodes
+  and `( … )` collections.
+
+Turtle and TriG bodies carry no `opts`, so policy inputs come from the
+`fluree-identity` / `fluree-policy*` headers, as on the other Turtle routes.
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/sync?ledger=mydb:main&graph=http://example.org/graphs/ontology" \
+  -H "Content-Type: text/turtle" \
+  --data-binary @ontology.ttl
+```
 
 The payload is a set: a fact it states more than once (the JSON-LD
 parallel-annotation shape repeats the base edge once per annotation) is one
@@ -87,19 +115,22 @@ assert!(report.committed || (report.asserted == 0 && report.retracted == 0));
 
 `SyncGraphOpts { dry_run, allow_empty }` mirror the query parameters;
 `sync_named_graph_with` additionally takes explicit `TxnOpts` and a
-`PolicyContext`. The builder form
-`fluree.stage(&handle).sync_graph(graph_iri, &payload)` is also available
-(note: the builder does not apply the `allow_empty` gate). Its consensus
+`PolicyContext`, and `sync_named_graph_rdf_with` is the same call for
+Turtle / N-Triples / TriG text. The builder form
+`fluree.stage(&handle).sync_graph(graph_iri, &payload)` is also available,
+with `sync_graph_payload(graph_iri, SyncPayload::Rdf { text, allow_empty })`
+for RDF text (note: the builder applies the `allow_empty` gate to an RDF
+payload, but not to JSON-LD). Its consensus
 terminal `build_commit()` returns `Ok(None)` for a no-change sync. Target
 validation (absolute IRI, no system graphs) is enforced at staging, so it
 applies on every entry point.
 
 ## Safety rails
 
-- **Empty payload requires opt-in.** `"@graph": []` means "the graph's
-  desired contents are empty" — i.e. clear the graph. Without
-  `allowEmpty`, it is rejected, so a truncated export cannot silently wipe
-  the graph.
+- **Empty payload requires opt-in.** `"@graph": []`, or a Turtle / TriG
+  document with no triples, means "the graph's desired contents are empty"
+  — i.e. clear the graph. Without `allowEmpty`, it is rejected, so a
+  truncated export cannot silently wipe the graph.
 - **Explicit scope.** No graph parameter, no sync. Subjects in the payload
   never widen or narrow the scope.
 - **Dry run first.** For a periodic pipeline, a `dryRun` call that reports an

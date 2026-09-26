@@ -824,6 +824,115 @@ async fn happy_path_follower_forwards_to_leader() {
     }
 }
 
+/// A TriG graph sync sent to a follower is forwarded, staged by the leader's
+/// commit worker as an RDF sync body, and replicated: an identical resync
+/// commits nothing, and a smaller payload retracts what it leaves out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rdf_graph_sync_commits_through_the_raft_queue() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+
+    let follower = cluster.pick_follower().await;
+    let ledger = "raft:sync";
+    let graph = "urn:example:tools";
+    cluster.create_ledger(follower, ledger).await;
+
+    let sync = |triples: &'static str| {
+        let trig =
+            format!("@prefix ex: <http://example.org/> .\nGRAPH <{graph}> {{ {triples} }}\n");
+        let request = cluster
+            .client
+            .post(format!(
+                "{}/v1/fluree/sync/{ledger}?graph={graph}",
+                cluster.public_url(follower)
+            ))
+            .header("content-type", "application/trig")
+            .body(trig);
+        async move {
+            let resp = request.send().await.expect("sync request");
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.expect("sync json");
+            assert!(status.is_success(), "sync returned {status}: {body}");
+            body["t"].as_i64()
+        }
+    };
+    let names_everywhere = |expected: serde_json::Value| {
+        let query = json!({
+            "@context": { "ex": "http://example.org/" },
+            "from": format!("{ledger}#{graph}"),
+            "select": "?name",
+            "where": { "@id": "?s", "ex:name": "?name" },
+            "orderBy": "?name"
+        });
+        let cluster = &cluster;
+        async move {
+            for node in &cluster.nodes {
+                let deadline = Instant::now() + DEFAULT_TIMEOUT;
+                let mut last = serde_json::Value::Null;
+                while Instant::now() < deadline {
+                    let resp = cluster
+                        .client
+                        .post(format!("{}/v1/fluree/query", node.public_url))
+                        .header("content-type", "application/json")
+                        .body(query.to_string())
+                        .send()
+                        .await
+                        .expect("query request");
+                    last = resp.json().await.expect("query json");
+                    if last == expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!(last, expected, "node {}", node.node_id);
+            }
+        }
+    };
+
+    let full = r#"ex:search ex:name "search" ; ex:param [ ex:name "q" ]"#;
+    assert_eq!(sync(full).await, Some(1));
+    // Same triples, different bytes: a byte-identical keyless resubmission
+    // shares the first's content-addressed queue envelope, which the first's
+    // apply releases, so the second's worker can find it gone (#1931).
+    let resync = r#"ex:search  ex:name "search" ; ex:param [ ex:name "q" ]"#;
+    assert_eq!(
+        sync(resync).await,
+        Some(1),
+        "an identical resync must not commit"
+    );
+    names_everywhere(json!(["q", "search"])).await;
+
+    assert_eq!(sync(r#"ex:search ex:name "search""#).await, Some(2));
+    names_everywhere(json!(["search"])).await;
+
+    // A block naming another graph fails identically on every attempt, so
+    // the worker poisons it at once instead of retrying, and the queue moves
+    // on to the next sync.
+    let resp = cluster
+        .client
+        .post(format!(
+            "{}/v1/fluree/sync/{ledger}?graph={graph}",
+            cluster.public_url(follower)
+        ))
+        .header("content-type", "application/trig")
+        .body("GRAPH <urn:example:other> { <urn:x> <urn:p> \"x\" }\n")
+        .send()
+        .await
+        .expect("refused sync request");
+    let status = resp.status();
+    let body = resp.text().await.expect("refused sync body");
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert!(
+        body.contains("BodyMalformed"),
+        "refused without the retry budget: {body}"
+    );
+    assert_eq!(
+        sync(r#"ex:search ex:name "search" ; ex:tag "t""#).await,
+        Some(3)
+    );
+}
+
 /// Build, in a local in-memory instance, a main branch that ends in a
 /// general merge of `dev`. Return the push a client would send for it: the
 /// first-parent line plus the commit `dev` made.

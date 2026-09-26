@@ -44,7 +44,9 @@ for the full semantics, safety rails, and blank-node behavior.
 
 Turtle input is converted to JSON-LD client-side before submission, so a
 Turtle export works against any server that implements the `/sync`
-endpoint (which is JSON-LD only).
+endpoint, including servers from before it accepted Turtle bodies. The CLI
+does not read TriG yet; `POST` a TriG file to
+[`/sync`](../transactions/sync.md#payload-formats) directly.
 
 ### Sources
 

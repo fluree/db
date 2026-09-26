@@ -9,7 +9,7 @@
 //! capabilities. They work with memory/file/S3 admin backends but are not
 //! available on read-only storage.
 
-use crate::{error::ApiError, tx::IndexingMode, Result};
+use crate::{error::ApiError, tx::IndexingMode, Result, SyncPayload};
 use fluree_db_core::tracking::{Tracker, TrackingOptions};
 use fluree_db_core::ContentId;
 use fluree_db_core::{
@@ -1067,6 +1067,45 @@ impl crate::Fluree {
         txn_opts: fluree_db_transact::TxnOpts,
         policy: Option<crate::PolicyContext>,
     ) -> Result<SyncGraphReport> {
+        self.sync_named_graph_payload(
+            ledger_id,
+            graph_iri,
+            SyncPayload::JsonLd(data),
+            opts,
+            txn_opts,
+            policy,
+        )
+        .await
+    }
+
+    /// [`Self::sync_named_graph_with`] for Turtle, N-Triples or TriG text
+    /// (see [`SyncPayload::Rdf`] for how a TriG body names the graph).
+    pub async fn sync_named_graph_rdf_with(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+        text: &str,
+        opts: SyncGraphOpts,
+        txn_opts: fluree_db_transact::TxnOpts,
+        policy: Option<crate::PolicyContext>,
+    ) -> Result<SyncGraphReport> {
+        let payload = SyncPayload::Rdf {
+            text,
+            allow_empty: opts.allow_empty,
+        };
+        self.sync_named_graph_payload(ledger_id, graph_iri, payload, opts, txn_opts, policy)
+            .await
+    }
+
+    async fn sync_named_graph_payload(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+        payload: SyncPayload<'_>,
+        opts: SyncGraphOpts,
+        txn_opts: fluree_db_transact::TxnOpts,
+        policy: Option<crate::PolicyContext>,
+    ) -> Result<SyncGraphReport> {
         use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
 
         let bad_request = |msg: String| ApiError::Http {
@@ -1097,11 +1136,8 @@ impl crate::Fluree {
 
         // An explicitly empty payload clears the graph — require the
         // explicit opt-in so a truncated export cannot wipe it silently.
-        let explicitly_empty = data
-            .get("@graph")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(Vec::is_empty);
-        if explicitly_empty && !opts.allow_empty {
+        // Staging makes the same check for an RDF payload once parsed.
+        if payload.is_explicitly_empty_jsonld() && !opts.allow_empty {
             return Err(bad_request(
                 "sync payload is empty; this would clear the graph — set allowEmpty to confirm"
                     .to_string(),
@@ -1123,7 +1159,7 @@ impl crate::Fluree {
                 .stage_sync_transaction_tracked(
                     ledger_state,
                     graph_iri,
-                    data,
+                    payload,
                     txn_opts,
                     None,
                     None,
@@ -1146,7 +1182,7 @@ impl crate::Fluree {
 
         let mut builder = self
             .stage(&handle)
-            .sync_graph(graph_iri, data)
+            .sync_graph_payload(graph_iri, payload)
             .txn_opts(txn_opts);
         if let Some(policy) = policy {
             builder = builder.policy(policy);

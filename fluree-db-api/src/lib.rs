@@ -217,7 +217,7 @@ pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
     TransactResultRef,
 };
-pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged};
+pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged, SyncPayload};
 pub use verify::{LedgerVerifyReport, VerifyProblem, VerifySeverity};
 pub use view::{
     ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,

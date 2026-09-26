@@ -40,6 +40,43 @@ use fluree_db_transact::{
 use rustc_hash::FxHashSet;
 use std::collections::HashMap;
 
+/// A graph sync payload: the target graph's desired full contents.
+#[derive(Debug, Clone, Copy)]
+pub enum SyncPayload<'a> {
+    /// An insert-shaped JSON-LD document. `"@graph": []` is how it asks to
+    /// clear the graph.
+    JsonLd(&'a serde_json::Value),
+    /// Turtle, N-Triples or TriG text. Default-graph triples are the target
+    /// graph's contents; a TriG body may instead hold them in `GRAPH` blocks
+    /// naming the target graph, but not both, and no other graph.
+    ///
+    /// RDF has no spelling for "deliberately empty", and emptiness is only
+    /// known once parsed, so the opt-in rides with the text to staging.
+    Rdf { text: &'a str, allow_empty: bool },
+}
+
+impl SyncPayload<'_> {
+    /// The payload as stored for `store_raw_txn`.
+    pub(crate) fn raw_txn(&self) -> serde_json::Value {
+        match self {
+            SyncPayload::JsonLd(data) => (*data).clone(),
+            SyncPayload::Rdf { text, .. } => serde_json::Value::String((*text).to_string()),
+        }
+    }
+
+    /// Only `admin`'s sync entry point asks, and it is native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn is_explicitly_empty_jsonld(&self) -> bool {
+        match self {
+            SyncPayload::JsonLd(data) => data
+                .get("@graph")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty),
+            SyncPayload::Rdf { .. } => false,
+        }
+    }
+}
+
 /// Parse, validate, and lower a SPARQL UPDATE request to a sequence of
 /// transaction IRs (one per `;`-separated operation, in request order)
 /// against a snapshot's namespace registry. An empty vector is a valid
@@ -340,11 +377,11 @@ pub(crate) enum TransactOperation<'a> {
     UpdateJson(&'a JsonValue),
     InsertTurtle(&'a str),
     UpsertTurtle(&'a str),
-    /// Graph sync: make `graph_iri`'s contents exactly `json`, committing
-    /// only the delta (see [`fluree_db_transact::Txn::sync_graph`]).
+    /// Graph sync: make `graph_iri`'s contents exactly `payload`,
+    /// committing only the delta (see [`fluree_db_transact::Txn::sync_graph`]).
     SyncGraph {
         graph_iri: &'a str,
-        json: &'a JsonValue,
+        payload: SyncPayload<'a>,
     },
 }
 
@@ -397,11 +434,11 @@ impl TransactOperation<'_> {
                 trig_meta: None,
                 named_graphs: Vec::new(),
             }),
-            TransactOperation::SyncGraph { json, .. } => Ok(ParsedOperation {
-                json: (*json).clone(),
-                trig_meta: None,
-                named_graphs: Vec::new(),
-            }),
+            // Every staging path dispatches sync first; parsing it as a plain
+            // insert would write the payload without the retraction wave.
+            TransactOperation::SyncGraph { .. } => Err(ApiError::internal(
+                "graph sync must be staged through stage_sync_transaction_tracked",
+            )),
             TransactOperation::InsertTurtle(ttl) | TransactOperation::UpsertTurtle(ttl) => {
                 // Phase 1: Extract TriG GRAPH block (if present)
                 let phase1 = parse_trig_phase1(ttl)?;
@@ -703,11 +740,15 @@ impl<'a> OwnedTransactBuilder<'a> {
     /// Set the operation to a graph sync: make `graph_iri`'s contents
     /// exactly `data`, committing only the delta (see
     /// [`fluree_db_transact::Txn::sync_graph`]).
-    pub fn sync_graph(mut self, graph_iri: &'a str, data: &'a JsonValue) -> Self {
-        self.core.set_operation(TransactOperation::SyncGraph {
-            graph_iri,
-            json: data,
-        });
+    pub fn sync_graph(self, graph_iri: &'a str, data: &'a JsonValue) -> Self {
+        self.sync_graph_payload(graph_iri, SyncPayload::JsonLd(data))
+    }
+
+    /// [`Self::sync_graph`] for any [`SyncPayload`], including Turtle /
+    /// N-Triples / TriG text.
+    pub fn sync_graph_payload(mut self, graph_iri: &'a str, payload: SyncPayload<'a>) -> Self {
+        self.core
+            .set_operation(TransactOperation::SyncGraph { graph_iri, payload });
         self
     }
 
@@ -857,7 +898,7 @@ impl<'a> OwnedTransactBuilder<'a> {
 
         // Graph sync: dedicated staging (whole-graph retraction wave) with
         // the no-change short-circuit — an identical payload commits nothing.
-        if let TransactOperation::SyncGraph { graph_iri, json } = op {
+        if let TransactOperation::SyncGraph { graph_iri, payload } = op {
             let tracker = self
                 .core
                 .tracking
@@ -869,7 +910,7 @@ impl<'a> OwnedTransactBuilder<'a> {
                 .stage_sync_transaction_tracked(
                     self.ledger,
                     graph_iri,
-                    json,
+                    payload,
                     self.core.txn_opts,
                     Some(&index_config),
                     Some(&tracker),
@@ -1002,7 +1043,7 @@ impl<'a> OwnedTransactBuilder<'a> {
         }
 
         // Graph sync: dedicated staging (whole-graph retraction wave).
-        if let TransactOperation::SyncGraph { graph_iri, json } = op {
+        if let TransactOperation::SyncGraph { graph_iri, payload } = op {
             let tracker = self
                 .core
                 .tracking
@@ -1015,7 +1056,7 @@ impl<'a> OwnedTransactBuilder<'a> {
                 .stage_sync_transaction_tracked(
                     self.ledger,
                     graph_iri,
-                    json,
+                    payload,
                     self.core.txn_opts,
                     Some(&index_config),
                     tracker_ref,
@@ -1157,11 +1198,15 @@ impl<'a> RefTransactBuilder<'a> {
     /// Set the operation to a graph sync: make `graph_iri`'s contents
     /// exactly `data`, committing only the delta (see
     /// [`fluree_db_transact::Txn::sync_graph`]).
-    pub fn sync_graph(mut self, graph_iri: &'a str, data: &'a JsonValue) -> Self {
-        self.core.set_operation(TransactOperation::SyncGraph {
-            graph_iri,
-            json: data,
-        });
+    pub fn sync_graph(self, graph_iri: &'a str, data: &'a JsonValue) -> Self {
+        self.sync_graph_payload(graph_iri, SyncPayload::JsonLd(data))
+    }
+
+    /// [`Self::sync_graph`] for any [`SyncPayload`], including Turtle /
+    /// N-Triples / TriG text.
+    pub fn sync_graph_payload(mut self, graph_iri: &'a str, payload: SyncPayload<'a>) -> Self {
+        self.core
+            .set_operation(TransactOperation::SyncGraph { graph_iri, payload });
         self
     }
 
@@ -1318,8 +1363,8 @@ enum OpPlan<'a> {
     },
     /// Graph sync (see [`fluree_db_transact::Txn::sync_graph`]).
     Sync {
-        graph_iri: String,
-        txn_json: JsonValue,
+        graph_iri: &'a str,
+        payload: SyncPayload<'a>,
     },
 }
 
@@ -1329,10 +1374,9 @@ impl<'a> OpPlan<'a> {
     fn from_op(op: TransactOperation<'a>) -> Result<Self> {
         match op {
             TransactOperation::InsertTurtle(turtle) => Ok(OpPlan::InsertTurtle(turtle)),
-            TransactOperation::SyncGraph { graph_iri, json } => Ok(OpPlan::Sync {
-                graph_iri: graph_iri.to_string(),
-                txn_json: json.clone(),
-            }),
+            TransactOperation::SyncGraph { graph_iri, payload } => {
+                Ok(OpPlan::Sync { graph_iri, payload })
+            }
             _ => {
                 let txn_type = op.txn_type();
                 let parsed = op.to_json_with_trig_meta()?;
@@ -1602,12 +1646,12 @@ impl Fluree {
         // Graph sync: dedicated staging (whole-graph retraction wave). Must
         // be dispatched before the JSON-like fallthrough, which would
         // otherwise stage the payload as a plain default-graph insert.
-        if let TransactOperation::SyncGraph { graph_iri, json } = op {
+        if let TransactOperation::SyncGraph { graph_iri, payload } = op {
             let stage_result = self
                 .stage_sync_transaction_tracked(
                     ledger_state,
                     graph_iri,
-                    json,
+                    payload,
                     core.txn_opts,
                     Some(index_config),
                     tracker_ref,
@@ -1617,7 +1661,7 @@ impl Fluree {
             let commit_opts = self.maybe_spawn_txn_upload(
                 core.commit_opts,
                 &ledger_id,
-                json.clone(),
+                payload.raw_txn(),
                 store_raw_txn,
             );
             return Ok((stage_result, TxnType::Insert, commit_opts, None));
@@ -1731,21 +1775,18 @@ impl Fluree {
                     .await?;
                 Ok((stage_result, *txn_type, commit_opts))
             }
-            OpPlan::Sync {
-                graph_iri,
-                txn_json,
-            } => {
+            OpPlan::Sync { graph_iri, payload } => {
                 let commit_opts = self.maybe_spawn_txn_upload(
                     commit_opts_base.clone(),
                     &ledger_id,
-                    txn_json.clone(),
+                    payload.raw_txn(),
                     store_raw_txn,
                 );
                 let stage_result = self
                     .stage_sync_transaction_tracked(
                         ledger_state,
                         graph_iri,
-                        txn_json,
+                        *payload,
                         txn_opts,
                         Some(index_config),
                         tracker_ref,

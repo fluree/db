@@ -136,6 +136,8 @@ curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
   --data-binary '@data.trig'
 ```
 
+To replace a named graph's contents wholesale, for example when reloading an export, use [sync](../transactions/sync.md) instead: it takes the graph's new contents as JSON-LD, Turtle, N-Triples or TriG and commits only what changed.
+
 **Querying user-defined named graphs (JSON-LD):**
 
 Use the structured `from` object with a `graph` field:

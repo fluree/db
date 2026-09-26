@@ -50,7 +50,8 @@ pub(crate) const CLAUSE_KEYS: &[&str] = &["where", "delete", "insert", "upsert",
 pub use jsonld::{parse_sync_transaction, parse_transaction};
 pub use nquads::nquads_to_trig;
 pub use trig_meta::{
-    extract_trig_txn_meta, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject,
-    RawTerm, RawTrigMeta, RawTriple, TrigMetaResult, TrigPhase1Result, TXN_META_GRAPH_IRI,
+    extract_trig_txn_meta, parse_trig_phase1, resolve_trig_meta, unwrap_trig_graph_blocks,
+    NamedGraphBlock, RawObject, RawTerm, RawTrigMeta, RawTriple, TrigMetaResult, TrigPhase1Result,
+    UnwrappedTrig, TXN_META_GRAPH_IRI,
 };
 pub use txn_meta::extract_txn_meta;

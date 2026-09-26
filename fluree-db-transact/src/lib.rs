@@ -77,7 +77,8 @@ pub use namespace::{
 };
 pub use parse::{
     parse_sync_transaction, parse_transaction, parse_trig_phase1, resolve_trig_meta,
-    NamedGraphBlock, RawObject, RawTerm, RawTrigMeta, RawTriple, TrigPhase1Result,
+    unwrap_trig_graph_blocks, NamedGraphBlock, RawObject, RawTerm, RawTrigMeta, RawTriple,
+    TrigPhase1Result, UnwrappedTrig,
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions};

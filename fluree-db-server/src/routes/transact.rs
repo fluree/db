@@ -1248,8 +1248,8 @@ async fn upsert_local(
     .await
 }
 
-/// Synchronize a named graph: make its contents exactly the JSON-LD payload,
-/// committing only the delta.
+/// Synchronize a named graph: make its contents exactly the payload (JSON-LD,
+/// Turtle, N-Triples or TriG), committing only the delta.
 ///
 /// POST /sync?ledger=name:branch&graph=<iri>[&dryRun=true][&allowEmpty=true]
 /// In peer mode, forwards the request to the transaction server.
@@ -1302,25 +1302,24 @@ async fn sync_local(
     )?;
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
 
+    let input_format = if credential.is_trig() {
+        "trig"
+    } else if credential.is_turtle() {
+        "turtle"
+    } else {
+        "json-ld"
+    };
     let span = create_request_span(
         "sync",
         request_id.as_deref(),
         extract_trace_id(&credential.headers).as_deref(),
         None,
         None,
-        Some("json-ld"),
+        Some(input_format),
     );
     async move {
         let span = tracing::Span::current();
         tracing::info!(status = "start", "graph sync requested");
-
-        // v1 is JSON-LD only; Turtle/TriG bodies are not accepted here.
-        if credential.is_turtle_or_trig() {
-            set_span_error_code(&span, "error:BadRequest");
-            return Err(ServerError::bad_request(
-                "sync accepts application/json (JSON-LD); convert Turtle payloads client-side",
-            ));
-        }
 
         let Some(graph_iri) = query_params.graph.clone() else {
             set_span_error_code(&span, "error:BadRequest");
@@ -1328,6 +1327,54 @@ async fn sync_local(
                 "sync requires a `graph` query parameter naming the target graph IRI",
             ));
         };
+
+        if credential.is_turtle_or_trig() {
+            let text = credential.body_string()?;
+            // An RDF body carries no `ledger` / `from` key.
+            let ledger_id = match path_ledger {
+                Some(l) => l,
+                None => get_ledger_id(None, &query_params, &headers, &JsonValue::Null)?,
+            };
+            span.record("ledger_id", ledger_id.as_str());
+            enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+            let author = effective_author(&credential, bearer.as_ref());
+            let op = TurtleOp::Sync {
+                graph_iri: &graph_iri,
+                allow_empty: query_params.allow_empty,
+            };
+            if query_params.dry_run {
+                // Turtle/TriG bodies carry no `opts`: policy comes from the
+                // headers alone, as it does for the committed run.
+                let governance = crate::routes::policy_auth::bound_governance(
+                    headers.identity.as_deref(),
+                    &headers,
+                )?;
+                let report = dry_run_sync(
+                    &state,
+                    &ledger_id,
+                    &graph_iri,
+                    fluree_db_api::SyncPayload::Rdf {
+                        text: &text,
+                        allow_empty: query_params.allow_empty,
+                    },
+                    query_params.allow_empty,
+                    TxnOpts::default(),
+                    &governance,
+                )
+                .await?;
+                return Ok(report);
+            }
+            return execute_turtle_transaction(
+                &state,
+                &ledger_id,
+                op,
+                &text,
+                &credential,
+                &headers,
+                author.as_deref(),
+            )
+            .await;
+        }
 
         let body_json = credential.body_json()?;
         let ledger_id = match path_ledger {
@@ -1363,48 +1410,16 @@ async fn sync_local(
             // policy / SHACL / uniqueness fails here too.
             let prepared = prepare_transaction_body(body_json, &headers)?;
             let txn_opts = txn_opts_from_body(&prepared.body, &span)?;
-            let handle = state
-                .fluree
-                .ledger_cached(&ledger_id)
-                .await
-                .map_err(ServerError::from)?;
-            let snap = handle.snapshot().await;
-            let policy = fluree_db_api::build_transact_policy_context(
-                &state.fluree,
-                &snap.snapshot,
-                snap.novelty.as_ref(),
-                Some(snap.novelty.as_ref()),
-                snap.t,
+            return dry_run_sync(
+                &state,
+                &ledger_id,
+                &graph_iri,
+                fluree_db_api::SyncPayload::JsonLd(&prepared.body),
+                query_params.allow_empty,
+                txn_opts,
                 &prepared.governance,
             )
-            .await
-            .map_err(ServerError::from)?;
-            drop(snap);
-            let report = state
-                .fluree
-                .sync_named_graph_with(
-                    &ledger_id,
-                    &graph_iri,
-                    &prepared.body,
-                    fluree_db_api::SyncGraphOpts {
-                        dry_run: true,
-                        allow_empty: query_params.allow_empty,
-                    },
-                    txn_opts,
-                    policy,
-                )
-                .await
-                .map_err(ServerError::from)?;
-            return Ok(axum::Json(serde_json::json!({
-                "ledger": report.ledger_id,
-                "graph": report.graph_iri,
-                "asserted": report.asserted,
-                "retracted": report.retracted,
-                "committed": report.committed,
-                "dryRun": report.dry_run,
-                "t": report.t,
-            }))
-            .into_response());
+            .await;
         }
 
         execute_transaction(
@@ -1421,6 +1436,68 @@ async fn sync_local(
     }
     .instrument(span)
     .await
+}
+
+/// Stage a sync against the ledger head and report the delta, committing
+/// nothing. Safe outside consensus: it is a read of the delta, not a write.
+/// Policy is built from the ledger state exactly as the committed run builds
+/// it, so a restricted writer sees policy-filtered counts and a run that
+/// would fail policy / SHACL / uniqueness fails here too.
+async fn dry_run_sync(
+    state: &AppState,
+    ledger_id: &str,
+    graph_iri: &str,
+    payload: fluree_db_api::SyncPayload<'_>,
+    allow_empty: bool,
+    txn_opts: TxnOpts,
+    governance: &fluree_db_api::GovernanceOptions,
+) -> Result<Response> {
+    let handle = state
+        .fluree
+        .ledger_cached(ledger_id)
+        .await
+        .map_err(ServerError::from)?;
+    let snap = handle.snapshot().await;
+    let policy = fluree_db_api::build_transact_policy_context(
+        &state.fluree,
+        &snap.snapshot,
+        snap.novelty.as_ref(),
+        Some(snap.novelty.as_ref()),
+        snap.t,
+        governance,
+    )
+    .await
+    .map_err(ServerError::from)?;
+    drop(snap);
+    let opts = fluree_db_api::SyncGraphOpts {
+        dry_run: true,
+        allow_empty,
+    };
+    let report = match payload {
+        fluree_db_api::SyncPayload::JsonLd(body) => {
+            state
+                .fluree
+                .sync_named_graph_with(ledger_id, graph_iri, body, opts, txn_opts, policy)
+                .await
+        }
+        fluree_db_api::SyncPayload::Rdf { text, .. } => {
+            state
+                .fluree
+                .sync_named_graph_rdf_with(ledger_id, graph_iri, text, opts, txn_opts, policy)
+                .await
+        }
+    }
+    .map_err(ServerError::from)?;
+    Ok(axum::Json(serde_json::json!({
+        "ledger": report.ledger_id,
+        "graph": report.graph_iri,
+        "asserted": report.asserted,
+        "retracted": report.retracted,
+        "committed": report.committed,
+        "dryRun": report.dry_run,
+        "t": report.t,
+    }))
+    .into_response())
 }
 
 /// Insert data with ledger in path
@@ -1949,16 +2026,21 @@ fn compute_tx_id_turtle(turtle: &str) -> String {
 /// (SPARQL UPDATE is the update path for RDF text), so the variant is
 /// excluded at the type level rather than checked at runtime.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TurtleOp {
+enum TurtleOp<'a> {
     Insert,
     Upsert,
+    /// Graph sync: `graph_iri`'s contents become exactly the body.
+    Sync {
+        graph_iri: &'a str,
+        allow_empty: bool,
+    },
 }
 
 /// Execute a Turtle/TriG transaction
 ///
 /// This function handles both:
-/// - text/turtle: Standard Turtle format (insert or upsert)
-/// - application/trig: TriG format with GRAPH blocks for named graphs (upsert only)
+/// - text/turtle: Standard Turtle format (insert, upsert or sync)
+/// - application/trig: TriG format with GRAPH blocks for named graphs (upsert or sync)
 ///
 /// # Insert vs Upsert Semantics
 ///
@@ -1969,10 +2051,12 @@ enum TurtleOp {
 /// - **Upsert with Turtle/TriG** (`/upsert`): Uses `upsert_turtle` which handles GRAPH blocks
 ///   and supports named graph ingestion. For each (subject, predicate) pair, existing values
 ///   are retracted before new values are asserted.
+/// - **Sync with Turtle/TriG** (`/sync`): the body becomes the target graph's whole contents,
+///   committing only the delta (see `fluree_db_api::SyncPayload::Rdf`).
 async fn execute_turtle_transaction(
     state: &AppState,
     ledger_id: &str,
-    op: TurtleOp,
+    op: TurtleOp<'_>,
     turtle: &str,
     credential: &MaybeCredential,
     headers: &FlureeHeaders,
@@ -2042,14 +2126,20 @@ async fn execute_turtle_transaction(
 
         // Tracking is header-driven and applies to every format.
         let tracking = tracking_from_headers(headers);
-        // Only the three valid cases remain after the (TriG, Insert)
-        // rejection above: Turtle+Insert, Turtle+Upsert, TriG+Upsert.
-        let body = if is_trig {
-            TransactionBody::TrigUpsert(turtle.to_string())
-        } else if op == TurtleOp::Insert {
-            TransactionBody::TurtleInsert(turtle.to_string())
-        } else {
-            TransactionBody::TurtleUpsert(turtle.to_string())
+        // (TriG, Insert) was rejected above. Sync reads GRAPH blocks from
+        // either content type.
+        let body = match op {
+            TurtleOp::Sync {
+                graph_iri,
+                allow_empty,
+            } => TransactionBody::RdfGraphSync {
+                graph_iri: graph_iri.to_string(),
+                text: turtle.to_string(),
+                allow_empty,
+            },
+            TurtleOp::Upsert if is_trig => TransactionBody::TrigUpsert(turtle.to_string()),
+            TurtleOp::Upsert => TransactionBody::TurtleUpsert(turtle.to_string()),
+            TurtleOp::Insert => TransactionBody::TurtleInsert(turtle.to_string()),
         };
         let request = TransactionRequest {
             idempotency_key: extract_idempotency_key(&credential.headers)?,

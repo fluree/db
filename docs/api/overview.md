@@ -89,6 +89,9 @@ defaults to `/v1/fluree`.
 **POST /insert** / **POST /upsert**
 - Insert or upsert data (JSON-LD and Turtle; TriG on upsert)
 
+**POST /sync**
+- Make one named graph's contents exactly the payload, committing only the difference (JSON-LD, Turtle, N-Triples or TriG)
+
 ### Query Endpoints
 
 **POST /query**
