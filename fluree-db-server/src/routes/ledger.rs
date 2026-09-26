@@ -1038,7 +1038,8 @@ pub struct CreateBranchResponse {
 /// - `source`: Source branch (optional, defaults to "main")
 ///
 /// Returns 201 Created on success, 409 Conflict if branch already exists,
-/// 404 Not Found if source branch does not exist.
+/// 404 Not Found if source branch does not exist, 400 Bad Request if the
+/// source branch has no commits.
 pub async fn create_branch(State(state): State<Arc<AppState>>, request: Request) -> Response {
     if state.config.server_role == ServerRole::Peer {
         return forward_write_request(&state, request).await;
