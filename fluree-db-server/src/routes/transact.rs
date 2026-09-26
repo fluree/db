@@ -60,6 +60,9 @@ pub struct TransactQueryParams {
     /// (`/sync` only).
     #[serde(rename = "allowEmpty", default)]
     pub allow_empty: bool,
+    /// SPARQL Protocol `using-graph-uri` / `using-named-graph-uri` (update only).
+    #[serde(skip)]
+    pub using: crate::routes::sparql_protocol::UsingParams,
 }
 
 /// Commit information in transaction response
@@ -377,13 +380,42 @@ fn raw_txn_from_credential(credential: &MaybeCredential) -> Option<JsonValue> {
     Some(JsonValue::String(format!("base64:{b64}")))
 }
 
-/// Extract query params from request URI before consuming the request
-fn extract_query_params(request: &Request) -> TransactQueryParams {
-    request
-        .uri()
-        .query()
-        .and_then(|q| serde_urlencoded::from_str(q).ok())
-        .unwrap_or_default()
+/// Extract query params from request URI before consuming the request.
+///
+/// Parsed from the decoded pair list rather than `serde_urlencoded` into the
+/// struct: the SPARQL Protocol `using-*` keys repeat once per graph, and a
+/// repeated key made the struct parse fail — which, swallowed, dropped every
+/// parameter, `ledger` included. A malformed parameter is now a 400 instead of
+/// silently becoming "no parameters".
+fn extract_query_params(request: &Request) -> Result<TransactQueryParams> {
+    let pairs = crate::routes::sparql_protocol::decode_pairs(request.uri().query().unwrap_or(""))?;
+    let mut params = TransactQueryParams::default();
+    let flag = |key: &str, value: &str| match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(ServerError::bad_request(format!(
+            "`{key}` must be true or false; got {other:?}"
+        ))),
+    };
+    let once = |slot: &mut Option<String>, key: &str, value: &str| {
+        if slot.replace(value.to_string()).is_some() {
+            return Err(ServerError::bad_request(format!(
+                "the `{key}` parameter may appear only once"
+            )));
+        }
+        Ok(())
+    };
+    for (key, value) in &pairs {
+        match key.as_str() {
+            "ledger" => once(&mut params.ledger, key, value)?,
+            "graph" => once(&mut params.graph, key, value)?,
+            "dryRun" => params.dry_run = flag(key, value)?,
+            "allowEmpty" => params.allow_empty = flag(key, value)?,
+            _ => {}
+        }
+    }
+    params.using.extend_from_pairs(&pairs);
+    Ok(params)
 }
 
 /// Check if the credential contains a W3C SPARQL Protocol form-encoded update
@@ -393,14 +425,20 @@ fn extract_query_params(request: &Request) -> TransactQueryParams {
 /// pipeline treats it as `application/sparql-update`.  This is required for
 /// standard SPARQL benchmarking tools (e.g. BSBM test driver) that use the
 /// form-encoded transport defined in the SPARQL 1.1 Protocol spec §2.2.
-fn maybe_rewrite_form_encoded_update(credential: &mut MaybeCredential) {
+///
+/// The form may also carry `using-graph-uri` / `using-named-graph-uri`, which
+/// are added to `using`.
+fn maybe_rewrite_form_encoded_update(
+    credential: &mut MaybeCredential,
+    using: &mut crate::routes::sparql_protocol::UsingParams,
+) -> Result<()> {
     // Only act when none of the typed content-type flags are already set
     if credential.is_sparql_update
         || credential.is_sparql
         || credential.is_turtle
         || credential.is_trig
     {
-        return;
+        return Ok(());
     }
 
     // Check Content-Type header for form-urlencoded
@@ -412,24 +450,26 @@ fn maybe_rewrite_form_encoded_update(credential: &mut MaybeCredential) {
         .unwrap_or(false);
 
     if !is_form {
-        return;
+        return Ok(());
     }
 
     // Try to parse the body as form data and extract the `update` field
     let body_str = match std::str::from_utf8(&credential.body) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
 
     let parsed: Vec<(String, String)> = match serde_urlencoded::from_str(body_str) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
 
     if let Some((_, sparql)) = parsed.iter().find(|(k, _)| k == "update") {
+        using.extend_from_pairs(&crate::routes::sparql_protocol::decode_pairs(body_str)?);
         credential.body = axum::body::Bytes::from(sparql.clone());
         credential.is_sparql_update = true;
     }
+    Ok(())
 }
 
 /// Inject header-based policy and tracking defaults into the transaction body.
@@ -599,7 +639,7 @@ async fn update_local(
     request: Request,
 ) -> Result<Response> {
     // Extract query params before consuming the request
-    let query_params = extract_query_params(&request);
+    let mut query_params = extract_query_params(&request)?;
     // Extract headers
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {
@@ -617,7 +657,10 @@ async fn update_local(
     )?;
 
     // W3C SPARQL Protocol: rewrite form-encoded `update=...` to sparql-update
-    maybe_rewrite_form_encoded_update(&mut credential);
+    maybe_rewrite_form_encoded_update(&mut credential, &mut query_params.using)?;
+    if !credential.is_sparql_update() {
+        query_params.using.reject_outside_sparql()?;
+    }
 
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
@@ -765,7 +808,7 @@ async fn update_ledger_local(
     request: Request,
 ) -> Result<Response> {
     // Extract query params before consuming the request
-    let query_params = extract_query_params(&request);
+    let mut query_params = extract_query_params(&request)?;
 
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {
@@ -781,7 +824,10 @@ async fn update_ledger_local(
     )?;
 
     // W3C SPARQL Protocol: rewrite form-encoded `update=...` to sparql-update
-    maybe_rewrite_form_encoded_update(&mut credential);
+    maybe_rewrite_form_encoded_update(&mut credential, &mut query_params.using)?;
+    if !credential.is_sparql_update() {
+        query_params.using.reject_outside_sparql()?;
+    }
 
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
 
@@ -921,7 +967,8 @@ async fn insert_local(
     request: Request,
 ) -> Result<Response> {
     // Extract query params before consuming the request
-    let query_params = extract_query_params(&request);
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
 
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {
@@ -1074,7 +1121,8 @@ async fn upsert_local(
     request: Request,
 ) -> Result<Response> {
     // Extract query params before consuming the request
-    let query_params = extract_query_params(&request);
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
 
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {
@@ -1242,7 +1290,8 @@ async fn sync_local(
     path_ledger: Option<String>,
     request: Request,
 ) -> Result<Response> {
-    let query_params = extract_query_params(&request);
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
     let headers = FlureeHeaders::from_headers(request.headers())?;
     let credential = MaybeCredential::extract(request).await?;
     let headers = crate::routes::policy_auth::bind_authorization(
@@ -1415,7 +1464,8 @@ async fn insert_ledger_local(
     request: Request,
 ) -> Result<Response> {
     // Extract query params before consuming the request
-    let query_params = extract_query_params(&request);
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
 
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {
@@ -1569,7 +1619,8 @@ async fn upsert_ledger_local(
     request: Request,
 ) -> Result<Response> {
     // Extract query params before consuming the request
-    let query_params = extract_query_params(&request);
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
 
     let headers_result = FlureeHeaders::from_headers(request.headers());
     let headers = match headers_result {
@@ -2231,6 +2282,13 @@ async fn execute_sparql_update_request(
             return Err(e);
         }
     };
+
+    // SPARQL Protocol `using-graph-uri` / `using-named-graph-uri` become the
+    // operations' USING / USING NAMED before the text is logged or lowered.
+    let sparql = query_params.using.apply(sparql).inspect_err(|e| {
+        set_span_error_code(parent_span, "error:BadRequest");
+        tracing::warn!(error = %e, "invalid SPARQL Protocol USING parameters");
+    })?;
 
     // Compute tx-id from SPARQL string
     let tx_id = compute_tx_id_sparql(&sparql);
