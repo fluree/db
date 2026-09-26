@@ -684,7 +684,7 @@ mod tests {
             let expected = batches
                 .iter()
                 .any(|batch| rows_match(&shared, &input, 0, batch, 0));
-            assert_eq!(op.input_row_eliminated(&input, 0), expected, "{:?}", input);
+            assert_eq!(op.input_row_eliminated(&input, 0), expected, "{input:?}");
         }
         let mut op = make_minus_with_shared(shared.to_vec());
         op.build_hash_index(vec![batch_1row(&shared, vec![Binding::encoded_sid(7)])]);
