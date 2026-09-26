@@ -305,3 +305,188 @@ async fn scope_checks_agree_across_spellings() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// Unauthenticated listing is refused when data auth is required, and a token
+/// sees only the ledgers it can read.
+#[tokio::test]
+async fn ledgers_listing_follows_data_auth() {
+    let (_tmp, state) = data_auth_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "listed").await;
+    create_ledger(&app, "hidden").await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/fluree/ledgers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let token = read_scoped_token(&["listed"], 81);
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/v1/fluree/ledgers",
+        &token,
+        &[],
+        "application/json",
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = body
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["listed"]);
+}
+
+// ---------------------------------------------------------------------------
+// MCP: issuer trust admits a token; its ledger claims decide what it reaches.
+// ---------------------------------------------------------------------------
+
+async fn mcp_state(issuer: &str) -> (TempDir, Arc<AppState>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        mcp_enabled: true,
+        mcp_auth_trusted_issuers: vec![issuer.to_string()],
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    (tmp, state)
+}
+
+/// One JSON-RPC exchange over the streamable HTTP transport; returns the
+/// response headers and the JSON message (SSE-framed or plain).
+async fn mcp_post(
+    app: &axum::Router,
+    token: &str,
+    session: Option<&str>,
+    body: JsonValue,
+) -> (http::HeaderMap, JsonValue) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(s) = session {
+        req = req.header("mcp-session-id", s);
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    let json = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .find_map(|d| serde_json::from_str(d.trim()).ok())
+        .or_else(|| serde_json::from_str(&text).ok())
+        .unwrap_or(JsonValue::Null);
+    (headers, json)
+}
+
+/// Call `tool` with `args` in a fresh session; returns the tool result.
+async fn mcp_tool(app: &axum::Router, token: &str, tool: &str, args: JsonValue) -> JsonValue {
+    let (headers, _) = mcp_post(
+        app,
+        token,
+        None,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}
+            }
+        }),
+    )
+    .await;
+    let session = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+    mcp_post(
+        app,
+        token,
+        Some(&session),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    let (_, resp) = mcp_post(
+        app,
+        token,
+        Some(&session),
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": args}
+        }),
+    )
+    .await;
+    resp["result"].clone()
+}
+
+fn tool_text(result: &JsonValue) -> String {
+    result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn mcp_tools_authorize_the_requested_ledger() {
+    let signing_key = SigningKey::from_bytes(&[91; 32]);
+    let issuer = fluree_db_credential::did_from_pubkey(&signing_key.verifying_key().to_bytes());
+    let (_tmp, state) = mcp_state(&issuer).await;
+    let app = build_router(state);
+    create_ledger(&app, "open").await;
+    create_ledger(&app, "closed").await;
+
+    // Same issuer for both tokens: only the ledger claims differ.
+    let scoped = read_scoped_token(&["open"], 91);
+    let unscoped = {
+        let claims = json!({
+            "iss": issuer, "exp": now_secs() + 3600, "iat": now_secs(), "sub": "agent"
+        });
+        create_jws(&claims, &signing_key)
+    };
+
+    let model = |ledger: &str| json!({"ledger": ledger});
+    let query = |ledger: &str| json!({"ledger": ledger, "query": "SELECT ?s WHERE { ?s ?p ?o }"});
+
+    let allowed = mcp_tool(&app, &scoped, "get_data_model", model("open")).await;
+    assert_ne!(allowed["isError"], json!(true), "control: {allowed}");
+    let allowed = mcp_tool(&app, &scoped, "sparql_query", query("open")).await;
+    assert_ne!(allowed["isError"], json!(true), "control: {allowed}");
+
+    for (token, ledger) in [(&scoped, "closed"), (&unscoped, "open")] {
+        for (tool, args) in [
+            ("get_data_model", model(ledger)),
+            ("sparql_query", query(ledger)),
+        ] {
+            let denied = mcp_tool(&app, token, tool, args).await;
+            assert_eq!(
+                denied["isError"],
+                json!(true),
+                "{tool} on {ledger}: {denied}"
+            );
+            assert_eq!(tool_text(&denied), "Ledger not found");
+        }
+    }
+}

@@ -705,6 +705,13 @@ fluree-server \
   --mcp-auth-trusted-issuer did:key:z6Mk...
 ```
 
+Issuer trust admits a token; its ledger claims decide what it can reach. Both MCP tools
+authorize the requested ledger against `fluree.ledger.read.all` /
+`fluree.ledger.read.ledgers` (falling back to `fluree.storage.*`), the same claims the data
+API uses — see [Authentication](../security/authentication.md). A token with neither claim
+reaches no ledger; issue `"fluree.ledger.read.all": true` for an agent that should read
+everything.
+
 ## Peer Mode Configuration
 
 ### Peer Subscription

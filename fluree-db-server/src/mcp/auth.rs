@@ -12,7 +12,9 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use fluree_db_api::LedgerId;
 use fluree_db_credential::{verify_jws, EventsTokenPayload};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Verified principal from MCP Bearer token
@@ -24,6 +26,19 @@ pub struct McpPrincipal {
     pub subject: Option<String>,
     /// Resolved identity (fluree.identity ?? sub)
     pub identity: Option<String>,
+    /// Read access to all ledgers (`fluree.ledger.read.all`).
+    pub read_all: bool,
+    /// Ledgers this token may read (`fluree.ledger.read.ledgers`), parsed like
+    /// data API scopes: `mydb` means `mydb:main`.
+    pub read_ledgers: HashSet<LedgerId>,
+}
+
+impl McpPrincipal {
+    /// Whether this token may read `ledger_id`. Issuer trust admits a token;
+    /// its ledger claims decide what it reaches.
+    pub fn can_read(&self, ledger_id: &LedgerId) -> bool {
+        self.read_all || self.read_ledgers.contains(ledger_id)
+    }
 }
 
 /// Middleware to validate MCP Bearer tokens.
@@ -107,9 +122,12 @@ fn verify_mcp_token(
 
     // 5. Build principal
     let identity = payload.resolve_identity();
+    let (read_all, read_ledgers) = crate::extract::read_scopes(&payload);
     Ok(McpPrincipal {
         issuer: payload.iss,
         subject: payload.sub,
         identity,
+        read_all,
+        read_ledgers,
     })
 }

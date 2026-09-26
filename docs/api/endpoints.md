@@ -1859,7 +1859,11 @@ endpoint. Use `GET /ledgers` to list ledgers and graph sources,
 
 ### GET /ledgers
 
-List all ledgers and graph sources.
+List ledgers and graph sources.
+
+Follows data auth like `/info` and `/exists`: when data auth is required, a Bearer token is
+required, and a request carrying a token lists only the ledgers and graph sources its
+`fluree.ledger.read.*` claims cover.
 
 **URL:**
 ```

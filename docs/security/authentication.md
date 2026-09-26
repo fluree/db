@@ -205,6 +205,8 @@ All Bearer-token-authenticated endpoints support both Ed25519 and OIDC verificat
 | Events (SSE) | `MaybeBearer` | `fluree.events.*` |
 | Storage proxy | `StorageProxyBearer` | `fluree.storage.*` |
 | Nameservice refs | `StorageProxyBearer` | `fluree.storage.*` |
+| Ledger listing (`GET /ledgers`) | `MaybeDataBearer` | `fluree.ledger.read.*` — lists only readable ledgers |
+| MCP tools | MCP issuer trust | `fluree.ledger.read.*` (then `fluree.storage.*`) |
 
 MCP endpoints currently use the Ed25519 path only.
 

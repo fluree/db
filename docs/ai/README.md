@@ -18,7 +18,7 @@ A self-describing query envelope designed for LLM consumption: datatypes declare
 
 Fluree exposes Model Context Protocol in two distinct places:
 
-- **Server `/mcp` endpoint** — turns a running ledger into a tool an agent can call. Exposes `sparql_query` (results returned as Agent JSON, byte-budgeted) and `get_data_model` (schema/stats discovery). Off by default; enable with `--mcp-enabled` and protect it with `--mcp-auth-trusted-issuer`. Tune the Agent JSON budget and query timeout per the config reference.
+- **Server `/mcp` endpoint** — turns a running ledger into a tool an agent can call. Exposes `sparql_query` (results returned as Agent JSON, byte-budgeted) and `get_data_model` (schema/stats discovery). Off by default; enable with `--mcp-enabled` and protect it with `--mcp-auth-trusted-issuer`; each token reaches only the ledgers its `fluree.ledger.read.*` claims cover. Tune the Agent JSON budget and query timeout per the config reference.
 
   → [MCP endpoint configuration](../operations/configuration.md#mcp-endpoint)
 

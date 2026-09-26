@@ -578,7 +578,14 @@ pub struct ListEntry {
 /// List all ledgers and graph sources
 ///
 /// GET /fluree/ledgers
-pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec<ListEntry>>> {
+///
+/// Follows data auth like `/info` and `/exists`: a bearer is required when
+/// data auth is, and a request carrying one sees only what its token can read.
+pub async fn list_ledgers(
+    State(state): State<Arc<AppState>>,
+    bearer: MaybeDataBearer,
+) -> Result<Json<Vec<ListEntry>>> {
+    let readable = |id: &fluree_db_api::LedgerId| bearer.0.as_ref().is_none_or(|p| p.can_read(id));
     let ledger_records = state
         .fluree
         .nameservice()
@@ -596,7 +603,7 @@ pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec
     let mut entries = Vec::new();
 
     for r in &ledger_records {
-        if r.retracted {
+        if r.retracted || !readable(&r.ledger_id) {
             continue;
         }
         entries.push(ListEntry {
@@ -609,7 +616,7 @@ pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec
     }
 
     for gs in &gs_records {
-        if gs.retracted {
+        if gs.retracted || !readable(&gs.graph_source_id) {
             continue;
         }
         entries.push(ListEntry {
