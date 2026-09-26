@@ -348,9 +348,15 @@ builds from the small side and probes by scanning the large predicate's
 *contiguous* PSOT/POST partition exactly once — that scan alone is ~75 ms at
 100 M.
 
-**`PropertyJoinOperator`** — fuses same-subject multi-predicate stars
-(`?s :name ?n . ?s :age ?a . ?s :email ?e`) into per-predicate PSOT scans instead
-of a join chain.
+**`PropertyJoinOperator`** — fuses same-subject multi-predicate stars anchored by
+a bound object or a range filter (`?s a :Person ; :name ?n ; :email ?e`) instead
+of a join chain. One scan of the anchor seeds the subjects; the other predicates
+are looked up for just those subjects, by batched PSOT probes or a single SPOT
+walk. On a current-state read, a bound-object anchor is read a chunk of subjects
+at a time (1,024 at first, growing eightfold to 100,000) and each chunk's rows are
+handed over before the next is read, so an outer `LIMIT` stops as soon as it is
+satisfied — including a `LIMIT` behind `DISTINCT`, which never passes a row
+budget down.
 
 **`SemijoinOperator`** — turns `EXISTS` / `NOT EXISTS` from per-row correlated
 subquery evaluation into a single uncorrelated build plus hash probes. Rows whose

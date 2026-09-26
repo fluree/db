@@ -34,19 +34,21 @@ use crate::fast_path_common::{
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::join::{
     batched_subject_probe_binary, batched_subject_star_spot, make_dict_overlay,
-    BatchedSpotStarMatch, BatchedSubjectProbeMatch, SpotStarPredicateParams, SubjectProbeParams,
+    SpotStarPredicateParams, SubjectProbeParams,
 };
+use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::temporal_mode::{PlanningContext, TemporalMode};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::DatatypeConstraint;
-use fluree_db_core::{ObjectBounds, Sid};
+use fluree_db_core::{ObjectBounds, Sid, BATCHED_JOIN_SIZE};
 use indexmap::IndexMap;
 use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -86,10 +88,10 @@ fn make_property_join_scan(
 /// values per emitted predicate). Insertion-ordered, so rows come out in the
 /// driver scan's subject order.
 ///
-/// Emission tracks subjects by position (`subject_idx`, `current_subject`),
-/// which stays valid only while the map is append-only. Removal (`retain`)
-/// is confined to `open`, before any position is taken; anything that fills
-/// the map during emission must only append.
+/// Emission tracks subjects by position (`subject_idx`, `chunk`,
+/// `current_subject`), which stays valid only while the map is append-only:
+/// each chunk appends driver subjects, and the map is cleared only in `open`
+/// and `close`.
 type SubjectMap = IndexMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>), FxBuildHasher>;
 
 /// Property-join operator for same-subject multi-predicate patterns
@@ -110,6 +112,16 @@ type SubjectMap = IndexMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>), FxBuil
 /// correct cross-ledger joins. The operator accepts both `Binding::Sid` (single-ledger)
 /// and `Binding::IriMatch` (multi-ledger) from scans and emits the appropriate
 /// binding type in output rows.
+///
+/// # Streaming
+///
+/// The driver scan is read a chunk of subjects at a time, and each chunk is
+/// probed for the other predicates and emitted before the next is read, so an
+/// outer `LIMIT` stops the work. That needs a bound-object driver (a subject
+/// takes nothing from later driver rows, so a chunk can close anywhere), a
+/// subject-probe lane for every other predicate (a chunk costs in proportion
+/// to its subjects), and a current-state read. Otherwise the whole driver is
+/// one chunk.
 pub struct PropertyJoinOperator {
     /// The shared subject variable
     subject_var: VarId,
@@ -125,10 +137,14 @@ pub struct PropertyJoinOperator {
     /// - Dataset/multi-ledger: use canonical IRI strings (cross-ledger safe)
     ///
     /// The subject_binding is preserved from the scan to emit the correct type.
-    /// After `open`, holds only subjects that matched every required predicate.
+    /// Holds every driver subject read so far, in driver order; a chunk is a
+    /// range of it. Earlier chunks stay so a subject the driver repeats is
+    /// joined once.
     subject_values: SubjectMap,
     /// Next position in `subject_values` to expand.
     subject_idx: usize,
+    /// Positions in `subject_values` of the chunk being emitted.
+    chunk: Range<usize>,
     /// Position of the subject currently being expanded into cartesian rows
     /// across batches.
     current_subject: Option<usize>,
@@ -147,6 +163,70 @@ pub struct PropertyJoinOperator {
     mode: TemporalMode,
     /// Binding emitted for an optional predicate with no values.
     unmatched: Binding,
+    /// Row budget from an outer `LIMIT`; sizes the first chunk.
+    row_budget: Option<usize>,
+    /// Predicate indices in read order, the driver first.
+    scan_order: Vec<usize>,
+    /// Presence bits a subject must collect to produce rows.
+    required_mask: u64,
+    /// Driver scan, open until exhausted.
+    driver: Option<BoxedOperator>,
+    /// Driver rows not yet read when the last chunk filled mid-batch.
+    driver_pending: Option<(Batch, usize)>,
+    /// Size of the next chunk; `None` reads the rest of the driver into one.
+    chunk_schedule: Option<FlushSchedule>,
+    /// Last encoded driver subject id, to notice a driver that isn't in
+    /// subject order.
+    last_driver_id: Option<u64>,
+    /// How the other predicates are read, planned on the first chunk whose
+    /// subjects all have encoded ids.
+    lanes: Option<ChunkLanes>,
+    stats: ProbeStats,
+}
+
+/// How the non-driver predicates are read for a chunk of driver subjects.
+///
+/// A lane's `probe_ops` reconciler is shared across driver chunks and probe
+/// sub-chunks. That is sound only because every subject lands in exactly one
+/// driver chunk (a subject the driver repeats is already in the map and
+/// joins no later chunk), so the reconciler is never asked about a subject
+/// twice.
+enum ChunkLanes {
+    /// One SPOT walk over the chunk's subjects covers every predicate.
+    SpotStar {
+        predicates: Vec<(usize, Sid)>,
+        probe_ops: Option<ProbeOps>,
+    },
+    /// Each predicate on its own lane, in read order.
+    PerPredicate(Vec<PredicateLane>),
+}
+
+enum PredicateLane {
+    /// Batched PSOT probe over the chunk's subjects.
+    Probe {
+        pred_idx: usize,
+        pred_sid: Sid,
+        probe_ops: Option<ProbeOps>,
+    },
+    /// Full predicate scan, keeping rows for the chunk's subjects.
+    Scan { pred_idx: usize },
+}
+
+impl ChunkLanes {
+    fn has_scan(&self) -> bool {
+        matches!(self, ChunkLanes::PerPredicate(lanes)
+            if lanes.iter().any(|lane| matches!(lane, PredicateLane::Scan { .. })))
+    }
+}
+
+#[derive(Default)]
+struct ProbeStats {
+    chunks: u64,
+    used_batched_probe: bool,
+    used_spot_star_walk: bool,
+    probe_chunks: u64,
+    probe_subjects_total: u64,
+    scan_rows_total: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -277,82 +357,529 @@ impl PropertyJoinOperator {
         }
     }
 
-    fn ingest_probe_match(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        all_subject_values: &mut SubjectMap,
+    /// Mark predicate `pred_idx` present on a probed subject, keeping the
+    /// object when that predicate is emitted. The probe lanes only run over a
+    /// chunk whose keys are all encoded ids, so the id is the key.
+    fn ingest_match(
+        subject_values: &mut SubjectMap,
+        subject_id: u64,
         pred_idx: usize,
-        probe_match: BatchedSubjectProbeMatch,
-    ) -> Result<()> {
-        let subject = Binding::encoded_sid(probe_match.subject_id);
-        if let Some(key) = Self::subject_key(ctx, &subject)? {
-            if let Some(entry) = all_subject_values.get_mut(&key) {
-                entry.1 |= 1u64 << pred_idx;
-                if let (Some(epos), Some(object)) =
-                    (self.emit_positions[pred_idx], probe_match.object)
-                {
-                    entry.2[epos].push(object);
-                }
+        emit_pos: Option<usize>,
+        object: Option<Binding>,
+    ) {
+        if let Some(entry) = subject_values.get_mut(&SubjectKey::Id(subject_id)) {
+            entry.1 |= 1u64 << pred_idx;
+            if let (Some(epos), Some(object)) = (emit_pos, object) {
+                entry.2[epos].push(object);
             }
         }
-        Ok(())
     }
 
-    fn ingest_spot_star_match(
+    /// Sorted encoded ids of the chunk's subjects, or `None` when the probe
+    /// lanes can't serve them (any subject without an encoded id).
+    fn chunk_subject_ids(
         &self,
         ctx: &ExecutionContext<'_>,
-        all_subject_values: &mut SubjectMap,
-        spot_match: BatchedSpotStarMatch,
-    ) -> Result<()> {
-        let subject = Binding::encoded_sid(spot_match.subject_id);
-        if let Some(key) = Self::subject_key(ctx, &subject)? {
-            if let Some(entry) = all_subject_values.get_mut(&key) {
-                entry.1 |= 1u64 << spot_match.predicate_idx;
-                if let (Some(epos), Some(object)) = (
-                    self.emit_positions[spot_match.predicate_idx],
-                    spot_match.object,
-                ) {
-                    entry.2[epos].push(object);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn capture_driver_subject_ids(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        order_pos: usize,
-        all_subject_values: &SubjectMap,
+        chunk: Range<usize>,
     ) -> Option<Vec<u64>> {
-        if order_pos != 0 || ctx.binary_store.is_none() {
+        if chunk.is_empty() || ctx.binary_store.is_none() {
             return None;
         }
-
-        let mut ids: Vec<u64> = Vec::with_capacity(all_subject_values.len());
-        for key in all_subject_values.keys() {
+        let mut ids: Vec<u64> = Vec::with_capacity(chunk.len());
+        for (key, _) in self.subject_values.get_range(chunk)? {
             if let SubjectKey::Id(s_id) = key {
                 ids.push(*s_id);
             } else {
                 return None;
             }
         }
-        (!ids.is_empty()).then_some(ids)
+        ids.sort_unstable();
+        Some(ids)
     }
 
     fn can_spot_walk_remaining(
         &self,
         ctx: &ExecutionContext<'_>,
-        driver_subject_ids: &Option<Vec<u64>>,
         remaining_predicates: &[usize],
     ) -> bool {
-        driver_subject_ids.is_some()
-            && !ctx.is_multi_ledger()
+        !ctx.is_multi_ledger()
             && ctx.binary_store.is_some()
             && !remaining_predicates.is_empty()
             && remaining_predicates
                 .iter()
                 .all(|&idx| self.predicates[idx].dtc.is_none())
+    }
+
+    /// Choose a lane for every non-driver predicate. The choice depends only
+    /// on the predicates and the overlay, so one plan serves every chunk.
+    fn plan_lanes(&self, ctx: &ExecutionContext<'_>) -> Result<ChunkLanes> {
+        let remaining = &self.scan_order[1..];
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return Ok(ChunkLanes::PerPredicate(
+                remaining
+                    .iter()
+                    .map(|&pred_idx| PredicateLane::Scan { pred_idx })
+                    .collect(),
+            ));
+        };
+
+        if self.can_spot_walk_remaining(ctx, remaining) {
+            let predicates: Vec<(usize, Sid)> = remaining
+                .iter()
+                .filter_map(|&idx| {
+                    let pred_sid = try_normalize_pred_sid(store, &self.predicates[idx].pred_ref)?;
+                    Some((idx, pred_sid))
+                })
+                .collect();
+            if predicates.len() == remaining.len() {
+                let pred_refs: Vec<&Sid> = predicates.iter().map(|(_, sid)| sid).collect();
+                match star_probe_lane_plan(ctx, store, &pred_refs)? {
+                    ProbeLanePlan::Decline => {}
+                    ProbeLanePlan::Clean => {
+                        return Ok(ChunkLanes::SpotStar {
+                            predicates,
+                            probe_ops: None,
+                        })
+                    }
+                    ProbeLanePlan::Merge(ops) => {
+                        return Ok(ChunkLanes::SpotStar {
+                            predicates,
+                            probe_ops: ProbeOps::new(ops),
+                        })
+                    }
+                }
+            }
+        }
+
+        // Probes don't replay an unmergeable overlay; those predicates take
+        // the overlay-correct per-predicate scan.
+        let mut lanes = Vec::with_capacity(remaining.len());
+        for &pred_idx in remaining {
+            let predicate = &self.predicates[pred_idx];
+            let pred_sid = (!ctx.is_multi_ledger() && predicate.dtc.is_none())
+                .then(|| try_normalize_pred_sid(store, &predicate.pred_ref))
+                .flatten();
+            let lane = match pred_sid {
+                Some(pred_sid) => match subject_probe_lane_plan(ctx, store, &pred_sid)? {
+                    ProbeLanePlan::Decline => PredicateLane::Scan { pred_idx },
+                    ProbeLanePlan::Clean => PredicateLane::Probe {
+                        pred_idx,
+                        pred_sid,
+                        probe_ops: None,
+                    },
+                    ProbeLanePlan::Merge(ops) => PredicateLane::Probe {
+                        pred_idx,
+                        pred_sid,
+                        probe_ops: ProbeOps::new(ops),
+                    },
+                },
+                None => PredicateLane::Scan { pred_idx },
+            };
+            lanes.push(lane);
+        }
+        Ok(ChunkLanes::PerPredicate(lanes))
+    }
+
+    /// Scan for one predicate: the subject column, plus the object when it is
+    /// emitted.
+    fn predicate_scan(&self, ctx: &ExecutionContext<'_>, pred_idx: usize) -> BoxedOperator {
+        let predicate = &self.predicates[pred_idx];
+        // Create pattern: ?s :pred ?o (temp var for object, accessed by index)
+        // pred_ref is already a Ref (Sid or Iri) so use it directly.
+        let (object, bounds) = match &predicate.object {
+            PropertyJoinObject::Var(obj_var) => (
+                Term::Var(TEMP_OBJECT_VAR),
+                self.object_bounds.get(obj_var).cloned(),
+            ),
+            PropertyJoinObject::Bound(term) => (term.clone(), None),
+        };
+        let pattern = TriplePattern {
+            s: Ref::Var(self.subject_var),
+            p: predicate.pred_ref.clone(),
+            o: object,
+            dtc: predicate.dtc.clone(),
+        };
+
+        // Create scan with optional bounds pushdown for this object variable.
+        //
+        // `DatasetOperator` wraps the scan for multi-graph fanout;
+        // inner `BinaryScanOperator` selects between binary cursor
+        // and range fallback at open() time.
+        let emit = if predicate.emit_object {
+            // Subject + object (no predicate column) for emitted predicates.
+            EmitMask {
+                s: true,
+                p: false,
+                o: true,
+            }
+        } else if ctx.default_graphs_slice().is_some_and(|g| g.len() >= 2) {
+            // Existence-only over a MULTI-member default union: the
+            // DatasetOperator arms the §13.2 set-dedup, whose key
+            // needs every VARIABLE column emitted (a pruned object
+            // column would collapse distinct triples — the operator
+            // now fails loud on that combination). Widen to include
+            // the object; the consumer below keys off `emit_obj` and
+            // simply ignores the extra column.
+            EmitMask {
+                s: true,
+                p: false,
+                o: true,
+            }
+        } else {
+            // Existence-only: only need the subject column.
+            EmitMask {
+                s: true,
+                p: false,
+                o: false,
+            }
+        };
+        make_property_join_scan(pattern, bounds, emit, self.mode)
+    }
+
+    /// Read driver rows into `subject_values` until the chunk starting at
+    /// `chunk_start` holds as many subjects as the schedule allows, or the
+    /// driver is exhausted.
+    async fn fill_chunk(&mut self, ctx: &ExecutionContext<'_>, chunk_start: usize) -> Result<()> {
+        let driver_idx = self.scan_order[0];
+        let emit_pos = self.emit_positions[driver_idx];
+        let emit_count = self.emitted_required.len();
+        let chunk_full = |op: &Self| {
+            op.chunk_schedule
+                .is_some_and(|schedule| op.subject_values.len() - chunk_start >= schedule.size())
+        };
+
+        while !chunk_full(self) {
+            let (batch, start) = match self.driver_pending.take() {
+                Some(pending) => pending,
+                None => {
+                    let Some(scan) = self.driver.as_mut() else {
+                        return Ok(());
+                    };
+                    match scan.next_batch(ctx).await? {
+                        Some(batch) => (batch, 0),
+                        None => {
+                            scan.close();
+                            self.driver = None;
+                            return Ok(());
+                        }
+                    }
+                }
+            };
+            // Rows here are priced by the inner scan's emission charge.
+            ctx.check_cancelled()?;
+            // Schema for this scan is either:
+            // - emitted predicate: [subject_var, temp_obj_var]
+            // - existence-only:   [subject_var]
+            let Some(subjects) = batch.column_by_idx(0) else {
+                continue;
+            };
+            let objects = batch.column_by_idx(1);
+            if emit_pos.is_some() && objects.is_none() {
+                continue;
+            }
+
+            let mut stop = None;
+            for row in start..subjects.len() {
+                if chunk_full(self) {
+                    stop = Some(row);
+                    break;
+                }
+                let subject = &subjects[row];
+                let Some(key) = Self::subject_key(ctx, subject)? else {
+                    continue;
+                };
+                // Chunks must be ascending id ranges so they partition the
+                // probe lanes' walk; any other driver order is read whole.
+                match key {
+                    SubjectKey::Id(s_id) => {
+                        if self.last_driver_id.is_some_and(|last| s_id < last) {
+                            self.chunk_schedule = None;
+                        }
+                        self.last_driver_id = Some(s_id);
+                    }
+                    _ => self.chunk_schedule = None,
+                }
+                let entry = self
+                    .subject_values
+                    .entry(key)
+                    .or_insert_with(|| (subject.clone(), 0u64, vec![Vec::new(); emit_count]));
+                entry.1 |= 1u64 << driver_idx;
+                if let (Some(epos), Some(objects)) = (emit_pos, objects) {
+                    entry.2[epos].push(objects[row].clone());
+                }
+            }
+            let read = stop.unwrap_or(subjects.len()) - start;
+            self.stats.scan_rows_total += read as u64;
+            if let Some(row) = stop {
+                self.driver_pending = Some((batch, row));
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the next chunk of driver subjects and look up the other
+    /// predicates for it.
+    async fn next_chunk(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        // Emitted subjects' values are never read again.
+        if let Some(done) = self.subject_values.get_range_mut(self.chunk.clone()) {
+            for (_, _, values) in done.values_mut() {
+                *values = Vec::new();
+            }
+        }
+
+        let chunk_start = self.subject_values.len();
+        self.fill_chunk(ctx, chunk_start).await?;
+        let mut ids = self.chunk_subject_ids(ctx, chunk_start..self.subject_values.len());
+        if ids.is_some() && self.lanes.is_none() {
+            self.lanes = Some(self.plan_lanes(ctx)?);
+        }
+        let probes_only = ids.is_some() && !self.lanes.as_ref().is_some_and(ChunkLanes::has_scan);
+        if self.chunk_schedule.is_some() && !probes_only {
+            // Only probes cost in proportion to the chunk; a scan reads its
+            // whole predicate, so run it once over every remaining subject.
+            self.chunk_schedule = None;
+            self.fill_chunk(ctx, chunk_start).await?;
+            ids = self.chunk_subject_ids(ctx, chunk_start..self.subject_values.len());
+        }
+        self.chunk = chunk_start..self.subject_values.len();
+        self.subject_idx = chunk_start;
+        if !self.chunk.is_empty() && self.scan_order.len() > 1 {
+            self.read_lanes(ctx, self.chunk.clone(), ids).await?;
+        }
+
+        if let Some(schedule) = self.chunk_schedule.as_mut() {
+            schedule.advance();
+        }
+        self.stats.chunks += 1;
+        Ok(())
+    }
+
+    /// Look up every non-driver predicate for the chunk's subjects. `ids` is
+    /// `None` when some subject has no encoded id; only scans serve those.
+    async fn read_lanes(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        chunk: Range<usize>,
+        ids: Option<Vec<u64>>,
+    ) -> Result<()> {
+        if let Some(ids) = ids {
+            let mut lanes = self
+                .lanes
+                .take()
+                .ok_or_else(|| QueryError::Internal("property join lanes not planned".into()))?;
+            let result = self.read_planned_lanes(ctx, &mut lanes, chunk, &ids).await;
+            self.lanes = Some(lanes);
+            return result;
+        }
+        for pos in 1..self.scan_order.len() {
+            self.scan_into_chunk(ctx, self.scan_order[pos], chunk.start)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn read_planned_lanes(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        lanes: &mut ChunkLanes,
+        chunk: Range<usize>,
+        ids: &[u64],
+    ) -> Result<()> {
+        let store = ctx.binary_store.as_ref().ok_or_else(|| {
+            QueryError::Internal("property join probe without a binary store".into())
+        })?;
+        let dict_overlay = make_dict_overlay(ctx, store);
+        match lanes {
+            ChunkLanes::SpotStar {
+                predicates,
+                probe_ops,
+            } => {
+                let spot_predicates: Vec<SpotStarPredicateParams<'_>> = predicates
+                    .iter()
+                    .map(|(idx, pred_sid)| {
+                        let predicate = &self.predicates[*idx];
+                        SpotStarPredicateParams {
+                            predicate_idx: *idx,
+                            pred_sid: pred_sid.clone(),
+                            object_bounds: self.predicate_bounds(predicate),
+                            bound_object: Self::predicate_bound_object(predicate),
+                            emit_object: self.emit_positions[*idx].is_some(),
+                        }
+                    })
+                    .collect();
+                let spot_matches = batched_subject_star_spot(
+                    ctx,
+                    store,
+                    ids,
+                    &spot_predicates,
+                    dict_overlay.as_ref(),
+                    probe_ops.as_mut(),
+                )?;
+                self.stats.used_spot_star_walk = true;
+                self.stats.scan_rows_total += spot_matches.len() as u64;
+                for m in spot_matches {
+                    Self::ingest_match(
+                        &mut self.subject_values,
+                        m.subject_id,
+                        m.predicate_idx,
+                        self.emit_positions[m.predicate_idx],
+                        m.object,
+                    );
+                }
+            }
+            ChunkLanes::PerPredicate(lanes) => {
+                for lane in lanes {
+                    match lane {
+                        PredicateLane::Probe {
+                            pred_idx,
+                            pred_sid,
+                            probe_ops,
+                        } => self.probe_into_chunk(
+                            ctx,
+                            store,
+                            *pred_idx,
+                            pred_sid,
+                            probe_ops.as_mut(),
+                            ids,
+                            dict_overlay.as_ref(),
+                        )?,
+                        PredicateLane::Scan { pred_idx } => {
+                            self.scan_into_chunk(ctx, *pred_idx, chunk.start).await?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Batched PSOT probe of one predicate for the chunk's sorted subject ids.
+    #[allow(clippy::too_many_arguments)]
+    fn probe_into_chunk(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+        pred_idx: usize,
+        pred_sid: &Sid,
+        mut probe_ops: Option<&mut ProbeOps>,
+        ids: &[u64],
+        dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    ) -> Result<()> {
+        // IMPORTANT: Batched join uses the min/max s_id range of the left batch
+        // to decide which leaf files/leaflets to scan. If the subject IDs are
+        // sparse across the full id space, a single huge batch can still scan
+        // nearly the entire predicate partition.
+        //
+        // To improve locality, chunk the subject IDs into smaller sorted ranges
+        // and probe each chunk independently. We split both by count and by
+        // span to avoid scanning large gaps.
+        const PROBE_CHUNK_SIZE: usize = 256;
+        const PROBE_MAX_SPAN: u64 = 100_000;
+
+        let emit_pos = self.emit_positions[pred_idx];
+        let mut chunk_start: usize = 0;
+        for i in 1..=ids.len() {
+            let is_end = i == ids.len();
+            let size = i - chunk_start;
+            let span = ids[i - 1].saturating_sub(ids[chunk_start]);
+            if !(is_end || size >= PROBE_CHUNK_SIZE || span > PROBE_MAX_SPAN) {
+                continue;
+            }
+
+            let chunk = &ids[chunk_start..i];
+            self.stats.used_batched_probe = true;
+            self.stats.probe_chunks += 1;
+            self.stats.probe_subjects_total += chunk.len() as u64;
+            let predicate = &self.predicates[pred_idx];
+            let probe_matches = batched_subject_probe_binary(
+                ctx,
+                store,
+                &SubjectProbeParams {
+                    pred_sid,
+                    subject_ids: chunk,
+                    object_bounds: self.predicate_bounds(predicate),
+                    bound_object: Self::predicate_bound_object(predicate),
+                    emit_object: emit_pos.is_some(),
+                    dict_overlay,
+                },
+                probe_ops.as_deref_mut(),
+            )?;
+            self.stats.scan_rows_total += probe_matches.len() as u64;
+            for m in probe_matches {
+                Self::ingest_match(
+                    &mut self.subject_values,
+                    m.subject_id,
+                    pred_idx,
+                    emit_pos,
+                    m.object,
+                );
+            }
+            chunk_start = i;
+        }
+        Ok(())
+    }
+
+    /// Scan one predicate in full, keeping rows for subjects at or after
+    /// `chunk_start` in `subject_values`.
+    async fn scan_into_chunk(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        pred_idx: usize,
+        chunk_start: usize,
+    ) -> Result<()> {
+        let emit_pos = self.emit_positions[pred_idx];
+        let mut scan = self.predicate_scan(ctx, pred_idx);
+        scan.open(ctx).await?;
+        while let Some(batch) = scan.next_batch(ctx).await? {
+            // Rows here are priced by the inner scan's emission charge.
+            ctx.check_cancelled()?;
+            let Some(subjects) = batch.column_by_idx(0) else {
+                continue;
+            };
+            let objects = batch.column_by_idx(1);
+            if emit_pos.is_some() && objects.is_none() {
+                continue;
+            }
+            self.stats.scan_rows_total += batch.len() as u64;
+            for (row, subject) in subjects.iter().enumerate() {
+                let Some(key) = Self::subject_key(ctx, subject)? else {
+                    continue;
+                };
+                let Some((idx, _, entry)) = self.subject_values.get_full_mut(&key) else {
+                    continue;
+                };
+                if idx < chunk_start {
+                    continue;
+                }
+                entry.1 |= 1u64 << pred_idx;
+                if let (Some(epos), Some(objects)) = (emit_pos, objects) {
+                    entry.2[epos].push(objects[row].clone());
+                }
+            }
+            ctx.check_cancelled()?;
+        }
+        scan.close();
+        Ok(())
+    }
+
+    /// Move to the next subject in the chunk that has a row to emit.
+    fn next_subject(&mut self) -> bool {
+        while self.subject_idx < self.chunk.end {
+            let idx = self.subject_idx;
+            self.subject_idx += 1;
+            let Some((_, (_, mask, values_per_pred))) = self.subject_values.get_index(idx) else {
+                continue;
+            };
+            if *mask & self.required_mask != self.required_mask
+                || !Self::has_cartesian_row(values_per_pred, &self.emitted_required)
+            {
+                continue;
+            }
+            self.current_indices = vec![0; values_per_pred.len()];
+            self.current_subject = Some(idx);
+            return true;
+        }
+        false
     }
 
     /// Create a new property-join operator from patterns
@@ -493,6 +1020,7 @@ impl PropertyJoinOperator {
             state: OperatorState::Created,
             subject_values: SubjectMap::default(),
             subject_idx: 0,
+            chunk: 0..0,
             current_subject: None,
             current_indices: Vec::new(),
             object_bounds,
@@ -501,6 +1029,15 @@ impl PropertyJoinOperator {
             inline_ops,
             mode: planning.mode(),
             unmatched: planning.unmatched_optional.binding(),
+            row_budget: None,
+            scan_order: Vec::new(),
+            required_mask: 0,
+            driver: None,
+            driver_pending: None,
+            chunk_schedule: None,
+            last_driver_id: None,
+            lanes: None,
+            stats: ProbeStats::default(),
         })
     }
 
@@ -752,11 +1289,6 @@ impl PropertyJoinOperator {
     }
 }
 
-/// Charge the fused lane's row work at a chunk/batch boundary.
-///
-/// The fused star lanes drain scans, probes, and SPOT walks whose per-row
-/// work never crosses the fuel-charging surfaces (leaflet touches are far
-
 #[async_trait]
 impl Operator for PropertyJoinOperator {
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
@@ -782,6 +1314,12 @@ impl Operator for PropertyJoinOperator {
         &self.output_schema
     }
 
+    /// Sizes the first chunk; the budget isn't forwarded, since a subject
+    /// may produce any number of rows.
+    fn set_row_budget(&mut self, budget: usize) {
+        self.row_budget = Some(budget);
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         let span = tracing::debug_span!(
             "property_join_open",
@@ -791,32 +1329,22 @@ impl Operator for PropertyJoinOperator {
             has_bounds = !self.object_bounds.is_empty(),
         );
         async {
+            if let Some(mut driver) = self.driver.take() {
+                driver.close();
+            }
             self.state = OperatorState::Open;
             self.subject_values.clear();
             self.subject_idx = 0;
+            self.chunk = 0..0;
             self.current_subject = None;
             self.current_indices.clear();
+            self.driver_pending = None;
+            self.last_driver_id = None;
+            self.lanes = None;
+            self.stats = ProbeStats::default();
 
-            // For each predicate, scan and collect (subject -> values) mappings.
-            // Key by a join-safe subject key (encoded IDs in single-ledger mode).
-            //
-            // Optimization: if a predicate has object bounds (range filter pushdown),
-            // scan it first to get a selective subject set, then use that as a semi-join
-            // driver for subsequent predicates in single-ledger binary mode.
-            //
-            // This turns a common "date filter + vector predicate" workload from:
-            //   scan(date with bounds) + scan(vec full) + intersect
-            // into:
-            //   scan(date with bounds) + batched probe(vec for matching subjects)
-            //
-            // NOTE: The batched probe path currently requires:
-            // - single-ledger (no dataset)
-            // - binary_store present
-            // - no datatype constraint on the probed predicate (dt=None)
-            // Map: subject -> (subject_binding, presence_mask, emitted_values)
             // presence_mask has one bit per predicate index, regardless of emit flag.
-            let mut all_subject_values = SubjectMap::default();
-            let required_mask: u64 = if self.predicates.len() >= 64 {
+            self.required_mask = if self.predicates.len() >= 64 {
                 u64::MAX
             } else {
                 self.predicates
@@ -826,6 +1354,10 @@ impl Operator for PropertyJoinOperator {
                     .fold(0u64, |mask, (idx, _)| mask | (1u64 << idx))
             };
 
+            // The driver scan seeds the subject set; every other predicate is
+            // then looked up for those subjects only, by a batched subject
+            // probe or SPOT star walk when the binary store can serve it, or
+            // else by a scan of the whole predicate.
             let replay = ctx
                 .binary_store
                 .as_ref()
@@ -857,327 +1389,27 @@ impl Operator for PropertyJoinOperator {
                     .filter(|(_, predicate)| !predicate.required)
                     .map(|(idx, _)| idx),
             );
+            self.scan_order = scan_order;
 
-            let mut driver_subject_ids: Option<Vec<u64>> = None;
-            let mut used_batched_probe = false;
-            let mut used_spot_star_walk = false;
-            let mut probe_chunks: u64 = 0;
-            let mut probe_subjects_total: u64 = 0;
-            let mut scan_rows_total: u64 = 0;
-            let emit_count = self.emit_positions.iter().flatten().count();
-
-            for (order_pos, pred_idx) in scan_order.iter().copied().enumerate() {
-                let predicate = &self.predicates[pred_idx];
-
-                // If we have a driver subject set and we're in the right execution mode,
-                // try a batched subject probe for this predicate.
-                // Batched probe requires binary store with batched_lookup support.
-                // Historical snapshots (`to_t < max_t`) are handled inside the
-                // probe helpers via `replay_leaflet_at_t`. Novelty overlay is
-                // NOT handled — the probe walks base leaflets directly, so an
-                // active overlay must use the per-predicate scan below instead.
-                let can_batched_probe = order_pos > 0
-                    && driver_subject_ids.is_some()
-                    && !ctx.is_multi_ledger()
-                    && ctx.binary_store.is_some()
-                    && predicate.dtc.is_none();
-
-                if can_batched_probe {
-                    let store = ctx.binary_store.as_ref().unwrap();
-                    let pred_sid = try_normalize_pred_sid(store, &predicate.pred_ref);
-
-                    if let Some(pred_sid) = pred_sid {
-                        let subject_ids = driver_subject_ids.as_ref().unwrap();
-                        // Unmergeable overlays fall through to the
-                        // per-predicate scan below (overlay-correct cursor).
-                        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
-                        if !subject_ids.is_empty() && !matches!(lane_plan, ProbeLanePlan::Decline) {
-                            // One reconciler per predicate, shared across its
-                            // chunks: chunked subject sets are disjoint, so
-                            // consumed-state never collides.
-                            let mut probe_ops = match &lane_plan {
-                                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
-                                _ => None,
-                            };
-                            let dict_overlay = make_dict_overlay(ctx, store);
-                            // IMPORTANT: Batched join uses the min/max s_id range of the left batch
-                            // to decide which leaf files/leaflets to scan. If the subject IDs are
-                            // sparse across the full id space, a single huge batch can still scan
-                            // nearly the entire predicate partition.
-                            //
-                            // To improve locality, chunk the subject IDs into smaller sorted ranges
-                            // and probe each chunk independently. We split both by count and by
-                            // span to avoid scanning large gaps.
-                            const PROBE_CHUNK_SIZE: usize = 256;
-                            const PROBE_MAX_SPAN: u64 = 100_000;
-
-                            let mut ids = subject_ids.clone();
-                            ids.sort_unstable();
-
-                            let mut chunk_start: usize = 0;
-                            for i in 1..=ids.len() {
-                                let is_end = i == ids.len();
-                                let size = i - chunk_start;
-                                let span = if size == 0 {
-                                    0
-                                } else {
-                                    ids[i - 1].saturating_sub(ids[chunk_start])
-                                };
-                                let should_split =
-                                    is_end || size >= PROBE_CHUNK_SIZE || span > PROBE_MAX_SPAN;
-                                if !should_split {
-                                    continue;
-                                }
-
-                                let chunk = &ids[chunk_start..i];
-                                if chunk.is_empty() {
-                                    continue;
-                                }
-                                used_batched_probe = true;
-                                probe_chunks += 1;
-                                probe_subjects_total += chunk.len() as u64;
-                                let emit_obj = self.emit_positions[pred_idx].is_some();
-                                let probe_matches = batched_subject_probe_binary(
-                                    ctx,
-                                    store,
-                                    &SubjectProbeParams {
-                                        pred_sid: &pred_sid,
-                                        subject_ids: chunk,
-                                        object_bounds: self.predicate_bounds(predicate),
-                                        bound_object: Self::predicate_bound_object(predicate),
-                                        emit_object: emit_obj,
-                                        dict_overlay: dict_overlay.as_ref(),
-                                    },
-                                    probe_ops.as_mut(),
-                                )?;
-                                scan_rows_total += probe_matches.len() as u64;
-                                for probe_match in probe_matches {
-                                    self.ingest_probe_match(
-                                        ctx,
-                                        &mut all_subject_values,
-                                        pred_idx,
-                                        probe_match,
-                                    )?;
-                                }
-                                chunk_start = i;
-                            }
-
-                            continue;
-                        }
-                    }
-                }
-
-                // Create pattern: ?s :pred ?o (temp var for object, accessed by index)
-                // pred_ref is already a Ref (Sid or Iri) so use it directly.
-                let (object, bounds) = match &predicate.object {
-                    PropertyJoinObject::Var(obj_var) => (
-                        Term::Var(TEMP_OBJECT_VAR),
-                        self.object_bounds.get(obj_var).cloned(),
-                    ),
-                    PropertyJoinObject::Bound(term) => (term.clone(), None),
-                };
-                let pattern = TriplePattern {
-                    s: Ref::Var(self.subject_var),
-                    p: predicate.pred_ref.clone(),
-                    o: object,
-                    dtc: predicate.dtc.clone(),
-                };
-
-                // Create scan with optional bounds pushdown for this object variable.
-                //
-                // `DatasetOperator` wraps the scan for multi-graph fanout;
-                // inner `BinaryScanOperator` selects between binary cursor
-                // and range fallback at open() time.
-                let emit = if predicate.emit_object {
-                    // Subject + object (no predicate column) for emitted predicates.
-                    EmitMask {
-                        s: true,
-                        p: false,
-                        o: true,
-                    }
-                } else if ctx.default_graphs_slice().is_some_and(|g| g.len() >= 2) {
-                    // Existence-only over a MULTI-member default union: the
-                    // DatasetOperator arms the §13.2 set-dedup, whose key
-                    // needs every VARIABLE column emitted (a pruned object
-                    // column would collapse distinct triples — the operator
-                    // now fails loud on that combination). Widen to include
-                    // the object; the consumer below keys off `emit_obj` and
-                    // simply ignores the extra column.
-                    EmitMask {
-                        s: true,
-                        p: false,
-                        o: true,
-                    }
-                } else {
-                    // Existence-only: only need the subject column.
-                    EmitMask {
-                        s: true,
-                        p: false,
-                        o: false,
-                    }
-                };
-                let mut scan: BoxedOperator =
-                    make_property_join_scan(pattern, bounds, emit, self.mode);
-                scan.open(ctx).await?;
-
-                while let Some(batch) = scan.next_batch(ctx).await? {
-                    // Rows here are priced by the inner scan's emission charge.
-                    ctx.check_cancelled()?;
-                    // Schema for this scan is either:
-                    // - emitted predicate: [subject_var, temp_obj_var]
-                    // - existence-only:   [subject_var]
-                    let subject_col = batch.column_by_idx(0);
-                    let object_col = batch.column_by_idx(1);
-
-                    if let Some(subjects) = subject_col {
-                        scan_rows_total += batch.len() as u64;
-                        let emit_obj = self.emit_positions[pred_idx].is_some();
-                        if emit_obj {
-                            if let Some(objects) = object_col {
-                                for (subject, object) in subjects.iter().zip(objects.iter()) {
-                                    if let Some(key) = Self::subject_key(ctx, subject)? {
-                                        if order_pos > 0 && !all_subject_values.is_empty() {
-                                            if let Some(entry) = all_subject_values.get_mut(&key) {
-                                                entry.1 |= 1u64 << pred_idx;
-                                                if let Some(epos) = self.emit_positions[pred_idx] {
-                                                    entry.2[epos].push(object.clone());
-                                                }
-                                            }
-                                            continue;
-                                        }
-
-                                        let entry =
-                                            all_subject_values.entry(key).or_insert_with(|| {
-                                                (
-                                                    subject.clone(),
-                                                    0u64,
-                                                    vec![Vec::new(); emit_count],
-                                                )
-                                            });
-                                        entry.1 |= 1u64 << pred_idx;
-                                        if let Some(epos) = self.emit_positions[pred_idx] {
-                                            entry.2[epos].push(object.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // Existence-only: only update presence bit for subjects already tracked,
-                            // unless this is the first scan (map empty) where we can seed subjects.
-                            for subject in subjects {
-                                if let Some(key) = Self::subject_key(ctx, subject)? {
-                                    if order_pos > 0 && !all_subject_values.is_empty() {
-                                        if let Some(entry) = all_subject_values.get_mut(&key) {
-                                            entry.1 |= 1u64 << pred_idx;
-                                        }
-                                        continue;
-                                    }
-                                    let entry =
-                                        all_subject_values.entry(key).or_insert_with(|| {
-                                            (subject.clone(), 0u64, vec![Vec::new(); emit_count])
-                                        });
-                                    entry.1 |= 1u64 << pred_idx;
-                                }
-                            }
-                        }
-                    }
-                    ctx.check_cancelled()?;
-                }
-
-                scan.close();
-
-                // After the driver scan, capture subject IDs for batched probing
-                // when the subject keys stayed as encoded IDs. This lets a
-                // selective exact scan like `?s rdf:type :Deal` drive later
-                // subject-bound probes. Only the driver position captures —
-                // re-capturing on later iterations would erase the ids (the
-                // helper returns None off the driver), cutting every
-                // predicate after the first remaining one off from probing.
-                if order_pos == 0 {
-                    driver_subject_ids =
-                        self.capture_driver_subject_ids(ctx, order_pos, &all_subject_values);
-                }
-
-                if order_pos == 0 {
-                    let remaining_predicates = &scan_order[1..];
-                    if self.can_spot_walk_remaining(ctx, &driver_subject_ids, remaining_predicates)
-                    {
-                        let store = ctx.binary_store.as_ref().unwrap();
-                        let dict_overlay = make_dict_overlay(ctx, store);
-                        let spot_predicates: Vec<_> = remaining_predicates
-                            .iter()
-                            .filter_map(|&idx| {
-                                let predicate = &self.predicates[idx];
-                                let pred_sid = try_normalize_pred_sid(store, &predicate.pred_ref)?;
-                                Some(SpotStarPredicateParams {
-                                    predicate_idx: idx,
-                                    pred_sid,
-                                    object_bounds: self.predicate_bounds(predicate),
-                                    bound_object: Self::predicate_bound_object(predicate),
-                                    emit_object: self.emit_positions[idx].is_some(),
-                                })
-                            })
-                            .collect();
-
-                        let star_plan = if spot_predicates.len() == remaining_predicates.len()
-                            && !spot_predicates.is_empty()
-                        {
-                            let pred_refs: Vec<&fluree_db_core::Sid> =
-                                spot_predicates.iter().map(|p| &p.pred_sid).collect();
-                            star_probe_lane_plan(ctx, store, &pred_refs)?
-                        } else {
-                            ProbeLanePlan::Decline
-                        };
-                        if !matches!(star_plan, ProbeLanePlan::Decline) {
-                            let mut probe_ops = match &star_plan {
-                                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
-                                _ => None,
-                            };
-                            used_spot_star_walk = true;
-                            let spot_matches = batched_subject_star_spot(
-                                ctx,
-                                store,
-                                driver_subject_ids.as_ref().unwrap(),
-                                &spot_predicates,
-                                dict_overlay.as_ref(),
-                                probe_ops.as_mut(),
-                            )?;
-                            scan_rows_total += spot_matches.len() as u64;
-                            for spot_match in spot_matches {
-                                self.ingest_spot_star_match(
-                                    ctx,
-                                    &mut all_subject_values,
-                                    spot_match,
-                                )?;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Keep only subjects that have values for ALL predicates
-            let emitted_required = &self.emitted_required;
-            all_subject_values.retain(|_, (_sb, mask, values)| {
-                (*mask & required_mask) == required_mask
-                    && (emit_count == 0
-                        || values
-                            .iter()
-                            .enumerate()
-                            .all(|(idx, v)| !emitted_required[idx] || !v.is_empty()))
+            let Some(&driver_idx) = self.scan_order.first() else {
+                self.driver = None;
+                return Ok(());
+            };
+            // A historical read replays leaflets uncached, so a leaflet split
+            // across chunks would be replayed once per chunk.
+            let streamable = matches!(
+                self.predicates[driver_idx].object,
+                PropertyJoinObject::Bound(_)
+            ) && !ctx.is_multi_ledger()
+                && ctx.binary_store.is_some()
+                && !replay;
+            self.chunk_schedule = streamable.then(|| match self.row_budget {
+                Some(budget) => FlushSchedule::budgeted(budget, BATCHED_JOIN_SIZE),
+                None => FlushSchedule::ramped(BATCHED_JOIN_SIZE),
             });
-            self.subject_values = all_subject_values;
-
-            tracing::debug!(
-                subjects = self.subject_values.len(),
-                used_batched_probe,
-                used_spot_star_walk,
-                probe_chunks,
-                probe_subjects_total,
-                scan_rows_total,
-                "property_join: open complete"
-            );
-
+            let mut driver = self.predicate_scan(ctx, driver_idx);
+            driver.open(ctx).await?;
+            self.driver = Some(driver);
             Ok(())
         }
         .instrument(span)
@@ -1197,26 +1429,14 @@ impl Operator for PropertyJoinOperator {
         let schema_len = self.output_schema.len();
 
         while all_rows.len() < batch_size {
-            if self.current_subject.is_none() {
-                let mut found = false;
-                while self.subject_idx < self.subject_values.len() {
-                    let idx = self.subject_idx;
-                    self.subject_idx += 1;
-                    let Some((_, (_, _, values_per_pred))) = self.subject_values.get_index(idx)
-                    else {
-                        continue;
-                    };
-                    if !Self::has_cartesian_row(values_per_pred, &self.emitted_required) {
-                        continue;
-                    }
-                    self.current_indices = vec![0; values_per_pred.len()];
-                    self.current_subject = Some(idx);
-                    found = true;
+            if self.current_subject.is_none() && !self.next_subject() {
+                // Hand over this chunk's rows before reading another: a
+                // selective star may already have satisfied an outer LIMIT.
+                if self.driver.is_none() || !all_rows.is_empty() {
                     break;
                 }
-                if !found {
-                    break;
-                }
+                self.next_chunk(ctx).await?;
+                continue;
             }
 
             let Some(idx) = self.current_subject else {
@@ -1272,11 +1492,30 @@ impl Operator for PropertyJoinOperator {
     }
 
     fn close(&mut self) {
+        if matches!(self.state, OperatorState::Open | OperatorState::Exhausted) {
+            tracing::debug!(
+                subjects = self.subject_values.len(),
+                chunks = self.stats.chunks,
+                driver_exhausted = self.driver.is_none(),
+                used_batched_probe = self.stats.used_batched_probe,
+                used_spot_star_walk = self.stats.used_spot_star_walk,
+                probe_chunks = self.stats.probe_chunks,
+                probe_subjects_total = self.stats.probe_subjects_total,
+                scan_rows_total = self.stats.scan_rows_total,
+                "property_join: complete"
+            );
+        }
+        if let Some(mut driver) = self.driver.take() {
+            driver.close();
+        }
         self.state = OperatorState::Closed;
         self.subject_values.clear();
         self.subject_idx = 0;
+        self.chunk = 0..0;
         self.current_subject = None;
         self.current_indices.clear();
+        self.driver_pending = None;
+        self.lanes = None;
     }
 
     fn estimated_rows(&self) -> Option<usize> {

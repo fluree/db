@@ -36,6 +36,7 @@ use crate::join::{
     UnifyInstruction,
 };
 use crate::object_binding::{equality_norm, EqualityNorm};
+use crate::operator::flush::FlushSchedule;
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -159,6 +160,32 @@ pub trait OptionalBuilder: Send + Sync {
 
     /// What optional-only variables are bound to when nothing matches.
     fn unmatched_optional(&self) -> UnmatchedOptional;
+}
+
+/// Encoded id of a subject binding, for the batched probes; `None` when the
+/// binding has none.
+fn resolve_subject_id(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+    let Some(store) = ctx.binary_store.as_deref() else {
+        return Ok(None);
+    };
+    match binding {
+        Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
+        Binding::Sid { sid, .. } => {
+            // Persisted reverse dict first, then DictNovelty — subjects
+            // minted after the last index resolve to novelty s_ids, the
+            // same id space the overlay ops are translated into.
+            let persisted = store
+                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
+            Ok(persisted.or_else(|| {
+                ctx.dict_novelty
+                    .as_ref()
+                    .filter(|dn| dn.is_initialized())
+                    .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
+            }))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Builder for single-pattern OPTIONAL
@@ -323,37 +350,6 @@ impl PatternOptionalBuilder {
     /// per-row path too.
     fn object_var_shared_with_required(&self) -> bool {
         matches!(&self.pattern.o, Term::Var(v) if !self.optional_only_vars.contains(v))
-    }
-
-    fn resolve_subject_id(
-        &self,
-        required_batch: &Batch,
-        row: usize,
-        subject_left_col: usize,
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<u64>> {
-        let binding = required_batch.get_by_col(row, subject_left_col);
-        let Some(store) = ctx.binary_store.as_deref() else {
-            return Ok(None);
-        };
-        match binding {
-            Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-            Binding::Sid { sid, .. } => {
-                // Persisted reverse dict first, then DictNovelty — subjects
-                // minted after the last index resolve to novelty s_ids, the
-                // same id space the overlay ops are translated into.
-                let persisted = store
-                    .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                    .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
-                Ok(persisted.or_else(|| {
-                    ctx.dict_novelty
-                        .as_ref()
-                        .filter(|dn| dn.is_initialized())
-                        .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-                }))
-            }
-            _ => Ok(None),
-        }
     }
 
     /// Substitute required bindings into pattern
@@ -633,7 +629,8 @@ impl OptionalBuilder for PatternOptionalBuilder {
             if self.has_poisoned_binding(required_batch, row) {
                 continue;
             }
-            let Some(s_id) = self.resolve_subject_id(required_batch, row, subject_left_col, ctx)?
+            let Some(s_id) =
+                resolve_subject_id(required_batch.get_by_col(row, subject_left_col), ctx)?
             else {
                 return Ok(None);
             };
@@ -842,36 +839,6 @@ impl GroupedPatternOptionalBuilder {
             .is_poisoned()
     }
 
-    fn resolve_subject_id(
-        &self,
-        required_batch: &Batch,
-        row: usize,
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<u64>> {
-        let binding = required_batch.get_by_col(row, self.subject_left_col);
-        let Some(store) = ctx.binary_store.as_deref() else {
-            return Ok(None);
-        };
-        match binding {
-            Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-            Binding::Sid { sid, .. } => {
-                // Persisted reverse dict first, then DictNovelty — subjects
-                // minted after the last index resolve to novelty s_ids, the
-                // same id space the overlay ops are translated into.
-                let persisted = store
-                    .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                    .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
-                Ok(persisted.or_else(|| {
-                    ctx.dict_novelty
-                        .as_ref()
-                        .filter(|dn| dn.is_initialized())
-                        .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-                }))
-            }
-            _ => Ok(None),
-        }
-    }
-
     fn grouped_schema(&self) -> Arc<[VarId]> {
         Arc::from(self.optional_only_vars.clone().into_boxed_slice())
     }
@@ -1057,7 +1024,9 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 );
                 return Ok(None);
             }
-            let Some(s_id) = self.resolve_subject_id(required_batch, row, ctx)? else {
+            let Some(s_id) =
+                resolve_subject_id(required_batch.get_by_col(row, self.subject_left_col), ctx)?
+            else {
                 tracing::debug!(
                     predicate_count = self.triples.len(),
                     start_row,
@@ -2316,6 +2285,13 @@ pub struct OptionalOperator {
     /// This prevents repeated OPTIONAL evaluation when the left side has fan-out
     /// on the correlation key (common for `?s <p1> ?o1 OPTIONAL { ?s <p2> ?o2 }`).
     result_cache: LruCache<Box<[u8]>, Arc<Vec<Batch>>>,
+    /// Required rows coalesced into each seed: the coalesce cap, unless a
+    /// row budget sizes the first seed. Every required row yields an output
+    /// row, so a budget-sized seed satisfies the `LIMIT` on its own.
+    coalesce_schedule: FlushSchedule,
+    /// A required batch a budget-sized seed stopped partway through, and the
+    /// first row it left unread.
+    required_pending: Option<(Batch, usize)>,
 }
 
 /// Tracks a required row's optional matches with progress cursor
@@ -2331,7 +2307,7 @@ struct PendingOptionalMatch {
 }
 
 impl OptionalOperator {
-    /// PR-4d: pull and CONCATENATE required batches (up to the coalesce cap) into
+    /// PR-4d: pull and CONCATENATE required batches (up to the coalesce window) into
     /// one combined batch, so a batched-OPTIONAL inner is seeded — and scanned —
     /// ONCE over the whole (bounded) driving side rather than once per outer batch
     /// (the F14 per-window re-scan). All required batches share one schema, so this
@@ -2342,34 +2318,57 @@ impl OptionalOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<Batch>> {
-        let cap = optional_seed_coalesce_cap();
+        let window = self.coalesce_schedule.size();
+        // A scan batch can be a whole leaflet, so a budget-sized window takes
+        // only the rows it needs; a cap-sized one keeps its last batch whole,
+        // as before.
+        let exact = window < optional_seed_coalesce_cap();
+        self.coalesce_schedule.advance();
         let mut schema: Option<Arc<[VarId]>> = None;
         let mut columns: Vec<Vec<Binding>> = Vec::new();
         let mut rows = 0usize;
-        while rows < cap {
-            match self.required.next_batch(ctx).await? {
-                Some(batch) => {
-                    if schema.is_none() {
-                        schema = Some(batch.schema_arc());
-                        columns = (0..batch.schema().len()).map(|_| Vec::new()).collect();
-                    }
-                    for (c, col) in columns.iter_mut().enumerate() {
-                        col.extend_from_slice(
-                            batch.column_by_idx(c).expect("column index within schema"),
-                        );
-                    }
-                    rows += batch.len();
-                }
-                None => break,
+        while rows < window {
+            let (batch, start) = match self.required_pending.take() {
+                Some(pending) => pending,
+                None => match self.required.next_batch(ctx).await? {
+                    Some(batch) => (batch, 0),
+                    None => break,
+                },
+            };
+            let end = if exact {
+                batch.len().min(start + window - rows)
+            } else {
+                batch.len()
+            };
+            if schema.is_none() {
+                schema = Some(batch.schema_arc());
+                columns = (0..batch.schema().len()).map(|_| Vec::new()).collect();
+            }
+            for (c, col) in columns.iter_mut().enumerate() {
+                let column = batch.column_by_idx(c).expect("column index within schema");
+                col.extend_from_slice(&column[start..end]);
+            }
+            rows += end - start;
+            if end < batch.len() {
+                self.required_pending = Some((batch, end));
             }
         }
-        match schema {
-            // Empty-schema (0-column) driving side still carries a row count.
-            Some(schema) if rows > 0 && schema.is_empty() => {
-                Ok(Some(Batch::empty_schema_with_len(rows)))
+        let Some(schema) = schema.filter(|_| rows > 0) else {
+            return Ok(None);
+        };
+        // `from_parts` keeps the row count of a 0-column driving side.
+        Ok(Some(Batch::from_parts(schema, columns, rows)?))
+    }
+
+    /// The next required batch, starting with rows a seed left unread.
+    async fn next_required(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        match self.required_pending.take() {
+            Some((batch, 0)) => Ok(Some(batch)),
+            Some((batch, start)) => {
+                let keep: Vec<bool> = (0..batch.len()).map(|row| row >= start).collect();
+                Ok(batch.filter_rows(&keep))
             }
-            Some(schema) if rows > 0 => Ok(Some(Batch::new(schema, columns)?)),
-            _ => Ok(None),
+            None => self.required.next_batch(ctx).await,
         }
     }
 
@@ -2418,6 +2417,8 @@ impl OptionalOperator {
             pending_output: VecDeque::new(),
             out_schema: None,
             result_cache: LruCache::new(NonZeroUsize::new(8192).expect("8192 is non-zero")),
+            coalesce_schedule: FlushSchedule::fixed(optional_seed_coalesce_cap()),
+            required_pending: None,
         }
     }
 
@@ -2573,10 +2574,12 @@ impl Operator for OptionalOperator {
     /// required rows — bounding the required side to `k` is sound (the `LIMIT`
     /// above truncates any surplus). The optional (inner) side is deliberately NOT
     /// budgeted: it must still produce every match for a given required row.
+    /// The budget also sizes the first coalesced seed.
     /// Gated by `FLUREE_R2RML_BUDGET_OPTIONAL`; OFF swallows the budget (the
     /// pre-item-11 full outer scan — byte-identical results).
     fn set_row_budget(&mut self, budget: usize) {
         if crate::r2rml::optional_budget_enabled() {
+            self.coalesce_schedule = FlushSchedule::budgeted(budget, optional_seed_coalesce_cap());
             self.required.set_row_budget(budget);
         } else {
             tracing::debug!(budget, "OPTIONAL row-budget forwarding disabled by switch");
@@ -2758,7 +2761,7 @@ impl Operator for OptionalOperator {
                 let next = if coalesce {
                     self.pull_coalesced_required(ctx).await?
                 } else {
-                    self.required.next_batch(ctx).await?
+                    self.next_required(ctx).await?
                 };
                 match next {
                     Some(batch) => {
@@ -2963,6 +2966,7 @@ impl Operator for OptionalOperator {
     fn close(&mut self) {
         self.required.close();
         self.current_required_batch = None;
+        self.required_pending = None;
         self.pending_output.clear();
         self.state = OperatorState::Closed;
     }
@@ -3066,6 +3070,54 @@ mod tests {
             50,
             "the budget must reach the required (outer) side (switch default-on)"
         );
+    }
+
+    /// A budget-sized seed is cut out of an oversized scan batch, and the rest
+    /// comes back, in order, as the next seed.
+    #[tokio::test]
+    async fn budget_sized_seed_cuts_an_oversized_batch() {
+        use crate::context::ExecutionContext;
+        use crate::operator::flush::MIN_FLUSH;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+
+        struct OneBatch(Option<Batch>);
+        #[async_trait]
+        impl Operator for OneBatch {
+            fn schema(&self) -> &[VarId] {
+                &[VarId(0)]
+            }
+            async fn open(&mut self, _: &ExecutionContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+                Ok(self.0.take())
+            }
+            fn close(&mut self) {}
+        }
+
+        const ROWS: usize = 3000;
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let subject = |i: usize| Binding::sid(Sid::new(1, format!("s{i}")));
+        let batch =
+            Batch::new(Arc::clone(&schema), vec![(0..ROWS).map(subject).collect()]).expect("batch");
+        let mut op = OptionalOperator::new(
+            Box::new(OneBatch(Some(batch))),
+            schema,
+            make_optional_pattern(),
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        op.set_row_budget(10);
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let first = op.pull_coalesced_required(&ctx).await.unwrap().unwrap();
+        assert_eq!(first.len(), MIN_FLUSH);
+        let second = op.pull_coalesced_required(&ctx).await.unwrap().unwrap();
+        assert_eq!(second.len(), ROWS - MIN_FLUSH);
+        assert_eq!(second.get_by_col(0, 0), &subject(MIN_FLUSH));
+        assert!(op.pull_coalesced_required(&ctx).await.unwrap().is_none());
     }
 
     #[test]

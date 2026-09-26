@@ -3,6 +3,7 @@
 //! Operators form a tree that produces batches of results through the
 //! `open/next_batch/close` lifecycle pattern.
 
+pub(crate) mod flush;
 pub mod inline;
 
 use crate::binding::Batch;
