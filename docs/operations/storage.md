@@ -215,7 +215,7 @@ Data stored as content-addressed blocks in IPFS via Kubo.
 
 ## Storage Encryption
 
-Fluree supports transparent AES-256-GCM encryption for data at rest. When enabled, all data is automatically encrypted before being written to storage.
+Fluree supports transparent AES-256-GCM encryption for data at rest. When enabled, every blob written through the storage layer is encrypted; the nameservice stays plaintext.
 
 ### Enabling Encryption
 
@@ -273,7 +273,10 @@ For S3 storage with encryption:
 
 **Key Features:**
 - AES-256-GCM authenticated encryption
-- Works natively with all storage backends (memory, file, S3), on every build path
+- Works with memory, file and S3 storage (not IPFS). Every terminal build method applies a
+  configured key except `build_ipfs()`, which rejects one, and `build_with()`, which leaves it
+  to the caller
+- Key sets and in-place key rotation; see [Key Rotation](../security/encryption.md#key-rotation)
 - Transparent encryption/decryption on read/write
 - Portable ciphertext format (encrypted data can be moved between backends)
 - Environment variable support for key configuration

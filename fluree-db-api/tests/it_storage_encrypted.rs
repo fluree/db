@@ -411,3 +411,132 @@ async fn from_json_ld_s3_config_carries_encryption_key() {
     let builder = FlureeBuilder::from_json_ld(&config).expect("config");
     assert!(builder.has_encryption_key());
 }
+
+// ============================================================================
+// Key sets and the rotation admin surface
+// ============================================================================
+
+const KEY2_B64: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+fn jsonld_file_config_with_keys(
+    path: &std::path::Path,
+    keys: &[(u32, &str)],
+    current: u32,
+) -> serde_json::Value {
+    let keys: Vec<_> = keys
+        .iter()
+        .map(|(id, key)| json!({"keyId": id, "AES256Key": key}))
+        .collect();
+    jsonld_storage_config(json!({
+        "@type": "Storage",
+        "filePath": path.to_string_lossy(),
+        "AES256Keys": keys,
+        "AES256CurrentKey": current
+    }))
+}
+
+/// A ledger written under key 1 reopens under a key set where key 2 is
+/// current: old blobs still read, the admin surface classifies every blob
+/// by key, re-envelopes each in place, and the data reads back under key 2.
+#[tokio::test]
+async fn key_set_reopens_old_data_and_admin_reencrypts_in_place() {
+    use fluree_db_core::StorageRead;
+
+    let data = tempfile::TempDir::new().expect("tempdir");
+    let ledger_name = "enc-rotate";
+    let ledger_id = "enc-rotate:main";
+    let tx = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:alice",
+        "ex:name": "Alice"
+    });
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?name"],
+        "where": {"@id": "ex:alice", "ex:name": "?name"}
+    });
+
+    // Phase 1: single key, id 1.
+    {
+        let builder = FlureeBuilder::from_json_ld(&jsonld_file_config_with_keys(
+            data.path(),
+            &[(1, KEY_B64)],
+            1,
+        ))
+        .expect("config");
+        assert_eq!(builder.encryption_key_ids(), vec![1]);
+        let fluree = builder.build_client().await.expect("build_client");
+        let ledger = fluree.create_ledger(ledger_name).await.expect("create");
+        fluree.insert(ledger, &tx).await.expect("insert");
+    }
+
+    // Phase 2: key 2 is current, key 1 still held.
+    let builder = FlureeBuilder::from_json_ld(&jsonld_file_config_with_keys(
+        data.path(),
+        &[(1, KEY_B64), (2, KEY2_B64)],
+        2,
+    ))
+    .expect("config");
+    assert_eq!(builder.encryption_key_ids(), vec![2, 1]);
+    let fluree = builder.build_client().await.expect("build_client");
+
+    let read_alice = |fluree: &fluree_db_api::Fluree| {
+        let query = query.clone();
+        let fluree = fluree.clone();
+        async move {
+            let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+            let rows = support::query_jsonld(&fluree, &ledger, &query)
+                .await
+                .expect("query")
+                .to_jsonld_async(ledger.as_graph_db_ref(0))
+                .await
+                .expect("to_jsonld");
+            assert_eq!(rows, json!([["Alice"]]));
+        }
+    };
+    read_alice(&fluree).await;
+
+    let storage = fluree
+        .backend()
+        .admin_storage_cloned()
+        .expect("managed backend");
+    let admin = storage.encryption_admin().expect("encrypted storage");
+    assert_eq!(admin.current_key_id(), 2);
+    assert_eq!(admin.key_ids(), vec![2, 1]);
+
+    // Every content blob is on key 1; nameservice records are not envelopes.
+    let addresses = storage.list_prefix("").await.expect("list");
+    let mut on_key_1 = Vec::new();
+    for address in &addresses {
+        match admin.key_id_at(address).await.expect("key_id_at") {
+            Some(1) => on_key_1.push(address.clone()),
+            Some(other) => panic!("{address} is on unexpected key {other}"),
+            None => assert!(address.contains("ns@"), "plaintext blob: {address}"),
+        }
+    }
+    assert!(!on_key_1.is_empty(), "expected blobs written under key 1");
+
+    for address in &on_key_1 {
+        assert!(admin.reencrypt(address).await.expect("reencrypt").is_some());
+        assert_eq!(admin.key_id_at(address).await.unwrap(), Some(2));
+        // Idempotent: already current.
+        assert!(admin
+            .reencrypt(address)
+            .await
+            .expect("reencrypt again")
+            .is_none());
+    }
+
+    // The re-enveloped blobs read back through a fresh client holding key 2 only.
+    drop(fluree);
+    let fluree = FlureeBuilder::from_json_ld(&jsonld_file_config_with_keys(
+        data.path(),
+        &[(2, KEY2_B64)],
+        2,
+    ))
+    .expect("config")
+    .build_client()
+    .await
+    .expect("build_client");
+    read_alice(&fluree).await;
+}

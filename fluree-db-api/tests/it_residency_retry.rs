@@ -122,6 +122,10 @@ impl StorageRead for ResidencyStorage {
         self.inner.permits_plaintext_cache()
     }
 
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        self.inner.encryption_admin()
+    }
+
     async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
         let bytes = self.inner.read_bytes(address).await?;
         // Fetch-pins contract: bytes served async become sync-resident.

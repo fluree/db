@@ -178,6 +178,7 @@ pub use schema_hierarchy::{
 };
 pub use sid::{Sid, SidInterner};
 pub use stats_view::{PropertyStatData, StatsView};
+pub use storage::EncryptionAdmin;
 pub use storage::{
     bridge_content_store,
     content_address,

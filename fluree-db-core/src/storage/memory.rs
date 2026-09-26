@@ -75,6 +75,10 @@ impl StorageRead for MemoryStorage {
         true
     }
 
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn crate::EncryptionAdmin>> {
+        None
+    }
+
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         self.data
             .read()

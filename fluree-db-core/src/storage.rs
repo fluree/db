@@ -246,6 +246,13 @@ pub trait StorageRead: Debug + Send + Sync {
     /// has to answer.
     fn permits_plaintext_cache(&self) -> bool;
 
+    /// The encryption administration surface, when this storage encrypts
+    /// at rest. `None` for plaintext storages; wrappers delegate to what
+    /// they wrap. Required for the same reason as
+    /// [`Self::permits_plaintext_cache`]: a wrapper that answered `None` by
+    /// default would report an encrypted store as plaintext.
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>>;
+
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
     /// Mirror of [`ContentStore::resolve_cached_bytes`] for address-keyed
@@ -476,6 +483,29 @@ pub trait StorageMethod {
 ///
 /// Used for type erasure in `AnyStorage`.
 pub trait Storage: StorageRead + ContentAddressedWrite + StorageMethod {}
+
+/// What a key rotation needs from an encrypting storage.
+///
+/// Addresses are hashes of plaintext, so re-enveloping a blob under a new
+/// key is an in-place overwrite at the same address: no pointer changes,
+/// and a crash between blobs leaves each one on exactly one key.
+#[async_trait]
+pub trait EncryptionAdmin: Send + Sync {
+    /// Ids of every key the storage can decrypt with, current first.
+    fn key_ids(&self) -> Vec<u32>;
+
+    /// Id of the key that encrypts new writes.
+    fn current_key_id(&self) -> u32;
+
+    /// The key id recorded in the envelope at `address`, read from its
+    /// header alone. `None` when the bytes there are not an envelope.
+    async fn key_id_at(&self, address: &str) -> Result<Option<u32>>;
+
+    /// Re-envelope the blob at `address` under the current key, verifying
+    /// the result reads back. Returns the plaintext size rewritten, or
+    /// `None` when the blob was already on the current key.
+    async fn reencrypt(&self, address: &str) -> Result<Option<u64>>;
+}
 impl<T: StorageRead + ContentAddressedWrite + StorageMethod> Storage for T {}
 
 // ============================================================================
@@ -518,6 +548,10 @@ impl StorageRead for Arc<dyn Storage> {
 
     fn permits_plaintext_cache(&self) -> bool {
         self.as_ref().permits_plaintext_cache()
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+        self.as_ref().encryption_admin()
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {

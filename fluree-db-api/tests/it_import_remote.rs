@@ -481,6 +481,10 @@ impl StorageRead for YieldingStorage {
         self.inner.permits_plaintext_cache()
     }
 
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        self.inner.encryption_admin()
+    }
+
     async fn read_bytes(&self, address: &str) -> fluree_db_core::error::Result<Vec<u8>> {
         // Hand control back to the runtime so the producer task genuinely
         // depends on the worker being free to make progress.

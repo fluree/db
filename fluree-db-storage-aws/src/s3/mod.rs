@@ -293,6 +293,10 @@ impl StorageRead for S3Storage {
         true
     }
 
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        None
+    }
+
     async fn read_bytes(&self, address: &str) -> std::result::Result<Vec<u8>, CoreError> {
         const SLOW_S3_SEND_WARN_MS: u64 = 1_000;
         const SLOW_S3_BODY_WARN_MS: u64 = 5_000;

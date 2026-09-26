@@ -2085,6 +2085,68 @@ impl RemoteLedgerClient {
     }
 
     // =========================================================================
+    // Encryption key rotation
+    // =========================================================================
+
+    /// Key ids the server holds: `GET {base_url}/encryption`.
+    pub async fn encryption_keys(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// The rotation progress record: `GET {base_url}/encryption/rotate/status`.
+    pub async fn encryption_rotate_status(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/status");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Start or resume a rotation: `POST {base_url}/encryption/rotate`.
+    pub async fn encryption_rotate(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Pause or cancel the sweep on the node that holds it:
+    /// `POST {base_url}/encryption/rotate/{signal}`.
+    pub async fn encryption_rotate_signal(
+        &self,
+        signal: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("encryption/rotate/{signal}"));
+        self.send_json(reqwest::Method::POST, &url, "application/json", None)
+            .await
+    }
+
+    /// Verify a rotation: `POST {base_url}/encryption/rotate/verify`. Shares
+    /// `REINDEX_TIMEOUT`: it reads every blob's header in the store.
+    pub async fn encryption_rotate_verify(
+        &self,
+        retire_key_id: u32,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/verify");
+        let body = serde_json::json!({ "retire_key_id": retire_key_id });
+        self.send_json_with_timeout(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+            Self::REINDEX_TIMEOUT,
+        )
+        .await
+    }
+
+    // =========================================================================
     // List ledgers
     // =========================================================================
 

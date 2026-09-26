@@ -31,6 +31,7 @@
   - [index](cli/index.md)
   - [reindex](cli/reindex.md)
   - [sweep](cli/sweep.md)
+  - [encryption](cli/encryption.md)
   - [config](cli/config.md)
   - [prefix](cli/prefix.md)
   - [token](cli/token.md)
