@@ -137,8 +137,10 @@ async fn send(
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
-        .header("authorization", format!("Bearer {token}"))
         .header("content-type", content_type);
+    if !token.is_empty() {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
@@ -352,14 +354,15 @@ async fn ledgers_listing_follows_data_auth() {
 // MCP: issuer trust admits a token; its ledger claims decide what it reaches.
 // ---------------------------------------------------------------------------
 
-async fn mcp_state(issuer: &str) -> (TempDir, Arc<AppState>) {
+/// An MCP server without data auth; `issuer` (if any) is the MCP trusted issuer.
+async fn mcp_state(issuer: Option<&str>) -> (TempDir, Arc<AppState>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = ServerConfig {
         cors_enabled: false,
         indexing_enabled: false,
         storage_path: Some(tmp.path().to_path_buf()),
         mcp_enabled: true,
-        mcp_auth_trusted_issuers: vec![issuer.to_string()],
+        mcp_auth_trusted_issuers: issuer.into_iter().map(str::to_string).collect(),
         ..Default::default()
     };
     let telemetry = TelemetryConfig::with_server_config(&cfg);
@@ -368,7 +371,8 @@ async fn mcp_state(issuer: &str) -> (TempDir, Arc<AppState>) {
 }
 
 /// One JSON-RPC exchange over the streamable HTTP transport; returns the
-/// response headers and the JSON message (SSE-framed or plain).
+/// response headers and the JSON message (SSE-framed or plain). An empty
+/// `token` sends no Authorization header.
 async fn mcp_post(
     app: &axum::Router,
     token: &str,
@@ -378,9 +382,11 @@ async fn mcp_post(
     let mut req = Request::builder()
         .method("POST")
         .uri("/mcp")
-        .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
+    if !token.is_empty() {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
     if let Some(s) = session {
         req = req.header("mcp-session-id", s);
     }
@@ -453,7 +459,7 @@ fn tool_text(result: &JsonValue) -> String {
 async fn mcp_tools_authorize_the_requested_ledger() {
     let signing_key = SigningKey::from_bytes(&[91; 32]);
     let issuer = fluree_db_credential::did_from_pubkey(&signing_key.verifying_key().to_bytes());
-    let (_tmp, state) = mcp_state(&issuer).await;
+    let (_tmp, state) = mcp_state(Some(&issuer)).await;
     let app = build_router(state);
     create_ledger(&app, "open").await;
     create_ledger(&app, "closed").await;
@@ -489,4 +495,114 @@ async fn mcp_tools_authorize_the_requested_ledger() {
             assert_eq!(tool_text(&denied), "Ledger not found");
         }
     }
+}
+
+/// `/mcp` on a server without data auth is as open as `/query`: no token
+/// needed, every ledger reachable, and a presented token is ignored.
+#[tokio::test]
+async fn mcp_runs_tokenless_without_data_auth() {
+    let (_tmp, state) = mcp_state(None).await;
+    let app = build_router(state);
+    create_ledger(&app, "a").await;
+    create_ledger(&app, "b").await;
+
+    let ignored = read_scoped_token(&["a"], 92);
+    for token in ["", ignored.as_str()] {
+        for ledger in ["a", "b"] {
+            let model = mcp_tool(&app, token, "get_data_model", json!({"ledger": ledger})).await;
+            assert_ne!(model["isError"], json!(true), "{ledger}: {model}");
+            let query = json!({"ledger": ledger, "query": "SELECT ?s WHERE { ?s ?p ?o }"});
+            let rows = mcp_tool(&app, token, "sparql_query", query).await;
+            assert_ne!(rows["isError"], json!(true), "{ledger}: {rows}");
+        }
+    }
+}
+
+/// Configuring an MCP issuer turns tokens on even when data auth is off.
+#[tokio::test]
+async fn a_configured_mcp_issuer_requires_a_token() {
+    let (_tmp, state) = mcp_state(Some("did:key:z6MkConfigured")).await;
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": {},
+                            "clientInfo": {"name": "test", "version": "0"}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A tokenless MCP request has no identity, like an anonymous `/query`, so the
+/// ledger's configured policy defaults must govern both alike.
+#[tokio::test]
+async fn tokenless_mcp_applies_the_ledgers_policy_defaults() {
+    let (_tmp, state) = mcp_state(None).await;
+    let app = build_router(state);
+    create_ledger(&app, "gov").await;
+    insert_one(&app, "gov", "ex:alice", "Alice", "").await;
+
+    let query = "SELECT ?s WHERE { ?s <http://example.org/name> ?o }";
+    let rows = |app: axum::Router| async move {
+        let result = mcp_tool(
+            &app,
+            "",
+            "sparql_query",
+            json!({"ledger": "gov", "query": query}),
+        )
+        .await;
+        let envelope: JsonValue = serde_json::from_str(&tool_text(&result)).expect("envelope");
+        envelope["rowCount"].as_u64().expect("rowCount")
+    };
+    assert_eq!(rows(app.clone()).await, 1, "control: unconfigured ledger");
+
+    let config = r"@prefix f: <https://ns.flur.ee/db#> .
+        GRAPH <urn:fluree:gov:main#config> {
+          <urn:cfg:main> a f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> .
+          <urn:cfg:policy> f:defaultAllow false .
+        }";
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/fluree/upsert/gov",
+        "",
+        &[],
+        "application/trig",
+        config.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/fluree/query/gov",
+        "",
+        &[],
+        "application/sparql-query",
+        query.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["results"]["bindings"].as_array().map(Vec::len),
+        Some(0),
+        "anonymous /query is denied by the defaults: {body}"
+    );
+    assert_eq!(rows(app).await, 0, "tokenless MCP must be denied too");
 }

@@ -214,44 +214,37 @@ impl FlureeToolService {
         // auth-layer verified: it gates `f:overrideControl` as well as policy.
         let server_identity = identity.clone().map(VerifiedIdentity::new);
         let mut envelope = run_query_task(timeout_ms, server_identity, move || async move {
-            let envelope = match identity.as_deref() {
+            let view = match identity.as_deref() {
                 Some(id) => {
                     let opts = fluree_db_api::GovernanceOptions {
                         identity: Some(id.to_string()),
                         server_identity: Some(VerifiedIdentity::new(id)),
                         ..Default::default()
                     };
-                    let view = match t {
+                    match t {
                         Some(t) => state.fluree.db_at_t_with_policy(&ledger, t, &opts).await?,
                         None => state.fluree.db_with_policy(&ledger, &opts).await?,
-                    };
-                    view.query(state.fluree.as_ref())
-                        .sparql(&query)
-                        .format(config)
-                        .execution_options(crate::query_control::current_query_execution_options(
-                            timeout_ms,
-                        ))
-                        .execute_formatted()
-                        .await?
+                    }
                 }
+                // No identity is an anonymous read: the ledger's configured
+                // policy defaults govern it, as on `/query`.
                 None => {
-                    let graph = match t {
-                        Some(t) => state
-                            .fluree
-                            .graph_at(&ledger, fluree_db_api::TimeSpec::AtT(t)),
-                        None => state.fluree.graph(&ledger),
+                    let view = match t {
+                        Some(t) => state.fluree.db_at_t(&ledger, t).await?,
+                        None => state.fluree.db(&ledger).await?,
                     };
-                    graph
-                        .query()
-                        .sparql(&query)
-                        .format(config)
-                        .execution_options(crate::query_control::current_query_execution_options(
-                            timeout_ms,
-                        ))
-                        .execute_formatted()
-                        .await?
+                    state.fluree.wrap_policy_defaults(view).await?
                 }
             };
+            let envelope = view
+                .query(state.fluree.as_ref())
+                .sparql(&query)
+                .format(config)
+                .execution_options(crate::query_control::current_query_execution_options(
+                    timeout_ms,
+                ))
+                .execute_formatted()
+                .await?;
             Ok(envelope)
         })
         .await
