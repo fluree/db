@@ -2107,8 +2107,8 @@ pub(crate) fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, flure
 ///
 /// Returns `Ok(Some(ops))` on success (`ops` may be empty), or `Ok(None)` when
 /// any flake fails to translate — in which case the caller must disable the
-/// fast path for correctness. Only meaningful when an overlay carrying novelty
-/// is present (`epoch != 0`).
+/// fast path for correctness. Only meaningful when [`overlay_has_novelty`]
+/// reports pending flakes.
 ///
 /// For predicate-leading orders (Psot/Post) the overlay walk is range-bounded
 /// to the predicate via [`predicate_walk_bounds`], so its cost is
@@ -2882,16 +2882,7 @@ pub fn build_overlay_cursor_for_predicate(
     // unchanged. (Production masks this via the cache's `all()` load; a
     // cache-less store would miscount. See `BinaryCursor::set_overlay_ops`.)
     let overlay_active = overlay_has_novelty(ctx);
-    let projection = if overlay_active {
-        let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
-        ColumnProjection {
-            output: projection.output,
-            // Don't duplicate columns already materialized in `output`.
-            internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
-        }
-    } else {
-        projection
-    };
+    let projection = overlay_cursor_projection(projection, overlay_active);
 
     let (min_key, max_key) = predicate_range_keys(p_id, g_id);
     let filter = BinaryFilter {
@@ -2906,10 +2897,10 @@ pub fn build_overlay_cursor_for_predicate(
     cursor.set_to_t(ctx.to_t);
 
     // Fold the novelty overlay in. Skip the walk entirely when there is no
-    // novelty (epoch 0): the persisted index alone is then exact. Ops come
+    // novelty: the persisted index alone is then exact. Ops come
     // from the per-execution cache, so N cursors over the same predicate
     // (flushes, partitions, cyclic edges) share one walk + translation.
-    if overlay_has_novelty(ctx) {
+    if overlay_active {
         match cached_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
             Some(ops) => {
                 if !ops.is_empty() {
@@ -2977,8 +2968,8 @@ pub fn build_post_cursor_for_predicate(
 /// for parallelizing an overlay count: the partition harness hands each worker a
 /// subject range, and each worker scans only its leaves and merges only its ops.
 ///
-/// Takes `to_t`/`epoch` as values (not `&ExecutionContext`) so the caller can hoist
-/// them out of the parallel region and keep the reducer `Sync`. The cursor's leaf
+/// Takes `to_t` as a value (not `&ExecutionContext`) so the caller can hoist
+/// it out of the parallel region and keep the reducer `Sync`. The cursor's leaf
 /// range is bounded by the keys, but rows are filtered only by `p_id`, so a boundary
 /// leaf shared with an adjacent partition still emits its out-of-range subjects — the
 /// caller MUST drop rows with `s_id < lo || s_id >= hi` so each subject is counted by
@@ -2993,20 +2984,11 @@ pub fn build_overlay_cursor_for_subject_range(
     hi: u64,
     sliced_ops: Vec<fluree_db_binary_index::read::types::OverlayOp>,
     to_t: i64,
-    epoch: u64,
 ) -> Option<BinaryCursor> {
-    let overlay_active = epoch != 0;
+    let overlay_active = !sliced_ops.is_empty();
     // Identity columns must be present for merge_overlay_into_batch (see
     // build_overlay_cursor_for_predicate / set_overlay_ops).
-    let projection = if overlay_active {
-        let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
-        ColumnProjection {
-            output: projection.output,
-            internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
-        }
-    } else {
-        projection
-    };
+    let projection = overlay_cursor_projection(projection, overlay_active);
 
     let (mut min_key, mut max_key) = predicate_range_keys(p_id, g_id);
     min_key.s_id = SubjectId(lo);
@@ -3032,10 +3014,25 @@ pub fn build_overlay_cursor_for_subject_range(
         projection,
     )?;
     cursor.set_to_t(to_t);
-    if overlay_active && !sliced_ops.is_empty() {
+    if overlay_active {
         cursor.set_overlay_ops(sliced_ops.into());
     }
     Some(cursor)
+}
+
+/// Include the full fact identity internally whenever a cursor merges overlay rows.
+fn overlay_cursor_projection(
+    projection: ColumnProjection,
+    overlay_active: bool,
+) -> ColumnProjection {
+    if !overlay_active {
+        return projection;
+    }
+    let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
+    ColumnProjection {
+        output: projection.output,
+        internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
+    }
 }
 
 /// Slice a predicate's resolved overlay ops (sorted in PSOT order, i.e. by
@@ -3337,7 +3334,6 @@ where
         None => return Ok(None),
     };
     let to_t = ctx.to_t;
-    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
 
     let ops_ref = &ops;
@@ -3359,7 +3355,6 @@ where
                 hi,
                 sliced,
                 to_t,
-                epoch,
             ) else {
                 return Ok(0u128);
             };
@@ -3398,7 +3393,7 @@ where
 }
 
 /// Overlay COUNT(*) of a predicate via a **novelty-delta**, for the common
-/// live-write case (`epoch != 0`, HEAD): `base_total − base(touched) + merged(touched)`.
+/// live-write case (pending novelty, HEAD): `base_total − base(touched) + merged(touched)`.
 ///
 /// At HEAD the predicate count is metadata-only (instant). Under novelty the cursor
 /// path would rescan the whole predicate to fold a few uncommitted rows. Instead:
@@ -3409,7 +3404,7 @@ where
 /// novelty's footprint, not the predicate size.
 ///
 /// CALLER GATE: only valid for `to_t == max_t` (no time-travel replay) and
-/// `epoch != 0`; the base manifest count is the current-state base count only then.
+/// pending novelty; the base manifest count is the current-state base count only then.
 /// Returns `Ok(None)` to defer (overlay flake failed to translate). Returns the
 /// plain manifest count when there is no novelty for the predicate.
 ///
@@ -3436,7 +3431,6 @@ pub fn count_predicate_overlay_delta(
         return Ok(Some(base_total));
     }
     let to_t = ctx.to_t;
-    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
 
     // Per-leaf subject ranges [lo, hi); the last extends to MAX so novelty subjects
@@ -3504,7 +3498,6 @@ pub fn count_predicate_overlay_delta(
             hi,
             sliced,
             to_t,
-            epoch,
         ) {
             while let Some(batch) = cursor
                 .next_batch()

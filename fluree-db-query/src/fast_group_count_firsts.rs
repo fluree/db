@@ -1001,7 +1001,7 @@ pub(crate) fn group_count_v6(
 /// Return values:
 /// - `Ok(Some(..))` — resolved to a persisted `(o_type, o_key)`.
 /// - `Ok(None)` — the object is **conclusively absent from the base dict**.
-///   Combined with the caller's no-novelty (`epoch == 0`) gate, "absent from
+///   Combined with the caller's no-live-novelty gate, "absent from
 ///   base dict" implies "absent from the logical DB", so the caller reports a
 ///   0 count.
 /// - `Err(..)` — genuine error or unbound object; routes to the generic
@@ -1276,11 +1276,7 @@ fn collect_subject_counts_for_predicate_group(
     pred: &crate::ir::triple::Ref,
     restrict_to: Option<&FxHashMap<u64, u64>>,
 ) -> Result<Option<FxHashMap<u64, u64>>> {
-    let overlay_has_rows = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0;
+    let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
     let sid = normalize_pred_sid(store, pred)?;
     let Some(p_id) = store.sid_to_p_id(&sid) else {
         return if overlay_has_rows {
@@ -1353,11 +1349,7 @@ fn compute_group_by_object_star_topk(
     sample_var: Option<VarId>,
     limit: usize,
 ) -> Result<Option<crate::binding::Batch>> {
-    let overlay_has_rows = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0;
+    let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
     // Scan group predicate PSOT for (s_id, o_type, o_key).
     let sid = normalize_pred_sid(store, group_pred)?;
     let Some(p_id) = store.sid_to_p_id(&sid) else {

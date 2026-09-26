@@ -215,12 +215,7 @@ pub fn predicate_string_fold_operator(
                 return Ok(None);
             };
             // Persisted index rows only — defer when novelty is present.
-            if ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0
-            {
+            if crate::fast_path_common::overlay_has_novelty(ctx) {
                 return Ok(None);
             }
             let pred_sid = normalize_pred_sid(store, &predicate)?;
