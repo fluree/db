@@ -1059,8 +1059,8 @@ async fn graph_scoped_builder_enforces_governed_source() {
         .expect("from-driven query");
     assert_eq!(rows(&via_from), 0, "{via_from}");
 
-    // Control: with no policy input on the request the source stays readable,
-    // so the assertion above cannot pass by denying everything unconditionally.
+    // A request with no policy inputs still gets the source's configured
+    // defaults, on both builders.
     let open = json!({ "@context": context(), "select": sel, "where": wh });
     let via_graph_open = fluree
         .graph(GOVERNED)
@@ -1068,8 +1068,34 @@ async fn graph_scoped_builder_enforces_governed_source() {
         .jsonld(&open)
         .execute_formatted()
         .await
+        .expect("no-input graph-scoped query");
+    assert_eq!(rows(&via_graph_open), 0, "{via_graph_open}");
+    let mut from_open = open.clone();
+    from_open["from"] = json!(GOVERNED);
+    let via_from_open = fluree
+        .query_from()
+        .jsonld(&from_open)
+        .execute_formatted()
+        .await
+        .expect("no-input from-driven query");
+    assert_eq!(rows(&via_from_open), 0, "{via_from_open}");
+
+    // Control: the same query over an ungoverned source returns its rows, so
+    // the denials above cannot pass by the query matching nothing.
+    let cfg = R2rmlCreateConfig::new_direct("local-ungoverned-gsb", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("ungoverned source");
+    let via_graph_ungoverned = fluree
+        .graph("local-ungoverned-gsb:main")
+        .query()
+        .jsonld(&open)
+        .execute_formatted()
+        .await
         .expect("ungoverned query");
-    assert_eq!(rows(&via_graph_open), 5, "{via_graph_open}");
+    assert_eq!(rows(&via_graph_ungoverned), 5, "{via_graph_ungoverned}");
 }
 
 /// `ORDER BY … LIMIT k` must not push a scan-side top-k under a view policy.

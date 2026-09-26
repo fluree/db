@@ -17,9 +17,9 @@ When no config graph is present (or a setting group is absent), the system defau
 | Transact constraints | Disabled — no uniqueness enforcement |
 | Override control | `f:OverrideAll` — any request can override any setting |
 
-An unconfigured ledger applies no validation and no reasoning. Policy is the one group where "unconfigured" is not the same as "open", because policy enforcement is switched on by the *request*, not by the ledger:
+An unconfigured ledger applies no validation and no reasoning. Policy is the one group where "unconfigured" is not the same as "open", because policy enforcement is switched on by the ledger's configuration *or* by the request:
 
-- A request that carries **no policy inputs** — no identity, no `policy-class`, no inline `policy` — builds no policy context at all and reads everything. This is the case that makes a fresh ledger feel fully open.
+- A request that carries **no policy inputs** — no identity, no `policy-class`, no inline `policy` — is governed by the ledger's [policy defaults](#policy-defaults) when the ledger configures any; `f:defaultAllow false`, for example, denies it. On a ledger with no policy configuration it reads everything. This is the case that makes a fresh ledger feel fully open.
 - A request that carries **any** of those inputs is enforced. If the identity has no policies granting it anything and nothing sets `f:defaultAllow true`, it reads no data — authenticating *reduces* what a caller sees on an unpoliced ledger. Setting `f:defaultAllow true` on the ledger is what opens an unpoliced ledger to identity-carrying requests.
 
 Schema flakes (`rdf:type` with a schema-class object, `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`) bypass policy, so even a fully denied identity can read the ontology.
@@ -36,7 +36,7 @@ Controls default policy enforcement behavior.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `f:defaultAllow` | boolean | `false` when unset | Allow (`true`) or deny (`false`) when no policy rule matches. Only consulted for requests that carry policy inputs |
+| `f:defaultAllow` | boolean | `false` when unset | Allow (`true`) or deny (`false`) when no policy rule matches. Applies to requests with and without policy inputs |
 | `f:policySource` | `f:GraphRef` | (none) | Graph containing policy rules (`f:Allow`, `f:Modify`, etc.) |
 | `f:policyClass` | IRI or list | (none) | Default policy classes to apply |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating (see [Override control](override-control.md)) |
