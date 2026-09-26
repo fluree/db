@@ -1366,12 +1366,13 @@ impl BinaryScanOperator {
         // Late materialization is safe only when the BinaryIndexStore is authoritative
         // for decoding (no novelty overlay with ephemeral IDs).
         //
-        // Note: ExecutionContext always carries an overlay provider; `NoOverlay` has epoch=0.
+        // An indexed cached ledger retains a nonzero overlay epoch even after
+        // all novelty is drained. Test for live overlay rows, not past writes.
         // When `eager_materialization` is set (via `GraphDbRef::eager()`), always resolve
         // bindings eagerly — infrastructure queries (config, policy) need concrete
         // `Binding::Sid`/`Lit`, not `EncodedSid`/`EncodedLit`.
         let late_materialize = ctx.is_some_and(|c| {
-            c.overlay.map(fluree_db_core::OverlayProvider::epoch).unwrap_or(0) == 0 && !c.eager_materialization
+            !crate::fast_path_common::overlay_has_novelty(c) && !c.eager_materialization
         })
             // If a repeated variable forces two components into the same output slot,
             // late-materialization must produce comparable binding representations.
@@ -2849,10 +2850,7 @@ impl Operator for BinaryScanOperator {
             &self.inline_ops,
             &self.pattern,
             store_ref,
-            ctx.overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                == 0,
+            !crate::fast_path_common::overlay_has_novelty(ctx),
         );
         self.encoded_pre_filters = encoded;
         self.inline_ops = pruned;

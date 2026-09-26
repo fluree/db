@@ -16,6 +16,152 @@ use fluree_db_api::{
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 
+#[tokio::test]
+async fn published_index_matches_fresh_query_on_cached_handle() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/index-adoption:main";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let handle = fluree
+        .ledger_cached(ledger_id)
+        .await
+        .expect("cache genesis");
+    let graph: Vec<_> = (0..2000)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:p{i}"),
+                "@type": "ex:Person",
+                "ex:name": format!("Person {i}"),
+                "ex:age": i % 100,
+                "ex:city": format!("City {}", i % 10),
+                "ex:knows": {"@id": format!("ex:p{i}")}
+            })
+        })
+        .collect();
+    fluree
+        .stage(&handle)
+        .insert(&json!({"@context": {"ex": "http://example.org/"}, "@graph": graph}))
+        .execute()
+        .await
+        .expect("insert through the original cached handle");
+
+    let before = handle.snapshot().await;
+    assert_eq!(before.snapshot.t, 0);
+    assert!(before.binary_store.is_none());
+    drop(before);
+    for expected_t in 1..=2 {
+        support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+        // Do not notify manually, reload, or evict: the publication listener
+        // must install the index on the original handle used by requests.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if handle.snapshot().await.snapshot.t == expected_t {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cached handle adopts the published index");
+
+        let cached = handle.snapshot().await.to_ledger_state();
+        assert!(cached.binary_store.is_some());
+        assert!(cached.snapshot.range_provider.is_some());
+        assert!(cached.novelty.is_empty());
+        assert_ne!(
+            cached.novelty.epoch, 0,
+            "indexing must preserve the mutation counter"
+        );
+        assert_cached_queries_match_fresh(&fluree, &cached).await;
+
+        if expected_t == 1 {
+            // A subsequent write must still use the overlay correctly. In
+            // particular these IRIs and strings do not exist in the base index.
+            fluree
+                .stage(&handle)
+                .insert(&json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "@id": "ex:new-person",
+                    "@type": "ex:Person",
+                    "ex:name": "Person newly added",
+                    "ex:age": 101,
+                    "ex:city": "New city",
+                    "ex:knows": {"@id": "ex:new-person"}
+                }))
+                .execute()
+                .await
+                .expect("commit after the first index install");
+            let cached = handle.snapshot().await.to_ledger_state();
+            assert!(!cached.novelty.is_empty());
+            assert_cached_queries_match_fresh(&fluree, &cached).await;
+        }
+    }
+}
+
+async fn assert_cached_queries_match_fresh(
+    fluree: &fluree_db_api::Fluree,
+    cached: &fluree_db_api::LedgerState,
+) {
+    let fresh = fluree
+        .ledger(cached.ledger_id())
+        .await
+        .expect("uncached load");
+    let queries = [
+        "SELECT ?p WHERE { ?p a ex:Person } LIMIT 10",
+        "SELECT ?p ?name WHERE { ?p a ex:Person ; ex:name ?name ; ex:age ?age } LIMIT 10",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?p a ex:Person ; ex:age ?age FILTER(?age > 60) }",
+        "SELECT (COUNT(*) AS ?n) WHERE { { ?p ex:name ?v } UNION { ?p ex:city ?v } }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?p ex:name ?name FILTER(STRSTARTS(?name, 'Person 1')) }",
+        "SELECT (SUM(xsd:integer(STRSTARTS(?name, 'Person 1'))) AS ?n) WHERE { ?p ex:name ?name }",
+        "SELECT ?p ?age WHERE { ?p ex:age ?age } ORDER BY DESC(?age) LIMIT 10",
+        "SELECT ?city (COUNT(*) AS ?n) WHERE { ?p ex:city ?city ; ex:name ?name } GROUP BY ?city ORDER BY ?city",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?p ex:knows/ex:knows+ ?friend }",
+        "SELECT ?name WHERE { ex:new-person ex:name ?name }",
+    ];
+    for body in queries {
+        let query = format!("PREFIX ex: <http://example.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {body}");
+        // This is also how the HTTP route constructs its single-ledger query.
+        let cached_result = fluree_db_api::GraphDb::from_ledger_state(cached)
+            .query(fluree)
+            .sparql(&query)
+            .track_all()
+            .execute_tracked()
+            .await
+            .expect("cached query");
+        let fresh_result = fluree_db_api::GraphDb::from_ledger_state(&fresh)
+            .query(fluree)
+            .sparql(&query)
+            .track_all()
+            .execute_tracked()
+            .await
+            .expect("fresh query");
+        assert_eq!(
+            cached_result.result,
+            fresh_result.result,
+            "{body}, t={}",
+            cached.t()
+        );
+        assert_eq!(
+            cached_result.fuel,
+            fresh_result.fuel,
+            "{body}, t={}",
+            cached.t()
+        );
+        if body == "SELECT ?name WHERE { ex:new-person ex:name ?name }" {
+            let rows = cached_result.result["results"]["bindings"]
+                .as_array()
+                .unwrap();
+            assert_eq!(rows.len(), usize::from(cached.t() == 2));
+            if let Some(row) = rows.first() {
+                assert_eq!(row["name"]["value"], "Person newly added");
+            }
+        }
+    }
+}
+
 /// A second ledger-manager over the same backend + nameservice as `fluree`,
 /// simulating a separate node whose cache can fall behind when another writer
 /// (here, `fluree` itself) advances the shared nameservice head. This is the

@@ -111,12 +111,7 @@ fn count_reachable_plus_from_fixed_subject(
     // under an uncommitted overlay the start subject may exist solely in novelty
     // (e.g. `ex:new` inserted but not yet indexed), so it would never match and we
     // would undercount to 0. Bail to the (correct) generic pipeline in that case.
-    if ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0
-    {
+    if crate::fast_path_common::overlay_has_novelty(ctx) {
         return Ok(None);
     }
 
@@ -199,11 +194,7 @@ fn count_p1_then_p2_plus(
     p1: &Ref,
     p2: &Ref,
 ) -> Result<Option<u64>> {
-    let overlay_has_rows = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0;
+    let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
     let p1_sid = normalize_pred_sid(store, p1)?;
     let p2_sid = normalize_pred_sid(store, p2)?;
     let Some(p1_id) = store.sid_to_p_id(&p1_sid) else {

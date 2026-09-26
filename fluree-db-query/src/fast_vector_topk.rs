@@ -440,11 +440,7 @@ pub fn vector_topk_operator(
             if ctx.to_t < store.max_t() {
                 return Ok(None);
             }
-            let overlay_present = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0;
+            let overlay_present = crate::fast_path_common::overlay_has_novelty(ctx);
             let g_id: GraphId = ctx.binary_g_id;
 
             let _span = tracing::debug_span!(

@@ -41,7 +41,7 @@ use std::sync::Arc;
 /// Per-execution bundle threaded through the plan evaluator.
 ///
 /// Carries the store + graph plus whether an **overlay lane** is required:
-/// novelty is present (`overlay.epoch() != 0`) or the query is time-travel
+/// novelty is present or the query is time-travel
 /// (`to_t < max_t`). When `overlay` is false the metadata (base-leaflet)
 /// primitives are exact and used as before; when true the subject-keyed nodes
 /// route through the overlay-merging PSOT cursor instead. Nodes not yet
@@ -84,12 +84,8 @@ pub(crate) fn count_plan_operator(
             // Overlay lane needed when novelty is present or the query is
             // time-travel (`to_t < max_t`) — in both cases the base-leaflet
             // metadata primitives are not exact.
-            let overlay = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0
-                || ctx.to_t != store.max_t();
+            let overlay =
+                crate::fast_path_common::overlay_has_novelty(ctx) || ctx.to_t != store.max_t();
 
             // Only some node types have an overlay lane so far; any other node
             // under overlay must bail to the (correct, slower) generic fallback

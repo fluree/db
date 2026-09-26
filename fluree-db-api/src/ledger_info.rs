@@ -767,18 +767,6 @@ fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String
 
 /// Build the `ledger` block with ledger-wide metadata.
 fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
-    let index_t = ledger
-        .ns_record
-        .as_ref()
-        .map(|r| r.index_t)
-        .unwrap_or(ledger.snapshot.t);
-
-    let commit_t = ledger
-        .ns_record
-        .as_ref()
-        .map(|r| r.commit_t)
-        .unwrap_or(ledger.t());
-
     let graph_sizes = stats.graphs.as_deref().unwrap_or_default();
     let graph_totals = |g_id: GraphId| -> (u64, u64) {
         graph_sizes
@@ -823,8 +811,10 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
     Ledger {
         alias: ledger.snapshot.ledger_id.clone(),
         t: Some(ledger.t()),
-        commit_t: Some(commit_t),
-        index_t: Some(index_t),
+        // The record saved at load time can lag cached commits or index installs.
+        // Describe the state serving this request, not that saved record.
+        commit_t: Some(ledger.t()),
+        index_t: Some(ledger.index_t()),
         flakes: Some(stats.flakes as i64),
         size: stats.size,
         named_graphs,
@@ -2840,6 +2830,21 @@ mod tests {
         assert_eq!(datatype_display_string(14), "rdf:langString");
         assert_eq!(datatype_display_string(38), "@vector");
         assert_eq!(datatype_display_string(39), "@fulltext");
+    }
+
+    #[test]
+    fn ledger_block_uses_live_watermarks_instead_of_saved_nameservice_record() {
+        let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("info-watermarks:main");
+        snapshot.t = 1;
+        let mut novelty = fluree_db_novelty::Novelty::new(1);
+        novelty.t = 2;
+        let mut ledger = LedgerState::new(snapshot, novelty);
+        ledger.ns_record = Some(NsRecord::new("info-watermarks", "main"));
+
+        let block = build_ledger_block(&ledger, &IndexStats::default());
+        assert_eq!(block.t, Some(2));
+        assert_eq!(block.commit_t, Some(2));
+        assert_eq!(block.index_t, Some(1));
     }
 
     #[test]

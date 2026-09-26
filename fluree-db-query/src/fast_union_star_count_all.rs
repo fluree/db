@@ -595,11 +595,7 @@ fn count_union_star(
     extra_preds: &[Ref],
     mode: UnionCountMode,
 ) -> Result<Option<u64>> {
-    let overlay_has_rows = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0;
+    let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
     if union_preds.is_empty() {
         return Ok(Some(0));
     }
@@ -612,7 +608,7 @@ fn count_union_star(
     // base-leaflet directory counts are exact; otherwise fall through to the
     // overlay-merging cursor path below.
     //
-    // Gate matches `count_plan_exec`: epoch != 0 OR to_t != max_t.
+    // Gate matches `count_plan_exec`: live overlay rows OR to_t != max_t.
     let time_travel = ctx.to_t != store.max_t();
     if matches!(mode, UnionCountMode::AllRows)
         && extra_preds.is_empty()
