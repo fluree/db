@@ -158,7 +158,8 @@ fluree create mydb --from ./data.jsonl      # Bulk-import newline-delimited JSON
 fluree list                                 # List local ledgers
 fluree info mydb                            # Show ledger metadata
 fluree use mydb                             # Set active ledger (used as default)
-fluree drop mydb --force                    # Delete a ledger
+fluree drop mydb                            # Drop a ledger (restorable)
+fluree drop mydb --hard --force             # Drop a ledger and delete its data
 fluree export mydb --format turtle          # Export data as Turtle
 ```
 

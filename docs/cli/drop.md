@@ -1,11 +1,11 @@
 # fluree drop
 
-Hard-drop an entire ledger (every branch under the name) or a graph source.
+Drop an entire ledger (every branch under the name) or a graph source.
 
 ## Usage
 
 ```bash
-fluree drop <NAME> --force
+fluree drop <NAME> [--hard --force]
 ```
 
 ## Arguments
@@ -18,36 +18,50 @@ fluree drop <NAME> --force
 
 | Option | Description |
 |--------|-------------|
-| `--force` | Required flag to confirm deletion |
+| `--hard` | Delete the data now instead of keeping it restorable. Irreversible. |
+| `--force` | Confirms permanent deletion. Required with `--hard`. |
+| `--remote <NAME>` | Run against a configured remote server. |
 
 ## Description
 
-Hard-drops a **whole ledger** — every branch under the name, including any retracted-but-not-purged branches, plus the cross-branch `@shared/dicts/` namespace. Branches are dropped leaf-first so partial failure leaves orphan parents rather than dangling children. Equivalent to `POST /drop` with `"hard": true`. Deleted artifacts are irreversible.
+Drops a **whole ledger**: every branch under the name. The name is free straight away, so `fluree create` can make a new ledger under it, and writers that loaded the old ledger are refused.
 
-The command first tries to drop the name as a ledger. If no nameservice record exists for the name, it tries to drop it as a graph source. This means `fluree drop` works uniformly for both ledgers and graph sources like Iceberg mappings.
+By default the data is kept. The dropped ledger moves to a list of dropped ledgers, keyed by an **instance id** that `fluree drop` prints; [`fluree dropped`](dropped.md) lists, restores and purges them.
 
-The `--force` flag is required to prevent accidental deletion. There is no CLI soft-drop flag; use the HTTP or Rust API if you need to retract a ledger while preserving artifacts. To remove a single branch (not the whole ledger), use `fluree branch drop`.
+`--hard` deletes the data now: commits, indexes, dictionaries and the cross-branch `@shared/` namespace. Equivalent to `POST /drop` with `"hard": true`.
 
-Graph source cleanup is implementation-specific. The command retracts the graph source record and performs any available hard-drop cleanup for that graph source type; warnings are printed when cleanup is partial.
+A ledger created before name bindings (by an earlier release) has no instance id. Dropping one keeps its data and its name stays reserved; `fluree drop <name> --hard --force` deletes it.
+
+The command first tries to drop the name as a ledger. If no ledger holds the name, it tries to drop it as a graph source, so `fluree drop` works uniformly for both ledgers and graph sources like Iceberg mappings. Graph sources cannot be restored; a soft drop retracts the graph source and keeps its files, and `--hard` deletes them. Graph source cleanup is implementation-specific, and warnings are printed when it is partial.
+
+To remove a single branch (not the whole ledger), use `fluree branch drop`.
 
 ## Examples
 
 ```bash
-# Drop the whole "oldledger" ledger (all branches + @shared/dicts/)
-fluree drop oldledger --force
+# Drop "oldledger", keeping its data
+fluree drop oldledger
+
+# Bring it back, or delete its data
+fluree dropped restore 01J9Z6Q8W2M4T7XK3B5N1C0D9E
+fluree dropped purge 01J9Z6Q8W2M4T7XK3B5N1C0D9E --force
+
+# Drop and delete at once
+fluree drop oldledger --hard --force
 
 # Drop a graph source (Iceberg mapping)
-fluree drop warehouse-orders --force
+fluree drop warehouse-orders
 ```
 
 ## Output
 
-Ledger:
+Soft drop:
 ```
 Dropped ledger 'oldledger'
+Its data is kept: restore it with `fluree dropped restore 01J9Z6Q8W2M4T7XK3B5N1C0D9E`, or delete it with `fluree dropped purge 01J9Z6Q8W2M4T7XK3B5N1C0D9E --force`.
 ```
 
-Ledger with artifact cleanup:
+Hard drop:
 ```
 Dropped ledger 'oldledger' (deleted 73 artifacts across 3 branches)
 ```
@@ -59,9 +73,14 @@ Dropped graph source 'warehouse-orders:main'
 
 ## Errors
 
-Without `--force`:
+`--hard` without `--force`:
 ```
-error: use --force to confirm deletion of 'oldledger'
+error: use --force with --hard to confirm permanent deletion of 'oldledger'
+```
+
+A name no ledger or graph source holds, including one already dropped:
+```
+error: 'oldledger' not found; `fluree dropped list` shows dropped ledgers
 ```
 
 Branch-qualified input with a non-default suffix:
@@ -103,6 +122,7 @@ at the `named-graphs` section of `fluree info <ledger>`).
 
 ## See Also
 
+- [dropped](dropped.md) - List, restore or purge dropped ledgers
 - [create](create.md) - Create a new ledger
 - [iceberg](iceberg.md) - Map Iceberg tables as graph sources
 - [list](list.md) - List all ledgers and graph sources

@@ -417,20 +417,31 @@ pub enum Commands {
         action: ClusterAction,
     },
 
-    /// Drop (delete) a ledger or graph source
+    /// Drop a ledger or graph source. A dropped ledger's data is kept until
+    /// purged, so it can be restored; `--hard` deletes it now.
     Drop {
         /// Ledger or graph source name to drop. The server resolves as a ledger
         /// first, then as a graph source — `fluree iceberg drop` is the
         /// explicit graph-source variant.
         name: String,
 
-        /// Required flag to confirm deletion
+        /// Delete the data now instead of keeping it restorable (irreversible)
+        #[arg(long)]
+        hard: bool,
+
+        /// Confirm permanent deletion; required with --hard
         #[arg(long)]
         force: bool,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
         remote: Option<String>,
+    },
+
+    /// List, restore, or purge dropped ledgers
+    Dropped {
+        #[command(subcommand)]
+        action: DroppedAction,
     },
 
     /// Manage named graphs within a ledger
@@ -1710,6 +1721,42 @@ pub enum GraphAction {
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g. "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Dropped-ledger subcommands. A dropped ledger is named by its instance id,
+/// since a new ledger may already hold the name it was dropped under.
+#[derive(Subcommand)]
+pub enum DroppedAction {
+    /// List dropped ledgers, most recently dropped first
+    List {
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Restore a dropped ledger under the name it was dropped under
+    Restore {
+        /// Instance id of the dropped ledger (from `fluree dropped list`)
+        instance: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Delete a dropped ledger's data (irreversible)
+    Purge {
+        /// Instance id of the dropped ledger (from `fluree dropped list`)
+        instance: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
         remote: Option<String>,
     },

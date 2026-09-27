@@ -11,6 +11,7 @@
   - [branch](cli/branch.md)
   - [cluster](cli/cluster.md)
   - [drop](cli/drop.md)
+  - [dropped](cli/dropped.md)
   - [graph](cli/graph.md)
   - [insert](cli/insert.md)
   - [upsert](cli/upsert.md)

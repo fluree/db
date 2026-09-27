@@ -180,8 +180,8 @@ fluree query warehouse-orders 'SELECT ?id ?total WHERE { ?o ex:id ?id ; ex:total
 # connection-scoped path automatically (or force it with --connection).
 fluree query --connection 'SELECT ?id ?total FROM <warehouse-orders:main> WHERE { ?o ex:id ?id ; ex:total ?total }'
 
-# Remove the mapping
-fluree drop warehouse-orders --force
+# Remove the mapping and delete its files
+fluree drop warehouse-orders --hard --force
 ```
 
 ### Feature Flag

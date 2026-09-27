@@ -829,16 +829,125 @@ fn insert_without_active_ledger_errors() {
 }
 
 #[test]
-fn drop_without_force_errors() {
+fn hard_drop_without_force_errors() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp).args(["create", "db"]).assert().success();
 
     fluree_cmd(&tmp)
-        .args(["drop", "db"])
+        .args(["drop", "db", "--hard"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--force"));
+}
+
+/// The instance id `fluree drop` prints for a soft-dropped ledger.
+fn dropped_instance(drop_stdout: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(drop_stdout);
+    let rest = stdout
+        .split("fluree dropped restore ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no restore hint in: {stdout}"));
+    rest.split('`').next().unwrap().to_string()
+}
+
+#[test]
+fn drop_keeps_the_data_until_purged() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "db"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:name": "Alice"}"#,
+        ])
+        .assert()
+        .success();
+
+    let dropped = fluree_cmd(&tmp)
+        .args(["drop", "db"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dropped ledger 'db'"))
+        .stdout(predicate::str::contains("Its data is kept"));
+    let instance = dropped_instance(&dropped.get_output().stdout);
+
+    // The name is free, and the dropped ledger is listed under its instance.
+    fluree_cmd(&tmp)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No ledgers found"));
+    fluree_cmd(&tmp)
+        .args(["dropped", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&instance))
+        .stdout(predicate::str::contains("db"));
+
+    fluree_cmd(&tmp)
+        .args(["dropped", "restore", &instance])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restored ledger 'db'"));
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "db",
+            "SELECT ?n WHERE { ?s <http://example.org/name> ?n }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"));
+
+    // Drop again and purge: nothing is left to restore.
+    let dropped = fluree_cmd(&tmp).args(["drop", "db"]).assert().success();
+    let instance = dropped_instance(&dropped.get_output().stdout);
+    fluree_cmd(&tmp)
+        .args(["dropped", "purge", &instance])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--force"));
+    fluree_cmd(&tmp)
+        .args(["dropped", "purge", &instance, "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Purged dropped ledger 'db'"));
+    fluree_cmd(&tmp)
+        .args(["dropped", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No dropped ledgers."));
+    fluree_cmd(&tmp)
+        .args(["dropped", "restore", &instance])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn hard_drop_deletes_the_data() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "db"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["drop", "db", "--hard", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dropped ledger 'db'"))
+        .stdout(predicate::str::contains("Its data is kept").not());
+    fluree_cmd(&tmp)
+        .args(["dropped", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No dropped ledgers."));
+    fluree_cmd(&tmp)
+        .args(["drop", "db"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("fluree dropped list"));
 }
 
 #[test]
