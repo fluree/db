@@ -586,8 +586,7 @@ impl crate::NameServiceLookup for FileNameService {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         // A graph-source record is not a ledger (#1369). `load_record` reports it
         // as Ok(None) so the caller can fall back to the graph-source path.
-        let record = self.load_record(&ledger_name, &branch).await?;
-        crate::read_resolved(self, record).await
+        crate::lookup_resolved(self, &ledger_name, self.load_record(&ledger_name, &branch)).await
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {

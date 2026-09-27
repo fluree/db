@@ -615,9 +615,13 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
         &self,
         ledger_id: &str,
     ) -> std::result::Result<Option<NsRecord>, NameServiceError> {
-        let pk = Self::normalize(ledger_id)?;
-        let items = self.query_metadata_items(&pk).await?;
-        fluree_db_nameservice::read_resolved(self, Self::items_to_ns_record(&pk, &items)).await
+        let id = LedgerId::parse(ledger_id)?;
+        let pk = id.to_string();
+        let record = async {
+            let items = self.query_metadata_items(&pk).await?;
+            Ok(Self::items_to_ns_record(&pk, &items))
+        };
+        fluree_db_nameservice::lookup_resolved(self, id.name(), record).await
     }
 
     /// One consistent Query over the `head..=index` sort-key range, projected

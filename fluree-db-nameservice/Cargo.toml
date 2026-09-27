@@ -16,6 +16,7 @@ conformance = []
 fluree-db-core = { path = "../fluree-db-core", default-features = false }
 fluree-vocab = { path = "../fluree-vocab" }
 async-trait = { workspace = true }
+futures = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

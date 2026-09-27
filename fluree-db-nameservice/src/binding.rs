@@ -392,6 +392,20 @@ pub async fn read_resolved<S: LedgerRegistry + ?Sized>(
     Ok(resolve_record(binding.as_ref().map(|v| &v.value), record))
 }
 
+/// [`read_resolved`] for a record of `name` that `record` reads, with the
+/// binding read alongside it rather than after, so a lookup costs no more
+/// round trips than the record alone. Either order can pair a record with a
+/// binding from just before or after a drop; the fences then differ, and the
+/// record resolves to `None`.
+pub async fn lookup_resolved<S, F>(store: &S, name: &str, record: F) -> Result<Option<NsRecord>>
+where
+    S: LedgerRegistry + ?Sized,
+    F: std::future::Future<Output = Result<Option<NsRecord>>>,
+{
+    let (record, binding) = futures::future::try_join(record, store.get_binding(name)).await?;
+    Ok(record.and_then(|record| resolve_record(binding.as_ref().map(|v| &v.value), record)))
+}
+
 /// [`resolve_record`] for many records, reading each name's binding once.
 pub async fn read_all_resolved<S: LedgerRegistry + ?Sized>(
     store: &S,
