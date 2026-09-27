@@ -17,6 +17,7 @@ use fluree_db_core::{
 };
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_novelty::TxnMetaEntry;
+use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 #[cfg(feature = "shacl")]
 use fluree_db_shacl::ShaclEngine;
 use fluree_db_transact::stage_with_graph_delta as stage_txn;
@@ -31,6 +32,10 @@ use fluree_vocab::config_iris;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+
+/// Routing stamp site for the streaming Turtle insert: `proceed` when the
+/// document parsed as Turtle, a fallback when it was TriG.
+pub const TURTLE_INSERT_SITE: &str = "turtle_insert";
 
 /// Stable id for an upsert payload, used as its blank-node skolem scope.
 ///
@@ -3752,20 +3757,54 @@ impl crate::Fluree {
         };
 
         let staged = self
-            .stage_turtle_insert(ledger, turtle, Some(index_config), None, policy)
+            .stage_turtle_insert_with_opts(
+                ledger,
+                turtle,
+                txn_opts,
+                Some(index_config),
+                None,
+                policy,
+            )
             .await?;
         self.commit_stage_result(staged, TxnType::Insert, commit_opts, index_config)
             .await
     }
 
-    /// Stage a Turtle INSERT by parsing directly to flakes (bypass JSON-LD / IR).
+    /// Stage a Turtle or TriG INSERT.
     ///
-    /// This is the fast path for Turtle ingestion. The Turtle is parsed using
-    /// `FlakeSink` which converts parser events directly to flakes.
+    /// Turtle is parsed directly to flakes by `FlakeSink`, bypassing JSON-LD /
+    /// IR. A TriG document (graph blocks, `<#txn-meta>`) is staged through the
+    /// named-graph path TriG upsert uses, with insert semantics.
     pub async fn stage_turtle_insert(
         &self,
         ledger: LedgerState,
         turtle: &str,
+        index_config: Option<&IndexConfig>,
+        tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+    ) -> Result<StageResult> {
+        self.stage_turtle_insert_with_opts(
+            ledger,
+            turtle,
+            TxnOpts::default(),
+            index_config,
+            tracker,
+            policy,
+        )
+        .await
+    }
+
+    /// [`Self::stage_turtle_insert`] with the caller's transaction options,
+    /// which only the TriG path reads.
+    ///
+    /// The streaming Turtle parser has no graph-block production, so it stops
+    /// at a TriG document's first block. Only then is the document read as
+    /// TriG, which keeps the second parse off plain Turtle entirely.
+    pub(crate) async fn stage_turtle_insert_with_opts(
+        &self,
+        ledger: LedgerState,
+        turtle: &str,
+        txn_opts: TxnOpts,
         index_config: Option<&IndexConfig>,
         tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
@@ -3791,11 +3830,29 @@ impl crate::Fluree {
         // Parse Turtle directly to flakes
         let parse_span =
             tracing::debug_span!("turtle_parse_to_flakes", turtle_bytes = turtle.len());
-        let flakes = {
+        let parsed = {
             let _g = parse_span.enter();
             let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id);
-            fluree_graph_turtle::parse(turtle, &mut sink)?;
-            sink.into_flakes().map_err(ApiError::from)?
+            fluree_graph_turtle::parse(turtle, &mut sink).map(|()| sink.into_flakes())
+        };
+        let flakes = match parsed {
+            Ok(flakes) => {
+                stamp_fast_path(TURTLE_INSERT_SITE, FastPathOutcome::Proceed);
+                flakes.map_err(ApiError::from)?
+            }
+            Err(turtle_err) => {
+                return self
+                    .stage_trig_insert(
+                        ledger,
+                        turtle,
+                        turtle_err.into(),
+                        txn_opts,
+                        index_config,
+                        tracker,
+                        policy,
+                    )
+                    .await;
+            }
         };
         tracing::info!(flake_count = flakes.len(), "turtle parsed to flakes");
 
@@ -3898,6 +3955,43 @@ impl crate::Fluree {
             graph_delta: rustc_hash::FxHashMap::default(),
             sync_graph: None,
         })
+    }
+
+    /// Stage a document the streaming Turtle parser rejected as a TriG insert,
+    /// through the same named-graph path TriG upsert takes. A document with no
+    /// graph blocks and no txn-meta isn't TriG, so its Turtle error stands.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_trig_insert(
+        &self,
+        ledger: LedgerState,
+        trig: &str,
+        turtle_err: ApiError,
+        txn_opts: TxnOpts,
+        index_config: Option<&IndexConfig>,
+        tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+    ) -> Result<StageResult> {
+        let phase1 = fluree_db_transact::parse_trig_phase1(trig)?;
+        if phase1.named_graphs.is_empty() && phase1.raw_meta.is_none() {
+            return Err(turtle_err);
+        }
+        stamp_fast_path(
+            TURTLE_INSERT_SITE,
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+        );
+        let txn_json = fluree_graph_turtle::parse_to_json(&phase1.turtle)?;
+        self.stage_transaction_with_named_graphs_tracked(
+            ledger,
+            TxnType::Insert,
+            &txn_json,
+            txn_opts,
+            index_config,
+            phase1.raw_meta.as_ref(),
+            &phase1.named_graphs,
+            tracker,
+            policy,
+        )
+        .await
     }
 
     /// Insert new data with options
