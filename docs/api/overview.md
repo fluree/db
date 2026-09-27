@@ -87,7 +87,7 @@ defaults to `/v1/fluree`.
 - Returns: Transaction receipt with commit info
 
 **POST /insert** / **POST /upsert**
-- Insert or upsert data (JSON-LD and Turtle; TriG on upsert)
+- Insert or upsert data (JSON-LD, Turtle and TriG)
 
 **POST /sync**
 - Make one graph's contents exactly the payload, committing only the difference (JSON-LD, Turtle, N-Triples or TriG)

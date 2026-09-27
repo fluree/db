@@ -2110,8 +2110,8 @@ let result = fluree.stage(&handle)  // or stage_owned(ledger)
 | `.insert(&json)` | Insert JSON-LD data |
 | `.upsert(&json)` | Upsert JSON-LD data |
 | `.update(&json)` | Update with WHERE/DELETE/INSERT |
-| `.insert_turtle(&ttl)` | Insert Turtle data |
-| `.upsert_turtle(&ttl)` | Upsert Turtle data |
+| `.insert_turtle(&ttl)` | Insert Turtle or TriG data (graph blocks land in their named graphs) |
+| `.upsert_turtle(&ttl)` | Upsert Turtle or TriG data |
 | `.txn_opts(opts)` | Set transaction options (branch, context) |
 | `.commit_opts(opts)` | Set commit options (identity, raw_txn) |
 | `.policy(ctx)` | Set policy enforcement |

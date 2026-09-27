@@ -24,7 +24,7 @@ fluree upsert [LEDGER] [DATA] [OPTIONS]
 | `-e, --expr <EXPR>` | Inline data expression (alternative to positional) |
 | `-f, --file <FILE>` | Read data from a file |
 | `-m, --message <MSG>` | Commit message |
-| `--format <FORMAT>` | Data format: `turtle` or `jsonld` (auto-detected if omitted) |
+| `--format <FORMAT>` | Data format: `turtle`, `trig` or `jsonld` (auto-detected if omitted) |
 | `--remote <NAME>` | Execute against a remote server (by remote name, e.g., `origin`) |
 
 ## Description
@@ -44,6 +44,9 @@ ex:alice ex:name "Alice Smith" ; ex:age 31 .'
 
 # Upsert from file
 fluree upsert -f updates.ttl
+
+# Upsert a TriG file: values are replaced within each named graph
+fluree upsert -f updates.trig
 
 # Upsert with commit message
 fluree upsert '{"@id": "ex:alice", "ex:status": "active"}' -m "Updated Alice status"
