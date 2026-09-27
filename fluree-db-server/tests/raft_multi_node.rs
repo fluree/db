@@ -1683,8 +1683,12 @@ async fn liveness_monitor_demotes_killed_follower() {
     cluster.bootstrap().await;
 
     let leader_id = cluster.current_leader().await.expect("leader present");
-    let initial_eligible = read_eligible_voters(&cluster, leader_id).await;
     let expected_voters: BTreeSet<NodeId> = (1..=CLUSTER_SIZE).collect();
+    // Under load, a voter still applying the membership change can lag past
+    // `max_healthy_lag` for long enough to be demoted, and is promoted again
+    // once it keeps pace. Wait that out rather than read the set once.
+    let initial_eligible =
+        wait_for_eligible_voters(&cluster, leader_id, &expected_voters, DEFAULT_TIMEOUT).await;
     assert_eq!(
         initial_eligible, expected_voters,
         "post-bootstrap eligible set must be the full voter set; got {initial_eligible:?}"
@@ -1776,6 +1780,24 @@ async fn read_eligible_voters(cluster: &TestCluster, node_id: NodeId) -> BTreeSe
         .expect("test node always has raft integration");
     let state = integration.shared_state.read().await;
     state.worker_eligible_voters.clone()
+}
+
+/// Poll `worker_eligible_voters` on `via_node` until it is `expected`,
+/// or `timeout` elapses. Returns the last set read.
+async fn wait_for_eligible_voters(
+    cluster: &TestCluster,
+    via_node: NodeId,
+    expected: &BTreeSet<NodeId>,
+    timeout: Duration,
+) -> BTreeSet<NodeId> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let eligible = read_eligible_voters(cluster, via_node).await;
+        if &eligible == expected || Instant::now() >= deadline {
+            return eligible;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Poll `worker_eligible_voters` on `via_node` until `voter` is
