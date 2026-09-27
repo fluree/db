@@ -621,6 +621,16 @@ pub async fn mirror_binds_the_origin_instance<S: LifecycleStore + crate::NameSer
     assert_eq!(copy.storage_root, replacement.storage_root);
     assert!(store.lookup("mydb:dev").await.unwrap().is_none());
 
+    // The old ledger's drop, heard late, leaves the new copy alone.
+    lifecycle::unmirror_record(store, &id("mydb"), main.instance().as_ref())
+        .await
+        .unwrap();
+    assert!(store.lookup("mydb:main").await.unwrap().is_some());
+    lifecycle::unmirror_record(store, &id("mydb"), replacement.instance().as_ref())
+        .await
+        .unwrap();
+    assert!(store.lookup("mydb:main").await.unwrap().is_none());
+
     let mut legacy = NsRecord::new(id("old:main"));
     legacy.storage_root = None;
     assert!(matches!(

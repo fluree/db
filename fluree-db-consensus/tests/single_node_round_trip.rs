@@ -80,6 +80,14 @@ impl RaftNetwork<TypeConfig> for StubNetwork {
     }
 }
 
+fn drain(sub: &mut fluree_db_nameservice::Subscription) -> Vec<NameServiceEvent> {
+    std::iter::from_fn(|| sub.receiver.try_recv().ok()).collect()
+}
+
+fn lid(s: &str) -> LedgerId {
+    LedgerId::parse(s).unwrap()
+}
+
 fn cid(seed: u8) -> ContentId {
     ContentId::new(ContentKind::Commit, &[seed])
 }
@@ -414,8 +422,19 @@ async fn single_node_branch_lifecycle_round_trip() {
     }))
     .await
     .unwrap();
-    // Drain seed commit event.
-    let _ = sub.receiver.try_recv().expect("seed commit event");
+    // Activating main announces it, naming its ledger.
+    let instance = ns
+        .lookup("test/db:main")
+        .await
+        .unwrap()
+        .and_then(|r| r.instance())
+        .expect("main resolves with its instance");
+    let created = |ledger_id: &str| NameServiceEvent::LedgerCreated {
+        ledger_id: lid(ledger_id),
+        instance: instance.clone(),
+    };
+    let events = drain(&mut sub);
+    assert!(events.contains(&created("test/db:main")), "{events:?}");
 
     // Fork feature from main.
     let name = LedgerName::parse("test/db").unwrap();
@@ -434,13 +453,17 @@ async fn single_node_branch_lifecycle_round_trip() {
     assert_eq!(main.branches, 1);
 
     // create_branch fires a LedgerCommitPublished against the new
-    // branch so the indexer picks it up.
-    match sub.receiver.try_recv().expect("create-branch event") {
-        NameServiceEvent::LedgerCommitPublished { ledger_id, .. } => {
-            assert_eq!(ledger_id, "test/db:feature");
-        }
-        other => panic!("expected LedgerCommitPublished, got {other:?}"),
-    }
+    // branch so the indexer picks it up, and announces it.
+    let events = drain(&mut sub);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            NameServiceEvent::LedgerCommitPublished { ledger_id, .. }
+                if *ledger_id == lid("test/db:feature")
+        )),
+        "{events:?}"
+    );
+    assert!(events.contains(&created("test/db:feature")), "{events:?}");
 
     // The root branch cannot be dropped on its own.
     assert!(lifecycle::begin_drop_branch(&ns, &name, "main")
@@ -482,18 +505,39 @@ async fn single_node_branch_lifecycle_round_trip() {
         0
     );
 
-    match sub.receiver.try_recv().expect("drop-branch event") {
-        NameServiceEvent::LedgerRetracted { ledger_id } => {
-            assert_eq!(ledger_id, "test/db:feature");
-        }
-        other => panic!("expected LedgerRetracted, got {other:?}"),
-    }
+    let events = drain(&mut sub);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            NameServiceEvent::LedgerRetracted { ledger_id, .. }
+                if *ledger_id == lid("test/db:feature")
+        )),
+        "{events:?}"
+    );
 
     // Dropping a missing branch surfaces NotFound.
     assert!(matches!(
         lifecycle::begin_drop_branch(&ns, &name, "ghost").await,
         Err(NameServiceError::NotFound(_))
     ));
+
+    // A ledger drop names the ledger in its retraction; a restore announces
+    // it again.
+    drain(&mut sub);
+    lifecycle::drop_ledger(&ns, &name, false)
+        .await
+        .expect("drop ledger");
+    let events = drain(&mut sub);
+    let retracted = NameServiceEvent::LedgerRetracted {
+        ledger_id: lid("test/db:main"),
+        instance: Some(instance.clone()),
+    };
+    assert!(events.contains(&retracted), "{events:?}");
+    lifecycle::restore_dropped(&ns, &instance)
+        .await
+        .expect("restore");
+    let events = drain(&mut sub);
+    assert!(events.contains(&created("test/db:main")), "{events:?}");
 
     raft.shutdown().await.unwrap();
 }

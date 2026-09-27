@@ -348,9 +348,13 @@ pub async fn mirror_record<S: LifecycleStore + ?Sized>(
 /// ledger has dropped the branch: unlist the branch, removing the binding
 /// with its last branch, then delete the record. The copy owns no data, so
 /// nothing else is deleted.
+///
+/// Given the `instance` the branch belonged to, a copy of another ledger
+/// under the name is left alone: the drop is older than that ledger.
 pub async fn unmirror_record<S: LifecycleStore + ?Sized>(
     store: &S,
     ledger_id: &LedgerId,
+    instance: Option<&InstanceId>,
 ) -> Result<()> {
     let name = ledger_id.ledger_name();
     let branch = ledger_id.branch();
@@ -358,6 +362,9 @@ pub async fn unmirror_record<S: LifecycleStore + ?Sized>(
         let Some(Versioned { value, version }) = store.get_binding(&name).await? else {
             return Ok(());
         };
+        if instance.is_some_and(|i| *i != value.instance) {
+            return Ok(());
+        }
         let Some(fence) = value.fence_of(branch) else {
             return Ok(());
         };

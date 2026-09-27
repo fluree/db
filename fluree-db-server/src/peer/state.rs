@@ -4,6 +4,7 @@
 //! This is separate from local ledger state which may lag behind.
 
 use fluree_db_api::LedgerId;
+use fluree_db_core::InstanceId;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -13,6 +14,8 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone)]
 pub struct RemoteLedgerWatermark {
     pub ledger_id: String,
+    /// The ledger the heads belong to; heads of another are not comparable.
+    pub instance: Option<InstanceId>,
     pub commit_t: i64,
     pub index_t: i64,
     pub commit_head_id: Option<String>,
@@ -120,11 +123,18 @@ impl PeerState {
         index_t: i64,
         commit_head_id: Option<String>,
         index_head_id: Option<String>,
+        instance: Option<InstanceId>,
     ) -> bool {
         let mut ledgers = self.ledgers.write().await;
 
+        // A ledger created under the name since replaces the watermark, at
+        // whatever t it starts.
         let changed = match ledgers.get(ledger_id) {
-            Some(existing) => commit_t > existing.commit_t || index_t > existing.index_t,
+            Some(existing) => {
+                existing.instance != instance
+                    || commit_t > existing.commit_t
+                    || index_t > existing.index_t
+            }
             None => true,
         };
 
@@ -133,6 +143,7 @@ impl PeerState {
                 ledger_id.clone(),
                 RemoteLedgerWatermark {
                     ledger_id: ledger_id.to_string(),
+                    instance,
                     commit_t,
                     index_t,
                     commit_head_id,
@@ -146,8 +157,18 @@ impl PeerState {
     }
 
     /// Remove ledger (on retraction)
-    pub async fn remove_ledger(&self, ledger_id: &LedgerId) {
-        self.ledgers.write().await.remove(ledger_id);
+    ///
+    /// Given the `instance` the retracted branch belonged to, a watermark of
+    /// another ledger under the name is kept, and `false` returned: the
+    /// retraction is older than that ledger and does not apply to it.
+    pub async fn remove_ledger(&self, ledger_id: &LedgerId, instance: Option<&InstanceId>) -> bool {
+        let mut ledgers = self.ledgers.write().await;
+        let held = ledgers.get(ledger_id).and_then(|w| w.instance.as_ref());
+        if matches!((instance, held), (Some(a), Some(b)) if a != b) {
+            return false;
+        }
+        ledgers.remove(ledger_id);
+        true
     }
 
     /// Update graph source watermark from SSE event (returns true if changed)
@@ -301,6 +322,7 @@ mod tests {
                 3,
                 Some("commit-cid:5".to_string()),
                 Some("index-cid:3".to_string()),
+                None,
             )
             .await;
 
@@ -311,18 +333,37 @@ mod tests {
         assert_eq!(ledger.index_t, 3);
     }
 
+    /// A ledger created under the name since starts over at a lower t, and
+    /// its watermark replaces the old one's.
+    #[tokio::test]
+    async fn a_ledger_created_under_the_name_replaces_the_watermark() {
+        let state = PeerState::new();
+        let old = InstanceId::parse("01JB8ZK4X5Y6Z7A8B9C0D1E2F3").unwrap();
+        let new = InstanceId::parse("01JC2QW7X5Y6Z7A8B9C0D1E2F3").unwrap();
+        state
+            .update_ledger(&id("books:main"), 50, 40, None, None, Some(old))
+            .await;
+        assert!(
+            state
+                .update_ledger(&id("books:main"), 2, 0, None, None, Some(new.clone()))
+                .await
+        );
+        let ledger = state.get_remote_ledger(&id("books:main")).await.unwrap();
+        assert_eq!((ledger.commit_t, ledger.instance), (2, Some(new)));
+    }
+
     #[tokio::test]
     async fn test_ledger_update_no_change() {
         let state = PeerState::new();
 
         // Initial update
         state
-            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .update_ledger(&id("books:main"), 5, 3, None, None, None)
             .await;
 
         // Same watermarks - no change
         let changed = state
-            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .update_ledger(&id("books:main"), 5, 3, None, None, None)
             .await;
         assert!(!changed);
     }
@@ -332,12 +373,12 @@ mod tests {
         let state = PeerState::new();
 
         state
-            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .update_ledger(&id("books:main"), 5, 3, None, None, None)
             .await;
 
         // Higher commit_t
         let changed = state
-            .update_ledger(&id("books:main"), 6, 3, None, None)
+            .update_ledger(&id("books:main"), 6, 3, None, None, None)
             .await;
         assert!(changed);
 
@@ -350,12 +391,12 @@ mod tests {
         let state = PeerState::new();
 
         state
-            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .update_ledger(&id("books:main"), 5, 3, None, None, None)
             .await;
 
         // Higher index_t
         let changed = state
-            .update_ledger(&id("books:main"), 5, 5, None, None)
+            .update_ledger(&id("books:main"), 5, 5, None, None, None)
             .await;
         assert!(changed);
 
@@ -367,7 +408,7 @@ mod tests {
     async fn test_check_ledger_freshness_no() {
         let state = PeerState::new();
         state
-            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .update_ledger(&id("books:main"), 5, 3, None, None, None)
             .await;
 
         let result = state.check_ledger_freshness(&id("books:main"), 3).await;
@@ -378,7 +419,7 @@ mod tests {
     async fn test_check_ledger_freshness_yes() {
         let state = PeerState::new();
         state
-            .update_ledger(&id("books:main"), 5, 5, None, None)
+            .update_ledger(&id("books:main"), 5, 5, None, None, None)
             .await;
 
         let result = state.check_ledger_freshness(&id("books:main"), 3).await;
@@ -407,11 +448,11 @@ mod tests {
     async fn test_remove_ledger() {
         let state = PeerState::new();
         state
-            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .update_ledger(&id("books:main"), 5, 3, None, None, None)
             .await;
         assert!(state.get_remote_ledger(&id("books:main")).await.is_some());
 
-        state.remove_ledger(&id("books:main")).await;
+        assert!(state.remove_ledger(&id("books:main"), None).await);
         assert!(state.get_remote_ledger(&id("books:main")).await.is_none());
     }
 
@@ -419,7 +460,7 @@ mod tests {
     async fn test_clear() {
         let state = PeerState::new();
         state
-            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .update_ledger(&id("books:main"), 5, 3, None, None, None)
             .await;
         state
             .update_graph_source(&id("search:main"), 2, "abc123".to_string(), None)

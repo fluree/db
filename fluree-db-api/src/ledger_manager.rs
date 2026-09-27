@@ -642,6 +642,13 @@ impl LedgerHandle {
         )
     }
 
+    /// Whether `record` belongs to another activation than the cached state;
+    /// see [`other_activation`].
+    pub async fn is_other_activation(&self, record: &NsRecord) -> bool {
+        let state = self.inner.state.read().await;
+        other_activation(state.ns_record.as_ref(), record)
+    }
+
     /// Check if cached state is fresh vs remote watermark
     pub async fn check_freshness(&self, remote: &RemoteWatermark) -> FreshnessCheck {
         let local_index_t = self.index_t().await;
@@ -1971,8 +1978,13 @@ impl LedgerManager {
                         // `t` than the in-memory state, we skip the swap and keep
                         // the fresher novelty — transiently forgoing the newer
                         // index, which the next reload picks up. Never clobber a
-                        // newer in-memory commit to adopt a newer index.
-                        if new_state.t() >= write_guard.state().t() {
+                        // newer in-memory commit to adopt a newer index. A state
+                        // of another activation is replaced whatever its t: its
+                        // commits can no longer be published.
+                        let replaced = new_state.ns_record.as_ref().is_some_and(|record| {
+                            other_activation(write_guard.state().ns_record.as_ref(), record)
+                        });
+                        if replaced || new_state.t() >= write_guard.state().t() {
                             let mut bs_guard = handle.inner.binary_store.write().await;
                             write_guard.replace(new_state);
                             *bs_guard = new_binary_store;
@@ -2287,6 +2299,23 @@ impl UpdatePlan {
     }
 }
 
+/// Whether `record` belongs to another activation than `cached`: another
+/// storage root, so another ledger under the name, or, where both carry one,
+/// another fence, so the same ledger dropped and restored. Heads of two
+/// activations are not comparable. A side that carries neither is taken to
+/// match.
+fn other_activation(cached: Option<&NsRecord>, record: &NsRecord) -> bool {
+    let Some(cached) = cached else {
+        return false;
+    };
+    let roots = matches!(
+        (&cached.storage_root, &record.storage_root),
+        (Some(a), Some(b)) if a != b
+    );
+    let fences = matches!((cached.fence, record.fence), (Some(a), Some(b)) if a != b);
+    roots || fences
+}
+
 /// Input for notify: ledger ID + optional fresh NsRecord
 pub struct NsNotify {
     /// Ledger ID
@@ -2311,6 +2340,9 @@ pub enum NotifyResult {
     },
     /// Was stale, reloaded in-place via reload()
     Reloaded,
+    /// The ledger no longer resolves under this id, as after a drop: its
+    /// cached state was removed.
+    Evicted,
 }
 
 /// Options for `Fluree::refresh()`.
@@ -2364,9 +2396,22 @@ impl LedgerManager {
                 .await?
             {
                 Some(r) => r,
-                None => return Ok(NotifyResult::Current), // Ledger doesn't exist
+                // Dropped, or being dropped: the cached state must not go on
+                // answering for it.
+                None => {
+                    self.disconnect(&input.ledger_id).await;
+                    return Ok(NotifyResult::Evicted);
+                }
             },
         };
+
+        // Heads are only comparable within one activation. A record from a
+        // ledger created under the name since, or from this one restored
+        // after a drop, may sit at a lower t than the cached state.
+        if handle.is_other_activation(&ns_record).await {
+            self.reload(&input.ledger_id).await?;
+            return Ok(NotifyResult::Reloaded);
+        }
 
         // Get local state metrics for planning
         let (local_t, local_index_t, local_index_id) = handle.state_metrics().await;

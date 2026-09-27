@@ -3132,8 +3132,8 @@ Server-Sent Events (SSE) stream of nameservice changes for ledgers and graph sou
 
 | Event | Description |
 |-------|-------------|
-| `ns-record` | A ledger or graph source was published/updated |
-| `ns-retracted` | A ledger or graph source was deleted |
+| `ns-record` | A ledger or graph source was created, restored or updated. A ledger's record carries its `instance` |
+| `ns-retracted` | A ledger or graph source was dropped. A ledger's retraction carries the `instance` it belonged to when known |
 
 **Authentication:** Configurable via `--events-auth-mode none|optional|required`. See [Query peers and replication](../operations/query-peers.md) for full details including auth configuration, event payloads, and peer subscription setup.
 

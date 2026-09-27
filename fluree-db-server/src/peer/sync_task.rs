@@ -79,8 +79,12 @@ impl PeerSyncTask {
                 RemoteEvent::LedgerUpdated(record) => {
                     self.handle_ledger_updated(&record).await;
                 }
-                RemoteEvent::LedgerRetracted { ledger_id } => {
-                    self.handle_ledger_retracted(&ledger_id).await;
+                RemoteEvent::LedgerRetracted {
+                    ledger_id,
+                    instance,
+                } => {
+                    self.handle_ledger_retracted(&ledger_id, instance.as_ref())
+                        .await;
                 }
                 RemoteEvent::GraphSourceUpdated(record) => {
                     let graph_source_id = record.graph_source_id.clone();
@@ -302,6 +306,7 @@ impl PeerSyncTask {
                     .index_head_id
                     .as_ref()
                     .map(std::string::ToString::to_string),
+                record.instance(),
             )
             .await;
 
@@ -317,14 +322,21 @@ impl PeerSyncTask {
 
     /// Remove the local copy of a branch the origin dropped and clear its
     /// in-memory watermarks. Cache eviction follows from the retraction
-    /// event the notifying nameservice emits.
-    async fn handle_ledger_retracted(&self, ledger_id: &fluree_db_api::LedgerId) {
+    /// event the notifying nameservice emits. Given the `instance` the
+    /// branch belonged to, a copy of a later ledger under the name is left.
+    async fn handle_ledger_retracted(
+        &self,
+        ledger_id: &fluree_db_api::LedgerId,
+        instance: Option<&fluree_db_core::InstanceId>,
+    ) {
         // 1. Remove the copy mirror_record made
         let Some(ns) = self.fluree.nameservice_mode().publisher() else {
             tracing::error!("PeerSyncTask requires a read-write nameservice");
             return;
         };
-        if let Err(e) = fluree_db_nameservice::lifecycle::unmirror_record(ns, ledger_id).await {
+        if let Err(e) =
+            fluree_db_nameservice::lifecycle::unmirror_record(ns, ledger_id, instance).await
+        {
             tracing::warn!(
                 ledger_id = %ledger_id,
                 error = %e,
@@ -333,7 +345,10 @@ impl PeerSyncTask {
         }
 
         // 2. Clear in-memory watermarks
-        self.peer_state.remove_ledger(ledger_id).await;
+        if !self.peer_state.remove_ledger(ledger_id, instance).await {
+            tracing::debug!(ledger_id = %ledger_id, "Ignoring the retraction of an earlier ledger under the name");
+            return;
+        }
 
         tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
     }

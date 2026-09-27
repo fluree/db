@@ -60,7 +60,7 @@ use crate::raft::waiter::{AbortReason, WaiterMap};
 use crate::raft::TypeConfig;
 use fluree_db_api::LedgerManager;
 use fluree_db_core::ContentId;
-use fluree_db_nameservice::{LedgerEventBus, NameServiceEvent};
+use fluree_db_nameservice::{Fence, LedgerEventBus, NameBinding, NameServiceEvent};
 use fluree_raft_core::node::NodeId;
 use fluree_raft_core::state_machine::{
     AppStateMachine, MembershipView, ReadOnlyState, SnapshotCodecError, SnapshotLoad,
@@ -287,7 +287,7 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
 
     fn on_command(
         &self,
-        _state: &NameServiceState,
+        state: &NameServiceState,
         command: &Command,
         response: &mut Response,
         _log_index: u64,
@@ -299,9 +299,14 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
             Command::Fenced { command, .. } => command.as_ref(),
             command => command,
         };
-        if let Some(event) = event_for(command, response) {
+        if let Some(event) = event_for(command, response, state) {
             out.push(Effect::Event(event));
         }
+        out.extend(
+            created_events(command, response, state)
+                .into_iter()
+                .map(Effect::Event),
+        );
         if let Some(resolution) = waiter_resolution_for(command, response) {
             out.push(Effect::Waiter(resolution));
         }
@@ -537,7 +542,11 @@ fn parsed_event_ledger_id(ledger_id: &str) -> Option<fluree_db_core::LedgerId> {
 
 /// matching [`NameServiceEvent`]. Returns `None` for pairs that
 /// don't advance head state — desyncs, no-ops, idempotency hits.
-fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
+fn event_for(
+    cmd: &Command,
+    response: &Response,
+    state: &NameServiceState,
+) -> Option<NameServiceEvent> {
     match (cmd, response) {
         (
             Command::ApplyHead(args),
@@ -564,10 +573,20 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
         }),
         (Command::RetractLedger { .. }, Response::Retracted { ledger_id, .. })
         | (Command::PurgeBranch { .. }, Response::Purged { ledger_id, .. })
-        | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. })
-        | (Command::DeleteBranch { .. }, Response::BranchDeleted { ledger_id, .. }) => {
+        | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. }) => {
             Some(NameServiceEvent::LedgerRetracted {
                 ledger_id: parsed_event_ledger_id(ledger_id)?,
+                instance: None,
+            })
+        }
+        // A drop deletes its records while the binding still lists them,
+        // which names the ledger they belonged to.
+        (Command::DeleteBranch { key, fence, .. }, Response::BranchDeleted { ledger_id, .. }) => {
+            Some(NameServiceEvent::LedgerRetracted {
+                ledger_id: parsed_event_ledger_id(ledger_id)?,
+                instance: state_binding(state, &key.ledger_name)
+                    .filter(|b| b.fence_of(&key.branch) == Some(Fence::from_u64(*fence)))
+                    .map(|b| b.instance),
             })
         }
         (Command::CreateBranch(_), Response::BranchCreated { ledger_id, head, t }) => {
@@ -588,6 +607,77 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
             })
         }
         _ => None,
+    }
+}
+
+/// The binding `state` holds for `name`. One that does not decode is logged
+/// and treated as absent: it only costs an event its instance.
+fn state_binding(state: &NameServiceState, name: &str) -> Option<NameBinding> {
+    let json = state.bindings.get(name)?.json.as_deref()?;
+    serde_json::from_str(json)
+        .inspect_err(
+            |e| tracing::error!(error = %e, name, "raft state holds an unreadable binding"),
+        )
+        .ok()
+}
+
+/// Whether `binding` shows `branch` to readers.
+fn shows(binding: &NameBinding, branch: &str) -> bool {
+    binding.is_active() && binding.listing(branch).is_some_and(|l| !l.dropped)
+}
+
+/// [`NameServiceEvent::LedgerCreated`] for each branch a command made
+/// visible. A binding written active announces every branch it shows that
+/// has a record: the state holds no copy of the binding it replaced, so
+/// branches it already showed are announced again. A record registered
+/// under a binding that already shows its branch, as a new branch's is,
+/// announces that branch.
+fn created_events(
+    cmd: &Command,
+    response: &Response,
+    state: &NameServiceState,
+) -> Vec<NameServiceEvent> {
+    let created = |binding: &NameBinding, name: &str, branch: &str| {
+        Some(NameServiceEvent::LedgerCreated {
+            ledger_id: event_ledger_id(name, branch)?,
+            instance: binding.instance.clone(),
+        })
+    };
+    match (cmd, response) {
+        (
+            Command::CasBinding {
+                name,
+                json: Some(_),
+                ..
+            },
+            Response::RegistryCasUpdated { version: Some(_) },
+        ) => {
+            let Some(binding) = state_binding(state, name) else {
+                return Vec::new();
+            };
+            binding
+                .branches
+                .iter()
+                .filter(|l| shows(&binding, &l.branch))
+                .filter(|l| {
+                    state
+                        .fences
+                        .get(&RefKey::new(name, &l.branch))
+                        .is_some_and(|f| f.fence == l.fence.as_u64())
+                })
+                .filter_map(|l| created(&binding, name, &l.branch))
+                .collect()
+        }
+        (Command::InsertBranchRecord(record), Response::BranchRecordInserted) => {
+            let key = &record.key;
+            state_binding(state, &key.ledger_name)
+                .filter(|b| shows(b, &key.branch))
+                .filter(|b| b.fence_of(&key.branch).map(Fence::as_u64) == record.fence)
+                .and_then(|b| created(&b, &key.ledger_name, &key.branch))
+                .into_iter()
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1021,7 +1111,7 @@ mod tests {
         .unwrap();
 
         match sub.receiver.try_recv().expect("retracted event") {
-            NameServiceEvent::LedgerRetracted { ledger_id } => {
+            NameServiceEvent::LedgerRetracted { ledger_id, .. } => {
                 assert_eq!(ledger_id, "test/db:main");
             }
             other => panic!("expected LedgerRetracted, got {other:?}"),
@@ -1090,7 +1180,7 @@ mod tests {
         .unwrap();
 
         match sub.receiver.try_recv().expect("purge event") {
-            NameServiceEvent::LedgerRetracted { ledger_id } => {
+            NameServiceEvent::LedgerRetracted { ledger_id, .. } => {
                 assert_eq!(ledger_id, "test/db:main");
             }
             other => panic!("expected LedgerRetracted, got {other:?}"),
@@ -1204,7 +1294,7 @@ mod tests {
         .unwrap();
 
         match sub.receiver.try_recv().expect("drop-branch event") {
-            NameServiceEvent::LedgerRetracted { ledger_id } => {
+            NameServiceEvent::LedgerRetracted { ledger_id, .. } => {
                 assert_eq!(ledger_id, "test/db:feature");
             }
             other => panic!("expected LedgerRetracted, got {other:?}"),
@@ -1595,6 +1685,7 @@ mod tests {
             // Carries no head; must not be mistaken for one.
             Effect::Event(NameServiceEvent::LedgerRetracted {
                 ledger_id: fluree_db_core::LedgerId::parse("c/db:main").unwrap(),
+                instance: None,
             }),
         ]);
 

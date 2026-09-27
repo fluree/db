@@ -134,7 +134,7 @@ pub use tracking_file::FileTrackingStore;
 
 use async_trait::async_trait;
 use fluree_db_core::{
-    format_ledger_id, ContentId, IntoLedgerId, LedgerId, StorageNamespace, StorageRoot,
+    format_ledger_id, ContentId, InstanceId, IntoLedgerId, LedgerId, StorageNamespace, StorageRoot,
 };
 use fluree_vocab::ns_types;
 use serde::{Deserialize, Serialize};
@@ -257,6 +257,18 @@ impl NsRecord {
         self.storage_root
             .clone()
             .unwrap_or_else(|| StorageRoot::legacy(&self.ledger_id.ledger_name()))
+    }
+
+    /// The ledger this branch belongs to, from the root a lookup resolved:
+    /// the instance its root names, or for a root at the name, from before
+    /// name bindings, the instance the migration derives from the name.
+    /// `None` for a record read without its binding.
+    pub fn instance(&self) -> Option<InstanceId> {
+        let root = self.storage_root.as_ref()?;
+        Some(
+            root.instance()
+                .unwrap_or_else(|| lifecycle::legacy_instance(&self.ledger_id.ledger_name())),
+        )
     }
 
     /// Where this branch's artifacts live.
@@ -897,21 +909,31 @@ pub enum NameServiceEvent {
         index_id: ContentId,
         index_t: i64,
     },
-    /// A branch's authoritative state went away: fired for retract
-    /// (soft tombstone), `drop_branch`, and purge alike. The event
-    /// carries only the exact `ledger:branch` id, and consumers use
-    /// it uniformly to evict per-branch state, so the distinction
-    /// between those transitions isn't conveyed.
+    /// A branch's authoritative state went away: fired for a ledger drop,
+    /// a branch drop, and purge alike. Consumers use it uniformly to evict
+    /// per-branch state, so the distinction between those transitions
+    /// isn't conveyed.
     ///
-    /// Known limitation: a query peer reacting to this always
-    /// applies a local retract (tombstone), even when the origin
-    /// hard-dropped or purged the branch. The divergence is benign
-    /// and self-healing — a later re-creation of the alias overwrites
-    /// the peer's tombstone via `init`, and `retracted` reads
-    /// identically to `not-found` for a peer's query path.
-    /// Distinguishing the transitions would need separate event
-    /// variants threaded through the SSE peer-sync protocol.
-    LedgerRetracted { ledger_id: LedgerId },
+    /// `instance` names the ledger the branch belonged to, so a consumer
+    /// holding a later ledger under the same name can tell the event is
+    /// not about it. `None` when no binding listed the record as it was
+    /// deleted: a branch drop unlists the branch first, and a record left
+    /// by an interrupted operation is listed by none. The name holds the
+    /// same ledger across a branch drop, so nothing is lost there.
+    LedgerRetracted {
+        ledger_id: LedgerId,
+        #[serde(default)]
+        instance: Option<InstanceId>,
+    },
+    /// A branch became visible: a create, import or restore finished, a
+    /// branch was created, or a peer copied one. `instance` tells it from
+    /// an earlier ledger that held the name. May be announced again, and
+    /// before the branch can be looked up, so consumers look it up and
+    /// treat it as idempotent.
+    LedgerCreated {
+        ledger_id: LedgerId,
+        instance: InstanceId,
+    },
     /// A graph source config was published/updated.
     GraphSourceConfigPublished {
         graph_source_id: LedgerId,

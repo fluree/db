@@ -1658,7 +1658,16 @@ pub fn spawn_local_cache_event_listener(
                 }) => {
                     reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                 }
-                Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {
+                // A branch shown again, or under a new ledger: a cached state
+                // of an earlier one is reloaded.
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerCreated {
+                    ledger_id, ..
+                }) => {
+                    reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
+                }
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted {
+                    ledger_id, ..
+                }) => {
                     ledger_manager.disconnect(&ledger_id).await;
                     tracing::debug!(
                         alias = %ledger_id,
@@ -4880,12 +4889,14 @@ impl Fluree {
     ///
     /// # Returns
     ///
-    /// - `Ok(None)` - Nameservice lookup returned no record (ledger doesn't exist)
+    /// - `Ok(None)` - Nameservice lookup returned no record (ledger doesn't
+    ///   exist); a cached state of it is removed
     /// - `Ok(Some(NotifyResult::NotLoaded))` - Record exists but ledger not cached
     /// - `Ok(Some(NotifyResult::Current))` - Ledger is already up to date
     /// - `Ok(Some(NotifyResult::IndexUpdated))` - Index was refreshed incrementally
     /// - `Ok(Some(NotifyResult::CommitsApplied { count }))` - Commits applied incrementally
-    /// - `Ok(Some(NotifyResult::Reloaded))` - Full reload was performed
+    /// - `Ok(Some(NotifyResult::Reloaded))` - Full reload was performed, as
+    ///   when the record belongs to a ledger created under the name since
     ///
     /// # Use Cases
     ///
@@ -4963,7 +4974,11 @@ impl Fluree {
         // Step B: Lookup nameservice record
         let ns_record = match self.nameservice().lookup(&ledger_id).await? {
             Some(record) => record,
-            None => return Ok(None), // Ledger doesn't exist in nameservice
+            // Gone, or never there: a cached state of it must not outlive it.
+            None => {
+                mgr.disconnect(&ledger_id).await;
+                return Ok(None);
+            }
         };
         // Step C: Use NsRecord.ledger_id as the cache key
         let canonical_alias = ns_record.ledger_id.clone();

@@ -213,7 +213,7 @@ impl LedgerRegistry {
                     }
                 }
             }
-            NameServiceEvent::LedgerRetracted { ledger_id } => {
+            NameServiceEvent::LedgerRetracted { ledger_id, .. } => {
                 // Remove retracted ledgers from tracking
                 if let Ok(mut entries) = self.entries.write() {
                     entries.remove(ledger_id);
@@ -414,6 +414,7 @@ mod tests {
 
         registry.on_ns_event(&NameServiceEvent::LedgerRetracted {
             ledger_id: id("test:main"),
+            instance: None,
         });
         assert!(!registry.is_tracked(&id("test:main")));
     }

@@ -217,7 +217,7 @@ impl HeadSink for PeerHeadSink {
                 }
                 self.registry.notify(&change);
             }
-            RemoteEvent::LedgerRetracted { ledger_id } => {
+            RemoteEvent::LedgerRetracted { ledger_id, .. } => {
                 tracing::info!(ledger_id = %ledger_id, "ledger retracted on the remote");
                 self.fluree.disconnect_ledger(&ledger_id).await;
             }

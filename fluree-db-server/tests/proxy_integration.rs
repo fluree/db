@@ -3188,6 +3188,99 @@ async fn test_events_accepts_per_ledger_subscription_over_http() {
         );
     }
 }
+/// The next ledger event on `body` of type `event`, as its JSON payload.
+async fn next_sse_event(
+    body: &mut axum::body::BodyDataStream,
+    parser: &mut fluree_sse::SseParser,
+    pending: &mut std::collections::VecDeque<fluree_sse::SseEvent>,
+    event: &str,
+) -> JsonValue {
+    use futures::StreamExt;
+    let deadline = std::time::Duration::from_secs(10);
+    tokio::time::timeout(deadline, async {
+        loop {
+            while let Some(next) = pending.pop_front() {
+                if next.event_type.as_deref() == Some(event) {
+                    return serde_json::from_str(&next.data).expect("event JSON");
+                }
+            }
+            let chunk = body.next().await.expect("stream open").expect("chunk");
+            pending.extend(parser.feed(&chunk));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {event} event within {deadline:?}"))
+}
+
+/// Peers learn which ledger an event is about: a create sends the record
+/// with its instance, a drop names the instance it retracts, and a ledger
+/// created again under the name arrives as another instance.
+#[tokio::test]
+async fn test_events_name_the_ledger_instance() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state);
+    let post = |uri: &str, body: JsonValue| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/fluree/events?all=true")
+                .header("Accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body().into_data_stream();
+    let mut parser = fluree_sse::SseParser::new();
+    let mut pending = std::collections::VecDeque::new();
+
+    let create = serde_json::json!({ "ledger": "sse-life:main" });
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/fluree/create", create.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = next_sse_event(&mut body, &mut parser, &mut pending, "ns-record").await;
+    assert_eq!(created["resource_id"], "sse-life:main");
+    let instance = created["record"]["instance"].clone();
+    assert!(instance.is_string(), "{created}");
+
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/fluree/drop",
+            serde_json::json!({ "ledger": "sse-life" }),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let retracted = next_sse_event(&mut body, &mut parser, &mut pending, "ns-retracted").await;
+    assert_eq!(retracted["resource_id"], "sse-life:main");
+    assert_eq!(retracted["instance"], instance, "{retracted}");
+
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/fluree/create", create))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let again = next_sse_event(&mut body, &mut parser, &mut pending, "ns-record").await;
+    assert_eq!(again["resource_id"], "sse-life:main");
+    assert!(again["record"]["instance"].is_string(), "{again}");
+    assert_ne!(again["record"]["instance"], instance);
+}
+
 // =============================================================================
 // Browser-Readiness Header Tests (CORS, immutable caching, conditional GET)
 // =============================================================================

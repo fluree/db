@@ -53,6 +53,31 @@ impl<N> NotifyingNameService<N> {
     }
 }
 
+impl<N: crate::LedgerRegistry> NotifyingNameService<N> {
+    /// The binding of `ledger_id`'s name, when it lists that branch with
+    /// `fence`. A failed read gives `None`: the event then goes out without
+    /// what the binding would have told it, rather than failing the write.
+    async fn listing_binding(
+        &self,
+        ledger_id: &LedgerId,
+        fence: Option<Fence>,
+    ) -> Option<crate::NameBinding> {
+        let binding = self
+            .inner
+            .get_binding(&ledger_id.ledger_name())
+            .await
+            .ok()??
+            .value;
+        let listed = binding.listing(ledger_id.branch())?;
+        (Some(listed.fence) == fence).then_some(binding)
+    }
+}
+
+/// Whether `binding` shows `branch` to readers.
+fn shows(binding: &crate::NameBinding, branch: &str) -> bool {
+    binding.is_active() && binding.listing(branch).is_some_and(|l| !l.dropped)
+}
+
 impl<N: Clone> Clone for NotifyingNameService<N> {
     fn clone(&self) -> Self {
         Self {
@@ -449,13 +474,49 @@ where
         self.inner.get_binding(name).await
     }
 
+    /// Announces each branch the new binding shows that the one it replaced
+    /// did not. When the replaced binding cannot be read as it was, every
+    /// branch shown is announced.
     async fn cas_binding(
         &self,
         name: &str,
         expected: Option<u64>,
         new: Option<&crate::NameBinding>,
     ) -> Result<crate::RegistryCas<crate::NameBinding>> {
-        self.inner.cas_binding(name, expected, new).await
+        let before = match new {
+            Some(binding) if binding.is_active() => self
+                .inner
+                .get_binding(name)
+                .await
+                .ok()
+                .flatten()
+                .filter(|v| Some(v.version) == expected)
+                .map(|v| v.value),
+            _ => None,
+        };
+        let result = self.inner.cas_binding(name, expected, new).await?;
+        if let (crate::RegistryCas::Updated { .. }, Some(binding)) = (&result, new) {
+            for listing in &binding.branches {
+                if !shows(binding, &listing.branch) {
+                    continue;
+                }
+                let shown_before = before.as_ref().is_some_and(|b| {
+                    b.instance == binding.instance
+                        && shows(b, &listing.branch)
+                        && b.fence_of(&listing.branch) == Some(listing.fence)
+                });
+                if shown_before {
+                    continue;
+                }
+                if let Ok(ledger_id) = LedgerId::from_parts(name, &listing.branch) {
+                    self.event_bus.notify(NameServiceEvent::LedgerCreated {
+                        ledger_id,
+                        instance: binding.instance.clone(),
+                    });
+                }
+            }
+        }
+        Ok(result)
     }
 
     async fn list_bindings(&self) -> Result<Vec<(String, crate::Versioned<crate::NameBinding>)>> {
@@ -486,7 +547,7 @@ where
 #[async_trait]
 impl<N> crate::BranchRecordStore for NotifyingNameService<N>
 where
-    N: crate::BranchRecordStore,
+    N: crate::BranchRecordStore + crate::LedgerRegistry,
 {
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         self.inner.raw_record(ledger_id).await
@@ -496,8 +557,21 @@ where
         self.inner.all_raw_records().await
     }
 
+    /// Announces the branch when its binding already shows it, as when a
+    /// branch is created under a live ledger.
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
-        self.inner.insert_record(record).await
+        let existing = self.inner.insert_record(record).await?;
+        if existing.is_none() {
+            if let Some(binding) = self.listing_binding(&record.ledger_id, record.fence).await {
+                if shows(&binding, &record.branch) {
+                    self.event_bus.notify(NameServiceEvent::LedgerCreated {
+                        ledger_id: record.ledger_id.clone(),
+                        instance: binding.instance,
+                    });
+                }
+            }
+        }
+        Ok(existing)
     }
 
     async fn adopt_record(
@@ -521,10 +595,18 @@ where
         ledger_id: &str,
         fence: crate::Fence,
     ) -> Result<crate::FenceOutcome> {
+        let id = LedgerId::parse(ledger_id)?;
+        // A drop deletes records while its binding still lists them, which
+        // names the ledger they belonged to.
+        let instance = self
+            .listing_binding(&id, Some(fence))
+            .await
+            .map(|b| b.instance);
         let outcome = self.inner.delete_record(ledger_id, fence).await?;
         if outcome == crate::FenceOutcome::Applied {
             self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-                ledger_id: LedgerId::parse(ledger_id)?,
+                ledger_id: id,
+                instance,
             });
         }
         Ok(outcome)
@@ -537,5 +619,74 @@ where
         delta: i32,
     ) -> Result<crate::FenceOutcome> {
         self.inner.adjust_children(ledger_id, fence, delta).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{lifecycle, memory::MemoryNameService, SubscriptionScope};
+    use fluree_db_core::{InstanceId, LedgerName};
+
+    fn drain(sub: &mut Subscription) -> Vec<NameServiceEvent> {
+        std::iter::from_fn(|| sub.receiver.try_recv().ok()).collect()
+    }
+
+    fn created(ledger_id: &str, instance: &InstanceId) -> NameServiceEvent {
+        NameServiceEvent::LedgerCreated {
+            ledger_id: LedgerId::parse(ledger_id).unwrap(),
+            instance: instance.clone(),
+        }
+    }
+
+    fn retracted(ledger_id: &str, instance: &InstanceId) -> NameServiceEvent {
+        NameServiceEvent::LedgerRetracted {
+            ledger_id: LedgerId::parse(ledger_id).unwrap(),
+            instance: Some(instance.clone()),
+        }
+    }
+
+    /// Creates, branches, drops and restores announce the branches they
+    /// show or remove, each naming the ledger it belongs to.
+    #[tokio::test]
+    async fn lifecycle_events_name_the_instance() {
+        let bus = Arc::new(LedgerEventBus::new(64));
+        let ns = NotifyingNameService::new(MemoryNameService::new(), Arc::clone(&bus));
+        let mut sub = bus.subscribe(SubscriptionScope::all());
+        let name = LedgerName::parse("mydb").unwrap();
+        let main_id = LedgerId::parse("mydb:main").unwrap();
+
+        let main = lifecycle::create_ledger(&ns, &main_id).await.unwrap();
+        let instance = main.instance().unwrap();
+        assert_eq!(drain(&mut sub), vec![created("mydb:main", &instance)]);
+
+        lifecycle::create_branch(&ns, &name, "dev", "main", None)
+            .await
+            .unwrap();
+        let events = drain(&mut sub);
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|e| *e == created("mydb:dev", &instance)));
+
+        lifecycle::drop_ledger(&ns, &name, false).await.unwrap();
+        let events = drain(&mut sub);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.contains(&retracted("mydb:main", &instance)));
+        assert!(events.contains(&retracted("mydb:dev", &instance)));
+
+        lifecycle::restore_dropped(&ns, &instance).await.unwrap();
+        let events = drain(&mut sub);
+        assert!(events.contains(&created("mydb:main", &instance)));
+        assert!(events.contains(&created("mydb:dev", &instance)));
+        assert!(events
+            .iter()
+            .all(|e| matches!(e, NameServiceEvent::LedgerCreated { .. })));
+
+        // A ledger created under the name later is another instance.
+        lifecycle::drop_ledger(&ns, &name, true).await.unwrap();
+        drain(&mut sub);
+        let again = lifecycle::create_ledger(&ns, &main_id).await.unwrap();
+        let next = again.instance().unwrap();
+        assert_ne!(next, instance);
+        assert_eq!(drain(&mut sub), vec![created("mydb:main", &next)]);
     }
 }

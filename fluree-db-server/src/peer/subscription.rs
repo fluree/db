@@ -152,6 +152,9 @@ impl PeerEventSink {
             Ok(NotifyResult::Current) => {
                 // Already up to date.
             }
+            Ok(NotifyResult::Evicted) => {
+                tracing::info!(ledger_id = %ledger_id, "Evicted a cached ledger that no longer resolves");
+            }
             Ok(
                 result @ (NotifyResult::Reloaded
                 | NotifyResult::IndexUpdated
@@ -199,6 +202,7 @@ impl HeadSink for PeerEventSink {
                         record.index_t,
                         record.commit_head_id.as_ref().map(ToString::to_string),
                         record.index_head_id.as_ref().map(ToString::to_string),
+                        record.instance(),
                     )
                     .await;
                 if changed {
@@ -229,8 +233,18 @@ impl HeadSink for PeerEventSink {
                     );
                 }
             }
-            RemoteEvent::LedgerRetracted { ledger_id } => {
-                self.peer_state.remove_ledger(&ledger_id).await;
+            RemoteEvent::LedgerRetracted {
+                ledger_id,
+                instance,
+            } => {
+                if !self
+                    .peer_state
+                    .remove_ledger(&ledger_id, instance.as_ref())
+                    .await
+                {
+                    tracing::debug!(ledger_id = %ledger_id, "Ignoring the retraction of an earlier ledger under the name");
+                    return;
+                }
                 tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
 
                 // Evict any cached state for the ledger (no-op if not cached).
