@@ -6,14 +6,22 @@
 //! so they are defined once here to ensure consistency.
 
 use crate::{
-    is_zero, parse_default_context_value, ConfigPayload, ConfigValue, LedgerHeads, RefValue,
-    StatusPayload, StatusValue,
+    is_zero, parse_default_context_value, ConfigPayload, ConfigValue, Fence, LedgerHeads, NsRecord,
+    RefValue, StatusPayload, StatusValue,
 };
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, LedgerId};
 use serde::{Deserialize, Serialize};
 
 /// ns@v2 format version path segment.
 pub(crate) const NS_VERSION: &str = "ns@v2";
+
+/// `f:status` of a branch a drop has frozen: it accepts no more writes.
+pub(crate) const STATUS_FROZEN: &str = "frozen";
+/// `f:status` of a deleted branch record. The file stays as a tombstone, so a
+/// late conditional write finds the fence gone rather than no file at all.
+pub(crate) const STATUS_DELETED: &str = "deleted";
+/// `f:status` of a soft-dropped branch under the old lifecycle.
+pub(crate) const STATUS_RETRACTED: &str = "retracted";
 
 /// Create the standard ns@v2 context as JSON value.
 /// Uses object format with the `"f"` prefix mapping to the Fluree DB namespace.
@@ -111,9 +119,97 @@ pub(crate) struct NsFileV2 {
     /// Number of child branches created from this branch
     #[serde(rename = "f:branches", default, skip_serializing_if = "is_zero")]
     pub branches: u32,
+
+    /// The fence a writer must present; see [`NsRecord::fence`].
+    #[serde(rename = "f:fence", default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<Fence>,
 }
 
 impl NsFileV2 {
+    /// A fresh file for `record`: its heads, lineage and fence.
+    pub(crate) fn for_record(record: &NsRecord) -> Self {
+        Self {
+            context: ns_context(),
+            id: record.ledger_id.to_string(),
+            record_type: vec!["f:LedgerSource".to_string()],
+            ledger: LedgerRef {
+                id: record.name.clone(),
+            },
+            branch: record.branch.clone(),
+            commit_cid: record.commit_head_id.as_ref().map(ToString::to_string),
+            t: record.commit_t,
+            index: record.index_head_id.as_ref().map(|id| IndexRef {
+                cid: Some(id.to_string()),
+                t: record.index_t,
+            }),
+            status: if record.frozen {
+                STATUS_FROZEN.to_string()
+            } else if record.retracted {
+                STATUS_RETRACTED.to_string()
+            } else {
+                "ready".to_string()
+            },
+            default_context_cid: record.default_context.as_ref().map(ToString::to_string),
+            status_v: Some(1),
+            status_meta: None,
+            config_v: Some(0),
+            config_meta: None,
+            config_cid: record.config_id.as_ref().map(ToString::to_string),
+            source_branch: record.source_branch.clone(),
+            branch_point: None,
+            branches: record.branches,
+            fence: record.fence,
+        }
+    }
+
+    /// Whether this file is a deleted record's tombstone.
+    pub(crate) fn is_deleted(&self) -> bool {
+        self.status == STATUS_DELETED
+    }
+
+    /// The record this file and its index-only file describe, or `None` for
+    /// a tombstone. The index file counts only when it carries this file's
+    /// fence: one left by an earlier incarnation of the key is stale.
+    pub(crate) fn into_record(
+        self,
+        index_file: Option<NsIndexFileV2>,
+    ) -> crate::Result<Option<NsRecord>> {
+        if self.is_deleted() {
+            return Ok(None);
+        }
+        let parse = |s: Option<&str>| s.and_then(|s| s.parse::<ContentId>().ok());
+        let mut record = NsRecord {
+            ledger_id: LedgerId::from_parts(&self.ledger.id, &self.branch)?,
+            name: self.ledger.id.clone(),
+            branch: self.branch,
+            commit_head_id: parse(self.commit_cid.as_deref()),
+            config_id: parse(self.config_cid.as_deref()),
+            commit_t: self.t,
+            index_head_id: parse(self.index.as_ref().and_then(|i| i.cid.as_deref())),
+            index_t: self.index.as_ref().map(|i| i.t).unwrap_or(0),
+            default_context: self
+                .default_context_cid
+                .as_deref()
+                .and_then(parse_default_context_value),
+            retracted: self.status == STATUS_RETRACTED,
+            source_branch: self
+                .source_branch
+                .or_else(|| self.branch_point.map(|bp| bp.source)),
+            branches: self.branches,
+            storage_root: None,
+            fence: self.fence,
+            frozen: self.status == STATUS_FROZEN,
+        };
+        // READ-TIME merge rule: the index file wins at equal or higher t.
+        if let Some(index_data) = index_file.filter(|f| f.fence == record.fence) {
+            if index_data.index.t >= record.index_t {
+                record.index_head_id = parse(index_data.index.cid.as_deref());
+                record.index_t = index_data.index.t;
+            }
+        }
+        Ok(Some(record))
+    }
+
     /// Extract the current `StatusValue` from this record's status fields.
     /// Defaults `status_v` to 1 if missing (backward compatibility with v1 records).
     pub fn to_status_value(&self) -> StatusValue {
@@ -185,7 +281,7 @@ pub(crate) fn merge_heads(main: &NsFileV2, index_file: Option<&NsIndexFileV2>) -
         id: parse(main.index.as_ref().and_then(|i| i.cid.as_deref())),
         t: main.index.as_ref().map(|i| i.t).unwrap_or(0),
     };
-    if let Some(f) = index_file {
+    if let Some(f) = index_file.filter(|f| f.fence == main.fence) {
         if f.index.t >= index.t {
             index = RefValue {
                 id: parse(f.index.cid.as_deref()),
@@ -211,6 +307,19 @@ pub(crate) struct NsIndexFileV2 {
 
     #[serde(rename = "f:ledgerIndex")]
     pub index: IndexRef,
+
+    /// The fence of the record this index file belongs to. A file whose fence
+    /// differs from its record's was left by an earlier incarnation.
+    #[serde(rename = "f:fence", default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<Fence>,
+
+    /// Set by a drop, alongside the record's frozen status.
+    #[serde(
+        rename = "f:frozen",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub frozen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +394,7 @@ mod tests {
             source_branch: None,
             branch_point: None,
             branches: 0,
+            fence: None,
         }
     }
 
@@ -295,6 +405,8 @@ mod tests {
                 cid: Some(c.to_string()),
                 t,
             },
+            fence: None,
+            frozen: false,
         }
     }
 

@@ -100,6 +100,8 @@ impl NsRecordResponse {
             source_branch: self.source_branch,
             branches: self.branches,
             storage_root: self.storage_root,
+            fence: None,
+            frozen: false,
         })
     }
 }

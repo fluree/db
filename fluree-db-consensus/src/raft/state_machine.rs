@@ -528,6 +528,110 @@ pub struct NameServiceState {
     /// this set on every membership change so newly-added voters
     /// start eligible and removed voters disappear from both sets.
     pub configured_voters: BTreeSet<NodeId>,
+    /// Name bindings, keyed by ledger name. Appended after every
+    /// field above, so a snapshot taken before bindings still decodes
+    /// through [`NameServiceStateV1`].
+    pub bindings: HashMap<String, VersionedJson>,
+    /// The dropped-ledger registry, keyed by instance id.
+    pub dropped: HashMap<String, VersionedJson>,
+    /// The fence and frozen flag of each branch created under a binding.
+    pub fences: HashMap<RefKey, FenceState>,
+}
+
+/// A name binding or dropped-ledger entry: its version, and the value as
+/// JSON, since postcard cannot carry the flattened shapes those types
+/// serialize to. A deleted item keeps its version with `json: None`, so
+/// versions never repeat for a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedJson {
+    pub version: u64,
+    pub json: Option<String>,
+}
+
+/// The fence a branch's writers must present, and whether a drop has
+/// frozen the branch.
+///
+/// Lineage normally lives on the branch's [`RefEntry`], which exists only
+/// once the branch has a head. While it is unborn, its source branch and
+/// child count are kept here, and its first head moves them onto the entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceState {
+    pub fence: u64,
+    pub frozen: bool,
+    pub source_branch: Option<String>,
+    pub children: u32,
+}
+
+/// An unborn branch's source branch and child count, for the [`RefEntry`]
+/// its first head creates.
+fn unborn_lineage(state: &NameServiceState, key: &RefKey) -> (Option<String>, u32) {
+    state
+        .fences
+        .get(key)
+        .map(|f| (f.source_branch.clone(), f.children))
+        .unwrap_or_default()
+}
+
+/// A branch record for [`Command::InsertBranchRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FencedBranchRecord {
+    pub key: RefKey,
+    /// `None` only for a record written before fencing.
+    pub fence: Option<u64>,
+    pub frozen: bool,
+    pub retracted: bool,
+    /// Commit head and its t; `None` for an unborn branch.
+    pub head: Option<(ContentId, i64)>,
+    pub index: Option<IndexState>,
+    pub source_branch: Option<String>,
+    pub branches: u32,
+    pub applied_at_millis: u64,
+}
+
+/// [`NameServiceState`] as snapshotted before name bindings. Postcard is
+/// positional, so a snapshot an earlier release took decodes only in this
+/// shape.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct NameServiceStateV1 {
+    refs: HashMap<RefKey, RefEntry>,
+    ledgers: HashMap<String, LedgerRecord>,
+    retracted: HashSet<RefKey>,
+    idempotency: HashMap<IdempotencyCacheKey, ApplyOutcome>,
+    queues: HashMap<RefKey, VecDeque<QueueEntry>>,
+    next_queue_id: u64,
+    recently_cleared: HashMap<RefKey, ClearMarker>,
+    evicted_idempotency_count: u64,
+    queue_config: QueueConfig,
+    status: HashMap<String, StoredStatus>,
+    config: HashMap<String, StoredConfig>,
+    graph_sources: HashMap<String, GraphSourceRecord>,
+    worker_eligible_voters: BTreeSet<NodeId>,
+    configured_voters: BTreeSet<NodeId>,
+}
+
+impl From<NameServiceStateV1> for NameServiceState {
+    fn from(v1: NameServiceStateV1) -> Self {
+        Self {
+            refs: v1.refs,
+            ledgers: v1.ledgers,
+            retracted: v1.retracted,
+            idempotency: v1.idempotency,
+            queues: v1.queues,
+            next_queue_id: v1.next_queue_id,
+            recently_cleared: v1.recently_cleared,
+            evicted_idempotency_count: v1.evicted_idempotency_count,
+            queue_config: v1.queue_config,
+            status: v1.status,
+            config: v1.config,
+            graph_sources: v1.graph_sources,
+            worker_eligible_voters: v1.worker_eligible_voters,
+            configured_voters: v1.configured_voters,
+            bindings: HashMap::new(),
+            dropped: HashMap::new(),
+            fences: HashMap::new(),
+        }
+    }
 }
 
 /// Replicated commands the state machine accepts.
@@ -706,6 +810,38 @@ pub enum Command {
     /// ineligible (no new worker assignments rendezvous to it);
     /// restored contact flips it back to eligible.
     SetWorkerEligibility(WorkerEligibility),
+    /// Compare-and-swap a name binding: see
+    /// [`fluree_db_nameservice::LedgerRegistry::cas_binding`].
+    CasBinding {
+        name: String,
+        expected: Option<u64>,
+        json: Option<String>,
+    },
+    /// Compare-and-swap a dropped-ledger registry entry: see
+    /// [`fluree_db_nameservice::LedgerRegistry::cas_dropped`].
+    CasDropped {
+        instance: String,
+        expected: Option<u64>,
+        json: Option<String>,
+    },
+    /// Register a branch with its fence, unless the branch exists.
+    InsertBranchRecord(FencedBranchRecord),
+    /// Freeze a branch if it carries `fence`, draining its queue.
+    FreezeBranch {
+        key: RefKey,
+        fence: u64,
+        applied_at_millis: u64,
+    },
+    /// Remove a branch and everything kept for it if it carries `fence`.
+    /// Unlike [`Self::PurgeBranch`], does not refuse a branch with
+    /// children: a drop removes every branch of the ledger.
+    DeleteBranch {
+        key: RefKey,
+        fence: u64,
+        applied_at_millis: u64,
+    },
+    /// Add `delta` to a branch's child count if it carries `fence`.
+    AdjustChildren { key: RefKey, fence: u64, delta: i32 },
 }
 
 /// Postcard-safe JSON value tree with deterministic encoding:
@@ -1294,6 +1430,31 @@ pub enum Response {
     /// Command was understood but no state change resulted (e.g.,
     /// [`Command::ReleaseContent`]).
     NoOp,
+    /// A registry compare-and-swap wrote; `version` is `None` after a
+    /// delete.
+    RegistryCasUpdated { version: Option<u64> },
+    /// A registry compare-and-swap found another version.
+    RegistryCasConflict { actual: Option<VersionedJson> },
+    /// [`Command::InsertBranchRecord`] registered the branch.
+    BranchRecordInserted,
+    /// [`Command::InsertBranchRecord`] found the branch already there.
+    BranchRecordExists,
+    /// A fenced branch command found no such branch.
+    FenceMissing,
+    /// A fenced branch command found another fence, or none.
+    FenceMismatch,
+    /// A fenced branch command applied.
+    FenceApplied,
+    /// [`Command::FreezeBranch`] froze the branch.
+    BranchFrozen {
+        ledger_id: String,
+        released_envelopes: Vec<(String, ContentId)>,
+    },
+    /// [`Command::DeleteBranch`] removed the branch.
+    BranchDeleted {
+        ledger_id: String,
+        released_envelopes: Vec<(String, ContentId)>,
+    },
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1364,7 +1525,12 @@ impl NameServiceState {
     /// Restore state machine state from snapshot bytes produced by
     /// [`Self::to_snapshot`].
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
-        Ok(postcard::from_bytes(bytes)?)
+        match postcard::from_bytes(bytes) {
+            Ok(state) => Ok(state),
+            Err(e) => postcard::from_bytes::<NameServiceStateV1>(bytes)
+                .map(Self::from)
+                .map_err(|_| e.into()),
+        }
     }
 }
 
@@ -1440,7 +1606,195 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             marker_cutoff_millis,
         } => apply_evict_idempotency(state, cutoff_millis, marker_cutoff_millis),
         Command::SetWorkerEligibility(args) => apply_set_worker_eligibility(state, args),
+        Command::CasBinding {
+            name,
+            expected,
+            json,
+        } => cas_versioned_json(&mut state.bindings, name, expected, json),
+        Command::CasDropped {
+            instance,
+            expected,
+            json,
+        } => cas_versioned_json(&mut state.dropped, instance, expected, json),
+        Command::InsertBranchRecord(record) => insert_branch_record(state, log_index, record),
+        Command::FreezeBranch {
+            key,
+            fence,
+            applied_at_millis,
+        } => freeze_branch(state, key, fence, applied_at_millis),
+        Command::DeleteBranch {
+            key,
+            fence,
+            applied_at_millis,
+        } => delete_branch(state, key, fence, applied_at_millis),
+        Command::AdjustChildren { key, fence, delta } => adjust_children(state, key, fence, delta),
     }
+}
+
+/// Compare-and-swap one versioned item; see
+/// [`fluree_db_nameservice::LedgerRegistry`] for the arguments.
+fn cas_versioned_json(
+    map: &mut HashMap<String, VersionedJson>,
+    key: String,
+    expected: Option<u64>,
+    json: Option<String>,
+) -> Response {
+    let current = map.get(&key);
+    let actual = current.filter(|v| v.json.is_some()).cloned();
+    if actual.as_ref().map(|v| v.version) != expected {
+        return Response::RegistryCasConflict { actual };
+    }
+    let version = current.map_or(1, |v| v.version + 1);
+    let deleted = json.is_none();
+    map.insert(key, VersionedJson { version, json });
+    Response::RegistryCasUpdated {
+        version: (!deleted).then_some(version),
+    }
+}
+
+/// Whether `key` is a registered branch.
+fn is_registered(state: &NameServiceState, key: &RefKey) -> bool {
+    state
+        .ledgers
+        .get(&key.ledger_name)
+        .is_some_and(|l| l.branches.iter().any(|b| b == &key.branch))
+}
+
+/// The outcome of checking `key`'s fence: `None` to proceed.
+fn check_fence(state: &NameServiceState, key: &RefKey, fence: u64) -> Option<Response> {
+    if !is_registered(state, key) {
+        return Some(Response::FenceMissing);
+    }
+    match state.fences.get(key) {
+        Some(f) if f.fence == fence => None,
+        _ => Some(Response::FenceMismatch),
+    }
+}
+
+fn insert_branch_record(
+    state: &mut NameServiceState,
+    log_index: u64,
+    record: FencedBranchRecord,
+) -> Response {
+    let key = record.key;
+    if is_registered(state, &key) {
+        return Response::BranchRecordExists;
+    }
+    state
+        .ledgers
+        .entry(key.ledger_name.clone())
+        .or_insert_with(|| LedgerRecord {
+            created_at_millis: record.applied_at_millis,
+            created_index: log_index,
+            branches: Vec::new(),
+        })
+        .branches
+        .push(key.branch.clone());
+    let born = record.head.is_some();
+    match record.head {
+        Some((head, t)) => {
+            state.refs.insert(
+                key.clone(),
+                RefEntry {
+                    head,
+                    t,
+                    last_advanced_at_millis: record.applied_at_millis,
+                    last_advanced_index: log_index,
+                    index: record.index,
+                    source_branch: record.source_branch.clone(),
+                    branches: record.branches,
+                },
+            );
+        }
+        None => {
+            state.refs.remove(&key);
+        }
+    }
+    if record.retracted {
+        state.retracted.insert(key.clone());
+    } else {
+        state.retracted.remove(&key);
+    }
+    match record.fence {
+        Some(fence) => {
+            state.fences.insert(
+                key,
+                FenceState {
+                    fence,
+                    frozen: record.frozen,
+                    source_branch: if born { None } else { record.source_branch },
+                    children: if born { 0 } else { record.branches },
+                },
+            );
+        }
+        None => {
+            state.fences.remove(&key);
+        }
+    }
+    Response::BranchRecordInserted
+}
+
+fn freeze_branch(
+    state: &mut NameServiceState,
+    key: RefKey,
+    fence: u64,
+    applied_at_millis: u64,
+) -> Response {
+    if let Some(refused) = check_fence(state, &key, fence) {
+        return refused;
+    }
+    if let Some(f) = state.fences.get_mut(&key) {
+        f.frozen = true;
+    }
+    let released_envelopes =
+        clear_queue_for_admin(state, &key, ClearReason::BranchRetracted, applied_at_millis);
+    Response::BranchFrozen {
+        ledger_id: key.ledger_id(),
+        released_envelopes,
+    }
+}
+
+fn delete_branch(
+    state: &mut NameServiceState,
+    key: RefKey,
+    fence: u64,
+    applied_at_millis: u64,
+) -> Response {
+    if let Some(refused) = check_fence(state, &key, fence) {
+        return refused;
+    }
+    let full = key.ledger_id();
+    state.refs.remove(&key);
+    state.retracted.remove(&key);
+    state.fences.remove(&key);
+    state.status.remove(&full);
+    state.config.remove(&full);
+    if let Some(ledger) = state.ledgers.get_mut(&key.ledger_name) {
+        ledger.branches.retain(|b| b != &key.branch);
+        if ledger.branches.is_empty() {
+            state.ledgers.remove(&key.ledger_name);
+        }
+    }
+    let released_envelopes =
+        clear_queue_for_admin(state, &key, ClearReason::BranchPurged, applied_at_millis);
+    Response::BranchDeleted {
+        ledger_id: full,
+        released_envelopes,
+    }
+}
+
+/// The child count lives on the branch's [`RefEntry`], or on its
+/// [`FenceState`] while it is unborn.
+fn adjust_children(state: &mut NameServiceState, key: RefKey, fence: u64, delta: i32) -> Response {
+    if let Some(refused) = check_fence(state, &key, fence) {
+        return refused;
+    }
+    if let Some(entry) = state.refs.get_mut(&key) {
+        entry.branches = entry.branches.saturating_add_signed(delta);
+    } else if let Some(f) = state.fences.get_mut(&key) {
+        f.children = f.children.saturating_add_signed(delta);
+    }
+    Response::FenceApplied
 }
 
 /// Apply [`Command::SetWorkerEligibility`]. Validate the voter is
@@ -1755,7 +2109,7 @@ fn reset_head(
         .refs
         .get(&key)
         .map(|r| (r.source_branch.clone(), r.branches))
-        .unwrap_or_default();
+        .unwrap_or_else(|| unborn_lineage(state, &key));
     let index = index_head_id.map(|head| IndexState { head, t: index_t });
     state.refs.insert(
         key.clone(),
@@ -2006,7 +2360,10 @@ fn apply_compare_and_set_ref(
         .refs
         .get(&key)
         .map(|r| (r.index.clone(), r.source_branch.clone(), r.branches))
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            let (source, children) = unborn_lineage(state, &key);
+            (None, source, children)
+        });
     match kind {
         RefKind::CommitHead => {
             // `new.id = None` on a commit head is rejected as a
@@ -3606,6 +3963,48 @@ mod tests {
         let bytes = state.to_snapshot().unwrap();
         let restored = NameServiceState::from_snapshot(&bytes).unwrap();
         assert_eq!(state, restored);
+    }
+
+    /// A snapshot an earlier release took, before name bindings were
+    /// appended to the state, still restores: deployed clusters hold
+    /// bare-postcard snapshots in that layout.
+    #[test]
+    fn pre_binding_snapshot_restores() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        seed_head(&mut state, "test/db", "main", cid(1), 1);
+        let v1 = NameServiceStateV1 {
+            refs: state.refs.clone(),
+            ledgers: state.ledgers.clone(),
+            retracted: state.retracted.clone(),
+            idempotency: state.idempotency.clone(),
+            queues: state.queues.clone(),
+            next_queue_id: state.next_queue_id,
+            recently_cleared: state.recently_cleared.clone(),
+            evicted_idempotency_count: state.evicted_idempotency_count,
+            queue_config: state.queue_config,
+            status: state.status.clone(),
+            config: state.config.clone(),
+            graph_sources: state.graph_sources.clone(),
+            worker_eligible_voters: state.worker_eligible_voters.clone(),
+            configured_voters: state.configured_voters.clone(),
+        };
+        let bytes = postcard::to_allocvec(&v1).unwrap();
+        assert_eq!(NameServiceState::from_snapshot(&bytes).unwrap(), state);
+
+        // And a snapshot in the current layout is not mistaken for the old
+        // one once it holds lifecycle state.
+        apply(
+            &mut state,
+            Command::CasBinding {
+                name: "test/db".into(),
+                expected: None,
+                json: Some("{}".into()),
+            },
+            5,
+        );
+        let restored = NameServiceState::from_snapshot(&state.to_snapshot().unwrap()).unwrap();
+        assert_eq!(restored.bindings.len(), 1);
     }
 
     // -------------------------------------------------------------

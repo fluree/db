@@ -156,6 +156,8 @@ fn ledger_sse_to_ns_record(ledger_id: LedgerId, record: LedgerSseRecord) -> NsRe
         source_branch: record.source_branch,
         branches: record.branches,
         storage_root: record.storage_root,
+        fence: None,
+        frozen: false,
     }
 }
 

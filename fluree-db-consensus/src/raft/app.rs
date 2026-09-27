@@ -496,6 +496,18 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
             ref_key: RefKey::new(ledger_id, branch),
             reason: AbortReason::BranchRetracted,
         }),
+        (Command::FreezeBranch { key, .. }, Response::BranchFrozen { .. }) => {
+            Some(WaiterResolution::AbortBranch {
+                ref_key: key.clone(),
+                reason: AbortReason::BranchRetracted,
+            })
+        }
+        (Command::DeleteBranch { key, .. }, Response::BranchDeleted { .. }) => {
+            Some(WaiterResolution::AbortBranch {
+                ref_key: key.clone(),
+                reason: AbortReason::BranchPurged,
+            })
+        }
         _ => None,
     }
 }
@@ -546,7 +558,8 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
         }),
         (Command::RetractLedger { .. }, Response::Retracted { ledger_id, .. })
         | (Command::PurgeBranch { .. }, Response::Purged { ledger_id, .. })
-        | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. }) => {
+        | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. })
+        | (Command::DeleteBranch { .. }, Response::BranchDeleted { ledger_id, .. }) => {
             Some(NameServiceEvent::LedgerRetracted {
                 ledger_id: parsed_event_ledger_id(ledger_id)?,
             })
@@ -582,6 +595,12 @@ fn drain_releases(response: &mut Response) -> Vec<(String, ContentId)> {
             released_envelopes, ..
         }
         | Response::Retracted {
+            released_envelopes, ..
+        }
+        | Response::BranchFrozen {
+            released_envelopes, ..
+        }
+        | Response::BranchDeleted {
             released_envelopes, ..
         } => std::mem::take(released_envelopes),
         // A keyless queue entry's envelope isn't held by any

@@ -94,7 +94,7 @@ pub mod wasm_cache;
 
 // Re-export main types
 pub use address::{extract_identifier, extract_path, parse_fluree_address, ParsedFlureeAddress};
-pub use address_path::{StorageNamespace, StorageRoot};
+pub use address_path::{InstanceId, StorageNamespace, StorageRoot};
 pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
 pub use cancellation::{QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};

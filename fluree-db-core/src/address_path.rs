@@ -42,11 +42,67 @@ pub(crate) fn storage_ledger_id(
     LedgerId::parse(ledger_id)
 }
 
+/// Separates a ledger name from an instance id in an instance root. `@` is
+/// reserved in ledger and branch names, so no name reaches an instance folder.
+const INSTANCE_SEPARATOR: &str = "/@";
+
+/// Identifies one incarnation of a ledger: created, imported, or restored from
+/// an archive. Unique across the whole registry and never reused, so nothing
+/// keyed by it can be confused with a later ledger of the same name.
+///
+/// A ULID: 26 Crockford base32 characters, sorting by creation time.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct InstanceId(String);
+
+impl InstanceId {
+    pub fn parse(id: &str) -> Result<Self, LedgerIdParseError> {
+        let crockford =
+            |c: char| c.is_ascii_digit() || (c.is_ascii_uppercase() && !"ILOU".contains(c));
+        if id.len() != 26 || !id.chars().all(crockford) {
+            return Err(LedgerIdParseError::new(format!(
+                "Invalid instance id '{id}': expected a 26-character ULID"
+            )));
+        }
+        Ok(Self(id.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for InstanceId {
+    type Error = LedgerIdParseError;
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        Self::parse(&id)
+    }
+}
+
+impl From<InstanceId> for String {
+    fn from(id: InstanceId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for InstanceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for InstanceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "InstanceId({})", self.0)
+    }
+}
+
 /// The folder that holds every artifact of one ledger.
 ///
-/// A ledger's root is its name (`mydb`). Everything that forms a path takes
-/// the root as an opaque prefix, so the root can later name a folder other
-/// than the ledger's name without any path-forming code changing.
+/// A ledger created before instance roots keeps its name as its root
+/// (`mydb`); every later incarnation gets a folder of its own under the name,
+/// `mydb/@{instance}`, so a reused name never shares a folder. Everything that
+/// forms a path takes the root as an opaque prefix.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct StorageRoot(String);
@@ -57,15 +113,33 @@ impl StorageRoot {
         Self(name.as_str().to_string())
     }
 
-    /// Parse a root read from a record.
+    /// The root of one incarnation: `{name}/@{instance}`.
+    pub fn for_instance(name: &LedgerName, instance: &InstanceId) -> Self {
+        Self(format!("{name}{INSTANCE_SEPARATOR}{instance}"))
+    }
+
+    /// Parse a root read from a record: `name` or `name/@instance`.
     pub fn parse(root: &str) -> Result<Self, LedgerIdParseError> {
-        Ok(Self::legacy(&LedgerName::parse(root).map_err(|e| {
+        let invalid = |e: LedgerIdParseError| {
             LedgerIdParseError::new(format!("Invalid storage root '{root}': {e}"))
-        })?))
+        };
+        match root.rsplit_once(INSTANCE_SEPARATOR) {
+            Some((name, instance)) => Ok(Self::for_instance(
+                &LedgerName::parse(name).map_err(invalid)?,
+                &InstanceId::parse(instance).map_err(invalid)?,
+            )),
+            None => Ok(Self::legacy(&LedgerName::parse(root).map_err(invalid)?)),
+        }
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The incarnation this root belongs to; `None` for a name root.
+    pub fn instance(&self) -> Option<InstanceId> {
+        let (_, instance) = self.0.rsplit_once(INSTANCE_SEPARATOR)?;
+        InstanceId::parse(instance).ok()
     }
 
     /// The namespace of `branch` under this root.
@@ -183,6 +257,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn instance_root_sits_under_the_name() {
+        let name = LedgerName::parse("acme/inventory").unwrap();
+        let instance = InstanceId::parse("01JB8ZK4X5Y6Z7A8B9C0D1E2F3").unwrap();
+        let root = StorageRoot::for_instance(&name, &instance);
+        assert_eq!(root.as_str(), "acme/inventory/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3");
+        assert_eq!(root.instance(), Some(instance));
+        assert_eq!(StorageRoot::parse(root.as_str()).unwrap(), root);
+        assert_eq!(StorageRoot::legacy(&name).instance(), None);
+
+        let ns = root.namespace("main");
+        assert_eq!(
+            ns.branch_prefix(),
+            "acme/inventory/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3/main"
+        );
+        assert_eq!(
+            ns.shared_prefix(),
+            "acme/inventory/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3/@shared"
+        );
+    }
+
+    #[test]
     fn legacy_namespace_is_the_name_and_branch() {
         let ns = StorageNamespace::legacy(&LedgerId::parse("acme/inventory:main").unwrap());
         assert_eq!(ns.branch_prefix(), "acme/inventory/main");
@@ -197,7 +292,17 @@ mod tests {
         assert_eq!(json, "\"acme/inventory\"");
         assert_eq!(serde_json::from_str::<StorageRoot>(&json).unwrap(), root);
 
-        for bad in ["", "a:b", "a#b", "a/@x", "/a", "a/"] {
+        for bad in [
+            "",
+            "a:b",
+            "a#b",
+            "a/@x",
+            "a/@",
+            "/a",
+            "a/",
+            "a/@01JB8ZK4X5Y6Z7A8B9C0D1E2F/b",
+            "a/@01jb8zk4x5y6z7a8b9c0d1e2f3",
+        ] {
             assert!(
                 serde_json::from_str::<StorageRoot>(&format!("\"{bad}\"")).is_err(),
                 "{bad:?} must not parse as a storage root"

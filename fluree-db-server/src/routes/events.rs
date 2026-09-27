@@ -659,6 +659,8 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            fence: None,
+            frozen: false,
         };
         let id = ledger_event_id("test:main", &record);
         assert_eq!(id, "ledger:test:main:42:40");

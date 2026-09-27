@@ -17,23 +17,28 @@
 //! Uses ETag-based compare-and-swap (CAS) operations for atomic updates.
 //! Under contention, operations will retry with exponential backoff.
 
+use crate::binding::{
+    BranchRecordStore, DroppedLedger, Fence, FenceOutcome, LedgerRegistry, NameBinding,
+    RegistryCas, Versioned,
+};
+use crate::ns_cas::{self, RecordKeys};
 use crate::ns_format::{
     merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
     NS_VERSION,
 };
 use crate::{
-    deserialize_json, parse_default_context_value, serialize_json, AdminPublisher, BranchLifecycle,
-    CasResult, CommitPublisher, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue,
-    GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher,
-    LedgerHeads, LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord,
-    RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
-    StatusPublisher, StatusValue,
+    deserialize_json, serialize_json, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
+    ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
+    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads,
+    LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind,
+    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
+    StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
 use fluree_db_core::{
-    CasAction, CasOutcome, ContentId, Error as CoreError, LedgerId, StorageCas, StorageList,
-    StorageRead, StorageWrite,
+    CasAction, CasOutcome, ContentId, Error as CoreError, InstanceId, LedgerId, StorageCas,
+    StorageList, StorageRead, StorageWrite,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -130,6 +135,31 @@ struct GraphSourceIndexRef {
 
 // Methods that do not depend on storage trait bounds.
 impl<S> StorageNameService<S> {
+    /// The key of `relative` under the versioned nameservice root.
+    fn ns_root_key(&self, relative: &str) -> String {
+        if self.prefix.is_empty() {
+            format!("{NS_VERSION}/{relative}")
+        } else {
+            format!("{}/{NS_VERSION}/{relative}", self.prefix)
+        }
+    }
+
+    fn binding_key(&self, name: &str) -> String {
+        self.ns_root_key(&format!("{name}/@binding.json"))
+    }
+
+    fn dropped_key(&self, instance: &InstanceId) -> String {
+        self.ns_root_key(&format!("@dropped/{instance}.json"))
+    }
+
+    /// Whether `key` is a binding or registry file rather than a record.
+    /// `@` is reserved in names and branches, so no record path has a
+    /// segment starting with it.
+    fn is_registry_key(&self, key: &str) -> bool {
+        key.strip_prefix(&self.ns_root_key(""))
+            .is_some_and(|rest| rest.split('/').any(|segment| segment.starts_with('@')))
+    }
+
     /// Create a new `NsFileV2` for initial creation.
     ///
     /// This is pure data construction and is intentionally available without
@@ -162,6 +192,7 @@ impl<S> StorageNameService<S> {
             source_branch: None,
             branch_point: None,
             branches: 0,
+            fence: None,
         }
     }
 }
@@ -411,51 +442,7 @@ where
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
 
-        // Convert to NsRecord, parsing persisted CID strings
-        let mut record = NsRecord {
-            ledger_id: LedgerId::from_parts(&main.ledger.id, &main.branch)?,
-            name: main.ledger.id.clone(),
-            branch: main.branch,
-            commit_head_id: main
-                .commit_cid
-                .as_deref()
-                .and_then(|s| s.parse::<ContentId>().ok()),
-            config_id: main
-                .config_cid
-                .as_deref()
-                .and_then(|s| s.parse::<ContentId>().ok()),
-            commit_t: main.t,
-            index_head_id: main
-                .index
-                .as_ref()
-                .and_then(|i| i.cid.as_deref())
-                .and_then(|s| s.parse::<ContentId>().ok()),
-            index_t: main.index.as_ref().map(|i| i.t).unwrap_or(0),
-            default_context: main
-                .default_context_cid
-                .as_deref()
-                .and_then(parse_default_context_value),
-            retracted: main.status == "retracted",
-            source_branch: main
-                .source_branch
-                .or_else(|| main.branch_point.map(|bp| bp.source)),
-            branches: main.branches,
-            storage_root: None,
-        };
-
-        // Merge index file if it has equal or higher t (READ-TIME merge rule)
-        if let Some(index_data) = index_file {
-            if index_data.index.t >= record.index_t {
-                record.index_head_id = index_data
-                    .index
-                    .cid
-                    .as_deref()
-                    .and_then(|s| s.parse::<ContentId>().ok());
-                record.index_t = index_data.index.t;
-            }
-        }
-
-        Ok(Some(record))
+        main.into_record(index_file)
     }
 
     /// Perform an atomic read-modify-write on a JSON value.
@@ -573,7 +560,7 @@ where
         let mut records = Vec::new();
 
         for key in keys {
-            if !key.ends_with(".json") {
+            if !key.ends_with(".json") || self.is_registry_key(&key) {
                 continue;
             }
 
@@ -604,7 +591,7 @@ where
         let mut records = Vec::new();
 
         for key in keys {
-            if !key.ends_with(".json") {
+            if !key.ends_with(".json") || self.is_registry_key(&key) {
                 continue;
             }
 
@@ -618,6 +605,145 @@ where
         }
 
         Ok(records)
+    }
+}
+
+#[async_trait]
+impl<S> LedgerRegistry for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
+        ns_cas::read_versioned(&self.storage, &self.binding_key(name)).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&NameBinding>,
+    ) -> Result<RegistryCas<NameBinding>> {
+        ns_cas::cas_versioned(&self.storage, &self.binding_key(name), expected, new).await
+    }
+
+    async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
+        let root = self.ns_root_key("");
+        let keys = StorageList::list_prefix(&self.storage, &root)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("Failed to list bindings: {e}")))?;
+        let mut found = Vec::new();
+        for key in keys {
+            let Some(name) = key
+                .strip_prefix(&root)
+                .and_then(|rest| rest.strip_suffix("/@binding.json"))
+            else {
+                continue;
+            };
+            if let Some(binding) = self.get_binding(name).await? {
+                found.push((name.to_string(), binding));
+            }
+        }
+        Ok(found)
+    }
+
+    async fn get_dropped(&self, instance: &InstanceId) -> Result<Option<Versioned<DroppedLedger>>> {
+        ns_cas::read_versioned(&self.storage, &self.dropped_key(instance)).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &InstanceId,
+        expected: Option<u64>,
+        new: Option<&DroppedLedger>,
+    ) -> Result<RegistryCas<DroppedLedger>> {
+        ns_cas::cas_versioned(&self.storage, &self.dropped_key(instance), expected, new).await
+    }
+
+    async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
+        let dir = self.ns_root_key("@dropped/");
+        let keys = StorageList::list_prefix(&self.storage, &dir)
+            .await
+            .map_err(|e| {
+                NameServiceError::storage(format!("Failed to list dropped ledgers: {e}"))
+            })?;
+        let mut found = Vec::new();
+        for key in keys {
+            let Some(instance) = key
+                .strip_prefix(&dir)
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .and_then(|stem| InstanceId::parse(stem).ok())
+            else {
+                continue;
+            };
+            if let Some(dropped) = self.get_dropped(&instance).await? {
+                found.push(dropped);
+            }
+        }
+        Ok(found)
+    }
+}
+
+#[async_trait]
+impl<S> BranchRecordStore for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
+        ns_cas::raw_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+        )
+        .await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        let (main, index) = (
+            self.ns_key(&record.name, &record.branch),
+            self.index_key(&record.name, &record.branch),
+        );
+        ns_cas::insert_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            record,
+        )
+        .await
+    }
+
+    async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
+        ns_cas::freeze_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            fence,
+        )
+        .await
+    }
+
+    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        ns_cas::delete_record(&self.storage, &self.ns_key(&name, &branch), fence).await
+    }
+
+    async fn adjust_children(
+        &self,
+        ledger_id: &str,
+        fence: Fence,
+        delta: i32,
+    ) -> Result<FenceOutcome> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        ns_cas::adjust_children(&self.storage, &self.ns_key(&name, &branch), fence, delta).await
     }
 }
 
@@ -677,6 +803,7 @@ where
                 t: 0,
             }),
             branches: 0,
+            fence: None,
         };
         let bytes = serde_json::to_vec_pretty(&file)
             .map_err(|e| NameServiceError::storage(e.to_string()))?;
@@ -804,6 +931,7 @@ where
             source_branch: None,
             branch_point: None,
             branches: 0,
+            fence: None,
         };
 
         let bytes = serde_json::to_vec_pretty(&file)?;
@@ -938,6 +1066,8 @@ where
                     cid: Some(cid_str.clone()),
                     t: index_t,
                 },
+                fence: existing.as_ref().and_then(|f| f.fence),
+                frozen: false,
             })
         })
         .await
@@ -972,6 +1102,8 @@ where
                         cid: Some(cid_str.clone()),
                         t: index_t,
                     },
+                    fence: existing.as_ref().and_then(|f| f.fence),
+                    frozen: false,
                 })
             } else {
                 None
@@ -1170,6 +1302,8 @@ where
                                         cid: new_cid.as_ref().map(std::string::ToString::to_string),
                                         t: new_t,
                                     },
+                                    fence: None,
+                                    frozen: false,
                                 });
                             }
                             (false, Some(actual)) => {
@@ -1196,6 +1330,8 @@ where
                                         cid: new_cid.as_ref().map(std::string::ToString::to_string),
                                         t: new_t,
                                     },
+                                    fence: None,
+                                    frozen: false,
                                 });
                             }
                             (true, Some(actual)) => {
@@ -1698,6 +1834,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod lifecycle_conformance {
+        crate::lifecycle_conformance_tests!((
+            super::StorageNameService::new(super::MemoryCasStorage::new(), "test"),
+            ()
+        ));
+    }
+
     use super::*;
     use crate::{CasResult, ConfigPayload, RefPublisher, RefValue, StatusPayload};
     use fluree_db_core::StorageExtError;

@@ -2798,6 +2798,8 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            fence: None,
+            frozen: false,
         }
     }
 

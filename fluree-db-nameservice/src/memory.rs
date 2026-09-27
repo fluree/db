@@ -4,6 +4,10 @@
 //! interior mutability, making it thread-safe and suitable for multi-threaded
 //! async runtimes.
 
+use crate::binding::{
+    BranchRecordStore, DroppedLedger, Fence, FenceOutcome, LedgerRegistry, NameBinding,
+    RegistryCas, Versioned,
+};
 use crate::{
     check_cas_expectation, ref_values_match, AdminPublisher, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
@@ -12,7 +16,7 @@ use crate::{
     StatusLookup, StatusPayload, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::{ContentId, LedgerId};
+use fluree_db_core::{ContentId, InstanceId, LedgerId};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -31,6 +35,48 @@ pub struct MemoryNameService {
     status_values: Arc<RwLock<HashMap<LedgerId, StatusValue>>>,
     /// Config values keyed by canonical address (v2 extension)
     config_values: Arc<RwLock<HashMap<LedgerId, ConfigValue>>>,
+    /// Name bindings keyed by ledger name; `None` is a deleted binding's
+    /// tombstone, which keeps its version from ever repeating.
+    bindings: Arc<RwLock<HashMap<String, Versioned<Option<NameBinding>>>>>,
+    /// Dropped-ledger registry keyed by instance, tombstoned the same way.
+    dropped: Arc<RwLock<HashMap<InstanceId, Versioned<Option<DroppedLedger>>>>>,
+}
+
+/// The live item behind a possibly tombstoned entry.
+fn live<T: Clone>(entry: Option<&Versioned<Option<T>>>) -> Option<Versioned<T>> {
+    let entry = entry?;
+    entry.value.as_ref().map(|value| Versioned {
+        value: value.clone(),
+        version: entry.version,
+    })
+}
+
+/// Compare-and-swap one versioned item in a map: `expected` is the version to
+/// replace, or `None` to insert only if absent; `new` is the value, or `None`
+/// to delete. A delete leaves a tombstone, so the next item under the key
+/// continues the version sequence and a stale expectation cannot match it.
+fn cas_versioned<K: std::hash::Hash + Eq, T: Clone>(
+    map: &mut HashMap<K, Versioned<Option<T>>>,
+    key: K,
+    expected: Option<u64>,
+    new: Option<&T>,
+) -> RegistryCas<T> {
+    let current = map.get(&key);
+    let actual = live(current);
+    if actual.as_ref().map(|v| v.version) != expected {
+        return RegistryCas::Conflict { actual };
+    }
+    let version = current.map_or(1, |v| v.version + 1);
+    map.insert(
+        key,
+        Versioned {
+            value: new.cloned(),
+            version,
+        },
+    );
+    RegistryCas::Updated {
+        version: new.map(|_| version),
+    }
 }
 
 impl Default for MemoryNameService {
@@ -40,6 +86,8 @@ impl Default for MemoryNameService {
             graph_source_records: Arc::new(RwLock::new(HashMap::new())),
             status_values: Arc::new(RwLock::new(HashMap::new())),
             config_values: Arc::new(RwLock::new(HashMap::new())),
+            bindings: Arc::new(RwLock::new(HashMap::new())),
+            dropped: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -105,6 +153,125 @@ impl crate::NameServiceLookup for MemoryNameService {
             .read()
             .get(&key)
             .map(crate::LedgerHeads::from_record))
+    }
+}
+
+#[async_trait]
+impl LedgerRegistry for MemoryNameService {
+    async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
+        Ok(live(self.bindings.read().get(name)))
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&NameBinding>,
+    ) -> Result<RegistryCas<NameBinding>> {
+        Ok(cas_versioned(
+            &mut self.bindings.write(),
+            name.to_string(),
+            expected,
+            new,
+        ))
+    }
+
+    async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
+        Ok(self
+            .bindings
+            .read()
+            .iter()
+            .filter_map(|(name, b)| live(Some(b)).map(|b| (name.clone(), b)))
+            .collect())
+    }
+
+    async fn get_dropped(&self, instance: &InstanceId) -> Result<Option<Versioned<DroppedLedger>>> {
+        Ok(live(self.dropped.read().get(instance)))
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &InstanceId,
+        expected: Option<u64>,
+        new: Option<&DroppedLedger>,
+    ) -> Result<RegistryCas<DroppedLedger>> {
+        Ok(cas_versioned(
+            &mut self.dropped.write(),
+            instance.clone(),
+            expected,
+            new,
+        ))
+    }
+
+    async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
+        Ok(self
+            .dropped
+            .read()
+            .values()
+            .filter_map(|e| live(Some(e)))
+            .collect())
+    }
+}
+
+#[async_trait]
+impl BranchRecordStore for MemoryNameService {
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        let key = LedgerId::parse(ledger_id)?;
+        Ok(self.records.read().get(&key).cloned())
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        let mut records = self.records.write();
+        if let Some(existing) = records.get(&record.ledger_id) {
+            return Ok(Some(existing.clone()));
+        }
+        let mut stored = record.clone();
+        stored.storage_root = None;
+        records.insert(record.ledger_id.clone(), stored);
+        Ok(None)
+    }
+
+    async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let key = LedgerId::parse(ledger_id)?;
+        Ok(match self.records.write().get_mut(&key) {
+            None => FenceOutcome::Missing,
+            Some(record) if record.fence != Some(fence) => FenceOutcome::Mismatch,
+            Some(record) => {
+                record.frozen = true;
+                FenceOutcome::Applied
+            }
+        })
+    }
+
+    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let key = LedgerId::parse(ledger_id)?;
+        let mut records = self.records.write();
+        match records.get(&key) {
+            None => return Ok(FenceOutcome::Missing),
+            Some(record) if record.fence != Some(fence) => return Ok(FenceOutcome::Mismatch),
+            Some(_) => {}
+        }
+        records.remove(&key);
+        self.status_values.write().remove(&key);
+        self.config_values.write().remove(&key);
+        Ok(FenceOutcome::Applied)
+    }
+
+    async fn adjust_children(
+        &self,
+        ledger_id: &str,
+        fence: Fence,
+        delta: i32,
+    ) -> Result<FenceOutcome> {
+        let key = LedgerId::parse(ledger_id)?;
+        Ok(match self.records.write().get_mut(&key) {
+            None => FenceOutcome::Missing,
+            Some(record) if record.fence != Some(fence) => FenceOutcome::Mismatch,
+            Some(record) => {
+                record.branches = record.branches.saturating_add_signed(delta);
+                FenceOutcome::Applied
+            }
+        })
     }
 }
 
@@ -701,6 +868,11 @@ impl ConfigPublisher for MemoryNameService {
 
         Ok(ConfigCasResult::Updated)
     }
+}
+
+#[cfg(test)]
+mod lifecycle_conformance {
+    crate::lifecycle_conformance_tests!((super::MemoryNameService::new(), ()));
 }
 
 #[cfg(test)]

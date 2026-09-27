@@ -757,3 +757,22 @@ async fn s3_testcontainers_build_client_honours_aes256_key() {
         .expect("to_jsonld_async");
     assert_eq!(results, json!([["ex:alice", "Alice"], ["ex:bob", "Bob"]]));
 }
+
+/// The nameservice lifecycle conformance suite against DynamoDB, each case on
+/// a fresh table in one LocalStack.
+#[tokio::test]
+async fn dynamodb_lifecycle_conformance() {
+    let (_lock, _container, endpoint) = start_localstack("dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let mut case = 0;
+    fluree_db_nameservice::conformance::run_all(|| {
+        case += 1;
+        let table = format!("lifecycle-conformance-{case}");
+        let sdk_config = sdk_config.clone();
+        async move {
+            ensure_dynamodb_table(&sdk_config, &table).await;
+            DynamoDbNameService::from_client(aws_sdk_dynamodb::Client::new(&sdk_config), table)
+        }
+    })
+    .await;
+}

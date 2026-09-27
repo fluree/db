@@ -17,21 +17,30 @@
 //! - [`FileNameService`]: File-based implementation using ns@v2 format
 //! - [`StorageNameService`]: Storage-backed implementation using CAS operations
 
+pub mod binding;
 pub mod branched_store;
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
 mod error;
 mod event_bus;
 #[cfg(feature = "native")]
 pub mod file;
 pub mod ledger_config;
+pub mod lifecycle;
 pub mod memory;
 pub mod mount;
 mod notifying;
+mod ns_cas;
 pub(crate) mod ns_format;
 pub mod storage_ns;
 pub mod tracking;
 #[cfg(feature = "native")]
 pub mod tracking_file;
 
+pub use binding::{
+    new_instance_id, resolve_record, BindingState, BranchFence, BranchRecordStore, DroppedLedger,
+    DroppedState, Fence, FenceOutcome, LedgerRegistry, NameBinding, RegistryCas, Versioned,
+};
 pub use branched_store::{
     branched_content_store_for_id, branched_content_store_for_record,
     branched_content_store_for_record_or_id, build_branched_store, content_store_for_record_or_id,
@@ -201,6 +210,15 @@ pub struct NsRecord {
     /// name. `None` means the root is the name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_root: Option<StorageRoot>,
+
+    /// The fence a writer must present to publish to this branch. The record
+    /// is live only while its ledger's name binding lists this fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<Fence>,
+
+    /// Set by a drop: the branch accepts no more writes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub frozen: bool,
 }
 
 pub(crate) fn is_zero(v: &u32) -> bool {
@@ -225,6 +243,8 @@ impl NsRecord {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            fence: None,
+            frozen: false,
         }
     }
 

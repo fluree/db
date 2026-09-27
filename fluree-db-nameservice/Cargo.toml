@@ -9,6 +9,8 @@ description = "Nameservice traits and implementations for Fluree DB"
 [features]
 default = ["native"]
 native = ["tokio/fs", "fluree-db-core/native"]
+# The lifecycle conformance suite, for backend crates' tests.
+conformance = []
 
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core", default-features = false }
@@ -21,6 +23,7 @@ tokio = { version = "1", default-features = false, features = ["time", "sync"] }
 tracing = { workspace = true }
 parking_lot = "0.12"
 rand = { workspace = true }
+ulid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }

@@ -2869,6 +2869,8 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            fence: None,
+            frozen: false,
         };
 
         let json = ns_record_to_jsonld(&record);
@@ -2901,6 +2903,8 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            fence: None,
+            frozen: false,
         };
 
         let json = ns_record_to_jsonld(&record);

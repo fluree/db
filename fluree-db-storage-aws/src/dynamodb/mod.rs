@@ -7,6 +7,7 @@
 //! - `docs/operations/dynamodb-guide.md` (operator-focused)
 //! - `fluree-db-storage-aws/src/dynamodb/schema.rs` (authoritative attribute constants)
 
+mod lifecycle;
 pub mod schema;
 
 use async_trait::async_trait;
@@ -298,6 +299,16 @@ impl DynamoDbNameService {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        let fence = meta
+            .get(ATTR_FENCE)
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| s.parse().ok());
+        let frozen = meta
+            .get(ATTR_FROZEN)
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false);
+
         // Identity from the name/branch attributes; `pk` only when an item
         // predates them.
         let ledger_id = LedgerId::from_parts(&name, &branch)
@@ -317,6 +328,8 @@ impl DynamoDbNameService {
             source_branch,
             branches,
             storage_root: None,
+            fence,
+            frozen,
         })
     }
 
