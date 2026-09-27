@@ -3872,6 +3872,79 @@ async fn sparql_graph_pattern_named_graph_without_from_named() {
     );
 }
 
+/// `/insert` accepts TriG under either content type (#1849): the API reads a
+/// body with graph blocks as TriG whatever it was labeled.
+#[tokio::test]
+async fn trig_insert_lands_named_graphs() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "triginsert:main" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    for (content_type, graph, value) in [
+        ("application/trig", "urn:g:trig", "via-trig"),
+        ("text/turtle", "urn:g:turtle", "via-turtle"),
+    ] {
+        let body = format!(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:label \"{value}\" .\n\
+             GRAPH <{graph}> {{ ex:a ex:q \"{value}\" . }}\n"
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert/triginsert:main")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{content_type} insert failed: {json}"
+        );
+
+        let sparql = format!("SELECT ?o WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/query/triginsert:main")
+                    .header("content-type", "application/sparql-query")
+                    .body(Body::from(sparql))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "graph query failed: {json}");
+        assert!(
+            json_contains_string(&json, value),
+            "{content_type}: expected the block's triple in <{graph}>, got: {json}"
+        );
+    }
+}
+
 /// `/sync` HTTP contract (what `fluree sync --remote` depends on): delta
 /// commit, no-op resync, dry-run report shape, and the 400 guards.
 #[tokio::test]
