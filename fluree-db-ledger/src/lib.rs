@@ -536,14 +536,15 @@ impl LedgerState {
     }
 
     /// The fence this state's writes present, captured from its nameservice
-    /// record when it was loaded. `None` for a branch from before fencing.
+    /// record when it was loaded. `None` for a state built without a record,
+    /// whose writes are refused.
     pub fn fence(&self) -> Option<fluree_db_nameservice::Fence> {
         self.ns_record.as_ref().and_then(|r| r.fence)
     }
 
     /// Where this branch's artifacts live, from its nameservice record. A
-    /// state built without one (a new ledger's genesis) is at its id's
-    /// legacy namespace.
+    /// state built without one belongs to no created ledger and holds no
+    /// data; it reads from its id's namespace at the name.
     pub fn storage_namespace(&self) -> fluree_db_core::StorageNamespace {
         match &self.ns_record {
             Some(record) => record.storage_namespace(),
@@ -1281,9 +1282,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_ledger_state_load_genesis() {
-        use fluree_db_nameservice::{CasResult, RefPublisher, RefValue};
+        use fluree_db_nameservice::testing::CurrentFence;
+        use fluree_db_nameservice::{CasResult, NameServiceLookup, RefValue};
 
-        async fn publish_commit(ns: &impl RefPublisher, ledger_id: &str, t: i64, cid: &ContentId) {
+        async fn publish_commit(ns: &MemoryNameService, ledger_id: &str, t: i64, cid: &ContentId) {
+            if ns.lookup(ledger_id).await.unwrap().is_none() {
+                fluree_db_nameservice::testing::create_at_name_root(ns, ledger_id)
+                    .await
+                    .unwrap();
+            }
             let new = RefValue {
                 id: Some(cid.clone()),
                 t,

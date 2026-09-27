@@ -50,8 +50,10 @@ async fn stream_pack_rejects_empty_want_with_error_frame() {
         .expect("build fluree");
 
     let ledger_id = "pack-validation/empty-want:main";
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(ledger_id);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     let committed = fluree
         .insert(
             src_state,
@@ -110,8 +112,10 @@ async fn full_ledger_pack_request_builds_valid_request() {
         .expect("build fluree");
 
     let ledger_id = "pack-validation/full-helper:main";
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(ledger_id);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     fluree
         .insert(
             src_state,
@@ -158,8 +162,10 @@ async fn stream_pack_omits_txn_blobs_when_include_txns_false() {
         .expect("build fluree");
 
     let ledger_id = "pack-validation/no-txns:main";
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(ledger_id);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     // Two commits so we exercise the per-commit loop.
     let committed1 = fluree
         .insert(

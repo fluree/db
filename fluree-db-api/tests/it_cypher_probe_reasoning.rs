@@ -34,7 +34,7 @@ use support::{genesis_ledger, graphdb_from_ledger};
 /// and no asserted `name`.
 async fn seeded_ledger(ledger_id: &str) -> (fluree_db_api::Fluree, fluree_db_api::LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let r = fluree
         .transact_cypher(ledger, r#"CREATE (a:Person {childName: "Alice"})"#)
@@ -233,7 +233,7 @@ async fn seeded_restriction_ledger(
     ledger_id: &str,
 ) -> (fluree_db_api::Fluree, fluree_db_api::LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let r = fluree
         .transact_cypher(ledger, r#"CREATE (a:Person {childName: "Alice"})"#)

@@ -45,6 +45,8 @@ pub mod parse;
 pub mod raw_txn_upload;
 pub mod stage;
 pub mod staged_dicts;
+#[cfg(test)]
+mod test_support;
 pub mod value_convert;
 
 #[cfg(feature = "import")]

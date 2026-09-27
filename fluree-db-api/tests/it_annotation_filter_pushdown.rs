@@ -187,7 +187,7 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after = fluree
                 .insert(ledger0, &seed_graph())
                 .await

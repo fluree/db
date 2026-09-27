@@ -2,8 +2,7 @@
 //!
 
 use crate::support;
-use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::{FlureeBuilder, LedgerState};
 use serde_json::{json, Map, Value as JsonValue};
 
 fn context_people() -> JsonValue {
@@ -38,8 +37,10 @@ async fn seed_people() -> (fluree_db_api::Fluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/construct:people";
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let tx = json!({
         "@context": context_people(),
@@ -582,8 +583,10 @@ async fn sparql_construct_anon_and_labeled_blank_never_merge() {
 async fn sparql_construct_minted_blank_disjoint_from_data_blank() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/construct:datablanks";
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     // `ex:alice ex:knows _:blank` where `_:blank` is a stored (fdb-) blank node.
     let tx = json!({
         "@context": {"ex": "http://example.org/"},
@@ -737,8 +740,10 @@ async fn sparql_construct_aggregate_order_by_is_rejected() {
 #[tokio::test]
 async fn sparql_construct_duplicate_rows_mint_distinct_blanks() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/construct:duprows");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/construct:duprows")
+        .await
+        .expect("create ledger");
     let tx = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -787,7 +792,7 @@ async fn seed_shared_object(
     same_value: bool,
 ) -> (fluree_db_api::Fluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let (v1, v2) = if same_value {
         ("same", "same")
     } else {

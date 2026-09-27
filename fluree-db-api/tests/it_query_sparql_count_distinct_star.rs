@@ -21,7 +21,7 @@ use serde_json::{json, Value as JsonValue};
 /// maker1 carries two properties, maker2 one — so the two makers have
 /// different group sizes and a wrong answer cannot look right by symmetry.
 async fn seed_makers(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -174,7 +174,7 @@ async fn sparql_count_distinct_star_traditional_path() {
 /// The two solutions agree on `(?s, ?o)` and differ only in the path-join
 /// variable the lowerer synthesized.
 async fn seed_two_paths(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [

@@ -15,7 +15,7 @@ async fn cypher_bare_match_full_scan_opt_in() {
     std::env::set_var("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1");
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:full-scan");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:full-scan").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -99,7 +99,7 @@ async fn cypher_indexed_whole_graph_aggregates_match_pipeline() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/cypher:full-scan-indexed";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let committed = fluree
         .insert(
             ledger0,
@@ -213,7 +213,7 @@ async fn cypher_whole_graph_aggregates_overlay_matches_pipeline() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/cypher:full-scan-overlay";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -296,7 +296,7 @@ async fn cypher_whole_graph_count_overlay_deletion_declines_but_correct() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/cypher:full-scan-overlay-del";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -340,7 +340,7 @@ async fn cypher_indexed_whole_graph_count_declines_on_edge_annotations() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/cypher:full-scan-annotated";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let committed = fluree
         .insert(
             ledger0,
@@ -391,7 +391,7 @@ async fn folds_stay_correct_on_incremental_index() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/cypher:incremental-stats";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = json!({"ex": ""});
     let ledger1 = fluree
         .insert(
@@ -557,7 +557,7 @@ async fn distinct_predicate_stats_shortcut_matches_pipeline_after_incremental() 
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/cypher:incremental-distinct-preds";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = json!({"ex": ""});
     let ledger1 = fluree
         .insert(

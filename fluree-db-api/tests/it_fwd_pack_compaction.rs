@@ -59,7 +59,7 @@ async fn incremental_cycles_compact_the_forward_pack_tail() {
     local
         .run_until(async move {
             let ledger_id = "it/fwd-pack-compaction:main";
-            let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let mut roots: Vec<ContentId> = Vec::new();
 
@@ -259,7 +259,7 @@ async fn a_namespace_that_goes_quiet_stays_bounded_and_readable() {
     local
         .run_until(async move {
             let ledger_id = "it/fwd-pack-quiet-ns:main";
-            let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             // Both namespaces active for the first few cycles, then `alt` goes
             // permanently quiet while `ex` keeps writing.

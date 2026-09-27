@@ -453,7 +453,7 @@ async fn correlated_range_probes_fold_into_a_semijoin_with_exact_rows() {
     );
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, LEDGER);
+    let ledger0 = genesis_ledger(&fluree, LEDGER).await;
     let ledger = fluree
         .insert(ledger0, &graph(&products))
         .await

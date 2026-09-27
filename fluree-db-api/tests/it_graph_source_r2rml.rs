@@ -426,7 +426,7 @@ async fn e2e_r2rml_query_iceberg_table() {
 
     // Create Fluree instance and ledger
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "e2e-iceberg:main");
+    let mut ledger = genesis_ledger(&fluree, "e2e-iceberg:main").await;
 
     // Register example.org namespace
     std::sync::Arc::make_mut(&mut ledger.snapshot)
@@ -599,7 +599,7 @@ async fn e2e_fluree_r2rml_provider_full_flow() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Create a ledger for query execution
-    let mut ledger = genesis_ledger(&fluree, "e2e-provider:main");
+    let mut ledger = genesis_ledger(&fluree, "e2e-provider:main").await;
     std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
@@ -790,7 +790,7 @@ async fn live_iceberg_fql_type_returns_instances() {
     );
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let _ledger = genesis_ledger(&fluree, "live-iceberg-type:main");
+    let _ledger = genesis_ledger(&fluree, "live-iceberg-type:main").await;
 
     let alias = "fql-type-e2e";
     let mut config = R2rmlCreateConfig::new(alias, &catalog_uri, &table, mapping)
@@ -1263,7 +1263,7 @@ fn test_ref_object_map_compilation() {
 async fn engine_e2e_graph_pattern_r2rml_scan() {
     // Create a minimal Fluree instance (we only need a Db for IRI encoding)
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "r2rml-e2e:main");
+    let mut ledger = genesis_ledger(&fluree, "r2rml-e2e:main").await;
 
     // Register the example.org namespace prefix in this Db so the R2RML operator
     // can encode subject IRIs produced by rr:template. Without this, encode_iri()
@@ -1377,7 +1377,7 @@ async fn run_airline_graph_scan(
 #[tokio::test]
 async fn engine_e2e_type_scan_bound_and_variable_parity() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "r2rml-type:main");
+    let mut ledger = genesis_ledger(&fluree, "r2rml-type:main").await;
     std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
@@ -1427,7 +1427,7 @@ async fn engine_e2e_type_scan_bound_and_variable_parity() {
 #[tokio::test]
 async fn engine_e2e_wildcard_binds_predicate_var() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "r2rml-wild:main");
+    let mut ledger = genesis_ledger(&fluree, "r2rml-wild:main").await;
     std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
@@ -1556,7 +1556,7 @@ async fn engine_e2e_split_triples_map_class_and_predicate_not_fused() {
 "#;
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "r2rml-split:main");
+    let mut ledger = genesis_ledger(&fluree, "r2rml-split:main").await;
     std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
@@ -1734,7 +1734,7 @@ async fn engine_e2e_provider_method_calls() {
 
     // Create minimal Fluree instance
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "r2rml-tracking:main");
+    let ledger = genesis_ledger(&fluree, "r2rml-tracking:main").await;
 
     // Build query with GRAPH pattern
     let mut vars = VarRegistry::new();
@@ -2247,7 +2247,7 @@ async fn integration_query_graph_source_provider_wiring() {
     let graph_source_id = gs_result.unwrap().graph_source_id;
 
     // Create a basic ledger to query against
-    let ledger = genesis_ledger(&fluree, "query-gs-test:main");
+    let ledger = genesis_ledger(&fluree, "query-gs-test:main").await;
 
     // Build a simple query with GRAPH pattern targeting our graph source
     // SELECT ?s WHERE { GRAPH <airlines-query-test:main> { ?s a ex:Airline } }
@@ -2317,7 +2317,7 @@ async fn streaming_graph_source_uses_real_r2rml_provider() {
         .expect("graph source creation should succeed")
         .graph_source_id;
 
-    let ledger = genesis_ledger(&fluree, "stream-gs-test:main");
+    let ledger = genesis_ledger(&fluree, "stream-gs-test:main").await;
 
     let sparql = format!(
         "SELECT ?s WHERE {{ GRAPH <{graph_source_id}> {{ ?s a <http://example.org/Airline> }} }}"
@@ -2504,7 +2504,7 @@ async fn engine_e2e_ref_object_map_join_execution() {
 
     // Create a minimal Fluree instance
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "ref-join-test:main");
+    let mut ledger = genesis_ledger(&fluree, "ref-join-test:main").await;
 
     // Register example.org namespace
     std::sync::Arc::make_mut(&mut ledger.snapshot)
@@ -2760,7 +2760,7 @@ async fn engine_e2e_base_fragment_scans_non_first_table() {
     };
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "edw-multi:main");
+    let mut ledger = genesis_ledger(&fluree, "edw-multi:main").await;
     std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
@@ -2971,7 +2971,7 @@ async fn run_val_agg(
     build: impl FnOnce(&mut VarRegistry, VarId) -> (Vec<Pattern>, AggregateFn),
 ) -> String {
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    let mut ledger = genesis_ledger(&fluree, "fa:main").await;
     Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
@@ -3152,7 +3152,7 @@ async fn fused_fallback_applies_offset_once() {
     let provider = MockR2rmlProvider::new(mapping, vec![batch]);
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    let mut ledger = genesis_ledger(&fluree, "fa:main").await;
     Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
@@ -3239,7 +3239,7 @@ async fn temporal_values_compare_equal_by_value() {
         let provider = MockR2rmlProvider::new(mapping, vec![batch]);
 
         let fluree = FlureeBuilder::memory().build_memory();
-        let mut ledger = genesis_ledger(&fluree, "fa:main");
+        let mut ledger = genesis_ledger(&fluree, "fa:main").await;
         Arc::make_mut(&mut ledger.snapshot)
             .insert_namespace_code(9_999, "http://example.org/".to_string())
             .unwrap();
@@ -3512,7 +3512,11 @@ impl R2rmlTableProvider for CountingProvider {
 /// templates and predicate IRIs encode/decode cleanly.
 fn edw_guard_ledger() -> (support::MemoryFluree, support::MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "edw-guard:main");
+    // Planned against, never committed: no ledger needs creating.
+    let mut ledger = fluree_db_api::LedgerState::new(
+        fluree_db_core::LedgerSnapshot::genesis("edw-guard:main"),
+        fluree_db_api::Novelty::new(0),
+    );
     std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
@@ -4444,7 +4448,7 @@ async fn guard_constant_object_decimal_scale_insensitive() {
     use std::str::FromStr;
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    let mut ledger = genesis_ledger(&fluree, "fa:main").await;
     Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
@@ -4702,7 +4706,7 @@ async fn materializer_driver_matches_engine_wildcard() {
     use fluree_db_r2rml::materialize::NTriplesCollector;
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "r2rml-mat:main");
+    let mut ledger = genesis_ledger(&fluree, "r2rml-mat:main").await;
     std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();

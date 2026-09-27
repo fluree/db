@@ -18,7 +18,7 @@ async fn run_indexed(
     q: &serde_json::Value,
 ) -> Vec<serde_json::Value> {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let canonical = fluree.insert(ledger0, data).await.unwrap().ledger;
     let lid = canonical.snapshot.ledger_id.to_string();
     rebuild_and_publish_index(&fluree, &lid).await;
@@ -36,7 +36,7 @@ async fn run_indexed(
 /// property (advisor → ex:p1), and a literal-valued property (name).
 async fn lubm_fixture() -> (support::MemoryFluree, support::MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "reasoning/join-repro");
+    let ledger0 = genesis_ledger(&fluree, "reasoning/join-repro").await;
 
     let data = json!({
         "@context": {
@@ -208,7 +208,7 @@ async fn case11_var_subject_var_ref_object() {
 /// ex:g memberOf ex:d0 ; ex:d0 a Department (base).
 async fn chain_fixture() -> (support::MemoryFluree, support::MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "reasoning/chain-repro");
+    let ledger0 = genesis_ledger(&fluree, "reasoning/chain-repro").await;
     let data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -295,7 +295,7 @@ async fn chain_derived_type_two_pattern() {
 /// => derived ex:rg0 subOrgOf ex:u0. ex:rg0 a ResearchGroup (base).
 async fn transitive_fixture() -> (support::MemoryFluree, support::MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "reasoning/transitive-repro");
+    let ledger0 = genesis_ledger(&fluree, "reasoning/transitive-repro").await;
     let data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -446,7 +446,7 @@ async fn idx_transitive_join_derived_property() {
 /// joins ref property" path from the subclass-UNION double-match.
 async fn equiv_fixture() -> (support::MemoryFluree, support::MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "reasoning/equiv-repro");
+    let ledger0 = genesis_ledger(&fluree, "reasoning/equiv-repro").await;
     let data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -523,7 +523,7 @@ async fn iso_pure_derived_type_literal() {
 /// branches with NO reasoning involved — reproduces the post-RDFS-rewrite shape.
 async fn dual_base_type_fixture() -> (support::MemoryFluree, support::MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "reasoning/manual-union");
+    let ledger0 = genesis_ledger(&fluree, "reasoning/manual-union").await;
     let data = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -637,7 +637,7 @@ async fn shared_var_join_multivalued_sanity() {
 #[tokio::test]
 async fn base_and_derived_same_type_not_doubled() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "reasoning/base-plus-derived");
+    let ledger0 = genesis_ledger(&fluree, "reasoning/base-plus-derived").await;
     let data = json!({
         "@context": {
             "ex": "http://example.org/",

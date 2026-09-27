@@ -178,7 +178,7 @@ async fn class_property_datatype_decrements_after_delete_non_last_instance() {
     local
         .run_until(async move {
             let ledger_id = "it/stats-classprop-delete:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -305,7 +305,7 @@ async fn class_property_reattributed_after_retype() {
     local
         .run_until(async move {
             let ledger_id = "it/stats-classprop-retype:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -486,7 +486,7 @@ async fn ref_class_reattributed_after_subject_retype() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-subject-retype:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -611,7 +611,7 @@ async fn ref_class_reattributed_after_object_retype() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-object-retype:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -737,7 +737,7 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-both-retype:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -862,7 +862,7 @@ async fn ref_class_attributed_when_object_typed_later() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-object-typed-later:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -979,7 +979,7 @@ async fn ref_class_attributed_when_subject_typed_later() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-subject-typed-later:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -1076,7 +1076,7 @@ async fn ref_class_attributed_when_both_endpoints_typed_later() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-both-typed-later:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -1173,7 +1173,7 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
     local
         .run_until(async move {
             let ledger_id = "it/large-retype-gate:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -1297,7 +1297,7 @@ async fn property_and_class_statistics_persist_in_db_root() {
     local
         .run_until(async move {
             let ledger_id ="it/indexing-stats:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1384,7 +1384,7 @@ async fn class_statistics_decrement_after_delete_refresh() {
     local
         .run_until(async move {
             let ledger_id = "it/indexing-stats-retracts:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1469,7 +1469,7 @@ async fn statistics_work_with_memory_storage_when_indexed() {
     local
         .run_until(async move {
             let ledger_id = "it/indexing-stats-memory:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1562,7 +1562,7 @@ async fn ledger_info_api_returns_expected_structure() {
     local
         .run_until(async move {
             let ledger_id ="test/ledger-info:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1830,7 +1830,7 @@ async fn ledger_info_api_with_context_compacts_stats_iris() {
     local
         .run_until(async move {
             let ledger_id ="test/ledger-info-ctx:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1988,7 +1988,7 @@ async fn ledger_info_property_datatypes_option_merges_novelty() {
     local
         .run_until(async move {
             let ledger_id ="test/ledger-info-datatypes:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2104,7 +2104,7 @@ async fn ledger_info_realtime_edges_merge_novelty_ref_counts() {
     local
         .run_until(async move {
             let ledger_id = "test/ledger-info-edges:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2216,7 +2216,7 @@ async fn ledger_info_stats_update_across_novelty_then_second_index_refresh() {
     local
         .run_until(async move {
             let ledger_id = "test/ledger-info-stats-refresh:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2468,7 +2468,7 @@ async fn ndv_cardinality_estimates_are_accurate() {
     local
         .run_until(async move {
             let ledger_id = "test/ndv-accuracy:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2762,7 +2762,7 @@ async fn selectivity_calculation_is_correct() {
     local
         .run_until(async move {
             let ledger_id = "test/selectivity:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2866,7 +2866,7 @@ async fn multi_class_entities_tracked_correctly() {
     local
         .run_until(async move {
             let ledger_id = "test/multi-class:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2982,7 +2982,7 @@ async fn class_property_type_distribution_tracked() {
     local
         .run_until(async move {
             let ledger_id = "test/type-distribution:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -3107,7 +3107,7 @@ async fn large_dataset_statistics_accuracy() {
     local
         .run_until(async move {
             let ledger_id = "test/large-dataset:main";
-            let mut ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let mut ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 1_000_000_000,

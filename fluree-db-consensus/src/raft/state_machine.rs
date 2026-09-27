@@ -487,13 +487,13 @@ pub struct NameServiceState {
     #[serde(default)]
     pub queue_config: QueueConfig,
     /// Per-`alias:branch` operational status pushed via
-    /// [`fluree_db_nameservice::StatusPublisher::push_status`]. The
+    /// [`fluree_db_nameservice::StatusPublisher::push_status_fenced`]. The
     /// read path falls back to [`StatusValue::initial`] when the
     /// branch is registered but no record lives here.
     #[serde(default)]
     pub status: HashMap<String, StoredStatus>,
     /// Per-`alias:branch` configuration pushed via
-    /// [`fluree_db_nameservice::ConfigPublisher::push_config`]. The
+    /// [`fluree_db_nameservice::ConfigPublisher::push_config_fenced`]. The
     /// read path falls back to [`ConfigValue::unborn`] when the
     /// branch is registered but no record lives here.
     #[serde(default)]
@@ -717,14 +717,14 @@ pub enum Command {
     /// every node's content store act in sync.
     ReleaseContent { id: ContentId },
     /// Compare-and-set one branch's commit or index head. Mirrors
-    /// the [`fluree_db_nameservice::RefPublisher::compare_and_set_ref`]
+    /// the [`fluree_db_nameservice::RefPublisher::compare_and_set_ref_fenced`]
     /// contract: returns [`Response::RefCasConflict`] on mismatch
     /// and enforces per-kind monotonicity on the update
     /// (`new.t > current.t` for [`RefKind::CommitHead`],
     /// `new.t >= current.t` for [`RefKind::IndexHead`]).
     CompareAndSetRef(RefCas),
     /// CAS push for one branch's operational status. Mirrors the
-    /// [`fluree_db_nameservice::StatusPublisher::push_status`]
+    /// [`fluree_db_nameservice::StatusPublisher::push_status_fenced`]
     /// contract: returns [`Response::StatusConflict`] when `expected`
     /// doesn't match the current value, and enforces
     /// `new.v > current.v`. The current value is
@@ -738,7 +738,7 @@ pub enum Command {
         new: StoredStatus,
     },
     /// CAS push for one branch's configuration. Mirrors the
-    /// [`fluree_db_nameservice::ConfigPublisher::push_config`]
+    /// [`fluree_db_nameservice::ConfigPublisher::push_config_fenced`]
     /// contract: returns [`Response::ConfigConflict`] when `expected`
     /// doesn't match the current value, and enforces
     /// `new.v > current.v`. The current value is
@@ -1167,13 +1167,12 @@ pub struct RefCas {
     pub applied_at_millis: u64,
 }
 
-/// Payload for [`Command::CreateLedger`].
+/// Payload for [`Command::CreateLedger`], which registered a branch before
+/// name bindings. Nothing proposes it now; it stays so a log written then
+/// still replays.
 ///
 /// `ledger_id` is the bare ledger name (no branch suffix); `branch`
-/// names the branch to register on that ledger. The trait surface
-/// (`LedgerLifecycle::init`) takes the full `name:branch` form; the
-/// adapter at `RaftNameService::init` splits it before building this
-/// command.
+/// names the branch to register on that ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewLedger {
     pub ledger_id: String,

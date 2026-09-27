@@ -21,7 +21,7 @@ async fn owl2rl_allvaluesfrom_with_inverse_property() {
     // Formulation ≡ Specification ∩ ∀(isMemberOf)⁻.Ingredient
     // If x is Formulation and y isMemberOf x, then y must be Ingredient
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/avf-inverse");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/avf-inverse").await;
 
     // Build schema with allValuesFrom on inverse property
     let schema = json!({
@@ -112,7 +112,7 @@ async fn owl2rl_multi_same_property_restrictions() {
     // Test: Multiple someValuesFrom restrictions on the same property in one intersection
     // DrugProduct ≡ ManufacturedItem ∩ ∃isCategorizedBy.DosageForm ∩ ∃isCategorizedBy.RouteOfAdmin
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/multi-same-prop");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/multi-same-prop").await;
 
     let schema = json!({
         "@context": {
@@ -198,7 +198,7 @@ async fn owl2rl_union_3_plus_branches() {
     // Test: unionOf with 3+ branches (not just 2)
     // MultiTarget ≡ Protein ∪ Receptor ∪ Enzyme ∪ Antibody
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/union-3plus");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/union-3plus").await;
 
     let schema = json!({
         "@context": {
@@ -281,7 +281,7 @@ async fn owl2rl_nested_unions() {
     // Test: Nested union (union containing another union)
     // NestedTarget ≡ SimpleTarget ∪ (ComplexA ∪ ComplexB)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/nested-union");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/nested-union").await;
 
     let schema = json!({
         "@context": {
@@ -355,7 +355,7 @@ async fn owl2rl_union_with_intersection() {
     // Test: Union combined with intersection
     // UnionIntersection ≡ (DrugTarget ∪ Biomarker) ∩ ∃hasFunction.TherapeuticFunction
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/union-intersection");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/union-intersection").await;
 
     let schema = json!({
         "@context": {
@@ -444,7 +444,7 @@ async fn owl2rl_inverse_in_deeper_chain() {
     // Define: hasGrandparent = hasParent ∘ hasChild⁻ ∘ hasParent
     // (This is a contrived chain, but tests inverse handling in chains)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/inverse-chain");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/inverse-chain").await;
 
     let schema = json!({
         "@context": {
@@ -520,7 +520,7 @@ async fn owl2rl_double_inverse_normalization() {
     // Test: Double inverse should normalize to original property
     // If R⁻⁻ should equal R
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/double-inverse");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/double-inverse").await;
 
     let schema = json!({
         "@context": {
@@ -597,7 +597,7 @@ async fn owl2rl_partial_conditions_no_inference() {
     // Test: When only partial conditions of an intersection are met, no inference should happen
     // ConjunctiveClass ≡ ∃hasA.ClassA ∩ ∃hasB.ClassB ∩ ∃hasC.ClassC
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/negative-partial");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/negative-partial").await;
 
     let schema = json!({
         "@context": {
@@ -678,7 +678,7 @@ async fn owl2rl_hasvalue_class_to_property_entailment() {
     // KilogramMagnitude ≡ Magnitude ∩ ∃hasUnit.{kg}
     // If x is KilogramMagnitude, then x hasUnit kg
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/hasvalue-entailment");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/hasvalue-entailment").await;
 
     let schema = json!({
         "@context": {

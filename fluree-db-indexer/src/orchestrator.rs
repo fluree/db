@@ -3016,6 +3016,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_nameservice::testing::CurrentFence;
 
     fn id(s: &str) -> LedgerId {
         LedgerId::parse(s).unwrap()
@@ -3028,7 +3029,7 @@ mod tests {
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeValue, MemoryStorage, Sid,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{CommitPublisher, NameServiceLookup};
+    use fluree_db_nameservice::NameServiceLookup;
     use fluree_db_novelty::Commit;
     use std::collections::HashMap;
 
@@ -3182,6 +3183,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let orchestrator = IndexerOrchestrator::new(
@@ -3216,6 +3220,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -3259,6 +3266,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid1 = store_commit(&storage, &commit1).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid1).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -3317,6 +3327,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -3526,7 +3539,6 @@ mod tests {
         use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
         use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
         use fluree_db_core::{ContentStore, StorageWrite};
-        use fluree_db_nameservice::IndexPublisher;
 
         const LEDGER: &str = "idle:main";
         let storage = MemoryStorage::new();
@@ -3632,7 +3644,6 @@ mod tests {
         use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
         use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
         use fluree_db_core::{ContentStore, DictKind, StorageWrite};
-        use fluree_db_nameservice::IndexPublisher;
 
         const MAIN: &str = "db:main";
         const DEV: &str = "db:dev";
@@ -3748,6 +3759,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -3791,6 +3805,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -5038,7 +5055,7 @@ mod embedded_tests {
     };
     use fluree_db_ledger::LedgerState;
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::CommitPublisher;
+    use fluree_db_nameservice::testing::CurrentFence;
     use fluree_db_novelty::{Commit, Novelty};
     use std::collections::HashMap;
 
@@ -5237,6 +5254,9 @@ mod embedded_tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         // Create a LedgerState with enough novelty to trigger threshold
@@ -5290,6 +5310,9 @@ mod embedded_tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let db = LedgerSnapshot::genesis("test:main");

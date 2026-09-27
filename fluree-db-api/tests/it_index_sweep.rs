@@ -95,7 +95,7 @@ async fn sweeping_a_real_ledger_reclaims_strays_and_leaves_queries_intact() {
         reindex_max_bytes: 1_000_000_000,
     };
 
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = fluree
         .insert_with_opts(
             ledger0,
@@ -152,7 +152,10 @@ async fn sweeping_a_real_ledger_reclaims_strays_and_leaves_queries_intact() {
     let stray_addr = fluree_db_core::content_address(
         storage.storage_method(),
         ContentKind::IndexLeaf,
-        &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+        &fluree
+            .storage_namespace(ledger_id)
+            .await
+            .expect("ledger's namespace"),
         &stray.digest_hex(),
     );
     storage

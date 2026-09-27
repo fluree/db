@@ -34,7 +34,7 @@ async fn names(fluree: &support::MemoryFluree, ledger_id: &str) -> Vec<serde_jso
 async fn db_reflects_owned_commit_after_cached_read() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/read-your-writes:main";
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
     let receipt = fluree
         .insert(

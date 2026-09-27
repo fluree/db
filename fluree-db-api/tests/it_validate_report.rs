@@ -17,7 +17,7 @@ use crate::support::genesis_ledger;
 async fn validate_report_shares_focus_nodes_across_shapes_targeting_same_class() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "test/validate-report/memo:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Step 1: data only — a subclass hierarchy plus two instances, one of the
     // subclass. No shapes exist yet, so no transaction-time enforcement fires.
@@ -140,7 +140,7 @@ async fn validate_report_shares_focus_nodes_across_shapes_targeting_same_class()
 async fn validate_report_t_advances_with_ledger_head() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "test/validate-report/t-advances:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(

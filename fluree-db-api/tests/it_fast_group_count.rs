@@ -22,7 +22,7 @@ use serde_json::json;
 /// Seed data with a well-known predicate (`schema:age`) and multiple objects
 /// sharing the same age, suitable for GROUP BY ?age COUNT(?s) queries.
 async fn seed_age_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -46,7 +46,7 @@ async fn seed_age_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
 
 /// Seed data across two transactions for fallback-via-time-travel tests.
 async fn seed_two_txns(fluree: &MemoryFluree, ledger_id: &str) -> (MemoryLedger, MemoryLedger) {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     // t=1: three people

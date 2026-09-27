@@ -16,10 +16,10 @@ use std::time::Duration;
 use fluree_db_consensus::raft::integration::{RaftBootstrapConfig, RaftIntegration};
 use fluree_db_core::{ContentId, ContentKind};
 use fluree_db_nameservice::file::FileNameService;
+use fluree_db_nameservice::testing::CurrentFence;
 use fluree_db_nameservice::{
-    CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher, ConfigValue,
-    LedgerLifecycle, NameServiceLookup, RefKind, RefLookup, RefPublisher, RefValue,
-    StatusCasResult, StatusLookup, StatusPayload, StatusPublisher, StatusValue,
+    CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigValue, NameServiceLookup,
+    RefKind, RefLookup, RefValue, StatusCasResult, StatusLookup, StatusPayload, StatusValue,
 };
 
 async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
@@ -37,15 +37,18 @@ fn cid(kind: ContentKind, seed: u8) -> ContentId {
 }
 
 /// Seed a file registry the way a life in the file posture before name
-/// bindings would have: through the FileNameService's own publisher surface,
-/// with unbound records, under the address those binaries used.
+/// bindings would have left it: heads, config and status written through the
+/// FileNameService's own publisher surface, then the bindings and fences
+/// taken away and the records moved to the address those binaries used.
 async fn seed_file_registry(root: &std::path::Path) {
     let ns = FileNameService::new(root);
     for (ledger, commit_seed, commit_t, index_seed, index_t) in [
         ("adopted/one", 1u8, 5i64, 2u8, 3i64),
         ("adopted/two", 3u8, 12i64, 4u8, 12i64),
     ] {
-        ns.init(ledger).await.expect("init");
+        fluree_db_nameservice::testing::create(&ns, ledger)
+            .await
+            .expect("create");
         let head = RefValue {
             id: Some(cid(ContentKind::Commit, commit_seed)),
             t: commit_t,
@@ -94,9 +97,37 @@ async fn seed_file_registry(root: &std::path::Path) {
         ));
     }
     // A soft-dropped ledger carries as a dropped ledger, not a live one.
-    ns.init("adopted/gone").await.expect("init tombstone");
-    ns.retract("adopted/gone").await.expect("retract");
-    std::fs::rename(root.join("ns@v3"), root.join("ns@v2")).expect("predecessor address");
+    fluree_db_nameservice::testing::create(&ns, "adopted/gone")
+        .await
+        .expect("create");
+    strip_to_predecessor_format(root, "adopted/gone:main");
+}
+
+/// Turn the records under `root` into what a binary from before name
+/// bindings wrote: no bindings, no fences, `retracted` soft-dropped, under
+/// `ns@v2/`.
+fn strip_to_predecessor_format(root: &std::path::Path, retracted: &str) {
+    let current = root.join("ns@v3");
+    for path in walk(&current) {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.starts_with('@') {
+            std::fs::remove_file(&path).expect("remove binding");
+            continue;
+        }
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let object = file.as_object_mut().unwrap();
+        object.remove("f:fence");
+        object.remove("f:frozen");
+        if object.get("@id").and_then(|v| v.as_str()) == Some(retracted) {
+            object.insert("f:status".into(), "retracted".into());
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    }
+    std::fs::rename(&current, root.join("ns@v2")).expect("predecessor address");
 }
 
 async fn boot_initialized(

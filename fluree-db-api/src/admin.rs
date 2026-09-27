@@ -98,10 +98,9 @@ pub struct DropReport {
     /// branch enumeration, etc.).
     pub warnings: Vec<String>,
     /// The dropped ledger's instance: a soft-dropped ledger is restored or
-    /// purged by it. `None` for a ledger created before name bindings.
+    /// purged by it. `None` when nothing was dropped.
     pub instance: Option<InstanceId>,
-    /// Whether the name is free again. Dropping a ledger created before name
-    /// bindings leaves its name reserved.
+    /// Whether the name is free again: always, once a ledger is dropped.
     pub name_released: bool,
     /// What became of the data; `None` when nothing was dropped.
     pub data: Option<DroppedData>,
@@ -513,15 +512,6 @@ mod validate_absolute_iri_tests {
 ///
 /// `operation` selects the rejection message, so each caller explains what
 /// *it* offers instead — see [`WholeLedgerOperation`].
-/// Where a branch's artifacts live: from its record, or its id's legacy
-/// namespace when no record survives.
-fn namespace_of(ledger_id: &LedgerId, record: Option<&NsRecord>) -> StorageNamespace {
-    record.map_or_else(
-        || StorageNamespace::legacy(ledger_id),
-        NsRecord::storage_namespace,
-    )
-}
-
 fn parse_whole_ledger_input(input: &str, operation: WholeLedgerOperation) -> Result<LedgerName> {
     let bad_input = |msg: String| ApiError::Http {
         status: 400,
@@ -649,11 +639,6 @@ impl crate::Fluree {
     ///    [`purge_dropped`](Self::purge_dropped) deletes it. `Hard`: its
     ///    storage is deleted now, then its registry entry.
     ///
-    /// A ledger created before name bindings keeps the older behaviour: a
-    /// soft drop retracts its records and keeps the name reserved, and a
-    /// hard drop deletes its data and frees the name. The report's
-    /// `name_released` says which happened.
-    ///
     /// # Input forms
     ///
     /// - `"mydb"` → drop the whole `mydb` ledger.
@@ -688,7 +673,14 @@ impl crate::Fluree {
                 self.drop_bound_ledger(&ledger_name, binding.value, mode)
                     .await
             }
-            None => self.drop_unbound_ledger(ledger_name, mode).await,
+            None => {
+                info!(ledger_name = %ledger_name, "No ledger holds the name");
+                Ok(DropReport {
+                    ledger_id: ledger_name.to_string(),
+                    status: DropStatus::NotFound,
+                    ..Default::default()
+                })
+            }
         }
     }
 
@@ -738,6 +730,16 @@ impl crate::Fluree {
         report.data = Some(if dropped.hard {
             self.purge_dropped_data(&dropped.entry, &mut report).await
         } else {
+            let mut branches = dropped.entry.branches.clone();
+            sort_leaf_first(&mut branches);
+            report.branch_reports = branches
+                .iter()
+                .map(|record| BranchDropReport {
+                    ledger_id: record.ledger_id.to_string(),
+                    status: DropStatus::Dropped,
+                    ..Default::default()
+                })
+                .collect();
             DroppedData::Retained
         });
         info!(
@@ -763,7 +765,7 @@ impl crate::Fluree {
         sort_leaf_first(&mut branches);
         for mut record in branches {
             record.storage_root = Some(entry.root.clone());
-            let (count, warnings) = self.drop_artifacts(&record.ledger_id, Some(&record)).await;
+            let (count, warnings) = self.drop_artifacts(&record.ledger_id, &record).await;
             report.artifacts_deleted += count;
             report.branch_reports.push(BranchDropReport {
                 ledger_id: record.ledger_id.to_string(),
@@ -867,178 +869,6 @@ impl crate::Fluree {
         Ok(report)
     }
 
-    /// Drop a ledger created before name bindings, whose records carry no
-    /// fence. Its name stays reserved: soft drop retracts, hard drop purges.
-    async fn drop_unbound_ledger(
-        &self,
-        ledger_name: LedgerName,
-        mode: DropMode,
-    ) -> Result<DropReport> {
-        let mut report = DropReport {
-            ledger_id: ledger_name.to_string(),
-            ..Default::default()
-        };
-
-        // 1. Snapshot every record under this ledger name. Use `all_records`
-        // (not `list_branches`, which excludes retracted) so hard-drop cleans
-        // up retracted-but-not-purged branches too. Keep the snapshots in
-        // memory — the CID-walk fallback needs them after the records are
-        // purged from the nameservice.
-        // Enumeration failures propagate as errors: silently coercing them
-        // to `NotFound` would let the HTTP route fall through to the
-        // drop_graph_source path, potentially deleting an unrelated graph
-        // source with the same name.
-        let all = self.nameservice().all_records().await?;
-        let mut branches: Vec<NsRecord> = all
-            .into_iter()
-            .filter(|r| r.ledger_id.name() == ledger_name.as_str())
-            .collect();
-
-        if branches.is_empty() {
-            report.status = DropStatus::NotFound;
-            info!(ledger_name = %ledger_name, "No branches found for ledger");
-            return Ok(report);
-        }
-
-        // Aggregate status: AlreadyRetracted iff every branch was already
-        // retracted; otherwise Dropped (matches per-branch semantics).
-        report.status = if branches.iter().all(|r| r.retracted) {
-            DropStatus::AlreadyRetracted
-        } else {
-            DropStatus::Dropped
-        };
-
-        // 2. Order branches leaf-first. A branch can appear after its parent
-        // in `all_records`; sort so children always come before the branches
-        // they point at via `source_branch`.
-        sort_leaf_first(&mut branches);
-
-        // 3. Stop indexing across all branches before touching storage. This
-        // also blocks any in-flight writes from publishing artifacts after
-        // we've started deleting.
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            for branch in &branches {
-                info!(ledger_id = %branch.ledger_id, "Cancelling pending indexing");
-                handle.cancel(&branch.ledger_id).await;
-                handle.wait_for_idle(&branch.ledger_id).await;
-            }
-        }
-
-        // 4. Drop each branch (artifacts + nameservice). `@shared/dicts/` is
-        // intentionally NOT wiped here — it lives at the ledger level and
-        // gets cleaned in the next step, once every branch is gone.
-        // Soft mode uses `LedgerLifecycle::retract`; hard mode uses
-        // `BranchLifecycle::drop_branch` so the parent's child count is
-        // decremented atomically — both surfaces are available on
-        // ReadWrite and Replicated nameservices.
-        let ledger_admin = self.ledger_admin()?;
-        let branch_admin = self.branch_admin()?;
-        for branch in &branches {
-            let mut br = BranchDropReport {
-                ledger_id: branch.ledger_id.to_string(),
-                status: if branch.retracted {
-                    DropStatus::AlreadyRetracted
-                } else {
-                    DropStatus::Dropped
-                },
-                ..Default::default()
-            };
-
-            if matches!(mode, DropMode::Hard) {
-                let (count, warnings) = self.drop_artifacts(&branch.ledger_id, Some(branch)).await;
-                br.artifacts_deleted += count;
-                br.warnings.extend(warnings);
-            }
-
-            // Hard mode uses `AdminPublisher::drop_branch` rather than
-            // `Publisher::purge` so the parent's `branches` count is
-            // decremented atomically with the row sweep. If we abort
-            // partway through a whole-ledger drop, surviving parent
-            // records still have an accurate child count rather than a
-            // stale one. Soft mode just retracts.
-            let ns_result = if matches!(mode, DropMode::Hard) {
-                branch_admin
-                    .drop_branch(&branch.ledger_id)
-                    .await
-                    .map(|_| ())
-                    .or_else(|e| {
-                        // Race: another caller already removed the meta
-                        // row. Treat as success — the row sweep inside
-                        // drop_branch ran regardless, and the other
-                        // caller already handled the parent decrement.
-                        if matches!(e, fluree_db_nameservice::NameServiceError::NotFound(_)) {
-                            Ok(())
-                        } else {
-                            Err(e)
-                        }
-                    })
-            } else {
-                ledger_admin.retract(&branch.ledger_id).await
-            };
-            // Cache disconnect runs unconditionally — the artifact deletion
-            // and any nameservice mutation already happened above, so even
-            // on a failure-about-to-bail-out we want stale state evicted.
-            if let Some(mgr) = &self.ledger_manager {
-                mgr.disconnect(&branch.ledger_id).await;
-            }
-
-            if let Err(e) = ns_result {
-                // Real nameservice failure (already filtered out the
-                // NotFound race-as-success). Continuing would risk
-                // purging parents while children still point at them.
-                // Bail with an error; the per-branch reports for what
-                // succeeded survive in tracing logs. Idempotent retry
-                // is safe because each step (artifact deletion, NS
-                // mutation, cache disconnect) tolerates partial prior
-                // progress.
-                let msg = format!("Nameservice retract/drop: {e}");
-                warn!(ledger_id = %branch.ledger_id, error = %e, "Aborting drop_ledger on nameservice failure");
-                br.warnings.push(msg.clone());
-                report.artifacts_deleted += br.artifacts_deleted;
-                report.warnings.extend(br.warnings.iter().cloned());
-                report.branch_reports.push(br);
-                return Err(ApiError::Drop(format!(
-                    "Failed to drop branch '{}' of ledger '{}': {e}. \
-                     Stopped before touching parent branches or @shared/dicts. \
-                     Retry is safe.",
-                    branch.ledger_id, ledger_name
-                )));
-            }
-
-            report.artifacts_deleted += br.artifacts_deleted;
-            report.warnings.extend(br.warnings.iter().cloned());
-            report.branch_reports.push(br);
-        }
-
-        // 5. Hard drop only: wipe the cross-branch `@shared/dicts/` namespace.
-        // Safe at this point because every branch under this ledger name has
-        // been dropped, so nothing left to reference shared dicts.
-        // Every branch of a ledger shares its root, and `branches` is non-empty.
-        if matches!(mode, DropMode::Hard) {
-            let root = branches[0].storage_root();
-            let (count, warnings) = self.drop_shared_artifacts(&root).await;
-            report.artifacts_deleted += count;
-            report.warnings.extend(warnings);
-        }
-
-        // A hard drop purges the records, so the name is reusable; a soft
-        // drop retracts them and keeps it reserved.
-        let hard = matches!(mode, DropMode::Hard);
-        report.name_released = hard;
-        report.data = Some(if hard {
-            DroppedData::Deleted
-        } else {
-            DroppedData::Retained
-        });
-        info!(
-            ledger_name = %ledger_name,
-            branches = report.branch_reports.len(),
-            artifacts_deleted = report.artifacts_deleted,
-            "Ledger dropped"
-        );
-        Ok(report)
-    }
-
     /// Drop a branch
     ///
     /// This operation:
@@ -1064,77 +894,10 @@ impl crate::Fluree {
         info!(ledger_id = %ledger_id, "Dropping branch");
 
         let name = ledger_id.ledger_name();
-        if self.publisher()?.get_binding(&name).await?.is_some() {
-            return self.drop_bound_branch(&name, &ledger_id).await;
+        if self.publisher()?.get_binding(&name).await?.is_none() {
+            return Err(ApiError::NotFound(format!("Branch not found: {ledger_id}")));
         }
-
-        let mut report = BranchDropReport {
-            ledger_id: ledger_id.to_string(),
-            ..Default::default()
-        };
-
-        // Look up the record first — the root check is record-based, not
-        // name-based, so we have to load before we can validate.
-        let record = self
-            .nameservice()
-            .lookup(&ledger_id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("Branch not found: {ledger_id}")))?;
-
-        if record.source_branch.is_none() {
-            return Err(ApiError::Http {
-                status: 400,
-                message: format!(
-                    "Cannot drop '{branch}': it is the root of ledger '{ledger_name}'. \
-                     Use drop_ledger to remove the whole ledger."
-                ),
-            });
-        }
-
-        if record.retracted {
-            report.status = DropStatus::AlreadyRetracted;
-            return Ok(report);
-        }
-
-        report.status = DropStatus::Dropped;
-
-        if record.branches > 0 {
-            // Has children — retract but preserve storage
-            self.ledger_admin()?.retract(&ledger_id).await?;
-            report.deferred = true;
-
-            // Disconnect from cache
-            if let Some(mgr) = &self.ledger_manager {
-                mgr.disconnect(&ledger_id).await;
-            }
-
-            info!(
-                ledger_id = %ledger_id,
-                children = record.branches,
-                "Branch retracted (deferred — has children)"
-            );
-            return Ok(report);
-        }
-
-        // Leaf branch — full drop
-        let parent_new_count = self
-            .purge_branch(&ledger_id, Some(&record), &mut report)
-            .await?;
-
-        // Cascade upward if parent is retracted with zero children
-        if let (Some(0), Some(source)) = (parent_new_count, &record.source_branch) {
-            let parent_id = LedgerId::from_parts(ledger_name, source)?;
-            self.try_cascade_drop(ledger_name, &parent_id, &mut report)
-                .await;
-        }
-
-        info!(
-            ledger_id = %ledger_id,
-            artifacts_deleted = report.artifacts_deleted,
-            cascaded = ?report.cascaded,
-            "Branch dropped"
-        );
-        Ok(report)
+        self.drop_bound_branch(&name, &ledger_id).await
     }
 
     /// Drop a branch of a ledger created under a name binding. The branch is
@@ -1187,7 +950,7 @@ impl crate::Fluree {
         while let Some(record) = next.take() {
             let branch_id = record.ledger_id.clone();
             let (own_dicts, complete) = self
-                .delete_branch_data(&branch_id, Some(&record), &mut report)
+                .delete_branch_data(&branch_id, &record, &mut report)
                 .await;
             if !complete {
                 // Still listed: dropping it again finishes the deletion.
@@ -1206,7 +969,7 @@ impl crate::Fluree {
                 }
                 Err(e) => return Err(e.into()),
             };
-            self.release_branch_dicts(&branch_id, Some(&record), own_dicts, &mut report)
+            self.release_branch_dicts(&branch_id, &record, own_dicts, &mut report)
                 .await;
             if branch_id != *ledger_id {
                 report.cascaded.push(branch_id.to_string());
@@ -1611,28 +1374,6 @@ impl crate::Fluree {
         Ok(!flakes.is_empty())
     }
 
-    /// Cancel indexing, delete storage artifacts, purge nameservice record,
-    /// and disconnect from cache. Returns the parent's new child count.
-    ///
-    /// Dictionary blobs live in the ledger-wide `@shared/dicts/` namespace,
-    /// so the branch prefix delete does not reach them. The ones only this
-    /// branch's index chain referenced go last, once the record is gone: a
-    /// sibling's collector pass may already have deferred them to this branch
-    /// (see the module docs on `fluree_db_indexer::gc`), after which nothing
-    /// else names them.
-    async fn purge_branch(
-        &self,
-        ledger_id: &LedgerId,
-        record: Option<&NsRecord>,
-        report: &mut BranchDropReport,
-    ) -> Result<Option<u32>> {
-        let (own_dicts, _) = self.delete_branch_data(ledger_id, record, report).await;
-        let parent_new_count = self.branch_admin()?.drop_branch(ledger_id).await?;
-        self.release_branch_dicts(ledger_id, record, own_dicts, report)
-            .await;
-        Ok(parent_new_count)
-    }
-
     /// Stop indexing the branch and delete its own artifacts. Returns the
     /// dictionary blobs its index chain referenced, for
     /// [`Self::release_branch_dicts`] once its record is gone, and whether
@@ -1640,7 +1381,7 @@ impl crate::Fluree {
     async fn delete_branch_data(
         &self,
         ledger_id: &LedgerId,
-        record: Option<&NsRecord>,
+        record: &NsRecord,
         report: &mut BranchDropReport,
     ) -> (HashSet<ContentId>, bool) {
         if let IndexingMode::Background(handle) = &self.indexing_mode {
@@ -1667,7 +1408,7 @@ impl crate::Fluree {
     async fn release_branch_dicts(
         &self,
         ledger_id: &LedgerId,
-        record: Option<&NsRecord>,
+        record: &NsRecord,
         own_dicts: HashSet<ContentId>,
         report: &mut BranchDropReport,
     ) {
@@ -1702,7 +1443,7 @@ impl crate::Fluree {
                 .unreferenced_by_survivors(ledger_id, own_dicts, &mut report.warnings)
                 .await;
             let failures = self
-                .content_store(&namespace_of(ledger_id, record))
+                .content_store(&record.storage_namespace())
                 .release_many(&unique_dicts)
                 .await;
             let released = unique_dicts.len() - failures.len();
@@ -1728,12 +1469,12 @@ impl crate::Fluree {
     /// branch still reads, whereas leaving the blobs costs disk until a sweep.
     async fn shared_blobs_of(
         &self,
-        record: Option<&NsRecord>,
+        record: &NsRecord,
         warnings: &mut Vec<String>,
     ) -> HashSet<ContentId> {
-        let Some(record) = record.filter(|r| r.index_head_id.is_some()) else {
+        if record.index_head_id.is_none() {
             return HashSet::new();
-        };
+        }
         let backend = self.backend();
         let own = BranchIndexHead::of(record);
         match shared_refs_of_branches(backend, &[own], None).await {
@@ -1801,50 +1542,6 @@ impl crate::Fluree {
         unique
     }
 
-    /// Recursively drop retracted ancestor branches that have zero children.
-    async fn try_cascade_drop(
-        &self,
-        ledger_name: &str,
-        ancestor_id: &LedgerId,
-        report: &mut BranchDropReport,
-    ) {
-        let Ok(Some(ancestor)) = self.nameservice().lookup(ancestor_id).await else {
-            return;
-        };
-
-        if !ancestor.retracted || ancestor.branches > 0 {
-            return;
-        }
-
-        info!(ledger_id = %ancestor_id, "Cascading drop to retracted ancestor");
-
-        let parent_new_count = match self
-            .purge_branch(ancestor_id, Some(&ancestor), report)
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                report
-                    .warnings
-                    .push(format!("Cascade purge of {ancestor_id}: {e}"));
-                return;
-            }
-        };
-
-        report.cascaded.push(ancestor_id.to_string());
-
-        if let (Some(0), Some(source)) = (parent_new_count, &ancestor.source_branch) {
-            match ancestor_id.with_branch(source) {
-                Ok(next_ancestor) => {
-                    Box::pin(self.try_cascade_drop(ledger_name, &next_ancestor, report)).await;
-                }
-                Err(e) => report.warnings.push(format!(
-                    "Cascade stopped at {ancestor_id}: source branch {e}"
-                )),
-            }
-        }
-    }
-
     /// Delete the branch-scoped storage artifacts for a single branch.
     ///
     /// Enumerates the per-branch subprefixes (`commit/`, `txn/`, `index/`,
@@ -1866,10 +1563,10 @@ impl crate::Fluree {
     pub(crate) async fn drop_artifacts(
         &self,
         ledger_id: &LedgerId,
-        record: Option<&fluree_db_nameservice::NsRecord>,
+        record: &fluree_db_nameservice::NsRecord,
     ) -> (usize, Vec<String>) {
         let mut warnings = Vec::new();
-        let namespace = namespace_of(ledger_id, record);
+        let namespace = record.storage_namespace();
         let storage = match self.admin_storage() {
             Some(s) => s,
             None => {
@@ -1994,18 +1691,10 @@ impl crate::Fluree {
     async fn drop_artifacts_by_cid_walk(
         &self,
         namespace: &StorageNamespace,
-        record: Option<&fluree_db_nameservice::NsRecord>,
+        record: &fluree_db_nameservice::NsRecord,
         warnings: &mut Vec<String>,
     ) -> (usize, Vec<String>) {
         let content_store = self.content_store(namespace);
-
-        let record = match record {
-            Some(r) => r,
-            None => {
-                warnings.push("No NsRecord available for CID-walking drop".to_string());
-                return (0, std::mem::take(warnings));
-            }
-        };
 
         let cids = match fluree_db_indexer::collect_ledger_cids(
             content_store.as_ref(),

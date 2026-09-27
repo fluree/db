@@ -245,8 +245,10 @@ async fn flpack_export_import_round_trip() {
         .build()
         .expect("build source");
 
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
 
     let insert_data = json!({
         "@context": {
@@ -366,8 +368,10 @@ async fn flpack_export_import_round_trip_with_index() {
 
     local
         .run_until(async {
-            let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-            let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+            let src_state = src_fluree
+                .create_ledger(src_ledger)
+                .await
+                .expect("create ledger");
 
             let insert_data = json!({
                 "@context": {
@@ -517,8 +521,10 @@ async fn flpack_restore_ledger_api_round_trip() {
         .build()
         .expect("build source");
 
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
 
     let insert_data = json!({
         "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" },
@@ -594,8 +600,10 @@ async fn flpack_restore_bare_name_normalizes_to_main() {
     let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
         .build()
         .expect("build source");
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:test", "ex:value": "hello"
@@ -661,8 +669,10 @@ async fn flpack_preserves_default_context() {
         .expect("build source");
 
     // Populate, then set a default context on the source.
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:a", "ex:v": "1"
@@ -744,8 +754,10 @@ async fn flpack_restore_restamps_index_root_ledger_id() {
 
     local
         .run_until(async {
-            let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-            let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+            let src_state = src_fluree
+                .create_ledger(src_ledger)
+                .await
+                .expect("create ledger");
             let insert = json!({
                 "@context": {"ex": "http://example.org/ns/"},
                 "@graph": [
@@ -848,8 +860,10 @@ async fn flpack_restore_rolls_back_on_truncated_stream() {
     let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
         .build()
         .expect("build source");
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:test", "ex:value": "hello"
@@ -900,8 +914,7 @@ async fn flpack_restore_refuses_name_held_on_another_branch() {
     let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
         .build()
         .expect("build");
-    let db = fluree_db_core::LedgerSnapshot::genesis(live);
-    let state = fluree_db_api::LedgerState::new(db, fluree_db_api::Novelty::new(0));
+    let state = fluree.create_ledger(live).await.expect("create ledger");
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:test", "ex:value": "hello"
@@ -948,8 +961,10 @@ async fn flpack_stream_structure_is_valid() {
         .build()
         .expect("build");
 
-    let db = fluree_db_core::LedgerSnapshot::genesis(ledger_id);
-    let state = fluree_db_api::LedgerState::new(db, fluree_db_api::Novelty::new(0));
+    let state = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},

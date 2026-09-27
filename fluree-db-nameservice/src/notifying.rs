@@ -14,9 +14,9 @@ use crate::{
     event_bus::LedgerEventBus, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
     GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads,
-    LedgerLifecycle, NameServiceEvent, NameServiceLookup, NsLookupResult, NsRecord,
-    NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
-    StatusLookup, StatusPublisher, StatusValue, Subscription, SubscriptionScope,
+    NameServiceEvent, NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
+    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
+    StatusValue, Subscription, SubscriptionScope,
 };
 
 /// Decorator that wraps a nameservice and emits events on a [`LedgerEventBus`]
@@ -93,30 +93,6 @@ impl<N> BranchLifecycle for NotifyingNameService<N>
 where
     N: BranchLifecycle,
 {
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
-    ) -> Result<()> {
-        self.inner
-            .create_branch(ledger_name, new_branch, source_branch, at_commit)
-            .await
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let remaining = self.inner.drop_branch(ledger_id).await?;
-        // Symmetric with `Publisher::retract` / `Publisher::purge`: subscribers
-        // (ledger cache, query peers) rely on `LedgerRetracted` to clear
-        // their per-branch state. Without this notification the new
-        // whole-ledger drop path would leave stale caches behind.
-        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: LedgerId::parse(ledger_id)?,
-        });
-        Ok(remaining)
-    }
-
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
@@ -148,32 +124,6 @@ where
 // ---------------------------------------------------------------------------
 // Publisher — emit events after successful writes
 // ---------------------------------------------------------------------------
-
-#[async_trait]
-impl<N> LedgerLifecycle for NotifyingNameService<N>
-where
-    N: LedgerLifecycle,
-{
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        self.inner.init(ledger_id).await
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        self.inner.retract(ledger_id).await?;
-        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: LedgerId::parse(ledger_id)?,
-        });
-        Ok(())
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        self.inner.purge(ledger_id).await?;
-        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: LedgerId::parse(ledger_id)?,
-        });
-        Ok(())
-    }
-}
 
 #[async_trait]
 impl<N> CommitPublisher for NotifyingNameService<N>

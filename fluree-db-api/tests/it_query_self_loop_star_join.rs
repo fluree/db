@@ -69,7 +69,7 @@ const SELF_LOOP_STAR_COUNT: &str =
     "SELECT (COUNT(*) AS ?n) WHERE { ?x <http://ex/rel> ?x . ?x a ?c }";
 
 async fn seed_memory(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(ledger, &fixture())
         .await
@@ -149,7 +149,7 @@ async fn self_loop_star_join_indexed_lane() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let result = fluree
                 .insert_with_opts(
                     ledger,

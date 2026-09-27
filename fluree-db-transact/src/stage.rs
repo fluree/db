@@ -4073,6 +4073,8 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
@@ -4176,6 +4178,8 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
@@ -4286,6 +4290,8 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
@@ -4509,6 +4515,8 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,

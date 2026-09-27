@@ -67,7 +67,7 @@ async fn notify_single_commit_uses_incremental_path() {
     let manager = peer_manager(&fluree);
 
     // Create ledger and insert initial data
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let t_after_first = ledger1.t();
     assert!(t_after_first >= 1);
@@ -130,7 +130,7 @@ async fn notify_small_gap_uses_incremental_path() {
     let manager = peer_manager(&fluree);
 
     // Create and commit initial data
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let t_initial = ledger1.t();
 
@@ -175,7 +175,7 @@ async fn notify_large_gap_falls_back_to_reload() {
     let manager = peer_manager(&fluree);
 
     // Create and commit initial data
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let mut ledger = insert_data(&fluree, ledger0, "item0").await;
 
     // Cache the ledger
@@ -228,7 +228,7 @@ async fn notify_index_only_trims_novelty() {
     local
         .run_until(async {
             // Create and commit data
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let mut graph = Vec::new();
             for i in 0..50u32 {
                 graph.push(json!({

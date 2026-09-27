@@ -6,8 +6,8 @@
 //! writing the commit blob. On success, the commit record references the
 //! raw-txn ContentId and the bytes are retrievable from the content store.
 
-use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, LedgerState, Novelty};
-use fluree_db_core::{commit::codec::read_commit, ContentKind, ContentStore as _, LedgerSnapshot};
+use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig};
+use fluree_db_core::{commit::codec::read_commit, ContentKind, ContentStore as _};
 use fluree_db_transact::{ir::TxnType, TxnOpts as IrTxnOpts};
 use serde_json::{json, Value as JsonValue};
 
@@ -23,8 +23,10 @@ fn ctx() -> JsonValue {
 async fn store_raw_txn_roundtrip_via_parallel_upload() {
     let ledger_id = "it/raw-txn-parallel-roundtrip:main";
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let txn_json = json!({
         "@context": ctx(),
@@ -128,7 +130,10 @@ async fn txn_cid_of(
 async fn duplicate_body_failure_keeps_first_commits_txn_blob() {
     let ledger_id = "it/raw-txn-duplicate-body:main";
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = LedgerState::new(LedgerSnapshot::genesis(ledger_id), Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     let txn_opts = IrTxnOpts::default().store_raw_txn(true);
 
     let first = fluree
@@ -200,7 +205,10 @@ async fn verify_and_export_tolerate_missing_txn_blob() {
 
     let ledger_id = "it/raw-txn-missing-blob:main";
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = LedgerState::new(LedgerSnapshot::genesis(ledger_id), Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let result = fluree
         .transact(
@@ -272,7 +280,10 @@ async fn push_accepts_commits_whose_txn_blob_is_missing() {
         fluree: &fluree_db_api::Fluree,
         ledger_id: &str,
     ) -> (Vec<fluree_db_api::Base64Bytes>, Vec<String>) {
-        let ledger0 = LedgerState::new(LedgerSnapshot::genesis(ledger_id), Novelty::new(0));
+        let ledger0 = fluree
+            .create_ledger(ledger_id)
+            .await
+            .expect("create ledger");
         let result = fluree
             .transact(
                 ledger0,

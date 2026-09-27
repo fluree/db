@@ -47,7 +47,7 @@ fn ctx_schema_value() -> serde_json::Value {
 }
 
 async fn seed_authors_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": ["https://schema.org", ctx_schema()],
         "@graph": [
@@ -63,7 +63,7 @@ async fn seed_authors_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLe
 }
 
 async fn seed_books_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": ["https://schema.org", ctx_schema()],
         "@graph": [
@@ -79,7 +79,7 @@ async fn seed_books_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedg
 }
 
 async fn seed_movies_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": ["https://schema.org", ctx_schema()],
         "@graph": [
@@ -96,7 +96,7 @@ async fn seed_movies_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLed
 
 /// Seed a "people" ledger with person data
 async fn seed_people_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -128,7 +128,7 @@ async fn seed_people_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLed
 
 /// Seed an "organizations" ledger with organization data
 async fn seed_orgs_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -158,7 +158,7 @@ async fn seed_orgs_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedge
 
 /// Seed a second "people" ledger with different person data (for union tests)
 async fn seed_people2_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -720,7 +720,7 @@ async fn dataset_cross_graph_join_in_union() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Create a people ledger with employment info
-    let ledger0 = genesis_ledger(&fluree, "employed:main");
+    let ledger0 = genesis_ledger(&fluree, "employed:main").await;
     let insert = json!({
         "@context": {
             "ex": "http://example.org/ns/",
@@ -790,7 +790,7 @@ async fn sparql_graph_pattern_concrete_iri() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Create a default ledger (empty for this test)
-    let ledger0 = genesis_ledger(&fluree, "default:main");
+    let ledger0 = genesis_ledger(&fluree, "default:main").await;
     let insert_default = json!({
         "@context": {
             "ex": "http://example.org/ns/",
@@ -1026,7 +1026,7 @@ async fn fql_graph_pattern_basic() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Create ledgers
-    let ledger0 = genesis_ledger(&fluree, "default:main");
+    let ledger0 = genesis_ledger(&fluree, "default:main").await;
     let insert_default = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:defaultEntity", "schema:name": "Default Entity"}]
@@ -1124,7 +1124,7 @@ async fn dataset_time_travel_at_t() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Commit 1: Alice
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1165,7 +1165,7 @@ async fn dataset_time_travel_at_time_iso() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Commit 1: Alice (capture its timestamp)
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1217,7 +1217,7 @@ async fn dataset_time_travel_future_t_errors() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Single commit so head t=1
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1237,7 +1237,7 @@ async fn dataset_time_travel_mixed_graphs() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // People ledger: t=1 Alice, t=2 Bob
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1250,7 +1250,7 @@ async fn dataset_time_travel_mixed_graphs() {
     let _ledger2 = fluree.insert(ledger1, &insert2).await.unwrap().ledger;
 
     // Orgs ledger: single commit Acme
-    let orgs_ledger0 = genesis_ledger(&fluree, "orgs:main");
+    let orgs_ledger0 = genesis_ledger(&fluree, "orgs:main").await;
     let orgs_insert = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:acme", "@type": "ex:Organization", "schema:name": "Acme Corp"}]
@@ -1290,7 +1290,7 @@ async fn dataset_time_travel_alias_syntax_at_t() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Commit 1: Alice
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1338,7 +1338,7 @@ async fn dataset_time_travel_at_commit() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Commit 1: Alice (capture its commit ID)
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1383,7 +1383,7 @@ async fn dataset_time_travel_at_commit_short_prefix() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Commit 1: Alice (capture its commit ID)
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1430,7 +1430,7 @@ async fn dataset_time_travel_alias_syntax_commit() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Commit 1: Alice (capture its commit ID)
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1482,7 +1482,7 @@ async fn dataset_time_travel_commit_not_found_errors() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Single commit
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1508,7 +1508,7 @@ async fn dataset_time_travel_commit_too_short_errors() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Single commit
-    let ledger0 = genesis_ledger(&fluree, "people:main");
+    let ledger0 = genesis_ledger(&fluree, "people:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -1701,7 +1701,7 @@ async fn sparql_single_db_graph_variable_bound_non_matching() {
 /// Seed a ledger via TriG upsert: "Alice" in the default graph and "Bob" in the
 /// user named graph `<urn:probegraph>` (registered at g_id >= FIRST_USER_GRAPH_ID).
 async fn seed_named_graph_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let trig = r#"
         @prefix ex: <http://example.org/ns/> .
         @prefix schema: <http://schema.org/> .
@@ -1858,7 +1858,7 @@ async fn sparql_single_db_graph_alias_wins_over_colliding_named_graph() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
-    let ledger0 = genesis_ledger(&fluree, "ngquirk:main");
+    let ledger0 = genesis_ledger(&fluree, "ngquirk:main").await;
     let trig = r#"
         @prefix ex: <http://example.org/ns/> .
         @prefix schema: <http://schema.org/> .
@@ -1971,7 +1971,7 @@ async fn fql_single_db_graph_variable_join_inner_use() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
-    let ledger0 = genesis_ledger(&fluree, "ngjoin:main");
+    let ledger0 = genesis_ledger(&fluree, "ngjoin:main").await;
     // Named graph <urn:g1> holds two triples; only ONE has the graph's own
     // name as its subject. `["graph","?g",{"@id":"?g",...}]` must return only
     // that one (mirror of W3C graph-variable-join).
@@ -2017,7 +2017,7 @@ async fn fql_single_db_graph_variable_bound_from_scan_exists() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
-    let ledger0 = genesis_ledger(&fluree, "ngscan:main");
+    let ledger0 = genesis_ledger(&fluree, "ngscan:main").await;
     // Default graph points at the named graph; the named graph has content.
     let trig = r#"
         @prefix ex: <http://example.org/ns/> .
@@ -2094,7 +2094,7 @@ async fn dataset_multi_ledger_time_travel_execution() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Ledger 1: t=1 Alice, t=2 Bob
-    let ledger1_0 = genesis_ledger(&fluree, "ledger1:main");
+    let ledger1_0 = genesis_ledger(&fluree, "ledger1:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -2107,7 +2107,7 @@ async fn dataset_multi_ledger_time_travel_execution() {
     let _ledger1_2 = fluree.insert(ledger1_1, &insert2).await.unwrap().ledger;
 
     // Ledger 2: t=1 Carol, t=2 Dave
-    let ledger2_0 = genesis_ledger(&fluree, "ledger2:main");
+    let ledger2_0 = genesis_ledger(&fluree, "ledger2:main").await;
     let insert3 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:carol", "@type": "ex:Person", "schema:name": "Carol"}]
@@ -2147,7 +2147,7 @@ async fn sparql_from_time_travel_suffixes() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Ledger 1: t=1 Alice, t=2 Bob
-    let ledger1_0 = genesis_ledger(&fluree, "ledger1:main");
+    let ledger1_0 = genesis_ledger(&fluree, "ledger1:main").await;
     let insert1 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
@@ -2160,7 +2160,7 @@ async fn sparql_from_time_travel_suffixes() {
     let _ledger1_2 = fluree.insert(ledger1_1, &insert2).await.unwrap().ledger;
 
     // Ledger 2: t=1 Carol, t=2 Dave
-    let ledger2_0 = genesis_ledger(&fluree, "ledger2:main");
+    let ledger2_0 = genesis_ledger(&fluree, "ledger2:main").await;
     let insert3 = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [{"@id": "ex:carol", "@type": "ex:Person", "schema:name": "Carol"}]
@@ -2300,7 +2300,7 @@ async fn dataset_staged_transaction_with_novel_namespace() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Ledger A: committed data using "ex:" namespace
-    let ledger_a0 = genesis_ledger(&fluree, "committed:main");
+    let ledger_a0 = genesis_ledger(&fluree, "committed:main").await;
     let insert_a = json!({
         "@context": {
             "ex": "http://example.org/ns/",
@@ -2321,7 +2321,7 @@ async fn dataset_staged_transaction_with_novel_namespace() {
     // Ledger B: stage (not commit) a transaction that introduces
     // "http://novel-namespace.example.com/org/" — a namespace prefix that
     // does NOT exist on ledger B's base (genesis) snapshot.
-    let ledger_b0 = genesis_ledger(&fluree, "staged:main");
+    let ledger_b0 = genesis_ledger(&fluree, "staged:main").await;
     let insert_b = json!({
         "@context": {
             "novel": "http://novel-namespace.example.com/org/",
@@ -2390,7 +2390,7 @@ async fn dataset_staged_transaction_with_novel_namespace() {
 /// distinct `schema:name`: default = Alice, `<urn:g1>` = Bob, `<urn:g2>` =
 /// Carol. All three live in the same ledger/snapshot.
 async fn seed_within_ledger_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let trig = r#"
         @prefix ex: <http://example.org/ns/> .
         @prefix schema: <http://schema.org/> .
@@ -2921,7 +2921,7 @@ async fn sparql_within_ledger_repeated_from_is_deduped() {
 /// / `ex:d2`) to pin the EmitMask pruning trap. The ledger default graph holds
 /// only `ex:alice schema:name "Alice"`.
 async fn seed_union_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let trig = r#"
         @prefix ex: <http://example.org/ns/> .
         @prefix schema: <http://schema.org/> .
@@ -3246,7 +3246,7 @@ async fn sparql_within_ledger_from_union_var_var_join_is_set_merged() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "wl-union-join:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     // ex:x carries BOTH properties in BOTH graphs — the worst case for
     // bag-union join inflation (2 copies × 2 copies = 4 rows).
     let trig = r#"
@@ -3291,7 +3291,7 @@ async fn sparql_within_ledger_from_union_var_var_join_is_set_merged() {
 /// Seed mutual `schema:knows` edges — the shape that makes a join's right
 /// triple bind nothing new (`?a knows ?b . ?b knows ?a`).
 async fn seed_mutual_knows_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "@graph": [
@@ -3396,7 +3396,7 @@ const HTTP_DS_G2: &str = "http://ex.org/g2";
 /// One default-graph triple plus a two-triple named graph, so "empty default
 /// graph" and "named graph enumerated once" are separately discriminating.
 async fn seed_http_dataset_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let trig = r#"
         @prefix ex: <http://ex.org/> .
 

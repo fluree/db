@@ -636,6 +636,14 @@ fn assert_fenced<T: std::fmt::Debug>(result: crate::Result<T>, write: &str) {
     }
 }
 
+/// [`assert_fenced`], also taking `NotFound` when `missing`.
+fn assert_refused<T: std::fmt::Debug>(result: crate::Result<T>, write: &str, missing: bool) {
+    match result {
+        Err(NameServiceError::NotFound(_)) if missing => {}
+        other => assert_fenced(other, write),
+    }
+}
+
 fn cid(kind: fluree_db_core::ContentKind, label: &str) -> fluree_db_core::ContentId {
     fluree_db_core::ContentId::new(kind, label.as_bytes())
 }
@@ -679,6 +687,17 @@ async fn assert_every_write_refused<S: crate::NameServicePublisher>(
     id: &str,
     fence: Option<Fence>,
 ) {
+    assert_writes_refused(store, id, fence, false).await;
+}
+
+/// [`assert_every_write_refused`], also taking `NotFound` when `missing`:
+/// a write to a record that does not exist may say so instead.
+async fn assert_writes_refused<S: crate::NameServicePublisher>(
+    store: &S,
+    id: &str,
+    fence: Option<Fence>,
+    missing: bool,
+) {
     use fluree_db_core::ContentKind::{Commit, IndexRoot};
     let commit = cid(Commit, "stale");
     let index = cid(IndexRoot, "stale");
@@ -687,12 +706,13 @@ async fn assert_every_write_refused<S: crate::NameServicePublisher>(
         id: Some(commit.clone()),
         t,
     };
-    assert_fenced(
+    assert_refused(
         store.publish_commit_fenced(id, fence, 99, &commit).await,
         "publish_commit",
+        missing,
     );
     let current = head(crate::RefKind::CommitHead).await;
-    assert_fenced(
+    assert_refused(
         store
             .compare_and_set_ref_fenced(
                 id,
@@ -703,25 +723,29 @@ async fn assert_every_write_refused<S: crate::NameServicePublisher>(
             )
             .await,
         "compare_and_set_ref(commit)",
+        missing,
     );
-    assert_fenced(
+    assert_refused(
         store
             .fast_forward_commit_fenced(id, fence, &next(99), 3)
             .await,
         "fast_forward_commit",
+        missing,
     );
-    assert_fenced(
+    assert_refused(
         store.publish_index_fenced(id, fence, 99, &index).await,
         "publish_index",
+        missing,
     );
-    assert_fenced(
+    assert_refused(
         store
             .publish_index_allow_equal_fenced(id, fence, 99, &index)
             .await,
         "publish_index_allow_equal",
+        missing,
     );
     let current = head(crate::RefKind::IndexHead).await;
-    assert_fenced(
+    assert_refused(
         store
             .compare_and_set_ref_fenced(
                 id,
@@ -735,8 +759,9 @@ async fn assert_every_write_refused<S: crate::NameServicePublisher>(
             )
             .await,
         "compare_and_set_ref(index)",
+        missing,
     );
-    assert_fenced(
+    assert_refused(
         store
             .reset_head_fenced(
                 id,
@@ -750,25 +775,28 @@ async fn assert_every_write_refused<S: crate::NameServicePublisher>(
             )
             .await,
         "reset_head",
+        missing,
     );
     let status = store.get_status(id).await.unwrap();
     let next_status = crate::StatusValue::new(
         status.as_ref().map_or(1, |s| s.v + 1),
         crate::StatusPayload::new("ready"),
     );
-    assert_fenced(
+    assert_refused(
         store
             .push_status_fenced(id, fence, status.as_ref(), &next_status)
             .await,
         "push_status",
+        missing,
     );
     let config = store.get_config(id).await.unwrap();
     let next_config = crate::ConfigValue::new(config.as_ref().map_or(1, |c| c.v + 1), None);
-    assert_fenced(
+    assert_refused(
         store
             .push_config_fenced(id, fence, config.as_ref(), &next_config)
             .await,
         "push_config",
+        missing,
     );
 }
 
@@ -889,23 +917,29 @@ pub async fn stale_writers_are_refused_across_drop_and_restore<S: crate::NameSer
     advance_commit(store, "mydb:main", restored.fence_of("main"), 1).await;
 }
 
-/// A record from before fencing takes unfenced writes, and refuses a fenced
-/// one: no writer holding a fence can have loaded it.
-pub async fn unfenced_record_takes_unfenced_writes<S: crate::NameServicePublisher>(store: &S) {
-    use fluree_db_core::ContentKind::Commit;
+/// A record no binding lists — an unfenced one, as a binary from before
+/// name bindings left it — reads as absent and takes no write.
+pub async fn unbound_record_is_invisible_and_takes_no_writes<S: crate::NameServicePublisher>(
+    store: &S,
+) {
     assert!(store
         .insert_record(&NsRecord::new(id("old:main")))
         .await
         .unwrap()
         .is_none());
-    assert_fenced(
-        store
-            .publish_commit_fenced("old:main", Some(Fence::generate()), 1, &cid(Commit, "f"))
-            .await,
-        "fenced write to an unfenced record",
-    );
-    advance_commit(store, "old:main", None, 1).await;
-    assert_eq!(store.lookup("old:main").await.unwrap().unwrap().commit_t, 1);
+    assert!(store.lookup("old:main").await.unwrap().is_none());
+    assert!(store.all_records().await.unwrap().is_empty());
+    assert_every_write_refused(store, "old:main", None).await;
+    assert_every_write_refused(store, "old:main", Some(Fence::generate())).await;
+}
+
+/// A write to a record that does not exist is refused, whatever it
+/// presents, and leaves no record behind: publication never creates one.
+pub async fn publication_never_creates_a_record<S: crate::NameServicePublisher>(store: &S) {
+    assert_writes_refused(store, "nobody:main", None, true).await;
+    assert_writes_refused(store, "nobody:main", Some(Fence::generate()), true).await;
+    assert!(store.raw_record("nobody:main").await.unwrap().is_none());
+    assert!(store.lookup("nobody:main").await.unwrap().is_none());
 }
 
 /// A branch record as a binary from before name bindings left it: unfenced.
@@ -922,14 +956,18 @@ fn legacy_record(ledger_id: &str, source: Option<&str>, retracted: bool) -> NsRe
 /// only a writer holding the fence can publish. A retracted branch stays
 /// listed as dropped. Running it again changes nothing.
 pub async fn migration_binds_legacy_ledgers<S: crate::NameServicePublisher>(store: &S) {
+    let main = NsRecord {
+        commit_head_id: Some(cid(fluree_db_core::ContentKind::Commit, "legacy")),
+        commit_t: 1,
+        ..legacy_record("mydb:main", None, false)
+    };
     for record in [
-        legacy_record("mydb:main", None, false),
+        main,
         legacy_record("mydb:dev", Some("main"), false),
         legacy_record("mydb:old", Some("main"), true),
     ] {
         assert!(store.insert_record(&record).await.unwrap().is_none());
     }
-    advance_commit(store, "mydb:main", None, 1).await;
 
     let report = lifecycle::migrate_legacy(store).await.unwrap();
     assert_eq!(report.bound, vec!["mydb".to_string()]);
@@ -1031,9 +1069,6 @@ pub async fn interrupted_migration_resumes<S: crate::NameServicePublisher>(store
     assert!(store.lookup("mydb:feature").await.unwrap().is_some());
 }
 
-/// Run every case in turn, each against a fresh backend from `make`: for
-/// backends too costly to set up once per test. Keep in step with
-/// [`lifecycle_conformance_tests!`](crate::lifecycle_conformance_tests).
 pub async fn run_all<S, F, Fut>(mut make: F)
 where
     S: crate::NameServicePublisher,
@@ -1063,7 +1098,8 @@ where
     writes_present_the_branch_fence(&make().await).await;
     frozen_branch_refuses_writes(&make().await).await;
     stale_writers_are_refused_across_drop_and_restore(&make().await).await;
-    unfenced_record_takes_unfenced_writes(&make().await).await;
+    unbound_record_is_invisible_and_takes_no_writes(&make().await).await;
+    publication_never_creates_a_record(&make().await).await;
     migration_binds_legacy_ledgers(&make().await).await;
     migration_registers_soft_dropped_ledgers(&make().await).await;
     interrupted_migration_resumes(&make().await).await;
@@ -1100,7 +1136,8 @@ macro_rules! lifecycle_conformance_tests {
             writes_present_the_branch_fence,
             frozen_branch_refuses_writes,
             stale_writers_are_refused_across_drop_and_restore,
-            unfenced_record_takes_unfenced_writes,
+            unbound_record_is_invisible_and_takes_no_writes,
+            publication_never_creates_a_record,
             migration_binds_legacy_ledgers,
             migration_registers_soft_dropped_ledgers,
             interrupted_migration_resumes,

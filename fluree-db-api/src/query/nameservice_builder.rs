@@ -323,6 +323,7 @@ mod tests {
     use super::*;
     use crate::FlureeBuilder;
     use fluree_db_core::{ContentId, ContentKind};
+    use fluree_db_nameservice::testing::CurrentFence;
     use fluree_db_nameservice::GraphSourceType;
 
     async fn setup_ns_with_records() -> Fluree {
@@ -333,6 +334,11 @@ mod tests {
         let cid1 = ContentId::new(ContentKind::Commit, b"commit-1");
         let cid2 = ContentId::new(ContentKind::Commit, b"commit-2");
         let cid3 = ContentId::new(ContentKind::Commit, b"commit-3");
+        for id in ["db1:main", "db1:dev", "db2:main"] {
+            fluree_db_nameservice::testing::create(publisher, id)
+                .await
+                .unwrap();
+        }
         publisher
             .publish_commit("db1:main", 10, &cid1)
             .await

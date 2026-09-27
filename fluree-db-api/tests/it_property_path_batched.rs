@@ -42,7 +42,7 @@ async fn run_query(
 async fn property_path_batched_lane_clean_and_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/property-path-batched:main";
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
     // t=1 (indexed): a 4-cycle of `knows` plus a `likes` branch for the
     // alternation path. `c` has exactly one knows edge so the novelty phase
@@ -252,7 +252,7 @@ async fn property_path_batched_lane_clean_and_novelty() {
 async fn property_path_batched_wildcard_cypher() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/property-path-batched-cypher:main";
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
     // Bare names (namespace 0): a→b→c→d chain over `rel`, with a `name`
     // data property that wildcard hops must ignore.

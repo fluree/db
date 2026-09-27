@@ -218,7 +218,7 @@ async fn build_indexed_fixture() -> (MemoryStorage, Arc<MemoryNameService>, flur
             ns.clone() as Arc<dyn fluree_db_nameservice::NameServicePublisher>
         ),
     );
-    let ledger0 = support::genesis_ledger_for_fluree(&fluree_a, LEDGER);
+    let ledger0 = support::genesis_ledger_for_fluree(&fluree_a, LEDGER).await;
     let _ = fluree_a
         .insert(ledger0, &people_txn())
         .await
@@ -244,11 +244,11 @@ fn residency_instance(
 
 /// A `ContentStore` over the same residency storage, for the recovery loop's
 /// drain-and-fetch side (the browser driver holds the equivalent handle).
-fn recovery_store(storage: &ResidencyStorage) -> impl ContentStore {
-    fluree_db_core::storage::content_store_for(
-        storage.clone(),
-        &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
-    )
+fn recovery_store(
+    storage: &ResidencyStorage,
+    namespace: &fluree_db_core::StorageNamespace,
+) -> impl ContentStore {
+    fluree_db_core::storage::content_store_for(storage.clone(), namespace)
 }
 
 // ============================================================================
@@ -291,7 +291,11 @@ async fn ledger_with_recovery(
     fluree: &fluree_db_api::Fluree,
     storage: &ResidencyStorage,
 ) -> fluree_db_api::LedgerState {
-    let cs = recovery_store(storage);
+    let namespace = fluree
+        .storage_namespace(LEDGER)
+        .await
+        .expect("ledger's namespace");
+    let cs = recovery_store(storage, &namespace);
     let mut recovery = Recovery {
         rounds: 0,
         wants: Vec::new(),
@@ -318,7 +322,7 @@ async fn rows_with_recovery(
     ledger: &fluree_db_api::LedgerState,
     storage: &ResidencyStorage,
 ) -> (Vec<JsonValue>, Vec<Want>) {
-    let cs = recovery_store(storage);
+    let cs = recovery_store(storage, &ledger.storage_namespace());
     let mut recovery = Recovery {
         rounds: 0,
         wants: Vec::new(),

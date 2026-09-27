@@ -69,7 +69,7 @@ async fn sparql_data_writes_refuse_the_txn_meta_graph() {
     let ledger_id = "it/reserved-write-sparql:main";
     let txn_meta = fluree_db_core::txn_meta_graph_iri(ledger_id);
     let user_graph = "http://example.org/g1";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Three spellings reach `Txn::write_graphs`: a GRAPH block, the WITH
     // default target, and CREATE (which lowers to an update carrying only a
@@ -124,7 +124,7 @@ async fn trig_data_writes_refuse_the_txn_meta_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reserved-write-trig:main";
     let txn_meta = fluree_db_core::txn_meta_graph_iri(ledger_id);
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let forged = format!(
         "@prefix f: <https://ns.flur.ee/db#> .\nGRAPH <{txn_meta}> {{ <fluree:commit:sha256:deadbeef> f:t 5 . }}\n"
@@ -160,7 +160,7 @@ async fn jsonld_data_writes_refuse_the_txn_meta_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reserved-write-jsonld:main";
     let txn_meta = fluree_db_core::txn_meta_graph_iri(ledger_id);
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let forged = json!({
         "@context": {"f": "https://ns.flur.ee/db#"},
@@ -350,7 +350,7 @@ async fn config_graph_stays_writable_by_an_ordinary_write() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reserved-write-config:main";
     let config = fluree_db_core::config_graph_iri(ledger_id);
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let sparql = format!(
         r#"INSERT DATA {{ GRAPH <{config}> {{ <http://example.org/shape> <http://example.org/p> "v" }} }}"#
@@ -385,7 +385,7 @@ async fn whole_graph_verbs_still_refuse_both_reserved_graphs() {
     let config = fluree_db_core::config_graph_iri(ledger_id);
     let txn_meta = fluree_db_core::txn_meta_graph_iri(ledger_id);
     let g1 = "http://example.org/g1";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed a user graph so the transfers have a valid non-reserved end.
     let seed = format!(

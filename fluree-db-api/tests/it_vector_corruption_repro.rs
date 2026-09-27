@@ -53,7 +53,7 @@ fn lower_sparql_update(ledger: &LedgerState, sparql: &str) -> Txn {
 async fn jsonld_context_vector_bare_array_round_trips_after_indexing() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/jsonld-context:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -121,7 +121,7 @@ async fn jsonld_context_vector_empty_array_is_rejected() {
     //      bypassed layer 1).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/jsonld-empty:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -155,7 +155,7 @@ async fn jsonld_context_vector_empty_array_is_rejected() {
 async fn jsonld_context_vector_bare_array_retracts_after_indexing() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/jsonld-retract:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -213,7 +213,7 @@ async fn jsonld_context_vector_bare_array_retracts_after_indexing() {
 async fn jsonld_context_vector_bare_array_retracts_via_novelty_overlay() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/jsonld-novelty-retract:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -275,7 +275,7 @@ async fn jsonld_context_vector_bare_array_retracts_via_novelty_overlay() {
 async fn jsonld_context_vector_duplicate_values_retract_one_keeps_other() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/duplicate-values:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -346,7 +346,7 @@ async fn jsonld_context_vector_duplicate_values_retract_one_keeps_other() {
 async fn jsonld_multi_valued_vectors_retract_one_keeps_other() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/multi-valued-rebuild:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -433,7 +433,7 @@ async fn jsonld_multi_valued_vectors_retract_one_keeps_other() {
 async fn jsonld_re_asserting_same_vector_dedups() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/dedup-reassert:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let same_value = json!({
         "@context": {
@@ -514,7 +514,7 @@ async fn jsonld_re_asserting_same_vector_dedups() {
 async fn jsonld_multi_valued_vectors_overlay_retract_one_keeps_other() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/multi-valued-overlay:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -595,7 +595,7 @@ async fn jsonld_multi_valued_vectors_overlay_retract_one_keeps_other() {
 async fn jsonld_context_vector_duplicate_values_overlay_retract_one_keeps_other() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/duplicate-overlay:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -668,7 +668,7 @@ async fn jsonld_context_vector_duplicate_values_overlay_retract_one_keeps_other(
 async fn jsonld_vector_retracts_via_incremental_publish() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/incremental-retract:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     // Commit 1: insert vector. Publish (full rebuild — no prior index).
     let insert = json!({
@@ -730,7 +730,7 @@ async fn jsonld_vector_retracts_via_incremental_publish() {
 async fn sparql_delete_data_unmatched_vector_is_no_op() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/unmatched-retract:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     // First commit: insert SOMETHING so the ledger has at least one
     // namespace allocation; this is a generic warm-up, not a vector.
@@ -762,7 +762,7 @@ async fn sparql_delete_data_unmatched_vector_is_no_op() {
 async fn sparql_insert_data_embedding_vector_literal_round_trips_after_indexing() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/sparql-insert:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let insert = r#"
         PREFIX ex: <http://example.org/>
@@ -840,7 +840,7 @@ async fn sparql_insert_data_embedding_vector_literal_round_trips_after_indexing(
 async fn jsonld_vector_round_trips_through_incremental_publish() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/incremental-roundtrip:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     // Commit 1: subject S1 with V1. Full rebuild — establishes the base
     // arena (`base_count == 1` for the next round).

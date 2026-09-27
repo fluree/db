@@ -14,7 +14,7 @@ fn ctx() -> JsonValue {
 }
 
 async fn seed_orders(fluree: &MemoryFluree, id: &str) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, id);
+    let ledger0 = genesis_ledger(fluree, id).await;
     // Orders in 2019, 2020, 2022 — note 2021 and 2023 have NONE.
     let txn = json!({
         "@context": ctx(),

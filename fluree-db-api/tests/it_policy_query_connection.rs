@@ -263,7 +263,7 @@ async fn policy_onclass_denies_hydration_only_subject() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "policy/onclass-hydration:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
@@ -929,7 +929,7 @@ async fn solo_embedded_policy_selection_and_privileged_read_defaults() {
     // no classes as well as an allow default to express its privileged grant.
     let model_id = "policy/solo-compat-model:main";
     fluree
-        .stage_owned(genesis_ledger(&fluree, model_id))
+        .stage_owned(genesis_ledger(&fluree, model_id).await)
         .upsert_turtle(
             r"
         @prefix f: <https://ns.flur.ee/db#> .

@@ -2046,7 +2046,7 @@ impl Fluree {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (_, warnings) = self
-                .drop_artifacts(&pending.record.ledger_id, Some(&pending.record))
+                .drop_artifacts(&pending.record.ledger_id, &pending.record)
                 .await;
             let (_, shared_warnings) = self.drop_shared_artifacts(&pending.root).await;
             for warning in warnings.iter().chain(&shared_warnings) {

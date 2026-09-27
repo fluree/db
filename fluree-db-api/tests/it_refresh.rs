@@ -49,7 +49,7 @@ async fn refresh_min_t_satisfied_returns_immediately() {
     let ledger_id = "it/refresh-fast:main";
 
     // Create ledger and insert data so t >= 1
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let t = ledger1.t();
     assert!(t >= 1);
@@ -82,7 +82,7 @@ async fn refresh_min_t_below_cached_t_returns_immediately() {
     let ledger_id = "it/refresh-below:main";
 
     // Create ledger and insert two items
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let ledger2 = insert_data(&fluree, ledger1, "item2").await;
     let t = ledger2.t();
@@ -116,7 +116,7 @@ async fn refresh_min_t_not_reached_returns_error() {
     let ledger_id = "it/refresh-not-reached:main";
 
     // Create ledger with one commit
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let t = ledger1.t();
 
@@ -169,7 +169,7 @@ async fn current_t_returns_correct_value_after_load() {
         .expect("ledger_manager should be present");
 
     // Create and commit data
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let expected_t = ledger1.t();
 

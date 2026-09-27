@@ -51,9 +51,9 @@ use crate::raft::commit_worker::{QueuePoisonError, QueuePoisonPublisher};
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, StashGuard};
 use crate::raft::state_machine::{
     Command as SmCommand, ConfigUpdate, DesyncReason, EntryPoisoning, FencedBranchRecord,
-    IndexState, NameServiceState, NewBranch, NewIndexHead, NewLedger, PoisonReason, RecordedTally,
-    RefCas, RefKey, ResetHeadSnapshot, Response as SmResponse, StagedHead, StoredConfig,
-    StoredStatus, VersionedJson,
+    IndexState, NameServiceState, NewIndexHead, PoisonReason, RecordedTally, RefCas, RefKey,
+    ResetHeadSnapshot, Response as SmResponse, StagedHead, StoredConfig, StoredStatus,
+    VersionedJson,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
@@ -68,9 +68,9 @@ use fluree_db_core::{ContentId, InstanceId, LedgerId};
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
-    NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
-    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, NameServiceError, NameServiceLookup,
+    NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result,
+    StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use fluree_db_nameservice::{
     BranchRecordStore, DroppedLedger, Fence, FenceOutcome, LedgerRegistry, NameBinding,
@@ -148,7 +148,7 @@ impl RaftNameService {
 
     /// Enable cross-node `apply_staged_commit` / `apply_queue_poison`
     /// forwarding from follower nodes. With this set,
-    /// [`Self::publish_commit`] and
+    /// [`Self::publish_commit_fenced`] and
     /// [`Self::poison_queue_entry`](QueuePoisonPublisher::poison_queue_entry)
     /// on a non-leader node POST to the current leader's matching
     /// endpoint instead of attempting a local propose; without it,
@@ -305,7 +305,7 @@ fn record_from_state(
 }
 
 /// A branch record as reads see it: see
-/// [`fluree_db_nameservice::resolve_for_read`].
+/// [`fluree_db_nameservice::resolve_record`].
 fn resolved_from_state(
     state: &NameServiceState,
     ledger_name: &str,
@@ -318,20 +318,24 @@ fn resolved_from_state(
         Some(entry) => versioned_from_json(entry)?.map(|v| v.value),
         None => None,
     };
-    Ok(fluree_db_nameservice::resolve_for_read(
+    Ok(fluree_db_nameservice::resolve_record(
         binding.as_ref(),
         record,
     ))
 }
 
 /// `command` by a writer holding `fence`; see [`SmCommand::Fenced`].
-fn fenced_command(command: SmCommand, fence: Option<Fence>) -> SmCommand {
+/// Every write presents a fence: one presenting none is refused here,
+/// before it is proposed. (The state machine still applies a bare command to
+/// a branch that has no fence, as it did when entries from before fencing
+/// were written, so the log replays as it applied.)
+fn fenced_command(ledger_id: &str, command: SmCommand, fence: Option<Fence>) -> Result<SmCommand> {
     match fence {
-        Some(fence) => SmCommand::Fenced {
+        Some(fence) => Ok(SmCommand::Fenced {
             fence: fence.as_u64(),
             command: Box::new(command),
-        },
-        None => command,
+        }),
+        None => Err(NameServiceError::fenced(ledger_id)),
     }
 }
 
@@ -354,8 +358,10 @@ fn stored_fence(state: &NameServiceState, key: &RefKey) -> Option<(Option<Fence>
     }
 }
 
-/// Where `key`'s artifacts live: under its ledger's binding root, or under
-/// its name for a ledger from before bindings.
+/// Where `key`'s artifacts live: under its ledger's binding root. A key no
+/// binding lists is a ledger from before bindings that the new leader has
+/// not bound yet; its data is under its name, the root the migration binds
+/// it to.
 pub(crate) fn storage_namespace_in(
     state: &NameServiceState,
     key: &RefKey,
@@ -428,9 +434,10 @@ impl IndexPublisher for RaftNameService {
         index_id: &ContentId,
     ) -> Result<()> {
         let cmd = fenced_command(
+            ledger_id,
             build_advance_index_command(ledger_id, index_t, index_id)?,
             fence,
-        );
+        )?;
         match self.raft.client_write(cmd).await {
             Ok(resp) => {
                 check_fence_response(&resp.data, ledger_id)?;
@@ -468,9 +475,10 @@ impl AdminPublisher for RaftNameService {
         index_id: &ContentId,
     ) -> Result<()> {
         let cmd = fenced_command(
+            ledger_id,
             build_rewrite_index_command(ledger_id, index_t, index_id)?,
             fence,
-        );
+        )?;
         match self.raft.client_write(cmd).await {
             Ok(resp) => {
                 check_fence_response(&resp.data, ledger_id)?;
@@ -525,7 +533,7 @@ fn peek_queue_front_id(
         })
 }
 
-/// Build the state-machine command a [`CommitPublisher::publish_commit`]
+/// Build the state-machine command a [`CommitPublisher::publish_commit_fenced`]
 /// call translates into.
 ///
 /// The `queue_id` is recovered from the worker's stash entry for the
@@ -920,7 +928,7 @@ impl RaftNameService {
 
 /// Path under [`apply_staged_commit_router`]'s root for the cross-node
 /// ApplyHead RPC. Exposed so the client side (see
-/// [`Self::publish_commit`] on a follower) can build the outbound URL
+/// [`Self::publish_commit_fenced`] on a follower) can build the outbound URL
 /// without hardcoding the route string twice.
 pub const APPLY_STAGED_COMMIT_PATH: &str = "/apply_staged_commit";
 
@@ -1562,76 +1570,6 @@ impl QueuePoisonPublisher for RaftNameService {
     }
 }
 
-/// Build the state-machine command for [`LedgerLifecycle::init`].
-fn build_create_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
-    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-    let applied_at_millis = crate::raft::current_millis();
-    Ok(SmCommand::CreateLedger(NewLedger {
-        ledger_id: ledger_name,
-        branch,
-        created_at_millis: applied_at_millis,
-    }))
-}
-
-fn build_retract_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
-    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-    Ok(SmCommand::RetractLedger {
-        ledger_id: ledger_name,
-        branch,
-        applied_at_millis: crate::raft::current_millis(),
-    })
-}
-
-fn build_purge_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
-    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-    Ok(SmCommand::PurgeBranch {
-        ledger_id: ledger_name,
-        branch,
-        applied_at_millis: crate::raft::current_millis(),
-    })
-}
-
-fn map_create_response(resp: SmResponse) -> Result<()> {
-    match resp {
-        SmResponse::Created { .. } => Ok(()),
-        SmResponse::AlreadyExists { ledger_id } => {
-            Err(NameServiceError::ledger_already_exists(ledger_id))
-        }
-        other => Err(NameServiceError::storage(format!(
-            "unexpected Response variant for CreateLedger: {other:?}"
-        ))),
-    }
-}
-
-fn map_retract_response(resp: SmResponse) -> Result<()> {
-    match resp {
-        SmResponse::Retracted { .. } | SmResponse::AlreadyRetracted { .. } => Ok(()),
-        other => Err(NameServiceError::storage(format!(
-            "unexpected Response variant for RetractLedger: {other:?}"
-        ))),
-    }
-}
-
-fn map_purge_response(resp: SmResponse) -> Result<()> {
-    match resp {
-        SmResponse::Purged { .. } | SmResponse::AlreadyPurged { .. } => Ok(()),
-        // Purge, like drop_branch, refuses a branch that still has
-        // children. The whole-ledger drop composes purges leaf-first
-        // (children already gone → the parent's count is 0), so this
-        // only fires on an out-of-order direct purge of a parent —
-        // failing loud instead of stranding the child.
-        SmResponse::BranchHasChildren {
-            ledger_id,
-            children,
-        } => Err(NameServiceError::storage(format!(
-            "purge refused: {ledger_id} still has {children} child branch(es)"
-        ))),
-        other => Err(NameServiceError::storage(format!(
-            "unexpected Response variant for PurgeBranch: {other:?}"
-        ))),
-    }
-}
-
 impl RaftNameService {
     /// Submit a lifecycle command through Raft and surface the
     /// response. Maps `ForwardToLeader` to a storage error so callers
@@ -1865,49 +1803,6 @@ impl BranchRecordStore for RaftNameService {
     }
 }
 
-#[async_trait]
-impl LedgerLifecycle for RaftNameService {
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        let cmd = build_create_command(ledger_id)?;
-        map_create_response(self.submit_lifecycle(cmd).await?)
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let cmd = build_retract_command(ledger_id)?;
-        map_retract_response(self.submit_lifecycle(cmd).await?)
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        let cmd = build_purge_command(ledger_id)?;
-        map_purge_response(self.submit_lifecycle(cmd).await?)
-    }
-}
-
-fn build_create_branch_command(
-    ledger_name: &str,
-    new_branch: &str,
-    source_branch: &str,
-    at_commit: Option<(ContentId, i64)>,
-) -> std::result::Result<SmCommand, NameServiceError> {
-    let applied_at_millis = crate::raft::current_millis();
-    Ok(SmCommand::CreateBranch(NewBranch {
-        ledger_id: ledger_name.into(),
-        branch: new_branch.into(),
-        source_branch: source_branch.into(),
-        at_commit,
-        applied_at_millis,
-    }))
-}
-
-fn build_drop_branch_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
-    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-    Ok(SmCommand::DropBranch {
-        ledger_id: ledger_name,
-        branch,
-        applied_at_millis: crate::raft::current_millis(),
-    })
-}
-
 fn build_reset_head_command(
     ledger_id: &str,
     snapshot: NsRecordSnapshot,
@@ -1926,40 +1821,6 @@ fn build_reset_head_command(
     })
 }
 
-fn map_create_branch_response(resp: SmResponse) -> Result<()> {
-    match resp {
-        SmResponse::BranchCreated { .. } => Ok(()),
-        SmResponse::AlreadyExists { ledger_id } => {
-            Err(NameServiceError::ledger_already_exists(ledger_id))
-        }
-        SmResponse::LedgerNotFound { ledger_id }
-        | SmResponse::SourceBranchNotFound { ledger_id } => {
-            Err(NameServiceError::not_found(ledger_id))
-        }
-        other => Err(NameServiceError::storage(format!(
-            "unexpected Response variant for CreateBranch: {other:?}"
-        ))),
-    }
-}
-
-fn map_drop_branch_response(resp: SmResponse) -> Result<Option<u32>> {
-    match resp {
-        SmResponse::BranchDropped {
-            parent_branches, ..
-        } => Ok(parent_branches),
-        SmResponse::BranchHasChildren {
-            ledger_id,
-            children,
-        } => Err(NameServiceError::storage(format!(
-            "drop_branch refused: {ledger_id} still has {children} child branch(es)"
-        ))),
-        SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
-        other => Err(NameServiceError::storage(format!(
-            "unexpected Response variant for DropBranch: {other:?}"
-        ))),
-    }
-}
-
 fn map_reset_head_response(resp: SmResponse) -> Result<()> {
     match resp {
         SmResponse::HeadReset { .. } => Ok(()),
@@ -1972,29 +1833,17 @@ fn map_reset_head_response(resp: SmResponse) -> Result<()> {
 
 #[async_trait]
 impl BranchLifecycle for RaftNameService {
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
-    ) -> Result<()> {
-        let cmd = build_create_branch_command(ledger_name, new_branch, source_branch, at_commit)?;
-        map_create_branch_response(self.submit_lifecycle(cmd).await?)
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let cmd = build_drop_branch_command(ledger_id)?;
-        map_drop_branch_response(self.submit_lifecycle(cmd).await?)
-    }
-
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         snapshot: NsRecordSnapshot,
     ) -> Result<()> {
-        let cmd = fenced_command(build_reset_head_command(ledger_id, snapshot)?, fence);
+        let cmd = fenced_command(
+            ledger_id,
+            build_reset_head_command(ledger_id, snapshot)?,
+            fence,
+        )?;
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
         map_reset_head_response(response)
@@ -2050,6 +1899,7 @@ impl RefPublisher for RaftNameService {
     ) -> Result<CasResult> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let cmd = fenced_command(
+            ledger_id,
             SmCommand::CompareAndSetRef(RefCas {
                 ledger_id: ledger_name,
                 branch,
@@ -2059,7 +1909,7 @@ impl RefPublisher for RaftNameService {
                 applied_at_millis: crate::raft::current_millis(),
             }),
             fence,
-        );
+        )?;
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
         match response {
@@ -2220,13 +2070,14 @@ impl StatusPublisher for RaftNameService {
         // verbatim.
         let (name, branch) = split_ledger_id(ledger_id)?;
         let cmd = fenced_command(
+            ledger_id,
             SmCommand::PushStatus {
                 ledger_id: format_ledger_id(&name, &branch),
                 expected: expected.map(StoredStatus::from),
                 new: StoredStatus::from(new),
             },
             fence,
-        );
+        )?;
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
         match response {
@@ -2276,13 +2127,14 @@ impl ConfigPublisher for RaftNameService {
         // Same canonicalize-before-propose contract as `push_status`.
         let (name, branch) = split_ledger_id(ledger_id)?;
         let cmd = fenced_command(
+            ledger_id,
             SmCommand::PushConfig(Box::new(ConfigUpdate {
                 ledger_id: format_ledger_id(&name, &branch),
                 expected: expected.map(StoredConfig::from),
                 new: StoredConfig::from(new),
             })),
             fence,
-        );
+        )?;
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
         match response {
@@ -2356,6 +2208,54 @@ mod tests {
     ) -> Response {
         let mut guard = state.write().await;
         crate::raft::state_machine::apply(&mut guard, cmd, index)
+    }
+
+    /// Bind every branch `ledger_name` has registered, as the migration
+    /// binds a ledger from before name bindings, so reads see them.
+    async fn bind(state: &Arc<RwLock<NameServiceState>>, ledger_name: &str) {
+        let branches = state
+            .read()
+            .await
+            .ledgers
+            .get(ledger_name)
+            .map(|l| l.branches.clone())
+            .unwrap_or_default();
+        let mut listings = Vec::new();
+        for (i, branch) in branches.iter().enumerate() {
+            let fence = 100 + i as u64;
+            apply_cmd(
+                state,
+                Command::AdoptBranch {
+                    key: RefKey::new(ledger_name, branch),
+                    fence,
+                },
+                900,
+            )
+            .await;
+            listings.push(fluree_db_nameservice::BranchFence::new(
+                branch,
+                Fence::from_u64(fence),
+            ));
+        }
+        let binding = NameBinding {
+            instance: fluree_db_nameservice::lifecycle::legacy_instance(ledger_name),
+            root: fluree_db_core::StorageRoot::legacy(
+                &fluree_db_core::LedgerName::parse(ledger_name).unwrap(),
+            ),
+            root_branch: "main".into(),
+            state: fluree_db_nameservice::BindingState::Active,
+            branches: listings,
+        };
+        apply_cmd(
+            state,
+            Command::CasBinding {
+                name: ledger_name.into(),
+                expected: None,
+                json: Some(serde_json::to_string(&binding).unwrap()),
+            },
+            901,
+        )
+        .await;
     }
 
     /// Slim init command: registers `(ledger_id, branch)` on the
@@ -3369,14 +3269,19 @@ mod tests {
     #[tokio::test]
     async fn publish_index_swallows_not_leader() {
         let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
-        assert!(ns.publish_index("test/db:main", 1, &cid(1)).await.is_ok());
+        let fence = Some(fluree_db_nameservice::Fence::generate());
+        assert!(ns
+            .publish_index_fenced("test/db:main", fence, 1, &cid(1))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
     async fn publish_index_allow_equal_surfaces_not_leader() {
         let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
+        let fence = Some(fluree_db_nameservice::Fence::generate());
         let err = ns
-            .publish_index_allow_equal("test/db:main", 1, &cid(1))
+            .publish_index_allow_equal_fenced("test/db:main", fence, 1, &cid(1))
             .await
             .expect_err("not-leader admin publish must not report success");
         assert!(
@@ -3397,6 +3302,7 @@ mod tests {
         let _ = apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         seed_head(&state, "test/db", "main", cid(5), 7).await;
 
+        bind(&state, "test/db").await;
         let ns = RaftNameService::new(view(&state), stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.ledger_id, "test/db:main");
@@ -3555,6 +3461,7 @@ mod tests {
         )
         .await;
 
+        bind(&state, "test/db").await;
         let ns = RaftNameService::new(view(&state), stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.commit_head_id, Some(cid(7)));
@@ -3610,6 +3517,7 @@ mod tests {
         .await;
         seed_head(&state, "test/db", "main", cid(8), 20).await;
 
+        bind(&state, "test/db").await;
         let ns = RaftNameService::new(view(&state), stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.commit_head_id, Some(cid(8)));
@@ -3625,6 +3533,7 @@ mod tests {
         apply_cmd(&state, init_cmd("a/db", "main"), 1).await;
         seed_head(&state, "a/db", "feat", cid(1), 1).await;
 
+        bind(&state, "a/db").await;
         let ns = RaftNameService::new(view(&state), stub_raft().await);
         let mut ids: Vec<_> = ns
             .all_records()

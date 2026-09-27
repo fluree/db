@@ -37,7 +37,7 @@ fn view_all() -> JsonValue {
 
 /// Seed a Lead (with two properties) and a Person.
 async fn seed(fluree: &support::MemoryFluree, ledger_id: &str) -> LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let txn = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@graph": [
@@ -330,7 +330,7 @@ async fn delete_allows_entity_removal_only() {
 async fn immutable_audit_events_with_verbs() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "verbs_audit");
+    let ledger0 = genesis_ledger(&fluree, "verbs_audit").await;
     let seed = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:evt1",
@@ -404,7 +404,7 @@ async fn immutable_audit_events_with_verbs() {
 async fn legacy_modify_class_semantics_preserved() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "verbs_legacy_modify");
+    let ledger0 = genesis_ledger(&fluree, "verbs_legacy_modify").await;
     let seed = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:evt1",

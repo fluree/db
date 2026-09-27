@@ -17,10 +17,7 @@
 
 use crate::support;
 use crate::support::{start_background_indexer_local, trigger_index_and_wait_outcome};
-use fluree_db_api::{
-    policy_builder, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerState, Novelty,
-};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::{policy_builder, FlureeBuilder, GovernanceOptions, IndexConfig};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::{json, Value as JsonValue};
 
@@ -211,8 +208,7 @@ async fn geo_search_time_travel_different_results_at_different_t() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // t=1: Insert Paris (lat=48.8566, lng=2.3522)
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
@@ -273,8 +269,7 @@ async fn geo_search_retraction_removes_point_from_results() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // t=1: Insert Paris
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
@@ -339,8 +334,7 @@ async fn geo_search_dedup_returns_min_distance_per_subject() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // Insert Paris with two locations: city center and a point 100km away
             // City center: (2.3522, 48.8566)
@@ -427,8 +421,7 @@ async fn geo_search_returns_correct_distances() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // Insert cities
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
@@ -505,8 +498,7 @@ async fn geo_search_respects_limit_returns_nearest() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // Insert cities at increasing distances from Paris
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
@@ -608,8 +600,7 @@ async fn geo_search_respects_named_graph_boundaries() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // Insert cities in default graph (France)
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;
@@ -752,8 +743,7 @@ async fn sparql_geof_distance_uses_geo_index() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // Insert cities
             let ledger = insert_city(&fluree, ledger, "ex:paris", "Paris", 2.3522, 48.8566).await;

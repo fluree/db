@@ -46,7 +46,7 @@ fn person_shape_jsonld() -> serde_json::Value {
 #[tokio::test]
 async fn inline_shape_rejects_violating_tx() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/inline-shapes/reject:main");
+    let ledger = genesis_ledger(&fluree, "test/inline-shapes/reject:main").await;
 
     let opts = TxnOpts {
         shapes: Some(person_shape_jsonld()),
@@ -81,7 +81,7 @@ async fn inline_shape_rejects_violating_tx() {
 #[tokio::test]
 async fn inline_shape_accepts_valid_tx() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/inline-shapes/accept:main");
+    let ledger = genesis_ledger(&fluree, "test/inline-shapes/accept:main").await;
 
     let opts = TxnOpts {
         shapes: Some(person_shape_jsonld()),
@@ -111,7 +111,7 @@ async fn inline_shapes_do_not_persist_after_tx() {
     // remain enforced on a subsequent tx without `opts.shapes`.
     // (They were never staged into the ledger.)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/inline-shapes/transient:main");
+    let ledger = genesis_ledger(&fluree, "test/inline-shapes/transient:main").await;
 
     // First tx: pass inline shape + a valid Person.
     let opts = TxnOpts {
@@ -157,7 +157,7 @@ async fn inline_shape_layered_on_cross_ledger_shape_enforces_both() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/inline-shapes/layered-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     let shapes_graph_iri = "http://example.org/governance/shapes";
     let m_trig = format!(
@@ -187,7 +187,7 @@ async fn inline_shape_layered_on_cross_ledger_shape_enforces_both() {
         .expect("seed M name-shape");
 
     let data_id = "test/inline-shapes/layered-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let config_iri = format!("urn:fluree:{data_id}#config");
     let r1 = fluree

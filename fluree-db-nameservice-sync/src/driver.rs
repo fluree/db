@@ -481,7 +481,8 @@ mod tests {
     use crate::config::{MemorySyncConfigStore, UpstreamConfig};
     use fluree_db_core::{ContentId, ContentKind};
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{CommitPublisher, MemoryTrackingStore, NsRecord, RefLookup};
+    use fluree_db_nameservice::testing::CurrentFence;
+    use fluree_db_nameservice::{MemoryTrackingStore, NsRecord, RefLookup};
 
     fn origin() -> RemoteName {
         RemoteName::new("origin")
@@ -576,6 +577,9 @@ mod tests {
         let (_local, remote, driver, _config) = setup_driver().await;
 
         // Publish something on the remote
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 5, &test_commit_id("commit-1"))
@@ -593,6 +597,9 @@ mod tests {
     async fn test_fetch_idempotent() {
         let (_local, remote, driver, _config) = setup_driver().await;
 
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 5, &test_commit_id("commit-1"))
@@ -623,12 +630,18 @@ mod tests {
             .unwrap();
 
         // Create local at t=1
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
 
         // Remote at t=5
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
@@ -671,8 +684,14 @@ mod tests {
             .unwrap();
 
         // Both at t=5 with same address
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
+            .await
+            .unwrap();
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
             .await
             .unwrap();
         remote
@@ -704,12 +723,18 @@ mod tests {
             .unwrap();
 
         // Local ahead at t=10
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 10, &test_commit_id("commit-10"))
             .await
             .unwrap();
 
         // Remote at t=5
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
@@ -743,7 +768,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_push_succeeds() {
-        let (local, _remote, driver, config) = setup_driver().await;
+        let (local, remote, driver, config) = setup_driver().await;
+        // The remote holds the ledger: a push moves a head, it creates none.
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
 
         config
             .set_upstream(&UpstreamConfig {
@@ -755,10 +784,15 @@ mod tests {
             .await
             .unwrap();
 
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
             .await
             .unwrap();
+        // The push names the remote head it last saw.
+        driver.fetch_remote(&origin()).await.unwrap();
 
         match driver.push_tracked("mydb:main").await.unwrap() {
             PushResult::Pushed { value, .. } => {
@@ -783,6 +817,9 @@ mod tests {
             .unwrap();
 
         // Remote has data already
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
@@ -790,6 +827,9 @@ mod tests {
             .unwrap();
 
         // Local has different data
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
             .await
@@ -813,6 +853,9 @@ mod tests {
     async fn test_push_no_upstream() {
         let (local, _remote, driver, _config) = setup_driver().await;
 
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await

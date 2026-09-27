@@ -11,9 +11,9 @@ use crate::binding::{
 use crate::{
     check_cas_expectation, ref_values_match, AdminPublisher, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
-    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerLifecycle,
-    NsLookupResult, NsRecord, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
-    StatusLookup, StatusPayload, StatusPublisher, StatusValue,
+    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, NsLookupResult,
+    NsRecord, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
+    StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::{ContentId, InstanceId, LedgerId};
@@ -113,14 +113,44 @@ impl MemoryNameService {
         Self::default()
     }
 
-    /// Create a record for a new ledger
+    /// Create a ledger rooted at its name, as a ledger migrated from before
+    /// name bindings is, so its data lives where
+    /// [`StorageNamespace::parse_legacy`](fluree_db_core::StorageNamespace::parse_legacy)
+    /// puts it. A second branch of a name joins the first.
     ///
-    /// This is a convenience method for tests to bootstrap a ledger.
+    /// A convenience for tests to bootstrap a ledger synchronously.
     pub fn create_ledger(&self, ledger_id: &str) -> Result<()> {
-        let record = NsRecord::new(LedgerId::parse(ledger_id)?);
-        self.records
-            .write()
-            .insert(record.ledger_id.clone(), record);
+        let id = LedgerId::parse(ledger_id)?;
+        let fence = crate::Fence::generate();
+        let mut records = self.records.write();
+        if records.contains_key(&id) {
+            return Err(crate::NameServiceError::ledger_already_exists(&id));
+        }
+        let mut bindings = self.bindings.write();
+        let name = id.name().to_string();
+        let current = live(bindings.get(&name));
+        let mut binding = match &current {
+            Some(existing) => existing.value.clone(),
+            None => crate::NameBinding {
+                instance: crate::lifecycle::legacy_instance(&name),
+                root: fluree_db_core::StorageRoot::legacy(&id.ledger_name()),
+                root_branch: id.branch().to_string(),
+                state: crate::BindingState::Active,
+                branches: Vec::new(),
+            },
+        };
+        binding
+            .branches
+            .push(crate::BranchFence::new(id.branch(), fence));
+        cas_versioned(
+            &mut bindings,
+            name,
+            current.map(|v| v.version),
+            Some(&binding),
+        );
+        let mut record = NsRecord::new(id.clone());
+        record.fence = Some(fence);
+        records.insert(id, record);
         Ok(())
     }
 }
@@ -302,77 +332,6 @@ impl BranchRecordStore for MemoryNameService {
 
 #[async_trait]
 impl crate::BranchLifecycle for MemoryNameService {
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
-    ) -> Result<()> {
-        let key = LedgerId::from_parts(ledger_name, new_branch)?;
-        let source_key = LedgerId::from_parts(ledger_name, source_branch)?;
-
-        let mut records = self.records.write();
-
-        if records.contains_key(&key) {
-            return Err(crate::NameServiceError::ledger_already_exists(&key));
-        }
-
-        // Increment source branch's child count and pick the starting commit
-        // head — either the caller-supplied historical commit or the source's
-        // current HEAD.
-        let source = records.get_mut(&source_key).ok_or_else(|| {
-            crate::NameServiceError::not_found(format!(
-                "source branch {ledger_name}:{source_branch}"
-            ))
-        })?;
-        source.branches += 1;
-        let (commit_head_id, commit_t) = match at_commit {
-            Some((id, t)) => (Some(id), t),
-            None => (source.commit_head_id.clone(), source.commit_t),
-        };
-
-        let mut record = NsRecord::new(key.clone());
-        record.commit_head_id = commit_head_id;
-        record.commit_t = commit_t;
-        record.source_branch = Some(source_branch.to_string());
-        records.insert(key, record);
-
-        Ok(())
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let key = LedgerId::parse(ledger_id)?;
-        let mut records = self.records.write();
-
-        // Refuse a branch that still has children (see the guard in
-        // `StorageNameService::drop_branch`). Peek before removing so
-        // a refused drop leaves the record intact.
-        let child_count = records
-            .get(&key)
-            .ok_or_else(|| crate::NameServiceError::not_found(&key))?
-            .branches;
-        if child_count > 0 {
-            return Err(crate::NameServiceError::storage(format!(
-                "drop_branch refused: {key} still has {child_count} child branch(es)"
-            )));
-        }
-
-        let record = records
-            .remove(&key)
-            .expect("record present — child-count check above loaded it");
-
-        // Decrement parent's child count if this branch had a parent
-        let parent_new_count = record.source_branch.as_ref().and_then(|source| {
-            let parent_key = record.ledger_id.with_branch(source).ok()?;
-            let parent = records.get_mut(&parent_key)?;
-            parent.branches = parent.branches.saturating_sub(1);
-            Some(parent.branches)
-        });
-
-        Ok(parent_new_count)
-    }
-
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
@@ -391,57 +350,6 @@ impl crate::BranchLifecycle for MemoryNameService {
         record.commit_t = snapshot.commit_t;
         record.index_head_id = snapshot.index_head_id;
         record.index_t = snapshot.index_t;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl LedgerLifecycle for MemoryNameService {
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        let key = LedgerId::parse(ledger_id)?;
-
-        // Check if record already exists — reject even if retracted (soft-dropped).
-        // A hard drop removes the record entirely, which is required to reuse the alias.
-        if self.records.read().contains_key(&key) {
-            return Err(crate::NameServiceError::ledger_already_exists(&key));
-        }
-
-        // Create (or reset) to a fresh NsRecord
-        let record = NsRecord::new(key.clone());
-        self.records.write().insert(key, record);
-
-        Ok(())
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let key = LedgerId::parse(ledger_id)?;
-        let mut records = self.records.write();
-        let mut did_update = false;
-
-        if let Some(record) = records.get_mut(&key) {
-            if !record.retracted {
-                record.retracted = true;
-                did_update = true;
-            }
-        }
-
-        if did_update {
-            // Advance status_v when retracting
-            let mut status_values = self.status_values.write();
-            let current_v = status_values.get(&key).map(|s| s.v).unwrap_or(1); // Default to 1 if no status exists
-            status_values.insert(
-                key,
-                StatusValue::new(current_v + 1, StatusPayload::new("retracted")),
-            );
-        }
-        Ok(())
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        let key = LedgerId::parse(ledger_id)?;
-        self.records.write().remove(&key);
-        self.status_values.write().remove(&key);
-        self.config_values.write().remove(&key);
         Ok(())
     }
 }
@@ -935,7 +843,8 @@ mod lifecycle_conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BranchLifecycle, ConfigPayload, NameServiceLookup, StatusPayload};
+    use crate::testing::CurrentFence;
+    use crate::{ConfigPayload, NameServiceLookup, StatusPayload};
     use fluree_db_core::ContentKind;
 
     fn test_commit_id(label: &str) -> ContentId {
@@ -951,6 +860,7 @@ mod tests {
         let ns = MemoryNameService::new();
         assert_eq!(ns.heads("mydb:main").await.unwrap(), None);
 
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 2, &test_commit_id("c2"))
             .await
             .unwrap();
@@ -972,6 +882,7 @@ mod tests {
         let ns = MemoryNameService::new();
 
         // First publish
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1004,6 +915,7 @@ mod tests {
         let ns = MemoryNameService::new();
 
         // Publish commit first
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 10, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1023,6 +935,7 @@ mod tests {
     async fn test_memory_ns_lookup_default_branch() {
         let ns = MemoryNameService::new();
 
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1034,23 +947,6 @@ mod tests {
         // Lookup with branch should also work
         let record = ns.lookup("mydb:main").await.unwrap();
         assert!(record.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_memory_ns_retract() {
-        let ns = MemoryNameService::new();
-
-        ns.publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
-            .await
-            .unwrap();
-
-        let record = ns.lookup("mydb:main").await.unwrap().unwrap();
-        assert!(!record.retracted);
-
-        ns.retract("mydb:main").await.unwrap();
-
-        let record = ns.lookup("mydb:main").await.unwrap().unwrap();
-        assert!(record.retracted);
     }
 
     #[tokio::test]
@@ -1071,12 +967,15 @@ mod tests {
     async fn test_memory_ns_all_records() {
         let ns = MemoryNameService::new();
 
+        crate::testing::create(&ns, "db1:main").await.unwrap();
         ns.publish_commit("db1:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
+        crate::testing::create(&ns, "db2:main").await.unwrap();
         ns.publish_commit("db2:main", 1, &test_commit_id("commit-2"))
             .await
             .unwrap();
+        crate::testing::create(&ns, "db3:dev").await.unwrap();
         ns.publish_commit("db3:dev", 1, &test_commit_id("commit-3"))
             .await
             .unwrap();
@@ -1179,6 +1078,7 @@ mod tests {
     async fn test_memory_graph_source_lookup_any() {
         let ns = MemoryNameService::new();
 
+        crate::testing::create(&ns, "ledger:main").await.unwrap();
         ns.publish_commit("ledger:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1219,6 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn test_ref_get_ref_after_publish() {
         let ns = MemoryNameService::new();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 5, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1249,8 +1150,10 @@ mod tests {
             t: 1,
         };
 
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
+        let unborn = ns.get_ref("mydb:main", RefKind::CommitHead).await.unwrap();
         let result = ns
-            .compare_and_set_ref("mydb:main", RefKind::CommitHead, None, &new_ref)
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, unborn.as_ref(), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);
@@ -1267,6 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn test_ref_cas_conflict_already_exists() {
         let ns = MemoryNameService::new();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1293,6 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn test_ref_cas_conflict_id_mismatch() {
         let ns = MemoryNameService::new();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1320,6 +1225,7 @@ mod tests {
     #[tokio::test]
     async fn test_ref_cas_success_id_matches() {
         let ns = MemoryNameService::new();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1350,6 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn test_ref_cas_commit_strict_monotonic() {
         let ns = MemoryNameService::new();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 5, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1390,6 +1297,7 @@ mod tests {
     #[tokio::test]
     async fn test_ref_cas_index_allows_equal_t() {
         let ns = MemoryNameService::new();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 5, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1416,6 +1324,7 @@ mod tests {
     #[tokio::test]
     async fn test_ref_fast_forward_commit_success() {
         let ns = MemoryNameService::new();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1441,6 +1350,7 @@ mod tests {
     #[tokio::test]
     async fn test_ref_fast_forward_commit_rejected_stale() {
         let ns = MemoryNameService::new();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 10, &test_commit_id("commit-1"))
             .await
             .unwrap();
@@ -1472,15 +1382,16 @@ mod tests {
             id: Some(test_commit_id("commit-2")),
             t: 2,
         };
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let result = ns
             .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
             CasResult::Conflict { actual } => {
-                assert_eq!(actual, None);
+                assert!(actual.as_ref().is_none_or(|a| a.id.is_none()), "{actual:?}");
             }
-            _ => panic!("expected conflict when ref doesn't exist"),
+            _ => panic!("expected conflict when the branch has no head"),
         }
     }
 
@@ -1498,7 +1409,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_get_initial() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let status = ns.get_status("mydb:main").await.unwrap().unwrap();
         assert_eq!(status.v, 1);
@@ -1508,7 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_push_update() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         // Get initial status
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
@@ -1531,7 +1442,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_push_conflict_wrong_expected() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         // Try to push with wrong expected value
         let wrong_expected = StatusValue::new(5, StatusPayload::new("wrong"));
@@ -1554,7 +1465,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_push_conflict_non_monotonic() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
 
@@ -1582,7 +1493,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_push_with_extra_metadata() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
 
@@ -1618,7 +1529,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_get_unborn() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let config = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert!(config.is_unborn());
@@ -1629,7 +1540,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_push_from_unborn() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let unborn = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert!(unborn.is_unborn());
@@ -1659,7 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_push_update() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let unborn = ns.get_config("mydb:main").await.unwrap().unwrap();
 
@@ -1696,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_push_conflict_wrong_expected() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         // Try to push with wrong expected value
         let wrong_expected = ConfigValue::new(5, Some(ConfigPayload::new()));
@@ -1718,7 +1629,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_push_conflict_non_monotonic() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let unborn = ns.get_config("mydb:main").await.unwrap().unwrap();
 
@@ -1753,19 +1664,14 @@ mod tests {
     async fn test_config_push_no_record() {
         let ns = MemoryNameService::new();
 
-        // Try to push config without ledger record
+        // A push to a ledger that does not exist is refused, not created.
         let new_config = ConfigValue::new(1, Some(ConfigPayload::new()));
-        let result = ns
+        let err = ns
             .push_config("nonexistent:main", None, &new_config)
             .await
-            .unwrap();
-
-        match result {
-            ConfigCasResult::Conflict { actual } => {
-                assert!(actual.is_none());
-            }
-            _ => panic!("expected conflict when no record exists"),
-        }
+            .unwrap_err();
+        assert!(matches!(err, crate::NameServiceError::Fenced(_)), "{err:?}");
+        assert!(ns.lookup("nonexistent:main").await.unwrap().is_none());
     }
 
     // =========================================================================
@@ -1775,13 +1681,11 @@ mod tests {
     #[tokio::test]
     async fn test_create_branch_from_main() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_commit_id("commit-5");
         ns.publish_commit("mydb:main", 5, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "feature-x", "main", None)
-            .await
-            .unwrap();
+        crate::testing::create(&ns, "mydb:feature-x").await.unwrap();
 
         let record = ns.lookup("mydb:feature-x").await.unwrap().unwrap();
         assert_eq!(record.name, "mydb");
@@ -1794,30 +1698,28 @@ mod tests {
     #[tokio::test]
     async fn test_create_branch_duplicate_fails() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_commit_id("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dev", "main", None).await.unwrap();
+        crate::testing::create(&ns, "mydb:dev").await.unwrap();
 
-        let result = ns.create_branch("mydb", "dev", "main", None).await;
+        let result = crate::testing::create(&ns, "mydb:dev").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_list_branches() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_commit_id("commit-3");
         ns.publish_commit("mydb:main", 3, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dev", "main", None).await.unwrap();
-        ns.create_branch("mydb", "staging", "main", None)
-            .await
-            .unwrap();
+        crate::testing::create(&ns, "mydb:dev").await.unwrap();
+        crate::testing::create(&ns, "mydb:staging").await.unwrap();
 
         // Also create a different ledger to ensure filtering works
-        ns.init("other:main").await.unwrap();
+        crate::testing::create(&ns, "other:main").await.unwrap();
 
         let branches = ns.list_branches("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
@@ -1836,43 +1738,21 @@ mod tests {
     #[tokio::test]
     async fn test_list_branches_excludes_retracted() {
         let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_commit_id("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dead", "main", None)
-            .await
-            .unwrap();
-        ns.retract("mydb:dead").await.unwrap();
+        crate::testing::create(&ns, "mydb:dead").await.unwrap();
+        crate::lifecycle::begin_drop_branch(
+            &ns,
+            &fluree_db_core::LedgerName::parse("mydb").unwrap(),
+            "dead",
+        )
+        .await
+        .unwrap();
 
         let branches = ns.list_branches("mydb").await.unwrap();
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].branch, "main");
-    }
-
-    #[tokio::test]
-    async fn drop_branch_refuses_parent_with_children() {
-        let ns = MemoryNameService::new();
-        ns.init("mydb:main").await.unwrap();
-        ns.create_branch("mydb", "feature", "main", None)
-            .await
-            .unwrap();
-
-        // `main` has a child now — dropping it must refuse, leaving
-        // both records intact.
-        let err = ns
-            .drop_branch("mydb:main")
-            .await
-            .expect_err("dropping a parent with children must fail");
-        assert!(
-            err.to_string().contains("child branch"),
-            "expected child-branch refusal, got: {err}"
-        );
-        assert!(ns.lookup("mydb:main").await.unwrap().is_some());
-        assert!(ns.lookup("mydb:feature").await.unwrap().is_some());
-
-        // Dropping the leaf first, then the parent, succeeds.
-        ns.drop_branch("mydb:feature").await.unwrap();
-        ns.drop_branch("mydb:main").await.unwrap();
     }
 }

@@ -18,7 +18,7 @@ fn ctx() -> JsonValue {
 }
 
 async fn seed_papers(fluree: &MemoryFluree, id: &str) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, id);
+    let ledger0 = genesis_ledger(fluree, id).await;
     // Alice wrote 3 papers — two on "AI", one on "ML"; Bob wrote 1 on "AI".
     // The author→paper→subject join yields "AI" twice for Alice.
     let txn = json!({

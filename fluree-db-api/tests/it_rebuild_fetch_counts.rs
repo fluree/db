@@ -14,9 +14,9 @@
 #![cfg(feature = "native")]
 
 use async_trait::async_trait;
-use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, Novelty};
+use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState};
 use fluree_db_core::error::Result as StorageResult;
-use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot};
+use fluree_db_core::{ContentId, ContentKind, ContentStore};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -119,8 +119,10 @@ impl<C: ContentStore + Send + Sync> ContentStore for CountingContentStore<C> {
 }
 
 async fn seed_commits(fluree: &fluree_db_api::Fluree, ledger_id: &str, n: usize) -> LedgerState {
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let mut ledger = LedgerState::new(db0, Novelty::new(0));
+    let mut ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     let idx_cfg = IndexConfig {
         reindex_min_bytes: 0,
         reindex_max_bytes: 10_000_000,

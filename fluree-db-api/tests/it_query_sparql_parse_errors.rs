@@ -15,7 +15,7 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
 async fn seed_one_triple(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@graph": [{"@id": "ex:s", "ex:p": "o"}]

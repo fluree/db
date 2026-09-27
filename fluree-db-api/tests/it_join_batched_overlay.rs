@@ -30,7 +30,7 @@ fn ctx() -> serde_json::Value {
 async fn batched_subject_join_merges_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/join-batched-overlay:main";
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
     // t=1 (indexed): knows edges + ages + names. `lonely` must never join.
     let base = json!({
@@ -222,7 +222,7 @@ async fn run_query(
 async fn probe_helpers_merge_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/probe-helpers-overlay:main";
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
     let base = json!({
         "@context": ctx(),
@@ -464,7 +464,7 @@ async fn probe_helpers_merge_novelty() {
 async fn batched_object_join_merges_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/join-batched-object-overlay:main";
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
     let base = json!({
         "@context": ctx(),
@@ -609,7 +609,7 @@ async fn batched_object_join_merges_novelty() {
 async fn batched_join_decimal_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/join-batched-decimal:main";
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
     fn dec(v: &str) -> serde_json::Value {
         json!({"@value": v, "@type": "http://www.w3.org/2001/XMLSchema#decimal"})

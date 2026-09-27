@@ -12,8 +12,7 @@
 //! - Batch conditional updates (multi-entity)
 
 use crate::support;
-use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::{FlureeBuilder, LedgerState};
 use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
@@ -29,8 +28,10 @@ fn ctx() -> JsonValue {
 /// Helper: build a memory-backed Fluree and seed it with initial data.
 async fn seed(ledger_id: &str, seed_data: JsonValue) -> (fluree_db_api::Fluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -573,8 +574,10 @@ async fn atomic_transfer_blocked_insufficient_funds() {
 #[tokio::test]
 async fn insert_if_not_exists_creates_new() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/conditional:insert-if-not-exists-new");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/conditional:insert-if-not-exists-new")
+        .await
+        .expect("create ledger");
 
     // Seed with just ex:alice — ex:bob does NOT exist.
     let seeded = fluree

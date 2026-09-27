@@ -38,8 +38,9 @@ fn condition_failed<E: aws_sdk_dynamodb::error::ProvideErrorMetadata>(
 }
 
 /// The clause a write presenting `fence` adds to its item's condition: the
-/// item carries that fence and is not frozen, or carries no fence for an
-/// unfenced write.
+/// item carries that fence and is not frozen. A write presenting none is
+/// refused, as [`fluree_db_nameservice::fence_admits`] refuses it: its clause
+/// can never hold.
 struct FenceClause {
     expr: &'static str,
     names: &'static [(&'static str, &'static str)],
@@ -58,7 +59,7 @@ impl FenceClause {
                 ],
             },
             None => Self {
-                expr: "attribute_not_exists(#fence)",
+                expr: "attribute_exists(#fence) AND attribute_not_exists(#fence)",
                 names: &[("#fence", ATTR_FENCE)],
                 values: Vec::new(),
             },
@@ -111,9 +112,9 @@ pub(super) fn fenced_update(
 
 impl DynamoDbNameService {
     /// Whether the item at `sk` refuses a write presenting `fence`: it does
-    /// not admit it, or it is missing and the write carries a fence. Read
-    /// after a conditional write failed, to tell a refused fence from a lost
-    /// race.
+    /// not admit it, or it is missing, since publication never creates a
+    /// record. Read after a conditional write failed, to tell a refused fence
+    /// from a lost race.
     pub(super) async fn fence_refuses(
         &self,
         pk: &str,
@@ -121,7 +122,7 @@ impl DynamoDbNameService {
         fence: Option<Fence>,
     ) -> Result<bool> {
         let Some(item) = self.get_item(pk, sk).await? else {
-            return Ok(fence.is_some());
+            return Ok(true);
         };
         let stored = item
             .get(ATTR_FENCE)
@@ -478,6 +479,23 @@ impl DynamoDbNameService {
         Ok(Some(report))
     }
 
+    /// Write `item` unless its key is taken.
+    async fn put_item_if_absent(&self, item: Item) -> Result<()> {
+        match self
+            .client
+            .put_item()
+            .table_name(&self.table_name)
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if condition_failed(&e) => Ok(()),
+            Err(e) => Err(storage_err("PutItem", e)),
+        }
+    }
+
     /// Give the item at `sk` `fence`, if it carries none or already carries
     /// it. Returns whether it carries `fence` afterwards.
     async fn adopt_item(&self, pk: &str, sk: &str, fence: Fence) -> Result<bool> {
@@ -639,6 +657,9 @@ impl BranchRecordStore for DynamoDbNameService {
 
     /// Fences every item but the commit index, the meta item last, so a
     /// crash part way leaves the record unfenced for the next attempt.
+    ///
+    /// An item the record never had (an index never published) is written
+    /// fenced, since a fenced publish never creates one.
     async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         let pk = Self::normalize(ledger_id)?;
         match self.meta_fence(&pk).await? {
@@ -647,8 +668,19 @@ impl BranchRecordStore for DynamoDbNameService {
             Some(Some(_)) => return Ok(FenceOutcome::Mismatch),
             Some(None) => {}
         }
-        for item in self.record_items(&pk).await? {
-            match Self::sk_of(&item) {
+        let items = self.record_items(&pk).await?;
+        if let Some(mut record) = Self::items_to_ns_record(&pk, &items) {
+            record.fence = Some(fence);
+            for item in self.record_items_for(&pk, &record) {
+                if Self::sk_of(&item)
+                    .is_some_and(|sk| sk != SK_META && Self::find_item_by_sk(&items, sk).is_none())
+                {
+                    self.put_item_if_absent(item).await?;
+                }
+            }
+        }
+        for item in &items {
+            match Self::sk_of(item) {
                 Some(sk) if sk != SK_META => {
                     self.adopt_item(&pk, sk, fence).await?;
                 }

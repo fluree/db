@@ -2045,8 +2045,6 @@ created under it, and it gets storage of its own.
 - **Soft drop** (`hard: false`, default): The dropped ledger keeps its data in the dropped-ledger registry, where it can be [restored](#post-droppedrestore) under its name or [purged](#post-droppedpurge). List it with [`GET /dropped`](#get-dropped).
 - **Hard drop** (`hard: true`): Deletes the ledger's data. **This is irreversible.** If deletion is interrupted, the ledger stays in the registry as `purging` and the response reports `"data": "deleting"`; purging it finishes the job.
 
-A ledger created by an earlier version, before name bindings, keeps the older behaviour until it is migrated: a soft drop marks its branches retracted and keeps the name reserved, and a hard drop deletes its data and frees the name. `name_released` in the response says which happened.
-
 If no ledger is found by name, the server tries the same name as a graph source on branch `main`. Graph source hard-drop cleanup is best effort; graph-source fallback responses omit `branches_dropped`, `files_deleted`, `instance`, `name_released` and `data`.
 
 **Response:**
@@ -2064,8 +2062,8 @@ If no ledger is found by name, the server tries the same name as a graph source 
 | Field | Type | Description |
 |-------|------|-------------|
 | `ledger_id` | string | Ledger name (or graph source ID if the graph-source fallback handled the request) |
-| `status` | string | One of: `"dropped"`, `"already_retracted"` (an earlier-version ledger already soft-dropped), `"not_found"` |
-| `instance` | string | The dropped ledger's instance id, by which it is restored or purged; omitted for an earlier-version ledger |
+| `status` | string | One of: `"dropped"`, `"not_found"`, or `"already_retracted"` for a graph source already dropped |
+| `instance` | string | The dropped ledger's instance id, by which it is restored or purged |
 | `name_released` | boolean | Whether the name is free for a new ledger |
 | `data` | string | `"retained"` (soft drop), `"deleted"`, or `"deleting"` (a purge must be retried to finish) |
 | `files_deleted` | integer | Number of storage artifacts deleted; omitted when zero |

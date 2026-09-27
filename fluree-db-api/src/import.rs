@@ -7813,7 +7813,7 @@ mod resource_model_tests {
 mod publish_import_commit_head_tests {
     use super::*;
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{LedgerLifecycle, RefKind, RefLookup};
+    use fluree_db_nameservice::{RefKind, RefLookup};
 
     fn cid(label: &str) -> ContentId {
         ContentId::new(ContentKind::Commit, label.as_bytes())
@@ -7830,10 +7830,13 @@ mod publish_import_commit_head_tests {
         let ns = MemoryNameService::new();
         let alias = "importdb:main";
 
-        // The importer initializes the ledger before its first publish.
-        ns.init(alias).await.expect("init");
+        // The importer creates the ledger before its first publish.
+        let fence = fluree_db_nameservice::testing::create(&ns, alias)
+            .await
+            .expect("create")
+            .fence;
 
-        publish_import_commit_head(&ns, alias, None, 1, &cid("t1"))
+        publish_import_commit_head(&ns, alias, fence, 1, &cid("t1"))
             .await
             .expect("initial publish creates the head");
         let head = ns
@@ -7844,15 +7847,15 @@ mod publish_import_commit_head_tests {
         assert_eq!(head.t, 1);
         assert_eq!(head.id, Some(cid("t1")));
 
-        publish_import_commit_head(&ns, alias, None, 5, &cid("t5"))
+        publish_import_commit_head(&ns, alias, fence, 5, &cid("t5"))
             .await
             .expect("checkpoint fast-forwards");
 
-        publish_import_commit_head(&ns, alias, None, 5, &cid("t5"))
+        publish_import_commit_head(&ns, alias, fence, 5, &cid("t5"))
             .await
             .expect("republish of the exact head is a no-op success");
 
-        let err = publish_import_commit_head(&ns, alias, None, 5, &cid("other"))
+        let err = publish_import_commit_head(&ns, alias, fence, 5, &cid("other"))
             .await
             .expect_err("equal t under a different id is a divergence");
         assert!(
@@ -7860,7 +7863,7 @@ mod publish_import_commit_head_tests {
             "unexpected error: {err}"
         );
 
-        let err = publish_import_commit_head(&ns, alias, None, 3, &cid("t3"))
+        let err = publish_import_commit_head(&ns, alias, fence, 3, &cid("t3"))
             .await
             .expect_err("a head past the published t is a divergence");
         assert!(

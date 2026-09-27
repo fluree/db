@@ -255,23 +255,18 @@ impl Fluree {
 
         let is_historical = at_commit.is_some();
 
-        // A ledger created under a name binding lists the branch there with
-        // its own fence; one created before bindings has none to list it in.
-        let store = self.publisher()?;
-        let created = if store.get_binding(ledger_name).await?.is_some() {
-            let name = fluree_db_core::LedgerName::parse(ledger_name)?;
-            fluree_db_nameservice::lifecycle::create_branch(
-                store, &name, new_branch, source, at_commit,
-            )
-            .await
-            .map(|record| record.fence)
-        } else {
-            self.branch_admin()?
-                .create_branch(ledger_name, new_branch, source, at_commit)
-                .await
-                .map(|()| None)
-        };
-        let new_fence = created.map_err(|e| match e {
+        // The binding lists the branch with its own fence.
+        let name = fluree_db_core::LedgerName::parse(ledger_name)?;
+        let new_fence = fluree_db_nameservice::lifecycle::create_branch(
+            self.publisher()?,
+            &name,
+            new_branch,
+            source,
+            at_commit,
+        )
+        .await
+        .map(|record| record.fence)
+        .map_err(|e| match e {
             NameServiceError::LedgerAlreadyExists(a) => ApiError::ledger_exists(a),
             other => other.into(),
         })?;
@@ -495,14 +490,6 @@ pub(crate) async fn claim_name(
     store: &dyn crate::NameServicePublisher,
     ledger_id: &LedgerId,
 ) -> Result<PendingLedger> {
-    // A ledger from before name bindings holds its name through its records
-    // alone. A binding over it would hide it, so the name stays taken until
-    // the migration binds it.
-    if store.get_binding(ledger_id.name()).await?.is_none() {
-        if let Some(existing) = store.list_branches(ledger_id.name()).await?.first() {
-            return Err(ApiError::ledger_exists(existing.ledger_id.to_string()));
-        }
-    }
     match fluree_db_nameservice::lifecycle::begin_create(store, ledger_id).await {
         Ok(pending) => Ok(pending),
         Err(NameServiceError::LedgerAlreadyExists(a)) => Err(ApiError::ledger_exists(a)),

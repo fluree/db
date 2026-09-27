@@ -8,15 +8,14 @@
 #![cfg(feature = "native")]
 
 use crate::support::start_background_indexer_local;
-use fluree_db_api::{DropMode, DropStatus, FlureeBuilder, IndexConfig, LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::{DropMode, DropStatus, FlureeBuilder, IndexConfig};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use tokio::time::{timeout, Duration};
 
-/// Test that soft drop only retracts from nameservice and leaves files intact.
+/// A soft drop frees the name and keeps the files, for a restore or purge.
 #[tokio::test]
-async fn drop_ledger_soft_mode_retracts_only() {
+async fn drop_ledger_soft_mode_keeps_files() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
 
@@ -24,8 +23,10 @@ async fn drop_ledger_soft_mode_retracts_only() {
 
     let ledger_id = "drop-soft-test:main";
     let ledger_name = "drop-soft-test";
-    let db = LedgerSnapshot::genesis(ledger_id);
-    let ledger = LedgerState::new(db, Novelty::new(0));
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let tx = json!({
         "@context": {"ex": "http://example.org/"},
@@ -35,8 +36,9 @@ async fn drop_ledger_soft_mode_retracts_only() {
 
     let result = fluree.insert(ledger, &tx).await.expect("insert");
     assert_eq!(result.receipt.t, 1);
+    let namespace = result.ledger.storage_namespace();
 
-    // Soft drop - should only retract, not delete files
+    // Soft drop - frees the name, deletes no files
     let report = fluree
         .drop_ledger(ledger_name, DropMode::Soft)
         .await
@@ -47,22 +49,20 @@ async fn drop_ledger_soft_mode_retracts_only() {
         "Soft mode should not delete artifacts"
     );
 
-    // Verify retracted in nameservice
+    // The name is free, and the dropped ledger waits in the registry.
     let record = fluree
         .nameservice()
         .lookup(ledger_id)
         .await
         .expect("lookup");
-    assert!(record.is_some(), "Record should still exist");
-    assert!(record.unwrap().retracted, "Record should be retracted");
-
-    // Files should still exist (commit prefix uses canonical storage path, no ':')
-    let commit_prefix = format!(
-        "fluree:file://{}/commit/",
-        fluree_db_core::StorageNamespace::parse_legacy(ledger_id)
-            .unwrap()
-            .branch_prefix()
+    assert!(record.is_none(), "the name is free");
+    assert_eq!(
+        fluree.list_dropped().await.expect("list dropped")[0].instance,
+        report.instance.expect("instance")
     );
+
+    // Files should still exist
+    let commit_prefix = format!("fluree:file://{}/commit/", namespace.branch_prefix());
     let files = fluree
         .admin_storage()
         .expect("managed backend")
@@ -82,8 +82,10 @@ async fn drop_ledger_hard_mode_deletes_files() {
 
     let ledger_id = "drop-hard-test:main";
     let ledger_name = "drop-hard-test";
-    let db = LedgerSnapshot::genesis(ledger_id);
-    let ledger = LedgerState::new(db, Novelty::new(0));
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let tx = json!({
         "@context": {"ex": "http://example.org/"},
@@ -97,9 +99,7 @@ async fn drop_ledger_hard_mode_deletes_files() {
     // Verify files exist before drop
     let commit_prefix = format!(
         "fluree:file://{}/commit/",
-        fluree_db_core::StorageNamespace::parse_legacy(ledger_id)
-            .unwrap()
-            .branch_prefix()
+        result.ledger.storage_namespace().branch_prefix()
     );
     let files_before = fluree
         .admin_storage()
@@ -162,7 +162,7 @@ async fn drop_ledger_not_found() {
     assert_eq!(report.status, DropStatus::NotFound);
 }
 
-/// Test drop is idempotent - second drop returns AlreadyRetracted.
+/// A second drop finds nothing: the first freed the name.
 #[tokio::test]
 async fn drop_ledger_idempotent() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -172,8 +172,10 @@ async fn drop_ledger_idempotent() {
 
     let ledger_id = "drop-idem-test:main";
     let ledger_name = "drop-idem-test";
-    let db = LedgerSnapshot::genesis(ledger_id);
-    let ledger = LedgerState::new(db, Novelty::new(0));
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let tx = json!({
         "@context": {"ex": "http://example.org/"},
@@ -189,12 +191,12 @@ async fn drop_ledger_idempotent() {
         .expect("drop1");
     assert_eq!(r1.status, DropStatus::Dropped);
 
-    // Second drop - should be idempotent
+    // Second drop - nothing holds the name now
     let r2 = fluree
         .drop_ledger(ledger_name, DropMode::Soft)
         .await
         .expect("drop2");
-    assert_eq!(r2.status, DropStatus::AlreadyRetracted);
+    assert_eq!(r2.status, DropStatus::NotFound);
 }
 
 /// Test that drop normalizes alias (adds :main if missing).
@@ -207,8 +209,10 @@ async fn drop_ledger_accepts_bare_name_and_default_suffix() {
 
     // Create ledger with full alias
     let ledger_id = "normalize-test:main";
-    let db = LedgerSnapshot::genesis(ledger_id);
-    let ledger = LedgerState::new(db, Novelty::new(0));
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let tx = json!({
         "@context": {"ex": "http://example.org/"},
@@ -244,8 +248,10 @@ async fn drop_ledger_rejects_main_suffix() {
     let fluree = FlureeBuilder::file(&path).build().expect("build");
 
     let ledger_id = "suffix-test:main";
-    let db = LedgerSnapshot::genesis(ledger_id);
-    let ledger = LedgerState::new(db, Novelty::new(0));
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     let tx = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:n": 1});
     fluree.insert(ledger, &tx).await.expect("insert");
 
@@ -496,8 +502,10 @@ async fn drop_ledger_cancels_pending_indexing() {
         .run_until(async move {
             let ledger_id = "drop-cancel-test:main";
             let ledger_name = "drop-cancel-test";
-            let db = LedgerSnapshot::genesis(ledger_id);
-            let ledger = LedgerState::new(db, Novelty::new(0));
+            let ledger = fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -525,6 +533,8 @@ async fn drop_ledger_cancels_pending_indexing() {
                 current = result.ledger;
             }
 
+            let namespace = current.storage_namespace();
+
             // Trigger indexing but DON'T wait - immediately drop
             // This exercises the "drop while indexing is pending/in progress" scenario
             let _completion = handle
@@ -544,9 +554,6 @@ async fn drop_ledger_cancels_pending_indexing() {
             assert_eq!(report.status, DropStatus::Dropped);
 
             // Verify both commit and index files are deleted
-            // Commits use raw alias: fluree:file://drop-cancel-test:main/commit/
-            // Indexes use normalized: fluree:file://drop-cancel-test/main/index/
-            let namespace = fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap();
             let prefix = namespace.branch_prefix();
             let commit_prefix = format!("fluree:file://{prefix}/commit/");
             let index_prefix = format!("fluree:file://{prefix}/index/");
@@ -576,9 +583,9 @@ async fn drop_ledger_cancels_pending_indexing() {
         .await;
 }
 
-/// Test that hard drop still attempts deletion even when ledger is already retracted.
+/// A soft-dropped ledger's files stay until it is purged, which deletes them.
 #[tokio::test]
-async fn drop_ledger_hard_mode_deletes_even_when_retracted() {
+async fn purging_a_soft_dropped_ledger_deletes_its_files() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
 
@@ -586,17 +593,24 @@ async fn drop_ledger_hard_mode_deletes_even_when_retracted() {
 
     let ledger_id = "drop-hard-retracted:main";
     let ledger_name = "drop-hard-retracted";
-    let db = LedgerSnapshot::genesis(ledger_id);
-    let ledger = LedgerState::new(db, Novelty::new(0));
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let tx = json!({
         "@context": {"ex": "http://example.org/"},
         "@id": "ex:test",
         "ex:name": "Test"
     });
-    fluree.insert(ledger, &tx).await.expect("insert");
+    let namespace = fluree
+        .insert(ledger, &tx)
+        .await
+        .expect("insert")
+        .ledger
+        .storage_namespace();
 
-    // First soft drop (retract only)
+    // Soft drop keeps the files
     let r1 = fluree
         .drop_ledger(ledger_name, DropMode::Soft)
         .await
@@ -604,12 +618,7 @@ async fn drop_ledger_hard_mode_deletes_even_when_retracted() {
     assert_eq!(r1.status, DropStatus::Dropped);
 
     // Verify files still exist
-    let commit_prefix = format!(
-        "fluree:file://{}/commit/",
-        fluree_db_core::StorageNamespace::parse_legacy(ledger_id)
-            .unwrap()
-            .branch_prefix()
-    );
+    let commit_prefix = format!("fluree:file://{}/commit/", namespace.branch_prefix());
     let files_before = fluree
         .admin_storage()
         .expect("managed backend")
@@ -621,15 +630,14 @@ async fn drop_ledger_hard_mode_deletes_even_when_retracted() {
         "Files should exist after soft drop"
     );
 
-    // Second hard drop (should still delete files)
+    // Purging the dropped ledger deletes them
     let r2 = fluree
-        .drop_ledger(ledger_name, DropMode::Hard)
+        .purge_dropped(r1.instance.expect("instance").as_str())
         .await
-        .expect("hard drop");
-    assert_eq!(r2.status, DropStatus::AlreadyRetracted);
+        .expect("purge");
     assert!(
         r2.artifacts_deleted > 0,
-        "Hard drop should delete artifacts even when already retracted"
+        "purge should delete the dropped ledger's artifacts"
     );
 
     // Verify files deleted
@@ -796,7 +804,10 @@ async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
     let parent = fluree.create_ledger("a").await.expect("create a");
     fluree.insert(parent, &txn).await.expect("insert a");
     let child_id = "a/main/index/child:main";
-    let child = LedgerState::new(LedgerSnapshot::genesis(child_id), Novelty::new(0));
+    fluree_db_nameservice::testing::create_at_name_root(fluree.publisher().unwrap(), child_id)
+        .await
+        .expect("a ledger from before name bindings");
+    let child = fluree.ledger(child_id).await.expect("load child");
     fluree.insert(child, &txn).await.expect("insert child");
     for id in ["a", "a/main/index/child"] {
         fluree

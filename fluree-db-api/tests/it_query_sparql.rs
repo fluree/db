@@ -24,7 +24,7 @@ fn normalize_object_rows(value: &JsonValue) -> Vec<String> {
 }
 
 async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     // Seed dataset roughly equivalent to a SPARQL INSERT DATA payload.
     let insert = json!({
@@ -83,7 +83,7 @@ async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
 }
 
 async fn seed_books(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -119,7 +119,7 @@ async fn seed_books(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
 ///
 /// Graph: a→b, b→c, b→d, d→e
 async fn sparql_seed_knows_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -144,7 +144,7 @@ async fn sparql_seed_knows_chain(fluree: &MemoryFluree, ledger_id: &str) -> Memo
 ///        alice --parent--> bob
 ///        bob   --parent--> carol
 async fn sparql_seed_chain_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -181,7 +181,7 @@ async fn sparql_seed_chain_data(fluree: &MemoryFluree, ledger_id: &str) -> Memor
 ///   ex:bob   --ex:name--> "Bob"
 ///   ex:carol --ex:name--> "Carol"
 async fn sparql_seed_alt_seq_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -198,7 +198,7 @@ async fn sparql_seed_alt_seq_data(fluree: &MemoryFluree, ledger_id: &str) -> Mem
 // =============================================================================
 
 async fn sparql_seed_alt_in_seq_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -224,7 +224,7 @@ async fn sparql_seed_alt_in_seq_data(fluree: &MemoryFluree, ledger_id: &str) -> 
 
 /// Seed data with a custom namespace that is NOT one of the default W3C namespaces.
 async fn seed_custom_ns(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -263,7 +263,7 @@ async fn seed_custom_ns(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger 
 /// Uses overlapping namespace prefixes (`https://taxo.cbcrc.ca/ns/` and
 /// `https://taxo.cbcrc.ca/id/`) and ref-valued custom predicates.
 async fn seed_exact_repro(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -309,7 +309,7 @@ async fn seed_exact_repro(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedge
 /// Seed dataset with multi-byte strings, datetime, and decimal values for
 /// built-in function tests.
 async fn seed_builtin_fn_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -720,7 +720,7 @@ async fn sparql_group_by_datatype_expression_collapses_decimal() {
     // distinct from the integer fast path above.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "gbdt:main");
+    let ledger0 = genesis_ledger(&fluree, "gbdt:main").await;
 
     let insert = json!({
         "@context": {
@@ -1225,7 +1225,7 @@ async fn sparql_subquery_limit_scopes_outer_join() {
     // only decorate the N selected resources, not the whole dataset.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "sqlimit:main");
+    let ledger0 = genesis_ledger(&fluree, "sqlimit:main").await;
 
     let insert = json!({
         "@context": {
@@ -1313,7 +1313,7 @@ async fn sparql_projection_expression_error_leaves_var_unbound() {
     // NOT fail. (W3C functions/plus-1-corrected, project-expression/projexp02.)
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "exprerr:main");
+    let ledger0 = genesis_ledger(&fluree, "exprerr:main").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
         "@graph": [
@@ -1362,7 +1362,7 @@ async fn sparql_bind_and_order_by_expression_errors_do_not_fail_query() {
     // surface — covered by the JSON-LD bind-error tests.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "exprerr2:main");
+    let ledger0 = genesis_ledger(&fluree, "exprerr2:main").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
         "@graph": [
@@ -1413,7 +1413,7 @@ async fn sparql_empty_group_sum_avg_return_zero() {
     // SAMPLE have no identity and stay unbound — not asserted here.)
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "emptyagg:main");
+    let ledger = genesis_ledger(&fluree, "emptyagg:main").await;
 
     for (agg, var) in [("COUNT", "count"), ("SUM", "sum"), ("AVG", "avg")] {
         let query = format!(
@@ -1456,7 +1456,7 @@ async fn sparql_subquery_limit_w3c_sq11_blank_node_form() {
     // surfaces (3) — a non-matching parent batch (order3/order4) arrives first.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "sq11ttl:main");
+    let ledger0 = genesis_ledger(&fluree, "sq11ttl:main").await;
 
     let ttl = r#"@prefix : <http://www.example.org> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
@@ -1526,7 +1526,7 @@ async fn sparql_blank_node_property_list_binds_vars() {
     // position, the multi-predicate `;` form, and nesting.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bnpl:main");
+    let ledger0 = genesis_ledger(&fluree, "bnpl:main").await;
     let ttl = r#"@prefix ex: <http://example.org/> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 ex:cart ex:has [ rdfs:label "Apple" ; ex:qty 3 ] , [ rdfs:label "Pear" ; ex:qty 1 ] .
@@ -1897,7 +1897,7 @@ async fn sparql_filter_equality_equijoin_results_preserved() {
     // product, the BI-2 shape.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "features:main");
+    let ledger0 = genesis_ledger(&fluree, "features:main").await;
     let insert = json!({
         "@context": { "ex": "http://example.org/ns/" },
         "@graph": [
@@ -1944,7 +1944,7 @@ async fn sparql_filter_equality_equijoin_inside_subquery() {
     // preserve results (the aggregate COUNT(?f2) follows the unified variable).
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "features:sub");
+    let ledger0 = genesis_ledger(&fluree, "features:sub").await;
     let insert = json!({
         "@context": { "ex": "http://example.org/ns/" },
         "@graph": [
@@ -3095,7 +3095,7 @@ async fn sparql_property_path_inverse_subject_var() {
 #[tokio::test]
 async fn sparql_property_path_alternative_object_var() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "sparql/path-alt-o:main");
+    let ledger0 = genesis_ledger(&fluree, "sparql/path-alt-o:main").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -3143,7 +3143,7 @@ async fn sparql_property_path_alternative_with_inverse() {
 #[tokio::test]
 async fn sparql_property_path_alternative_three_way() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "sparql/path-alt-3:main");
+    let ledger0 = genesis_ledger(&fluree, "sparql/path-alt-3:main").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -3174,7 +3174,7 @@ async fn sparql_property_path_alternative_duplicate_semantics() {
     // When both predicates match the same (s,o) pair, UNION bag semantics
     // produces the result twice (one per branch).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "sparql/path-alt-dup:main");
+    let ledger0 = genesis_ledger(&fluree, "sparql/path-alt-dup:main").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -3440,7 +3440,7 @@ async fn sparql_property_path_sequence_with_middle_alternative() {
     // Three-step chain with middle alternative: ex:friend/(ex:name|ex:nick)
     // Uses the same data but with a different ledger alias to test isolation
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "sparql/path-mid-alt:main");
+    let ledger0 = genesis_ledger(&fluree, "sparql/path-mid-alt:main").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -3736,7 +3736,7 @@ async fn jsonld_exact_repro_expansion_custom_type() {
 async fn sparql_bind_iri_with_optional_propagates_binding() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "bind_opt");
+    let ledger = genesis_ledger(&fluree, "bind_opt").await;
 
     // Insert a simple entity with a known IRI and property.
     let insert = json!({
@@ -3795,7 +3795,7 @@ async fn sparql_bind_iri_with_optional_propagates_binding() {
 async fn sparql_minus_with_filter_in_subtree() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "negation:minus");
+    let ledger0 = genesis_ledger(&fluree, "negation:minus").await;
 
     // Seed data equivalent to subsetByExcl.ttl
     let insert = json!({
@@ -3848,7 +3848,7 @@ async fn sparql_minus_with_filter_in_subtree() {
 async fn sparql_minus_basic_anti_join() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "negation:basic");
+    let ledger0 = genesis_ledger(&fluree, "negation:basic").await;
 
     let insert = json!({
         "@context": {
@@ -3896,7 +3896,7 @@ async fn sparql_minus_basic_anti_join() {
 async fn sparql_minus_compound_not_exists() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "negation:compound-nex");
+    let ledger0 = genesis_ledger(&fluree, "negation:compound-nex").await;
 
     // Minimal set data: two sets with overlapping members
     // set_a = {1, 2}, set_b = {1}
@@ -3960,7 +3960,7 @@ async fn sparql_minus_compound_not_exists() {
 async fn sparql_compound_filter_not_exists_standalone() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "negation:compound-nex-standalone");
+    let ledger0 = genesis_ledger(&fluree, "negation:compound-nex-standalone").await;
 
     let insert = json!({
         "@context": {
@@ -4019,7 +4019,7 @@ async fn sparql_compound_filter_not_exists_standalone() {
 async fn sparql_compound_filter_not_exists_equals_standalone() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "negation:compound-vs-standalone");
+    let ledger0 = genesis_ledger(&fluree, "negation:compound-vs-standalone").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/ns/" },
@@ -4077,7 +4077,7 @@ async fn sparql_compound_filter_not_exists_equals_standalone() {
 async fn sparql_wildcard_header_with_empty_results() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "negation:empty-wildcard");
+    let ledger0 = genesis_ledger(&fluree, "negation:empty-wildcard").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/ns/" },
@@ -4412,7 +4412,7 @@ async fn sparql_sum_avg_over_xsd_decimal_repro() {
 }
 
 async fn seed_receipt_line_items(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -4652,7 +4652,7 @@ async fn sparql_double_canonical_lexical_form_across_formats() {
     use fluree_db_api::format::{format_results_string, FormatterConfig};
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "canon:double-formats");
+    let ledger0 = genesis_ledger(&fluree, "canon:double-formats").await;
 
     let insert = json!({
         "@context": {
@@ -4726,7 +4726,7 @@ async fn sparql_double_canonical_lexical_form_across_formats() {
 #[tokio::test]
 async fn sparql_str_double_matches_serializer_canonical_form() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "canon:str-double");
+    let ledger0 = genesis_ledger(&fluree, "canon:str-double").await;
 
     // Representative doubles: the issue's repro (1E0), an integral value,
     // a large exponent, a small exponent, a negative, and the specials.
@@ -4816,7 +4816,7 @@ async fn sparql_str_double_matches_serializer_canonical_form() {
 #[tokio::test]
 async fn sparql_str_float_matches_serializer_canonical_form() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "canon:str-float");
+    let ledger0 = genesis_ledger(&fluree, "canon:str-float").await;
 
     let cases = [
         ("ex:f1", "1E0", "1.0E0"),
@@ -4881,7 +4881,7 @@ async fn sparql_str_float_matches_serializer_canonical_form() {
 #[tokio::test]
 async fn sparql_group_concat_double_canonical_form() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "canon:gc-double");
+    let ledger0 = genesis_ledger(&fluree, "canon:gc-double").await;
 
     let insert = json!({
         "@context": {
@@ -5010,7 +5010,7 @@ async fn sparql_xsd_cast_invalid_returns_unbound() {
 async fn sparql_bind01_exact_w3c_unbound_predicate() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bind:w3c01");
+    let ledger0 = genesis_ledger(&fluree, "bind:w3c01").await;
 
     // Load turtle data matching W3C bind/data.ttl
     let turtle = r"
@@ -5062,7 +5062,7 @@ async fn sparql_bind01_exact_w3c_unbound_predicate() {
 async fn sparql_bind_expression_in_select() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bind:expr");
+    let ledger0 = genesis_ledger(&fluree, "bind:expr").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -5103,7 +5103,7 @@ async fn sparql_bind_expression_in_select() {
 async fn sparql_bind_wildcard_select() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bind:wildcard");
+    let ledger0 = genesis_ledger(&fluree, "bind:wildcard").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -5147,7 +5147,7 @@ async fn sparql_bind_wildcard_select() {
 async fn sparql_post_query_values() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "values:post");
+    let ledger0 = genesis_ledger(&fluree, "values:post").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -5189,7 +5189,7 @@ async fn sparql_post_query_values() {
 async fn sparql_bind_chained_binds() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bind:chained");
+    let ledger0 = genesis_ledger(&fluree, "bind:chained").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -5243,7 +5243,7 @@ async fn sparql_bind_chained_binds() {
 async fn sparql_bind_in_union() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bind:union");
+    let ledger0 = genesis_ledger(&fluree, "bind:union").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -5285,7 +5285,7 @@ async fn sparql_bind_in_union() {
 async fn sparql_bind_with_filter() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bind:filter");
+    let ledger0 = genesis_ledger(&fluree, "bind:filter").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -5328,7 +5328,7 @@ async fn sparql_bind_with_filter() {
 async fn sparql_bind_scoping() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bind:scope");
+    let ledger0 = genesis_ledger(&fluree, "bind:scope").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -5372,7 +5372,7 @@ async fn sparql_bind_scoping() {
 async fn sparql_post_query_values_with_undef() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "values:undef");
+    let ledger0 = genesis_ledger(&fluree, "values:undef").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -5415,7 +5415,7 @@ async fn sparql_post_query_values_with_undef() {
 async fn sparql_describe_constant_iri_outgoing_triples() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "describe:const");
+    let ledger0 = genesis_ledger(&fluree, "describe:const").await;
 
     let insert = json!({
         "@context": { "ex": "http://example.org/" },
@@ -5784,7 +5784,7 @@ async fn sparql_service_remote_no_executor_errors() {
 /// Seed line items across three currencies (mixed case) so that
 /// `GROUP BY (LCASE(?cur))` collapses to exactly three groups.
 async fn seed_currency_line_items(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     // 5 USD, 3 CAD, 2 EUR (mixed case to exercise LCASE collapsing).
     let currencies = [("USD", 5usize), ("Cad", 3usize), ("eur", 2usize)];
@@ -5902,7 +5902,7 @@ async fn sparql_group_by_expression_via_bind_workaround() {
 async fn sparql_order_by_exists_expression_sorts_by_correlated_existence() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "exists:order-by");
+    let ledger0 = genesis_ledger(&fluree, "exists:order-by").await;
 
     // alice and dave know someone; bob and carol know no one.
     let insert = json!({
@@ -5956,7 +5956,7 @@ async fn sparql_alternation_transitive_path() {
     // From n0, `(a|b)*` reaches n0 (zero hops), n1, n2, n3. Neither `a*` nor
     // `b*` alone reaches past the first heterogeneous hop.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:alt-transitive");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:alt-transitive").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -6003,7 +6003,7 @@ async fn sparql_both_bound_path_reachability() {
     // shape). With a sibling variable it yields one row iff reachable, none if
     // not. Chain a->b->c via ex:p.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:both-bound");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:both-bound").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -6043,7 +6043,7 @@ async fn sparql_both_bound_path_reachability() {
 
 /// Seed a simple `a -> b -> c` chain over `ex:p` for ZeroOrOne path tests.
 async fn seed_pp_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6057,7 +6057,7 @@ async fn seed_pp_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
 /// Seed `a -p-> m -q-> b -p-> n -q-> c`: an alternating two-predicate chain so
 /// each `(ex:p/ex:q)` hop advances a→b→c.
 async fn seed_composite_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6076,7 +6076,7 @@ async fn sparql_composite_star_both_unbound_includes_all_self_pairs() {
     // path pairs EVERY node in the path's domain {a, m, b} with itself — not just
     // hop-start subjects — plus the one composite hop a→b.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-star-closure");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-star-closure").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6110,7 +6110,7 @@ async fn sparql_zero_or_one_inside_sequence() {
     // yields a itself (zero hops) and its p-neighbor b, then `ex:q` from each:
     // a→q→x (zero p) and b→q→y (one p) → {x, y}.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:zoo-in-seq");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:zoo-in-seq").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6187,7 +6187,7 @@ async fn sparql_composite_transitive_inverse_step() {
     // hub0 q x1), so x0 (^p/q) x1; likewise x1 (^p/q) x2 via hub1. Transitively
     // from x0: {x1, x2}.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6229,7 +6229,7 @@ async fn sparql_parenthesized_inverse_transitive() {
     // p-chain x -p-> y -p-> z, from z it walks p backwards: `+` → {y, x},
     // `*` → {z, y, x}, `?` → {z, y}.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:paren-inv");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:paren-inv").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6267,7 +6267,7 @@ async fn sparql_composite_inverse_step_both_unbound() {
     // make `^p/q` the co-parent relation x0~x1~x2, so the transitive closure is
     // {(x0,x1), (x0,x2), (x1,x2)}.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-unbound");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-unbound").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6300,7 +6300,7 @@ async fn sparql_composite_inverse_second_step() {
     // links x and y that share a target via different predicates: x p m, y q m.
     // x0 p m0, x1 q m0 → x0 (p/^q) x1; x1 p m1, x2 q m1 → x1 (p/^q) x2.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv2");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv2").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6345,7 +6345,7 @@ async fn sparql_composite_inverse_alternation_step() {
     // hub. One hop: a (^(p|q)/r) ? — from a, `^(p|q)` finds hub (hub p a), then
     // `r` from hub → c.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-alt");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-alt").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6458,7 +6458,7 @@ async fn sparql_negated_set_forward_excludes_type() {
     // W3C `nps_a`: `?s !a ?o`. Data has a type edge (sa→oa) and a plain edge
     // (sp→op). The negated set excludes rdf:type, so only (sp, op) matches.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:nps-fwd");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:nps-fwd").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6483,7 +6483,7 @@ async fn sparql_negated_set_forward_excludes_type() {
 
 /// Seed the W3C nps data: `sd pd od . sr pr or .`
 async fn seed_nps(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -6617,7 +6617,7 @@ async fn sparql_zero_or_one_both_bound() {
 /// one fragment-style subject/predicate pair and one path-style pair, both
 /// under `http://example.org/x/`.
 async fn seed_base_resolution(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@graph": [
             {"@id": "http://example.org/x/#x", "http://example.org/x/#p": "hit-fragment"},
@@ -6718,7 +6718,7 @@ async fn sparql_base_resolves_path_references() {
 async fn sparql_base_resolves_constant_graph_iri() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:base-graph");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:base-graph").await;
     let trig = r#"
         @prefix ex: <http://example.org/ns/> .
         @prefix schema: <http://schema.org/> .
@@ -6794,7 +6794,7 @@ async fn sparql_iri_function_resolves_constant_against_base() {
 async fn sparql_no_base_keeps_relative_iris_verbatim() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql:no-base");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:no-base").await;
     let insert = json!({
         "@graph": [
             {"@id": "local-x", "http://schema.org/name": "Bob"}
@@ -6829,7 +6829,7 @@ async fn sparql_no_base_keeps_relative_iris_verbatim() {
 /// Chain rows for `?a :p1 ?b . ?b :p2 ?x`: (a1,b1,10) (a1,b1,20) (a2,b1,10)
 /// (a2,b1,20) — COUNT(?x) = 4, COUNT(DISTINCT ?x) = 2.
 async fn seed_chain_fan_in(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@graph": [
@@ -6900,7 +6900,7 @@ async fn sparql_count_distinct_chain_fan_in() {
 /// `xsd:decimal` bound used to push the representable half and drop the rest;
 /// two temporal bounds on the same side used to keep whichever came first.
 async fn seed_ranges(fluree: &MemoryFluree, ledger_id: &str) -> fluree_db_api::TransactResult {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {
             "ex": "http://example.org/",

@@ -293,6 +293,12 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
         _log_index: u64,
         out: &mut Vec<Effect>,
     ) {
+        // A fenced write is the write it wraps, once the state machine has
+        // admitted it.
+        let command = match command {
+            Command::Fenced { command, .. } => command.as_ref(),
+            command => command,
+        };
         if let Some(event) = event_for(command, response) {
             out.push(Effect::Event(event));
         }
@@ -571,6 +577,16 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
                 commit_t: *t,
             })
         }
+        // A branch created or restored with a head announces it, as a
+        // branch created before fencing did.
+        (Command::InsertBranchRecord(record), Response::BranchRecordInserted) => {
+            let (commit_id, commit_t) = record.head.clone()?;
+            Some(NameServiceEvent::LedgerCommitPublished {
+                ledger_id: event_ledger_id(&record.key.ledger_name, &record.key.branch)?,
+                commit_id,
+                commit_t,
+            })
+        }
         _ => None,
     }
 }
@@ -680,6 +696,43 @@ mod tests {
         assert_eq!(
             drain_releases(&mut poisoned),
             vec![("test/db:main".to_string(), cid(3))]
+        );
+    }
+
+    /// A write presenting a fence reaches the observer wrapped, as it was
+    /// logged; it announces what it wraps.
+    #[test]
+    fn a_fenced_index_publish_is_announced() {
+        let command = Command::Fenced {
+            fence: 7,
+            command: Box::new(Command::AdvanceIndexHead(
+                crate::raft::state_machine::NewIndexHead {
+                    ledger_id: "test/db".into(),
+                    branch: "main".into(),
+                    new_index_head: cid(2),
+                    t: 3,
+                    applied_at_millis: 1_000,
+                },
+            )),
+        };
+        let mut response = Response::IndexAdvanced {
+            index_t: 3,
+            index_head: cid(2),
+        };
+        let mut effects = Vec::new();
+        NameServiceObserver::new().on_command(
+            &NameServiceState::default(),
+            &command,
+            &mut response,
+            1,
+            &mut effects,
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Event(NameServiceEvent::LedgerIndexPublished { index_t: 3, .. })
+            )),
+            "no index event for a fenced publish"
         );
     }
 

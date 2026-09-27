@@ -146,7 +146,7 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
     local
         .run_until(async move {
             let ledger_id = "it/trigger-index-incremental:main";
-            let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             // Seed enough facts to force multiple leaf files under the tiny leaf sizing.
             // 120 subjects × 1 property => 120 facts => ~6 leaves per order (20 rows per leaf).

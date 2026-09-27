@@ -18,7 +18,7 @@ async fn inline_policy_with_identity_binding() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Create ledger
-    let ledger0 = genesis_ledger(&fluree, "policy/inline-policy-identity:main");
+    let ledger0 = genesis_ledger(&fluree, "policy/inline-policy-identity:main").await;
 
     // Use HTTP IRI for identity (avoid DID encoding issues)
     let alice_identity = "http://example.org/identity/alice";
@@ -159,7 +159,7 @@ async fn identity_based_policy_lookup() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Create ledger
-    let ledger0 = genesis_ledger(&fluree, "policy/identity-lookup:main");
+    let ledger0 = genesis_ledger(&fluree, "policy/identity-lookup:main").await;
 
     // Use HTTP IRI for identity
     let alice_identity = "http://example.org/identity/alice";
@@ -296,7 +296,7 @@ async fn wrap_identity_policy_view_api() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Create ledger
-    let ledger0 = genesis_ledger(&fluree, "policy/wrap-identity:main");
+    let ledger0 = genesis_ledger(&fluree, "policy/wrap-identity:main").await;
 
     // Use HTTP IRI for identity
     let alice_identity = "http://example.org/identity/alice";

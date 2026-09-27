@@ -8,7 +8,7 @@ async fn create_graph_source_test() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Create test ledger
-    let ledger = support::genesis_ledger(&fluree, "test-gs:main");
+    let ledger = support::genesis_ledger(&fluree, "test-gs:main").await;
     let tx = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@graph": [
@@ -71,7 +71,7 @@ async fn bm25_index_updates_with_ledger() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Create initial ledger with one article
-    let ledger = support::genesis_ledger(&fluree, "articles:main");
+    let ledger = support::genesis_ledger(&fluree, "articles:main").await;
     let tx1 = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@graph": [{"@id": "ex:article1", "ex:title": "First Article", "ex:content": "This is the first article about databases"}]

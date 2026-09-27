@@ -13,7 +13,7 @@ use serde_json::json;
 /// Seed a tiny in-memory ledger with a single named subject.
 async fn seed_one() -> (support::MemoryFluree, support::MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "fuel/floor:main");
+    let ledger0 = support::genesis_ledger(&fluree, "fuel/floor:main").await;
     let seed = json!({
         "@context": { "a": "http://a.co/" },
         "@graph": [{ "@id": "http://a.co/x", "a:name": "X" }]

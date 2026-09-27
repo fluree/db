@@ -24,7 +24,7 @@ async fn vector_create_index_indexes_docs_and_is_loadable() {
     // Seed a small ledger with embeddings (3-dimensional for simplicity)
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication of array elements
     let ledger_id = "vector/docs:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex":"http://example.org/",
@@ -82,7 +82,7 @@ async fn vector_search_returns_scored_results() {
     // doc3 is different (high third component)
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
     let ledger_id = "vector/search:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex":"http://example.org/",
@@ -160,7 +160,7 @@ async fn vector_sync_indexes_new_documents() {
     // Create initial ledger with one doc
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
     let ledger_id = "vector/sync:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": {
             "ex":"http://example.org/",
@@ -248,7 +248,7 @@ async fn vector_sync_updates_head_snapshot() {
     // Create ledger with initial doc
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
     let ledger_id = "vector/headonly:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": {
             "ex":"http://example.org/",
@@ -324,7 +324,7 @@ async fn vector_drop_index_marks_as_retracted() {
     // Create a minimal index
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
     let ledger_id = "vector/drop:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex":"http://example.org/",
@@ -376,7 +376,7 @@ async fn vector_skips_documents_without_embeddings() {
     // Create ledger with some docs having embeddings and some without
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
     let ledger_id = "vector/skip:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex":"http://example.org/",
@@ -427,7 +427,7 @@ async fn vector_supports_different_metrics() {
 
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
     let ledger_id = "vector/metrics:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex":"http://example.org/",
@@ -495,7 +495,7 @@ async fn vector_provider_integration() {
     // Create ledger with vectors
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
     let ledger_id = "vector/provider:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex":"http://example.org/",
@@ -557,7 +557,7 @@ async fn vector_collection_exists() {
     // Create a ledger and index
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
     let ledger_id = "vector/exists:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex":"http://example.org/",
@@ -623,7 +623,7 @@ async fn vector_idx_query_syntax_e2e() {
     // Create ledger with vector embeddings
     // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
     let ledger_id = "vector/query-e2e:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -742,7 +742,7 @@ async fn vector_idx_query_syntax_e2e() {
 async fn vector_search_enforces_view_policy_on_embedding_flake() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "vector/policy:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex": "http://example.org/" },
         "@graph": [
@@ -847,7 +847,7 @@ async fn vector_sync_without_indexed_changes_advances_watermark_without_resync()
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "vector/noop:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ {
@@ -907,7 +907,7 @@ async fn vector_sync_with_wildcard_select_always_rebuilds() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "vector/wildcard:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ {
@@ -962,7 +962,7 @@ async fn vector_sync_with_nested_pattern_rebuilds_when_membership_changes() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "vector/nested:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ {

@@ -29,7 +29,7 @@ async fn seed_time_travel_ledger(
     fluree: &MemoryFluree,
     ledger_id: &str,
 ) -> (MemoryLedger, String, std::collections::HashMap<i64, String>) {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     // Record wallclock times for ISO time-travel tests.
     // We record times AFTER each commit to ensure they're at or after the commit's actual timestamp.
@@ -476,7 +476,7 @@ async fn time_travel_branch_interaction_main_at_t() {
     let base = "it/branch-time-test";
     let ledger_id = format!("{base}:main");
 
-    let ledger0 = genesis_ledger(&fluree, &ledger_id);
+    let ledger0 = genesis_ledger(&fluree, &ledger_id).await;
     let out = fluree
         .insert(
             ledger0,

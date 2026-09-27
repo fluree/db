@@ -39,7 +39,7 @@ fn graph_iris(info: &JsonValue) -> Vec<String> {
 async fn named_graphs_visible_without_an_index() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/ledger-info-named-graphs/no-index:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let trig = format!(
         r#"
@@ -119,7 +119,7 @@ async fn named_graphs_visible_without_an_index() {
 async fn named_graphs_include_post_index_registrations() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/ledger-info-named-graphs/post-index:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed alpha and build an index at this t.
     let trig_alpha = format!(

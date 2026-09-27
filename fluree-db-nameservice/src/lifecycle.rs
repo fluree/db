@@ -268,7 +268,9 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
 
 /// Copy `record`, read from the nameservice that owns its ledger, into
 /// `store`: bind its name to the record's instance and root, list its
-/// branch, and insert it. A binding to another instance is replaced: the
+/// branch, and insert it. A root at the name itself, from before name
+/// bindings, takes the instance the migration derives from the name
+/// ([`legacy_instance`]). A binding to another instance is replaced: the
 /// origin has dropped that ledger and created this one under the name.
 ///
 /// The record keeps its fence when it carries one; otherwise a local one is
@@ -279,14 +281,16 @@ pub async fn mirror_record<S: LifecycleStore + ?Sized>(
     store: &S,
     record: &NsRecord,
 ) -> Result<Fence> {
-    let root = record.storage_root.clone();
-    let Some((root, instance)) = root.and_then(|r| r.instance().map(|i| (r, i))) else {
+    let Some(root) = record.storage_root.clone() else {
         return Err(NameServiceError::invalid_id(format!(
-            "{} has no instance root to mirror",
+            "{} has no storage root to mirror",
             record.ledger_id
         )));
     };
     let name = record.ledger_id.ledger_name();
+    // A ledger from before name bindings keeps its root at the name; the
+    // origin's migration gave it the instance derived from the name.
+    let instance = root.instance().unwrap_or_else(|| legacy_instance(&name));
     let mut fence = None;
     for _ in 0..MAX_ATTEMPTS {
         let current = store.get_binding(&name).await?;
@@ -338,6 +342,34 @@ pub async fn mirror_record<S: LifecycleStore + ?Sized>(
     copy.retracted = false;
     insert_fenced(store, &copy).await?;
     Ok(fence)
+}
+
+/// Remove a copy [`mirror_record`] made, once the nameservice that owns the
+/// ledger has dropped the branch: unlist the branch, removing the binding
+/// with its last branch, then delete the record. The copy owns no data, so
+/// nothing else is deleted.
+pub async fn unmirror_record<S: LifecycleStore + ?Sized>(
+    store: &S,
+    ledger_id: &LedgerId,
+) -> Result<()> {
+    let name = ledger_id.ledger_name();
+    let branch = ledger_id.branch();
+    for _ in 0..MAX_ATTEMPTS {
+        let Some(Versioned { value, version }) = store.get_binding(&name).await? else {
+            return Ok(());
+        };
+        let Some(fence) = value.fence_of(branch) else {
+            return Ok(());
+        };
+        let mut next = value;
+        next.branches.retain(|b| b.branch != branch);
+        let new = (!next.branches.is_empty()).then_some(&next);
+        if let RegistryCas::Updated { .. } = store.cas_binding(&name, Some(version), new).await? {
+            store.delete_record(ledger_id.as_ref(), fence).await?;
+            return Ok(());
+        }
+    }
+    Err(contended(&name))
 }
 
 /// What [`begin_drop_branch`] left to do.

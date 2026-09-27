@@ -21,7 +21,7 @@ fn ctx() -> JsonValue {
 /// Seed a small graph with various datatypes for testing typed output.
 async fn seed_typed_graph() -> (MemoryFluree, MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/typed-json:test");
+    let ledger0 = genesis_ledger(&fluree, "it/typed-json:test").await;
 
     let tx = json!({
         "@context": ctx(),
@@ -144,7 +144,7 @@ async fn typed_json_expansion_novelty_json_value_decodes_via_binary_range_provid
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/typed-json-novelty:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed base data and build an index (persisted forward packs exist).
     let base_tx = json!({
@@ -442,7 +442,7 @@ async fn typed_json_novelty_only_json_equality_match() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/typed-json-eq:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Phase 1: Seed base @json data and build an index.
     let base_tx = json!({

@@ -32,7 +32,7 @@ use serde_json::json;
 async fn seed_two_ledgers(fluree: &MemoryFluree) -> (MemoryLedger, MemoryLedger) {
     let users = fluree
         .insert(
-            genesis_ledger(fluree, "mq:users"),
+            genesis_ledger(fluree, "mq-users:main").await,
             &json!({
                 "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
                 "@graph": [
@@ -46,7 +46,7 @@ async fn seed_two_ledgers(fluree: &MemoryFluree) -> (MemoryLedger, MemoryLedger)
         .ledger;
     let orders = fluree
         .insert(
-            genesis_ledger(fluree, "mq:orders"),
+            genesis_ledger(fluree, "mq-orders:main").await,
             &json!({
                 "@context": { "ex": "http://example.org/" },
                 "@graph": [
@@ -86,14 +86,14 @@ async fn multi_query_builder_runs_envelope_in_process() {
             "people_jsonld": {
                 "language": "jsonld",
                 "query": {
-                    "from":   "mq:users",
+                    "from":   "mq-users:main",
                     "select": ["?name"],
                     "where":  { "@id": "?p", "schema:name": "?name" }
                 }
             },
             "people_sparql": {
                 "language": "sparql",
-                "query": "SELECT ?name FROM <mq:users> WHERE { ?p schema:name ?name }"
+                "query": "SELECT ?name FROM <mq-users:main> WHERE { ?p schema:name ?name }"
             }
         }
     }))
@@ -117,8 +117,8 @@ async fn multi_query_builder_runs_envelope_in_process() {
     // The snapshot map echoes the per-ledger `t` so a downstream caller
     // can replay against the same moment.
     assert!(
-        response.snapshot.ledgers.get("mq:users").is_some(),
-        "snapshot.ledgers should contain mq:users, got: {:?}",
+        response.snapshot.ledgers.get("mq-users:main").is_some(),
+        "snapshot.ledgers should contain mq-users:main, got: {:?}",
         response.snapshot.ledgers
     );
 
@@ -149,13 +149,13 @@ async fn multi_query_two_ledgers_share_one_snapshot() {
         "queries": {
             "users":  {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             },
             "orders": {
                 "language": "jsonld",
-                "query": { "from": "mq:orders",
+                "query": { "from": "mq-orders:main",
                            "select": ["?id"],
                            "where": { "@id": "?o", "ex:orderId": "?id" } }
             }
@@ -171,8 +171,8 @@ async fn multi_query_two_ledgers_share_one_snapshot() {
         .expect("envelope executes");
 
     assert_eq!(response.status, MultiQueryStatus::Ok);
-    assert!(response.snapshot.ledgers.contains_key("mq:users"));
-    assert!(response.snapshot.ledgers.contains_key("mq:orders"));
+    assert!(response.snapshot.ledgers.contains_key("mq-users:main"));
+    assert!(response.snapshot.ledgers.contains_key("mq-orders:main"));
 }
 
 // =============================================================================
@@ -194,13 +194,13 @@ async fn multi_query_envelope_meta_populates_per_alias_tracking() {
         "queries": {
             "a": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             },
             "b": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?u"],
                            "where": { "@id": "?u", "schema:name": "Alice" } }
             }
@@ -243,14 +243,14 @@ async fn multi_query_per_subquery_opts_meta_only_tracks_that_alias() {
         "queries": {
             "tracked": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } },
                 "opts": { "meta": true }
             },
             "untracked": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             }
@@ -313,13 +313,13 @@ async fn multi_query_partial_failure_per_alias_via_in_process_api() {
         "queries": {
             "good": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             },
             "bad": {
                 "language": "sparql",
-                "query": "SELECT ?x FROM <mq:users> WHERE { this is not valid SPARQL }"
+                "query": "SELECT ?x FROM <mq-users:main> WHERE { this is not valid SPARQL }"
             }
         }
     }))
@@ -368,7 +368,7 @@ async fn multi_query_builder_bounds_override_is_threaded_through() {
         "queries": {
             "a": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             }
@@ -414,7 +414,7 @@ async fn multi_query_builder_typed_json_format_applies_to_jsonld_alias() {
         "queries": {
             "people": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             }
@@ -453,7 +453,7 @@ async fn multi_query_builder_rejects_non_json_format() {
         "queries": {
             "a": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             }
@@ -491,13 +491,13 @@ async fn multi_query_jsonld_normalize_arrays_does_not_change_sparql_alias_shape(
         "queries": {
             "jsonld_alias": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             },
             "sparql_alias": {
                 "language": "sparql",
-                "query": "SELECT ?n FROM <mq:users> WHERE { ?u schema:name ?n }"
+                "query": "SELECT ?n FROM <mq-users:main> WHERE { ?u schema:name ?n }"
             }
         }
     }))
@@ -552,7 +552,7 @@ async fn multi_query_builder_default_format_unchanged_without_format_call() {
         "queries": {
             "people": {
                 "language": "jsonld",
-                "query": { "from": "mq:users",
+                "query": { "from": "mq-users:main",
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             }

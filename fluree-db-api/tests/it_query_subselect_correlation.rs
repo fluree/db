@@ -45,7 +45,7 @@ use serde_json::json;
 /// Having no `ex:r`, it never appears in the per-subject subqueries (they
 /// require an `ex:r` join), so it leaves every other test's result unchanged.
 async fn seed_counts(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [

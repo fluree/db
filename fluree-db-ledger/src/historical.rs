@@ -610,8 +610,14 @@ mod tests {
         ledger_id: &str,
         commit: &fluree_db_novelty::Commit,
     ) -> ContentId {
-        use fluree_db_nameservice::{CasResult, RefPublisher, RefValue};
+        use fluree_db_nameservice::testing::CurrentFence;
+        use fluree_db_nameservice::{CasResult, NameServiceLookup, RefValue};
 
+        if ns.lookup(ledger_id).await.unwrap().is_none() {
+            fluree_db_nameservice::testing::create_at_name_root(ns, ledger_id)
+                .await
+                .unwrap();
+        }
         let store = content_store_for(
             storage.clone(),
             &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),

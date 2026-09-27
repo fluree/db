@@ -21,7 +21,7 @@ async fn seed(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
         "{PREFIX}ex:seed ex:p \"default\" .\nGRAPH <{OTHER}> {{ ex:zed ex:name \"Zed\" . }}\n"
     );
     fluree
-        .stage_owned(genesis_ledger(fluree, ledger_id))
+        .stage_owned(genesis_ledger(fluree, ledger_id).await)
         .upsert_turtle(&trig)
         .execute()
         .await

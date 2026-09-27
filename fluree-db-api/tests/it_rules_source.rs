@@ -24,7 +24,7 @@ async fn seed_rules_in_named_graph(
     ledger_id: &str,
     rules_graph_iri: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
 
     // JSON-LD update with `["graph", <iri>, {…}]` sugar so the
     // rule flake lands in the configured rules graph (rather than
@@ -153,7 +153,7 @@ async fn unknown_rules_source_graph_iri_fails_loudly() {
     // at db() load time, not silently fall back to "no rules".
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "rules-src/unknown-graph:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let cfg = config_iri(ledger_id);
     let bad_iri = "http://example.org/this-graph-does-not-exist";
@@ -197,7 +197,7 @@ async fn rules_source_with_unsupported_at_t_fails_loudly() {
     // as a config error rather than silently disabling rules.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "rules-src/unsupported-at-t:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let cfg = config_iri(ledger_id);
     let cfg_trig = format!(
@@ -245,7 +245,7 @@ async fn rule_in_named_graph_without_rules_source_is_ignored() {
     let fluree = FlureeBuilder::memory().build_memory();
     let rules_iri = "http://example.org/governance/rules";
     let ledger_id = "rules-src/no-config:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Same rule, same named graph — but no `f:rulesSource` config.
     let rule_tx = json!({

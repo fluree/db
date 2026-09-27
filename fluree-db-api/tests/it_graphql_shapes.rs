@@ -36,7 +36,7 @@ async fn run(fluree: &MemoryFluree, db: &GraphDb, query: &str) -> JsonValue {
 /// Two people and a company, plus shapes over both classes.
 async fn seeded(ledger_id: &str, shapes: JsonValue) -> (MemoryFluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let ledger = fluree
         .insert(
             ledger,

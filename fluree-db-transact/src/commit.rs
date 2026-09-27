@@ -1418,22 +1418,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl BranchLifecycle for LosePublishRaceNameService {
-        async fn create_branch(
-            &self,
-            ledger_name: &str,
-            new_branch: &str,
-            source_branch: &str,
-            at_commit: Option<(fluree_db_core::ContentId, i64)>,
-        ) -> fluree_db_nameservice::Result<()> {
-            self.inner
-                .create_branch(ledger_name, new_branch, source_branch, at_commit)
-                .await
-        }
-
-        async fn drop_branch(&self, ledger_id: &str) -> fluree_db_nameservice::Result<Option<u32>> {
-            self.inner.drop_branch(ledger_id).await
-        }
-
         async fn reset_head_fenced(
             &self,
             ledger_id: &str,
@@ -1504,17 +1488,6 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl fluree_db_nameservice::LedgerLifecycle for LosePublishRaceNameService {
-        async fn init(&self, ledger_id: &str) -> fluree_db_nameservice::Result<()> {
-            self.inner.init(ledger_id).await
-        }
-
-        async fn retract(&self, ledger_id: &str) -> fluree_db_nameservice::Result<()> {
-            self.inner.retract(ledger_id).await
-        }
-    }
-
-    #[async_trait::async_trait]
     impl fluree_db_nameservice::CommitPublisher for LosePublishRaceNameService {
         async fn publish_commit_fenced(
             &self,
@@ -1556,6 +1529,8 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
 
         // Stage an insert
         let txn = Txn::insert().with_insert(TripleTemplate::new(
@@ -1606,6 +1581,8 @@ mod tests {
 
         let nameservice = MemoryNameService::new();
 
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
+
         // Stage an empty transaction (no inserts)
         let txn = Txn::insert();
         let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
@@ -1643,6 +1620,8 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
@@ -1717,6 +1696,8 @@ mod tests {
 
         let nameservice = MemoryNameService::new();
 
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
+
         // Create a transaction with a large string value
         let big_value = "x".repeat(1000);
         let txn = Txn::insert().with_insert(TripleTemplate::new(
@@ -1769,6 +1750,7 @@ mod tests {
             inner: MemoryNameService::new(),
             winner_commit_id: winner_commit_id.clone(),
         };
+        let ledger = crate::test_support::created(&nameservice.inner, ledger).await;
 
         let txn = Txn::insert().with_insert(TripleTemplate::new(
             TemplateTerm::Sid(Sid::new(1, "ex:alice")),
@@ -1829,6 +1811,8 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let txn = Txn::insert();
         let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let (view, ns_registry) = stage(ledger, txn, ns_registry, StageOptions::default())

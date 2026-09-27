@@ -23,7 +23,7 @@ async fn debug_graph_ids_after_named_graph_index() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let trig = r#"
                 @prefix ex: <http://example.org/> .

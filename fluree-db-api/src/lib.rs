@@ -340,7 +340,7 @@ pub use fluree_db_ledger::{
 };
 pub use fluree_db_nameservice::{
     BranchLifecycle, ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue,
-    GraphSourceLookup, GraphSourcePublisher, IndexPublisher, IndexingNameService, LedgerLifecycle,
+    GraphSourceLookup, GraphSourcePublisher, IndexPublisher, IndexingNameService,
     NameServiceLookup, NsRecord, Publisher,
 };
 pub use fluree_db_novelty::Novelty;
@@ -608,15 +608,6 @@ impl NameServiceMode {
         }
     }
 
-    /// Get the ledger-admin surface ([`LedgerLifecycle`] — init,
-    /// retract, purge). `None` for [`Self::ReadOnly`].
-    pub fn ledger_admin(&self) -> Option<&dyn LedgerLifecycle> {
-        match self {
-            Self::ReadWrite(ns) => Some(ns.as_ref()),
-            Self::ReadOnly(_) => None,
-        }
-    }
-
     /// Get the branch-admin surface ([`BranchLifecycle`] —
     /// create_branch, drop_branch, reset_head). `None` for
     /// [`Self::ReadOnly`].
@@ -727,7 +718,7 @@ impl fluree_db_nameservice::GraphSourceLookup for NameServiceMode {
 // NOTE: `NameServiceMode` deliberately does NOT implement any of the
 // write traits (`GraphSourcePublisher`, `AdminPublisher`,
 // `ConfigPublisher`, `StatusPublisher`, `RefPublisher`,
-// `LedgerLifecycle`, `CommitPublisher`, `IndexPublisher`). The
+// `CommitPublisher`, `IndexPublisher`). The
 // `ReadOnly` variant has no writer to call, so any such impl would
 // have to fake the contract by returning an error on every call —
 // a runtime check for what is a compile-time guarantee, and a
@@ -3700,15 +3691,6 @@ impl Fluree {
             .ok_or_else(|| ApiError::internal("write operations require a read-write nameservice"))
     }
 
-    /// Get the ledger-admin write surface ([`LedgerLifecycle`] —
-    /// init, retract, purge). Available from both `ReadWrite` and
-    /// `Replicated` nameservices; errors only from `ReadOnly` proxies.
-    pub fn ledger_admin(&self) -> Result<&dyn LedgerLifecycle> {
-        self.nameservice_mode
-            .ledger_admin()
-            .ok_or_else(|| ApiError::internal("ledger admin requires a writable nameservice"))
-    }
-
     /// Get the branch-admin write surface ([`BranchLifecycle`] —
     /// create_branch, drop_branch, reset_head). Available from both
     /// `ReadWrite` and `Replicated` nameservices.
@@ -5425,6 +5407,7 @@ pub fn fluree_memory() -> Fluree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_nameservice::testing::CurrentFence;
 
     #[tokio::test]
     async fn test_fluree_builder_memory() {
@@ -5747,9 +5730,11 @@ mod tests {
         let cid = ContentId::new(ContentKind::Commit, b"commit-1");
 
         // Publish a record to nameservice directly (without caching the ledger)
-        fluree
-            .publisher()
-            .unwrap()
+        let publisher = fluree.publisher().unwrap();
+        fluree_db_nameservice::testing::create(publisher, "mydb:main")
+            .await
+            .unwrap();
+        publisher
             .publish_commit("mydb:main", 5, &cid)
             .await
             .unwrap();
@@ -5785,9 +5770,11 @@ mod tests {
         let cid = ContentId::new(ContentKind::Commit, b"commit-1");
 
         // Publish with canonical alias
-        fluree
-            .publisher()
-            .unwrap()
+        let publisher = fluree.publisher().unwrap();
+        fluree_db_nameservice::testing::create(publisher, "mydb:main")
+            .await
+            .unwrap();
+        publisher
             .publish_commit("mydb:main", 5, &cid)
             .await
             .unwrap();

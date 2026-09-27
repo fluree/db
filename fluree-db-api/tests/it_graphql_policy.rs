@@ -20,7 +20,7 @@ fn context() -> JsonValue {
 /// Two classes and a sensitive property, so a policy has something to remove in
 /// each dimension.
 async fn seed(fluree: &MemoryFluree, ledger_id: &str) -> LedgerState {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger,

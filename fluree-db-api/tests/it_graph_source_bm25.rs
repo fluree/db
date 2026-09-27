@@ -12,7 +12,7 @@ async fn bm25_create_full_text_index_indexes_docs_and_is_loadable() {
 
     // Seed a small ledger
     let ledger_id = "bm25/docs:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -49,7 +49,7 @@ async fn bm25_search_returns_scored_results() {
 
     // Seed ledger with documents
     let ledger_id = "bm25/search:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -124,7 +124,7 @@ async fn bm25_sync_indexes_new_documents() {
 
     // Create initial ledger with one doc
     let ledger_id = "bm25/sync:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -177,7 +177,7 @@ async fn bm25_snapshot_history_tracks_versions() {
 
     // Create ledger with doc
     let ledger_id = "bm25/history:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -237,7 +237,7 @@ async fn bm25_drop_full_text_index_cleans_up() {
 
     // Create ledger with doc
     let ledger_id = "bm25/drop:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -318,7 +318,7 @@ async fn bm25_recreate_after_drop() {
 
     // Create ledger with docs
     let ledger_id = "bm25/recreate:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -419,7 +419,7 @@ async fn bm25_federated_query_via_provider() {
 
     // Create ledger with documents
     let ledger_id = "bm25/federated:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -621,7 +621,7 @@ async fn bm25_query_connection_with_idx_pattern() {
 
     // Create ledger with documents
     let ledger_id = "bm25/qc:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -741,7 +741,7 @@ async fn bm25_embedded_search_via_plain_query_connection() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/plain-qc:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -806,7 +806,7 @@ async fn bm25_federated_query_with_aggregation() {
 
     // Create ledger with books having year and category metadata
     let ledger_id = "bm25/agg:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -904,7 +904,7 @@ async fn bm25_search_enforces_view_policy_on_indexed_flake() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/policy:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex": "http://example.org/" },
         "@graph": [
@@ -1008,7 +1008,7 @@ async fn bm25_embedded_search_via_dataset_path() {
     // Two ledgers so `from` is a dataset, forcing the dataset execution path.
     let l1 = "bm25/dataset-a:main";
     let l2 = "bm25/dataset-b:main";
-    let a0 = support::genesis_ledger(&fluree, l1);
+    let a0 = support::genesis_ledger(&fluree, l1).await;
     let _ = fluree
         .insert(
             a0,
@@ -1024,7 +1024,7 @@ async fn bm25_embedded_search_via_dataset_path() {
         .await
         .expect("insert a");
 
-    let b0 = support::genesis_ledger(&fluree, l2);
+    let b0 = support::genesis_ledger(&fluree, l2).await;
     let _ = fluree
         .insert(
             b0,
@@ -1085,7 +1085,7 @@ async fn bm25_embedded_search_enforces_policy_via_plain_query_connection() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/plain-policy:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let _ = fluree
         .insert(
             ledger0,
@@ -1201,7 +1201,7 @@ async fn bm25_embedded_search_via_tracked_dataset_path() {
 
     let l1 = "bm25/tracked-a:main";
     let l2 = "bm25/tracked-b:main";
-    let a0 = support::genesis_ledger(&fluree, l1);
+    let a0 = support::genesis_ledger(&fluree, l1).await;
     let _ = fluree
         .insert(
             a0,
@@ -1217,7 +1217,7 @@ async fn bm25_embedded_search_via_tracked_dataset_path() {
         .await
         .expect("insert a");
 
-    let b0 = support::genesis_ledger(&fluree, l2);
+    let b0 = support::genesis_ledger(&fluree, l2).await;
     let _ = fluree
         .insert(
             b0,
@@ -1455,7 +1455,7 @@ async fn bm25_sync_refuses_a_retracted_index() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/retracted:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Original document one" }]
@@ -1517,7 +1517,7 @@ async fn bm25_incremental_sync_matches_full_resync() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/diff:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let seed = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -1657,7 +1657,7 @@ async fn scoped_indexing_query_narrows_the_indexed_scan() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/fuel:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     const CORPUS: usize = 400;
     let docs: Vec<_> = (0..CORPUS)
@@ -1741,7 +1741,7 @@ async fn sync_without_indexed_changes_advances_watermark_without_resync() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/noop:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
@@ -1834,7 +1834,7 @@ async fn sync_with_wildcard_select_rebuilds_instead_of_advancing_past_the_change
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/wildcard:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
@@ -1889,7 +1889,7 @@ async fn sync_with_nested_projection_rebuilds_when_the_referenced_subject_change
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/nested:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ {
@@ -1952,7 +1952,7 @@ async fn sync_with_variable_predicate_always_rebuilds() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/varpred:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]

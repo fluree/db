@@ -15,7 +15,7 @@ use serde_json::json;
 #[tokio::test]
 async fn sparql_rule_grandparent() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-grandparent");
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-grandparent").await;
 
     let rule_data = json!({
         "@context": { "f": "https://ns.flur.ee/db#" },
@@ -66,7 +66,7 @@ async fn sparql_rule_grandparent() {
 #[tokio::test]
 async fn sparql_rule_with_filter() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-filter");
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-filter").await;
 
     let rule_data = json!({
         "@context": { "f": "https://ns.flur.ee/db#" },
@@ -125,7 +125,7 @@ async fn sparql_rule_with_filter() {
 #[tokio::test]
 async fn sparql_rule_unsupported_construct_rejected_loudly() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-unsupported");
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-unsupported").await;
 
     let rule_data = json!({
         "@context": { "f": "https://ns.flur.ee/db#" },
@@ -184,7 +184,7 @@ async fn sparql_rule_unsupported_construct_rejected_loudly() {
 #[tokio::test]
 async fn sparql_rule_literal_bound_predicate_variable_does_not_abort_other_rules() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-literal-pred");
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-literal-pred").await;
 
     let rule_data = json!({
         "@context": { "f": "https://ns.flur.ee/db#" },

@@ -212,7 +212,7 @@ pub struct DropResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// The dropped ledger's instance, by which a soft-dropped ledger is
-    /// restored or purged. Absent for a ledger created before name bindings.
+    /// restored or purged. Absent for a graph source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     /// Whether the name is free for a new ledger. Absent for a graph source.

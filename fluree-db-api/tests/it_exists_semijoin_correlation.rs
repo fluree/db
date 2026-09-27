@@ -278,7 +278,7 @@ where
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let result = fluree
                 .insert_with_opts(
                     ledger,
@@ -394,7 +394,7 @@ async fn uncorrelated_exists_keeps_semijoin() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let result = fluree
                 .insert_with_opts(
                     ledger,

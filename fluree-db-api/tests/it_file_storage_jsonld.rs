@@ -8,8 +8,7 @@
 //! - reload from file-backed nameservice + storage and re-run the query
 
 use crate::support;
-use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
 #[tokio::test]
@@ -25,8 +24,10 @@ async fn file_storage_jsonld_insert_then_query_roundtrip() {
     let ledger_id = "rust-port/jsonld-insert-query:main";
 
     // Create a brand-new ledger state (genesis).
-    let db = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     // Insert JSON-LD data.
     let insert = json!({
@@ -130,8 +131,10 @@ async fn file_storage_json_datatype_survives_commit_roundtrip() {
     support::assert_index_defaults();
 
     let ledger_id = "rust-port/json-dt-roundtrip:main";
-    let db = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     // Insert data with @json-typed value
     let insert = json!({

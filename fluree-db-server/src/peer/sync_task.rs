@@ -138,21 +138,12 @@ impl PeerSyncTask {
             return;
         };
 
-        // 1. Ensure ledger exists locally (idempotent). A ledger the origin
-        // created under a name binding is copied with it, so the copy reads
-        // from the origin's instance root.
-        let ensured = if record
-            .storage_root
-            .as_ref()
-            .and_then(fluree_db_core::StorageRoot::instance)
-            .is_some()
-        {
-            fluree_db_nameservice::lifecycle::mirror_record(ns, record)
-                .await
-                .map(Some)
-        } else {
-            ns.init(&record.ledger_id).await.map(|()| None)
-        };
+        // 1. Ensure ledger exists locally (idempotent), bound to the
+        // origin's instance and root so the copy reads from the origin's
+        // storage.
+        let ensured = fluree_db_nameservice::lifecycle::mirror_record(ns, record)
+            .await
+            .map(Some);
         // The fence the local copy's writes present.
         let fence = match ensured {
             Ok(fence) => fence,
@@ -324,16 +315,16 @@ impl PeerSyncTask {
         }
     }
 
-    /// Retract ledger locally and clear its in-memory watermarks. Cache
-    /// eviction follows from the retraction event the notifying
-    /// nameservice emits.
+    /// Remove the local copy of a branch the origin dropped and clear its
+    /// in-memory watermarks. Cache eviction follows from the retraction
+    /// event the notifying nameservice emits.
     async fn handle_ledger_retracted(&self, ledger_id: &fluree_db_api::LedgerId) {
-        // 1. Retract via Publisher::retract()
+        // 1. Remove the copy mirror_record made
         let Some(ns) = self.fluree.nameservice_mode().publisher() else {
             tracing::error!("PeerSyncTask requires a read-write nameservice");
             return;
         };
-        if let Err(e) = ns.retract(ledger_id).await {
+        if let Err(e) = fluree_db_nameservice::lifecycle::unmirror_record(ns, ledger_id).await {
             tracing::warn!(
                 ledger_id = %ledger_id,
                 error = %e,

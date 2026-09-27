@@ -39,7 +39,7 @@ fn person(i: usize) -> JsonValue {
 /// People interleaved with untyped subjects that share their predicates, so
 /// the typed subjects' ids are not contiguous.
 async fn seed_people(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> LedgerState {
-    let mut ledger = genesis_ledger_for_fluree(fluree, ledger_id);
+    let mut ledger = genesis_ledger_for_fluree(fluree, ledger_id).await;
     for start in (0..PEOPLE).step_by(4000) {
         let graph: Vec<JsonValue> = (start..start + 4000)
             .flat_map(|i| {
@@ -197,7 +197,7 @@ async fn driver_revisiting_a_subject_joins_it_once() {
     const TAGGED: usize = 3000;
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/pj-stream-revisit:main";
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let graph: Vec<JsonValue> = (0..TAGGED)
         .map(|i| {
             json!({

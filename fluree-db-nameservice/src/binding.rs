@@ -188,16 +188,17 @@ pub struct DroppedLedger {
 }
 
 /// Whether a write presenting `presented` may change a record carrying
-/// `fence`. A fenced record takes only its own fence, and nothing once
-/// frozen; a record from before fencing takes only unfenced writes.
+/// `fence`: every write presents the record's own fence, and a frozen record
+/// takes none. A record carrying no fence is garbage no binding can list, and
+/// takes no writes.
 pub fn fence_admits(fence: Option<Fence>, frozen: bool, presented: Option<Fence>) -> bool {
-    fence == presented && !frozen
+    presented.is_some() && fence == presented && !frozen
 }
 
 /// Refuse a write presenting `presented` to `record`, given as its fence and
 /// frozen flag or `None` when there is none, unless [`fence_admits`] it. A
-/// fenced write to a missing record is refused too: the branch was dropped
-/// since the writer loaded it, and publication never creates a record.
+/// write to a missing record is refused whatever it presents: publication
+/// never creates a record, so a write after a drop cannot bring one back.
 pub fn check_write_fence(
     ledger_id: &str,
     record: Option<(Option<Fence>, bool)>,
@@ -205,7 +206,7 @@ pub fn check_write_fence(
 ) -> Result<()> {
     let admitted = match record {
         Some((fence, frozen)) => fence_admits(fence, frozen, presented),
-        None => presented.is_none(),
+        None => false,
     };
     if admitted {
         Ok(())
@@ -379,17 +380,7 @@ pub fn resolve_record(binding: Option<&NameBinding>, mut record: NsRecord) -> Op
     Some(record)
 }
 
-/// How reads see a record, given its name's binding. Under a binding, see
-/// [`resolve_record`]. A record whose name has no binding at all was created
-/// before bindings, and reads as it is.
-pub fn resolve_for_read(binding: Option<&NameBinding>, record: NsRecord) -> Option<NsRecord> {
-    match binding {
-        None => Some(record),
-        Some(binding) => resolve_record(Some(binding), record),
-    }
-}
-
-/// [`resolve_for_read`] for one record, reading its binding from `store`.
+/// [`resolve_record`] for one record, reading its binding from `store`.
 pub async fn read_resolved<S: LedgerRegistry + ?Sized>(
     store: &S,
     record: Option<NsRecord>,
@@ -398,10 +389,10 @@ pub async fn read_resolved<S: LedgerRegistry + ?Sized>(
         return Ok(None);
     };
     let binding = store.get_binding(&record.name).await?;
-    Ok(resolve_for_read(binding.as_ref().map(|v| &v.value), record))
+    Ok(resolve_record(binding.as_ref().map(|v| &v.value), record))
 }
 
-/// [`resolve_for_read`] for many records, reading each name's binding once.
+/// [`resolve_record`] for many records, reading each name's binding once.
 pub async fn read_all_resolved<S: LedgerRegistry + ?Sized>(
     store: &S,
     records: Vec<NsRecord>,
@@ -414,7 +405,7 @@ pub async fn read_all_resolved<S: LedgerRegistry + ?Sized>(
             let binding = store.get_binding(&record.name).await?.map(|v| v.value);
             bindings.insert(record.name.clone(), binding);
         }
-        if let Some(record) = resolve_for_read(bindings[&record.name].as_ref(), record) {
+        if let Some(record) = resolve_record(bindings[&record.name].as_ref(), record) {
             resolved.push(record);
         }
     }

@@ -15,8 +15,7 @@
 
 pub mod span_capture;
 
-use fluree_db_api::{LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::LedgerState;
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 
@@ -243,24 +242,21 @@ pub async fn decode_annotations_for_subject(
     keys
 }
 
-/// Create a genesis ledger state for the given ledger ID.
-///
-/// This is the Rust equivalent of `(fluree/create conn "ledger")` prior to the first commit:
-/// the nameservice has no record yet, and `commit()` will create one via `publish_commit()`.
-pub fn genesis_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    genesis_ledger_for_fluree(fluree, ledger_id)
+/// Create the ledger `ledger_id` and return its genesis state, ready for its
+/// first commit: the Rust equivalent of `(fluree/create conn "ledger")`.
+pub async fn genesis_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    genesis_ledger_for_fluree(fluree, ledger_id).await
 }
 
 /// Generic version of `genesis_ledger` for any `Fluree` storage backend.
-///
-/// The ledger ID is normalized to canonical `name:branch` form (e.g., `"mydb"` → `"mydb:main"`)
-/// so that the `LedgerSnapshot.ledger_id` matches the canonical form used by the nameservice and
-/// content-addressed storage paths.
-pub fn genesis_ledger_for_fluree(_fluree: &fluree_db_api::Fluree, ledger_id: &str) -> LedgerState {
-    let canonical = fluree_db_core::ledger_id::normalize_ledger_id(ledger_id)
-        .unwrap_or_else(|_| ledger_id.to_string());
-    let db = LedgerSnapshot::genesis(&canonical);
-    LedgerState::new(db, Novelty::new(0))
+pub async fn genesis_ledger_for_fluree(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> LedgerState {
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .unwrap_or_else(|e| panic!("create {ledger_id}: {e}"))
 }
 
 // =============================================================================
@@ -276,7 +272,7 @@ pub async fn seed_user_with_ssn(
     user_id: &str,
     ssn: &str,
 ) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let txn = json!({
         "@context": {
             "ex": "http://example.org/ns/",
@@ -682,7 +678,7 @@ pub fn people_data() -> JsonValue {
 
 /// Seed the "people" dataset used by JSON-LD filter/optional/union tests.
 pub async fn seed_people_filter_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -740,7 +736,7 @@ pub async fn seed_people_filter_dataset(fluree: &MemoryFluree, ledger_id: &str) 
 
 /// Seed the "people" dataset used by JSON-LD compound query tests.
 pub async fn seed_people_compound_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {
             "id":"@id",
@@ -762,7 +758,7 @@ pub async fn seed_people_compound_dataset(fluree: &MemoryFluree, ledger_id: &str
 ///
 /// Includes `schema:ssn` so view-policy behavior can be tested.
 pub async fn seed_people_with_ssn(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let txn = json!({
         "@context": {

@@ -31,15 +31,14 @@ use crate::lifecycle::MigrationReport;
 use crate::migration::{FormatMarker, FORMAT_MARKER, LEGACY_NS_VERSION};
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
-    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
-    NS_VERSION,
+    merge_heads, ns_context, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
 };
 use crate::{
     check_cas_expectation, deserialize_json, ref_values_match, serialize_json, AdminPublisher,
     CasResult, CommitPublisher, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue,
     GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher,
-    LedgerHeads, LedgerLifecycle, NameServiceError, NsLookupResult, NsRecord, RefKind, RefLookup,
-    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    LedgerHeads, NameServiceError, NsLookupResult, NsRecord, RefKind, RefLookup, RefPublisher,
+    RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
@@ -290,15 +289,6 @@ impl FileNameService {
             .join(NS_VERSION)
             .join(ledger_name)
             .join(format!("{branch}.json"))
-    }
-
-    /// Get the filesystem path for the index ns record (for directory walking).
-    fn index_path(&self, ledger_name: &str, branch: &str) -> PathBuf {
-        self.storage
-            .base_path()
-            .join(NS_VERSION)
-            .join(ledger_name)
-            .join(format!("{branch}.index.json"))
     }
 
     /// Get the filesystem path for the append-only commit-CID index.
@@ -897,142 +887,6 @@ impl BranchRecordStore for FileNameService {
 
 #[async_trait]
 impl crate::BranchLifecycle for FileNameService {
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
-    ) -> Result<()> {
-        let address = Self::ns_address(ledger_name, new_branch);
-        let normalized_id = format_ledger_id(ledger_name, new_branch);
-
-        // Read the source branch to validate it exists (and to get commit info
-        // when `at_commit` is None).
-        let source_record = self
-            .load_record(ledger_name, source_branch)
-            .await?
-            .ok_or_else(|| {
-                NameServiceError::not_found(format!("source branch {ledger_name}:{source_branch}"))
-            })?;
-
-        let (commit_head_id, commit_t) = match at_commit {
-            Some((id, t)) => (Some(id), t),
-            None => (source_record.commit_head_id.clone(), source_record.commit_t),
-        };
-
-        let file = NsFileV2 {
-            context: ns_context(),
-            id: normalized_id.clone(),
-            record_type: vec!["f:LedgerSource".to_string()],
-            ledger: LedgerRef {
-                id: ledger_name.to_string(),
-            },
-            branch: new_branch.to_string(),
-            commit_cid: commit_head_id
-                .as_ref()
-                .map(std::string::ToString::to_string),
-            config_cid: None,
-            t: commit_t,
-            index: None,
-            status: "ready".to_string(),
-            default_context_cid: None,
-            status_v: Some(1),
-            status_meta: None,
-            config_v: Some(0),
-            config_meta: None,
-            source_branch: Some(source_branch.to_string()),
-            branch_point: Some(BranchPointRef {
-                source: source_branch.to_string(),
-                commit_cid: None,
-                t: 0,
-            }),
-            branches: 0,
-            fence: None,
-            extra: Default::default(),
-        };
-        let bytes = serde_json::to_vec_pretty(&file)?;
-
-        let created = self.storage.insert(&address, &bytes).await?;
-        if !created {
-            return Err(NameServiceError::ledger_already_exists(&normalized_id));
-        }
-
-        // Increment source branch's child count
-        let source_address = Self::ns_address(ledger_name, source_branch);
-        let outcome = self
-            .storage
-            .compare_and_swap(&source_address, |bytes| {
-                let Some(data) = bytes else {
-                    return Ok(CasAction::Abort(()));
-                };
-                let mut file: NsFileV2 = deserialize_json(data)?;
-                file.branches += 1;
-                let new_bytes = serialize_json(&file)?;
-                Ok(CasAction::Write(new_bytes))
-            })
-            .await?;
-
-        if matches!(outcome, CasOutcome::Aborted(())) {
-            // Source branch doesn't exist; clean up the file we just created
-            let created_path = self.ns_path(ledger_name, new_branch);
-            let _ = tokio::fs::remove_file(&created_path).await;
-            return Err(NameServiceError::not_found(format!(
-                "source branch {ledger_name}:{source_branch}"
-            )));
-        }
-
-        Ok(())
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-
-        // Read the record to find the parent before purging
-        let record = self
-            .load_record(&ledger_name, &branch)
-            .await?
-            .ok_or_else(|| NameServiceError::not_found(ledger_id))?;
-
-        let parent_source = record.source_branch.clone();
-
-        // Remove the NS files (purge)
-        let main_path = self.ns_path(&ledger_name, &branch);
-        let _ = tokio::fs::remove_file(&main_path).await;
-        let idx_path = self.index_path(&ledger_name, &branch);
-        let _ = tokio::fs::remove_file(&idx_path).await;
-        let _ = tokio::fs::remove_file(&self.commits_path(&ledger_name, &branch)).await;
-
-        // Decrement parent's child count if this branch had a parent
-        match parent_source {
-            Some(source) => {
-                let parent_address = Self::ns_address(&ledger_name, &source);
-                let outcome = self
-                    .storage
-                    .compare_and_swap(&parent_address, |bytes| {
-                        let Some(data) = bytes else {
-                            return Ok(CasAction::Abort(()));
-                        };
-                        let mut file: NsFileV2 = deserialize_json(data)?;
-                        file.branches = file.branches.saturating_sub(1);
-                        let new_bytes = serialize_json(&file)?;
-                        Ok(CasAction::Write(new_bytes))
-                    })
-                    .await?;
-
-                if matches!(outcome, CasOutcome::Aborted(())) {
-                    // Parent was already deleted — nothing to decrement
-                    return Ok(None);
-                }
-
-                // Re-read the parent to get the updated count
-                let parent_record = self.load_record(&ledger_name, &source).await?;
-                Ok(parent_record.map(|r| r.branches))
-            }
-            None => Ok(None),
-        }
-    }
-
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
@@ -1158,91 +1012,6 @@ impl crate::BranchLifecycle for FileNameService {
 struct CommitIndexEntry {
     t: i64,
     cid: String,
-}
-
-#[async_trait]
-impl LedgerLifecycle for FileNameService {
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let address = Self::ns_address(&ledger_name, &branch);
-        let normalized_address = format_ledger_id(&ledger_name, &branch);
-
-        // Create a fresh record with no commits
-        let file = NsFileV2 {
-            context: ns_context(),
-            id: normalized_address.clone(),
-            record_type: vec!["f:LedgerSource".to_string()],
-            ledger: LedgerRef {
-                id: ledger_name.clone(),
-            },
-            branch: branch.clone(),
-            commit_cid: None,
-            config_cid: None,
-            t: 0,
-            index: None,
-            status: "ready".to_string(),
-            default_context_cid: None,
-            // v2 extension fields - initialize with defaults
-            status_v: Some(1), // Initial status
-            status_meta: None,
-            config_v: Some(0), // Unborn config
-            config_meta: None,
-            source_branch: None,
-            branch_point: None,
-            branches: 0,
-            fence: None,
-            extra: Default::default(),
-        };
-        let bytes = serde_json::to_vec_pretty(&file)?;
-
-        // Atomic create-if-absent: returns false if file already exists.
-        let created = self.storage.insert(&address, &bytes).await?;
-        if !created {
-            return Err(NameServiceError::ledger_already_exists(normalized_address));
-        }
-
-        Ok(())
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let address = Self::ns_address(&ledger_name, &branch);
-
-        self.storage
-            .compare_and_swap(&address, |bytes| {
-                let Some(data) = bytes else {
-                    return Ok(CasAction::Abort(()));
-                };
-                let mut file: NsFileV2 = deserialize_json(data)?;
-                if file.status == "retracted" {
-                    return Ok(CasAction::Abort(()));
-                }
-                file.status = "retracted".to_string();
-                // Advance status_v when retracting
-                let current_v = file.status_v.unwrap_or(1);
-                file.status_v = Some(current_v + 1);
-                let new_bytes = serialize_json(&file)?;
-                Ok(CasAction::Write(new_bytes))
-            })
-            .await?;
-
-        Ok(())
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        // First retract (updates status, fires event)
-        self.retract(ledger_id).await?;
-        // Then remove the NS file so the alias can be reused
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let main_path = self.ns_path(&ledger_name, &branch);
-        let _ = tokio::fs::remove_file(&main_path).await;
-        // Also remove the index sidecar if present
-        let idx_path = self.index_path(&ledger_name, &branch);
-        let _ = tokio::fs::remove_file(&idx_path).await;
-        // And the commit-CID index sidecar
-        let _ = tokio::fs::remove_file(&self.commits_path(&ledger_name, &branch)).await;
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -2124,7 +1893,8 @@ mod lifecycle_conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BranchLifecycle, NameServiceLookup};
+    use crate::testing::CurrentFence;
+    use crate::NameServiceLookup;
     use fluree_db_core::ContentKind;
     use tempfile::TempDir;
 
@@ -2290,6 +2060,7 @@ mod tests {
         let cid_old = test_cid("commit-old");
 
         // First publish
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &cid1).await.unwrap();
 
         let record = ns.lookup("mydb:main").await.unwrap().unwrap();
@@ -2319,6 +2090,7 @@ mod tests {
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"index-1");
 
         // Publish commit
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 10, &commit_cid)
             .await
             .unwrap();
@@ -2341,6 +2113,7 @@ mod tests {
         let index_new_cid = ContentId::new(ContentKind::IndexRoot, b"index-new");
 
         // Publish commit with embedded index
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 10, &commit_cid)
             .await
             .unwrap();
@@ -2382,6 +2155,7 @@ mod tests {
             "mydb:feature.index",
             "mydb:main.json",
         ] {
+            crate::testing::create(&ns, id).await.unwrap();
             ns.publish_commit(id, 1, &test_cid(id)).await.unwrap();
         }
 
@@ -2428,12 +2202,15 @@ mod tests {
     async fn test_file_ns_all_records() {
         let (_temp, ns) = setup().await;
 
+        crate::testing::create(&ns, "db1:main").await.unwrap();
         ns.publish_commit("db1:main", 1, &test_cid("commit-1"))
             .await
             .unwrap();
+        crate::testing::create(&ns, "db2:main").await.unwrap();
         ns.publish_commit("db2:main", 1, &test_cid("commit-2"))
             .await
             .unwrap();
+        crate::testing::create(&ns, "db3:dev").await.unwrap();
         ns.publish_commit("db3:dev", 1, &test_cid("commit-3"))
             .await
             .unwrap();
@@ -2446,6 +2223,9 @@ mod tests {
     async fn test_file_ns_ledger_with_slash() {
         let (_temp, ns) = setup().await;
 
+        crate::testing::create(&ns, "tenant/customers:main")
+            .await
+            .unwrap();
         ns.publish_commit("tenant/customers:main", 1, &test_cid("commit-1"))
             .await
             .unwrap();
@@ -2619,6 +2399,7 @@ mod tests {
         let (_temp, ns) = setup().await;
 
         // Create a regular ledger
+        crate::testing::create(&ns, "ledger:main").await.unwrap();
         ns.publish_commit("ledger:main", 1, &test_cid("commit-1"))
             .await
             .unwrap();
@@ -2651,6 +2432,7 @@ mod tests {
         let (_temp, ns) = setup().await;
 
         // Create a regular ledger
+        crate::testing::create(&ns, "ledger:main").await.unwrap();
         ns.publish_commit("ledger:main", 1, &test_cid("commit-1"))
             .await
             .unwrap();
@@ -2668,6 +2450,7 @@ mod tests {
     async fn test_listings_exclude_graph_source_records() {
         let (_temp, ns) = setup().await;
 
+        crate::testing::create(&ns, "realdb:main").await.unwrap();
         ns.publish_commit("realdb:main", 1, &test_cid("commit-1"))
             .await
             .unwrap();
@@ -2789,6 +2572,7 @@ mod tests {
     async fn test_file_ref_get_ref_after_publish() {
         let (_dir, ns) = setup().await;
         let cid1 = test_cid("commit-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 5, &cid1).await.unwrap();
 
         let commit = ns
@@ -2805,8 +2589,12 @@ mod tests {
         let (_dir, ns) = setup().await;
         let new_ref = RefValue { id: None, t: 1 };
 
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
+
+        let unborn = ns.get_ref("mydb:main", RefKind::CommitHead).await.unwrap();
+
         let result = ns
-            .compare_and_set_ref("mydb:main", RefKind::CommitHead, None, &new_ref)
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, unborn.as_ref(), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);
@@ -2824,6 +2612,7 @@ mod tests {
     async fn test_file_ref_cas_conflict_already_exists() {
         let (_dir, ns) = setup().await;
         let cid1 = test_cid("commit-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &cid1).await.unwrap();
 
         let new_ref = RefValue { id: None, t: 2 };
@@ -2844,6 +2633,7 @@ mod tests {
     async fn test_file_ref_cas_cid_mismatch() {
         let (_dir, ns) = setup().await;
         let cid1 = test_cid("commit-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &cid1).await.unwrap();
 
         let wrong_cid = test_cid("wrong");
@@ -2869,6 +2659,7 @@ mod tests {
     async fn test_file_ref_cas_success() {
         let (_dir, ns) = setup().await;
         let cid1 = test_cid("commit-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &cid1).await.unwrap();
 
         // Expected must match what's stored: id from CID
@@ -2900,6 +2691,7 @@ mod tests {
     async fn test_file_ref_cas_commit_strict_monotonic() {
         let (_dir, ns) = setup().await;
         let cid1 = test_cid("commit-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 5, &cid1).await.unwrap();
 
         let expected = RefValue {
@@ -2925,6 +2717,7 @@ mod tests {
         let (_dir, ns) = setup().await;
         let commit_cid = test_cid("commit-1");
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"index-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 5, &commit_cid)
             .await
             .unwrap();
@@ -2951,6 +2744,7 @@ mod tests {
     async fn test_file_ref_fast_forward_commit() {
         let (_dir, ns) = setup().await;
         let cid1 = test_cid("commit-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 1, &cid1).await.unwrap();
 
         let new_ref = RefValue {
@@ -2975,6 +2769,7 @@ mod tests {
     async fn test_file_ref_fast_forward_rejected_stale() {
         let (_dir, ns) = setup().await;
         let cid1 = test_cid("commit-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 10, &cid1).await.unwrap();
 
         let new_ref = RefValue {
@@ -2998,6 +2793,7 @@ mod tests {
         let (_dir, ns) = setup().await;
         let commit_cid = test_cid("commit-1");
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"index-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 5, &commit_cid)
             .await
             .unwrap();
@@ -3028,6 +2824,7 @@ mod tests {
         let (_dir, ns) = setup().await;
         let commit_cid = test_cid("commit-1");
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"index-1");
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_commit("mydb:main", 5, &commit_cid)
             .await
             .unwrap();
@@ -3067,6 +2864,11 @@ mod tests {
         let inline = ContentId::new(ContentKind::IndexRoot, b"inline");
         let separate = ContentId::new(ContentKind::IndexRoot, b"separate");
 
+        let fence = crate::testing::create(&ns, "mydb:main")
+            .await
+            .unwrap()
+            .fence
+            .unwrap();
         ns.publish_commit("mydb:main", 9, &test_cid("commit-1"))
             .await
             .unwrap();
@@ -3092,6 +2894,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "@context": ns_context(),
                 "f:ledgerIndex": { "f:cid": separate.to_string(), "f:t": 5 },
+                "f:fence": fence.to_string(),
             }))
             .unwrap(),
         )
@@ -3122,7 +2925,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_status_get_initial() {
         let (_dir, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let status = ns.get_status("mydb:main").await.unwrap().unwrap();
         assert_eq!(status.v, 1);
@@ -3132,7 +2935,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_status_push_update() {
         let (_dir, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
 
@@ -3153,7 +2956,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_status_push_conflict() {
         let (_dir, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         // Try to push with wrong expected value
         let wrong_expected = crate::StatusValue::new(5, crate::StatusPayload::new("wrong"));
@@ -3173,28 +2976,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_file_retract_bumps_status_v() {
-        let (_dir, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
-
-        // Get initial status (v=1, state="ready")
-        let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
-        assert_eq!(initial.v, 1);
-        assert_eq!(initial.payload.state, "ready");
-
-        // Retract the ledger
-        ns.retract("mydb:main").await.unwrap();
-
-        // Verify status_v was incremented and state changed to "retracted"
-        let after_retract = ns.get_status("mydb:main").await.unwrap().unwrap();
-        assert_eq!(
-            after_retract.v, 2,
-            "status_v should be incremented on retract"
-        );
-        assert_eq!(after_retract.payload.state, "retracted");
-    }
-
     // =========================================================================
     // ConfigPublisher tests
     // =========================================================================
@@ -3209,7 +2990,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_config_get_unborn() {
         let (_dir, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let config = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert!(config.is_unborn());
@@ -3219,7 +3000,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_config_push_from_unborn() {
         let (_dir, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         let unborn = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert!(unborn.is_unborn());
@@ -3249,7 +3030,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_config_push_conflict() {
         let (_dir, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
 
         // Try to push with wrong expected value
         let wrong_expected = crate::ConfigValue::new(5, Some(crate::ConfigPayload::new()));
@@ -3275,13 +3056,11 @@ mod tests {
     #[tokio::test]
     async fn test_file_create_branch_from_main() {
         let (_temp, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_cid("commit-5");
         ns.publish_commit("mydb:main", 5, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "feature-x", "main", None)
-            .await
-            .unwrap();
+        crate::testing::create(&ns, "mydb:feature-x").await.unwrap();
 
         let record = ns.lookup("mydb:feature-x").await.unwrap().unwrap();
         assert_eq!(record.name, "mydb");
@@ -3294,30 +3073,28 @@ mod tests {
     #[tokio::test]
     async fn test_file_create_branch_duplicate_fails() {
         let (_temp, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_cid("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dev", "main", None).await.unwrap();
+        crate::testing::create(&ns, "mydb:dev").await.unwrap();
 
-        let result = ns.create_branch("mydb", "dev", "main", None).await;
+        let result = crate::testing::create(&ns, "mydb:dev").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_file_list_branches() {
         let (_temp, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_cid("commit-3");
         ns.publish_commit("mydb:main", 3, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dev", "main", None).await.unwrap();
-        ns.create_branch("mydb", "staging", "main", None)
-            .await
-            .unwrap();
+        crate::testing::create(&ns, "mydb:dev").await.unwrap();
+        crate::testing::create(&ns, "mydb:staging").await.unwrap();
 
         // Also create a different ledger to ensure filtering works
-        ns.init("other:main").await.unwrap();
+        crate::testing::create(&ns, "other:main").await.unwrap();
 
         let branches = ns.list_branches("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
@@ -3329,14 +3106,14 @@ mod tests {
     #[tokio::test]
     async fn test_file_list_branches_with_slashes() {
         let (_temp, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_cid("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "release/v1.0", "main", None)
+        crate::testing::create(&ns, "mydb:release/v1.0")
             .await
             .unwrap();
-        ns.create_branch("mydb", "feature/auth", "main", None)
+        crate::testing::create(&ns, "mydb:feature/auth")
             .await
             .unwrap();
 
@@ -3357,14 +3134,18 @@ mod tests {
     #[tokio::test]
     async fn test_file_list_branches_excludes_retracted() {
         let (_temp, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_cid("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dead", "main", None)
-            .await
-            .unwrap();
-        ns.retract("mydb:dead").await.unwrap();
+        crate::testing::create(&ns, "mydb:dead").await.unwrap();
+        crate::lifecycle::begin_drop_branch(
+            &ns,
+            &fluree_db_core::LedgerName::parse("mydb").unwrap(),
+            "dead",
+        )
+        .await
+        .unwrap();
 
         let branches = ns.list_branches("mydb").await.unwrap();
         assert_eq!(branches.len(), 1);
@@ -3374,13 +3155,11 @@ mod tests {
     #[tokio::test]
     async fn test_file_branch_point_persists_across_reload() {
         let (temp, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_cid("commit-2");
         ns.publish_commit("mydb:main", 2, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "persisted", "main", None)
-            .await
-            .unwrap();
+        crate::testing::create(&ns, "mydb:persisted").await.unwrap();
 
         // Create a new FileNameService pointing to the same directory
         let ns2 = FileNameService::new(temp.path());

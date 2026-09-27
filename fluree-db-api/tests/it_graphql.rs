@@ -14,7 +14,7 @@ fn context() -> JsonValue {
 
 /// Alice knows Bob and works for Acme; Bob has two names and no employer.
 async fn seed(fluree: &MemoryFluree, ledger_id: &str) -> LedgerState {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger,
@@ -315,7 +315,7 @@ async fn invalid_documents_come_back_in_the_graphql_envelope() {
 #[tokio::test]
 async fn a_ledger_with_no_typed_data_reports_an_empty_schema() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "gql-empty");
+    let ledger = genesis_ledger(&fluree, "gql-empty").await;
     let db = view(&ledger);
     let response = fluree
         .graphql(&db, &GraphQlRequest::new("{ __typename }"))
@@ -408,7 +408,7 @@ async fn the_default_context_is_part_of_the_cache_key() {
 #[tokio::test]
 async fn nested_field_arguments_page_each_subject_s_values() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "gql-nested-args");
+    let ledger = genesis_ledger(&fluree, "gql-nested-args").await;
     let ledger = fluree
         .insert(
             ledger,

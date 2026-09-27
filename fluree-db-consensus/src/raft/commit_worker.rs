@@ -7,7 +7,7 @@
 //! the rendezvous-hash owner resolves to; each polls its branch's
 //! queue front, restages the commit locally, writes the commit blob
 //! to shared CAS, and publishes the head advance through
-//! [`CommitPublisher::publish_commit`] — which proposes
+//! [`CommitPublisher::publish_commit_fenced`] — which proposes
 //! [`Command::ApplyHead`](crate::raft::state_machine::Command::ApplyHead).
 //! The entry pops and the head advances on that apply.
 //!
@@ -92,7 +92,7 @@ const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 /// — so a deterministic poison (e.g. [`PoisonReason::BodyMalformed`])
 /// would otherwise bounce forever and head-of-line-block the
 /// branch. Implementations dispatch by local-leader status, mirroring
-/// how [`CommitPublisher::publish_commit`] routes `ApplyHead` via
+/// how [`CommitPublisher::publish_commit_fenced`] routes `ApplyHead` via
 /// `RaftNameService::publish_commit_via_leader` on a follower.
 #[async_trait]
 pub trait QueuePoisonPublisher: Send + Sync {
@@ -178,7 +178,7 @@ pub struct StagingContext {
 ///
 /// Drains a single branch's queue: peeks the front, stages the
 /// commit, writes the commit blob, publishes the head advance through
-/// [`CommitPublisher::publish_commit`], and retires the entry. One
+/// [`CommitPublisher::publish_commit_fenced`], and retires the entry. One
 /// worker runs per active [`RefKey`] on whichever node the rendezvous
 /// owner resolves to; cross-branch concurrency is the supervisor's
 /// responsibility.

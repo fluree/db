@@ -3444,6 +3444,15 @@ impl crate::Fluree {
         index_config: &IndexConfig,
         commit_opts: CommitOpts,
     ) -> Result<(CommitReceipt, LedgerState)> {
+        // A commit publishes to the ledger's record and never creates one:
+        // a state that has none belongs to a ledger that was never created.
+        if view.base().ns_record.is_none() {
+            return Err(ApiError::NotFound(format!(
+                "Ledger not found: {}; create it with create_ledger before committing",
+                view.base().ledger_id()
+            )));
+        }
+
         // Resolve head temporal metadata if it wasn't observed at load time
         // (index == head, no novelty walk): the event-time monotonicity
         // guard and sticky dual-stamp decision in `build_commit` need it.

@@ -25,7 +25,7 @@ fn view(ledger: &LedgerState) -> GraphDb {
 /// A ledger with a Person shape and a curated schema built from `schema_extra`.
 async fn seeded(ledger_id: &str, schema_extra: JsonValue) -> (MemoryFluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let mut schema_node = json!({
         "@id": "ex:Api",

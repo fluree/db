@@ -55,6 +55,7 @@ native = ["fluree-db-nameservice/native", "fluree-db-core/native"]
 aws = ["dep:fluree-db-storage-aws", "dep:aws-config", "dep:aws-credential-types"]
 
 [dev-dependencies]
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false, features = ["conformance"] }
 fluree-db-core = { path = "../fluree-db-core" }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "test-util"] }
 wiremock = { workspace = true }

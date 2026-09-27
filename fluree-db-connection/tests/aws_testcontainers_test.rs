@@ -7,12 +7,12 @@
 
 use fluree_db_connection::{connect_async, ConnectionHandle};
 use fluree_db_core::{ContentId, ContentKind, StorageRead, StorageWrite};
+use fluree_db_nameservice::testing::{create, CurrentFence};
 use fluree_db_nameservice::{
-    AdminPublisher, CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher,
-    ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceType, IndexPublisher,
-    LedgerHeads, LedgerLifecycle, NameServiceLookup, NsLookupResult, RefKind, RefLookup,
-    RefPublisher, RefValue, StatusCasResult, StatusLookup, StatusPayload, StatusPublisher,
-    StatusValue,
+    BranchRecordStore, CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigValue,
+    GraphSourceLookup, GraphSourcePublisher, GraphSourceType, LedgerHeads, NameServiceError,
+    NameServiceLookup, NsLookupResult, RefKind, RefLookup, RefPublisher, RefValue, StatusCasResult,
+    StatusLookup, StatusPayload, StatusValue,
 };
 use fluree_db_storage_aws::DynamoDbNameService;
 use fs2::FileExt;
@@ -32,7 +32,7 @@ fn test_index_id(label: &str) -> ContentId {
 }
 
 async fn publish_commit(
-    ns: &(impl RefPublisher + ?Sized),
+    ns: &(impl RefPublisher + NameServiceLookup + ?Sized),
     ledger_id: &str,
     t: i64,
     cid: &ContentId,
@@ -226,11 +226,10 @@ async fn localstack_s3_and_dynamodb_smoke() {
     // 5) DynamoDB nameservice smoke: init + publish + lookup
     let alias = "mydb:main";
 
-    // Init materializes all concern items (meta, head, index, status, config)
-    aws.nameservice_arc()
-        .init(alias)
+    // Create materializes all concern items (meta, head, index, status, config)
+    create(aws.nameservice_arc().as_ref(), alias)
         .await
-        .expect("init should succeed");
+        .expect("create should succeed");
 
     // Publish commit head
     let commit_id = test_commit_id("commit:1");
@@ -238,7 +237,11 @@ async fn localstack_s3_and_dynamodb_smoke() {
 
     // Publish index head
     let index_id = test_index_id("index:1");
-    aws.publish_index(alias, None, 1, &index_id)
+    let fence =
+        fluree_db_nameservice::testing::current_fence(aws.nameservice_arc().as_ref(), alias)
+            .await
+            .unwrap();
+    aws.publish_index(alias, fence, 1, &index_id)
         .await
         .expect("publish_index should succeed");
 
@@ -336,38 +339,38 @@ async fn nameservice_ledger_lifecycle() {
     let alias = "lifecycle-test:main";
     let direct_alias = "lifecycle-direct:main";
 
-    // ── lookup before init → None ──────────────────────────────────────────
+    // ── lookup before create → None ────────────────────────────────────────
     assert!(ns.lookup(alias).await.unwrap().is_none());
 
-    // ── direct ref publish can create a commit head without prior init ─────
+    // ── publication never creates a record ─────────────────────────────────
     let direct_commit = test_commit_id("commit:direct");
-    let result = ns
+    assert!(ns
         .fast_forward_commit(
             direct_alias,
             &RefValue {
-                id: Some(direct_commit.clone()),
+                id: Some(direct_commit),
                 t: 1,
             },
             3,
         )
         .await
-        .unwrap();
-    assert!(matches!(result, CasResult::Updated));
-    let direct_record = ns.lookup(direct_alias).await.unwrap().expect("direct head");
-    assert_eq!(direct_record.commit_head_id.as_ref(), Some(&direct_commit));
-    assert_eq!(direct_record.commit_t, 1);
-
+        .is_err());
+    assert!(ns.lookup(direct_alias).await.unwrap().is_none());
     let err = ns.publish_index(alias, 1, &test_index_id("index:1")).await;
     assert!(
         err.is_err(),
-        "publish_index on uninitialized alias should fail"
+        "publish_index on an uncreated alias should fail"
     );
 
-    // ── init ────────────────────────────────────────────────
-    ns.init(alias).await.unwrap();
+    // ── create ─────────────────────────────────────────────────────────────
+    create(&ns, alias).await.unwrap();
 
     // Lookup returns record with unborn head/index
-    let rec = ns.lookup(alias).await.unwrap().expect("exists after init");
+    let rec = ns
+        .lookup(alias)
+        .await
+        .unwrap()
+        .expect("exists after create");
     assert_eq!(rec.ledger_id, alias, "ledger_id should be the full alias");
     assert_eq!(
         rec.name, "lifecycle-test",
@@ -378,14 +381,8 @@ async fn nameservice_ledger_lifecycle() {
     assert!(rec.index_head_id.is_none());
     assert_eq!(rec.index_t, 0);
 
-    // Double init → should succeed (idempotent or conflict suppressed)
-    // The implementation uses conditional PutItems that will fail if items exist,
-    // but the error should be suppressed as "already exists".
-    let init2 = ns.init(alias).await;
-    assert!(
-        init2.is_ok() || init2.is_err(),
-        "double init should not panic"
-    );
+    // A second create of the name is refused.
+    assert!(create(&ns, alias).await.is_err());
 
     // ── publish_commit + publish_index ─────────────────────────────────────
     let commit_id_1 = test_commit_id("commit:1");
@@ -424,12 +421,13 @@ async fn nameservice_ledger_lifecycle() {
         "all_records should contain our ledger"
     );
 
-    // ── retract ────────────────────────────────────────────────────────────
-    ns.retract(alias).await.unwrap();
-    // Lookup still returns record, but record should have retracted flag
-    // (NsRecord might not expose retracted directly — depends on fields)
-    let rec = ns.lookup(alias).await.unwrap();
-    assert!(rec.is_some(), "retracted record still visible via lookup");
+    // ── drop ───────────────────────────────────────────────────────────────
+    let name = fluree_db_core::LedgerName::parse("lifecycle-test").unwrap();
+    fluree_db_nameservice::lifecycle::drop_ledger(&ns, &name, false)
+        .await
+        .unwrap()
+        .expect("dropped");
+    assert!(ns.lookup(alias).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -437,7 +435,7 @@ async fn nameservice_admin_publisher() {
     let (_lock, _container, ns) = setup_localstack_ns().await;
 
     let alias = "admin-test:main";
-    ns.init(alias).await.unwrap();
+    create(&ns, alias).await.unwrap();
     let index_id_5 = test_index_id("index:5");
     ns.publish_index(alias, 5, &index_id_5).await.unwrap();
 
@@ -480,17 +478,14 @@ async fn publish_index_without_preexisting_index_item() {
 
     let alias = "missing-index-item:main";
 
-    // 1. Initialize ledger — creates meta, head, index, status, config items
-    ns.init(alias).await.unwrap();
-
-    // Sanity: publish_index works on a fully initialized ledger
-    let index_id_1 = test_index_id("index:1");
-    ns.publish_index(alias, 1, &index_id_1).await.unwrap();
-    let rec = ns.lookup(alias).await.unwrap().unwrap();
-    assert_eq!(rec.index_head_id.as_ref(), Some(&index_id_1));
-    assert_eq!(rec.index_t, 1);
-
-    // 2. Manually delete the sk="index" item to simulate the bug condition
+    // 1. A record from before fences, whose sk="index" item was never
+    // written: insert it unfenced, then delete the item.
+    let id = fluree_db_core::LedgerId::parse(alias).unwrap();
+    assert!(ns
+        .insert_record(&fluree_db_nameservice::NsRecord::new(id))
+        .await
+        .unwrap()
+        .is_none());
     let ddb = aws_sdk_dynamodb::Client::new(&sdk_config);
     ddb.delete_item()
         .table_name("fluree-ns-test")
@@ -506,18 +501,17 @@ async fn publish_index_without_preexisting_index_item() {
         .await
         .expect("delete_item should succeed");
 
-    // Verify the index item is gone
-    let rec = ns.lookup(alias).await.unwrap().unwrap();
-    assert!(
-        rec.index_head_id.is_none(),
-        "index should be gone after manual deletion"
-    );
+    // 2. A fenced publish never creates an item, so the migration that
+    // fences the record must write the missing one.
+    fluree_db_nameservice::lifecycle::migrate_legacy(&ns)
+        .await
+        .unwrap();
 
     // 3. publish_index should succeed — this was the bug
     let index_id_2 = test_index_id("index:2");
     ns.publish_index(alias, 2, &index_id_2)
         .await
-        .expect("publish_index must succeed even when sk=index item is missing");
+        .expect("publish_index must succeed once the migration fenced the record");
 
     // 4. Verify the index was written correctly
     let rec = ns.lookup(alias).await.unwrap().unwrap();
@@ -557,7 +551,7 @@ async fn nameservice_ref_publisher() {
         .is_none());
     assert!(ns.heads(alias).await.unwrap().is_none());
 
-    ns.init(alias).await.unwrap();
+    create(&ns, alias).await.unwrap();
 
     // get_ref after init → unborn (id=None, t=0)
     let ref_val = ns
@@ -655,40 +649,28 @@ async fn nameservice_ref_publisher() {
     assert_eq!(heads.commit.id.as_ref(), Some(&commit_id_2));
     assert_eq!(heads.index, new_idx);
 
-    // ── CAS expected=None creates ledger (matches StorageNameService) ────
+    // ── A CAS never creates a record ────
     let new_alias = "cas-create-test:main";
-    assert!(ns.lookup(new_alias).await.unwrap().is_none());
-
-    let create_commit_id = test_commit_id("create-commit:1");
     let create_ref = RefValue {
-        id: Some(create_commit_id.clone()),
+        id: Some(test_commit_id("create-commit:1")),
         t: 1,
     };
     let result = ns
         .compare_and_set_ref(new_alias, RefKind::CommitHead, None, &create_ref)
-        .await
-        .unwrap();
+        .await;
     assert!(
-        matches!(result, CasResult::Updated),
-        "expected=None should create ledger when alias unknown"
+        matches!(result, Err(NameServiceError::Fenced(_))),
+        "a CAS on an unknown alias is refused, got {result:?}"
     );
+    assert!(ns.lookup(new_alias).await.unwrap().is_none());
 
-    // Verify the ledger was created with the ref set
-    let rec = ns
-        .lookup(new_alias)
-        .await
-        .unwrap()
-        .expect("ledger should exist after CAS create");
-    assert_eq!(rec.commit_head_id.as_ref(), Some(&create_commit_id));
-    assert_eq!(rec.index_t, 0, "index should be unborn");
-
-    // CAS expected=None on existing alias → Conflict
+    // expected=None on an existing ledger → Conflict
     let create_ref2 = RefValue {
         id: Some(test_commit_id("commit:99")),
         t: 99,
     };
     let result = ns
-        .compare_and_set_ref(new_alias, RefKind::CommitHead, None, &create_ref2)
+        .compare_and_set_ref(alias, RefKind::CommitHead, None, &create_ref2)
         .await
         .unwrap();
     assert!(
@@ -706,7 +688,7 @@ async fn nameservice_status_publisher() {
     // get_status before init → None
     assert!(ns.get_status(alias).await.unwrap().is_none());
 
-    ns.init(alias).await.unwrap();
+    create(&ns, alias).await.unwrap();
 
     // get_status after init → initial (v=1, state="ready")
     let status = ns.get_status(alias).await.unwrap().expect("exists");
@@ -745,7 +727,7 @@ async fn nameservice_config_publisher() {
     // get_config before init → None
     assert!(ns.get_config(alias).await.unwrap().is_none());
 
-    ns.init(alias).await.unwrap();
+    create(&ns, alias).await.unwrap();
 
     // get_config after init → unborn (v=0, payload=None)
     let config = ns.get_config(alias).await.unwrap().expect("exists");
@@ -867,7 +849,7 @@ async fn nameservice_graph_source_publisher() {
     }
 
     // Also test lookup_any for a ledger
-    ns.init("ledger-test:main").await.unwrap();
+    create(&ns, "ledger-test:main").await.unwrap();
     let any = ns.lookup_any("ledger-test:main").await.unwrap();
     match any {
         NsLookupResult::Ledger(ref r) => assert_eq!(r.ledger_id, "ledger-test:main"),

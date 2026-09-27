@@ -16,7 +16,7 @@ async fn commit_id_has_valid_sha256_format() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/hash-format:main";
 
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let tx = json!({
         "@context": {
@@ -66,7 +66,7 @@ async fn sequential_commits_produce_unique_hashes() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/unique-hashes:main";
 
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let tx1 = json!({
         "@context": {"ex": "http://example.org/ns/"},
@@ -114,7 +114,7 @@ async fn commit_id_consistent_within_session() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/consistent-id:main";
 
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     let tx = json!({
         "@context": {"ex": "http://example.org/ns/"},

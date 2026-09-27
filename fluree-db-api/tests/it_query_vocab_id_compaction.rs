@@ -19,7 +19,7 @@ use serde_json::{json, Value as JsonValue};
 /// - `http://example.org/items/q1`     (an Item, referenced by the list)
 async fn seed_lists() -> (MemoryFluree, MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/vocab-id:lists");
+    let ledger0 = genesis_ledger(&fluree, "it/vocab-id:lists").await;
 
     let tx = json!({
         "@context": {
@@ -153,7 +153,7 @@ async fn flat_select_ref_under_vocab_is_not_bare_term() {
 #[tokio::test]
 async fn base_and_vocab_each_govern_their_position() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/vocab-id:base-vocab");
+    let ledger0 = genesis_ledger(&fluree, "it/vocab-id:base-vocab").await;
 
     // Insert: a relative @id (→ @base), bare @type/predicates (→ @vocab), and a
     // reference whose @id is written under the @vocab namespace (via `v:`).
@@ -251,7 +251,7 @@ async fn base_and_vocab_each_govern_their_position() {
 #[tokio::test]
 async fn vocab_empty_string_maps_to_base() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/vocab-id:vocab-empty");
+    let ledger0 = genesis_ledger(&fluree, "it/vocab-id:vocab-empty").await;
 
     let insert = json!({
         "@context": {"@base": "https://flur.ee/ledger/", "@vocab": ""},

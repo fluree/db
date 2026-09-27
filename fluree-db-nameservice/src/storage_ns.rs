@@ -23,16 +23,14 @@ use crate::binding::{
 };
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
-    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
-    NS_VERSION,
+    merge_heads, ns_context, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
 };
 use crate::{
     deserialize_json, serialize_json, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
     GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads,
-    LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind,
-    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
-    StatusValue,
+    NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup,
+    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
@@ -882,128 +880,6 @@ impl<S> BranchLifecycle for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
-    ) -> Result<()> {
-        let key = self.ns_key(ledger_name, new_branch);
-        let normalized_id = format_ledger_id(ledger_name, new_branch);
-
-        // Read the source branch to validate it exists (and to get commit info
-        // when `at_commit` is None).
-        let source_record = self
-            .load_record(ledger_name, source_branch)
-            .await?
-            .ok_or_else(|| {
-                NameServiceError::not_found(format!("source branch {ledger_name}:{source_branch}"))
-            })?;
-
-        let (commit_head_id, commit_t) = match at_commit {
-            Some((id, t)) => (Some(id), t),
-            None => (source_record.commit_head_id.clone(), source_record.commit_t),
-        };
-
-        let file = NsFileV2 {
-            context: ns_context(),
-            id: normalized_id.clone(),
-            record_type: vec!["f:LedgerSource".to_string()],
-            ledger: LedgerRef {
-                id: ledger_name.to_string(),
-            },
-            branch: new_branch.to_string(),
-            commit_cid: commit_head_id
-                .as_ref()
-                .map(std::string::ToString::to_string),
-            config_cid: None,
-            t: commit_t,
-            index: None,
-            status: "ready".to_string(),
-            default_context_cid: None,
-            status_v: Some(1),
-            status_meta: None,
-            config_v: Some(0),
-            config_meta: None,
-            source_branch: Some(source_branch.to_string()),
-            branch_point: Some(BranchPointRef {
-                source: source_branch.to_string(),
-                commit_cid: None,
-                t: 0,
-            }),
-            branches: 0,
-            fence: None,
-            extra: Default::default(),
-        };
-        let bytes = serde_json::to_vec_pretty(&file)
-            .map_err(|e| NameServiceError::storage(e.to_string()))?;
-
-        let created = self.storage.insert(&key, &bytes).await?;
-        if !created {
-            return Err(NameServiceError::ledger_already_exists(&normalized_id));
-        }
-
-        // Increment source branch's child count
-        let source_key = self.ns_key(ledger_name, source_branch);
-        self.cas_update::<NsFileV2, _>(&source_key, |existing| {
-            let mut file = existing?;
-            file.branches += 1;
-            Some(file)
-        })
-        .await?;
-
-        Ok(())
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-
-        // Read the record to find the parent before purging
-        let record = self
-            .load_record(&ledger_name, &branch)
-            .await?
-            .ok_or_else(|| NameServiceError::not_found(ledger_id))?;
-
-        // Refuse a branch that still has children — the same lineage
-        // guard the raft state machine enforces. The authoritative
-        // drop policy in the api layer defers (retracts) a branch
-        // with children rather than reaching this primitive, so this
-        // only fires on a direct out-of-order call, failing loud
-        // instead of stranding a child with a dangling `source_branch`.
-        if record.branches > 0 {
-            return Err(NameServiceError::storage(format!(
-                "drop_branch refused: {ledger_id} still has {} child branch(es)",
-                record.branches
-            )));
-        }
-
-        let parent_source = record.source_branch.clone();
-
-        // Remove the NS files
-        let main_key = self.ns_key(&ledger_name, &branch);
-        let index_key = self.index_key(&ledger_name, &branch);
-        let _ = self.storage.delete(&main_key).await;
-        let _ = self.storage.delete(&index_key).await;
-
-        // Decrement parent's child count if this branch had a parent
-        match parent_source {
-            Some(source) => {
-                let parent_key = self.ns_key(&ledger_name, &source);
-                self.cas_update::<NsFileV2, _>(&parent_key, move |existing| {
-                    let mut file = existing?;
-                    file.branches = file.branches.saturating_sub(1);
-                    Some(file)
-                })
-                .await?;
-                // Re-read the parent to get the updated count
-                let parent_record = self.load_record(&ledger_name, &source).await?;
-                Ok(parent_record.map(|r| r.branches))
-            }
-            None => Ok(None),
-        }
-    }
-
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
@@ -1034,95 +910,6 @@ where
             CasOutcome::Aborted(true) => Err(NameServiceError::fenced(ledger_id)),
             CasOutcome::Aborted(false) => Err(NameServiceError::not_found(ledger_id)),
         }
-    }
-}
-
-#[async_trait]
-impl<S> LedgerLifecycle for StorageNameService<S>
-where
-    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
-{
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let key = self.ns_key(&ledger_name, &branch);
-        let normalized_address = format_ledger_id(&ledger_name, &branch);
-
-        // Create minimal record with no commits
-        let file = NsFileV2 {
-            context: ns_context(),
-            id: normalized_address.clone(),
-            record_type: vec!["f:LedgerSource".to_string()],
-            ledger: LedgerRef {
-                id: ledger_name.clone(),
-            },
-            branch: branch.clone(),
-            commit_cid: None,
-            config_cid: None,
-            t: 0,
-            index: None,
-            status: "ready".to_string(),
-            default_context_cid: None,
-            // v2 extension fields
-            status_v: Some(1),
-            status_meta: None,
-            config_v: Some(0),
-            config_meta: None,
-            source_branch: None,
-            branch_point: None,
-            branches: 0,
-            fence: None,
-            extra: Default::default(),
-        };
-
-        let bytes = serde_json::to_vec_pretty(&file)?;
-
-        // Use insert for atomic create-if-not-exists
-        match self.storage.insert(&key, &bytes).await {
-            Ok(true) => Ok(()), // Successfully created
-            Ok(false) => {
-                // Record exists — check if it's retracted (dropped) and allow re-creation
-                match self.storage.read_bytes(&key).await {
-                    Ok(existing_bytes) => {
-                        let existing: NsFileV2 = serde_json::from_slice(&existing_bytes)?;
-                        if existing.status == "retracted" {
-                            // Overwrite the retracted record with a fresh one
-                            self.storage.write_bytes(&key, &bytes).await.map_err(|e| {
-                                NameServiceError::storage(format!(
-                                    "Failed to re-create ledger {normalized_address}: {e}"
-                                ))
-                            })?;
-                            // Clean up stale index sidecar
-                            let idx_key = self.index_key(&ledger_name, &branch);
-                            let _ = self.storage.delete(&idx_key).await;
-                            return Ok(());
-                        }
-                        Err(NameServiceError::ledger_already_exists(normalized_address))
-                    }
-                    Err(_) => Err(NameServiceError::ledger_already_exists(normalized_address)),
-                }
-            }
-            Err(e) => Err(NameServiceError::storage(format!(
-                "Failed to create ledger {normalized_address}: {e}"
-            ))),
-        }
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let key = self.ns_key(&ledger_name, &branch);
-
-        self.cas_update::<NsFileV2, _>(&key, |existing| {
-            let mut file = existing?;
-            if file.status == "retracted" {
-                return None; // Already retracted
-            }
-            file.status = "retracted".to_string();
-            // Advance status_v when retracting
-            let current_v = file.status_v.unwrap_or(1);
-            file.status_v = Some(current_v + 1);
-            Some(file)
-        })
-        .await
     }
 }
 
@@ -2033,10 +1820,16 @@ mod tests {
     }
 
     use super::*;
+    use crate::testing::CurrentFence;
     use crate::{CasResult, ConfigPayload, RefPublisher, RefValue, StatusPayload};
     use fluree_db_core::StorageExtError;
 
-    async fn publish_commit(ns: &impl RefPublisher, ledger_id: &str, t: i64, cid: &ContentId) {
+    async fn publish_commit(
+        ns: &(impl RefPublisher + NameServiceLookup),
+        ledger_id: &str,
+        t: i64,
+        cid: &ContentId,
+    ) {
         let new = RefValue {
             id: Some(cid.clone()),
             t,
@@ -2424,6 +2217,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_status_push_retries_on_etag_mismatch() {
         let ns = make_flaky_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let expected = ns.get_status("mydb:main").await.unwrap().unwrap();
@@ -2443,6 +2237,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_config_push_retries_on_etag_mismatch() {
         let ns = make_flaky_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let expected = ns.get_config("mydb:main").await.unwrap().unwrap();
@@ -2479,6 +2274,7 @@ mod tests {
             "mydb:feature.index",
             "mydb:main.json",
         ] {
+            crate::testing::create(&ns, id).await.unwrap();
             publish_commit(&ns, id, 1, &dummy_cid(id)).await;
         }
 
@@ -2524,6 +2320,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_get_ref_after_publish() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 5, &dummy_cid("commit-1")).await;
 
         let commit = ns
@@ -2543,8 +2340,12 @@ mod tests {
             t: 1,
         };
 
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
+
+        let unborn = ns.get_ref("mydb:main", RefKind::CommitHead).await.unwrap();
+
         let result = ns
-            .compare_and_set_ref("mydb:main", RefKind::CommitHead, None, &new_ref)
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, unborn.as_ref(), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);
@@ -2561,6 +2362,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_conflict_already_exists() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let new_ref = RefValue {
@@ -2583,6 +2385,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_id_mismatch() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let expected = RefValue {
@@ -2606,6 +2409,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_success() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let expected = RefValue {
@@ -2634,6 +2438,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_commit_strict_monotonic() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 5, &dummy_cid("commit-1")).await;
 
         let expected = RefValue {
@@ -2658,6 +2463,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_index_allows_equal_t() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_index("mydb:main", 5, &dummy_cid("index-1"))
             .await
             .unwrap();
@@ -2680,6 +2486,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_fast_forward_commit() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let new_ref = RefValue {
@@ -2703,6 +2510,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_fast_forward_rejected_stale() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 10, &dummy_cid("commit-1")).await;
 
         let new_ref = RefValue {
@@ -2724,6 +2532,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_get_index_after_publish() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 5, &dummy_cid("commit-1")).await;
         ns.publish_index("mydb:main", 3, &dummy_cid("index-1"))
             .await
@@ -2743,6 +2552,7 @@ mod tests {
         let ns = make_storage_ns();
         assert_eq!(ns.heads("mydb:main").await.unwrap(), None);
 
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 5, &dummy_cid("commit-1")).await;
         let heads = ns.heads("mydb:main").await.unwrap().unwrap();
         assert_eq!(heads.commit.t, 5);
@@ -2769,13 +2579,14 @@ mod tests {
             id: Some(dummy_cid("commit-2")),
             t: 2,
         };
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let result = ns
             .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
             CasResult::Conflict { actual } => {
-                assert_eq!(actual, None);
+                assert!(actual.as_ref().is_none_or(|a| a.id.is_none()), "{actual:?}");
             }
             _ => panic!("expected conflict when ref doesn't exist"),
         }
@@ -2784,30 +2595,6 @@ mod tests {
     // =========================================================================
     // StatusPublisher tests
     // =========================================================================
-
-    #[tokio::test]
-    async fn test_storage_retract_bumps_status_v() {
-        use crate::StatusLookup;
-
-        let ns = make_storage_ns();
-        ns.init("mydb:main").await.unwrap();
-
-        // Get initial status (v=1, state="ready")
-        let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
-        assert_eq!(initial.v, 1);
-        assert_eq!(initial.payload.state, "ready");
-
-        // Retract the ledger
-        ns.retract("mydb:main").await.unwrap();
-
-        // Verify status_v was incremented and state changed to "retracted"
-        let after_retract = ns.get_status("mydb:main").await.unwrap().unwrap();
-        assert_eq!(
-            after_retract.v, 2,
-            "status_v should be incremented on retract"
-        );
-        assert_eq!(after_retract.payload.state, "retracted");
-    }
 
     /// Regression (#1369): a graph-source record shares the
     /// `ns@v3/{name}/{branch}.json` key space with ledger records but uses a
@@ -2819,6 +2606,7 @@ mod tests {
     async fn test_storage_ns_lookup_skips_graph_source_record() {
         let ns = make_storage_ns();
 
+        crate::testing::create(&ns, "realdb:main").await.unwrap();
         publish_commit(&ns, "realdb:main", 1, &dummy_cid("commit-1")).await;
         ns.publish_graph_source(
             "gs",
@@ -2849,32 +2637,5 @@ mod tests {
             ns.lookup_any("realdb:main").await.unwrap(),
             NsLookupResult::Ledger(_)
         ));
-    }
-
-    #[tokio::test]
-    async fn drop_branch_refuses_parent_with_children() {
-        let ns = make_storage_ns();
-        ns.init("mydb:main").await.unwrap();
-        ns.create_branch("mydb", "feature", "main", None)
-            .await
-            .unwrap();
-
-        // `main` has a child — the drop must refuse and leave both
-        // records intact rather than strand `feature` with a
-        // dangling `source_branch`.
-        let err = ns
-            .drop_branch("mydb:main")
-            .await
-            .expect_err("dropping a parent with children must fail");
-        assert!(
-            err.to_string().contains("child branch"),
-            "expected child-branch refusal, got: {err}"
-        );
-        assert!(ns.lookup("mydb:main").await.unwrap().is_some());
-        assert!(ns.lookup("mydb:feature").await.unwrap().is_some());
-
-        // Leaf-first drop succeeds.
-        ns.drop_branch("mydb:feature").await.unwrap();
-        ns.drop_branch("mydb:main").await.unwrap();
     }
 }

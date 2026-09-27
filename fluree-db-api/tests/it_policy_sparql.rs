@@ -21,7 +21,7 @@ use std::collections::HashMap;
 async fn sparql_policy_stored_ask_restricts_property() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "policy_sparql_ssn");
+    let ledger0 = genesis_ledger(&fluree, "policy_sparql_ssn").await;
 
     let setup = json!({
         "@context": {
@@ -119,7 +119,7 @@ async fn sparql_policy_stored_ask_restricts_property() {
 
 /// Helper to seed items with a numeric classification level.
 async fn seed_leveled_data(fluree: &support::MemoryFluree, ledger_id: &str) {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let txn = json!({
         "@context": { "ex": "http://example.org/ns/" },
         "@graph": [
@@ -270,7 +270,7 @@ async fn sparql_policy_select_form() {
 async fn sparql_policy_positional_identity_unbound_fails_closed() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "policy_sparql_unbound_identity");
+    let ledger0 = genesis_ledger(&fluree, "policy_sparql_unbound_identity").await;
 
     let setup = json!({
         "@context": {
@@ -363,7 +363,7 @@ async fn sparql_policy_positional_identity_unbound_fails_closed() {
 async fn sparql_policy_positional_identity_bound_still_allows() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "policy_sparql_bound_identity");
+    let ledger0 = genesis_ledger(&fluree, "policy_sparql_bound_identity").await;
 
     let setup = json!({
         "@context": {

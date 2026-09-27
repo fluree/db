@@ -27,7 +27,7 @@ fn ctx() -> JsonValue {
 }
 
 async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [
@@ -408,7 +408,7 @@ async fn jsonld_datatype_of_iri_keeps_id_extension() {
 #[tokio::test]
 async fn sparql_xsd_temporal_casts() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "exprsem/d3:sparql");
+    let ledger0 = genesis_ledger(&fluree, "exprsem/d3:sparql").await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [
@@ -454,7 +454,7 @@ async fn sparql_xsd_temporal_casts() {
 #[tokio::test]
 async fn sparql_bnode_label_is_per_solution() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "exprsem/d9:sparql");
+    let ledger0 = genesis_ledger(&fluree, "exprsem/d9:sparql").await;
     let tx = json!({
         "@context": { "ex": "http://example.org/" },
         "@graph": [
@@ -510,7 +510,7 @@ WHERE {
 #[tokio::test]
 async fn sparql_regex_q_flag_literal_pattern() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "exprsem/d10:sparql");
+    let ledger0 = genesis_ledger(&fluree, "exprsem/d10:sparql").await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [
@@ -638,7 +638,7 @@ async fn jsonld_values_integer_is_xsd_integer_term() {
 
 /// One node carrying an xsd:float, xsd:decimal and xsd:double property.
 async fn seed_typed(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [{
@@ -700,7 +700,7 @@ async fn jsonld_numeric_promotion_result_datatype() {
 /// One node carrying a negative, fractional xsd:float — drives all four numeric
 /// builtins (ABS/ROUND/CEIL/FLOOR) and isNumeric across the rounding directions.
 async fn seed_float(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [{ "@id": "ex:n", "ex:f": { "@value": "-2.5", "@type": "xsd:float" } }]
@@ -883,7 +883,7 @@ async fn jsonld_in_error_propagation() {
 /// Four one-property nodes spanning the EBV cases: numeric zero, empty string,
 /// a truthy number and a truthy string.
 async fn seed_ebv(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [
@@ -991,7 +991,7 @@ async fn jsonld_rdfterm_equal_is_datatype_aware() {
 /// self-join materializes both as `Binding::Lit`): same lexeme for the `=`
 /// case, different lexeme (on a second predicate) for the `!=` case.
 async fn seed_foreign(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [
@@ -1197,7 +1197,7 @@ async fn sparql_concat_non_string_is_type_error() {
 /// One node carrying a foreign-datatype (non-xsd) string literal, which
 /// `as_str()` exposes but CONCAT must reject.
 async fn seed_foreign_typed(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [{ "@id": "ex:m", "ex:custom": { "@value": "abc", "@type": "ex:myType" } }]
@@ -1263,7 +1263,7 @@ async fn jsonld_concat_non_string_is_type_error() {
 
 /// Two groups: one all-numeric, one with a non-numeric (IRI) member.
 async fn seed_groups(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [
@@ -1322,7 +1322,7 @@ async fn sparql_avg_poisons_on_non_numeric_member() {
 /// One node carrying a stored `"NaN"^^xsd:double`, so the stored/value path
 /// (not just constant folding) drives the NaN rule.
 async fn seed_nan(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [{ "@id": "ex:n", "ex:d": { "@value": "NaN", "@type": "xsd:double" } }]
@@ -1616,7 +1616,7 @@ async fn jsonld_sum_poisons_on_non_numeric_member() {
 /// (no trailing novelty) so scans late-materialize to `Binding::EncodedLit`.
 async fn seed_indexed(fluree: &MemoryFluree, ledger_id: &str, tx: &JsonValue) -> MemoryLedger {
     use fluree_db_api::ReindexOptions;
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree.insert(ledger0, tx).await.expect("insert");
     fluree
         .reindex(ledger_id, ReindexOptions::default())
@@ -1758,7 +1758,7 @@ async fn jsonld_ebv_of_cast_numeric_literals() {
 /// `ex:v`, so a self-join materializes both operands as `Binding::Lit` (the
 /// memory-backed Lit path, where `lit_to_comparable` runs).
 async fn seed_lang(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let tx = json!({
         "@context": ctx(),
         "@graph": [

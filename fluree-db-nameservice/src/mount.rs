@@ -23,10 +23,9 @@ use crate::Fence;
 use crate::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
-    NameServiceLookup, NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
-    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
-    StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, NameServiceError, NameServiceLookup,
+    NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
+    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::{ContentId, LedgerId, StorageRoot};
@@ -327,54 +326,7 @@ impl IndexPublisher for CompositeNameService {
 }
 
 #[async_trait]
-impl LedgerLifecycle for CompositeNameService {
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        // Also prevents creating a local ledger that would shadow a mount.
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.init(ledger_id).await
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.retract(ledger_id).await
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.purge(ledger_id).await
-    }
-}
-
-#[async_trait]
 impl BranchLifecycle for CompositeNameService {
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
-    ) -> Result<()> {
-        if let Some(err) = self.reject_mounted_write(ledger_name) {
-            return Err(err);
-        }
-        self.local
-            .create_branch(ledger_name, new_branch, source_branch, at_commit)
-            .await
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.drop_branch(ledger_id).await
-    }
-
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
@@ -648,6 +600,7 @@ impl crate::BranchRecordStore for CompositeNameService {
 mod tests {
     use super::*;
     use crate::memory::MemoryNameService;
+    use crate::testing::CurrentFence;
 
     fn mounted_composite() -> (Arc<MemoryNameService>, CompositeNameService) {
         let local = Arc::new(MemoryNameService::new());
@@ -663,7 +616,9 @@ mod tests {
     #[tokio::test]
     async fn lookup_routes_by_prefix_and_localizes() {
         let (remote, composite) = mounted_composite();
-        remote.init("inventory:main").await.expect("init remote");
+        crate::testing::create(&remote, "inventory:main")
+            .await
+            .unwrap();
 
         let record = composite
             .lookup("acme/inventory:main")
@@ -708,7 +663,9 @@ mod tests {
     #[tokio::test]
     async fn local_aliases_route_to_local_publisher() {
         let (_remote, composite) = mounted_composite();
-        composite.init("books:main").await.expect("init local");
+        crate::testing::create(&composite, "books:main")
+            .await
+            .unwrap();
         let record = composite
             .lookup("books:main")
             .await
@@ -720,12 +677,13 @@ mod tests {
     #[tokio::test]
     async fn writes_to_mounted_aliases_are_rejected() {
         let (remote, composite) = mounted_composite();
-        remote.init("inventory:main").await.expect("init remote");
-
-        let err = composite
-            .init("acme/other:main")
+        crate::testing::create(&remote, "inventory:main")
             .await
-            .expect_err("init on mount must fail");
+            .expect("create on the remote");
+
+        let err = crate::testing::create(&composite, "acme/other:main")
+            .await
+            .expect_err("create on mount must fail");
         assert!(
             err.to_string().contains("read-only remote mount"),
             "unexpected error: {err}"
@@ -746,7 +704,9 @@ mod tests {
     async fn prefix_requires_separator() {
         let (_remote, composite) = mounted_composite();
         // "acmecorp:main" starts with "acme" but is not under the mount.
-        composite.init("acmecorp:main").await.expect("local init");
+        crate::testing::create(&composite, "acmecorp:main")
+            .await
+            .unwrap();
         let record = composite
             .lookup("acmecorp:main")
             .await

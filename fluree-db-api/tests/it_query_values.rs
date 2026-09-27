@@ -14,7 +14,7 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
 async fn seed_values_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     // Local explicit context: mirror the values-test usage (flur.ee + default context + ex).
     // For Rust, we keep it explicit and minimal for what these tests need.
@@ -345,7 +345,7 @@ async fn values_federated_query_connection_from_two_ledgers() {
     let _ = seed_values_dataset(&fluree, "values-test:main").await;
 
     // Seed second ledger with a single person.
-    let other_ledger0 = genesis_ledger(&fluree, "other-ledger:main");
+    let other_ledger0 = genesis_ledger(&fluree, "other-ledger:main").await;
     let other_insert = json!({
         "@context": {
             "schema": "http://schema.org/",

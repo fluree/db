@@ -187,7 +187,7 @@ fn assert_left_join_contributes(lane: &str, with_optional: &[Value], without_opt
 }
 
 async fn seed_novelty(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> LedgerState {
-    let ledger = genesis_ledger_for_fluree(fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(fluree, ledger_id).await;
     fluree
         .insert(ledger, &seed_data())
         .await
@@ -337,7 +337,7 @@ async fn indexed_optional_extends_union_unbound_rows() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger = fluree
                 .insert_with_opts(
                     ledger,
@@ -946,7 +946,7 @@ async fn indexed_second_optional_binds_var_first_left_unbound() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger = fluree
                 .insert_with_opts(
                     ledger,
@@ -1084,7 +1084,7 @@ ex:k ex:g "k" .
 "#;
 
 async fn seed_ordering(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> LedgerState {
-    let ledger = genesis_ledger_for_fluree(fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(fluree, ledger_id).await;
     fluree
         .insert_turtle(ledger, ORDERING_TTL)
         .await

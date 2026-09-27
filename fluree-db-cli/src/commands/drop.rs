@@ -85,7 +85,7 @@ pub(crate) struct DropSummary {
     status: DropStatus,
     files_deleted: usize,
     branches: usize,
-    /// A ledger created before name bindings has none.
+    /// `None` for a graph source.
     instance: Option<String>,
     data: Option<DroppedData>,
     warnings: Vec<String>,
@@ -203,7 +203,7 @@ impl DropSummary {
             DropStatus::AlreadyRetracted => println!("The {kind} '{id}' was already dropped"),
             DropStatus::Dropped => {
                 println!("Dropped {kind} '{id}'{}", self.deleted_suffix());
-                self.print_data_hint(name);
+                self.print_data_hint();
             }
         }
         self.print_warnings();
@@ -217,27 +217,19 @@ impl DropSummary {
             self.id,
             self.deleted_suffix()
         );
-        self.print_data_hint(&self.id);
+        self.print_data_hint();
         self.print_warnings();
     }
 
-    fn print_data_hint(&self, name: &str) {
+    fn print_data_hint(&self) {
         match (self.data, &self.instance) {
             (Some(DroppedData::Retained), Some(instance)) => println!(
                 "Its data is kept: restore it with `fluree dropped restore {instance}`, \
                  or delete it with `fluree dropped purge {instance} --force`."
             ),
-            (Some(DroppedData::Retained), None) => println!(
-                "Its data is kept and its name stays reserved; \
-                 `fluree drop {name} --hard --force` deletes it."
-            ),
             (Some(DroppedData::Deleting), Some(instance)) => eprintln!(
                 "warning: not all of its data was deleted; \
                  `fluree dropped purge {instance} --force` finishes it"
-            ),
-            (Some(DroppedData::Deleting), None) => eprintln!(
-                "warning: not all of its data was deleted; \
-                 `fluree drop {name} --hard --force` finishes it"
             ),
             _ => {}
         }

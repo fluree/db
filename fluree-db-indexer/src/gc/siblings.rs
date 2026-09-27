@@ -189,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn current_sibling_heads_reads_each_sibling_from_the_nameservice() {
         use fluree_db_nameservice::memory::MemoryNameService;
-        use fluree_db_nameservice::{IndexPublisher, LedgerLifecycle};
+        use fluree_db_nameservice::testing::CurrentFence;
 
         let ns = MemoryNameService::new();
         let head = ContentId::new(ContentKind::IndexRoot, b"dev head");
@@ -197,7 +197,13 @@ mod tests {
             ns.create_ledger(id).unwrap();
         }
         ns.publish_index("db:dev", 7, &head).await.unwrap();
-        ns.retract("db:old").await.unwrap();
+        fluree_db_nameservice::lifecycle::begin_drop_branch(
+            &ns,
+            &fluree_db_core::LedgerName::parse("db").unwrap(),
+            "old",
+        )
+        .await
+        .unwrap();
 
         let candidates: Vec<LedgerId> = [
             "db:dev",

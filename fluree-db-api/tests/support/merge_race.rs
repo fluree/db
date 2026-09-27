@@ -6,10 +6,9 @@ use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, Fence, GraphSourceLookup, GraphSourcePublisher,
-    GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle,
-    NameServiceLookup, NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
-    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
-    StatusValue,
+    GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads, NameServiceLookup,
+    NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
+    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -96,22 +95,6 @@ impl NameServiceLookup for PausingNameService {
 
 #[async_trait]
 impl BranchLifecycle for PausingNameService {
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
-    ) -> Result<()> {
-        self.inner
-            .create_branch(ledger_name, new_branch, source_branch, at_commit)
-            .await
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        self.inner.drop_branch(ledger_id).await
-    }
-
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
@@ -133,21 +116,6 @@ impl BranchLifecycle for PausingNameService {
 
     async fn prune_commit_index(&self, ledger_id: &str, up_to_t: i64) -> Result<()> {
         self.inner.prune_commit_index(ledger_id, up_to_t).await
-    }
-}
-
-#[async_trait]
-impl LedgerLifecycle for PausingNameService {
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        self.inner.init(ledger_id).await
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        self.inner.retract(ledger_id).await
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        self.inner.purge(ledger_id).await
     }
 }
 

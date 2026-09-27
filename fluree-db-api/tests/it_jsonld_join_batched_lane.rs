@@ -22,7 +22,7 @@ const EX: &str = "http://example.org/ns/";
 
 async fn indexed_people() -> Fluree {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, LEDGER);
+    let ledger = genesis_ledger(&fluree, LEDGER).await;
     let no_background = IndexConfig {
         reindex_min_bytes: 1_000_000_000,
         reindex_max_bytes: 1_000_000_000,
@@ -102,7 +102,7 @@ async fn jsonld_cross_ledger_join_matches_sparql() {
     // therefore gets a different code in each ledger.
     fluree
         .insert(
-            genesis_ledger(&fluree, "xl-catalog:main"),
+            genesis_ledger(&fluree, "xl-catalog:main").await,
             &json!({
                 "@context": {"cat": "http://catalog.example/", "p": "http://people.example/"},
                 "@graph": [
@@ -115,7 +115,7 @@ async fn jsonld_cross_ledger_join_matches_sparql() {
         .expect("insert catalog");
     fluree
         .insert(
-            genesis_ledger(&fluree, "xl-people:main"),
+            genesis_ledger(&fluree, "xl-people:main").await,
             &json!({
                 "@context": {"p": "http://people.example/", "cat": "http://catalog.example/"},
                 "@graph": [
