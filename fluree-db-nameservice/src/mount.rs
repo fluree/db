@@ -437,6 +437,13 @@ impl GraphSourcePublisher for CompositeNameService {
         }
         self.local.retract_graph_source(name, branch).await
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        if let Some(err) = self.reject_mounted_write(name) {
+            return Err(err);
+        }
+        self.local.reset_graph_source_index(name, branch).await
+    }
 }
 
 #[async_trait]

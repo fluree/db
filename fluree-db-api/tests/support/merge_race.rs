@@ -221,6 +221,10 @@ impl GraphSourcePublisher for PausingNameService {
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
         self.inner.retract_graph_source(name, branch).await
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        self.inner.reset_graph_source_index(name, branch).await
+    }
 }
 
 #[async_trait]

@@ -1021,3 +1021,66 @@ async fn vector_sync_with_nested_pattern_rebuilds_when_membership_changes() {
         "the document no longer matches the indexing query and must be gone"
     );
 }
+
+/// Twin of the BM25 test: a vector source over a ledger that was dropped and
+/// its name reused refuses to sync from the new ledger, and recreating it
+/// indexes the new ledger even though its `t` is below the old index's.
+#[tokio::test]
+async fn vector_suspends_when_its_ledger_is_replaced() {
+    use fluree_db_api::{ApiError, DropMode};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "vector/replaced:main";
+    let doc = |id: &str, v: [f64; 3]| {
+        json!({
+            "@context": { "ex":"http://example.org/" },
+            "@graph": [{
+                "@id": id, "@type":"ex:Doc",
+                "ex:embedding": { "@value": v, "@type": "@vector" }
+            }]
+        })
+    };
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let config =
+        || VectorCreateConfig::new("replaced", ledger_id, query.clone(), "ex:embedding", 3);
+
+    let mut ledger = support::genesis_ledger(&fluree, ledger_id).await;
+    for i in 0..3 {
+        let tx = doc(&format!("ex:doc{i}"), [0.1, 0.2, f64::from(i)]);
+        ledger = fluree.insert(ledger, &tx).await.unwrap().ledger;
+    }
+    let gs = fluree
+        .create_vector_index(config())
+        .await
+        .unwrap()
+        .graph_source_id;
+
+    fluree
+        .drop_ledger("vector/replaced", DropMode::Hard)
+        .await
+        .unwrap();
+    let ledger = support::genesis_ledger(&fluree, ledger_id).await;
+    fluree
+        .insert(ledger, &doc("ex:new", [0.9, 0.9, 0.9]))
+        .await
+        .unwrap();
+    for sync in [
+        fluree.sync_vector_index(&gs).await.map(|_| ()),
+        fluree.resync_vector_index(&gs).await.map(|_| ()),
+    ] {
+        let err = sync.expect_err("the replacement is not the ledger indexed");
+        assert!(matches!(err, ApiError::GraphSourceSuspended(_)), "{err}");
+    }
+
+    fluree.drop_vector_index(&gs).await.unwrap();
+    fluree.create_vector_index(config()).await.unwrap();
+    assert_eq!(fluree.load_vector_index(&gs).await.unwrap().len(), 1);
+    fluree
+        .sync_vector_index(&gs)
+        .await
+        .expect("it syncs from the ledger it now indexes");
+}

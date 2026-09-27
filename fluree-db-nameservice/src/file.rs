@@ -1311,6 +1311,17 @@ impl GraphSourcePublisher for FileNameService {
 
         Ok(())
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        let main: Option<GraphSourceNsFileV2> = self
+            .read_json_from_address(&Self::ns_address(name, branch))
+            .await?;
+        if main.is_some_and(|m| m.status == "retracted") {
+            fluree_db_core::StorageWrite::delete(&self.storage, &Self::index_address(name, branch))
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

@@ -241,6 +241,12 @@ if none does).
 }
 ```
 
+**`err:db/GraphSourceSuspended`** — a sync of a BM25 or vector index whose
+source ledger was dropped and replaced by another ledger of the same name.
+Retrying does not help: restore the dropped ledger, or drop the index and
+create it again to index the new ledger. See
+[When the Source Ledger Is Dropped](../indexing-and-search/bm25.md#when-the-source-ledger-is-dropped).
+
 #### 413 Payload Too Large
 
 The request was refused because of its size. The server emits **two distinct

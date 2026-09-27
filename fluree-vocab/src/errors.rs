@@ -94,6 +94,10 @@ pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 /// Graph source not found
 pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
 
+/// A graph source over a ledger that was dropped and its name reused: it
+/// indexes nothing from the new ledger until it is recreated over it
+pub const GRAPH_SOURCE_SUSPENDED: &str = "err:db/GraphSourceSuspended";
+
 /// Graph source index stale
 pub const GRAPH_SOURCE_STALE: &str = "err:db/GraphSourceStale";
 

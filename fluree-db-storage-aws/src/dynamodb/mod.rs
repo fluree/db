@@ -12,9 +12,9 @@ pub mod schema;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
-    KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType, TransactWriteItem,
-    Update,
+    AttributeDefinition, AttributeValue, BillingMode, ConditionCheck, GlobalSecondaryIndex,
+    KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType,
+    TransactWriteItem, Update,
 };
 use aws_sdk_dynamodb::Client;
 use aws_smithy_types::timeout::TimeoutConfig;
@@ -1517,6 +1517,57 @@ impl GraphSourcePublisher for DynamoDbNameService {
             .map_err(|e| NameServiceError::storage(format!("DynamoDB UpdateItem failed: {e}")))?;
 
         Ok(())
+    }
+
+    /// One transaction, so the index item is reset only while the meta item
+    /// says the source is retracted.
+    async fn reset_graph_source_index(
+        &self,
+        name: &str,
+        branch: &str,
+    ) -> std::result::Result<(), NameServiceError> {
+        let pk = format_ledger_id(name, branch);
+        let now = Self::now_epoch_ms().to_string();
+        let retracted = ConditionCheck::builder()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk.clone()))
+            .key(ATTR_SK, AttributeValue::S(SK_META.to_string()))
+            .condition_expression("#ret = :true_val")
+            .expression_attribute_names("#ret", ATTR_RETRACTED)
+            .expression_attribute_values(":true_val", AttributeValue::Bool(true))
+            .build()
+            .map_err(|e| NameServiceError::storage(format!("ConditionCheck: {e}")))?;
+        let reset = Update::builder()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk))
+            .key(ATTR_SK, AttributeValue::S(SK_INDEX.to_string()))
+            .update_expression("REMOVE #ii SET #it = :zero, #ua = :now")
+            .expression_attribute_names("#ii", ATTR_INDEX_ID)
+            .expression_attribute_names("#it", ATTR_INDEX_T)
+            .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
+            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
+            .expression_attribute_values(":now", AttributeValue::N(now))
+            .build()
+            .map_err(|e| NameServiceError::storage(format!("Update: {e}")))?;
+        match self
+            .client
+            .transact_write_items()
+            .transact_items(
+                TransactWriteItem::builder()
+                    .condition_check(retracted)
+                    .build(),
+            )
+            .transact_items(TransactWriteItem::builder().update(reset).build())
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Not retracted, or no such source: nothing to reset.
+            Err(e) if Self::is_transaction_canceled(&e) => Ok(()),
+            Err(e) => Err(NameServiceError::storage(format!(
+                "DynamoDB TransactWriteItems failed: {e}"
+            ))),
+        }
     }
 }
 

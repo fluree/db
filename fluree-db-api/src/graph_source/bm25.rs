@@ -8,6 +8,7 @@ use crate::graph_source::helpers::{expand_ids_in_results, extract_prefix_map};
 use crate::graph_source::result::{
     Bm25CreateResult, Bm25DropResult, Bm25StalenessCheck, Bm25SyncResult, SnapshotSelection,
 };
+use crate::graph_source::source_instance::{check_source_instance, instance_of, SOURCE_INSTANCE};
 use crate::Result;
 use fluree_db_core::{
     ledger_id::split_ledger_id, ContentId, ContentStore, OverlayProvider, Storage,
@@ -351,8 +352,15 @@ impl crate::Fluree {
             "k1": config.k1.unwrap_or(1.2),
             "b": config.b.unwrap_or(0.75),
             "query": config.query,
+            SOURCE_INSTANCE: instance_of(ledger.storage_namespace().root()).to_string(),
         }))?;
 
+        // A source dropped under this name left its index head, which this
+        // index may sit below: over a ledger that replaced the one it
+        // indexed, its `t` starts again.
+        self.publisher()?
+            .reset_graph_source_index(&config.name, config.effective_branch())
+            .await?;
         self.publisher()?
             .publish_graph_source(
                 &config.name,
@@ -1072,6 +1080,11 @@ impl crate::Fluree {
 
         // 2. Load source ledger to get current state
         let ledger = self.ledger(&source_ledger_alias).await?;
+        check_source_instance(
+            &record,
+            &source_ledger_alias,
+            ledger.storage_namespace().root(),
+        )?;
         let ledger_t = ledger.t();
 
         // 3. Load existing index via manifest head
@@ -1366,6 +1379,7 @@ impl crate::Fluree {
 
         // 3. Load source ledger
         let ledger = self.ledger(&source_ledger).await?;
+        check_source_instance(&record, &source_ledger, ledger.storage_namespace().root())?;
         let ledger_t = ledger.t();
 
         // 4. Re-run indexing query
@@ -1566,6 +1580,9 @@ impl crate::Fluree {
         // "binary-only db has no range_provider attached" once the snapshot
         // is index-backed (which it now is for any `target_t` covered by
         // `base_t..=index_t`).
+        if let Some(ledger) = self.nameservice().lookup(&source_ledger).await? {
+            check_source_instance(&record, &source_ledger, &ledger.storage_root())?;
+        }
         let view = self.load_graph_db_at_t(&source_ledger, target_t).await?;
 
         // 4. Execute indexing query at target_t

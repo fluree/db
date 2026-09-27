@@ -1069,6 +1069,60 @@ pub async fn interrupted_migration_resumes<S: crate::NameServicePublisher>(store
     assert!(store.lookup("mydb:feature").await.unwrap().is_some());
 }
 
+/// Run every case in turn, each against a fresh backend from `make`: for
+/// backends too costly to set up once per test. Keep in step with
+/// [`lifecycle_conformance_tests!`](crate::lifecycle_conformance_tests).
+/// A retracted graph source's index head can be cleared, so one created
+/// again under its name publishes from `t` 0; a live one's is left alone.
+pub async fn retracted_graph_source_index_resets<S: crate::NameServicePublisher>(store: &S) {
+    use crate::{GraphSourceLookup, GraphSourceType};
+    use fluree_db_core::{ContentId, ContentKind};
+
+    let index = |n: &str| ContentId::new(ContentKind::IndexRoot, n.as_bytes());
+    let deps = ["docs:main".to_string()];
+    async fn head<S: GraphSourceLookup>(store: &S) -> (bool, Option<ContentId>, i64) {
+        let record = store
+            .lookup_graph_source("search:main")
+            .await
+            .unwrap()
+            .expect("graph source");
+        (record.retracted, record.index_id, record.index_t)
+    }
+    store
+        .publish_graph_source("search", "main", GraphSourceType::Bm25, "{}", &deps)
+        .await
+        .unwrap();
+    store
+        .publish_graph_source_index("search", "main", &index("a"), 5)
+        .await
+        .unwrap();
+    store
+        .reset_graph_source_index("search", "main")
+        .await
+        .unwrap();
+    assert_eq!(head(store).await, (false, Some(index("a")), 5), "live");
+
+    store.retract_graph_source("search", "main").await.unwrap();
+    store
+        .reset_graph_source_index("search", "main")
+        .await
+        .unwrap();
+    store
+        .publish_graph_source("search", "main", GraphSourceType::Bm25, "{}", &deps)
+        .await
+        .unwrap();
+    store
+        .publish_graph_source_index("search", "main", &index("b"), 1)
+        .await
+        .unwrap();
+    assert_eq!(head(store).await, (false, Some(index("b")), 1), "recreated");
+
+    store
+        .reset_graph_source_index("nothing", "main")
+        .await
+        .unwrap();
+}
+
 pub async fn run_all<S, F, Fut>(mut make: F)
 where
     S: crate::NameServicePublisher,
@@ -1103,6 +1157,7 @@ where
     migration_binds_legacy_ledgers(&make().await).await;
     migration_registers_soft_dropped_ledgers(&make().await).await;
     interrupted_migration_resumes(&make().await).await;
+    retracted_graph_source_index_resets(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1141,6 +1196,7 @@ macro_rules! lifecycle_conformance_tests {
             migration_binds_legacy_ledgers,
             migration_registers_soft_dropped_ledgers,
             interrupted_migration_resumes,
+            retracted_graph_source_index_resets,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

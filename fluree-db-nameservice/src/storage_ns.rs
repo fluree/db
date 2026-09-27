@@ -1447,6 +1447,14 @@ where
         })
         .await
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        let main: Option<GraphSourceNsFileV2> = self.read_json(&self.ns_key(name, branch)).await?;
+        if main.is_some_and(|m| m.status == "retracted") {
+            StorageWrite::delete(&self.storage, &self.index_key(name, branch)).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

@@ -836,6 +836,13 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     /// Marks the graph source as retracted. Future lookups will return the record
     /// with `retracted: true`.
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()>;
+
+    /// Clear the index head of a retracted graph source, so one created again
+    /// under its name starts from no index at all. Otherwise the new index
+    /// could not be published below the dropped one's `t`, as it must when
+    /// it indexes a ledger that replaced the dropped one's. A live source is
+    /// left as it is.
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()>;
 }
 
 /// Subscription scope for filtering nameservice events.
@@ -1740,6 +1747,10 @@ where
 
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
         (**self).retract_graph_source(name, branch).await
+    }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        (**self).reset_graph_source_index(name, branch).await
     }
 }
 

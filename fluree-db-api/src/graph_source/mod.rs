@@ -193,6 +193,7 @@ pub(crate) mod dependency_index;
 mod helpers;
 mod provider;
 mod result;
+mod source_instance;
 
 #[cfg(feature = "vector")]
 mod vector;

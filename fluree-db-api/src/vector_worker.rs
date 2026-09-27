@@ -365,6 +365,11 @@ impl<'a> VectorMaintenanceWorker<'a> {
                 );
                 Ok(())
             }
+            // Its ledger was replaced; it waits for an admin to recreate it.
+            Err(e @ ApiError::GraphSourceSuspended(_)) => {
+                warn!(graph_source = %graph_source_id, error = %e, "Vector graph source suspended; not syncing");
+                Ok(())
+            }
             Err(e) => {
                 self.state.borrow_mut().record_sync(false);
                 error!(graph_source = %graph_source_id, error = %e, "Vector graph source sync failed");

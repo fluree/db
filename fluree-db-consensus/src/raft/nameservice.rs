@@ -2024,6 +2024,19 @@ impl GraphSourcePublisher for RaftNameService {
             ))),
         }
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        let cmd = SmCommand::ResetGraphSourceIndex {
+            name: name.to_string(),
+            branch: branch.to_string(),
+        };
+        match self.submit_lifecycle(cmd).await? {
+            SmResponse::GraphSourceIndexReset | SmResponse::NoOp => Ok(()),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for ResetGraphSourceIndex: {other:?}"
+            ))),
+        }
+    }
 }
 
 #[async_trait]

@@ -322,6 +322,12 @@ pub enum ApiError {
     #[error("Branch conflict: {0}")]
     BranchConflict(String),
 
+    /// A graph source indexed a ledger that has since been dropped and its
+    /// name reused. It indexes nothing from the new ledger until it is
+    /// recreated over it.
+    #[error("Graph source suspended: {0}")]
+    GraphSourceSuspended(String),
+
     /// Not found errors
     #[error("Not found: {0}")]
     NotFound(String),
@@ -636,6 +642,7 @@ impl ApiError {
             ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
             e if e.is_fenced() => 409,
             ApiError::BranchConflict(_) => 409,
+            ApiError::GraphSourceSuspended(_) => 409,
             ApiError::NotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
             ApiError::LedgerExists(_) => 409,

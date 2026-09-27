@@ -1999,3 +1999,98 @@ async fn sync_with_variable_predicate_always_rebuilds() {
         .unwrap();
     assert!(after.term_idx("quokka").is_some());
 }
+
+/// A graph source records the ledger instance it indexed. Once that ledger
+/// is dropped and its name reused, the source refuses to sync from the new
+/// ledger until it is recreated over it; restoring the dropped ledger
+/// instead keeps it syncing.
+#[tokio::test]
+async fn bm25_suspends_when_its_ledger_is_replaced() {
+    use fluree_db_api::{ApiError, DropMode};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "bm25/replaced:main";
+    let doc = |id: &str, title: &str| {
+        json!({
+            "@context": { "ex":"http://example.org/" },
+            "@graph": [{ "@id": id, "@type":"ex:Doc", "ex:title": title }]
+        })
+    };
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let hits = |idx: &fluree_db_query::bm25::Bm25Index, word: &str| {
+        let terms = Analyzer::english_default().analyze_to_strings(word);
+        let terms: Vec<&str> = terms.iter().map(String::as_str).collect();
+        Bm25Scorer::new(idx, &terms).top_k(10).len()
+    };
+
+    // Several commits, so the index head is past any `t` the replacement
+    // reaches.
+    let mut ledger = support::genesis_ledger(&fluree, ledger_id).await;
+    for i in 0..3 {
+        let tx = doc(&format!("ex:doc{i}"), &format!("original {i}"));
+        ledger = fluree.insert(ledger, &tx).await.unwrap().ledger;
+    }
+    let gs = fluree
+        .create_full_text_index(Bm25CreateConfig::new("replaced", ledger_id, query.clone()))
+        .await
+        .unwrap()
+        .graph_source_id;
+
+    // Dropped and restored: the same ledger, so the source keeps syncing.
+    let dropped = fluree
+        .drop_ledger("bm25/replaced", DropMode::Soft)
+        .await
+        .unwrap();
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    fluree
+        .insert(ledger, &doc("ex:doc3", "original 3"))
+        .await
+        .unwrap();
+    fluree
+        .sync_bm25_index(&gs)
+        .await
+        .expect("a restored ledger is the one indexed");
+
+    // Dropped and its name reused: another ledger.
+    fluree
+        .drop_ledger("bm25/replaced", DropMode::Hard)
+        .await
+        .unwrap();
+    let ledger = support::genesis_ledger(&fluree, ledger_id).await;
+    fluree
+        .insert(ledger, &doc("ex:new", "replacement"))
+        .await
+        .unwrap();
+    for sync in [
+        fluree.sync_bm25_index(&gs).await,
+        fluree.resync_bm25_index(&gs).await,
+    ] {
+        let err = sync.expect_err("the replacement is not the ledger indexed");
+        assert!(matches!(err, ApiError::GraphSourceSuspended(_)), "{err}");
+        assert_eq!(err.status_code(), 409);
+    }
+    let idx = fluree.load_bm25_index(&gs).await.unwrap();
+    assert_eq!(hits(&idx, "replacement"), 0, "nothing synced from it");
+
+    // Recreated over the replacement, it indexes the replacement alone.
+    fluree.drop_full_text_index(&gs).await.unwrap();
+    fluree
+        .create_full_text_index(Bm25CreateConfig::new("replaced", ledger_id, query))
+        .await
+        .unwrap();
+    let idx = fluree.load_bm25_index(&gs).await.unwrap();
+    assert_eq!(hits(&idx, "replacement"), 1);
+    assert_eq!(hits(&idx, "original"), 0);
+    fluree
+        .sync_bm25_index(&gs)
+        .await
+        .expect("it syncs from the ledger it now indexes");
+}

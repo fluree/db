@@ -14,6 +14,8 @@ use crate::graph_source::result::{
     VectorCreateResult, VectorDropResult, VectorStalenessCheck, VectorSyncResult,
 };
 #[cfg(feature = "vector")]
+use crate::graph_source::source_instance::{check_source_instance, instance_of, SOURCE_INSTANCE};
+#[cfg(feature = "vector")]
 use crate::Result;
 #[cfg(feature = "vector")]
 use fluree_db_core::{ledger_id::split_ledger_id, ContentId, ContentStore};
@@ -182,6 +184,7 @@ impl crate::Fluree {
 
         // 5. Publish graph source record to nameservice
         let config_json = serde_json::to_string(&serde_json::json!({
+            SOURCE_INSTANCE: instance_of(ledger.storage_namespace().root()).to_string(),
             "embedding_property": config.embedding_property,
             "dimensions": config.dimensions,
             "metric": format!("{:?}", metric),
@@ -193,6 +196,12 @@ impl crate::Fluree {
             }
         }))?;
 
+        // A source dropped under this name left its index head, which this
+        // index may sit below: over a ledger that replaced the one it
+        // indexed, its `t` starts again.
+        self.publisher()?
+            .reset_graph_source_index(&config.name, config.effective_branch())
+            .await?;
         self.publisher()?
             .publish_graph_source(
                 &config.name,
@@ -447,6 +456,11 @@ impl crate::Fluree {
 
         // 2. Load source ledger to get current state
         let ledger = self.ledger(&source_ledger_alias).await?;
+        check_source_instance(
+            &record,
+            &source_ledger_alias,
+            ledger.storage_namespace().root(),
+        )?;
         let ledger_t = ledger.t();
 
         // 3. Load existing index by CID
@@ -695,6 +709,11 @@ impl crate::Fluree {
 
         // 2. Load source ledger
         let ledger = self.ledger(&source_ledger_alias).await?;
+        check_source_instance(
+            &record,
+            &source_ledger_alias,
+            ledger.storage_namespace().root(),
+        )?;
         let ledger_t = ledger.t();
 
         // 3. Load existing index to get old watermark

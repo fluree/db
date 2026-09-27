@@ -851,6 +851,10 @@ pub enum Command {
     /// Give a branch registered before fencing its first fence; applied
     /// when it carries none or already carries `fence`.
     AdoptBranch { key: RefKey, fence: u64 },
+    /// Clear a retracted graph source's index pointer, so one created
+    /// again under its name can publish from `t` 0. A no-op on a live or
+    /// missing record.
+    ResetGraphSourceIndex { name: String, branch: String },
 }
 
 /// Postcard-safe JSON value tree with deterministic encoding:
@@ -1466,6 +1470,8 @@ pub enum Response {
         ledger_id: String,
         released_envelopes: Vec<(String, ContentId)>,
     },
+    /// [`Command::ResetGraphSourceIndex`] cleared the index pointer.
+    GraphSourceIndexReset,
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1698,6 +1704,19 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
         } => delete_branch(state, key, fence, applied_at_millis),
         Command::AdjustChildren { key, fence, delta } => adjust_children(state, key, fence, delta),
         Command::AdoptBranch { key, fence } => adopt_branch(state, key, fence),
+        Command::ResetGraphSourceIndex { name, branch } => {
+            match state
+                .graph_sources
+                .get_mut(&format_ledger_id(&name, &branch))
+            {
+                Some(record) if record.retracted => {
+                    record.index_id = None;
+                    record.index_t = 0;
+                    Response::GraphSourceIndexReset
+                }
+                _ => Response::NoOp,
+            }
+        }
         // A wrapper nested in a wrapper covers no single branch write.
         Command::Fenced { .. } => Response::FenceMismatch,
     }

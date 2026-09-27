@@ -638,6 +638,17 @@ impl GraphSourcePublisher for MemoryNameService {
 
         Ok(())
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        let key = LedgerId::from_parts(name, branch)?;
+        if let Some(record) = self.graph_source_records.write().get_mut(&key) {
+            if record.retracted {
+                record.index_id = None;
+                record.index_t = 0;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

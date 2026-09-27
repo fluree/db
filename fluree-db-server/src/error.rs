@@ -117,6 +117,7 @@ impl ServerError {
                 }
             }
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
+            ServerError::Api(ApiError::GraphSourceSuspended(_)) => errors::GRAPH_SOURCE_SUSPENDED,
 
             // Index operations
             ServerError::Api(ApiError::IndexTimeout(_)) => errors::INDEX_TIMEOUT,

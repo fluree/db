@@ -357,6 +357,12 @@ where
             .notify(NameServiceEvent::GraphSourceRetracted { graph_source_id });
         Ok(())
     }
+
+    /// Emits nothing: the source is retracted, and publishing it again
+    /// announces it.
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        self.inner.reset_graph_source_index(name, branch).await
+    }
 }
 
 // ---------------------------------------------------------------------------
