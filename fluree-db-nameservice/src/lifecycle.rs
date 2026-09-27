@@ -1,4 +1,5 @@
-//! Ledger lifecycle protocols: create, create branch, drop, restore, purge.
+//! Ledger lifecycle protocols: create, create or drop a branch, drop, restore,
+//! purge.
 //!
 //! Written against backends that can compare-and-swap only one item at a
 //! time. Every step is idempotent, and an operation interrupted at any step
@@ -6,8 +7,9 @@
 //! records to decide anything: the binding names every live branch.
 //!
 //! Storage is not touched here. Callers write a new ledger's data between
-//! [`begin_create`] and [`activate`], and delete a purged ledger's root
-//! between [`begin_purge`] and [`finish_purge`].
+//! [`begin_create`] and [`activate`], delete a purged ledger's root between
+//! [`begin_purge`] and [`finish_purge`], and delete a dropped branch's data
+//! between [`begin_drop_branch`] and [`finish_drop_branch`].
 
 use crate::binding::{
     new_instance_id, BindingState, BranchFence, BranchRecordStore, DroppedLedger, DroppedState,
@@ -95,10 +97,7 @@ pub async fn begin_create<S: LifecycleStore + ?Sized>(
         root: root.clone(),
         root_branch: id.branch().to_string(),
         state: BindingState::Creating,
-        branches: vec![BranchFence {
-            branch: id.branch().to_string(),
-            fence,
-        }],
+        branches: vec![BranchFence::new(id.branch(), fence)],
     };
 
     let version = match store.cas_binding(&name, None, Some(&binding)).await? {
@@ -115,16 +114,24 @@ pub async fn begin_create<S: LifecycleStore + ?Sized>(
 
     let mut record = NsRecord::new(id.clone());
     record.fence = Some(fence);
-    insert_fenced(store, &record).await?;
-    record.storage_root = Some(root.clone());
-
-    Ok(PendingLedger {
+    let pending = PendingLedger {
         instance,
-        root,
-        record,
+        root: root.clone(),
+        record: NsRecord {
+            storage_root: Some(root),
+            ..record.clone()
+        },
         binding,
         version,
-    })
+    };
+    if let Err(e) = insert_fenced(store, &record).await {
+        // Release the claim, or the name stays held by a create that failed.
+        if let Err(undo) = abandon(store, &pending).await {
+            tracing::warn!(name = %name, error = %undo, "could not release a failed create's claim on the name");
+        }
+        return Err(e);
+    }
+    Ok(pending)
 }
 
 /// Make a pending ledger visible.
@@ -206,8 +213,10 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
             version,
         } = active_binding(store, name).await?;
         let source_fence = binding
-            .fence_of(source_branch)
-            .ok_or_else(|| NameServiceError::not_found(source_id.to_string()))?;
+            .listing(source_branch)
+            .filter(|b| !b.dropped)
+            .ok_or_else(|| NameServiceError::not_found(source_id.to_string()))?
+            .fence;
         let source = store
             .raw_record(&source_id)
             .await?
@@ -230,10 +239,7 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
         let fence = Fence::generate();
         let mut next = binding.clone();
         next.branches.retain(|b| b.branch != new_branch);
-        next.branches.push(BranchFence {
-            branch: new_branch.to_string(),
-            fence,
-        });
+        next.branches.push(BranchFence::new(new_branch, fence));
         match store.cas_binding(name, Some(version), Some(&next)).await? {
             RegistryCas::Updated { .. } => {}
             RegistryCas::Conflict { .. } => continue,
@@ -241,7 +247,7 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
 
         // The parent's count goes up before the child exists: a crash in
         // between leaves the parent undroppable rather than droppable under
-        // a live child.
+        // a live child. A parent frozen since it was read refuses.
         if store.adjust_children(&source_id, source_fence, 1).await? != FenceOutcome::Applied {
             return Err(NameServiceError::not_found(source_id.to_string()));
         }
@@ -258,6 +264,222 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
         return Ok(record);
     }
     Err(contended(name))
+}
+
+/// Copy `record`, read from the nameservice that owns its ledger, into
+/// `store`: bind its name to the record's instance and root, list its
+/// branch, and insert it. A binding to another instance is replaced: the
+/// origin has dropped that ledger and created this one under the name.
+///
+/// The record keeps its fence when it carries one; otherwise a local one is
+/// issued, since only this copy has to agree with it. Heads are copied as the
+/// record carries them, and an existing copy's heads are left for the caller
+/// to fast-forward.
+pub async fn mirror_record<S: LifecycleStore + ?Sized>(store: &S, record: &NsRecord) -> Result<()> {
+    let root = record.storage_root.clone();
+    let Some((root, instance)) = root.and_then(|r| r.instance().map(|i| (r, i))) else {
+        return Err(NameServiceError::invalid_id(format!(
+            "{} has no instance root to mirror",
+            record.ledger_id
+        )));
+    };
+    let name = record.ledger_id.ledger_name();
+    let mut fence = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let current = store.get_binding(&name).await?;
+        let (expected, mut next) = match current {
+            Some(Versioned { value, version }) if value.instance == instance => {
+                if let Some(listed) = value.listing(&record.branch) {
+                    if value.is_active() && listed.dropped == record.retracted {
+                        fence = Some(listed.fence);
+                        break;
+                    }
+                }
+                (Some(version), value)
+            }
+            other => (
+                other.map(|v| v.version),
+                NameBinding {
+                    instance: instance.clone(),
+                    root: root.clone(),
+                    root_branch: fluree_db_core::DEFAULT_BRANCH.to_string(),
+                    state: BindingState::Active,
+                    branches: Vec::new(),
+                },
+            ),
+        };
+        let branch_fence = next
+            .fence_of(&record.branch)
+            .or(record.fence)
+            .unwrap_or_else(Fence::generate);
+        next.state = BindingState::Active;
+        if record.source_branch.is_none() {
+            next.root_branch = record.branch.clone();
+        }
+        next.branches.retain(|b| b.branch != record.branch);
+        next.branches.push(BranchFence {
+            dropped: record.retracted,
+            ..BranchFence::new(&record.branch, branch_fence)
+        });
+        if let RegistryCas::Updated { .. } = store.cas_binding(&name, expected, Some(&next)).await?
+        {
+            fence = Some(branch_fence);
+            break;
+        }
+    }
+    let fence = fence.ok_or_else(|| contended(&name))?;
+
+    let mut copy = record.clone();
+    copy.fence = Some(fence);
+    copy.storage_root = None;
+    copy.retracted = false;
+    insert_fenced(store, &copy).await
+}
+
+/// What [`begin_drop_branch`] left to do.
+#[derive(Clone, Debug)]
+pub enum BranchDrop {
+    /// The branch has child branches, whose history reaches into its data.
+    /// It is frozen and reads as dropped, and keeps its record and data
+    /// until [`finish_drop_branch`] of its last child hands it back.
+    Deferred {
+        /// Frozen by an earlier drop, not this one.
+        already: bool,
+    },
+    /// The branch is frozen and has no children. The caller deletes its
+    /// storage, then calls [`finish_drop_branch`] with this record.
+    Purge(Box<NsRecord>),
+}
+
+/// Drop `branch` of the ledger holding `name`: mark it dropped in the
+/// binding, so reads see it as absent and nothing can branch from it, then
+/// freeze its record, so no writer can publish to it.
+///
+/// The branch stays listed until [`finish_drop_branch`], so its name cannot
+/// be reused while its storage is being deleted. A drop already under way is
+/// resumed.
+pub async fn begin_drop_branch<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    branch: &str,
+) -> Result<BranchDrop> {
+    let id = name.with_branch(branch)?;
+    let not_found = || NameServiceError::not_found(id.to_string());
+
+    let mut marked = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let Versioned {
+            value: binding,
+            version,
+        } = active_binding(store, name).await?;
+        if branch == binding.root_branch {
+            return Err(NameServiceError::invalid_id(format!(
+                "'{branch}' is the root branch of '{name}'; drop the ledger instead"
+            )));
+        }
+        let listing = binding.listing(branch).ok_or_else(not_found)?.clone();
+        if listing.dropped {
+            marked = Some((binding.root, listing.fence, true));
+            break;
+        }
+        let mut next = binding;
+        for b in &mut next.branches {
+            b.dropped |= b.branch == branch;
+        }
+        if let RegistryCas::Updated { .. } =
+            store.cas_binding(name, Some(version), Some(&next)).await?
+        {
+            marked = Some((next.root, listing.fence, false));
+            break;
+        }
+    }
+    let (root, fence, already) = marked.ok_or_else(|| contended(name))?;
+
+    if store.freeze_record(&id, fence).await? != FenceOutcome::Applied {
+        return Err(not_found());
+    }
+    // Read after freezing: from here the count can only fall.
+    let mut record = store
+        .raw_record(&id)
+        .await?
+        .filter(|r| r.fence == Some(fence))
+        .ok_or_else(not_found)?;
+    if record.branches > 0 {
+        return Ok(BranchDrop::Deferred { already });
+    }
+    record.storage_root = Some(root);
+    Ok(BranchDrop::Purge(Box::new(record)))
+}
+
+/// Forget a dropped branch once its storage is gone: take it out of the
+/// binding, delete its record, and take it off its parent's child count.
+///
+/// Returns the parent's record when the parent is itself a dropped branch
+/// that this left with no children, for the caller to purge in turn.
+pub async fn finish_drop_branch<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    record: &NsRecord,
+) -> Result<Option<NsRecord>> {
+    let fence = record.fence.ok_or_else(|| {
+        NameServiceError::storage(format!("{} carries no fence", record.ledger_id))
+    })?;
+    let mut parent_fence = None;
+    let mut unlisted = false;
+    for _ in 0..MAX_ATTEMPTS {
+        let Versioned {
+            value: binding,
+            version,
+        } = active_binding(store, name).await?;
+        // An earlier attempt got further. If it stopped before the parent's
+        // count, the count stays high, which only keeps the parent's data
+        // longer.
+        if binding.fence_of(&record.branch) != Some(fence) {
+            return Ok(None);
+        }
+        parent_fence = record
+            .source_branch
+            .as_deref()
+            .and_then(|p| binding.fence_of(p));
+        let mut next = binding;
+        next.branches.retain(|b| b.branch != record.branch);
+        if let RegistryCas::Updated { .. } =
+            store.cas_binding(name, Some(version), Some(&next)).await?
+        {
+            unlisted = true;
+            break;
+        }
+    }
+    if !unlisted {
+        return Err(contended(name));
+    }
+    store.delete_record(&record.ledger_id, fence).await?;
+
+    let (Some(parent), Some(parent_fence)) = (record.source_branch.as_deref(), parent_fence) else {
+        return Ok(None);
+    };
+    let parent_id = name.with_branch(parent)?;
+    if store.adjust_children(&parent_id, parent_fence, -1).await? != FenceOutcome::Applied {
+        return Ok(None);
+    }
+    let Ok(binding) = active_binding(store, name).await else {
+        return Ok(None);
+    };
+    if !binding
+        .value
+        .listing(parent)
+        .is_some_and(|b| b.dropped && b.fence == parent_fence)
+    {
+        return Ok(None);
+    }
+    Ok(store
+        .raw_record(&parent_id)
+        .await?
+        .filter(|r| r.fence == Some(parent_fence) && r.branches == 0)
+        .map(|mut r| {
+            r.storage_root = Some(binding.value.root);
+            r
+        }))
 }
 
 /// What a drop did.
@@ -330,6 +552,7 @@ pub async fn drop_ledger<S: LifecycleStore + ?Sized>(
                 .filter(|r| r.fence == Some(b.fence))
             {
                 record.storage_root = None;
+                record.retracted = b.dropped;
                 records.push(record);
             }
         }
@@ -403,8 +626,8 @@ pub async fn restore_dropped<S: LifecycleStore + ?Sized>(
                 .branches
                 .iter()
                 .map(|r| BranchFence {
-                    branch: r.branch.clone(),
-                    fence: Fence::generate(),
+                    dropped: r.retracted,
+                    ..BranchFence::new(&r.branch, Fence::generate())
                 })
                 .collect();
             let restoring = DroppedLedger {
@@ -470,7 +693,8 @@ pub async fn restore_dropped<S: LifecycleStore + ?Sized>(
     for saved in &entry.branches {
         let mut record = saved.clone();
         record.fence = binding.fence_of(&record.branch);
-        record.frozen = false;
+        record.frozen = record.retracted;
+        record.retracted = false;
         insert_fenced(store, &record).await?;
         record.storage_root = Some(entry.root.clone());
         records.push(record);

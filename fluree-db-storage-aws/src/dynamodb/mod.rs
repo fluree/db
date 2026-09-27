@@ -618,7 +618,7 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
     ) -> std::result::Result<Option<NsRecord>, NameServiceError> {
         let pk = Self::normalize(ledger_id)?;
         let items = self.query_metadata_items(&pk).await?;
-        Ok(Self::items_to_ns_record(&pk, &items))
+        fluree_db_nameservice::read_resolved(self, Self::items_to_ns_record(&pk, &items)).await
     }
 
     /// One consistent Query over the `head..=index` sort-key range, projected
@@ -695,7 +695,7 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
             }
         }
 
-        Ok(records)
+        fluree_db_nameservice::read_all_resolved(self, records).await
     }
 }
 
@@ -2110,7 +2110,8 @@ impl GraphSourceLookup for DynamoDbNameService {
 
         match kind {
             Some(k) if k == KIND_LEDGER => {
-                if let Some(record) = Self::items_to_ns_record(&pk, &items) {
+                let record = Self::items_to_ns_record(&pk, &items);
+                if let Some(record) = fluree_db_nameservice::read_resolved(self, record).await? {
                     return Ok(NsLookupResult::Ledger(record));
                 }
             }

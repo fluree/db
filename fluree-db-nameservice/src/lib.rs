@@ -38,8 +38,9 @@ pub mod tracking;
 pub mod tracking_file;
 
 pub use binding::{
-    new_instance_id, resolve_record, BindingState, BranchFence, BranchRecordStore, DroppedLedger,
-    DroppedState, Fence, FenceOutcome, LedgerRegistry, NameBinding, RegistryCas, Versioned,
+    new_instance_id, read_all_resolved, read_resolved, resolve_for_read, resolve_record,
+    BindingState, BranchFence, BranchRecordStore, DroppedLedger, DroppedState, Fence, FenceOutcome,
+    LedgerRegistry, NameBinding, RegistryCas, Versioned,
 };
 pub use branched_store::{
     branched_content_store_for_id, branched_content_store_for_record,
@@ -1434,6 +1435,8 @@ pub trait NameServicePublisher:
     + GraphSourcePublisher
     + StatusPublisher
     + ConfigPublisher
+    + LedgerRegistry
+    + BranchRecordStore
 {
 }
 
@@ -1444,7 +1447,83 @@ impl<T> NameServicePublisher for T where
         + GraphSourcePublisher
         + StatusPublisher
         + ConfigPublisher
+        + LedgerRegistry
+        + BranchRecordStore
 {
+}
+
+#[async_trait]
+impl<T> LedgerRegistry for Arc<T>
+where
+    T: LedgerRegistry + ?Sized,
+{
+    async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
+        (**self).get_binding(name).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&NameBinding>,
+    ) -> Result<RegistryCas<NameBinding>> {
+        (**self).cas_binding(name, expected, new).await
+    }
+
+    async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
+        (**self).list_bindings().await
+    }
+
+    async fn get_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+    ) -> Result<Option<Versioned<DroppedLedger>>> {
+        (**self).get_dropped(instance).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+        expected: Option<u64>,
+        new: Option<&DroppedLedger>,
+    ) -> Result<RegistryCas<DroppedLedger>> {
+        (**self).cas_dropped(instance, expected, new).await
+    }
+
+    async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
+        (**self).list_dropped().await
+    }
+}
+
+#[async_trait]
+impl<T> BranchRecordStore for Arc<T>
+where
+    T: BranchRecordStore + ?Sized,
+{
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        (**self).raw_record(ledger_id).await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        (**self).insert_record(record).await
+    }
+
+    async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        (**self).freeze_record(ledger_id, fence).await
+    }
+
+    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        (**self).delete_record(ledger_id, fence).await
+    }
+
+    async fn adjust_children(
+        &self,
+        ledger_id: &str,
+        fence: Fence,
+        delta: i32,
+    ) -> Result<FenceOutcome> {
+        (**self).adjust_children(ledger_id, fence, delta).await
+    }
 }
 
 #[async_trait]

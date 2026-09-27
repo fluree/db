@@ -112,8 +112,8 @@ async fn post_envelope(app: &axum::Router, envelope: &JsonValue) -> (StatusCode,
 async fn multi_query_all_jsonld_succeeds() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:a").await;
-    insert_one(&app, "mq:a", "ex:alice", "Alice").await;
+    create_ledger(&app, "mq-a:main").await;
+    insert_one(&app, "mq-a:main", "ex:alice", "Alice").await;
 
     let envelope = json!({
         "queries": {
@@ -121,7 +121,7 @@ async fn multi_query_all_jsonld_succeeds() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:a",
+                    "from": "mq-a:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -130,7 +130,7 @@ async fn multi_query_all_jsonld_succeeds() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:a",
+                    "from": "mq-a:main",
                     "selectOne": "?id",
                     "where": { "@id": "?id", "ex:name": "Alice" }
                 }
@@ -149,8 +149,8 @@ async fn multi_query_all_jsonld_succeeds() {
 async fn multi_query_mixed_language_succeeds() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:mixed").await;
-    insert_one(&app, "mq:mixed", "ex:bob", "Bob").await;
+    create_ledger(&app, "mq-mixed:main").await;
+    insert_one(&app, "mq-mixed:main", "ex:bob", "Bob").await;
 
     let envelope = json!({
         "queries": {
@@ -158,14 +158,14 @@ async fn multi_query_mixed_language_succeeds() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:mixed",
+                    "from": "mq-mixed:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
             },
             "sparql_q": {
                 "language": "sparql",
-                "query": "PREFIX ex: <http://example.org/> SELECT ?name FROM <mq:mixed> WHERE { ?s ex:name ?name }"
+                "query": "PREFIX ex: <http://example.org/> SELECT ?name FROM <mq-mixed:main> WHERE { ?s ex:name ?name }"
             }
         }
     });
@@ -182,8 +182,8 @@ async fn multi_query_mixed_language_succeeds() {
 async fn multi_query_shared_context_lifts_to_jsonld_subqueries() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:ctx").await;
-    insert_one(&app, "mq:ctx", "ex:carol", "Carol").await;
+    create_ledger(&app, "mq-ctx:main").await;
+    insert_one(&app, "mq-ctx:main", "ex:carol", "Carol").await;
 
     // Envelope-level @context — sub-queries don't repeat it.
     let envelope = json!({
@@ -192,7 +192,7 @@ async fn multi_query_shared_context_lifts_to_jsonld_subqueries() {
             "find": {
                 "language": "jsonld",
                 "query": {
-                    "from": "mq:ctx",
+                    "from": "mq-ctx:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -210,8 +210,8 @@ async fn multi_query_shared_context_lifts_to_jsonld_subqueries() {
 async fn multi_query_shared_context_injects_sparql_prefix() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:sparqlctx").await;
-    insert_one(&app, "mq:sparqlctx", "ex:dan", "Dan").await;
+    create_ledger(&app, "mq-sparqlctx:main").await;
+    insert_one(&app, "mq-sparqlctx:main", "ex:dan", "Dan").await;
 
     // SPARQL query without its own PREFIX line — should pick up `ex:`
     // from envelope @context.
@@ -220,7 +220,7 @@ async fn multi_query_shared_context_injects_sparql_prefix() {
         "queries": {
             "find": {
                 "language": "sparql",
-                "query": "SELECT ?name FROM <mq:sparqlctx> WHERE { ?s ex:name ?name }"
+                "query": "SELECT ?name FROM <mq-sparqlctx:main> WHERE { ?s ex:name ?name }"
             }
         }
     });
@@ -235,8 +235,8 @@ async fn multi_query_shared_context_injects_sparql_prefix() {
 async fn multi_query_response_echoes_snapshot_ledgers() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:snap").await;
-    insert_one(&app, "mq:snap", "ex:e", "E").await;
+    create_ledger(&app, "mq-snap:main").await;
+    insert_one(&app, "mq-snap:main", "ex:e", "E").await;
 
     let envelope = json!({
         "queries": {
@@ -244,7 +244,7 @@ async fn multi_query_response_echoes_snapshot_ledgers() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:snap",
+                    "from": "mq-snap:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -255,10 +255,10 @@ async fn multi_query_response_echoes_snapshot_ledgers() {
     assert_eq!(status, StatusCode::OK, "got body: {body}");
     let snapshot = &body["snapshot"];
     assert!(snapshot["asOf"].is_string(), "asOf should echo server-now");
-    let t = snapshot["ledgers"]["mq:snap"].as_i64();
+    let t = snapshot["ledgers"]["mq-snap:main"].as_i64();
     assert!(
         t.is_some() && t.unwrap() >= 1,
-        "snapshot.ledgers should pin mq:snap to t >= 1, got: {snapshot}"
+        "snapshot.ledgers should pin mq-snap:main to t >= 1, got: {snapshot}"
     );
 }
 
@@ -270,10 +270,10 @@ async fn multi_query_response_echoes_snapshot_ledgers() {
 async fn multi_query_two_ledgers_share_snapshot() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:l1").await;
-    insert_one(&app, "mq:l1", "ex:foo", "Foo").await;
-    create_ledger(&app, "mq:l2").await;
-    insert_one(&app, "mq:l2", "ex:bar", "Bar").await;
+    create_ledger(&app, "mq-l1:main").await;
+    insert_one(&app, "mq-l1:main", "ex:foo", "Foo").await;
+    create_ledger(&app, "mq-l2:main").await;
+    insert_one(&app, "mq-l2:main", "ex:bar", "Bar").await;
 
     let envelope = json!({
         "queries": {
@@ -281,7 +281,7 @@ async fn multi_query_two_ledgers_share_snapshot() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:l1",
+                    "from": "mq-l1:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -290,7 +290,7 @@ async fn multi_query_two_ledgers_share_snapshot() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:l2",
+                    "from": "mq-l2:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -301,8 +301,8 @@ async fn multi_query_two_ledgers_share_snapshot() {
     assert_eq!(status, StatusCode::OK, "got body: {body}");
     assert_eq!(body["status"], "ok");
     // Both ledgers' resolved t values must appear in the snapshot echo.
-    assert!(body["snapshot"]["ledgers"]["mq:l1"].is_i64());
-    assert!(body["snapshot"]["ledgers"]["mq:l2"].is_i64());
+    assert!(body["snapshot"]["ledgers"]["mq-l1:main"].is_i64());
+    assert!(body["snapshot"]["ledgers"]["mq-l2:main"].is_i64());
 }
 
 // =============================================================================
@@ -313,13 +313,13 @@ async fn multi_query_two_ledgers_share_snapshot() {
 async fn multi_query_partial_failure_reports_per_alias_error() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:partial").await;
-    insert_one(&app, "mq:partial", "ex:p", "P").await;
+    create_ledger(&app, "mq-partial:main").await;
+    insert_one(&app, "mq-partial:main", "ex:p", "P").await;
 
     // 'bad' uses a SPARQL string that the envelope validator can't tell
     // apart from a valid query (parse failure defers to the downstream
     // parser) — so envelope-level checks pass, snapshot resolution
-    // succeeds against mq:partial, and dispatch reports the per-alias
+    // succeeds against mq-partial:main, and dispatch reports the per-alias
     // SPARQL parse error.
     let envelope = json!({
         "queries": {
@@ -327,14 +327,14 @@ async fn multi_query_partial_failure_reports_per_alias_error() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:partial",
+                    "from": "mq-partial:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
             },
             "bad": {
                 "language": "sparql",
-                "query": "SELECT ?x FROM <mq:partial> WHERE { this is not valid SPARQL }"
+                "query": "SELECT ?x FROM <mq-partial:main> WHERE { this is not valid SPARQL }"
             }
         }
     });
@@ -382,8 +382,8 @@ async fn multi_query_subquery_missing_from_returns_400() {
 async fn multi_query_asof_collision_returns_400() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:as").await;
-    insert_one(&app, "mq:as", "ex:y", "Y").await;
+    create_ledger(&app, "mq-as:main").await;
+    insert_one(&app, "mq-as:main", "ex:y", "Y").await;
 
     // Envelope sets asOf, sub-query also carries a @t: pin — collision.
     let envelope = json!({
@@ -393,7 +393,7 @@ async fn multi_query_asof_collision_returns_400() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:as@t:1",
+                    "from": "mq-as:main@t:1",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -408,8 +408,8 @@ async fn multi_query_asof_collision_returns_400() {
 async fn multi_query_envelope_max_fuel_returns_400() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:fuel").await;
-    insert_one(&app, "mq:fuel", "ex:f", "F").await;
+    create_ledger(&app, "mq-fuel:main").await;
+    insert_one(&app, "mq-fuel:main", "ex:f", "F").await;
 
     // Envelope-level fuel budget isn't supported in v1.
     let envelope = json!({
@@ -419,7 +419,7 @@ async fn multi_query_envelope_max_fuel_returns_400() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:fuel",
+                    "from": "mq-fuel:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -434,8 +434,8 @@ async fn multi_query_envelope_max_fuel_returns_400() {
 async fn multi_query_history_subquery_returns_400() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:hist").await;
-    insert_one(&app, "mq:hist", "ex:h", "H").await;
+    create_ledger(&app, "mq-hist:main").await;
+    insert_one(&app, "mq-hist:main", "ex:h", "H").await;
 
     // History range queries aren't supported inside envelopes in v1.
     let envelope = json!({
@@ -444,8 +444,8 @@ async fn multi_query_history_subquery_returns_400() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:hist@t:1",
-                    "to":   "mq:hist@t:latest",
+                    "from": "mq-hist:main@t:1",
+                    "to":   "mq-hist:main@t:latest",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -460,8 +460,8 @@ async fn multi_query_history_subquery_returns_400() {
 async fn multi_query_max_concurrency_zero_returns_400() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:zc").await;
-    insert_one(&app, "mq:zc", "ex:z", "Z").await;
+    create_ledger(&app, "mq-zc:main").await;
+    insert_one(&app, "mq-zc:main", "ex:z", "Z").await;
 
     let envelope = json!({
         "opts": { "maxConcurrency": 0 },
@@ -470,7 +470,7 @@ async fn multi_query_max_concurrency_zero_returns_400() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:zc",
+                    "from": "mq-zc:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -492,14 +492,14 @@ async fn multi_query_fragment_ledger_sparql_runs_at_envelope_t() {
     // Pre-fix, the rewrite was skipped because `value_str != bare`.
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:frag").await;
-    insert_one(&app, "mq:frag", "ex:f", "F").await;
+    create_ledger(&app, "mq-frag:main").await;
+    insert_one(&app, "mq-frag:main", "ex:f", "F").await;
 
     let envelope = json!({
         "queries": {
             "txn": {
                 "language": "sparql",
-                "query": "SELECT ?s ?t FROM <mq:frag#txn-meta> WHERE { ?s <https://ns.flur.ee/db#t> ?t } LIMIT 1"
+                "query": "SELECT ?s ?t FROM <mq-frag:main#txn-meta> WHERE { ?s <https://ns.flur.ee/db#t> ?t } LIMIT 1"
             }
         }
     });
@@ -524,8 +524,8 @@ async fn multi_query_fragment_ledger_sparql_runs_at_envelope_t() {
 async fn multi_query_meta_block_included_when_opts_meta_true() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:meta").await;
-    insert_one(&app, "mq:meta", "ex:m", "M").await;
+    create_ledger(&app, "mq-meta:main").await;
+    insert_one(&app, "mq-meta:main", "ex:m", "M").await;
 
     let envelope = json!({
         "opts": { "meta": true },
@@ -534,7 +534,7 @@ async fn multi_query_meta_block_included_when_opts_meta_true() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:meta",
+                    "from": "mq-meta:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -557,9 +557,9 @@ async fn multi_query_per_alias_tracking_surfaces_under_opts_meta() {
     // single-query `/query` returns for tracked requests.
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:track").await;
-    insert_one(&app, "mq:track", "ex:alice", "Alice").await;
-    insert_one(&app, "mq:track", "ex:brian", "Brian").await;
+    create_ledger(&app, "mq-track:main").await;
+    insert_one(&app, "mq-track:main", "ex:alice", "Alice").await;
+    insert_one(&app, "mq-track:main", "ex:brian", "Brian").await;
 
     let envelope = json!({
         "opts": { "meta": true },
@@ -568,7 +568,7 @@ async fn multi_query_per_alias_tracking_surfaces_under_opts_meta() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:track",
+                    "from": "mq-track:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -577,7 +577,7 @@ async fn multi_query_per_alias_tracking_surfaces_under_opts_meta() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:track",
+                    "from": "mq-track:main",
                     "select": ["?id"],
                     "where": { "@id": "?id", "ex:name": "?name" }
                 }
@@ -635,8 +635,8 @@ async fn multi_query_per_alias_tracking_only_for_tracked_aliases() {
     // tracking map should hold that alias, but not the un-tracked one.
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:psel").await;
-    insert_one(&app, "mq:psel", "ex:p", "P").await;
+    create_ledger(&app, "mq-psel:main").await;
+    insert_one(&app, "mq-psel:main", "ex:p", "P").await;
 
     let envelope = json!({
         "queries": {
@@ -644,7 +644,7 @@ async fn multi_query_per_alias_tracking_only_for_tracked_aliases() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:psel",
+                    "from": "mq-psel:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 },
@@ -654,7 +654,7 @@ async fn multi_query_per_alias_tracking_only_for_tracked_aliases() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:psel",
+                    "from": "mq-psel:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -708,8 +708,8 @@ async fn post_envelope_with_headers(
 async fn multi_query_fluree_output_format_typed_json_wraps_literals() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:fmt").await;
-    insert_one(&app, "mq:fmt", "ex:alice", "Alice").await;
+    create_ledger(&app, "mq-fmt:main").await;
+    insert_one(&app, "mq-fmt:main", "ex:alice", "Alice").await;
 
     let envelope = json!({
         "queries": {
@@ -717,7 +717,7 @@ async fn multi_query_fluree_output_format_typed_json_wraps_literals() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:fmt",
+                    "from": "mq-fmt:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -742,8 +742,8 @@ async fn multi_query_fluree_output_format_typed_json_wraps_literals() {
 async fn multi_query_fluree_output_format_unknown_value_returns_400() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:fmtbad").await;
-    insert_one(&app, "mq:fmtbad", "ex:alice", "Alice").await;
+    create_ledger(&app, "mq-fmtbad:main").await;
+    insert_one(&app, "mq-fmtbad:main", "ex:alice", "Alice").await;
 
     let envelope = json!({
         "queries": {
@@ -751,7 +751,7 @@ async fn multi_query_fluree_output_format_unknown_value_returns_400() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:fmtbad",
+                    "from": "mq-fmtbad:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -778,8 +778,8 @@ async fn multi_query_fluree_output_format_wins_over_byte_shape_accept() {
     // safely cohabit with content negotiation rules.
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:fmtprec").await;
-    insert_one(&app, "mq:fmtprec", "ex:alice", "Alice").await;
+    create_ledger(&app, "mq-fmtprec:main").await;
+    insert_one(&app, "mq-fmtprec:main", "ex:alice", "Alice").await;
 
     let envelope = json!({
         "queries": {
@@ -787,7 +787,7 @@ async fn multi_query_fluree_output_format_wins_over_byte_shape_accept() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:fmtprec",
+                    "from": "mq-fmtprec:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
@@ -816,8 +816,8 @@ async fn multi_query_fluree_output_format_wins_over_byte_shape_accept() {
 async fn multi_query_tsv_accept_returns_406() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mq:tsv").await;
-    insert_one(&app, "mq:tsv", "ex:alice", "Alice").await;
+    create_ledger(&app, "mq-tsv:main").await;
+    insert_one(&app, "mq-tsv:main", "ex:alice", "Alice").await;
 
     let envelope = json!({
         "queries": {
@@ -825,7 +825,7 @@ async fn multi_query_tsv_accept_returns_406() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from": "mq:tsv",
+                    "from": "mq-tsv:main",
                     "select": ["?name"],
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }

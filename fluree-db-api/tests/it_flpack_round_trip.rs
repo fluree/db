@@ -36,8 +36,7 @@ async fn export_ledger_to_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &str)
         .as_ref()
         .expect("ledger should have commits");
 
-    let content_store =
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
+    let content_store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
 
     let missing_commits = compute_missing_commits(
         &content_store,
@@ -154,6 +153,7 @@ async fn import_ledger_from_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &st
         .create_ledger(ledger_id)
         .await
         .expect("create ledger for import");
+    let namespace = fluree.storage_namespace(ledger_id).await.unwrap();
 
     let mut pos = read_stream_preamble(data).expect("valid preamble");
     let admin_storage = fluree
@@ -178,14 +178,9 @@ async fn import_ledger_from_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &st
             }
             PackFrame::Data { cid, payload } => {
                 assert!(saw_header, "data frame before header");
-                ingest_pack_frame(
-                    &cid,
-                    &payload,
-                    &admin_storage,
-                    &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
-                )
-                .await
-                .unwrap_or_else(|e| panic!("ingest failed for {cid}: {e}"));
+                ingest_pack_frame(&cid, &payload, &admin_storage, &namespace)
+                    .await
+                    .unwrap_or_else(|e| panic!("ingest failed for {cid}: {e}"));
                 objects += 1;
             }
             PackFrame::Manifest(json) => {
@@ -793,7 +788,7 @@ async fn flpack_restore_restamps_index_root_ledger_id() {
                 .expect("restored record");
             let index_id = rec.index_head_id.expect("restored index head id");
             let root_bytes = dst_fluree
-                .content_store(&fluree_db_core::StorageNamespace::parse_legacy(dst_ledger).unwrap())
+                .content_store(&dst_fluree.storage_namespace(dst_ledger).await.unwrap())
                 .get(&index_id)
                 .await
                 .expect("read restored index root");

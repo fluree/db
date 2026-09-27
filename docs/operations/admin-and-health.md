@@ -236,15 +236,15 @@ See [Admin Authentication](../api/endpoints.md#admin-authentication) for details
 
 ### POST /v1/fluree/drop
 
-Drop an **entire ledger** (every branch under the name, plus `@shared/dicts/` in hard mode) or, as a fallback, a graph source with the same name:
+Drop an **entire ledger** (every branch under the name) or, as a fallback, a graph source with the same name. Either mode frees the name at once:
 
 ```bash
-# Soft drop the whole "mydb" ledger (retract every branch)
+# Soft drop the whole "mydb" ledger (data kept in the dropped-ledger registry)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb"}'
 
-# Hard drop (delete every branch's artifacts + @shared/dicts - IRREVERSIBLE)
+# Hard drop (delete the ledger's data - IRREVERSIBLE)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "hard": true}'
@@ -260,24 +260,23 @@ single branch.
 {
   "ledger_id": "mydb",
   "status": "dropped",
-  "files_deleted": 73,
-  "branches_dropped": ["mydb:feature-x", "mydb:dev", "mydb:main"]
+  "instance": "01JB8ZK4X5Y6Z7A8B9C0D1E2F3",
+  "name_released": true,
+  "data": "retained"
 }
 ```
 
 | Status | Description |
 |--------|-------------|
-| `dropped` | Successfully dropped (aggregate across branches) |
-| `already_retracted` | Every branch was previously retracted |
-| `not_found` | No nameservice record exists for the name |
+| `dropped` | Successfully dropped |
+| `already_retracted` | A ledger from an earlier version that was already soft-dropped |
+| `not_found` | Nothing holds the name |
 
 **Authentication:** When `--admin-auth-mode=required`, requires Bearer token from a trusted issuer.
 
-**Drop Modes:**
-- **Soft** (default): Marks every branch retracted in the nameservice; artifacts remain and aliases stay reserved.
-- **Hard**: Deletes per-branch storage artifacts and `@shared/dicts/`, then purges the nameservice records so the ledger name can be reused. Branches are dropped leaf-first; on a per-branch nameservice failure the operation aborts with `500` before touching parents or shared cleanup (retry is safe — each step is idempotent).
+**Dropped ledgers:** a soft-dropped ledger waits in the registry. List them with `GET /v1/fluree/dropped`, and restore or purge one by its `instance` with `POST /v1/fluree/dropped/restore` or `POST /v1/fluree/dropped/purge`. A hard drop whose deletion was interrupted reports `"data": "deleting"`; purging it finishes the job.
 
-If no nameservice record is found for the name, the endpoint tries the same name as a graph source on branch `main`. Truly orphaned storage with no nameservice pointer is **not** swept by `/drop`.
+If nothing holds the name, the endpoint tries the same name as a graph source on branch `main`.
 
 See [Dropping Ledgers](../getting-started/rust-api.md#dropping-ledgers) and [`POST /drop`](../api/endpoints.md#post-drop) for the full reference.
 

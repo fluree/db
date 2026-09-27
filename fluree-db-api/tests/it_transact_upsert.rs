@@ -270,8 +270,7 @@ async fn upsert_typed_string_retract_and_assert_use_same_datatype_sid() {
     });
     let result = fluree.upsert(ledger1, &upsert_txn).await.unwrap();
 
-    let content_store =
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
+    let content_store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
     let commit = load_commit_by_id(&content_store, &result.receipt.commit_id)
         .await
         .expect("load upsert commit");

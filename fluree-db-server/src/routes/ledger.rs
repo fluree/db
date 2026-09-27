@@ -17,6 +17,7 @@ use fluree_db_api::wire::{
 };
 use fluree_db_api::{
     ApiError, BranchDropReport, DropMode, DropNamedGraphReport, DropReport, DropStatus,
+    DroppedData, DroppedLedgerInfo, DroppedLedgerState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -210,6 +211,17 @@ pub struct DropResponse {
     /// Warnings (if any)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// The dropped ledger's instance, by which a soft-dropped ledger is
+    /// restored or purged. Absent for a ledger created before name bindings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// Whether the name is free for a new ledger. Absent for a graph source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_released: Option<bool>,
+    /// What became of the data: `retained`, `deleted`, or `deleting` when a
+    /// purge must be retried to finish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<&'static str>,
 }
 
 impl From<DropReport> for DropResponse {
@@ -238,6 +250,13 @@ impl From<DropReport> for DropResponse {
             files_deleted,
             branches_dropped,
             warnings: report.warnings,
+            instance: report.instance.map(|i| i.to_string()),
+            name_released: Some(report.name_released),
+            data: report.data.map(|d| match d {
+                DroppedData::Retained => "retained",
+                DroppedData::Deleted => "deleted",
+                DroppedData::Deleting => "deleting",
+            }),
         }
     }
 }
@@ -352,6 +371,9 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
                 files_deleted,
                 branches_dropped: Vec::new(),
                 warnings: gs_report.warnings,
+                instance: None,
+                name_released: None,
+                data: None,
             }));
         }
 
@@ -360,6 +382,126 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
     }
     .instrument(span)
     .await
+}
+
+// =============================================================================
+// Dropped ledgers
+// =============================================================================
+
+/// A dropped ledger held in the registry.
+#[derive(Serialize)]
+pub struct DroppedLedgerResponse {
+    /// Restore or purge it by this id.
+    pub instance: String,
+    /// The name it was dropped under.
+    pub name: String,
+    /// Milliseconds since the Unix epoch.
+    pub dropped_at: i64,
+    /// `dropped`, or `restoring` / `purging` when that operation must be
+    /// retried to finish.
+    pub state: &'static str,
+    pub branches: Vec<String>,
+}
+
+impl From<DroppedLedgerInfo> for DroppedLedgerResponse {
+    fn from(info: DroppedLedgerInfo) -> Self {
+        Self {
+            instance: info.instance.to_string(),
+            name: info.name,
+            dropped_at: info.dropped_at,
+            state: match info.state {
+                DroppedLedgerState::Dropped => "dropped",
+                DroppedLedgerState::Restoring => "restoring",
+                DroppedLedgerState::Purging => "purging",
+            },
+            branches: info.branches,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct DroppedListResponse {
+    /// Most recently dropped first.
+    pub dropped: Vec<DroppedLedgerResponse>,
+}
+
+/// Names one dropped ledger.
+#[derive(Deserialize)]
+pub struct DroppedRequest {
+    pub instance: String,
+}
+
+async fn dropped_request(request: Request) -> Result<DroppedRequest> {
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    serde_json::from_slice(&body)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))
+}
+
+/// List dropped ledgers
+///
+/// GET /fluree/dropped
+pub async fn list_dropped(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    async {
+        let dropped = state
+            .fluree
+            .list_dropped()
+            .await
+            .map_err(ServerError::Api)?;
+        Ok::<_, ServerError>(Json(DroppedListResponse {
+            dropped: dropped.into_iter().map(Into::into).collect(),
+        }))
+    }
+    .await
+    .into_response()
+}
+
+/// Restore a dropped ledger under the name it was dropped under
+///
+/// POST /fluree/dropped/restore `{"instance": "..."}`
+pub async fn restore_dropped(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    async {
+        let req = dropped_request(request).await?;
+        let restored = state
+            .fluree
+            .restore_dropped(&req.instance)
+            .await
+            .map_err(ServerError::Api)?;
+        tracing::info!(ledger = %restored.name, instance = %restored.instance, "dropped ledger restored");
+        Ok::<_, ServerError>(Json(DroppedLedgerResponse::from(restored)))
+    }
+    .await
+    .into_response()
+}
+
+/// Delete a dropped ledger's data
+///
+/// POST /fluree/dropped/purge `{"instance": "..."}`
+pub async fn purge_dropped(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    async {
+        let req = dropped_request(request).await?;
+        let report = state
+            .fluree
+            .purge_dropped(&req.instance)
+            .await
+            .map_err(ServerError::Api)?;
+        tracing::info!(ledger = %report.ledger_id, instance = %req.instance, "dropped ledger purged");
+        let mut response = DropResponse::from(report);
+        response.status = "purged".to_string();
+        Ok::<_, ServerError>(Json(response))
+    }
+    .await
+    .into_response()
 }
 
 // =============================================================================

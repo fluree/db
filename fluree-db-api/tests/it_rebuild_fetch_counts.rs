@@ -165,7 +165,7 @@ async fn rebuild_issues_exactly_one_range_and_one_blob_fetch_per_commit() {
     assert_eq!(record.commit_t, N as i64);
 
     let counted = CountingContentStore::new(
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
     );
     let counters = counted.counters();
 
@@ -217,7 +217,7 @@ async fn rebuild_fetch_concurrency_env_override_preserves_counts() {
         .expect("ns record exists");
 
     let counted = CountingContentStore::new(
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
     );
     let counters = counted.counters();
 

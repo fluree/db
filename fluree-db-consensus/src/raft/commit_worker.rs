@@ -199,13 +199,12 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Where this branch's artifacts live. The worker holds no
-    /// nameservice record, so this is the branch's legacy namespace.
-    fn storage_namespace(&self) -> Result<StorageNamespace, WorkerError> {
-        self.ref_key
-            .id()
-            .map(|id| StorageNamespace::legacy(&id))
-            .map_err(|e| WorkerError::Transient(format!("invalid branch key: {e}")))
+    /// Where this branch's artifacts live, from its ledger's binding in
+    /// the replicated state.
+    async fn storage_namespace(&self) -> Result<StorageNamespace, WorkerError> {
+        let state = self.shared_state.read().await;
+        crate::raft::nameservice::storage_namespace_in(&state, &self.ref_key)
+            .map_err(|e| WorkerError::Transient(format!("no storage root for the branch: {e}")))
     }
 
     fn new(
@@ -514,7 +513,7 @@ impl Worker {
     /// the worker's retry loop. `ContentStore::release` is
     /// idempotent on non-existent CIDs.
     async fn release_orphaned_commit_blob(&self, commit_id: &ContentId) {
-        let Ok(namespace) = self.storage_namespace() else {
+        let Ok(namespace) = self.storage_namespace().await else {
             return;
         };
         let content_store = self.staging.fluree.content_store(&namespace);
@@ -575,7 +574,7 @@ impl Worker {
         let bytes = self
             .staging
             .fluree
-            .content_store(&self.storage_namespace()?)
+            .content_store(&self.storage_namespace().await?)
             .get(&entry.request_cid)
             .await
             .map_err(|e| WorkerError::Transient(format!("CAS read of request_cid failed: {e}")))?;
@@ -752,7 +751,7 @@ impl Worker {
         let tally = staged_commit.tally.clone();
 
         self.persist_staged_blobs(
-            &self.storage_namespace()?,
+            &self.storage_namespace().await?,
             &commit_cid,
             &staged_commit,
             "transact",
@@ -901,7 +900,7 @@ impl Worker {
         let content_store = self
             .staging
             .fluree
-            .content_store(&self.storage_namespace()?);
+            .content_store(&self.storage_namespace().await?);
         // Read each commit's bytes back from CAS by CID. The
         // transactor wrote them before enqueueing, so a definitive
         // `NotFound` means the blob has been GC'd (or never landed)

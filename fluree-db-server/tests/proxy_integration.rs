@@ -1510,7 +1510,7 @@ async fn test_proxy_storage_read_bytes_hint_returns_flkb_for_leaf() {
     );
     let root_bytes = root_resp.bytes().await.expect("read root bytes");
     let leaf_cid = extract_spot_leaf_cid(&root_bytes);
-    let leaf_address = leaf_address_from_cid(&leaf_cid, "peer:test");
+    let leaf_address = leaf_address_from_cid(&leaf_cid, &state, "peer:test").await;
 
     // Create ProxyStorage pointing to our test server
     let proxy_storage = ProxyStorage::new(server_url.clone(), token, ProxyReadMode::Filtered);
@@ -1655,7 +1655,7 @@ async fn test_proxy_storage_read_bytes_leaf_returns_flkb_under_policy() {
     );
     let root_bytes = root_resp.bytes().await.expect("read root bytes");
     let leaf_cid = extract_spot_leaf_cid(&root_bytes);
-    let leaf_address = leaf_address_from_cid(&leaf_cid, "raw:test");
+    let leaf_address = leaf_address_from_cid(&leaf_cid, &state, "raw:test").await;
 
     // Create ProxyStorage pointing to our test server
     let proxy_storage = ProxyStorage::new(server_url.clone(), token, ProxyReadMode::Filtered);
@@ -1765,7 +1765,11 @@ async fn test_proxy_storage_raw_mode_returns_canonical_bytes() {
     let root_address = fluree_db_core::content_address(
         "file",
         ContentKind::IndexRoot,
-        &fluree_db_core::StorageNamespace::parse_legacy("rawmode:test").unwrap(),
+        &state
+            .fluree
+            .storage_namespace("rawmode:test")
+            .await
+            .unwrap(),
         &reindex_result.root_id.digest_hex(),
     );
     let direct_root_bytes = admin_storage
@@ -1773,7 +1777,7 @@ async fn test_proxy_storage_raw_mode_returns_canonical_bytes() {
         .await
         .expect("direct root read");
     let leaf_cid = extract_spot_leaf_cid(&direct_root_bytes);
-    let leaf_address = leaf_address_from_cid(&leaf_cid, "rawmode:test");
+    let leaf_address = leaf_address_from_cid(&leaf_cid, &state, "rawmode:test").await;
     let direct_leaf_bytes = admin_storage
         .read_bytes(&leaf_address)
         .await
@@ -2505,12 +2509,12 @@ fn extract_spot_leaf_cid(root_bytes: &[u8]) -> String {
 
 /// Derive the storage address for a leaf from its CID string.
 /// (Needed by ProxyStorage tests that call `read_bytes(address)` directly.)
-fn leaf_address_from_cid(cid_str: &str, ledger_id: &str) -> String {
+async fn leaf_address_from_cid(cid_str: &str, state: &AppState, ledger_id: &str) -> String {
     let cid: ContentId = cid_str.parse().expect("leaf should be a valid CID");
     fluree_db_core::content_address(
         "file",
         ContentKind::IndexLeaf,
-        &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+        &state.fluree.storage_namespace(ledger_id).await.unwrap(),
         &cid.digest_hex(),
     )
 }
@@ -2923,7 +2927,11 @@ async fn test_object_endpoint_serves_ledger_scoped_advanced_kinds() {
         let written = admin_storage
             .content_write_bytes(
                 kind,
-                &fluree_db_core::StorageNamespace::parse_legacy("advkinds:test").unwrap(),
+                &state
+                    .fluree
+                    .storage_namespace("advkinds:test")
+                    .await
+                    .unwrap(),
                 payload,
             )
             .await
@@ -3201,7 +3209,11 @@ async fn test_object_endpoint_immutable_caching_and_conditional_get() {
     admin_storage
         .content_write_bytes(
             ContentKind::StatsSketch,
-            &fluree_db_core::StorageNamespace::parse_legacy("cachehdrs:test").unwrap(),
+            &state
+                .fluree
+                .storage_namespace("cachehdrs:test")
+                .await
+                .unwrap(),
             payload,
         )
         .await

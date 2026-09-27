@@ -843,7 +843,7 @@ async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -947,7 +947,7 @@ async fn fulltext_configured_property_first_build_via_provider() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -1042,7 +1042,7 @@ async fn fulltext_configured_langtagged_literal_scores_via_arena() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -1144,7 +1144,7 @@ async fn fulltext_configured_incremental_adds_to_arena() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -1184,7 +1184,7 @@ async fn fulltext_configured_incremental_adds_to_arena() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -1665,8 +1665,7 @@ async fn fulltext_configured_persisted_incremental_extends_arena() {
         let idx_config = fluree_db_indexer::IndexerConfig::default()
             .with_fulltext_config_provider(fluree.fulltext_config_provider());
         let result = fluree_db_indexer::build_index_for_ledger(
-            fluree
-                .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+            fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
             fluree.nameservice(),
             ledger_id,
             idx_config,

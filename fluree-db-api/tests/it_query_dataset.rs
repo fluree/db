@@ -1171,8 +1171,8 @@ async fn dataset_time_travel_at_time_iso() {
         "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "schema:name": "Alice"}]
     });
     let tx1 = fluree.insert(ledger0, &insert1).await.unwrap();
-    let content_store = fluree
-        .content_store(&fluree_db_core::StorageNamespace::parse_legacy("people:main").unwrap());
+    let content_store =
+        fluree.content_store(&fluree.storage_namespace("people:main").await.unwrap());
     let commit1 = load_commit_by_id(&content_store, &tx1.receipt.commit_id)
         .await
         .unwrap();

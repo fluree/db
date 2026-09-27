@@ -1445,6 +1445,9 @@ pub enum Response {
     FenceMismatch,
     /// A fenced branch command applied.
     FenceApplied,
+    /// [`Command::AdjustChildren`] refused to add a child to a frozen
+    /// branch.
+    FenceFrozen,
     /// [`Command::FreezeBranch`] froze the branch.
     BranchFrozen {
         ledger_id: String,
@@ -1788,6 +1791,9 @@ fn delete_branch(
 fn adjust_children(state: &mut NameServiceState, key: RefKey, fence: u64, delta: i32) -> Response {
     if let Some(refused) = check_fence(state, &key, fence) {
         return refused;
+    }
+    if delta > 0 && state.fences.get(&key).is_some_and(|f| f.frozen) {
+        return Response::FenceFrozen;
     }
     if let Some(entry) = state.refs.get_mut(&key) {
         entry.branches = entry.branches.saturating_add_signed(delta);

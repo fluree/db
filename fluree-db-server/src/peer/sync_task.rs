@@ -138,8 +138,20 @@ impl PeerSyncTask {
             return;
         };
 
-        // 1. Ensure ledger exists locally (idempotent)
-        match ns.init(&record.ledger_id).await {
+        // 1. Ensure ledger exists locally (idempotent). A ledger the origin
+        // created under a name binding is copied with it, so the copy reads
+        // from the origin's instance root.
+        let ensured = if record
+            .storage_root
+            .as_ref()
+            .and_then(fluree_db_core::StorageRoot::instance)
+            .is_some()
+        {
+            fluree_db_nameservice::lifecycle::mirror_record(ns, record).await
+        } else {
+            ns.init(&record.ledger_id).await
+        };
+        match ensured {
             Ok(()) => {}
             Err(NameServiceError::LedgerAlreadyExists(_)) => {}
             Err(e) => {

@@ -483,8 +483,7 @@ async fn single_insert_three_json_datatype_forms_produce_same_dt_sid() {
     });
 
     let result = fluree.insert(ledger0, &insert).await.unwrap();
-    let content_store =
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
+    let content_store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
     let commit = load_commit_by_id(&content_store, &result.receipt.commit_id)
         .await
         .expect("load commit");
@@ -539,8 +538,7 @@ async fn single_insert_two_xsd_string_datatype_forms_produce_same_dt_sid() {
     });
 
     let result = fluree.insert(ledger0, &insert).await.unwrap();
-    let content_store =
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
+    let content_store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
     let commit = load_commit_by_id(&content_store, &result.receipt.commit_id)
         .await
         .expect("load commit");

@@ -304,12 +304,48 @@ fn record_from_state(
     Some(record)
 }
 
+/// A branch record as reads see it: see
+/// [`fluree_db_nameservice::resolve_for_read`].
+fn resolved_from_state(
+    state: &NameServiceState,
+    ledger_name: &str,
+    branch: &str,
+) -> Result<Option<NsRecord>> {
+    let Some(record) = record_from_state(state, ledger_name, branch) else {
+        return Ok(None);
+    };
+    let binding: Option<NameBinding> = match state.bindings.get(ledger_name) {
+        Some(entry) => versioned_from_json(entry)?.map(|v| v.value),
+        None => None,
+    };
+    Ok(fluree_db_nameservice::resolve_for_read(
+        binding.as_ref(),
+        record,
+    ))
+}
+
+/// Where `key`'s artifacts live: under its ledger's binding root, or under
+/// its name for a ledger from before bindings.
+pub(crate) fn storage_namespace_in(
+    state: &NameServiceState,
+    key: &RefKey,
+) -> Result<fluree_db_core::StorageNamespace> {
+    let root = match state.bindings.get(&key.ledger_name) {
+        Some(entry) => versioned_from_json::<NameBinding>(entry)?.map(|v| v.value.root),
+        None => None,
+    };
+    Ok(match root {
+        Some(root) => root.namespace(&key.branch),
+        None => fluree_db_core::StorageNamespace::legacy(&key.id()?),
+    })
+}
+
 #[async_trait]
 impl NameServiceLookup for RaftNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let (name, branch) = split_ledger_id(ledger_id)?;
         let state = self.state.read().await;
-        Ok(record_from_state(&state, &name, &branch))
+        resolved_from_state(&state, &name, &branch)
     }
 
     /// One lock, two field reads. Mirrors `get_ref`: retracted branches are
@@ -343,7 +379,7 @@ impl NameServiceLookup for RaftNameService {
         let mut records = Vec::new();
         for (ledger_name, ledger) in &state.ledgers {
             for branch in &ledger.branches {
-                if let Some(record) = record_from_state(&state, ledger_name, branch) {
+                if let Some(record) = resolved_from_state(&state, ledger_name, branch)? {
                     records.push(record);
                 }
             }
@@ -1600,6 +1636,7 @@ fn fence_outcome_from_response(response: SmResponse) -> Result<FenceOutcome> {
         | SmResponse::BranchDeleted { .. } => Ok(FenceOutcome::Applied),
         SmResponse::FenceMissing => Ok(FenceOutcome::Missing),
         SmResponse::FenceMismatch => Ok(FenceOutcome::Mismatch),
+        SmResponse::FenceFrozen => Ok(FenceOutcome::Frozen),
         other => Err(NameServiceError::storage(format!(
             "unexpected fenced-branch response: {other:?}"
         ))),

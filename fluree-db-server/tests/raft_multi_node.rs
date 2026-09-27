@@ -1138,10 +1138,9 @@ async fn push_with_merges_through_a_follower() {
     use fluree_db_core::ContentStore;
     let side = fluree_db_core::commit::codec::read_commit(&request.merged_commits[0].0).unwrap();
     let txn = side.txn.expect("dev's commit has a txn blob");
-    let stored = cluster.nodes[0]
-        ._state
-        .fluree
-        .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger).unwrap())
+    let fluree = &cluster.nodes[0]._state.fluree;
+    let stored = fluree
+        .content_store(&fluree.storage_namespace(ledger).await.unwrap())
         .get(&txn)
         .await;
     assert!(

@@ -264,3 +264,92 @@ impl ConfigPublisher for PausingNameService {
         self.inner.push_config(ledger_id, expected, new).await
     }
 }
+
+#[async_trait]
+impl fluree_db_nameservice::LedgerRegistry for PausingNameService {
+    async fn get_binding(
+        &self,
+        name: &str,
+    ) -> Result<Option<fluree_db_nameservice::Versioned<fluree_db_nameservice::NameBinding>>> {
+        self.inner.get_binding(name).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&fluree_db_nameservice::NameBinding>,
+    ) -> Result<fluree_db_nameservice::RegistryCas<fluree_db_nameservice::NameBinding>> {
+        self.inner.cas_binding(name, expected, new).await
+    }
+
+    async fn list_bindings(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            fluree_db_nameservice::Versioned<fluree_db_nameservice::NameBinding>,
+        )>,
+    > {
+        self.inner.list_bindings().await
+    }
+
+    async fn get_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+    ) -> Result<Option<fluree_db_nameservice::Versioned<fluree_db_nameservice::DroppedLedger>>>
+    {
+        self.inner.get_dropped(instance).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+        expected: Option<u64>,
+        new: Option<&fluree_db_nameservice::DroppedLedger>,
+    ) -> Result<fluree_db_nameservice::RegistryCas<fluree_db_nameservice::DroppedLedger>> {
+        self.inner.cas_dropped(instance, expected, new).await
+    }
+
+    async fn list_dropped(
+        &self,
+    ) -> Result<Vec<fluree_db_nameservice::Versioned<fluree_db_nameservice::DroppedLedger>>> {
+        self.inner.list_dropped().await
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::BranchRecordStore for PausingNameService {
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        self.inner.raw_record(ledger_id).await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        self.inner.insert_record(record).await
+    }
+
+    async fn freeze_record(
+        &self,
+        ledger_id: &str,
+        fence: fluree_db_nameservice::Fence,
+    ) -> Result<fluree_db_nameservice::FenceOutcome> {
+        self.inner.freeze_record(ledger_id, fence).await
+    }
+
+    async fn delete_record(
+        &self,
+        ledger_id: &str,
+        fence: fluree_db_nameservice::Fence,
+    ) -> Result<fluree_db_nameservice::FenceOutcome> {
+        self.inner.delete_record(ledger_id, fence).await
+    }
+
+    async fn adjust_children(
+        &self,
+        ledger_id: &str,
+        fence: fluree_db_nameservice::Fence,
+        delta: i32,
+    ) -> Result<fluree_db_nameservice::FenceOutcome> {
+        self.inner.adjust_children(ledger_id, fence, delta).await
+    }
+}

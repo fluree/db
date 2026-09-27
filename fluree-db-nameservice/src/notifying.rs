@@ -462,3 +462,94 @@ where
         self.inner.push_config(ledger_id, expected, new).await
     }
 }
+
+#[async_trait]
+impl<N> crate::LedgerRegistry for NotifyingNameService<N>
+where
+    N: crate::LedgerRegistry,
+{
+    async fn get_binding(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::Versioned<crate::NameBinding>>> {
+        self.inner.get_binding(name).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&crate::NameBinding>,
+    ) -> Result<crate::RegistryCas<crate::NameBinding>> {
+        self.inner.cas_binding(name, expected, new).await
+    }
+
+    async fn list_bindings(&self) -> Result<Vec<(String, crate::Versioned<crate::NameBinding>)>> {
+        self.inner.list_bindings().await
+    }
+
+    async fn get_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+    ) -> Result<Option<crate::Versioned<crate::DroppedLedger>>> {
+        self.inner.get_dropped(instance).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+        expected: Option<u64>,
+        new: Option<&crate::DroppedLedger>,
+    ) -> Result<crate::RegistryCas<crate::DroppedLedger>> {
+        self.inner.cas_dropped(instance, expected, new).await
+    }
+
+    async fn list_dropped(&self) -> Result<Vec<crate::Versioned<crate::DroppedLedger>>> {
+        self.inner.list_dropped().await
+    }
+}
+
+#[async_trait]
+impl<N> crate::BranchRecordStore for NotifyingNameService<N>
+where
+    N: crate::BranchRecordStore,
+{
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        self.inner.raw_record(ledger_id).await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        self.inner.insert_record(record).await
+    }
+
+    async fn freeze_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        self.inner.freeze_record(ledger_id, fence).await
+    }
+
+    async fn delete_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        let outcome = self.inner.delete_record(ledger_id, fence).await?;
+        if outcome == crate::FenceOutcome::Applied {
+            self.event_bus.notify(NameServiceEvent::LedgerRetracted {
+                ledger_id: LedgerId::parse(ledger_id)?,
+            });
+        }
+        Ok(outcome)
+    }
+
+    async fn adjust_children(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+        delta: i32,
+    ) -> Result<crate::FenceOutcome> {
+        self.inner.adjust_children(ledger_id, fence, delta).await
+    }
+}

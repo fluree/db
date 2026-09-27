@@ -166,14 +166,14 @@ async fn stream_sparql_connection(
 async fn connection_jsonld_from_streams_union() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:ca").await;
-    create_ledger(&app, "strm:cb").await;
-    insert_name(&app, "strm:ca", "ex:p", "Alice").await;
-    insert_name(&app, "strm:cb", "ex:q", "Bob").await;
+    create_ledger(&app, "strm-ca:main").await;
+    create_ledger(&app, "strm-cb:main").await;
+    insert_name(&app, "strm-ca:main", "ex:p", "Alice").await;
+    insert_name(&app, "strm-cb:main", "ex:q", "Bob").await;
 
     let query = json!({
         "@context": { "ex": "http://example.org/" },
-        "from": ["strm:ca", "strm:cb"],
+        "from": ["strm-ca:main", "strm-cb:main"],
         "select": ["?name"],
         "where": { "@id": "?s", "ex:name": "?name" }
     });
@@ -196,12 +196,12 @@ async fn connection_jsonld_from_streams_union() {
 async fn connection_sparql_from_streams() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:csp").await;
-    insert_name(&app, "strm:csp", "ex:x", "Xavier").await;
+    create_ledger(&app, "strm-csp:main").await;
+    insert_name(&app, "strm-csp:main", "ex:x", "Xavier").await;
 
     let resp = stream_sparql_connection(
         &app,
-        "SELECT ?name FROM <strm:csp> WHERE { ?s <http://example.org/name> ?name }",
+        "SELECT ?name FROM <strm-csp:main> WHERE { ?s <http://example.org/name> ?name }",
         None,
     )
     .await;
@@ -235,12 +235,12 @@ async fn connection_missing_ledger_spec_rejected() {
 async fn connection_sparql_policy_enforced() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:cpr").await;
-    insert_name(&app, "strm:cpr", "ex:x", "Xavier").await;
+    create_ledger(&app, "strm-cpr:main").await;
+    insert_name(&app, "strm-cpr:main", "ex:x", "Xavier").await;
 
     let resp = stream_sparql_connection(
         &app,
-        "SELECT ?name FROM <strm:cpr> WHERE { ?s <http://example.org/name> ?name }",
+        "SELECT ?name FROM <strm-cpr:main> WHERE { ?s <http://example.org/name> ?name }",
         Some(("fluree-policy-class", "http://example.org/PublicClass")),
     )
     .await;
@@ -267,15 +267,15 @@ async fn state_no_heartbeat() -> (TempDir, Arc<AppState>) {
 async fn heartbeat_disabled_still_streams() {
     let (_tmp, state) = state_no_heartbeat().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:nohb").await;
-    insert_name(&app, "strm:nohb", "ex:x", "Xavier").await;
+    create_ledger(&app, "strm-nohb:main").await;
+    insert_name(&app, "strm-nohb:main", "ex:x", "Xavier").await;
 
     let query = json!({
         "@context": { "ex": "http://example.org/" },
         "select": ["?name"],
         "where": { "@id": "?s", "ex:name": "?name" }
     });
-    let resp = stream_jsonld(&app, "strm:nohb", &query).await;
+    let resp = stream_jsonld(&app, "strm-nohb:main", &query).await;
     let (status, ct, records) = ndjson_records(resp).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(ct.as_deref(), Some("application/x-ndjson"));
@@ -293,9 +293,9 @@ async fn heartbeat_disabled_still_streams() {
 async fn jsonld_select_streams_ndjson() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:sel").await;
-    insert_name(&app, "strm:sel", "ex:x", "Xavier").await;
-    insert_name(&app, "strm:sel", "ex:y", "Yolanda").await;
+    create_ledger(&app, "strm-sel:main").await;
+    insert_name(&app, "strm-sel:main", "ex:x", "Xavier").await;
+    insert_name(&app, "strm-sel:main", "ex:y", "Yolanda").await;
 
     let query = json!({
         "@context": { "ex": "http://example.org/" },
@@ -307,7 +307,7 @@ async fn jsonld_select_streams_ndjson() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/fluree/stream/query/strm:sel")
+                .uri("/v1/fluree/stream/query/strm-sel:main")
                 .header("content-type", "application/json")
                 .body(Body::from(query.to_string()))
                 .unwrap(),
@@ -335,12 +335,12 @@ async fn jsonld_select_streams_ndjson() {
 async fn sparql_select_streams_ndjson() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:sparql").await;
-    insert_name(&app, "strm:sparql", "ex:x", "Xavier").await;
+    create_ledger(&app, "strm-sparql:main").await;
+    insert_name(&app, "strm-sparql:main", "ex:x", "Xavier").await;
 
     let resp = stream_sparql(
         &app,
-        "strm:sparql",
+        "strm-sparql:main",
         "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
         None,
     )
@@ -357,19 +357,19 @@ async fn sparql_select_streams_ndjson() {
 async fn multi_ledger_from_streams_union() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:a").await;
-    create_ledger(&app, "strm:b").await;
-    insert_name(&app, "strm:a", "ex:p", "Alice").await;
-    insert_name(&app, "strm:b", "ex:q", "Bob").await;
+    create_ledger(&app, "strm-a:main").await;
+    create_ledger(&app, "strm-b:main").await;
+    insert_name(&app, "strm-a:main", "ex:p", "Alice").await;
+    insert_name(&app, "strm-b:main", "ex:q", "Bob").await;
 
     // `from: [a, b]` routes through the connection/dataset streaming path.
     let query = json!({
         "@context": { "ex": "http://example.org/" },
-        "from": ["strm:a", "strm:b"],
+        "from": ["strm-a:main", "strm-b:main"],
         "select": ["?name"],
         "where": { "@id": "?s", "ex:name": "?name" }
     });
-    let resp = stream_jsonld(&app, "strm:a", &query).await;
+    let resp = stream_jsonld(&app, "strm-a:main", &query).await;
     let (status, _ct, records) = ndjson_records(resp).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(records.last().unwrap()["type"], "end");
@@ -387,9 +387,9 @@ async fn multi_ledger_from_streams_union() {
 async fn ask_query_rejected() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:ask").await;
+    create_ledger(&app, "strm-ask:main").await;
 
-    let resp = stream_sparql(&app, "strm:ask", "ASK { ?s ?p ?o }", None).await;
+    let resp = stream_sparql(&app, "strm-ask:main", "ASK { ?s ?p ?o }", None).await;
     assert_eq!(
         resp.status(),
         StatusCode::BAD_REQUEST,
@@ -401,11 +401,11 @@ async fn ask_query_rejected() {
 async fn construct_query_rejected() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:con").await;
+    create_ledger(&app, "strm-con:main").await;
 
     let resp = stream_sparql(
         &app,
-        "strm:con",
+        "strm-con:main",
         "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
         None,
     )
@@ -417,18 +417,18 @@ async fn construct_query_rejected() {
 async fn history_to_query_rejected() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:hist").await;
-    insert_name(&app, "strm:hist", "ex:x", "Xavier").await;
+    create_ledger(&app, "strm-hist:main").await;
+    insert_name(&app, "strm-hist:main", "ex:x", "Xavier").await;
 
     // Top-level `to` (history) must be rejected, not planned at current view.
     let query = json!({
         "@context": { "ex": "http://example.org/" },
-        "from": "strm:hist",
+        "from": "strm-hist:main",
         "to": 1,
         "select": ["?name"],
         "where": { "@id": "?s", "ex:name": "?name" }
     });
-    let resp = stream_jsonld(&app, "strm:hist", &query).await;
+    let resp = stream_jsonld(&app, "strm-hist:main", &query).await;
     assert_eq!(
         resp.status(),
         StatusCode::BAD_REQUEST,
@@ -442,12 +442,12 @@ async fn history_to_query_rejected() {
 async fn sparql_max_fuel_header_emits_error_code() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:sfuel").await;
-    insert_name(&app, "strm:sfuel", "ex:x", "Xavier").await;
+    create_ledger(&app, "strm-sfuel:main").await;
+    insert_name(&app, "strm-sfuel:main", "ex:x", "Xavier").await;
 
     let resp = stream_sparql(
         &app,
-        "strm:sfuel",
+        "strm-sfuel:main",
         "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
         Some(("fluree-max-fuel", "0.5")),
     )
@@ -465,14 +465,14 @@ async fn sparql_max_fuel_header_emits_error_code() {
 async fn sparql_from_clause_streams() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:from").await;
-    insert_name(&app, "strm:from", "ex:x", "Xavier").await;
-    insert_name(&app, "strm:from", "ex:y", "Yolanda").await;
+    create_ledger(&app, "strm-from:main").await;
+    insert_name(&app, "strm-from:main", "ex:x", "Xavier").await;
+    insert_name(&app, "strm-from:main", "ex:y", "Yolanda").await;
 
     let resp = stream_sparql(
         &app,
-        "strm:from",
-        "SELECT ?name FROM <strm:from> WHERE { ?s <http://example.org/name> ?name }",
+        "strm-from:main",
+        "SELECT ?name FROM <strm-from:main> WHERE { ?s <http://example.org/name> ?name }",
         None,
     )
     .await;
@@ -493,11 +493,11 @@ async fn sparql_from_clause_streams() {
 async fn sparql_policy_class_header_enforced() {
     let (_tmp, state) = policy_state().await;
     let app = build_router(state);
-    setup_policy_ledger(&app, "strm:sparql-pol").await;
+    setup_policy_ledger(&app, "strm-sparql:main-pol").await;
 
     let resp = stream_sparql(
         &app,
-        "strm:sparql-pol",
+        "strm-sparql:main-pol",
         "SELECT ?name WHERE { ?d <http://example.org/name> ?name }",
         Some(("fluree-policy-class", "http://example.org/PublicClass")),
     )
@@ -607,7 +607,7 @@ async fn setup_policy_ledger(app: &axum::Router, ledger: &str) {
 async fn policy_identity_filters_streamed_rows() {
     let (_tmp, state) = policy_state().await;
     let app = build_router(state);
-    setup_policy_ledger(&app, "strm:pol-enf").await;
+    setup_policy_ledger(&app, "strm-pol:main-enf").await;
 
     let docs_query = |identity: &str| {
         json!({
@@ -624,7 +624,7 @@ async fn policy_identity_filters_streamed_rows() {
     // Restricted identity → only the public doc streams.
     let resp = stream_jsonld(
         &app,
-        "strm:pol-enf",
+        "strm-pol:main-enf",
         &docs_query("http://example.org/public-user"),
     )
     .await;
@@ -644,7 +644,7 @@ async fn policy_identity_filters_streamed_rows() {
     // Manager identity (f:allow true) → all three stream.
     let resp = stream_jsonld(
         &app,
-        "strm:pol-enf",
+        "strm-pol:main-enf",
         &docs_query("http://example.org/manager-user"),
     )
     .await;
@@ -665,7 +665,7 @@ async fn policy_identity_filters_streamed_rows() {
 async fn stream_end_record_reports_policy_enforcement() {
     let (_tmp, state) = policy_state().await;
     let app = build_router(state);
-    setup_policy_ledger(&app, "strm:pol-track").await;
+    setup_policy_ledger(&app, "strm-pol:main-track").await;
 
     let query = |identity: &str, meta: bool| {
         let mut opts = json!({ "identity": identity, "default-allow": false });
@@ -695,7 +695,7 @@ async fn stream_end_record_reports_policy_enforcement() {
     // set is not empty.
     let resp = stream_jsonld(
         &app,
-        "strm:pol-track",
+        "strm-pol:main-track",
         &query("http://example.org/public-user", true),
     )
     .await;
@@ -712,7 +712,7 @@ async fn stream_end_record_reports_policy_enforcement() {
     // opt-in, exactly as on the buffered path.
     let resp = stream_jsonld(
         &app,
-        "strm:pol-track",
+        "strm-pol:main-track",
         &query("http://example.org/public-user", false),
     )
     .await;
@@ -727,7 +727,7 @@ async fn stream_end_record_reports_policy_enforcement() {
     // flake could have been returned.
     let resp = stream_jsonld(
         &app,
-        "strm:pol-track",
+        "strm-pol:main-track",
         &query("http://example.org/nobody", true),
     )
     .await;
@@ -755,7 +755,7 @@ async fn stream_end_record_reports_policy_enforcement() {
             {"@id": "?d", "ex:name": "?name"}
         ]
     });
-    let resp = stream_jsonld(&app, "strm:pol-track", &anon).await;
+    let resp = stream_jsonld(&app, "strm-pol:main-track", &anon).await;
     let (_status, _ct, records) = ndjson_records(resp).await;
     assert_eq!(
         records.iter().filter(|r| r["type"] == "row").count(),
@@ -841,11 +841,11 @@ async fn stream_jsonld_token(
 async fn bearer_scope_enforced_on_stream() {
     let (_tmp, state) = required_auth_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:scopeA").await;
-    create_ledger(&app, "strm:scopeB").await;
+    create_ledger(&app, "strm-scopeA:main").await;
+    create_ledger(&app, "strm-scopeB:main").await;
 
-    let tok_a = read_token(&["strm:scopeA"], 7);
-    let tok_b = read_token(&["strm:scopeB"], 8);
+    let tok_a = read_token(&["strm-scopeA:main"], 7);
+    let tok_b = read_token(&["strm-scopeB:main"], 8);
 
     // Seed B with its own token.
     let seed = json!({
@@ -857,7 +857,7 @@ async fn bearer_scope_enforced_on_stream() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/fluree/insert/strm:scopeB")
+                .uri("/v1/fluree/insert/strm-scopeB:main")
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {tok_b}"))
                 .body(Body::from(seed.to_string()))
@@ -874,7 +874,7 @@ async fn bearer_scope_enforced_on_stream() {
     });
 
     // Token scoped to A streaming B → 404 (out of scope).
-    let resp = stream_jsonld_token(&app, "strm:scopeB", &query, &tok_a).await;
+    let resp = stream_jsonld_token(&app, "strm-scopeB:main", &query, &tok_a).await;
     assert_eq!(
         resp.status(),
         StatusCode::NOT_FOUND,
@@ -882,7 +882,7 @@ async fn bearer_scope_enforced_on_stream() {
     );
 
     // Token scoped to B streaming B → 200 + rows.
-    let resp = stream_jsonld_token(&app, "strm:scopeB", &query, &tok_b).await;
+    let resp = stream_jsonld_token(&app, "strm-scopeB:main", &query, &tok_b).await;
     let (status, _ct, records) = ndjson_records(resp).await;
     assert_eq!(status, StatusCode::OK, "B-scoped token streams B");
     assert_eq!(records.last().unwrap()["type"], "end");
@@ -897,8 +897,8 @@ async fn bearer_scope_enforced_on_stream() {
 async fn fuel_overrun_emits_error_code_terminal() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:fuel").await;
-    insert_name(&app, "strm:fuel", "ex:x", "Xavier").await;
+    create_ledger(&app, "strm-fuel:main").await;
+    insert_name(&app, "strm-fuel:main", "ex:x", "Xavier").await;
 
     let query = json!({
         "@context": { "ex": "http://example.org/" },
@@ -906,7 +906,7 @@ async fn fuel_overrun_emits_error_code_terminal() {
         "select": ["?name"],
         "where": { "@id": "?s", "ex:name": "?name" }
     });
-    let resp = stream_jsonld(&app, "strm:fuel", &query).await;
+    let resp = stream_jsonld(&app, "strm-fuel:main", &query).await;
     let (status, _ct, records) = ndjson_records(resp).await;
     assert_eq!(
         status,
@@ -929,7 +929,7 @@ async fn unknown_ledger_streams_error_terminal_or_4xx() {
         "select": ["?name"],
         "where": { "@id": "?s", "ex:name": "?name" }
     });
-    let resp = stream_jsonld(&app, "strm:nope", &query).await;
+    let resp = stream_jsonld(&app, "strm-nope:main", &query).await;
     // Loading a missing ledger fails before the stream commits → 4xx.
     assert!(
         resp.status().is_client_error() || resp.status().is_server_error(),
@@ -948,7 +948,7 @@ async fn unknown_ledger_streams_error_terminal_or_4xx() {
 async fn sparql_from_named_dataset_semantics_stream() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:dsem").await;
+    create_ledger(&app, "strm-dsem:main").await;
 
     let trig = "@prefix ex: <http://ex.org/> .\n\
                 ex:d1 ex:name \"D\" .\n\
@@ -961,7 +961,7 @@ async fn sparql_from_named_dataset_semantics_stream() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/fluree/upsert/strm:dsem")
+                .uri("/v1/fluree/upsert/strm-dsem:main")
                 .header("content-type", "application/trig")
                 .body(Body::from(trig))
                 .unwrap(),
@@ -973,7 +973,7 @@ async fn sparql_from_named_dataset_semantics_stream() {
     // GRAPH ?g over the one declared graph: one row per triple, no warning.
     let resp = stream_sparql(
         &app,
-        "strm:dsem",
+        "strm-dsem:main",
         "PREFIX ex: <http://ex.org/>\n\
          SELECT ?g ?n FROM NAMED <http://ex.org/g1> WHERE { GRAPH ?g { ?s ex:name ?n } }",
         None,
@@ -987,7 +987,7 @@ async fn sparql_from_named_dataset_semantics_stream() {
     // FROM NAMED with no FROM: empty default graph, and say so on the wire.
     let resp = stream_sparql(
         &app,
-        "strm:dsem",
+        "strm-dsem:main",
         "PREFIX ex: <http://ex.org/>\n\
          SELECT ?n FROM NAMED <http://ex.org/g1> WHERE { ?s ex:name ?n }",
         None,
@@ -1013,7 +1013,7 @@ async fn sparql_from_named_dataset_semantics_stream() {
 async fn jsonld_from_named_dataset_semantics_stream() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:jdsem").await;
+    create_ledger(&app, "strm-jdsem:main").await;
 
     let trig = "@prefix ex: <http://ex.org/> .\n\
                 ex:d1 ex:name \"D\" .\n\
@@ -1025,7 +1025,7 @@ async fn jsonld_from_named_dataset_semantics_stream() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/fluree/upsert/strm:jdsem")
+                .uri("/v1/fluree/upsert/strm-jdsem:main")
                 .header("content-type", "application/trig")
                 .body(Body::from(trig))
                 .unwrap(),
@@ -1036,13 +1036,13 @@ async fn jsonld_from_named_dataset_semantics_stream() {
 
     let body = json!({
         "@context": {"ex": "http://ex.org/"},
-        "fromNamed": {"g1": {"@id": "strm:jdsem", "@graph": "http://ex.org/g1"}},
+        "fromNamed": {"g1": {"@id": "strm-jdsem:main", "@graph": "http://ex.org/g1"}},
         "select": ["?n"],
         "where": {"@id": "?s", "ex:name": "?n"}
     });
 
     // Ledger-scoped streaming form.
-    let resp = stream_jsonld(&app, "strm:jdsem", &body).await;
+    let resp = stream_jsonld(&app, "strm-jdsem:main", &body).await;
     let warning = resp
         .headers()
         .get("x-fdb-warning")
@@ -1074,11 +1074,11 @@ async fn jsonld_from_named_dataset_semantics_stream() {
     // The named half still streams, and draws no warning.
     let graph_body = json!({
         "@context": {"ex": "http://ex.org/"},
-        "fromNamed": {"g1": {"@id": "strm:jdsem", "@graph": "http://ex.org/g1"}},
+        "fromNamed": {"g1": {"@id": "strm-jdsem:main", "@graph": "http://ex.org/g1"}},
         "select": ["?n"],
         "where": [["graph", "g1", {"@id": "?s", "ex:name": "?n"}]]
     });
-    let resp = stream_jsonld(&app, "strm:jdsem", &graph_body).await;
+    let resp = stream_jsonld(&app, "strm-jdsem:main", &graph_body).await;
     assert!(resp.headers().get("x-fdb-warning").is_none());
     let (status, _ct, records) = ndjson_records(resp).await;
     assert_eq!(status, StatusCode::OK);
@@ -1094,7 +1094,7 @@ async fn jsonld_from_named_dataset_semantics_stream() {
 async fn connection_sparql_from_named_only_warns_on_stream() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:cwarn").await;
+    create_ledger(&app, "strm-cwarn:main").await;
 
     let trig = "@prefix ex: <http://ex.org/> .\n\
                 ex:d1 ex:name \"D\" .\n\
@@ -1106,7 +1106,7 @@ async fn connection_sparql_from_named_only_warns_on_stream() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/fluree/upsert/strm:cwarn")
+                .uri("/v1/fluree/upsert/strm-cwarn:main")
                 .header("content-type", "application/trig")
                 .body(Body::from(trig))
                 .unwrap(),
@@ -1119,7 +1119,7 @@ async fn connection_sparql_from_named_only_warns_on_stream() {
     let resp = stream_sparql_connection(
         &app,
         "PREFIX ex: <http://ex.org/>\n\
-         SELECT ?n FROM NAMED <strm:cwarn> WHERE { ?s ex:name ?n }",
+         SELECT ?n FROM NAMED <strm-cwarn:main> WHERE { ?s ex:name ?n }",
         None,
     )
     .await;
@@ -1148,7 +1148,7 @@ async fn connection_sparql_from_named_only_warns_on_stream() {
     let resp = stream_sparql_connection(
         &app,
         "PREFIX ex: <http://ex.org/>\n\
-         SELECT ?n FROM NAMED <strm:cwarn> WHERE { GRAPH ?g { ?s ex:name ?n } }",
+         SELECT ?n FROM NAMED <strm-cwarn:main> WHERE { GRAPH ?g { ?s ex:name ?n } }",
         None,
     )
     .await;

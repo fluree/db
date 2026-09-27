@@ -226,7 +226,7 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
             assert_ne!(root1, root2, "root CID should change after update");
 
             // Sanity: both roots decode as IndexRoot and the second root remains queryable.
-            let cs = fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
+            let cs = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
             let bytes1 = cs.get(&root1).await.expect("root1 bytes");
             let bytes2 = cs.get(&root2).await.expect("root2 bytes");
             let v1 = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes1)

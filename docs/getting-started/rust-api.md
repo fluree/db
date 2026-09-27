@@ -841,35 +841,31 @@ async fn main() -> Result<()> {
 
 #### Dropping Ledgers
 
-`drop_ledger` operates on the **whole ledger** — every branch under a ledger
-name, including retracted-but-not-purged branches and the cross-branch
-`@shared/dicts/` namespace. Use `drop_branch` to remove a single branch.
+`drop_ledger` operates on the **whole ledger**, every branch under a ledger
+name. Use `drop_branch` to remove a single branch. Either mode frees the name
+at once: a new ledger can be created under it.
 
 ```rust
-use fluree_db_api::{FlureeBuilder, DropMode, DropStatus, Result};
+use fluree_db_api::{DropMode, DroppedData, FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let fluree = FlureeBuilder::file("./data").build()?;
 
-    // Soft drop: retract every branch in the nameservice, preserve artifacts
+    // Soft drop: the ledger keeps its data in the dropped-ledger registry
     let report = fluree.drop_ledger("mydb", DropMode::Soft).await?;
-    match report.status {
-        DropStatus::Dropped => println!("Ledger dropped"),
-        DropStatus::AlreadyRetracted => println!("Already dropped"),
-        DropStatus::NotFound => println!("Ledger not found"),
-    }
+    assert_eq!(report.data, Some(DroppedData::Retained));
+    let instance = report.instance.expect("dropped ledger's instance");
 
-    // Hard drop: delete artifacts for every branch + @shared/dicts (IRREVERSIBLE)
-    let report = fluree.drop_ledger("mydb", DropMode::Hard).await?;
-    println!(
-        "Dropped {} branches; deleted {} storage artifacts",
-        report.branch_reports.len(),
-        report.artifacts_deleted
-    );
-    for br in &report.branch_reports {
-        println!("  - {} ({:?})", br.ledger_id, br.status);
+    // List, restore, or purge dropped ledgers by instance
+    for dropped in fluree.list_dropped().await? {
+        println!("{} dropped at {} ({})", dropped.name, dropped.dropped_at, dropped.instance);
     }
+    fluree.restore_dropped(instance.as_str()).await?;
+
+    // Hard drop: delete the ledger's data (IRREVERSIBLE)
+    let report = fluree.drop_ledger("mydb", DropMode::Hard).await?;
+    println!("deleted {} storage artifacts", report.artifacts_deleted);
 
     Ok(())
 }
@@ -886,18 +882,28 @@ async fn main() -> Result<()> {
 
 | Mode | Behavior | Reversible |
 |------|----------|------------|
-| `DropMode::Soft` (default) | Marks every branch retracted in the nameservice; artifacts remain | Partially; requires administrative recovery |
-| `DropMode::Hard` | Deletes managed storage artifacts for every branch, wipes `@shared/dicts/`, and purges nameservice records so the name can be reused | **No** for deleted artifacts |
+| `DropMode::Soft` (default) | Frees the name; the ledger waits in the dropped-ledger registry with its data | Yes, with `restore_dropped` until it is purged |
+| `DropMode::Hard` | Frees the name and deletes the ledger's data | **No** |
+
+`restore_dropped` fails with `ApiError::LedgerExists` when another ledger now
+holds the name. `purge_dropped` deletes a dropped ledger's data; it also
+finishes a hard drop whose deletion was interrupted (reported as
+`DroppedData::Deleting`).
+
+A ledger created by an earlier version keeps the older behaviour until it is
+migrated: a soft drop marks its branches retracted and keeps the name
+reserved. The report's `name_released` and `instance` tell the two apart.
 
 **Drop Sequence:**
 
 1. Parses input (rejects non-default branch suffixes).
-2. Snapshots every NsRecord under the ledger name via `all_records` (so retracted branches are included). Enumeration failures propagate as `Err`.
-3. Sorts branches leaf-first via `source_branch` parent pointers — partial failures leave orphan parents, never dangling children.
-4. Cancels and waits for pending background indexing on each branch.
-5. For each branch: deletes per-branch artifacts (commit/txn/index/config) in hard mode; retracts (soft) or drops the NS record (hard) using the parent-aware path so surviving parents have accurate child counts.
-6. Hard mode: wipes `{ledger_name}/@shared/dicts/` after every branch is gone.
-7. Disconnects each branch from the ledger cache.
+2. Cancels and waits for pending background indexing on each branch.
+3. Marks the ledger as dropping: it reads as absent, and creating the name is refused until the drop finishes.
+4. Records the ledger in the dropped-ledger registry, removes its branch records, and frees the name.
+5. Hard mode: deletes the ledger's storage, then its registry entry.
+6. Disconnects each branch from the ledger cache.
+
+A drop interrupted at any step resumes when the ledger is dropped again.
 
 **Report shape:**
 

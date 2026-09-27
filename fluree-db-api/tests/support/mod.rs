@@ -308,7 +308,7 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        fluree.content_store(&record.storage_namespace()),
         ledger_id,
         &record,
         fluree_db_indexer::IndexerConfig::default(),
@@ -335,7 +335,7 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::build_index_for_record(
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        fluree.content_store(&record.storage_namespace()),
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )
@@ -890,30 +890,20 @@ pub async fn run_collector_and_fork_drop_scenario(
                 .hold_gc(&fluree_db_api::LedgerName::parse(ledger_name).unwrap())
                 .await,
         );
-        let head = fluree
+        let record = fluree
             .nameservice()
             .lookup(&ledger_id)
             .await
             .expect("lookup")
-            .expect("record")
-            .index_head_id;
-        let refs = shared_refs_of_branches(
-            fluree.backend(),
-            &[BranchIndexHead {
-                ledger_id: fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
-                namespace: fluree_db_core::StorageNamespace::parse_legacy(&ledger_id).unwrap(),
-                index_head_id: head,
-            }],
-            None,
-        )
-        .await
-        .expect("walk chain");
+            .expect("record");
+        let refs = shared_refs_of_branches(fluree.backend(), &[BranchIndexHead::of(&record)], None)
+            .await
+            .expect("walk chain");
         assert!(
             !refs.is_empty(),
             "{stage}: {ledger_id} references no dictionaries"
         );
-        let store = fluree
-            .content_store(&fluree_db_core::StorageNamespace::parse_legacy(&ledger_id).unwrap());
+        let store = fluree.content_store(&record.storage_namespace());
         for cid in &refs {
             assert!(
                 store.has(cid).await.expect("has"),
@@ -940,8 +930,7 @@ pub async fn run_collector_and_fork_drop_scenario(
     assert_dicts_present(main_id.clone(), "main alone").await;
 
     // The collector really ran: the first version is past retention.
-    let store =
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(&main_id).unwrap());
+    let store = fluree.content_store(&fluree.storage_namespace(&main_id).await.unwrap());
     let mut collected = false;
     for _ in 0..100 {
         if !store.has(&first_root).await.expect("has") {

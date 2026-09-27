@@ -5,6 +5,7 @@ use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result};
 use fluree_db_core::ContentStore;
 use fluree_db_core::LedgerId;
 use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId};
+use fluree_db_nameservice::lifecycle::PendingLedger;
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 
 impl Fluree {
@@ -116,7 +117,8 @@ impl Fluree {
     ///
     /// This operation:
     /// 1. Normalizes the ledger ID (ensures branch suffix like `:main`)
-    /// 2. Registers the ledger in the nameservice (fails if already exists)
+    /// 2. Claims the name under a fresh instance, with its own storage root
+    ///    (fails if the name is held)
     /// 3. Creates a genesis database with t=0 (no transactions yet)
     /// 4. Returns the new LedgerState ready for transactions
     ///
@@ -126,9 +128,9 @@ impl Fluree {
     ///
     /// # Errors
     ///
-    /// Returns `ApiError::LedgerExists` (HTTP 409) if:
-    /// - The ledger already exists
-    /// - The ledger was previously dropped (retracted) - must use hard drop to reuse address
+    /// Returns `ApiError::LedgerExists` (HTTP 409) if the name holds a ledger,
+    /// on any branch, or a drop of it is still in progress. A dropped name is
+    /// free at once.
     ///
     /// # Example
     ///
@@ -147,27 +149,29 @@ impl Fluree {
         fluree_db_core::validate_branch_name(ledger_id.branch())?;
         info!(ledger_id = %ledger_id, "Creating ledger");
 
-        // 2. Register in nameservice via the ledger-admin surface
-        //    (fails if already exists). Works for both ReadWrite and
-        //    Replicated nameservices; the latter goes through Raft.
-        match self.ledger_admin()?.init(&ledger_id).await {
-            Ok(()) => {}
-            Err(NameServiceError::LedgerAlreadyExists(a)) => {
-                return Err(ApiError::ledger_exists(a));
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
+        // 2. Claim the name under a fresh instance and register the root
+        //    branch (fails if the name is held). Works for every read-write
+        //    nameservice; the replicated one goes through Raft.
+        let pending = self.claim_name(&ledger_id).await?;
+        fluree_db_nameservice::lifecycle::activate(self.publisher()?, &pending).await?;
+        let record = pending.record;
 
         // 3. Create genesis LedgerSnapshot with empty state at t=0
         let db = fluree_db_core::LedgerSnapshot::genesis(&ledger_id);
 
-        // 4. Create LedgerState with empty Novelty (t=0)
-        let ledger = LedgerState::new(db, Novelty::new(0));
+        // 4. Create LedgerState with empty Novelty (t=0), carrying the new
+        //    record: its fence and storage root.
+        let mut ledger = LedgerState::new(db, Novelty::new(0));
+        ledger.ns_record = Some(record);
 
         info!(ledger_id = %ledger_id, "Ledger created successfully");
         Ok(ledger)
+    }
+
+    /// Claim `ledger_id`'s name for a new ledger, not yet visible: the caller
+    /// writes its data, then activates or abandons it.
+    pub(crate) async fn claim_name(&self, ledger_id: &LedgerId) -> Result<PendingLedger> {
+        claim_name(self.publisher()?, ledger_id).await
     }
 
     /// Create a new branch for a ledger.
@@ -251,13 +255,25 @@ impl Fluree {
 
         let is_historical = at_commit.is_some();
 
-        self.branch_admin()?
-            .create_branch(ledger_name, new_branch, source, at_commit)
+        // A ledger created under a name binding lists the branch there with
+        // its own fence; one created before bindings has none to list it in.
+        let store = self.publisher()?;
+        let created = if store.get_binding(ledger_name).await?.is_some() {
+            let name = fluree_db_core::LedgerName::parse(ledger_name)?;
+            fluree_db_nameservice::lifecycle::create_branch(
+                store, &name, new_branch, source, at_commit,
+            )
             .await
-            .map_err(|e| match e {
-                NameServiceError::LedgerAlreadyExists(a) => ApiError::ledger_exists(a),
-                other => other.into(),
-            })?;
+            .map(|_| ())
+        } else {
+            self.branch_admin()?
+                .create_branch(ledger_name, new_branch, source, at_commit)
+                .await
+        };
+        created.map_err(|e| match e {
+            NameServiceError::LedgerAlreadyExists(a) => ApiError::ledger_exists(a),
+            other => other.into(),
+        })?;
 
         // Historical branches replay from genesis — skip the index copy.
         // The source's current index reflects HEAD, which is too fresh.
@@ -469,5 +485,26 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
              A commit that arrived through a merge cannot be branched at: branch \
              at the merge commit instead, or at a commit on the branch that made it"
         )))
+    }
+}
+
+/// Claim `ledger_id`'s name in `store` for a new ledger, not yet visible:
+/// the caller writes its data, then activates or abandons it.
+pub(crate) async fn claim_name(
+    store: &dyn crate::NameServicePublisher,
+    ledger_id: &LedgerId,
+) -> Result<PendingLedger> {
+    // A ledger from before name bindings holds its name through its records
+    // alone. A binding over it would hide it, so the name stays taken until
+    // the migration binds it.
+    if store.get_binding(ledger_id.name()).await?.is_none() {
+        if let Some(existing) = store.list_branches(ledger_id.name()).await?.first() {
+            return Err(ApiError::ledger_exists(existing.ledger_id.to_string()));
+        }
+    }
+    match fluree_db_nameservice::lifecycle::begin_create(store, ledger_id).await {
+        Ok(pending) => Ok(pending),
+        Err(NameServiceError::LedgerAlreadyExists(a)) => Err(ApiError::ledger_exists(a)),
+        Err(e) => Err(e.into()),
     }
 }

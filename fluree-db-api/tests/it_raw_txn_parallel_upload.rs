@@ -21,7 +21,7 @@ fn ctx() -> JsonValue {
 
 #[tokio::test]
 async fn store_raw_txn_roundtrip_via_parallel_upload() {
-    let ledger_id = "it/raw-txn:parallel-roundtrip";
+    let ledger_id = "it/raw-txn-parallel-roundtrip:main";
     let fluree = FlureeBuilder::memory().build_memory();
     let db0 = LedgerSnapshot::genesis(ledger_id);
     let ledger0 = LedgerState::new(db0, Novelty::new(0));
@@ -54,8 +54,7 @@ async fn store_raw_txn_roundtrip_via_parallel_upload() {
         .expect("transaction should succeed with parallel raw-txn upload");
 
     // Fetch the commit blob, decode it, and confirm it references a txn CID.
-    let content_store =
-        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
+    let content_store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
     let commit_bytes = content_store
         .get(&result.receipt.commit_id)
         .await
@@ -106,7 +105,7 @@ async fn txn_cid_of(
     commit_id: &fluree_db_core::ContentId,
 ) -> fluree_db_core::ContentId {
     let bytes = fluree
-        .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
+        .content_store(&fluree.storage_namespace(ledger_id).await.unwrap())
         .get(commit_id)
         .await
         .expect("commit blob readable");
@@ -127,7 +126,7 @@ async fn txn_cid_of(
 /// while staging runs, as it does in production.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_body_failure_keeps_first_commits_txn_blob() {
-    let ledger_id = "it/raw-txn:duplicate-body";
+    let ledger_id = "it/raw-txn-duplicate-body:main";
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = LedgerState::new(LedgerSnapshot::genesis(ledger_id), Novelty::new(0));
     let txn_opts = IrTxnOpts::default().store_raw_txn(true);
@@ -172,7 +171,7 @@ async fn duplicate_body_failure_keeps_first_commits_txn_blob() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
         fluree
-            .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
+            .content_store(&fluree.storage_namespace(ledger_id).await.unwrap())
             .get(&txn_cid)
             .await
             .is_ok(),
@@ -199,7 +198,7 @@ async fn duplicate_body_failure_keeps_first_commits_txn_blob() {
 async fn verify_and_export_tolerate_missing_txn_blob() {
     use fluree_db_api::{ExportCommitsRequest, VerifyProblem, VerifySeverity};
 
-    let ledger_id = "it/raw-txn:missing-blob";
+    let ledger_id = "it/raw-txn-missing-blob:main";
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = LedgerState::new(LedgerSnapshot::genesis(ledger_id), Novelty::new(0));
 
@@ -219,7 +218,7 @@ async fn verify_and_export_tolerate_missing_txn_blob() {
 
     // Simulate the production damage: the blob vanishes out from under the commit.
     fluree
-        .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
+        .content_store(&fluree.storage_namespace(ledger_id).await.unwrap())
         .release(&txn_cid)
         .await
         .expect("release");
@@ -287,7 +286,7 @@ async fn push_accepts_commits_whose_txn_blob_is_missing() {
             .expect("commit succeeds");
         let txn_cid = txn_cid_of(fluree, ledger_id, &result.receipt.commit_id).await;
         fluree
-            .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
+            .content_store(&fluree.storage_namespace(ledger_id).await.unwrap())
             .release(&txn_cid)
             .await
             .expect("release");
@@ -319,9 +318,9 @@ async fn push_accepts_commits_whose_txn_blob_is_missing() {
     {
         let fluree = FlureeBuilder::memory().build_memory();
         let (commits, missing_blobs) =
-            export_with_gap(&fluree, "it/raw-txn:push-src-declared").await;
+            export_with_gap(&fluree, "it/raw-txn-push-src-declared:main").await;
 
-        let tgt = "it/raw-txn:push-tgt-declared";
+        let tgt = "it/raw-txn-push-tgt-declared:main";
         fluree.create_ledger(tgt).await.expect("create target");
         let resp = fluree
             .push_commits(
@@ -354,9 +353,9 @@ async fn push_accepts_commits_whose_txn_blob_is_missing() {
     // bundle with an empty declaration. Still accepted (logged as a warning).
     {
         let fluree = FlureeBuilder::memory().build_memory();
-        let (commits, _) = export_with_gap(&fluree, "it/raw-txn:push-src-undeclared").await;
+        let (commits, _) = export_with_gap(&fluree, "it/raw-txn-push-src-undeclared:main").await;
 
-        let tgt = "it/raw-txn:push-tgt-undeclared";
+        let tgt = "it/raw-txn-push-tgt-undeclared:main";
         fluree.create_ledger(tgt).await.expect("create target");
         let resp = fluree
             .push_commits(

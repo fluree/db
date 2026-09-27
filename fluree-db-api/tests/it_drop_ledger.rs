@@ -430,24 +430,15 @@ async fn drop_branch_releases_dictionary_blobs_only_the_branch_referenced() {
         fluree: &fluree_db_api::Fluree,
         ledger_id: &str,
     ) -> std::collections::HashSet<fluree_db_core::ContentId> {
-        let head = fluree
+        let record = fluree
             .nameservice()
             .lookup(ledger_id)
             .await
             .unwrap()
-            .expect("record")
-            .index_head_id;
-        shared_refs_of_branches(
-            fluree.backend(),
-            &[BranchIndexHead {
-                ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
-                namespace: fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
-                index_head_id: head,
-            }],
-            None,
-        )
-        .await
-        .unwrap()
+            .expect("record");
+        shared_refs_of_branches(fluree.backend(), &[BranchIndexHead::of(&record)], None)
+            .await
+            .unwrap()
     }
     let main_refs = dict_refs(&fluree, "fork-dicts:main").await;
     let dev_refs = dict_refs(&fluree, "fork-dicts:dev").await;
@@ -465,8 +456,7 @@ async fn drop_branch_releases_dictionary_blobs_only_the_branch_referenced() {
     assert_eq!(report.status, DropStatus::Dropped);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 
-    let store = fluree
-        .content_store(&fluree_db_core::StorageNamespace::parse_legacy("fork-dicts:main").unwrap());
+    let store = fluree.content_store(&fluree.storage_namespace("fork-dicts:main").await.unwrap());
     for cid in &main_refs {
         assert!(
             store.has(cid).await.unwrap(),
@@ -750,21 +740,34 @@ async fn hard_drop_of_nested_name_keeps_the_parent_named_ledgers_dicts() {
     }
 
     let admin = fluree.admin_storage().expect("managed backend");
-    let parent_dicts = "fluree:file://test/@shared/dicts/";
-    let before = admin.list_prefix(parent_dicts).await.expect("list");
+    let dicts_of = |id: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let root = fluree.storage_namespace(id).await.unwrap().root().clone();
+            format!("fluree:file://{}/dicts/", root.shared_prefix())
+        }
+    };
+    let parent_dicts = dicts_of("test:main").await;
+    let nested_dicts = dicts_of("test/db:main").await;
+    let before = admin.list_prefix(&parent_dicts).await.expect("list");
     assert!(!before.is_empty(), "fixture: `test` must have dict blobs");
+    assert!(
+        !admin
+            .list_prefix(&nested_dicts)
+            .await
+            .expect("list")
+            .is_empty(),
+        "fixture: `test/db` must have dict blobs"
+    );
 
     fluree
         .drop_ledger("test/db", DropMode::Hard)
         .await
         .expect("drop test/db");
 
-    let after = admin.list_prefix(parent_dicts).await.expect("list");
+    let after = admin.list_prefix(&parent_dicts).await.expect("list");
     assert_eq!(after, before, "dropping `test/db` deleted `test`'s dicts");
-    let nested = admin
-        .list_prefix("fluree:file://test/db/@shared/dicts/")
-        .await
-        .expect("list");
+    let nested = admin.list_prefix(&nested_dicts).await.expect("list");
     assert!(
         nested.is_empty(),
         "`test/db`'s own dicts must be reclaimed: {nested:?}"

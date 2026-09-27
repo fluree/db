@@ -129,21 +129,26 @@ impl MemoryNameService {
 impl crate::NameServiceLookup for MemoryNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let key = LedgerId::parse(ledger_id)?;
-        Ok(self.records.read().get(&key).cloned())
+        let record = self.records.read().get(&key).cloned();
+        crate::read_resolved(self, record).await
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
-        Ok(self.records.read().values().cloned().collect())
+        let records: Vec<NsRecord> = self.records.read().values().cloned().collect();
+        crate::read_all_resolved(self, records).await
     }
 
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        Ok(self
+        let records: Vec<NsRecord> = self
             .records
             .read()
             .values()
-            .filter(|r| r.name == ledger_name && !r.retracted)
+            .filter(|r| r.name == ledger_name)
             .cloned()
-            .collect())
+            .collect();
+        let mut records = crate::read_all_resolved(self, records).await?;
+        records.retain(|r| !r.retracted);
+        Ok(records)
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<crate::LedgerHeads>> {
@@ -267,6 +272,7 @@ impl BranchRecordStore for MemoryNameService {
         Ok(match self.records.write().get_mut(&key) {
             None => FenceOutcome::Missing,
             Some(record) if record.fence != Some(fence) => FenceOutcome::Mismatch,
+            Some(record) if record.frozen && delta > 0 => FenceOutcome::Frozen,
             Some(record) => {
                 record.branches = record.branches.saturating_add_signed(delta);
                 FenceOutcome::Applied
@@ -710,7 +716,8 @@ impl GraphSourceLookup for MemoryNameService {
             return Ok(NsLookupResult::GraphSource(record));
         }
 
-        if let Some(record) = self.records.read().get(&key).cloned() {
+        let record = self.records.read().get(&key).cloned();
+        if let Some(record) = crate::read_resolved(self, record).await? {
             return Ok(NsLookupResult::Ledger(record));
         }
 

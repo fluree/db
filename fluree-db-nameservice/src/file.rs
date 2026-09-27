@@ -530,7 +530,8 @@ impl crate::NameServiceLookup for FileNameService {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         // A graph-source record is not a ledger (#1369). `load_record` reports it
         // as Ok(None) so the caller can fall back to the graph-source path.
-        self.load_record(&ledger_name, &branch).await
+        let record = self.load_record(&ledger_name, &branch).await?;
+        crate::read_resolved(self, record).await
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
@@ -548,12 +549,14 @@ impl crate::NameServiceLookup for FileNameService {
             // Graph-source records are skipped by `read_record_at` (Ok(None)).
             let relative = format!("{ledger_name}/{}", ns_record_stem(&relative));
             if let Ok(Some(record)) = self.read_record_at(&relative).await {
-                if record.name == ledger_name && !record.retracted {
+                if record.name == ledger_name {
                     records.push(record);
                 }
             }
         }
 
+        let mut records = crate::read_all_resolved(self, records).await?;
+        records.retain(|r| !r.retracted);
         Ok(records)
     }
 
@@ -574,7 +577,7 @@ impl crate::NameServiceLookup for FileNameService {
             }
         }
 
-        Ok(records)
+        crate::read_all_resolved(self, records).await
     }
 }
 
@@ -1385,7 +1388,8 @@ impl GraphSourceLookup for FileNameService {
             }
         } else {
             // It's a ledger record
-            match self.load_record(&name, &branch).await? {
+            let record = self.load_record(&name, &branch).await?;
+            match crate::read_resolved(self, record).await? {
                 Some(record) => Ok(NsLookupResult::Ledger(record)),
                 None => Ok(NsLookupResult::NotFound),
             }

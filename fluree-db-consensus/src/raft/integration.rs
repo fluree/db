@@ -424,7 +424,19 @@ impl RaftIntegration {
                 continue;
             }
             let ledger_id = &record.ledger_id;
-            match publisher.init(ledger_id).await {
+            // A ledger created under a name binding carries its binding over,
+            // so it keeps its instance root.
+            let created = if record
+                .storage_root
+                .as_ref()
+                .and_then(fluree_db_core::StorageRoot::instance)
+                .is_some()
+            {
+                fluree_db_nameservice::lifecycle::mirror_record(publisher.as_ref(), &record).await
+            } else {
+                publisher.init(ledger_id).await
+            };
+            match created {
                 Ok(()) | Err(NameServiceError::LedgerAlreadyExists(_)) => {}
                 Err(e) => return Err(FileRegistryAdoptionError::replay(ledger_id, "init", e)),
             }

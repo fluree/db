@@ -404,7 +404,7 @@ impl QueuedTransactor {
     /// to the caller, since the submission has already returned its
     /// terminal status.
     async fn release_envelope(&self, ledger_id: &str, request_cid: &ContentId) {
-        let Ok(namespace) = StorageNamespace::parse_legacy(ledger_id) else {
+        let Ok(namespace) = self.namespace_of(ledger_id).await else {
             return;
         };
         if let Err(err) = self
@@ -420,6 +420,17 @@ impl QueuedTransactor {
                 "failed to release orphaned QueuedRequest envelope"
             );
         }
+    }
+
+    /// Where `ledger_id`'s artifacts live, from its nameservice record.
+    async fn namespace_of(&self, ledger_id: &str) -> Result<StorageNamespace, SubmissionError> {
+        self.fluree
+            .storage_namespace(ledger_id)
+            .await
+            .map_err(|e| SubmissionError::Execution {
+                status: e.status_code(),
+                message: e.to_string(),
+            })
     }
 
     /// Encode `envelope`, write it to the per-ledger content store,
@@ -460,12 +471,7 @@ impl QueuedTransactor {
                 status: 500,
                 message: format!("QueuedRequest encode failed: {e}"),
             })?;
-        let namespace = StorageNamespace::parse_legacy(&full_ledger_id).map_err(|e| {
-            SubmissionError::Execution {
-                status: 400,
-                message: format!("invalid ledger_id: {e}"),
-            }
-        })?;
+        let namespace = self.namespace_of(&full_ledger_id).await?;
         let request_cid = self
             .fluree
             .content_store(&namespace)
@@ -795,11 +801,7 @@ impl Committer for QueuedTransactor {
         // Upload each commit's bytes to the per-ledger content store
         // and record its CID. The envelope carries only the CIDs;
         // the worker reads the bytes back when staging.
-        let namespace =
-            StorageNamespace::parse_legacy(&ledger_id).map_err(|e| SubmissionError::Execution {
-                status: 400,
-                message: format!("invalid ledger_id: {e}"),
-            })?;
+        let namespace = self.namespace_of(&ledger_id).await?;
         let content_store = self.fluree.content_store(&namespace);
         let upload = |blobs: Vec<Vec<u8>>| {
             let content_store = content_store.clone();

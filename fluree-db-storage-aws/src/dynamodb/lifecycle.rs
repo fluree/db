@@ -182,6 +182,25 @@ impl DynamoDbNameService {
         update: &str,
         values: &[(&str, AttributeValue)],
     ) -> Result<bool> {
+        self.update_item_conditioned(pk, sk, fence, None, update, values)
+            .await
+    }
+
+    /// [`update_item_fenced`](Self::update_item_fenced), also requiring
+    /// `also` to hold.
+    async fn update_item_conditioned(
+        &self,
+        pk: &str,
+        sk: &str,
+        fence: Fence,
+        also: Option<&str>,
+        update: &str,
+        values: &[(&str, AttributeValue)],
+    ) -> Result<bool> {
+        let condition = match also {
+            Some(also) => format!("#fence = :fence AND ({also})"),
+            None => "#fence = :fence".to_string(),
+        };
         let mut request = self
             .client
             .update_item()
@@ -189,13 +208,13 @@ impl DynamoDbNameService {
             .key(ATTR_PK, AttributeValue::S(pk.to_string()))
             .key(ATTR_SK, AttributeValue::S(sk.to_string()))
             .update_expression(update)
-            .condition_expression("#fence = :fence")
+            .condition_expression(&condition)
             .expression_attribute_names("#fence", ATTR_FENCE)
             .expression_attribute_values(":fence", fence_value(fence));
         for (name, value) in values {
             request = request.expression_attribute_values(*name, value.clone());
         }
-        if update.contains("#frozen") {
+        if update.contains("#frozen") || condition.contains("#frozen") {
             request = request.expression_attribute_names("#frozen", ATTR_FROZEN);
         }
         if update.contains("#branches") {
@@ -541,20 +560,33 @@ impl BranchRecordStore for DynamoDbNameService {
         if self.meta_fence(&pk).await?.is_none() {
             return Ok(FenceOutcome::Missing);
         }
+        let mut values = vec![
+            (":zero", AttributeValue::N("0".to_string())),
+            (":delta", AttributeValue::N(delta.to_string())),
+        ];
+        let not_frozen = (delta > 0).then(|| {
+            values.push((":frozen", AttributeValue::Bool(true)));
+            "attribute_not_exists(#frozen) OR #frozen <> :frozen"
+        });
         let applied = self
-            .update_item_fenced(
+            .update_item_conditioned(
                 &pk,
                 SK_META,
                 fence,
+                not_frozen,
                 "SET #branches = if_not_exists(#branches, :zero) + :delta",
-                &[
-                    (":zero", AttributeValue::N("0".to_string())),
-                    (":delta", AttributeValue::N(delta.to_string())),
-                ],
+                &values,
             )
             .await?;
-        Ok(if applied {
-            FenceOutcome::Applied
+        if applied {
+            return Ok(FenceOutcome::Applied);
+        }
+        let frozen = not_frozen.is_some()
+            && self.get_item(&pk, SK_META).await?.is_some_and(|meta| {
+                meta.get(ATTR_FROZEN).and_then(|v| v.as_bool().ok()) == Some(&true)
+            });
+        Ok(if frozen {
+            FenceOutcome::Frozen
         } else {
             FenceOutcome::Mismatch
         })

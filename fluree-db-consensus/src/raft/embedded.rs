@@ -305,9 +305,12 @@ pub async fn release_one(fluree: &Fluree, ledger_id: &str, cid: &ContentId) {
     const ATTEMPTS: u32 = 3;
     const BASE_BACKOFF: Duration = Duration::from_millis(100);
 
-    let Ok(namespace) = fluree_db_core::StorageNamespace::parse_legacy(ledger_id) else {
-        tracing::warn!(%ledger_id, %cid, "invalid ledger id; envelope not released");
-        return;
+    let namespace = match fluree.storage_namespace(ledger_id).await {
+        Ok(namespace) => namespace,
+        Err(e) => {
+            tracing::warn!(%ledger_id, %cid, error = %e, "no storage root; envelope not released");
+            return;
+        }
     };
     let store = fluree.content_store(&namespace);
     for attempt in 1..=ATTEMPTS {

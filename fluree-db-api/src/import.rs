@@ -5,7 +5,7 @@
 //!
 //! ## Pipeline overview (Tier 2: parallel local IDs + remap)
 //!
-//! 1. **Create ledger** — `nameservice.init(ledger_id)`
+//! 1. **Create ledger** — claim the name; the ledger is published at the end
 //! 2. **Parse + commit** — parallel chunk parsing with chunk-local IDs written
 //!    to spool files, serial commit finalization
 //! 3. **Dict merge** — merge chunk-local subject/string dicts into global dicts,
@@ -3667,46 +3667,30 @@ where
             ),
         };
 
-        // ---- Phase 1: Create ledger (init nameservice) ----
-        // Check if ledger already exists
-        let ns_record = nameservice
+        // ---- Phase 1: Create the ledger, or take the empty one there ----
+        // A new ledger stays invisible until the import has published it.
+        let existing = nameservice
             .lookup(&normalized_alias)
             .await
             .map_err(|e| ImportError::Storage(e.to_string()))?;
-
-        let needs_init = match &ns_record {
-            None => true,
-            Some(record) if record.retracted => {
-                // Ledger was dropped — safe to re-create.
-                tracing::info!(alias = %normalized_alias, "re-initializing retracted ledger");
-                true
-            }
+        let (namespace, pending) = match existing {
             Some(record) if record.commit_t > 0 || record.commit_head_id.is_some() => {
                 return Err(ImportError::Transact(format!(
                     "import requires a fresh ledger, but '{}' already has commits (t={})",
                     normalized_alias, record.commit_t
                 )));
             }
-            Some(_) => false,
+            Some(record) if !record.retracted => (record.storage_namespace(), None),
+            _ => {
+                let id = fluree_db_core::LedgerId::parse(&normalized_alias)
+                    .map_err(|e| ImportError::Storage(e.to_string()))?;
+                let pending = crate::ledger::claim_name(nameservice, &id)
+                    .await
+                    .map_err(|e| ImportError::Storage(e.to_string()))?;
+                tracing::info!(alias = %normalized_alias, instance = %pending.instance, "claimed the name for a new ledger");
+                (pending.record.storage_namespace(), Some(pending))
+            }
         };
-
-        if needs_init {
-            nameservice
-                .init(&normalized_alias)
-                .await
-                .map_err(|e| ImportError::Storage(e.to_string()))?;
-            tracing::info!(alias = %normalized_alias, "initialized new ledger in nameservice");
-        }
-
-        // Where the ledger's artifacts go, from the record `init` wrote.
-        let namespace = nameservice
-            .lookup(&normalized_alias)
-            .await
-            .map_err(|e| ImportError::Storage(e.to_string()))?
-            .ok_or_else(|| {
-                ImportError::Storage(format!("ledger '{normalized_alias}' has no record"))
-            })?
-            .storage_namespace();
 
         // ---- Set up session directory for runs/indexes ----
         // A local scratch directory keyed by the ledger id, not a storage key.
@@ -3770,6 +3754,23 @@ where
                 session_dir = %session_dir.display(),
                 "cleanup disabled; import artifacts retained"
             );
+        }
+
+        let pipeline_result = match (pipeline_result, &pending) {
+            (Ok(result), Some(pending)) => {
+                fluree_db_nameservice::lifecycle::activate(nameservice, pending)
+                    .await
+                    .map(|()| result)
+                    .map_err(|e| ImportError::Storage(e.to_string()))
+            }
+            (result, _) => result,
+        };
+        if let (Err(_), Some(pending)) = (&pipeline_result, &pending) {
+            // Its data is left for the orphan sweep: nothing references the
+            // instance once the claim is gone.
+            if let Err(e) = fluree_db_nameservice::lifecycle::abandon(nameservice, pending).await {
+                tracing::warn!(alias = %normalized_alias, error = %e, "failed to release a failed import's claim on the name");
+            }
         }
 
         match pipeline_result {

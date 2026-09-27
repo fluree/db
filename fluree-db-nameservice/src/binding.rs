@@ -114,6 +114,21 @@ pub enum BindingState {
 pub struct BranchFence {
     pub branch: String,
     pub fence: Fence,
+    /// The branch has been dropped: it reads as absent and its record is
+    /// frozen. It stays listed while child branches keep its data, or until
+    /// its storage is deleted, so its name cannot be reused before then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dropped: bool,
+}
+
+impl BranchFence {
+    pub fn new(branch: impl Into<String>, fence: Fence) -> Self {
+        Self {
+            branch: branch.into(),
+            fence,
+            dropped: false,
+        }
+    }
 }
 
 /// The authoritative claim on a ledger name.
@@ -130,10 +145,11 @@ pub struct NameBinding {
 impl NameBinding {
     /// The fence `branch`'s record must carry to be live.
     pub fn fence_of(&self, branch: &str) -> Option<Fence> {
-        self.branches
-            .iter()
-            .find(|b| b.branch == branch)
-            .map(|b| b.fence)
+        self.listing(branch).map(|b| b.fence)
+    }
+
+    pub fn listing(&self, branch: &str) -> Option<&BranchFence> {
+        self.branches.iter().find(|b| b.branch == branch)
     }
 
     pub fn is_active(&self) -> bool {
@@ -165,7 +181,9 @@ pub struct DroppedLedger {
     pub name: String,
     pub root: StorageRoot,
     pub root_branch: String,
-    /// The branch records as they were when the ledger was dropped.
+    /// The branch records as they were when the ledger was dropped. One
+    /// marked retracted is a branch dropped before its ledger, which a
+    /// restore brings back still dropped.
     pub branches: Vec<NsRecord>,
 }
 
@@ -194,6 +212,8 @@ pub enum FenceOutcome {
     Missing,
     /// The record carries a different fence (or none).
     Mismatch,
+    /// The record is frozen and refuses the change.
+    Frozen,
 }
 
 fn unsupported<T>(what: &str) -> Result<T> {
@@ -287,6 +307,9 @@ pub trait BranchRecordStore: Debug + Send + Sync {
     }
 
     /// Add `delta` to the record's child-branch count, if it carries `fence`.
+    /// A frozen record gains no children: a positive `delta` returns
+    /// [`FenceOutcome::Frozen`], so a branch being dropped cannot acquire a
+    /// child after its drop has read the count.
     async fn adjust_children(
         &self,
         ledger_id: &str,
@@ -302,15 +325,59 @@ pub trait BranchRecordStore: Debug + Send + Sync {
 /// record is garbage: the binding is not active, or does not list the
 /// record's fence.
 ///
-/// The returned record carries the binding's storage root.
+/// The returned record carries the binding's storage root. A dropped branch
+/// still listed reads as retracted.
 pub fn resolve_record(binding: Option<&NameBinding>, mut record: NsRecord) -> Option<NsRecord> {
     let binding = binding.filter(|b| b.is_active())?;
-    let fence = binding.fence_of(&record.branch)?;
-    if record.fence != Some(fence) {
+    let listing = binding.listing(&record.branch)?;
+    if record.fence != Some(listing.fence) {
         return None;
     }
     record.storage_root = Some(binding.root.clone());
+    record.retracted |= listing.dropped;
     Some(record)
+}
+
+/// How reads see a record, given its name's binding. Under a binding, see
+/// [`resolve_record`]. A record whose name has no binding at all was created
+/// before bindings, and reads as it is.
+pub fn resolve_for_read(binding: Option<&NameBinding>, record: NsRecord) -> Option<NsRecord> {
+    match binding {
+        None => Some(record),
+        Some(binding) => resolve_record(Some(binding), record),
+    }
+}
+
+/// [`resolve_for_read`] for one record, reading its binding from `store`.
+pub async fn read_resolved<S: LedgerRegistry + ?Sized>(
+    store: &S,
+    record: Option<NsRecord>,
+) -> Result<Option<NsRecord>> {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let binding = store.get_binding(&record.name).await?;
+    Ok(resolve_for_read(binding.as_ref().map(|v| &v.value), record))
+}
+
+/// [`resolve_for_read`] for many records, reading each name's binding once.
+pub async fn read_all_resolved<S: LedgerRegistry + ?Sized>(
+    store: &S,
+    records: Vec<NsRecord>,
+) -> Result<Vec<NsRecord>> {
+    let mut bindings: std::collections::HashMap<String, Option<NameBinding>> =
+        std::collections::HashMap::new();
+    let mut resolved = Vec::with_capacity(records.len());
+    for record in records {
+        if !bindings.contains_key(&record.name) {
+            let binding = store.get_binding(&record.name).await?.map(|v| v.value);
+            bindings.insert(record.name.clone(), binding);
+        }
+        if let Some(record) = resolve_for_read(bindings[&record.name].as_ref(), record) {
+            resolved.push(record);
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -325,10 +392,7 @@ mod tests {
             instance,
             root_branch: "main".into(),
             state,
-            branches: vec![BranchFence {
-                branch: "main".into(),
-                fence,
-            }],
+            branches: vec![BranchFence::new("main", fence)],
         }
     }
 
@@ -386,10 +450,7 @@ mod tests {
             DroppedState::Dropped,
             DroppedState::Purging,
             DroppedState::Restoring {
-                fences: vec![BranchFence {
-                    branch: "main".into(),
-                    fence: Fence::generate(),
-                }],
+                fences: vec![BranchFence::new("main", Fence::generate())],
             },
         ] {
             let entry = DroppedLedger {

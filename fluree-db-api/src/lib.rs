@@ -132,6 +132,9 @@ pub use admin::{
     DropNamedGraphReport,
     DropReport,
     DropStatus,
+    DroppedData,
+    DroppedLedgerInfo,
+    DroppedLedgerState,
     GraphSourceDropReport,
     // Index maintenance
     IndexStatusResult,
@@ -3748,6 +3751,16 @@ impl Fluree {
         self.backend.content_store(namespace)
     }
 
+    /// Where `ledger_id`'s artifacts live, from its nameservice record.
+    pub async fn storage_namespace(&self, ledger_id: &str) -> Result<StorageNamespace> {
+        Ok(self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?
+            .storage_namespace())
+    }
+
     /// Get a content store for a graph source's artifacts, which always live
     /// under its own id.
     pub fn graph_source_store(&self, graph_source_id: &str) -> Result<Arc<dyn ContentStore>> {
@@ -5283,6 +5296,16 @@ impl Fluree {
             .lookup(ledger_id)
             .await?
             .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+        self.push_default_context(&record, context).await
+    }
+
+    /// [`Self::set_default_context`] for the branch `record` describes,
+    /// which need not be visible yet.
+    pub(crate) async fn push_default_context(
+        &self,
+        record: &NsRecord,
+        context: &serde_json::Value,
+    ) -> Result<SetContextResult> {
         let canonical_id = &record.ledger_id;
         let namespace = record.storage_namespace();
 

@@ -1145,8 +1145,7 @@ async fn rebuild_cost_of_retracted_partitions() {
     for rep in 0..REPS {
         let start = Instant::now();
         let r = fluree_db_indexer::rebuild_index_from_commits(
-            fluree
-                .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+            fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
             ledger_id,
             &record,
             fluree_db_indexer::IndexerConfig::default(),

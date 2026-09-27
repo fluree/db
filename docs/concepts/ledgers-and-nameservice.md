@@ -49,13 +49,22 @@ Ledgers are created implicitly through the first transaction and persist until e
 4. Background indexing process creates queryable indexes
 5. Index ID is published to the nameservice when complete
 
-**Retraction:**
+**One ledger per name:**
 
-Ledgers can be marked as retracted (soft delete), which:
-- Marks the ledger as inactive in the nameservice
-- Preserves storage artifacts
-- Prevents normal load/create/write paths from treating the alias as active
-- Keeps the alias reserved until an administrator purges or otherwise repairs the nameservice record
+A name holds one ledger at a time, with the branches created from it. Each
+ledger gets storage of its own under its name (`mydb/@{instance}/`), so a
+ledger created under a reused name never shares files with the one before it.
+
+**Dropping:**
+
+Dropping a ledger frees its name at once. A soft drop keeps the ledger's data
+in the dropped-ledger registry, where it can be restored under its name or
+purged; a hard drop deletes the data. See [`POST /drop`](../api/endpoints.md#post-drop)
+and [`GET /dropped`](../api/endpoints.md#get-dropped).
+
+A ledger created by an earlier version keeps the older behaviour until it is
+migrated: its storage lives directly under its name, and a soft drop marks
+it retracted, keeping the name reserved.
 
 ## The Nameservice
 

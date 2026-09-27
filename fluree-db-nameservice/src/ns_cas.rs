@@ -173,7 +173,8 @@ where
     }
 }
 
-/// Apply `change` to the main record if it carries `fence`.
+/// Apply `change` to the main record if it carries `fence`. `change` may
+/// refuse with the outcome to report instead.
 async fn update_fenced<S, F>(
     storage: &S,
     main_key: &str,
@@ -182,7 +183,7 @@ async fn update_fenced<S, F>(
 ) -> Result<FenceOutcome>
 where
     S: StorageCas + ?Sized,
-    F: Fn(&mut NsFileV2) + Send + Sync,
+    F: Fn(&mut NsFileV2) -> std::result::Result<(), FenceOutcome> + Send + Sync,
 {
     let outcome = storage
         .compare_and_swap(main_key, |bytes| {
@@ -196,7 +197,9 @@ where
             if file.fence != Some(fence) {
                 return Ok(CasAction::Abort(FenceOutcome::Mismatch));
             }
-            change(&mut file);
+            if let Err(refused) = change(&mut file) {
+                return Ok(CasAction::Abort(refused));
+            }
             Ok(CasAction::Write(serialize_json(&file)?))
         })
         .await?;
@@ -217,6 +220,7 @@ where
 {
     let outcome = update_fenced(storage, keys.main, fence, |file| {
         file.status = STATUS_FROZEN.to_string();
+        Ok(())
     })
     .await?;
     if outcome == FenceOutcome::Applied {
@@ -245,6 +249,7 @@ where
 {
     update_fenced(storage, main_key, fence, |file| {
         file.status = STATUS_DELETED.to_string();
+        Ok(())
     })
     .await
 }
@@ -260,7 +265,11 @@ where
     S: StorageCas + ?Sized,
 {
     update_fenced(storage, main_key, fence, |file| {
+        if delta > 0 && file.status == STATUS_FROZEN {
+            return Err(FenceOutcome::Frozen);
+        }
         file.branches = file.branches.saturating_add_signed(delta);
+        Ok(())
     })
     .await
 }

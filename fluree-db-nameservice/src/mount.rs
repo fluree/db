@@ -28,7 +28,7 @@ use crate::{
     StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::{ContentId, LedgerId};
+use fluree_db_core::{ContentId, LedgerId, StorageRoot};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -74,6 +74,11 @@ impl RemoteMount {
     fn localize_record(&self, mut record: NsRecord) -> Result<NsRecord> {
         record.name = format!("{}/{}", self.prefix, record.ledger_id.name());
         record.ledger_id = LedgerId::from_parts(&record.name, record.ledger_id.branch())?;
+        // Addresses route to the mount by prefix, so an instance root moves
+        // under it too. A name root follows the localized name already.
+        if let Some(root) = record.storage_root.take() {
+            record.storage_root = Some(StorageRoot::parse(&format!("{}/{root}", self.prefix))?);
+        }
         Ok(record)
     }
 
@@ -498,6 +503,111 @@ impl ConfigPublisher for CompositeNameService {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle: local only. A mounted ledger's records arrive already resolved
+// by its origin, which owns its binding.
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::LedgerRegistry for CompositeNameService {
+    async fn get_binding(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::Versioned<crate::NameBinding>>> {
+        if self.mount_for(name).is_some() {
+            return Ok(None);
+        }
+        self.local.get_binding(name).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&crate::NameBinding>,
+    ) -> Result<crate::RegistryCas<crate::NameBinding>> {
+        if let Some(err) = self.reject_mounted_write(name) {
+            return Err(err);
+        }
+        self.local.cas_binding(name, expected, new).await
+    }
+
+    async fn list_bindings(&self) -> Result<Vec<(String, crate::Versioned<crate::NameBinding>)>> {
+        self.local.list_bindings().await
+    }
+
+    async fn get_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+    ) -> Result<Option<crate::Versioned<crate::DroppedLedger>>> {
+        self.local.get_dropped(instance).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+        expected: Option<u64>,
+        new: Option<&crate::DroppedLedger>,
+    ) -> Result<crate::RegistryCas<crate::DroppedLedger>> {
+        self.local.cas_dropped(instance, expected, new).await
+    }
+
+    async fn list_dropped(&self) -> Result<Vec<crate::Versioned<crate::DroppedLedger>>> {
+        self.local.list_dropped().await
+    }
+}
+
+#[async_trait]
+impl crate::BranchRecordStore for CompositeNameService {
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        if self.mount_for(ledger_id).is_some() {
+            return Ok(None);
+        }
+        self.local.raw_record(ledger_id).await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        if let Some(err) = self.reject_mounted_write(&record.ledger_id) {
+            return Err(err);
+        }
+        self.local.insert_record(record).await
+    }
+
+    async fn freeze_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.freeze_record(ledger_id, fence).await
+    }
+
+    async fn delete_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.delete_record(ledger_id, fence).await
+    }
+
+    async fn adjust_children(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+        delta: i32,
+    ) -> Result<crate::FenceOutcome> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.adjust_children(ledger_id, fence, delta).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +644,29 @@ mod tests {
             .await
             .expect("local lookup")
             .is_none());
+    }
+
+    /// A mounted ledger's instance root moves under the mount prefix, where
+    /// its addresses route to the mount's storage.
+    #[tokio::test]
+    async fn lookup_localizes_an_instance_root() {
+        let (remote, composite) = mounted_composite();
+        let created = crate::lifecycle::create_ledger(
+            remote.as_ref(),
+            &LedgerId::parse("inventory").unwrap(),
+        )
+        .await
+        .unwrap();
+        let remote_root = created.storage_root.unwrap();
+
+        let record = composite
+            .lookup("acme/inventory:main")
+            .await
+            .unwrap()
+            .expect("mounted record found");
+        let root = record.storage_root.expect("instance root");
+        assert_eq!(root.as_str(), format!("acme/{remote_root}"));
+        assert_eq!(root.instance(), remote_root.instance());
     }
 
     #[tokio::test]

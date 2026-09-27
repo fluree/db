@@ -538,7 +538,8 @@ where
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         // A graph-source record is not a ledger (#1369). `load_record` reports it
         // as Ok(None) so the caller can fall back to the graph-source path.
-        self.load_record(&ledger_name, &branch).await
+        let record = self.load_record(&ledger_name, &branch).await?;
+        crate::read_resolved(self, record).await
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
@@ -567,12 +568,14 @@ where
             // Keys under `{ledger_name}/` also include nested ledgers
             // (`{ledger_name}/sub/main.json`); the record says which it is.
             if let Ok(Some(record)) = self.read_record_at(&key).await {
-                if record.name == ledger_name && !record.retracted {
+                if record.name == ledger_name {
                     records.push(record);
                 }
             }
         }
 
+        let mut records = crate::read_all_resolved(self, records).await?;
+        records.retain(|r| !r.retracted);
         Ok(records)
     }
 
@@ -604,7 +607,7 @@ where
             }
         }
 
-        Ok(records)
+        crate::read_all_resolved(self, records).await
     }
 }
 
@@ -1527,7 +1530,8 @@ where
             }
         } else {
             // It's a ledger record
-            match self.load_record(&name, &branch).await? {
+            let record = self.load_record(&name, &branch).await?;
+            match crate::read_resolved(self, record).await? {
                 Some(record) => Ok(NsLookupResult::Ledger(record)),
                 None => Ok(NsLookupResult::NotFound),
             }

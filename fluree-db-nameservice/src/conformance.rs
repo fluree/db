@@ -5,7 +5,7 @@
 //! backend's test module to run them all against it.
 
 use crate::binding::{BindingState, DroppedState, Fence, FenceOutcome};
-use crate::lifecycle::{self, LifecycleStore};
+use crate::lifecycle::{self, BranchDrop, LifecycleStore};
 use crate::{NameServiceError, NsRecord};
 use fluree_db_core::{LedgerId, LedgerName, StorageRoot};
 
@@ -401,6 +401,234 @@ pub async fn listings_skip_registry_state<S: LifecycleStore + crate::NameService
     assert!(store.lookup("gone:main").await.unwrap().is_none());
 }
 
+/// Dropping a leaf branch hides it at once but keeps its name taken until
+/// its storage is gone; then the name is free and the parent's count is back.
+pub async fn leaf_branch_drop_frees_the_branch<S: LifecycleStore + crate::NameServiceLookup>(
+    store: &S,
+) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let dev = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        lifecycle::begin_drop_branch(store, &name("mydb"), "main")
+            .await
+            .unwrap_err(),
+        NameServiceError::InvalidId(_)
+    ));
+
+    let BranchDrop::Purge(record) = lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap()
+    else {
+        panic!("a leaf branch is purged at once");
+    };
+    assert_eq!(record.fence, dev.fence);
+    assert_eq!(record.storage_root, dev.storage_root);
+    assert!(store.raw_record("mydb:dev").await.unwrap().unwrap().frozen);
+    assert!(store.lookup("mydb:dev").await.unwrap().unwrap().retracted);
+    assert_eq!(store.list_branches("mydb").await.unwrap().len(), 1);
+    assert_exists(
+        lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+            .await
+            .unwrap_err(),
+    );
+
+    let parent = lifecycle::finish_drop_branch(store, &name("mydb"), &record)
+        .await
+        .unwrap();
+    assert!(parent.is_none(), "main is not dropped");
+    assert!(store.raw_record("mydb:dev").await.unwrap().is_none());
+    assert!(store.lookup("mydb:dev").await.unwrap().is_none());
+    let main = store.raw_record("mydb:main").await.unwrap().unwrap();
+    assert_eq!(main.branches, 0);
+    // Finishing again is a no-op, and does not count the child off twice.
+    lifecycle::finish_drop_branch(store, &name("mydb"), &record)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .raw_record("mydb:main")
+            .await
+            .unwrap()
+            .unwrap()
+            .branches,
+        0
+    );
+
+    let again = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    assert_ne!(again.fence, dev.fence);
+}
+
+/// A branch with children is frozen but kept, since their history reaches
+/// into its data; dropping its last child hands it back for purging.
+pub async fn branch_with_children_drop_is_deferred<S: LifecycleStore + crate::NameServiceLookup>(
+    store: &S,
+) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "fx", "dev", None)
+        .await
+        .unwrap();
+
+    let first = lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap();
+    assert!(matches!(first, BranchDrop::Deferred { already: false }));
+    let second = lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap();
+    assert!(matches!(second, BranchDrop::Deferred { already: true }));
+    assert!(store.lookup("mydb:dev").await.unwrap().unwrap().retracted);
+    assert!(matches!(
+        lifecycle::create_branch(store, &name("mydb"), "fy", "dev", None)
+            .await
+            .unwrap_err(),
+        NameServiceError::NotFound(_)
+    ));
+
+    let BranchDrop::Purge(fx) = lifecycle::begin_drop_branch(store, &name("mydb"), "fx")
+        .await
+        .unwrap()
+    else {
+        panic!("fx is a leaf");
+    };
+    let dev = lifecycle::finish_drop_branch(store, &name("mydb"), &fx)
+        .await
+        .unwrap()
+        .expect("dev's last child is gone");
+    assert_eq!(dev.branch, "dev");
+    assert_eq!(dev.storage_root, fx.storage_root);
+    assert!(lifecycle::finish_drop_branch(store, &name("mydb"), &dev)
+        .await
+        .unwrap()
+        .is_none());
+
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    let listed: Vec<&str> = binding.branches.iter().map(|b| b.branch.as_str()).collect();
+    assert_eq!(listed, vec!["main"]);
+    assert_eq!(
+        store
+            .raw_record("mydb:main")
+            .await
+            .unwrap()
+            .unwrap()
+            .branches,
+        0
+    );
+}
+
+/// A frozen record refuses a new child, so a branch being dropped cannot
+/// gain one after its drop read the count, but still counts children off.
+pub async fn frozen_record_refuses_new_children<S: LifecycleStore>(store: &S) {
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let fence = created.fence.unwrap();
+    store.adjust_children("mydb:main", fence, 1).await.unwrap();
+    store.freeze_record("mydb:main", fence).await.unwrap();
+    assert_eq!(
+        store.adjust_children("mydb:main", fence, 1).await.unwrap(),
+        FenceOutcome::Frozen
+    );
+    assert_eq!(
+        store.adjust_children("mydb:main", fence, -1).await.unwrap(),
+        FenceOutcome::Applied
+    );
+    assert_eq!(
+        store
+            .raw_record("mydb:main")
+            .await
+            .unwrap()
+            .unwrap()
+            .branches,
+        0
+    );
+}
+
+/// A branch dropped before its ledger comes back dropped when the ledger is
+/// restored, rather than live over data its drop may have deleted.
+pub async fn restore_keeps_dropped_branches_dropped<
+    S: LifecycleStore + crate::NameServiceLookup,
+>(
+    store: &S,
+) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "fx", "dev", None)
+        .await
+        .unwrap();
+    lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap();
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+
+    lifecycle::restore_dropped(store, &dropped.instance)
+        .await
+        .unwrap();
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    assert!(binding.listing("dev").unwrap().dropped);
+    assert!(!binding.listing("fx").unwrap().dropped);
+    assert!(store.raw_record("mydb:dev").await.unwrap().unwrap().frozen);
+    assert!(store.lookup("mydb:dev").await.unwrap().unwrap().retracted);
+    let fx = store.lookup("mydb:fx").await.unwrap().unwrap();
+    assert!(!fx.retracted && !fx.frozen);
+}
+
+/// A record mirrored from its origin binds the name to the origin's instance
+/// and root; a second branch joins the binding; a record from a newer
+/// instance replaces it, and the old copies stop resolving.
+pub async fn mirror_binds_the_origin_instance<S: LifecycleStore + crate::NameServiceLookup>(
+    store: &S,
+) {
+    let origin = crate::memory::MemoryNameService::new();
+    let main = lifecycle::create_ledger(&origin, &id("mydb"))
+        .await
+        .unwrap();
+    let dev = lifecycle::create_branch(&origin, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+
+    let mut sent = main.clone();
+    sent.fence = None;
+    lifecycle::mirror_record(store, &sent).await.unwrap();
+    lifecycle::mirror_record(store, &sent).await.unwrap();
+    lifecycle::mirror_record(store, &dev).await.unwrap();
+
+    let copy = store.lookup("mydb:main").await.unwrap().unwrap();
+    assert_eq!(copy.storage_root, main.storage_root);
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    assert_eq!(Some(&binding.root), main.storage_root.as_ref());
+    assert_eq!(binding.root_branch, "main");
+    assert_eq!(binding.fence_of("dev"), dev.fence);
+    assert_eq!(store.list_branches("mydb").await.unwrap().len(), 2);
+
+    lifecycle::drop_ledger(&origin, &name("mydb"), true)
+        .await
+        .unwrap();
+    let replacement = lifecycle::create_ledger(&origin, &id("mydb"))
+        .await
+        .unwrap();
+    lifecycle::mirror_record(store, &replacement).await.unwrap();
+    let copy = store.lookup("mydb:main").await.unwrap().unwrap();
+    assert_eq!(copy.storage_root, replacement.storage_root);
+    assert!(store.lookup("mydb:dev").await.unwrap().is_none());
+
+    let mut legacy = NsRecord::new(id("old:main"));
+    legacy.storage_root = None;
+    assert!(matches!(
+        lifecycle::mirror_record(store, &legacy).await.unwrap_err(),
+        NameServiceError::InvalidId(_)
+    ));
+}
+
 /// Run every case in turn, each against a fresh backend from `make`: for
 /// backends too costly to set up once per test. Keep in step with
 /// [`lifecycle_conformance_tests!`](crate::lifecycle_conformance_tests).
@@ -425,6 +653,11 @@ where
     fenced_record_writes_check_the_fence(&make().await).await;
     stale_binding_version_never_matches_a_reused_name(&make().await).await;
     listings_skip_registry_state(&make().await).await;
+    leaf_branch_drop_frees_the_branch(&make().await).await;
+    branch_with_children_drop_is_deferred(&make().await).await;
+    frozen_record_refuses_new_children(&make().await).await;
+    restore_keeps_dropped_branches_dropped(&make().await).await;
+    mirror_binds_the_origin_instance(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -450,6 +683,11 @@ macro_rules! lifecycle_conformance_tests {
             fenced_record_writes_check_the_fence,
             stale_binding_version_never_matches_a_reused_name,
             listings_skip_registry_state,
+            leaf_branch_drop_frees_the_branch,
+            branch_with_children_drop_is_deferred,
+            frozen_record_refuses_new_children,
+            restore_keeps_dropped_branches_dropped,
+            mirror_binds_the_origin_instance,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {
