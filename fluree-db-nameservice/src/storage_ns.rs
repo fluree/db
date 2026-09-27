@@ -1767,6 +1767,14 @@ mod tests {
 
     #[async_trait]
     impl fluree_db_core::StorageRead for MemoryCasStorage {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+
+        fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+            None
+        }
+
         async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
             self.data
                 .read()
@@ -1916,6 +1924,14 @@ mod tests {
 
     #[async_trait]
     impl fluree_db_core::StorageRead for FlakyCasStorage {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
+        fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+            self.inner.encryption_admin()
+        }
+
         async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
             fluree_db_core::StorageRead::read_bytes(&self.inner, address).await
         }

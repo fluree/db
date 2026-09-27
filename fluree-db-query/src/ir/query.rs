@@ -308,6 +308,10 @@ pub struct Query {
     /// prefix when it applies, otherwise keep the full IRI (round-trippable).
     /// `None` for JSON-LD/SPARQL queries and vocab-less Cypher.
     pub cypher_vocab: Option<std::sync::Arc<str>>,
+    /// What an unmatched OPTIONAL binds its optional-only variables to: the
+    /// surface language's null semantics. SPARQL / JSON-LD leave the default
+    /// `Unbound`; Cypher lowering sets `Poisoned`.
+    pub unmatched_optional: crate::binding::UnmatchedOptional,
 }
 
 impl Query {
@@ -327,6 +331,7 @@ impl Query {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: crate::binding::UnmatchedOptional::Unbound,
         }
     }
 
@@ -349,6 +354,7 @@ impl Query {
             post_values: self.post_values.clone(),
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            unmatched_optional: self.unmatched_optional,
         }
     }
 }

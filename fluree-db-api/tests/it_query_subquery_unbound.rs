@@ -150,27 +150,24 @@ async fn grouped_subquery_restricts_partially_bound_composite_keys() {
 }
 
 #[tokio::test]
-async fn grouped_subquery_distinguishes_union_unbound_from_optional_poisoned() {
+async fn grouped_subquery_joins_optional_unbound_like_union_unbound() {
     let fluree = seed().await;
     for indexed in [false, true] {
         if indexed {
             rebuild_and_publish_index(&fluree, LEDGER).await;
         }
-        for (outer, expected) in [
-            // Preserve the engine's existing Poisoned contract for failed
-            // OPTIONAL bindings: they must not fan out like an actual UNDEF.
-            (
-                "VALUES ?row { ex:left ex:right } OPTIONAL { ?row ex:selected ?p }",
-                json!([["left", "a", "10"]]),
-            ),
-            (
-                "{ VALUES (?row ?p) { (ex:left ex:a) } } UNION { VALUES ?row { ex:right } }",
-                json!([
-                    ["left", "a", "10"],
-                    ["right", "a", "10"],
-                    ["right", "b", "20"]
-                ]),
-            ),
+        // `ex:right` reaches the join with `?p` unbound — left so by an
+        // OPTIONAL that matched nothing, or by a UNION branch that never binds
+        // it. Either way it is compatible with every subquery row (§18.2.4),
+        // so both forms fan out identically (#1734).
+        let expected = json!([
+            ["left", "a", "10"],
+            ["right", "a", "10"],
+            ["right", "b", "20"]
+        ]);
+        for outer in [
+            "VALUES ?row { ex:left ex:right } OPTIONAL { ?row ex:selected ?p }",
+            "{ VALUES (?row ?p) { (ex:left ex:a) } } UNION { VALUES ?row { ex:right } }",
         ] {
             // Materialize the outer solutions independently so this test does
             // not depend on placement of a bare OPTIONAL relative to the join.
@@ -181,7 +178,7 @@ async fn grouped_subquery_distinguishes_union_unbound_from_optional_poisoned() {
                 {{ SELECT ?p (SUM(?price) AS ?n) WHERE {{ ?p ex:price ?price }} GROUP BY ?p }}
             }}"
                 ),
-                expected,
+                expected.clone(),
             )
             .await;
         }

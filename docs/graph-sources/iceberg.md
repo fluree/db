@@ -171,6 +171,31 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
 }
 ```
 
+`warehouse` is the name the catalog knows the warehouse (or catalog) by. It is
+sent to the catalog's `/v1/config` route, and the path prefix that route
+returns is used for every later request, as the Iceberg REST specification
+describes — so the name is enough even where the catalog's routes are laid out
+differently (for example `catalogs/<name>` on Databricks Unity Catalog, whose
+Iceberg endpoint is `https://<workspace>/api/2.1/unity-catalog/iceberg-rest`).
+A catalog with no `/v1/config` route is addressed with the warehouse name as
+the prefix.
+
+**Keeping the secret out of the stored config.** `auth_bearer` and
+`oauth2_client_secret` are stored with the graph source as given. To store only
+a name, give `auth_bearer_env` / `oauth2_client_secret_env`
+(`--auth-bearer-env` / `--oauth2-client-secret-env`): the variable is read from
+the environment of the process that reads the tables, each time a token is
+needed, and the stored config holds `{ "env_var": "<name>" }`. A local CLI
+may name any variable. A **server** accepts only names its operator has listed
+in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` (comma-separated): the request also
+chooses the catalog and token URLs the secret is sent to, so an unlisted name
+would let a caller send the server's environment to a host of their choosing.
+An embedding application can use a secret reference resolved through its
+`SecretResolver` instead.
+
+For Databricks — what to enable in Unity Catalog, and the token it needs — see
+[Connecting to lakehouse platforms](lakehouse-platforms.md#databricks-through-the-iceberg-rest-endpoint).
+
 **Direct S3 config:**
 
 ```json
@@ -716,11 +741,23 @@ Combines customer data from Fluree with order data from Iceberg.
 
 ## Time Travel
 
-Query historical Iceberg snapshots:
+A query against a virtual Iceberg source reads the table's **current**
+snapshot unless the alias carries a time specification, in which case every
+table of the source is read at the snapshot that specification selects, for the
+whole query. Two selectors apply to Iceberg sources:
+
+| Selector | Selects |
+| --- | --- |
+| `@snapshot:<id>` | The snapshot with exactly that Iceberg snapshot id (any retained snapshot, including one later rolled back) |
+| `@time:<timestamp>` | The snapshot that **was the table's current state** at that instant (RFC 3339): the latest snapshot-log entry at or before it, the same rule as Iceberg's own `TIMESTAMP AS OF`. A retained snapshot that was rolled back, or lives only on a branch, is not selected by time. |
+
+`@recorded:<timestamp>` is accepted as a synonym for `@time:`: an Iceberg
+snapshot carries one time, its commit time, and no separate event-time axis —
+the same rule as a ledger that never used caller-supplied event times.
 
 ```json
 {
-  "from": "warehouse-orders:main@snapshot:12345",
+  "from": "warehouse-orders:main@snapshot:5648190075564901028",
   "select": ["?orderId", "?total"],
   "where": [
     { "@id": "?order", "ex:orderId": "?orderId" },
@@ -729,15 +766,48 @@ Query historical Iceberg snapshots:
 }
 ```
 
-Or by timestamp:
-
 ```json
 {
-  "from": "warehouse-orders:main@timestamp:2024-01-01T00:00:00Z",
+  "from": "warehouse-orders:main@time:2024-01-01T00:00:00Z",
   "select": ["?orderId", "?total"],
   "where": [...]
 }
 ```
+
+The same selectors work in SPARQL `FROM <warehouse-orders:main@time:...>` and in
+the Rust API as `fluree.graph_at(alias, TimeSpec::AtSnapshot(id))` /
+`TimeSpec::AtTime(iso)`. Aggregates, including the manifest-backed `COUNT`
+shortcut, answer from the selected snapshot, so a count and a row scan in one
+query never disagree. Columns are resolved against the schema **as of that
+snapshot** (Iceberg reads Parquet by field id); the R2RML mapping applied is
+always the source's current mapping.
+
+A selection that no retained snapshot can satisfy is an **error**, never a
+fallback to the current or oldest snapshot:
+
+- `@snapshot:` with an id the table no longer has (expired by snapshot
+  retention, or never existed) → `snapshot <id> not found for table '...'`.
+- `@time:` before the oldest retained snapshot → `no snapshot of table '...' at
+  or before <requested>; the oldest retained snapshot is <time>`.
+- Either selector on a table that has never committed (no snapshots yet) →
+  the same errors, saying the table has no snapshots. Unpinned, such a table
+  simply reads as empty.
+
+`@t:` and `@commit:` name Fluree ledger states and are rejected on a graph
+source; `@snapshot:` is rejected on a native ledger. Only table sources with
+retained history can be pinned — Iceberg and [Delta](delta.md#time-travel): a
+SQL-backed R2RML source, a BM25 or vector index read their current state and
+reject any time specification. Naming one source at
+two different states in one query — two different pins, or one reference
+pinned and another not, across `from` and `fromNamed` — is also rejected,
+because a pin applies to every read of that source in the query.
+
+Retention matters: Iceberg's `expire_snapshots` removes old snapshots, and a
+table whose history has been expired cannot answer for it. For a durable
+point-in-time copy, [materialize a native twin](#materializing-a-native-twin);
+its completion stamp records the exact snapshot each table was read at, and
+`@snapshot:` with that id re-reads the same state from the source while it is
+retained.
 
 ## Aggregations
 
@@ -825,6 +895,8 @@ the type (`?s a ?t`), both are kept unless their class sets are equal.
 ## Schema Evolution
 
 Iceberg supports schema evolution via metadata updates. If a schema change renames/removes columns used by your R2RML mapping, update the mapping accordingly.
+
+A time-pinned read always uses the current mapping. Columns are matched by Iceberg field id, so a column renamed since the pinned snapshot still resolves under its new name, and a column added since reads as absent, as it was at that snapshot.
 
 ## Configuration Options
 

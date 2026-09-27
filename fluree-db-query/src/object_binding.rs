@@ -2,8 +2,9 @@ use crate::binding::Binding;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
-use fluree_db_core::value_id::ObjKind;
+use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
+use fluree_vocab::xsd_names;
 use std::sync::Arc;
 
 fn encoded_i_val(o_i: u32) -> i32 {
@@ -252,42 +253,84 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
                         lang_id,
                     )
                 }
-                (FlakeValue::String(s), DatatypeConstraint::Explicit(dt))
-                    if *dt == Sid::xsd_string() =>
-                {
+                (FlakeValue::String(s), DatatypeConstraint::Explicit(dt)) => {
+                    let dt_id = if is_xsd(dt, xsd_names::STRING) {
+                        DatatypeDictId::STRING.as_u16()
+                    } else if dt.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+                        && dt.name.as_ref() == "fullText"
+                    {
+                        DatatypeDictId::FULL_TEXT.as_u16()
+                    } else {
+                        return None;
+                    };
+                    let str_id = store.find_string_id(s).ok()??;
+                    (ObjKind::LEX_ID.as_u8(), u64::from(str_id), dt_id, 0)
+                }
+                // JSON shares the string dictionary, keyed by its serialized text.
+                (FlakeValue::Json(s), _) => {
                     let str_id = store.find_string_id(s).ok()??;
                     (
-                        ObjKind::LEX_ID.as_u8(),
+                        ObjKind::JSON_ID.as_u8(),
                         u64::from(str_id),
-                        DatatypeDictId::STRING.as_u16(),
+                        DatatypeDictId::JSON.as_u16(),
                         0,
                     )
                 }
                 (FlakeValue::Long(v), DatatypeConstraint::Explicit(dt)) => {
-                    let dt_id = if *dt == Sid::xsd_integer() {
+                    let dt_id = if is_xsd(dt, xsd_names::INTEGER) {
                         DatatypeDictId::INTEGER.as_u16()
-                    } else if dt.namespace_code == fluree_vocab::namespaces::XSD
-                        && dt.name.as_ref() == "long"
-                    {
+                    } else if is_xsd(dt, xsd_names::LONG) {
                         DatatypeDictId::LONG.as_u16()
                     } else {
                         return None;
                     };
                     (
                         ObjKind::NUM_INT.as_u8(),
-                        fluree_db_core::value_id::ObjKey::encode_i64(*v).as_u64(),
+                        ObjKey::encode_i64(*v).as_u64(),
                         dt_id,
                         0,
                     )
                 }
-                (FlakeValue::Double(v), DatatypeConstraint::Explicit(dt))
-                    if *dt == Sid::xsd_double() =>
+                (FlakeValue::Double(v), DatatypeConstraint::Explicit(dt)) => {
+                    let dt_id = if is_xsd(dt, xsd_names::DOUBLE) {
+                        DatatypeDictId::DOUBLE.as_u16()
+                    } else if is_xsd(dt, xsd_names::FLOAT) {
+                        DatatypeDictId::FLOAT.as_u16()
+                    } else {
+                        return None;
+                    };
+                    let key = ObjKey::encode_f64(*v).ok()?;
+                    (ObjKind::NUM_F64.as_u8(), key.as_u64(), dt_id, 0)
+                }
+                // The temporal types `embedded_temporal_encoding` keeps
+                // encoded. Their keys are the canonical value itself.
+                (FlakeValue::Date(d), DatatypeConstraint::Explicit(dt))
+                    if is_xsd(dt, xsd_names::DATE) =>
                 {
-                    let key = fluree_db_core::value_id::ObjKey::encode_f64(*v).ok()?;
                     (
-                        ObjKind::NUM_F64.as_u8(),
-                        key.as_u64(),
-                        DatatypeDictId::DOUBLE.as_u16(),
+                        ObjKind::DATE.as_u8(),
+                        ObjKey::encode_date(d.days_since_epoch()).as_u64(),
+                        DatatypeDictId::DATE.as_u16(),
+                        0,
+                    )
+                }
+                (FlakeValue::Time(t), DatatypeConstraint::Explicit(dt))
+                    if is_xsd(dt, xsd_names::TIME) =>
+                {
+                    (
+                        ObjKind::TIME.as_u8(),
+                        ObjKey::encode_time(t.micros_since_midnight()).as_u64(),
+                        DatatypeDictId::TIME.as_u16(),
+                        0,
+                    )
+                }
+                (FlakeValue::DateTime(dt_val), DatatypeConstraint::Explicit(dt))
+                    if is_xsd(dt, xsd_names::DATE_TIME) =>
+                {
+                    (
+                        ObjKind::DATE_TIME.as_u8(),
+                        ObjKey::encode_datetime(dt_val.epoch_micros()).as_u64(),
+                        DatatypeDictId::DATE_TIME.as_u16(),
                         0,
                     )
                 }
@@ -305,6 +348,10 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
         }
         _ => None,
     }
+}
+
+fn is_xsd(dt: &Sid, name: &str) -> bool {
+    dt.namespace_code == fluree_vocab::namespaces::XSD && dt.name.as_ref() == name
 }
 
 /// Store handle for representation normalization at equality surfaces.

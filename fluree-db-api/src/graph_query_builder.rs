@@ -156,27 +156,19 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
 
             if let Some((r2rml, _)) = &self.core.r2rml {
                 if r2rml.has_r2rml_mapping(&gs_id).await {
-                    let snapshot = fluree_db_core::LedgerSnapshot::genesis(&gs_id);
-                    let state = fluree_db_ledger::LedgerState::new(
-                        snapshot,
-                        fluree_db_novelty::Novelty::new(0),
-                    );
-                    let mut db = crate::view::GraphDb::from_ledger_state(&state);
-                    // A model-governed source carries its model ledger as the
-                    // policy / schema source so `wrap_policy` resolves both. A
-                    // lookup FAILURE must not read as "ungoverned": it would drop
-                    // the model silently and open the source.
-                    if let Some(record) = self
+                    // The shared resolver builds the genesis view, carries (or
+                    // refuses) the handle's pin, and resolves the model config a
+                    // governed source presents to `wrap_policy`. A `None` here
+                    // is a record that vanished between the two lookups: keep
+                    // the NotFound the ledger load produced.
+                    let Some(db) = self
                         .graph
                         .fluree
-                        .nameservice()
-                        .lookup_graph_source(&gs_id)
-                        .await
-                        .map_err(|e| ApiError::internal(e.to_string()))?
-                    {
-                        db.resolved_config = crate::Fluree::graph_source_model_config(&record);
-                    }
-                    db.graph_source_id = Some(gs_id.into());
+                        .resolve_graph_source_at(ledger_id, &self.graph.time_spec)
+                        .await?
+                    else {
+                        return result;
+                    };
                     // Unlike the `from`-driven builder, nothing downstream of this
                     // one wraps policy, so a governed source would otherwise be read
                     // unfiltered. Gated on the request carrying a policy input, the

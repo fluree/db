@@ -271,6 +271,10 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for MissInjectingStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
@@ -415,6 +419,10 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for NonPinningStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }

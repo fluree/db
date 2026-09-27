@@ -13,9 +13,9 @@ use fluree_db_binary_index::{
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{
-    flake_matches_range_eq, range_provider::RangeQuery, Flake, FlakeValue, GraphId, IndexType,
-    OType, OverlayProvider, RangeMatch, RangeOptions, RangeProvider, RangeTest, RuntimeSmallDicts,
-    Sid,
+    flake_matches_range_eq, overlay_eq_bounds, range_provider::RangeQuery, Flake, FlakeValue,
+    GraphId, IndexType, OType, OverlayProvider, RangeMatch, RangeOptions, RangeProvider, RangeTest,
+    RuntimeSmallDicts, Sid,
 };
 
 use crate::binary_scan::{encode_bound_object_prefilter, index_type_to_sort_order};
@@ -160,6 +160,10 @@ struct RangeTranslationKey {
 /// the raw untranslatable flakes (retracts intact — the raw-merge fallback
 /// in `binary_range_eq_v3` needs them to cancel base facts) and the
 /// ephemeral predicate mapping for decode.
+///
+/// `raw` is in the key's index order: the overlay yields in comparator order
+/// and translation keeps the failures in visit order. [`raw_window`] relies
+/// on that to binary-search a probe's slice instead of scanning all of it.
 struct CachedRangeTranslation {
     ops: Arc<[fluree_db_binary_index::OverlayOp]>,
     raw: Arc<[Flake]>,
@@ -223,7 +227,7 @@ fn cached_overlay_translation(
 
     let OverlayTranslateV3Result {
         mut ops,
-        raw,
+        mut raw,
         ephemeral_p_id_to_sid,
         failed: _,
     } = translate_overlay_ops_v3_with_raw(
@@ -240,6 +244,14 @@ fn cached_overlay_translation(
     let order = index_type_to_sort_order(index);
     fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
     fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
+
+    // `raw_window` binary-searches this set, so an out-of-order overlay would
+    // silently drop matches. Once per cache fill, not per probe.
+    let cmp = index.comparator();
+    if !raw.is_sorted_by(|a, b| cmp(a, b).is_le()) {
+        debug_assert!(false, "overlay yielded out of comparator order");
+        raw.sort_by(cmp);
+    }
 
     let entry = Arc::new(CachedRangeTranslation {
         ops: ops.into(),
@@ -376,6 +388,29 @@ impl RangeProvider for BinaryRangeProvider {
             overlay,
         )
     }
+}
+
+/// The slice of `raw` — sorted in `index` order — that can hold a flake
+/// matching `match_val`: the span between [`overlay_eq_bounds`]' sentinels,
+/// or all of `raw` when the match binds no prefix of the order.
+fn raw_window<'a>(raw: &'a [Flake], index: IndexType, match_val: &RangeMatch) -> &'a [Flake] {
+    let Some((min, max)) = overlay_eq_bounds(index, RangeTest::Eq, match_val) else {
+        return raw;
+    };
+    let cmp = index.comparator();
+    let start = raw.partition_point(|f| cmp(f, &min).is_lt());
+    let end = raw.partition_point(|f| cmp(f, &max).is_le());
+    &raw[start..end.max(start)]
+}
+
+/// Whether an untranslated overlay flake can belong to a fact matching
+/// `match_val`. Tests the fact identity only — never `t`: a retraction that
+/// cancels a matching assert carries a different `t` and must still reach
+/// lifecycle resolution.
+fn raw_fact_may_match(f: &Flake, match_val: &RangeMatch) -> bool {
+    match_val.s.as_ref().is_none_or(|s| f.s == *s)
+        && match_val.p.as_ref().is_none_or(|p| f.p == *p)
+        && match_val.o.as_ref().is_none_or(|o| f.o == *o)
 }
 
 /// V3 equality range query: scan the appropriate index order with filters,
@@ -610,7 +645,11 @@ fn binary_range_eq_v3(
     let (overlay_ops, untranslated, ephemeral_p_id_to_sid) = match cached {
         Some(entry) => (
             Arc::clone(&entry.ops),
-            entry.raw.to_vec(),
+            raw_window(&entry.raw, index, match_val)
+                .iter()
+                .filter(|f| raw_fact_may_match(f, match_val))
+                .cloned()
+                .collect::<Vec<Flake>>(),
             Arc::clone(&entry.ephemeral_p_id_to_sid),
         ),
         None => {
@@ -638,11 +677,19 @@ fn binary_range_eq_v3(
             fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
             (
                 Arc::<[fluree_db_binary_index::OverlayOp]>::from(ops),
-                raw,
+                raw.into_iter()
+                    .filter(|f| raw_fact_may_match(f, match_val))
+                    .collect(),
                 Arc::new(ephemeral_p_id_to_sid),
             )
         }
     };
+    if !untranslated.is_empty() {
+        tracing::trace!(
+            raw_merged = untranslated.len(),
+            "V3 range probe merges raw overlay flakes"
+        );
+    }
 
     if !overlay_ops.is_empty() {
         // Range-bounded cursors get only the ops window intersecting
@@ -1509,8 +1556,7 @@ fn overlay_only_flakes_bounded(
 /// equivalent to pruning survivors while collecting and cloning less. The
 /// `offset`/`limit` pair cannot move in with it — they count survivors, and
 /// the retraction that cancels an already-counted assert can arrive after
-/// the count is reached. `for_each_overlay_flake` walks the graph's whole
-/// overlay regardless, so no early exit would shorten the traversal anyway.
+/// the count is reached.
 fn overlay_only_flakes(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
@@ -1525,12 +1571,21 @@ fn overlay_only_flakes(
 
     let mut flakes = Vec::new();
 
+    // Seek to the match's prefix span instead of walking the whole overlay.
+    // The sentinels sit strictly outside every real flake, so the overlay's
+    // left-exclusive `(first, rhs]` contract loses nothing.
+    let bounds = overlay_eq_bounds(index, RangeTest::Eq, match_val);
+    let (first, rhs) = match &bounds {
+        Some((min, max)) => (Some(min), Some(max)),
+        None => (None, None),
+    };
+
     overlay.for_each_overlay_flake(
         g_id,
         index,
-        None,
-        None,
-        true,
+        first,
+        rhs,
+        first.is_none(),
         effective_to_t,
         &mut |flake| {
             // Filter by match components. A retraction carries the same
@@ -1709,6 +1764,279 @@ mod tests {
         assert!(
             !out.contains_key(&s("dave")),
             "a subject with no surviving class must not appear in the map"
+        );
+    }
+
+    fn weight(subject: &str, value: &str, t: i64, op: bool) -> Flake {
+        Flake::new(
+            s(subject),
+            s("weight"),
+            FlakeValue::Decimal(Box::new(value.parse().unwrap())),
+            Sid::new(2, "decimal"),
+            t,
+            op,
+            None,
+        )
+    }
+
+    /// SPOT-sorted untranslated flakes for three subjects; `b`'s value was
+    /// asserted at t=2 and retracted at t=3.
+    fn sorted_raw() -> Vec<Flake> {
+        let mut raw = vec![
+            weight("a", "1.25", 2, true),
+            weight("b", "2.5", 2, true),
+            weight("b", "2.5", 3, false),
+            weight("c", "3.75", 2, true),
+        ];
+        raw.sort_by(IndexType::Spot.comparator());
+        raw
+    }
+
+    /// A subject+predicate probe gets exactly that subject's slice of the
+    /// cached raw flakes — the retraction included, though its `t` differs,
+    /// so lifecycle resolution can still cancel the assert.
+    #[test]
+    fn raw_window_is_the_probe_span_with_its_retractions() {
+        let raw = sorted_raw();
+        let window = raw_window(
+            &raw,
+            IndexType::Spot,
+            &RangeMatch::subject_predicate(s("b"), s("weight")),
+        );
+        assert_eq!(window.len(), 2);
+        assert!(window.iter().all(|f| f.s == s("b")));
+        assert!(window.iter().any(|f| !f.op));
+
+        let current =
+            fluree_db_core::range::resolve_current_flakes(window.to_vec(), IndexType::Spot);
+        assert!(current.is_empty(), "the t=3 retraction cancels b's value");
+    }
+
+    /// A match that binds no prefix of the order cannot be narrowed, so the
+    /// window is everything and the per-flake test does the filtering.
+    #[test]
+    fn raw_window_without_a_prefix_is_everything() {
+        let raw = sorted_raw();
+        let by_predicate = RangeMatch::predicate(s("weight"));
+        assert_eq!(
+            raw_window(&raw, IndexType::Spot, &by_predicate).len(),
+            raw.len()
+        );
+    }
+
+    #[test]
+    fn raw_fact_filter_ignores_t() {
+        let probe = RangeMatch {
+            t: Some(2),
+            ..RangeMatch::subject_predicate(s("b"), s("weight"))
+        };
+        assert!(raw_fact_may_match(&weight("b", "2.5", 3, false), &probe));
+        assert!(!raw_fact_may_match(&weight("a", "1.25", 2, true), &probe));
+    }
+
+    /// The window is sound only where `FlakeValue`'s ordering calls equal
+    /// what its equality does — a POST probe for `Long(3)` must find a raw
+    /// `BigInt(3)` or `Decimal("3")` between its sentinels. Every index order
+    /// and probe shape here must answer as merging all raw flakes did: resolve
+    /// the whole set, then filter.
+    #[test]
+    fn raw_window_answers_as_the_full_merge_in_every_order() {
+        use fluree_db_core::range::{flake_matches_range_eq, resolve_current_flakes};
+        use fluree_db_core::FlakeMeta;
+
+        fn dec(v: &str) -> FlakeValue {
+            FlakeValue::Decimal(Box::new(v.parse().unwrap()))
+        }
+        let fl = |subj: &str, pred: &str, o: FlakeValue, dt: &str, t: i64, op: bool| {
+            Flake::new(s(subj), s(pred), o, Sid::new(2, dt), t, op, None)
+        };
+        let lang = |subj: &str, v: &str, tag: &str, t: i64, op: bool| {
+            Flake::new(
+                s(subj),
+                s("label"),
+                FlakeValue::String(v.into()),
+                Sid::new(3, "langString"),
+                t,
+                op,
+                Some(FlakeMeta::with_lang(tag)),
+            )
+        };
+        let raw_all = vec![
+            // A retraction written at another scale cancels its assert.
+            fl("a", "weight", dec("2.5"), "decimal", 2, true),
+            fl("a", "weight", dec("2.50"), "decimal", 3, false),
+            // One numeric value across four representations.
+            fl("b", "weight", FlakeValue::Long(3), "long", 2, true),
+            fl(
+                "c",
+                "weight",
+                FlakeValue::BigInt(Box::new(3.into())),
+                "integer",
+                2,
+                true,
+            ),
+            fl("d", "weight", dec("3"), "decimal", 2, true),
+            fl("e", "weight", FlakeValue::Double(3.0), "double", 2, true),
+            fl("a", "score", FlakeValue::Long(7), "long", 2, true),
+            fl("b", "score", dec("7.0"), "decimal", 2, true),
+            fl("e", "knows", FlakeValue::Ref(s("a")), "id", 2, true),
+            lang("c", "x", "en", 2, true),
+            lang("d", "x", "fr", 2, true),
+            lang("d", "x", "fr", 4, false),
+        ];
+        let subjects: Vec<Option<Sid>> = std::iter::once(None)
+            .chain(["a", "b", "c", "d", "e", "zz"].map(|n| Some(s(n))))
+            .collect();
+        let predicates: Vec<Option<Sid>> = std::iter::once(None)
+            .chain(["weight", "score", "knows", "label", "zz"].map(|n| Some(s(n))))
+            .collect();
+        let objects: Vec<Option<FlakeValue>> = vec![
+            None,
+            Some(FlakeValue::Long(3)),
+            Some(FlakeValue::BigInt(Box::new(3.into()))),
+            Some(dec("3.000")),
+            Some(FlakeValue::Double(3.0)),
+            Some(dec("2.5")),
+            Some(FlakeValue::Long(7)),
+            Some(FlakeValue::Ref(s("a"))),
+            Some(FlakeValue::String("x".into())),
+            Some(FlakeValue::Long(4)),
+        ];
+
+        for index in [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ] {
+            let mut raw = raw_all.clone();
+            raw.sort_by(index.comparator());
+            let mut narrowed = 0;
+            let mut non_empty = 0;
+            for s_ in &subjects {
+                for p_ in &predicates {
+                    for o_ in &objects {
+                        let probe = RangeMatch {
+                            s: s_.clone(),
+                            p: p_.clone(),
+                            o: o_.clone(),
+                            ..RangeMatch::new()
+                        };
+                        let mut full: Vec<Flake> = resolve_current_flakes(raw.clone(), index)
+                            .into_iter()
+                            .filter(|f| flake_matches_range_eq(f, &probe))
+                            .collect();
+                        let window = raw_window(&raw, index, &probe);
+                        narrowed += usize::from(window.len() < raw.len());
+                        let mut windowed: Vec<Flake> = resolve_current_flakes(
+                            window
+                                .iter()
+                                .filter(|f| raw_fact_may_match(f, &probe))
+                                .cloned()
+                                .collect(),
+                            index,
+                        )
+                        .into_iter()
+                        .filter(|f| flake_matches_range_eq(f, &probe))
+                        .collect();
+                        full.sort_by(index.comparator());
+                        windowed.sort_by(index.comparator());
+                        assert_eq!(windowed, full, "{index:?} {probe:?}");
+                        non_empty += usize::from(!full.is_empty());
+                    }
+                }
+            }
+            assert!(narrowed > 0, "{index:?}: no probe narrowed the window");
+            assert!(non_empty > 0, "{index:?}: every answer was empty");
+        }
+    }
+
+    /// Sorted-vec overlay honoring the `(first, rhs]` contract, counting what
+    /// each walk yields.
+    struct CountingOverlay {
+        flakes: Vec<Flake>,
+        yielded: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OverlayProvider for CountingOverlay {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn epoch(&self) -> u64 {
+            1
+        }
+
+        fn for_each_overlay_flake(
+            &self,
+            _g_id: GraphId,
+            index: IndexType,
+            first: Option<&Flake>,
+            rhs: Option<&Flake>,
+            leftmost: bool,
+            to_t: i64,
+            callback: &mut dyn FnMut(&Flake),
+        ) {
+            let cmp = index.comparator();
+            for f in &self.flakes {
+                if f.t > to_t
+                    || (!leftmost && first.is_some_and(|lo| cmp(f, lo).is_le()))
+                    || rhs.is_some_and(|hi| cmp(f, hi).is_gt())
+                {
+                    continue;
+                }
+                self.yielded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                callback(f);
+            }
+        }
+    }
+
+    /// The overlay-only lane seeks to the probe's span: a subject+predicate
+    /// probe visits only that subject's flakes, not the whole overlay, and
+    /// still resolves the in-novelty retraction.
+    #[test]
+    fn overlay_only_probe_walks_only_its_span() {
+        let overlay = CountingOverlay {
+            flakes: sorted_raw(),
+            yielded: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let opts = RangeOptions {
+            to_t: Some(10),
+            ..Default::default()
+        };
+
+        let a = overlay_only_flakes(
+            &store,
+            0,
+            IndexType::Spot,
+            &RangeMatch::subject_predicate(s("a"), s("weight")),
+            &opts,
+            &overlay,
+        )
+        .unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            overlay
+                .yielded
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let b = overlay_only_flakes(
+            &store,
+            0,
+            IndexType::Spot,
+            &RangeMatch::subject_predicate(s("b"), s("weight")),
+            &opts,
+            &overlay,
+        )
+        .unwrap();
+        assert!(b.is_empty(), "the t=3 retraction cancels b's value");
+        assert_eq!(
+            overlay.yielded.load(std::sync::atomic::Ordering::Relaxed),
+            2
         );
     }
 }

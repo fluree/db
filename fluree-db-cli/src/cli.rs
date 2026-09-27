@@ -367,8 +367,10 @@ pub enum Commands {
         leaflets_per_leaf: usize,
 
         /// Create the ledger on a remote server (by remote name, e.g., "origin").
-        /// Only valid with empty creates — incompatible with --from/--memory.
-        /// Use `fluree publish` if you also need to push local commits.
+        /// Empty, or with `--from`: a `.flpack` archive is restored on the
+        /// server, and a single source file is imported there when the server
+        /// offers source uploads. Incompatible with `--memory`. Use
+        /// `fluree publish` if you also need to push local commits.
         #[arg(long)]
         remote: Option<String>,
     },
@@ -588,8 +590,8 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
-    /// Synchronize a named graph: make its contents exactly the supplied
-    /// data, committing only the delta.
+    /// Synchronize a graph: make its contents exactly the supplied data,
+    /// committing only the delta. Without --graph, the default graph.
     ///
     /// The target graph is the constant; the SOURCE of the desired contents
     /// is pluggable. Today the source is RDF text (Turtle or JSON-LD) from a
@@ -597,6 +599,7 @@ pub enum Commands {
     /// mapped sources (R2RML over Iceberg / CSV / Excel) will plug in.
     ///
     /// Examples:
+    ///   fluree sync mydb -f data.ttl
     ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl
     ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl --dry-run
     ///   cat export.jsonld | fluree sync --graph urn:example:ontology --remote origin
@@ -611,10 +614,10 @@ pub enum Commands {
         #[arg(short = 'l', long)]
         ledger: Option<String>,
 
-        /// Target named graph IRI — the sync scope. Required; the payload
-        /// never widens or narrows it.
+        /// Target named graph IRI — the sync scope; the payload never widens
+        /// or narrows it. Omit it to sync the default graph.
         #[arg(short = 'g', long)]
-        graph: String,
+        graph: Option<String>,
 
         /// Inline data expression (Turtle or JSON-LD).
         #[arg(short = 'e', long = "expr")]
@@ -777,7 +780,7 @@ pub enum Commands {
         /// Query at a specific point in time.
         ///
         /// Accepts `t:<N>` (transaction number), `t:latest`/`latest`,
-        /// `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the
+        /// `time:<ISO-8601>` (commit event time; `iso:` is an alias), `recorded:<ISO-8601>` (the
         /// wall-clock time the commit was recorded), and `commit:<prefix>`
         /// (hex digest, min 6 chars). A bare transaction number, ISO-8601
         /// timestamp, or commit prefix also works; a bare integer is read as
@@ -901,7 +904,7 @@ pub enum Commands {
         /// Start of time range (default: 1).
         ///
         /// Same spellings as `query --at`: `t:<N>`, `t:latest`/`latest`,
-        /// `iso:<ISO-8601>`, `recorded:<ISO-8601>`, `commit:<prefix>`, or a
+        /// `time:<ISO-8601>` (`iso:` is an alias), `recorded:<ISO-8601>`, `commit:<prefix>`, or a
         /// bare transaction number / timestamp / commit prefix.
         #[arg(long, default_value = "1")]
         from: String,
@@ -1103,7 +1106,7 @@ pub enum Commands {
         /// Query at a specific point in time.
         ///
         /// Accepts `t:<N>` (transaction number), `t:latest`/`latest`,
-        /// `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the
+        /// `time:<ISO-8601>` (commit event time; `iso:` is an alias), `recorded:<ISO-8601>` (the
         /// wall-clock time the commit was recorded), and `commit:<prefix>`
         /// (hex digest, min 6 chars). A bare transaction number, ISO-8601
         /// timestamp, or commit prefix also works; a bare integer is read as
@@ -1363,6 +1366,18 @@ pub enum Commands {
         remote: Option<String>,
     },
 
+    /// Encryption at rest: held keys and key rotation
+    ///
+    /// Runs against a server (`--remote`) or, with `--connection-config`,
+    /// directly against the storage that config describes. A rotation
+    /// re-envelopes every blob on a retiring key under the current key, in
+    /// place and resumably; `verify` reports when none remain, which is the
+    /// signal to drop the old key from configuration.
+    Encryption {
+        #[command(subcommand)]
+        action: EncryptionAction,
+    },
+
     /// Manage the Fluree HTTP server
     Server {
         #[command(subcommand)]
@@ -1409,6 +1424,12 @@ pub enum Commands {
     Sql {
         #[command(subcommand)]
         action: SqlAction,
+    },
+
+    /// Manage Delta Lake graph sources (R2RML over Delta tables)
+    Delta {
+        #[command(subcommand)]
+        action: DeltaAction,
     },
 
     /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
@@ -1718,7 +1739,7 @@ pub enum BranchAction {
         /// that is all digits. The source branch must be indexed for `t:` /
         /// prefix resolution (full CIDs work unconditionally).
         ///
-        /// Unlike `query --at` this names a *commit*, so it has no `iso:`,
+        /// Unlike `query --at` this names a *commit*, so it has no `time:`,
         /// `recorded:` or `latest` forms; the spellings the two share mean the
         /// same thing on both.
         #[arg(long)]
@@ -1924,6 +1945,93 @@ pub enum BranchAction {
         #[arg(long)]
         remote: Option<String>,
     },
+}
+
+/// Where an `encryption` command runs.
+#[derive(clap::Args, Debug, Clone)]
+pub struct EncryptionTarget {
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    /// Run directly against the storage a connection config (JSON-LD)
+    /// describes; the config must list every key involved
+    #[arg(long, value_name = "PATH", conflicts_with = "remote")]
+    pub connection_config: Option<PathBuf>,
+
+    /// Print the raw JSON response
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EncryptionAction {
+    /// Show the held key ids and the rotation record, if any
+    Status {
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Start (or resume) a rotation off `--retire` onto the current key
+    Rotate {
+        /// Id of the key being retired
+        #[arg(long)]
+        retire: u32,
+
+        /// Count what would be rewritten without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Limit the sweep to one ledger (name or branch-qualified id)
+        #[arg(long)]
+        ledger: Option<String>,
+
+        /// Throttle rewrites, e.g. "50mb" per second
+        #[arg(long, value_name = "BYTES/S")]
+        rate: Option<String>,
+
+        /// Poll status until the sweep stops, printing progress
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Resume the rotation the record describes
+    Resume {
+        /// Poll status until the sweep stops, printing progress
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Pause the running sweep after its next blob
+    Pause {
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Cancel the running sweep; the next rotate starts over
+    Cancel {
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Count blobs still on a retiring key and stamp the record
+    Verify {
+        /// Id of the key being retired
+        #[arg(long)]
+        retire: u32,
+
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Print a fresh base64 AES-256 key for AES256Key / AES256Keys
+    GenerateKey,
 }
 
 /// `cluster` subcommands.
@@ -3170,6 +3278,347 @@ pub enum SqlAction {
     },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum DeltaAction {
+    /// Map Delta Lake tables as an R2RML graph source
+    ///
+    /// Tables are named by path, or by their Unity Catalog name. By path, each
+    /// rr:tableName in the mapping resolves to its --table entry, else to a
+    /// directory under --root with the name's dots as separators
+    /// (dbo.orders -> <root>/dbo/orders). With --unity-uri, each rr:tableName is
+    /// a Unity Catalog name (catalog.schema.table, or shorter with
+    /// --unity-catalog / --unity-schema): Unity places the table and issues the
+    /// credentials that read it.
+    ///
+    /// Query a past table state with `<name>@snapshot:<delta-version>` or
+    /// `<name>@time:<ISO-8601>`.
+    ///
+    /// Examples:
+    ///   fluree delta map sales --root s3://lake/Tables --r2rml mappings/sales.ttl
+    ///   fluree delta map sales --table orders=s3://lake/raw/orders_v2 --r2rml sales.ttl
+    ///   fluree delta map sales --r2rml mappings/sales.ttl \
+    ///     --unity-uri https://<workspace>.cloud.databricks.com --unity-catalog main \
+    ///     --oauth2-client-id <application-id> \
+    ///     --oauth2-client-secret-env DATABRICKS_CLIENT_SECRET --s3-region us-east-1
+    Map(Box<DeltaMapArgs>),
+
+    /// List what a Unity Catalog holds
+    ///
+    /// With no --unity-catalog, its catalogs; with one, that catalog's schemas
+    /// and tables; with --unity-schema too, that schema's tables. Each table
+    /// shows whether it is a Delta table this reader can read.
+    ///
+    /// Examples:
+    ///   fluree delta browse --unity-uri https://<workspace> --auth-bearer-env DATABRICKS_TOKEN
+    ///   fluree delta browse --unity-uri ... --auth-bearer-env ... --unity-catalog main
+    Browse(Box<DeltaBrowseArgs>),
+
+    /// Show a Unity Catalog table's columns and declared keys
+    Preview(Box<DeltaTableArgs>),
+
+    /// Read a Unity Catalog table with the credentials Unity issues for it
+    Verify(Box<DeltaTableArgs>),
+
+    /// Generate an R2RML mapping from Unity Catalog tables
+    ///
+    /// Declared primary keys become subjects and declared foreign keys joins.
+    /// What had to be decided without one is said on standard error.
+    ///
+    /// Example:
+    ///   fluree delta generate main.sales.orders main.sales.customers \
+    ///     --unity-uri https://<workspace> --auth-bearer-env DATABRICKS_TOKEN \
+    ///     --base-namespace https://example.org/sales# -o sales.ttl
+    Generate(Box<DeltaGenerateArgs>),
+
+    /// Check a mapping against the tables `delta map` would read, registering
+    /// nothing. Takes the options of `delta map`.
+    Validate(Box<DeltaValidateArgs>),
+
+    /// List mapped graph sources (Delta, SQL, Iceberg and R2RML)
+    List {
+        /// List graph sources on a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show details for a mapped graph source
+    Info {
+        /// Graph source name
+        name: String,
+
+        /// Query a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Drop a mapped graph source
+    Drop {
+        /// Graph source name
+        name: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// A Unity Catalog connection.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaUnityArgs {
+    /// Databricks workspace URL. For `map`, tables without a --table entry are
+    /// then named in Unity Catalog (catalog.schema.table), which says where
+    /// each lives and issues the credentials that read it. Excludes --root
+    #[arg(long, value_name = "URL")]
+    pub unity_uri: Option<String>,
+
+    /// Catalog that completes a table name of fewer than three parts, and
+    /// that `browse` lists
+    #[arg(long, requires = "unity_uri")]
+    pub unity_catalog: Option<String>,
+
+    /// Schema that completes a one-part table name, and that `browse` lists
+    #[arg(long, requires = "unity_uri")]
+    pub unity_schema: Option<String>,
+
+    /// Databricks token for Unity Catalog (stored with the graph source;
+    /// prefer --auth-bearer-env)
+    #[arg(long, requires = "unity_uri", conflicts_with = "auth_bearer_env")]
+    pub auth_bearer: Option<String>,
+
+    /// Environment variable holding the Databricks token, read by the process
+    /// that reads the tables. With --remote, the server must list the variable
+    /// in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
+    #[arg(long, value_name = "VAR", requires = "unity_uri")]
+    pub auth_bearer_env: Option<String>,
+
+    /// Application id of a Databricks service principal
+    #[arg(long, requires = "unity_uri")]
+    pub oauth2_client_id: Option<String>,
+
+    /// The service principal's OAuth secret (stored with the graph source;
+    /// prefer --oauth2-client-secret-env)
+    #[arg(
+        long,
+        requires = "unity_uri",
+        conflicts_with = "oauth2_client_secret_env"
+    )]
+    pub oauth2_client_secret: Option<String>,
+
+    /// Environment variable holding the OAuth secret; as --auth-bearer-env
+    #[arg(long, value_name = "VAR", requires = "unity_uri")]
+    pub oauth2_client_secret_env: Option<String>,
+
+    /// OAuth2 token URL (default: the workspace's own, <unity-uri>/oidc/v1/token)
+    #[arg(long, requires = "unity_uri")]
+    pub oauth2_token_url: Option<String>,
+
+    /// OAuth2 scope (default: all-apis)
+    #[arg(long, requires = "unity_uri")]
+    pub oauth2_scope: Option<String>,
+}
+
+/// S3 options for tables read with credentials that name no region.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaS3Args {
+    /// S3 region override
+    #[arg(long)]
+    pub s3_region: Option<String>,
+
+    /// S3 endpoint override (MinIO, LocalStack)
+    #[arg(long)]
+    pub s3_endpoint: Option<String>,
+
+    /// Use path-style S3 URLs (MinIO, LocalStack)
+    #[arg(long)]
+    pub s3_path_style: bool,
+}
+
+/// Where a Delta source's tables are, and the mapping over them.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaSourceArgs {
+    /// Directory the mapping's table names resolve beneath: s3://bucket/prefix,
+    /// abfss://container@account.dfs.core.windows.net/path (or the OneLake
+    /// form), or a local path under FLUREE_ICEBERG_LOCAL_ROOTS
+    #[arg(long, conflicts_with = "unity_uri")]
+    pub root: Option<String>,
+
+    /// Explicit table location (repeatable): --table orders=s3://lake/raw/orders_v2
+    #[arg(long = "table", value_name = "NAME=LOCATION")]
+    pub table: Vec<String>,
+
+    /// R2RML mapping file. Each rr:tableName names a Delta table; rr:sqlQuery
+    /// is not supported.
+    #[arg(long)]
+    pub r2rml: PathBuf,
+
+    /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
+    #[arg(long)]
+    pub r2rml_type: Option<String>,
+
+    #[command(flatten)]
+    pub s3: DeltaS3Args,
+
+    /// Microsoft Entra tenant id of a service principal for abfss:// locations.
+    /// Omit the --azure-* options to use ambient Azure credentials.
+    #[arg(long)]
+    pub azure_tenant_id: Option<String>,
+
+    /// Service principal (application) client id
+    #[arg(long)]
+    pub azure_client_id: Option<String>,
+
+    /// Service principal client secret (stored with the graph source; prefer
+    /// --azure-client-secret-env)
+    #[arg(long, conflicts_with = "azure_client_secret_env")]
+    pub azure_client_secret: Option<String>,
+
+    /// Environment variable holding the client secret, read by the process
+    /// that reads the tables
+    #[arg(long, value_name = "VAR")]
+    pub azure_client_secret_env: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+}
+
+/// Arguments for mapping Delta tables as a graph source.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaMapArgs {
+    /// Graph source name (e.g., "sales")
+    pub name: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub source: DeltaSourceArgs,
+
+    /// Branch name (defaults to "main")
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
+}
+
+/// Arguments for checking a mapping against the tables a `delta map` with the
+/// same options would read.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaValidateArgs {
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub source: DeltaSourceArgs,
+
+    /// Print the server's JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DeltaBrowseDepth {
+    Schemas,
+    Tables,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaBrowseArgs {
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+
+    /// How far a listing of one catalog reaches
+    #[arg(long, value_enum, default_value = "tables")]
+    pub depth: DeltaBrowseDepth,
+
+    /// Print the server's JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaTableArgs {
+    /// Table name, completed from --unity-catalog and --unity-schema
+    pub table: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+
+    #[command(flatten)]
+    pub s3: DeltaS3Args,
+
+    /// Print the server's JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaGenerateArgs {
+    /// Tables to map, in output order; completed from --unity-catalog and
+    /// --unity-schema
+    #[arg(required = true)]
+    pub tables: Vec<String>,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+
+    /// The IRI every generated class, property and subject derives from
+    #[arg(long, value_name = "IRI")]
+    pub base_namespace: String,
+
+    /// Write the mapping here instead of standard output
+    #[arg(long, short, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Subject columns for a table, in place of its declared or chosen key
+    /// (repeatable): --subject-key orders=order_id,line
+    #[arg(long, value_name = "TABLE=COLUMN[,COLUMN]")]
+    pub subject_key: Vec<String>,
+
+    /// Class name for a table (repeatable): --class-name orders=Purchase
+    #[arg(long, value_name = "TABLE=NAME")]
+    pub class_name: Vec<String>,
+
+    /// Give a table no subject unless it has a declared or provably non-null
+    /// key, instead of always choosing one
+    #[arg(long)]
+    pub strict_subjects: bool,
+
+    /// Keep foreign keys as plain values; emit no joins
+    #[arg(long)]
+    pub no_joins: bool,
+
+    /// Print the server's JSON (mapping, structure and diagnostics)
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for mapping a SQL endpoint as a graph source.
 #[derive(Debug, Clone, clap::Args)]
 pub struct SqlMapArgs {
@@ -3327,9 +3776,16 @@ pub struct IcebergMapArgs {
     #[arg(long, value_name = "BOOL")]
     pub default_allow: Option<bool>,
 
-    /// Bearer token for REST catalog authentication
-    #[arg(long)]
+    /// Bearer token for REST catalog authentication. Stored with the graph
+    /// source; prefer --auth-bearer-env
+    #[arg(long, conflicts_with = "auth_bearer_env")]
     pub auth_bearer: Option<String>,
+
+    /// Environment variable holding the bearer token, read by the process that
+    /// reads the tables. The token is not stored. With --remote, the server
+    /// must list the variable in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
+    #[arg(long, value_name = "VAR")]
+    pub auth_bearer_env: Option<String>,
 
     /// OAuth2 token URL for client credentials auth
     #[arg(long)]
@@ -3339,9 +3795,14 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub oauth2_client_id: Option<String>,
 
-    /// OAuth2 client secret
-    #[arg(long)]
+    /// OAuth2 client secret. Stored with the graph source; prefer
+    /// --oauth2-client-secret-env
+    #[arg(long, conflicts_with = "oauth2_client_secret_env")]
     pub oauth2_client_secret: Option<String>,
+
+    /// Environment variable holding the OAuth2 client secret; as --auth-bearer-env
+    #[arg(long, value_name = "VAR")]
+    pub oauth2_client_secret_env: Option<String>,
 
     /// OAuth2 scope (e.g. "session:role:ICEBERG_READER" for Snowflake Horizon / Polaris)
     #[arg(long)]

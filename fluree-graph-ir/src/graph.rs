@@ -85,6 +85,11 @@ impl Graph {
         self.prefixes.insert(prefix.into(), namespace.into());
     }
 
+    /// Reserve room for at least `additional` more triples.
+    pub fn reserve(&mut self, additional: usize) {
+        self.triples.reserve(additional);
+    }
+
     /// Add a triple to the graph
     pub fn add(&mut self, triple: Triple) {
         self.triples.push(triple);

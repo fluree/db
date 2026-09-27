@@ -69,6 +69,27 @@ pub enum QueryError {
         snapshot_id: i64,
     },
 
+    /// A time-pinned graph-source read (`@iso:` / `@recorded:`) names an
+    /// instant before the table's oldest retained snapshot, so no snapshot can
+    /// answer it. Typed, like [`Self::SnapshotNotFound`], and never satisfied
+    /// by the oldest or the current snapshot instead.
+    #[error(
+        "no snapshot of table '{table}' at or before {requested}; {}",
+        .oldest.as_deref().map_or_else(
+            || "the table has no snapshots".to_string(),
+            |oldest| format!("the oldest retained snapshot is {oldest}"),
+        )
+    )]
+    NoSnapshotAtTime {
+        /// The table whose metadata was consulted.
+        table: String,
+        /// The requested instant, RFC 3339.
+        requested: String,
+        /// The oldest retained snapshot's commit time, RFC 3339; `None` for a
+        /// table with no snapshots.
+        oldest: Option<String>,
+    },
+
     /// Resource limit exceeded
     #[error("Resource limit exceeded: {0}")]
     ResourceLimit(String),
@@ -153,6 +174,16 @@ pub enum QueryError {
     CatalogCredentialsNotVended {
         /// The REST catalog URI that authorized the table.
         catalog_uri: String,
+    },
+
+    /// The catalog refused this principal access to the table (its 401/403),
+    /// in the catalog's own words.
+    #[error("Catalog denied access to table '{table}': {message}")]
+    CatalogAccessDenied {
+        /// The table as the catalog names it.
+        table: String,
+        /// The catalog's refusal.
+        message: String,
     },
 
     /// Internal error (should not happen in normal operation)

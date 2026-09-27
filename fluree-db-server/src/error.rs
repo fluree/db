@@ -47,6 +47,10 @@ pub enum ServerError {
     #[error("{0}")]
     NotAcceptable(String),
 
+    /// Unsupported Media Type (415) - request body format not accepted
+    #[error("{0}")]
+    UnsupportedMediaType(String),
+
     /// SPARQL UPDATE lowering error
     #[error("SPARQL UPDATE error: {0}")]
     SparqlUpdateLower(#[from] SparqlUpdateLowerError),
@@ -150,6 +154,9 @@ impl ServerError {
                     ..
                 }),
             ) => errors::CATALOG_CREDENTIALS_NOT_VENDED,
+            ServerError::Api(ApiError::Query(
+                fluree_db_query::QueryError::CatalogAccessDenied { .. },
+            )) => errors::CATALOG_ACCESS_DENIED,
 
             // Virtual-dataset (R2RML) unsupported-pattern refusal: a distinct
             // `@type` so Solo's browse UI can gate on the condition instead of
@@ -157,6 +164,8 @@ impl ServerError {
             // this source) — unlike the 403/507 distinct-status precedents — via
             // the generic `Query(_)` arm in `status_code()`. MUST precede the
             // generic `ApiError::Query(_)` arm below.
+            // The same fact as it leaves the ledger loader, unconverted.
+            ServerError::Api(e) if e.is_not_found() => errors::LEDGER_NOT_FOUND,
             ServerError::Api(ApiError::Query(
                 fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. },
             )) => errors::R2RML_UNSUPPORTED_PATTERN,
@@ -200,6 +209,7 @@ impl ServerError {
             ServerError::Unauthorized(_) => errors::UNAUTHORIZED,
             ServerError::NotFound(_) => errors::NOT_FOUND,
             ServerError::NotAcceptable(_) => errors::NOT_ACCEPTABLE,
+            ServerError::UnsupportedMediaType(_) => errors::UNSUPPORTED_MEDIA_TYPE,
             ServerError::SparqlUpdateLower(_) => errors::SPARQL_LOWER,
 
             // Auth/Policy (requires credential feature)
@@ -258,7 +268,9 @@ impl ServerError {
                     StatusCode::SERVICE_UNAVAILABLE
                 }
             }
-            ServerError::Api(ApiError::NotFound(_)) => StatusCode::NOT_FOUND,
+            // Every form `ApiError` gives a missing ledger, not only `NotFound`:
+            // the ledger loader's own error is one, and read as a 500 here.
+            ServerError::Api(e) if e.is_not_found() => StatusCode::NOT_FOUND,
 
             // 409 - Conflict
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
@@ -304,7 +316,8 @@ impl ServerError {
                 | ApiError::CatalogCredentialsNotVended { .. }
                 | ApiError::Query(
                     fluree_db_query::QueryError::StorageAccessDenied { .. }
-                    | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. },
+                    | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
+                    | fluree_db_query::QueryError::CatalogAccessDenied { .. },
                 ),
             ) => StatusCode::FORBIDDEN,
 
@@ -344,6 +357,7 @@ impl ServerError {
 
             // 406 - Not Acceptable (content negotiation failure)
             ServerError::NotAcceptable(_) => StatusCode::NOT_ACCEPTABLE,
+            ServerError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             #[cfg(feature = "credential")]
             ServerError::Api(ApiError::Credential(_)) => StatusCode::UNAUTHORIZED,
 
@@ -407,6 +421,11 @@ impl ServerError {
     /// Create a not acceptable error (406)
     pub fn not_acceptable(msg: impl Into<String>) -> Self {
         ServerError::NotAcceptable(msg.into())
+    }
+
+    /// Create an unsupported media type error (415)
+    pub fn unsupported_media_type(msg: impl Into<String>) -> Self {
+        ServerError::UnsupportedMediaType(msg.into())
     }
 }
 
@@ -627,6 +646,18 @@ mod tests {
             assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
             assert_eq!(se.error_type(), errors::STORAGE_ACCESS_DENIED);
         }
+    }
+
+    #[test]
+    fn a_catalog_access_refusal_is_403_with_its_own_type() {
+        let se = ServerError::Api(ApiError::Query(
+            fluree_db_query::QueryError::CatalogAccessDenied {
+                table: "main.sales.orders".into(),
+                message: "User does not have SELECT (403 Forbidden)".into(),
+            },
+        ));
+        assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(se.error_type(), errors::CATALOG_ACCESS_DENIED);
     }
 
     #[test]

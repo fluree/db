@@ -1603,7 +1603,7 @@ fn build_property_join_block(
         pushdown.object_bounds.clone(),
         Some(&needed),
         inline_ops,
-        planning.mode(),
+        *planning,
     )?;
     let mut operator: Option<BoxedOperator> = Some(Box::new(property_join));
 
@@ -3842,7 +3842,7 @@ pub fn build_triple_operators(
             &triples_for_exec,
             object_bounds.clone(),
             Some(&needed),
-            ctx.planning.mode(),
+            *ctx.planning,
         )?;
         return Ok(Box::new(pj));
     }

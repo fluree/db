@@ -145,7 +145,7 @@ where
             apply_range_filter(&mut flakes, test, &match_val);
             // Apply RangeOptions semantics for overlay-only path (object bounds, offset, limits).
             //
-            // This matters for time resolution (`@iso:`), which uses `object_bounds`
+            // This matters for time resolution (`@time:`), which uses `object_bounds`
             // and `flake_limit(1)` to efficiently resolve the first flake after a target.
             apply_overlay_only_options(&mut flakes, &opts);
             Ok(flakes)
@@ -364,7 +364,7 @@ fn apply_overlay_only_options(flakes: &mut Vec<Flake>, opts: &RangeOptions) {
 /// OPST bounds stop at the object: `cmp_object` orders by value THEN
 /// datatype, and the predicate compares after both — so with the datatype
 /// unmatched, an `o+p` bound covers exactly the same span as `o` alone.
-fn overlay_eq_bounds(
+pub fn overlay_eq_bounds(
     index: IndexType,
     test: RangeTest,
     match_val: &RangeMatch,

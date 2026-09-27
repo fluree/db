@@ -157,6 +157,23 @@ pub struct ScanTopK {
     pub ascending: bool,
 }
 
+/// The table state a time-pinned graph-source query reads, in the source
+/// format's own terms (an Iceberg snapshot id or commit time), as opposed to
+/// the Fluree `t` the scan methods' `as_of_t` carries.
+///
+/// A pin applies to every table of the source for the whole query, so a scan
+/// and a count cannot read different snapshots. An instant selects the latest
+/// snapshot committed at or before it; an instant before the oldest retained
+/// snapshot, or an unknown id, is an error — never the current snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceTime {
+    /// An exact snapshot by the source format's own identifier.
+    SnapshotId(i64),
+    /// The latest snapshot committed at or before this instant, epoch
+    /// milliseconds.
+    AsOfTimestampMs(i64),
+}
+
 /// Provider for compiled R2RML mappings.
 ///
 /// This trait is used by the R2RML operator to load mappings at query time.
@@ -375,6 +392,18 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
     /// provider without a remote catalog has nothing to warm).
     async fn prefetch_tables(&self, graph_source_id: &str, table_names: &[String]) {
         let _ = (graph_source_id, table_names);
+    }
+
+    /// Pin every read of `graph_source_id` in this query to `time`. Called
+    /// before execution for each time-specified source in the dataset; the
+    /// provider then selects that state in `scan_table` and `table_row_count`
+    /// alike. The default REFUSES: a provider that cannot honor a pin must not
+    /// let the query proceed against its current state.
+    fn pin_source_time(&self, graph_source_id: &str, time: SourceTime) -> Result<()> {
+        let _ = time;
+        Err(crate::error::QueryError::UnsupportedFeature(format!(
+            "graph source '{graph_source_id}' does not support time-pinned reads"
+        )))
     }
 }
 

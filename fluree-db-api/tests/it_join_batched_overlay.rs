@@ -416,7 +416,7 @@ async fn probe_helpers_merge_novelty() {
                 );
             }
             Engage::SpotStarWalk => {
-                let opens = spans.find_events("property_join: open complete");
+                let opens = spans.find_events("property_join: complete");
                 assert!(
                     opens
                         .iter()
@@ -427,7 +427,7 @@ async fn probe_helpers_merge_novelty() {
                 );
             }
             Engage::BatchedProbe => {
-                let opens = spans.find_events("property_join: open complete");
+                let opens = spans.find_events("property_join: complete");
                 assert!(
                     opens
                         .iter()

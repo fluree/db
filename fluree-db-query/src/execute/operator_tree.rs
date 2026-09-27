@@ -2277,6 +2277,7 @@ pub fn build_operator_tree(
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    let planning = &planning.with_unmatched_optional(query.unmatched_optional);
     // Convert single-triple OPTIONALs whose fresh var is error-rejected by a
     // same-group filter into required triples (well-formed left-join
     // simplification), so equality/range pushdown and selectivity estimation
@@ -4026,6 +4027,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         }
     }
 
@@ -4226,6 +4228,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
             grouping: Grouping::assemble(
                 vec![p],
                 vec![AggregateSpec {
@@ -4302,6 +4305,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
 
         let spec =
@@ -4333,6 +4337,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
 
         let result = build_operator_tree(
@@ -4362,6 +4367,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
 
         let result = build_operator_tree(
@@ -4439,6 +4445,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
         let reversed = Query {
             context: ParsedContext::default(),
@@ -4465,6 +4472,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
         assert_eq!(
             detect_exists_join_count_distinct_object(&counted_first),
@@ -4502,6 +4510,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -4577,6 +4586,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -4635,6 +4645,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -4685,6 +4696,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
             grouping: None,
             ordering,
             order_binds: Vec::new(),

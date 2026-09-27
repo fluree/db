@@ -2126,6 +2126,9 @@ pub mod ns_types {
 
     /// `https://ns.flur.ee/db#SqlMapping` - R2RML mapping over a SQL endpoint
     pub const SQL_MAPPING: &str = "https://ns.flur.ee/db#SqlMapping";
+
+    /// `https://ns.flur.ee/db#DeltaMapping` - R2RML mapping over Delta Lake tables
+    pub const DELTA_MAPPING: &str = "https://ns.flur.ee/db#DeltaMapping";
 }
 
 /// Graph source nameservice field local names (under `https://ns.flur.ee/db#`)

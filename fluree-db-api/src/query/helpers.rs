@@ -640,7 +640,7 @@ pub(crate) fn status_for_query_error(err: &fluree_db_query::QueryError) -> u16 {
 pub(crate) fn parse_dataset_spec(
     query_json: &JsonValue,
 ) -> Result<(DatasetSpec, GovernanceOptions)> {
-    DatasetSpec::from_query_json(query_json).map_err(|e| ApiError::query(e.to_string()))
+    DatasetSpec::from_query_json(query_json).map_err(|e| ApiError::invalid_query(e.to_string()))
 }
 
 /// [`parse_dataset_spec`] on behalf of an auth-layer-verified caller.
@@ -672,9 +672,8 @@ pub(crate) fn extract_sparql_dataset_spec(
     };
 
     match dataset_clause {
-        Some(clause) => {
-            DatasetSpec::from_sparql_clause(clause).map_err(|e| ApiError::query(e.to_string()))
-        }
+        Some(clause) => DatasetSpec::from_sparql_clause(clause)
+            .map_err(|e| ApiError::invalid_query(e.to_string())),
         None => Ok(DatasetSpec::default()),
     }
 }

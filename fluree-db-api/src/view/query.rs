@@ -747,12 +747,7 @@ impl Fluree {
             Some(db.overlay.clone()),
             db.binary_graph(),
         );
-        // This is the R2RML / graph-source execution path. Mark the result so the
-        // sparql_json formatter CURIE-compacts its raw graph-source `Binding::Iri`
-        // node references (F9). The resolved view of a genuine graph source carries
-        // `graph_source_id = Some` (set by `load_view`); a native ledger reached with
-        // `.with_r2rml()` attached but no mapping stays `None` → raw, unchanged.
-        result.from_graph_source = db.graph_source_id.is_some();
+        mark_graph_source_result(&mut result, db);
         Ok(result)
     }
 
@@ -1108,7 +1103,7 @@ impl Fluree {
                 crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
-        let query_result = build_query_result(
+        let mut query_result = build_query_result(
             vars,
             parsed,
             batches,
@@ -1116,6 +1111,7 @@ impl Fluree {
             Some(db.overlay.clone()),
             db.binary_graph(),
         );
+        mark_graph_source_result(&mut query_result, db);
 
         if query_result.output.construct_template().is_some()
             && format_config.format != crate::format::OutputFormat::JsonLd
@@ -1819,6 +1815,10 @@ impl Fluree {
             .await
             .map_err(query_error_to_api_error)?;
 
+        // A time-pinned graph-source view reads that table state, never current.
+        crate::graph_source::pin_graph_source_times([db], r2rml.table_provider)
+            .map_err(query_error_to_api_error)?;
+
         view_context_config!(
             config,
             self,
@@ -1884,6 +1884,8 @@ impl Fluree {
         );
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config).await?;
 
+        crate::graph_source::pin_graph_source_times([db], r2rml.table_provider)?;
+
         view_context_config!(
             config,
             self,
@@ -1901,6 +1903,23 @@ impl Fluree {
 // ============================================================================
 // Error Conversion Helpers
 // ============================================================================
+
+/// Mark a result produced on the R2RML / graph-source execution path, tracked or
+/// not. The resolved view of a genuine graph source carries `graph_source_id =
+/// Some` (set by `load_view`); a native ledger reached with `.with_r2rml()`
+/// attached but no mapping stays `None` → unchanged.
+///
+/// `from_graph_source` has the sparql_json formatter CURIE-compact raw
+/// graph-source `Binding::Iri` node references (F9). A virtual source also has
+/// no `t`: the genesis view's 0 is a placeholder, and advertising it would have
+/// a client (the MCP pagination protocol) pin the next page to `@t:0`, which a
+/// graph source refuses.
+fn mark_graph_source_result(result: &mut QueryResult, db: &GraphDb) {
+    result.from_graph_source = db.graph_source_id.is_some();
+    if result.from_graph_source {
+        result.t = None;
+    }
+}
 
 fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
     ApiError::Query(err)

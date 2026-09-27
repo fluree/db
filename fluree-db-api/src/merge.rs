@@ -612,7 +612,7 @@ impl crate::Fluree {
         let CollectedCommitData {
             flakes: source_flakes,
             namespace_delta,
-            graph_delta,
+            graph_iris,
         } = source_data;
 
         let current_head_t = target_state.t();
@@ -631,6 +631,7 @@ impl crate::Fluree {
                 &conflicts,
                 &strategy,
                 &namespace_delta,
+                &graph_iris,
             )
             .await?;
         outcome.into_result()?;
@@ -643,8 +644,8 @@ impl crate::Fluree {
         if !namespace_delta.is_empty() {
             commit_opts = commit_opts.with_namespace_delta(namespace_delta);
         }
-        if !graph_delta.is_empty() {
-            commit_opts = commit_opts.with_graph_delta(graph_delta);
+        if !graph_iris.is_empty() {
+            commit_opts = commit_opts.with_graph_iris(graph_iris);
         }
 
         // Copy source commit chain to target namespace so the target is

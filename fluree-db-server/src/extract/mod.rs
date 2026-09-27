@@ -14,6 +14,6 @@ pub use credential::{CredentialPayload, ExtractedCredential, MaybeCredential};
 pub use credential_policy::CredentialPolicy;
 pub(crate) use data_bearer::verify_data_principal;
 pub use data_bearer::{DataPrincipal, MaybeDataBearer};
-pub use headers::FlureeHeaders;
+pub use headers::{negotiate_graph_format, FlureeHeaders, GraphFormat};
 pub use storage_proxy::{StorageProxyBearer, StorageProxyPrincipal};
 pub use tracking::{tracking_headers, X_FDB_FUEL, X_FDB_POLICY, X_FDB_TIME};

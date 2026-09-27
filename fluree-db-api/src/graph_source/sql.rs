@@ -277,63 +277,17 @@ impl crate::Fluree {
         config.validate()?;
         let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
 
-        let mut compiled_for_probe: Option<CompiledR2rmlMapping> = None;
-        let (mapping_address, triples_map_count, table_names, mapping_validated) = match &config
-            .mapping
-        {
-            R2rmlMappingInput::Content(content) => {
-                let compiled =
-                    Self::compile_r2rml_content(content, config.mapping_media_type.as_deref(), "")?;
-                let count = compiled.len();
-                let tables = Self::sorted_table_names(&compiled);
-                compiled_for_probe = Some(compiled);
-                let cid = self
-                    .content_store(&graph_source_id)
-                    .put(
-                        fluree_db_core::ContentKind::GraphSourceMapping,
-                        content.as_bytes(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::ApiError::Config(format!("Failed to store R2RML mapping: {e}"))
-                    })?;
-                (cid.to_string(), count, tables, true)
-            }
-            R2rmlMappingInput::Address(address) => {
-                let storage = self.admin_storage().ok_or_else(|| {
-                    crate::ApiError::Config(
-                        "address-based mappings are not supported on this backend".to_string(),
-                    )
-                })?;
-                let (count, tables, validated) = match storage.read_bytes(address).await {
-                    Ok(bytes) => match String::from_utf8(bytes)
-                        .map_err(|e| crate::ApiError::Config(e.to_string()))
-                        .and_then(|content| {
-                            Self::compile_r2rml_content(
-                                &content,
-                                config.mapping_media_type.as_deref(),
-                                address,
-                            )
-                        }) {
-                        Ok(compiled) => {
-                            let summary =
-                                (compiled.len(), Self::sorted_table_names(&compiled), true);
-                            compiled_for_probe = Some(compiled);
-                            summary
-                        }
-                        Err(e) => {
-                            warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
-                            (0, Vec::new(), false)
-                        }
-                    },
-                    Err(e) => {
-                        warn!(graph_source_id = %graph_source_id, error = %e, "Could not read R2RML mapping from address");
-                        (0, Vec::new(), false)
-                    }
-                };
-                (address.clone(), count, tables, validated)
-            }
-        };
+        let registered = self
+            .register_r2rml_mapping(
+                &graph_source_id,
+                &config.mapping,
+                config.mapping_media_type.as_deref(),
+                true,
+            )
+            .await?;
+        let (triples_map_count, table_names, mapping_validated) = registered.summary();
+        let mapping_address = registered.address;
+        let compiled_for_probe = registered.compiled;
 
         let mut gs_config = config.to_gs_config(&mapping_address);
         let mut mapping_warnings = Vec::new();

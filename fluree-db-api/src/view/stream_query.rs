@@ -270,6 +270,7 @@ impl Fluree {
         // buffered `execute_view_internal_with_r2rml`); no-op without `iceberg`
         // and never consulted for plain queries.
         let r2rml = crate::r2rml_provider!(self);
+        crate::graph_source::pin_graph_source_times([db], &r2rml)?;
         view_context_config!(
             config,
             self,

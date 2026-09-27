@@ -3,7 +3,9 @@
 //! JSON-LD for the default (no `Accept`), `application/ld+json`, and
 //! `application/json` cases — not a self-contradictory
 //! `400 "CONSTRUCT queries only support JSON-LD output format"`. The explicit
-//! `application/rdf+xml` path must keep working as the graph alternative.
+//! `application/rdf+xml` path must keep working as the graph alternative, and
+//! `text/turtle` / `application/n-triples` serve the graph as Turtle / N-Triples
+//! on every ledger-scoped path that serves RDF/XML.
 
 use axum::body::Body;
 use fluree_db_server::routes::build_router;
@@ -79,12 +81,25 @@ async fn post_sparql(
     sparql: &str,
     accept: Option<&str>,
 ) -> (StatusCode, String, Vec<u8>) {
+    post_sparql_with(state, ledger, sparql, accept, &[]).await
+}
+
+async fn post_sparql_with(
+    state: &Arc<AppState>,
+    ledger: &str,
+    sparql: &str,
+    accept: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, String, Vec<u8>) {
     let mut builder = Request::builder()
         .method("POST")
         .uri(format!("/v1/fluree/query/{ledger}"))
         .header("content-type", "application/sparql-query");
     if let Some(a) = accept {
         builder = builder.header("accept", a);
+    }
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
     }
     let resp = build_router(Arc::clone(state))
         .oneshot(builder.body(Body::from(sparql.to_string())).unwrap())
@@ -365,4 +380,207 @@ async fn connection_byte_formats_are_406() {
         StatusCode::NOT_ACCEPTABLE,
         "connection SELECT + sparql-results+xml must be 406 (use ledger-scoped route)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Turtle and N-Triples
+// ---------------------------------------------------------------------------
+
+const PREFIXED_CONSTRUCT: &str =
+    "PREFIX schema: <http://schema.org/> CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }";
+
+/// Parse a Turtle or N-Triples body back into triples.
+fn parse_rdf(body: &[u8]) -> fluree_graph_ir::Graph {
+    let text = std::str::from_utf8(body).expect("UTF-8 body");
+    let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+    fluree_graph_turtle::parse(text, &mut sink)
+        .unwrap_or_else(|e| panic!("body must parse as Turtle: {e}\n{text}"));
+    sink.into_graph()
+}
+
+#[tokio::test]
+async fn construct_accept_turtle_and_ntriples() {
+    let (_tmp, state) = server_state().await;
+    let ledger = "test/construct-ttl:main";
+    seed(&state, ledger).await;
+
+    let (status, content_type, body) =
+        post_sparql(&state, ledger, PREFIXED_CONSTRUCT, Some("text/turtle")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(content_type, "text/turtle; charset=utf-8");
+    assert_eq!(parse_rdf(&body).len(), 2, "type + name");
+    let ttl = String::from_utf8(body).unwrap();
+    assert!(
+        ttl.starts_with("@prefix schema: <http://schema.org/> ."),
+        "{ttl}"
+    );
+    assert!(
+        ttl.contains("<http://ex.org/alice> a schema:Person ;\n    schema:name \"Alice\" ."),
+        "{ttl}"
+    );
+
+    let (status, content_type, body) = post_sparql(
+        &state,
+        ledger,
+        PREFIXED_CONSTRUCT,
+        Some("application/n-triples"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(content_type, "application/n-triples; charset=utf-8");
+    assert_eq!(parse_rdf(&body).len(), 2);
+    let nt = String::from_utf8(body).unwrap();
+    assert!(
+        nt.lines()
+            .any(|l| l == "<http://ex.org/alice> <http://schema.org/name> \"Alice\" ."),
+        "{nt}"
+    );
+}
+
+#[tokio::test]
+async fn describe_accept_turtle() {
+    let (_tmp, state) = server_state().await;
+    let ledger = "test/describe-ttl:main";
+    seed(&state, ledger).await;
+
+    let (status, content_type, body) = post_sparql(
+        &state,
+        ledger,
+        "DESCRIBE <http://ex.org/alice>",
+        Some("text/turtle"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(content_type.starts_with("text/turtle"), "{content_type}");
+    let graph = parse_rdf(&body);
+    assert!(
+        graph.iter().any(|t| t
+            .object()
+            .as_literal()
+            .is_some_and(|(v, _, _)| v.lexical() == "Alice")),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// The highest-`q` graph format wins; equal weights keep the header's order.
+#[tokio::test]
+async fn construct_accept_negotiates_by_q() {
+    let (_tmp, state) = server_state().await;
+    let ledger = "test/construct-q:main";
+    seed(&state, ledger).await;
+
+    for (accept, expected) in [
+        ("application/ld+json;q=0.5, text/turtle", "text/turtle"),
+        (
+            "text/turtle;q=0.1, application/ld+json",
+            "application/ld+json",
+        ),
+        (
+            "application/n-triples, text/turtle",
+            "application/n-triples",
+        ),
+        ("text/*", "text/turtle"),
+    ] {
+        let (status, content_type, body) =
+            post_sparql(&state, ledger, CONSTRUCT, Some(accept)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{accept}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            content_type.starts_with(expected),
+            "{accept} → {content_type}"
+        );
+    }
+}
+
+/// A solution table has no Turtle form: a SELECT that accepts only graph
+/// formats is a 406, while one that also accepts a results format is served.
+#[tokio::test]
+async fn select_accept_only_graph_formats_is_406() {
+    let (_tmp, state) = server_state().await;
+    let ledger = "test/select-ttl:main";
+    seed(&state, ledger).await;
+    let select = "SELECT ?s WHERE { ?s ?p ?o }";
+
+    for accept in [
+        "text/turtle",
+        "application/n-triples",
+        "text/turtle, application/rdf+xml",
+    ] {
+        let (status, _, _) = post_sparql(&state, ledger, select, Some(accept)).await;
+        assert_eq!(status, StatusCode::NOT_ACCEPTABLE, "{accept}");
+    }
+    let (status, content_type, _) = post_sparql(
+        &state,
+        ledger,
+        select,
+        Some("application/sparql-results+json, text/turtle;q=0.1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+}
+
+/// Graph formats are served on the policy-scoped path (policy inputs, no
+/// dataset clause) and the dataset path (FROM), not just the plain one.
+#[tokio::test]
+async fn construct_graph_formats_on_policy_and_dataset_paths() {
+    let (_tmp, state) = server_state().await;
+    let ledger = "test/construct-paths:main";
+    seed(&state, ledger).await;
+
+    for format in [
+        "text/turtle",
+        "application/n-triples",
+        "application/rdf+xml",
+    ] {
+        let (status, content_type, body) = post_sparql_with(
+            &state,
+            ledger,
+            CONSTRUCT,
+            Some(format),
+            &[("fluree-default-allow", "true")],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "policy path, {format}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            content_type.starts_with(format),
+            "{format} → {content_type}"
+        );
+    }
+
+    let from = format!("CONSTRUCT {{ ?s ?p ?o }} FROM <{ledger}> WHERE {{ ?s ?p ?o }}");
+    let (status, content_type, body) =
+        post_sparql(&state, ledger, &from, Some("text/turtle")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "dataset path: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(content_type.starts_with("text/turtle"), "{content_type}");
+    assert_eq!(parse_rdf(&body).len(), 2);
+}
+
+#[tokio::test]
+async fn connection_construct_turtle_is_406() {
+    let (_tmp, state) = server_state().await;
+    let ledger = "test/connection-ttl:main";
+    seed(&state, ledger).await;
+
+    let construct = format!("CONSTRUCT {{ ?s ?p ?o }} FROM <{ledger}> WHERE {{ ?s ?p ?o }}");
+    let (status, _, _) = post_connection_sparql(&state, &construct, Some("text/turtle")).await;
+    assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
 }

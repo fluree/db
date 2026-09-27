@@ -1510,10 +1510,11 @@ Content-Type: application/json
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `graph` (query) | Yes | Full **absolute** IRI of the target named graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address named graphs itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `graph` (query) | No | Full **absolute** IRI of the target named graph; absent means the default graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address named graphs itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `default` (query) | No | Bare key: sync the default graph, said explicitly. Passing it with `graph` is a `400`. The CLI omits `graph` for the default graph. |
 | `dryRun` (query) | No | `true` → stage and report the delta; commit nothing. |
 | `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |
-| body | Yes | Insert-shaped JSON-LD describing the graph's desired full contents. The CLI always sends JSON-LD (Turtle is converted client-side). Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
+| body | Yes | The graph's desired full contents: insert-shaped JSON-LD, or Turtle / N-Triples / TriG by `Content-Type` (see [Payload formats](../transactions/sync.md#payload-formats)). The CLI always sends JSON-LD (Turtle is converted client-side), so it works against servers that predate RDF bodies. Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
 
 ### Auth
 
@@ -1564,7 +1565,7 @@ runs, so scripts consume either path identically.
 
 | Status | When |
 |--------|------|
-| `400` | missing `graph`; malformed / relative graph IRI; system-graph target; empty payload without `allowEmpty`; payload addressing named graphs; non-JSON body (Turtle/TriG are not accepted here) |
+| `400` | both `graph` and `default`; malformed / relative graph IRI; system-graph target; empty payload without `allowEmpty`; JSON-LD payload addressing named graphs; TriG block naming a graph other than `graph`; TriG default-graph triples beside a block; unparseable body |
 | `401` / `403` | per the policy contract |
 | `404` | unknown ledger |
 
@@ -2109,7 +2110,7 @@ Content-Type: application/json
 | `raw_reifies` | bool | No | `false` | Emit edge annotations as raw `f:reifies*` triples instead of RDF 1.2 annotation syntax. The escape hatch the `x-fluree-export-annotations-unresolved` header points at, and the way to keep pre-4.2 bytes. |
 | `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
 | `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object (`{ "ex": "..." }`) or `{ "@context": {...} }`. Falls back to the ledger's stored default context when absent. |
-| `at` | string | No | latest | Time spec — `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Identical to the local `--at` flag. |
+| `at` | string | No | latest | Time spec — `t:<N>` (transaction number), `t:latest` or `latest`, `time:<ISO-8601>` (commit event time; `iso:<ISO-8601>` is an alias, and the spelling the CLI sends), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Identical to the local `--at` flag. |
 
 An empty body is accepted and treated as all-default (Turtle export at HEAD).
 
@@ -2153,18 +2154,20 @@ stream chunked bodies; clients MUST be prepared to read until EOF.
    `system_graphs == true` without `all_graphs` is also a `400`: it selects
    nothing on its own.
 3. **Time spec parsing.** Accept the tagged forms `t:<N>`, `t:latest`,
-   `iso:<ISO-8601>`, `recorded:<ISO-8601>` and `commit:<hex-prefix>` (min 6
-   characters) — the same grammar a ledger address carries after `@`, minus
-   the `@`. For compatibility also accept three untagged forms, tried in this
-   order: `latest`; a bare integer (a `t`); a string containing both `-` and
-   `:` (an ISO-8601 timestamp); anything else as a commit hex-digest prefix.
+   `time:<ISO-8601>`, `iso:<ISO-8601>` (an alias of `time:`, and the spelling
+   the CLI sends, so servers that predate `time:` keep working),
+   `recorded:<ISO-8601>` and `commit:<hex-prefix>` (min 6 characters) — the
+   same grammar a ledger address carries after `@`, minus the `@`. For
+   compatibility also accept three untagged forms, tried in this order:
+   `latest`; a bare integer (a `t`); a string containing `-` (an ISO-8601
+   timestamp or date); anything else as a commit hex-digest prefix.
    A string beginning with a tag is never reinterpreted as an untagged form —
    `"t:abc"` is a malformed `t:`, so return `400` rather than looking up a
    commit prefix named `t:abc`. Note that a bare integer resolves to a `t`
    even when it is also a valid hex prefix; `commit:` forces the other
    reading. The merge-preview / show contracts take the same spellings
    wherever the two grammars overlap, but name a *commit*, so they have no
-   `iso:`, `recorded:` or `latest` forms.
+   `time:`, `recorded:` or `latest` forms.
 4. **Graph IRI resolution.** When `graph` is set, resolve via the ledger's
    graph registry; an unknown IRI is a `400` (or `5xx` if you treat it as
    a config error — the reference returns `400` via `ApiError::Config`).

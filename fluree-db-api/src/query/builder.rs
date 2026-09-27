@@ -755,6 +755,20 @@ pub struct FromQueryBuilder<'a> {
     authorization: Option<&'a crate::PolicyAuthorization>,
 }
 
+/// The builder's graph-source providers in the borrowed form execution takes.
+#[allow(clippy::type_complexity)]
+fn providers<'s>(
+    r2rml: Option<&'s (
+        Arc<dyn R2rmlProvider + '_>,
+        Arc<dyn R2rmlTableProvider + '_>,
+    )>,
+) -> Option<crate::R2rmlProviders<'s>> {
+    r2rml.map(|(provider, table_provider)| crate::R2rmlProviders {
+        provider: provider.as_ref(),
+        table_provider: table_provider.as_ref(),
+    })
+}
+
 impl<'a> FromQueryBuilder<'a> {
     /// Create a new builder (called by `Fluree::query_from()`).
     pub(crate) fn new(fluree: &'a Fluree) -> Self {
@@ -987,7 +1001,12 @@ impl<'a> FromQueryBuilder<'a> {
         {
             return self
                 .fluree
-                .query_connection_sparql_with_opts_options(sparql, qc_opts, execution.clone())
+                .query_connection_sparql_with_opts_options(
+                    sparql,
+                    qc_opts,
+                    providers(r2rml.as_ref()),
+                    execution.clone(),
+                )
                 .await;
         }
         match input {
@@ -1111,7 +1130,12 @@ impl<'a> FromQueryBuilder<'a> {
         {
             let result = self
                 .fluree
-                .query_connection_sparql_with_opts_options(sparql, qc_opts, execution.clone())
+                .query_connection_sparql_with_opts_options(
+                    sparql,
+                    qc_opts,
+                    providers(r2rml.as_ref()),
+                    execution.clone(),
+                )
                 .await?;
             let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
@@ -1279,7 +1303,12 @@ impl<'a> FromQueryBuilder<'a> {
         {
             let result = self
                 .fluree
-                .query_connection_sparql_with_opts_options(sparql, qc_opts, execution.clone())
+                .query_connection_sparql_with_opts_options(
+                    sparql,
+                    qc_opts,
+                    providers(r2rml.as_ref()),
+                    execution.clone(),
+                )
                 .await?;
             let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
@@ -1488,6 +1517,7 @@ impl<'a> FromQueryBuilder<'a> {
                         qc_opts,
                         format_config,
                         tracking,
+                        providers(r2rml.as_ref()),
                         execution.clone(),
                     ),
             )

@@ -26,7 +26,7 @@ fluree branch create <NAME> [OPTIONS]
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--from <BRANCH>` | Source branch to create from (defaults to "main") |
-| `--at <COMMIT-REF>` | Commit to branch at (defaults to source branch HEAD). Accepts `t:<N>` or a bare transaction number, `commit:<prefix>` or a bare hex digest prefix (min 6 chars), or a full CID. A bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Unlike `query --at` this names a *commit*, so it has no `iso:`, `recorded:` or `latest` forms; the spellings the two share mean the same thing on both. |
+| `--at <COMMIT-REF>` | Commit to branch at (defaults to source branch HEAD). Accepts `t:<N>` or a bare transaction number, `commit:<prefix>` or a bare hex digest prefix (min 6 chars), or a full CID. A bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Unlike `query --at` this names a *commit*, so it has no `time:`, `recorded:` or `latest` forms; the spellings the two share mean the same thing on both. |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**

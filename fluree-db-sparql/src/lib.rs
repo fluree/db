@@ -37,6 +37,7 @@ pub mod ast;
 pub mod diag;
 pub mod lex;
 pub mod parse;
+pub mod protocol;
 pub mod span;
 pub mod validate;
 

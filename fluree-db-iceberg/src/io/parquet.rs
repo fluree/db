@@ -555,6 +555,10 @@ pub fn convert_field_to_column_value(
         Field::Str(v) => Some(ColumnValue::String(v.clone())),
         Field::Bytes(v) => Some(ColumnValue::Bytes(v.data().to_vec())),
         Field::Date(v) => Some(ColumnValue::Date(*v)),
+        // Iceberg time values use microseconds since midnight, represented by
+        // Int64 in our tabular schema. Parquet 58 exposes explicit time fields.
+        Field::TimeMillis(v) => Some(ColumnValue::Int64(i64::from(*v) * 1000)),
+        Field::TimeMicros(v) => Some(ColumnValue::Int64(*v)),
         Field::TimestampMillis(v) => {
             // Convert milliseconds to microseconds for consistent storage
             let micros = *v * 1000;
@@ -1602,6 +1606,13 @@ fn parquet_type_to_field_type(parquet_type: &Arc<SchemaType>) -> FieldType {
             return FieldType::Date;
         }
 
+        if matches!(
+            converted_type,
+            parquet::basic::ConvertedType::TIME_MILLIS | parquet::basic::ConvertedType::TIME_MICROS
+        ) {
+            return FieldType::Int64;
+        }
+
         // Check for timestamp annotations
         // Parquet 2.0+ uses LogicalType for timezone info, converted_type doesn't distinguish
         if converted_type == parquet::basic::ConvertedType::TIMESTAMP_MILLIS
@@ -1611,7 +1622,7 @@ fn parquet_type_to_field_type(parquet_type: &Arc<SchemaType>) -> FieldType {
             if let Some(parquet::basic::LogicalType::Timestamp {
                 is_adjusted_to_u_t_c: true,
                 ..
-            }) = basic_info.logical_type()
+            }) = basic_info.logical_type_ref()
             {
                 return FieldType::TimestampTz;
             }
@@ -1622,11 +1633,11 @@ fn parquet_type_to_field_type(parquet_type: &Arc<SchemaType>) -> FieldType {
         if converted_type == parquet::basic::ConvertedType::DECIMAL {
             // Try to get precision/scale from logical type
             if let Some(parquet::basic::LogicalType::Decimal { precision, scale }) =
-                basic_info.logical_type()
+                basic_info.logical_type_ref()
             {
                 return FieldType::Decimal {
-                    precision: precision as u8,
-                    scale: scale as i8,
+                    precision: *precision as u8,
+                    scale: *scale as i8,
                 };
             }
             // Fallback: use default precision/scale if not available

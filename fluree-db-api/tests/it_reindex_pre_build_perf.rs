@@ -87,6 +87,10 @@ impl<C: ContentStore> CountingContentStore<C> {
 
 #[async_trait]
 impl<C: ContentStore + Send + Sync> ContentStore for CountingContentStore<C> {
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
     async fn has(&self, id: &ContentId) -> StorageResult<bool> {
         self.inner.has(id).await
     }

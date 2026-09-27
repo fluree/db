@@ -1217,6 +1217,7 @@ pub fn graph_source_type_label(source_type: &GraphSourceType) -> String {
         GraphSourceType::R2rml => "R2RML".to_string(),
         GraphSourceType::Iceberg => "Iceberg".to_string(),
         GraphSourceType::Sql => "SQL".to_string(),
+        GraphSourceType::Delta => "Delta".to_string(),
         GraphSourceType::Unknown(s) => format!("Unknown({s})"),
     }
 }

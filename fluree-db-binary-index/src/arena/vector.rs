@@ -716,12 +716,10 @@ impl LazyVectorArena {
             return Ok(shard);
         }
         let source = self.get_source(shard_idx)?;
-        self.ensure_on_disk(source, shard_idx)?;
-        let path = source.path.clone();
         let shard = self
             .cache
             .try_get_or_load_vector_shard(source.cid_hash, || {
-                let bytes = std::fs::read(&path)?;
+                let bytes = self.shard_bytes(source, shard_idx)?;
                 let parsed = read_vector_shard_from_bytes(&bytes)?;
                 Ok(Arc::new(parsed))
             })?;
@@ -741,8 +739,7 @@ impl LazyVectorArena {
             return Ok(shard);
         }
         let source = self.get_source(shard_idx)?;
-        self.ensure_on_disk(source, shard_idx)?;
-        let bytes = std::fs::read(&source.path)?;
+        let bytes = self.shard_bytes(source, shard_idx)?;
         let shard = Arc::new(read_vector_shard_from_bytes(&bytes)?);
         self.validate_shard_dims(&shard, shard_idx)?;
         Ok(shard)
@@ -792,16 +789,18 @@ impl LazyVectorArena {
         })
     }
 
-    /// Ensure a shard file exists on local disk, fetching from remote if needed.
+    /// Bytes of shard `idx`: read from its local file when one exists, else
+    /// fetched from the CAS.
     ///
-    /// For FileStorage (all shards `on_disk: true` at construction), this is
-    /// a fast Acquire-load no-op. For remote backends, uses the same sync→async
-    /// bridge as `ensure_index_leaf_cached`: spawns an OS thread that calls
-    /// `tokio::Handle::block_on(cs.get(&cid))`, writes the result to disk,
-    /// then flips `on_disk`.
-    fn ensure_on_disk(&self, source: &ShardSource, idx: usize) -> io::Result<()> {
+    /// For FileStorage (all shards `on_disk: true` at construction) this is
+    /// a fast Acquire-load and a file read. For remote backends it uses the
+    /// same sync→async bridge as `ensure_index_leaf_cached`, then keeps the
+    /// fetched shard on disk for the next miss — unless the store forbids a
+    /// plaintext copy outside it (encrypted storage), in which case the
+    /// bytes stay in memory and the next miss fetches again.
+    fn shard_bytes(&self, source: &ShardSource, idx: usize) -> io::Result<Vec<u8>> {
         if source.on_disk.load(Ordering::Acquire) {
-            return Ok(());
+            return std::fs::read(&source.path);
         }
         // Shard not on disk — try lazy fetch from remote CAS.
         let cas = self.cas.as_ref().ok_or_else(|| {
@@ -827,7 +826,6 @@ impl LazyVectorArena {
         // search against remote (S3) stores.
         let cs = Arc::clone(cas);
         let cid = cid.clone();
-        let path = source.path.clone();
         // Bound the fetch with the same `cas_sync_timeout()` the index-leaf and
         // dict-pack bridges use, so a stalled remote (S3) GET fails fast instead
         // of blocking the waiting thread indefinitely.
@@ -849,19 +847,22 @@ impl LazyVectorArena {
                 fut.await.map_err(|e| io::Error::other(e.to_string()))
             }
         })?;
-        if let Some(parent) = path.parent() {
+        if !cas.permits_plaintext_cache() {
+            return Ok(bytes);
+        }
+        if let Some(parent) = source.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         // Publish atomically: write to a unique temp file in the same directory,
         // then rename onto the final path. Without this, two concurrent
-        // `ensure_on_disk` calls for the same shard (e.g. a cached `lookup_vector`
-        // racing a transient streaming scan) both `fs::write` the same path, and a
+        // fetches for the same shard (e.g. a cached `lookup_vector` racing a
+        // transient streaming scan) both `fs::write` the same path, and a
         // reader can observe a half-written file — surfacing as
         // "vector shard too small for header". A POSIX rename is atomic, so a
         // reader always sees a complete shard once this returns.
-        write_atomic(&path, &bytes)?;
+        write_atomic(&source.path, &bytes)?;
         source.on_disk.store(true, Ordering::Release);
-        Ok(())
+        Ok(bytes)
     }
 
     fn validate_shard_dims(&self, shard: &VectorShard, idx: usize) -> io::Result<()> {

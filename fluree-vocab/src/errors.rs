@@ -118,6 +118,9 @@ pub const NOT_FOUND: &str = "err:api/NotFound";
 /// Not acceptable (content negotiation failure)
 pub const NOT_ACCEPTABLE: &str = "err:api/NotAcceptable";
 
+/// Unsupported media type (request body format not accepted)
+pub const UNSUPPORTED_MEDIA_TYPE: &str = "err:api/UnsupportedMediaType";
+
 // =============================================================================
 // Parsing Errors (parse)
 // =============================================================================
@@ -171,6 +174,13 @@ pub const STORAGE_ACCESS_DENIED: &str = "err:storage/AccessDenied";
 /// Fail-closed signal: the query/preview is refused rather than silently
 /// downgrading to ambient (process-default) AWS credentials.
 pub const CATALOG_CREDENTIALS_NOT_VENDED: &str = "err:catalog/CredentialsNotVended";
+
+/// A catalog refused access to a table (HTTP 401/403 from the catalog), e.g. a
+/// Unity Catalog principal lacking `SELECT` or `EXTERNAL USE SCHEMA`.
+///
+/// Distinct from [`STORAGE_ACCESS_DENIED`] (the object store refused a read)
+/// and from the policy-layer [`ACCESS_DENIED`].
+pub const CATALOG_ACCESS_DENIED: &str = "err:catalog/AccessDenied";
 
 /// Connection error
 pub const CONNECTION: &str = "err:storage/ConnectionError";

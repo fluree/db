@@ -31,7 +31,7 @@ the positional auto-detection (e.g. `fluree query --ledger mydb:main 'SELECT …
 | `--sparql` | Force SPARQL query format |
 | `--jsonld` | Force JSON-LD query format |
 | `--cypher` | Force openCypher query format (local ledgers only) |
-| `--at <TIME>` | Query at a specific point in time. `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
+| `--at <TIME>` | Query at a specific point in time. `t:<N>` (transaction number), `t:latest` or `latest`, `time:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
 | `--normalize-arrays` | Always wrap multi-value properties in arrays (graph-crawl JSON-LD queries only) |
 | `--bench` | Benchmark mode: time execution only and print the first 5 rows as a table (no full-result JSON formatting) |
 | `--explain` | Print the query plan without executing it |
@@ -183,15 +183,25 @@ fluree query --at commit:123456 'SELECT * WHERE { ?s ?p ?o }'
 # Query at ISO-8601 timestamp
 fluree query --at 2024-01-15T10:30:00Z 'SELECT * WHERE { ?s ?p ?o }'
 
-# Tag the axis explicitly. `iso:` resolves against commit *event* time
+# Tag the axis explicitly. `time:` (alias `iso:`) resolves against commit *event* time
 # (`db:time`, user-suppliable on backdated loads); `recorded:` resolves
 # against the wall-clock time the commit was recorded (`db:receivedAt`).
 # They differ only on ledgers that used caller-supplied event times.
-fluree query --at iso:2024-01-15T10:30:00Z 'SELECT * WHERE { ?s ?p ?o }'
+fluree query --at time:2024-01-15T10:30:00Z 'SELECT * WHERE { ?s ?p ?o }'
 fluree query --at recorded:2024-01-15T10:30:00Z 'SELECT * WHERE { ?s ?p ?o }'
 
 # `latest` and `t:latest` both pin to the current head.
 fluree query --at latest 'SELECT * WHERE { ?s ?p ?o }'
+```
+
+A graph source backed by versioned tables (Iceberg, Delta) takes `--at
+snapshot:<id>` (an Iceberg snapshot id, or a Delta table version) or `--at
+time:<ISO-8601>`; `t:` and `commit:` name ledger states and are rejected there.
+See
+[time travel on graph sources](../concepts/time-travel.md#graph-sources-snapshot).
+
+```bash
+fluree query warehouse-orders --at snapshot:5648190075564901028 'SELECT * WHERE { ?s ?p ?o } LIMIT 10'
 ```
 
 Tracked/remote ledgers also support `--at`. The CLI will translate `--at` into the appropriate dataset/time-travel form when forwarding the query to the remote server.

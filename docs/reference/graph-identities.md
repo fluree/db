@@ -53,10 +53,10 @@ Fluree supports time pinning in graph references.
 
 **Current syntax (implemented today):**
 - `<ledger>:<branch>@t:<t>` — pin to transaction time
-- `<ledger>:<branch>@iso:<rfc3339>` — pin to ISO datetime
+- `<ledger>:<branch>@time:<rfc3339>` — pin to ISO datetime
 - `<ledger>:<branch>@commit:<commit-content-id>` — pin to commit ContentId (prefix allowed)
 
-Note: you may see an `=` form in older design notes (`@t=100`, etc.). That form is **not** the supported user-facing syntax today; use the `@t:` / `@iso:` / `@commit:` forms in docs and examples.
+Note: you may see an `=` form in older design notes (`@t=100`, etc.). That form is **not** the supported user-facing syntax today; use the `@t:` / `@time:` / `@commit:` forms in docs and examples.
 
 From a user perspective:
 - The `@…` portion selects **which snapshot value** you mean for that ledger graph.

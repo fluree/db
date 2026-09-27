@@ -209,7 +209,8 @@ Connection node:
 - `primaryPublisher` (publisher node)
 
 Storage node:
-- File: `filePath`, `AES256Key`
+- Any storage: `AES256Key`, or `AES256Keys` + `AES256CurrentKey` (mutually exclusive; put the key on `indexStorage`)
+- File: `filePath`, `durability`
 - S3: `s3Bucket`, `s3Prefix`, `s3Endpoint`, `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`, `s3MaxRetries`, `s3RetryBaseDelayMs`, `s3RetryMaxDelayMs`, `s3MaxConcurrentRequests`
 
 Publisher node:

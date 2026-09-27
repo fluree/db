@@ -140,6 +140,10 @@ pub(crate) struct IcebergCatalogSession {
     /// just to learn the source family.
     #[cfg(feature = "sql")]
     sql_dispatch: Mutex<HashMap<String, Option<Arc<super::sql::SqlSource>>>>,
+    /// The same memo for Delta sources. The memoized source also holds the
+    /// table versions this query reads.
+    #[cfg(feature = "delta")]
+    delta_dispatch: Mutex<HashMap<String, Option<Arc<super::delta::DeltaSource>>>>,
 }
 
 impl IcebergCatalogSession {
@@ -174,6 +178,30 @@ impl IcebergCatalogSession {
         decision: Option<Arc<super::sql::SqlSource>>,
     ) {
         self.sql_dispatch
+            .lock()
+            .unwrap()
+            .insert(graph_source_id.to_string(), decision);
+    }
+
+    #[cfg(feature = "delta")]
+    pub(crate) fn delta_dispatch(
+        &self,
+        graph_source_id: &str,
+    ) -> Option<Option<Arc<super::delta::DeltaSource>>> {
+        self.delta_dispatch
+            .lock()
+            .unwrap()
+            .get(graph_source_id)
+            .cloned()
+    }
+
+    #[cfg(feature = "delta")]
+    pub(crate) fn memo_delta_dispatch(
+        &self,
+        graph_source_id: &str,
+        decision: Option<Arc<super::delta::DeltaSource>>,
+    ) {
+        self.delta_dispatch
             .lock()
             .unwrap()
             .insert(graph_source_id.to_string(), decision);

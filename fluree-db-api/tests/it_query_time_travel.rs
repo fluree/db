@@ -213,11 +213,30 @@ async fn time_travel_invalid_format_errors() {
         "where": [{"@id":"?s"}]
     });
 
-    let err = fluree.query_connection(&q).await.unwrap_err().to_string();
+    let err = fluree.query_connection(&q).await.unwrap_err();
     assert!(
-        err.contains("Invalid time travel format"),
+        err.to_string().contains("Invalid time travel format"),
         "expected invalid time travel error, got: {err}"
     );
+    assert_eq!(
+        err.status_code(),
+        400,
+        "a malformed pin is the caller's error"
+    );
+
+    let err = fluree
+        .query_from()
+        .sparql(&format!(
+            "SELECT ?s FROM <{ledger_id}@invalid:format> WHERE {{ ?s ?p ?o }}"
+        ))
+        .execute_formatted()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid time travel format"),
+        "expected invalid time travel error from SPARQL FROM, got: {err}"
+    );
+    assert_eq!(err.status_code(), 400, "SPARQL FROM: {err}");
 
     // sanity: ledger still usable
     assert_eq!(
@@ -240,6 +259,7 @@ async fn time_travel_missing_value_errors() {
 
     for (spec, expect) in [
         ("@t:", "Missing value after '@t:'"),
+        ("@time:", "Missing value after '@time:'"),
         ("@iso:", "Missing value after '@iso:'"),
         ("@commit:", "Missing value after '@commit:'"),
     ] {
@@ -249,8 +269,12 @@ async fn time_travel_missing_value_errors() {
             "select": ["?s"],
             "where": [{"@id":"?s"}]
         });
-        let err = fluree.query_connection(&q).await.unwrap_err().to_string();
-        assert!(err.contains(expect), "expected '{expect}', got: {err}");
+        let err = fluree.query_connection(&q).await.unwrap_err();
+        assert!(
+            err.to_string().contains(expect),
+            "expected '{expect}', got: {err}"
+        );
+        assert_eq!(err.status_code(), 400, "{spec}: {err}");
     }
 }
 
@@ -373,6 +397,55 @@ async fn time_travel_iso_between_commits_resolves_to_previous_commit() {
         .await,
         normalize_rows(&json!([["Alice"], ["Bob"]]))
     );
+}
+
+/// `@time:` is the canonical spelling and `@iso:` its alias: both select the
+/// same state, through JSON-LD `from` and through SPARQL `FROM`, which lexes
+/// the pin out of an IRI on its own path.
+#[tokio::test]
+async fn time_travel_time_tag_and_iso_alias_agree_on_both_surfaces() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/time-travel-time-tag";
+    let (ledger3, _commit_hex_t1, iso_by_t) = seed_time_travel_ledger(&fluree, ledger_id).await;
+
+    let dt1 = DateTime::parse_from_rfc3339(&iso_by_t[&1]).expect("parse t=1 iso");
+    let dt2 = DateTime::parse_from_rfc3339(&iso_by_t[&2]).expect("parse t=2 iso");
+    let mid_12 = Utc
+        .timestamp_millis_opt(i64::midpoint(
+            dt1.timestamp_millis(),
+            dt2.timestamp_millis().max(dt1.timestamp_millis() + 2),
+        ))
+        .single()
+        .unwrap()
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    for tag in ["time", "iso"] {
+        let from = format!("{ledger_id}@{tag}:{mid_12}");
+        assert_eq!(
+            query_names_at(&fluree, ledger3.as_graph_db_ref(0), &from).await,
+            normalize_rows(&json!([["Alice"]])),
+            "JSON-LD from {from}"
+        );
+
+        let sparql = format!(
+            "PREFIX test: <http://example.org/test#>
+             SELECT ?name FROM <{from}> WHERE {{ ?s test:name ?name }}"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL FROM <{from}>: {e}"));
+        let names: Vec<&str> = result["results"]["bindings"]
+            .as_array()
+            .expect("SPARQL bindings")
+            .iter()
+            .filter_map(|b| b["name"]["value"].as_str())
+            .collect();
+        assert_eq!(names, ["Alice"], "SPARQL FROM <{from}>: {result}");
+    }
 }
 
 #[tokio::test]

@@ -520,7 +520,6 @@ impl Fluree {
                     &mut staged_view,
                     crate::tx::StagedShaclContext {
                         graph_delta: Some(&routing.graph_iris),
-                        graph_sids: Some(&routing.graph_sids),
                         tracker: None,
                         // Commit replay doesn't engage the
                         // cross-ledger dispatch (the leader

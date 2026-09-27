@@ -18,7 +18,7 @@
 
 use fluree_db_tabular::FieldType;
 
-use crate::emit::SubjectStrategy;
+use crate::emit::{naming, SubjectStrategy};
 
 /// A comparable typed bound for range-containment FK confirmation.
 ///
@@ -105,7 +105,9 @@ impl EmitColumn {
 
     /// Whether the column name looks like a key by convention (`*_KEY` / `*_ID`).
     pub fn is_key_like(&self) -> bool {
-        self.name.ends_with("_KEY") || self.name.ends_with("_ID")
+        ["_KEY", "_ID"]
+            .iter()
+            .any(|suffix| naming::strip_suffix_ignore_case(&self.name, suffix).is_some())
     }
 }
 
@@ -168,6 +170,18 @@ pub struct EmitTableSchema {
     pub columns: Vec<EmitColumn>,
     /// Iceberg's declared row-identity hint — the primary PK signal.
     pub identifier_field_ids: Vec<i32>,
+    /// Foreign keys the catalog declares. One takes precedence over anything
+    /// inferred for its columns. Empty where the catalog records none.
+    pub foreign_keys: Vec<DeclaredForeignKey>,
+}
+
+/// A foreign key as a catalog declares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredForeignKey {
+    pub child_columns: Vec<String>,
+    /// The parent's [`EmitTableSchema::qualified_name`].
+    pub parent_table: String,
+    pub parent_columns: Vec<String>,
 }
 
 impl EmitTableSchema {
@@ -196,7 +210,7 @@ impl EmitTableSchema {
     /// Whether this is a fact table (`FACT_*`) — used for the child-fact→hub
     /// join advisory.
     pub fn is_fact(&self) -> bool {
-        self.name.starts_with("FACT_")
+        naming::strip_prefix_ignore_case(&self.name, "FACT_").is_some()
     }
 
     /// Look up a column by field id.

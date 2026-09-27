@@ -533,7 +533,7 @@ impl crate::Fluree {
                         Ok::<_, ApiError>((
                             want_keys.then_some(keys),
                             Some(data.flakes),
-                            Some(data.namespace_delta),
+                            Some((data.namespace_delta, data.graph_iris)),
                         ))
                     } else {
                         // Keys alone. Only the source's own commits are
@@ -549,10 +549,10 @@ impl crate::Fluree {
                 // No target head: the change set is the source's whole
                 // history.
                 (None, Some(s_head)) if need_changes => {
-                    let (keys, net, ns_delta) =
+                    let (keys, net, ns_delta, graph_iris) =
                         compute_delta_keys_and_changes(source_store.clone(), s_head.clone(), 0)
                             .await?;
-                    Ok((Some(keys), Some(net), Some(ns_delta)))
+                    Ok((Some(keys), Some(net), Some((ns_delta, graph_iris))))
                 }
                 _ => Ok((None, None, None)),
             }
@@ -569,7 +569,7 @@ impl crate::Fluree {
                 _ => Ok(None),
             }
         };
-        let ((source_delta, net_flakes, source_ns_delta), target_delta) =
+        let ((source_delta, net_flakes, source_deltas), target_delta) =
             tokio::try_join!(source_fut, target_fut)?;
 
         // ---- Conflicts. ----------------------------------------------------
@@ -704,7 +704,7 @@ impl crate::Fluree {
                 // The change summary above borrowed it; nothing needs it
                 // after this, so hand it over.
                 let net = net_flakes.take();
-                let ns_delta = source_ns_delta.unwrap_or_default();
+                let (ns_delta, graph_iris) = source_deltas.unwrap_or_default();
                 let (_view, outcome) = self
                     .stage_merge(
                         target_state.clone(),
@@ -712,6 +712,7 @@ impl crate::Fluree {
                         &all_conflict_keys,
                         &opts.conflict_strategy,
                         &ns_delta,
+                        &graph_iris,
                     )
                     .await?;
                 Some(ValidationSummary {

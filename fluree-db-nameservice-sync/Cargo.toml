@@ -36,7 +36,7 @@ aws-config = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["query", "stream"] }
 tokio = { workspace = true, features = ["time", "sync"] }
 parking_lot = "0.12"
 async-stream = "0.3"

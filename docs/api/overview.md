@@ -55,7 +55,7 @@ Historical queries use time specifiers in ledger IDs:
 
 ```text
 ledger:branch@t:100           # Transaction number
-ledger:branch@iso:2024-01-15  # ISO timestamp
+ledger:branch@time:2024-01-15  # ISO timestamp
 ledger:branch@commit:bafybeig...  # Commit ID
 ```
 
@@ -88,6 +88,12 @@ defaults to `/v1/fluree`.
 
 **POST /insert** / **POST /upsert**
 - Insert or upsert data (JSON-LD and Turtle; TriG on upsert)
+
+**POST /sync**
+- Make one graph's contents exactly the payload, committing only the difference (JSON-LD, Turtle, N-Triples or TriG)
+
+**GET / HEAD / PUT / POST / DELETE /data**
+- W3C Graph Store Protocol: read, replace, add to or remove one graph ([Graph Store Protocol](graph-store.md))
 
 ### Query Endpoints
 
@@ -496,7 +502,7 @@ Combine related entities in single transactions for better performance.
 ### 2. Use Appropriate Time Specifiers
 
 - `@t:NNN` is fastest (direct lookup)
-- `@iso:DATETIME` requires binary search
+- `@time:DATETIME` requires binary search
 - `@commit:CID` requires scan
 
 ### 3. Limit Result Sets

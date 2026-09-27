@@ -1163,6 +1163,15 @@ impl FileStorage {
 
 #[async_trait]
 impl StorageRead for FileStorage {
+    /// Reads return exactly the bytes at rest.
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn crate::EncryptionAdmin>> {
+        None
+    }
+
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         let path = self.resolve_path(address)?;
         let mut read = tokio::fs::read(&path).await;

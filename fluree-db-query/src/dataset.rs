@@ -176,6 +176,9 @@ pub struct DataSet<'a> {
     default_graphs: Vec<GraphRef<'a>>,
     /// Named graphs keyed by IRI string (not Sid)
     named_graphs: HashMap<Arc<str>, GraphRef<'a>>,
+    /// Further names for graphs, addressable by `GRAPH <name>` but not
+    /// enumerated by `GRAPH ?g`, so one graph never binds `?g` twice.
+    named_graph_aliases: HashMap<Arc<str>, GraphRef<'a>>,
 }
 
 impl<'a> DataSet<'a> {
@@ -184,6 +187,7 @@ impl<'a> DataSet<'a> {
         Self {
             default_graphs: Vec::new(),
             named_graphs: HashMap::new(),
+            named_graph_aliases: HashMap::new(),
         }
     }
 
@@ -199,6 +203,18 @@ impl<'a> DataSet<'a> {
         self
     }
 
+    /// Add a name that resolves to `graph` for `GRAPH <name>` without being
+    /// enumerated by `GRAPH ?g`. A name already present as a named graph
+    /// keeps that entry.
+    pub fn with_named_graph_alias(
+        mut self,
+        name: impl Into<Arc<str>>,
+        graph: GraphRef<'a>,
+    ) -> Self {
+        self.named_graph_aliases.insert(name.into(), graph);
+        self
+    }
+
     /// Get default graph references
     pub fn default_graphs(&self) -> &[GraphRef<'a>] {
         &self.default_graphs
@@ -206,7 +222,9 @@ impl<'a> DataSet<'a> {
 
     /// Get a named graph by IRI (None if not found)
     pub fn named_graph(&self, iri: &str) -> Option<&GraphRef<'a>> {
-        self.named_graphs.get(iri)
+        self.named_graphs
+            .get(iri)
+            .or_else(|| self.named_graph_aliases.get(iri))
     }
 
     /// Get all named graph IRIs (for GRAPH ?g iteration)
@@ -216,7 +234,7 @@ impl<'a> DataSet<'a> {
 
     /// Check if a named graph exists
     pub fn has_named_graph(&self, iri: &str) -> bool {
-        self.named_graphs.contains_key(iri)
+        self.named_graphs.contains_key(iri) || self.named_graph_aliases.contains_key(iri)
     }
 
     /// Copy of this dataset where every graph matching the primary
@@ -254,6 +272,11 @@ impl<'a> DataSet<'a> {
             default_graphs: self.default_graphs.iter().map(&patch).collect(),
             named_graphs: self
                 .named_graphs
+                .iter()
+                .map(|(iri, g)| (Arc::clone(iri), patch(g)))
+                .collect(),
+            named_graph_aliases: self
+                .named_graph_aliases
                 .iter()
                 .map(|(iri, g)| (Arc::clone(iri), patch(g)))
                 .collect(),

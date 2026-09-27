@@ -65,8 +65,8 @@ pub use error::{Result, TransactError};
 pub use flake_sink::FlakeSink;
 pub use generate::{apply_cancellation, FlakeGenerator};
 pub use ir::{
-    GraphMgmtOp, GraphSel, GraphTarget, InlineValues, TemplateTerm, TripleTemplate, Txn, TxnOpts,
-    TxnType,
+    GraphMgmtOp, GraphSel, GraphTarget, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate,
+    Txn, TxnOpts, TxnType,
 };
 pub use lower_sparql_update::{
     lower_sparql_update, lower_sparql_update_ast, lower_sparql_update_request, LowerError,
@@ -76,18 +76,17 @@ pub use namespace::{
     SharedNamespaceAllocator, BLANK_NODE_ID_PREFIX, BLANK_NODE_PREFIX,
 };
 pub use parse::{
-    parse_sync_transaction, parse_transaction, parse_trig_phase1, resolve_trig_meta,
-    NamedGraphBlock, RawObject, RawTerm, RawTrigMeta, RawTriple, TrigPhase1Result,
+    parse_graph_insert, parse_sync_transaction, parse_transaction, parse_trig_phase1,
+    resolve_trig_meta, unwrap_trig_graph_blocks, NamedGraphBlock, RawObject, RawTerm, RawTrigMeta,
+    RawTriple, TrigPhase1Result, UnwrappedTrig,
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
-pub use stage::{generate_txn_id, stage, stage_flakes, StageOptions};
+pub use stage::{generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions};
 pub use staged_dicts::{
     attach_binary_provider, attach_staged_dicts, detach_binary_provider, staged_dicts, StagedDicts,
 };
 
 #[cfg(feature = "shacl")]
-pub use stage::{
-    stage_with_shacl, validate_view_with_shacl, ShaclGraphPolicy, ShaclValidationOutcome,
-};
+pub use stage::{validate_view_with_shacl, ShaclGraphPolicy, ShaclValidationOutcome};
 
 pub mod commit_v2;

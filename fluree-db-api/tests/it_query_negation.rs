@@ -536,3 +536,125 @@ async fn filter_not_exists_expression_equals_pattern_level() {
         "expression-level NOT EXISTS should equal pattern-level NOT EXISTS"
     );
 }
+
+/// alice's only acquaintance works somewhere but alice doesn't; carol works at
+/// a different org than her acquaintance; dave's acquaintance has no employer.
+async fn seed_knows_works_for(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ttl = r"@prefix ex: <http://example.com/> .
+ex:alice ex:knows ex:bob .
+ex:bob ex:worksFor ex:acme .
+ex:carol ex:knows ex:bob ;
+    ex:worksFor ex:globex .
+ex:dave ex:knows ex:erin .
+";
+    fluree
+        .insert_turtle(ledger0, ttl)
+        .await
+        .expect("insert turtle")
+        .ledger
+}
+
+async fn sparql_rows(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    q: &str,
+) -> Vec<serde_json::Value> {
+    let r = support::query_sparql(fluree, ledger, q)
+        .await
+        .unwrap_or_else(|e| panic!("sparql query failed: {e}\n{q}"));
+    normalize_rows(&r.to_jsonld(&ledger.snapshot).unwrap())
+}
+
+/// A variable left unbound by an unmatched OPTIONAL is free inside a later
+/// NOT EXISTS: substitution (SPARQL 1.1 §18.6) replaces only bound variables.
+/// For alice (`?org` unbound) the body becomes
+/// `ex:alice ex:knows ?x . ?x ex:worksFor ?org`, which matches via bob/acme,
+/// so the row is removed. Each query routes the NOT EXISTS through a
+/// different evaluator; all must agree.
+#[tokio::test]
+async fn sparql_not_exists_treats_optional_unbound_var_as_free() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_knows_works_for(&fluree, "negation:optional-unbound").await;
+    let expected = normalize_rows(&json!([["ex:carol", "ex:globex"], ["ex:dave", null]]));
+
+    let cases = [
+        // Pattern-level; correlated only via inner-produced vars (?p, ?org) →
+        // semijoin, whose unbound-key rows take the per-row seeded path.
+        (
+            "semijoin",
+            r"PREFIX ex: <http://example.com/>
+SELECT ?p ?org WHERE {
+  ?p ex:knows ?f .
+  OPTIONAL { ?p ex:worksFor ?org }
+  FILTER NOT EXISTS { ?p ex:knows ?x . ?x ex:worksFor ?org }
+}",
+        ),
+        // Inner consumes outer-only ?f → per-row ExistsOperator.
+        (
+            "per-row",
+            r"PREFIX ex: <http://example.com/>
+SELECT ?p ?org WHERE {
+  ?p ex:knows ?f .
+  OPTIONAL { ?p ex:worksFor ?org }
+  FILTER NOT EXISTS { ?p ex:knows ?x . ?x ex:worksFor ?org FILTER(?x = ?f) }
+}",
+        ),
+        // NOT EXISTS inside a compound expression → FilterOperator.
+        (
+            "expression",
+            r"PREFIX ex: <http://example.com/>
+SELECT ?p ?org WHERE {
+  ?p ex:knows ?f .
+  OPTIONAL { ?p ex:worksFor ?org }
+  FILTER (?p = ex:nobody || NOT EXISTS { ?p ex:knows ?x . ?x ex:worksFor ?org })
+}",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (lane, q) in cases {
+        let rows = sparql_rows(&fluree, &ledger, q).await;
+        if rows != expected {
+            wrong.push(format!("{lane}: {rows:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "expected {expected:?}; got {wrong:#?}");
+
+    let q_exists = r"PREFIX ex: <http://example.com/>
+SELECT ?p ?org WHERE {
+  ?p ex:knows ?f .
+  OPTIONAL { ?p ex:worksFor ?org }
+  FILTER EXISTS { ?p ex:knows ?x . ?x ex:worksFor ?org }
+}";
+    assert_eq!(
+        sparql_rows(&fluree, &ledger, q_exists).await,
+        normalize_rows(&json!([["ex:alice", null]]))
+    );
+}
+
+#[tokio::test]
+async fn jsonld_not_exists_treats_optional_unbound_var_as_free() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_knows_works_for(&fluree, "negation:optional-unbound-jsonld").await;
+
+    let q = json!({
+        "@context": ctx_ex(),
+        "select": ["?p", "?org"],
+        "where": [
+            {"@id": "?p", "ex:knows": "?f"},
+            ["optional", {"@id": "?p", "ex:worksFor": "?org"}],
+            ["not-exists",
+                {"@id": "?p", "ex:knows": "?x"},
+                {"@id": "?x", "ex:worksFor": "?org"}]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:carol", "ex:globex"], ["ex:dave", null]]))
+    );
+}

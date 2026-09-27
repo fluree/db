@@ -24,6 +24,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::query::multi::AsOf;
 use crate::{time_resolve, ApiError, Fluree, Result};
+use fluree_db_core::ledger_id::TIME_TRAVEL_TAGS;
 
 /// Resolved per-ledger `t` map for an envelope, plus the wall-clock moment it
 /// represents (echoed back to the client).
@@ -267,23 +268,33 @@ fn pin_object_entry(obj: &mut JsonMap<String, JsonValue>, ledgers: &HashMap<Stri
     obj.insert("t".to_string(), JsonValue::Number(t.into()));
 }
 
-/// Does this identifier string carry a Fluree temporal marker
-/// (`@t:`/`@iso:`/`@commit:`)? Used to skip snapshot rewrite on already-pinned
-/// IRIs. Fragment suffixes (`#named-graph`) are not temporal and do not match.
-fn string_has_explicit_pin(s: &str) -> bool {
-    ["@t:", "@iso:", "@commit:"].iter().any(|m| s.contains(m))
+/// Where a Fluree temporal marker (`@` + one of the shared grammar's tags,
+/// [`TIME_TRAVEL_TAGS`]) starts in `s`, if it carries one. One source of truth
+/// with the parser, so a tag added there is recognised here and by the
+/// envelope validator in `mod.rs`.
+pub(super) fn explicit_pin_at(s: &str) -> Option<usize> {
+    s.match_indices('@').map(|(idx, _)| idx).find(|&idx| {
+        TIME_TRAVEL_TAGS
+            .iter()
+            .any(|tag| s[idx + 1..].starts_with(tag))
+    })
 }
 
-/// Bare ledger id (no temporal suffix, no named-graph fragment). Mirrors the
-/// suffix-stripping done by validation.
-fn bare_ledger_id(s: &str) -> &str {
+/// Does this identifier string carry a Fluree temporal marker? Used to skip
+/// snapshot rewrite on already-pinned IRIs. Fragment suffixes (`#named-graph`)
+/// are not temporal and do not match.
+pub(super) fn string_has_explicit_pin(s: &str) -> bool {
+    explicit_pin_at(s).is_some()
+}
+
+/// Bare ledger id (no temporal suffix, no named-graph fragment): what distinct
+/// ledger counting and snapshot resolution key on.
+pub(super) fn bare_ledger_id(s: &str) -> &str {
     let bare = s.split('#').next().unwrap_or(s);
-    for marker in ["@t:", "@iso:", "@commit:"] {
-        if let Some(idx) = bare.find(marker) {
-            return &bare[..idx];
-        }
+    match explicit_pin_at(bare) {
+        Some(idx) => &bare[..idx],
+        None => bare,
     }
-    bare
 }
 
 /// Apply the envelope snapshot to a SPARQL sub-query, returning a new query
@@ -608,6 +619,28 @@ mod tests {
         });
         apply_snapshot_to_jsonld(&mut query, &snap);
         assert_eq!(query["from"], "ledgerA@iso:2024-01-01T00:00:00Z");
+    }
+
+    /// Every tag of the shared grammar is a pin, not just the three the old
+    /// hand-kept list named (`@recorded:` was silently re-pinned to `@t:`).
+    #[test]
+    fn jsonld_string_from_with_any_grammar_tag_left_untouched() {
+        let snap = snapshot(&[("ledgerA", 99)]);
+        for pinned in [
+            "ledgerA@time:2024-01-01T00:00:00Z",
+            "ledgerA@recorded:2024-01-01T00:00:00Z",
+            "ledgerA@snapshot:42",
+            "ledgerA@time:2024-01-01T00:00:00Z#txn-meta",
+        ] {
+            let mut query = json!({
+                "from": pinned,
+                "select": {"?s": ["*"]},
+                "where": []
+            });
+            apply_snapshot_to_jsonld(&mut query, &snap);
+            assert_eq!(query["from"], pinned);
+            assert_eq!(bare_ledger_id(pinned), "ledgerA");
+        }
     }
 
     #[test]

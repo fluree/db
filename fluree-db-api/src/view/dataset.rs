@@ -167,6 +167,11 @@ impl DataSetDb {
         self.named.get(name)
     }
 
+    /// Every view in the dataset, default graphs first.
+    pub fn views(&self) -> impl Iterator<Item = &GraphDb> {
+        self.default.iter().chain(self.named.values())
+    }
+
     /// Get the maximum `t` across all views in the dataset.
     ///
     /// This is only a safe upper bound for internal operations that need a bound
