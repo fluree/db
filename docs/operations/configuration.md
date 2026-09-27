@@ -478,6 +478,28 @@ reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # gc_hard_max_old_indexes = 40     # unset by default: the age guard is never overridden
 ```
 
+### Periodic Maintenance
+
+The indexer's catch-up tick queues ledgers whose indexing has stalled, collects old index versions, and finishes lifecycle operations a crash interrupted:
+
+- a drop, restore or purge that has not moved since the previous tick is resumed, and completes as if it had not been interrupted;
+- a create or import that has not finished is logged at `warn` but left alone, since an import holds its create open for as long as it runs. If nothing is still creating it, `fluree drop <name> --hard --force` frees the name.
+
+Only the node that owns catch-up runs the tick: never a peer, and under Raft only the leader. It runs only where background indexing is enabled.
+
+| Flag                              | Env Var                                | Default | Description |
+| --------------------------------- | -------------------------------------- | ------- | ----------- |
+| `--indexer-catchup-interval-secs` | `FLUREE_INDEXER_CATCHUP_INTERVAL_SECS` | `300`   | Seconds between ticks. `0` turns the periodic tick off; the sweep for stalled ledgers at start-up still runs |
+| `--orphan-sweep-interval-secs`    | `FLUREE_ORPHAN_SWEEP_INTERVAL_SECS`    | `0`     | Seconds between [orphan sweeps](../cli/dropped.md), which delete storage folders that no ledger or dropped ledger owns. `0` never sweeps. Each sweep lists the whole store, which on a large object store is slow and billed per request. Checked on each tick, and first run one interval after start |
+
+Config file equivalent:
+
+```toml
+[server.indexing]
+# indexer_catchup_interval_secs = 300
+# orphan_sweep_interval_secs = 86400   # daily; unset or 0 never sweeps
+```
+
 ## Server Role Configuration
 
 ### Server Role

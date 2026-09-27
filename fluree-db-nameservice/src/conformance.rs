@@ -1123,6 +1123,64 @@ pub async fn retracted_graph_source_index_resets<S: crate::NameServicePublisher>
         .unwrap();
 }
 
+/// The resume-only entry points finish an operation already under way and
+/// nothing else: never a drop, restore or branch drop of their own.
+pub async fn resuming_starts_nothing<S: LifecycleStore>(store: &S) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let dev = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+
+    assert!(lifecycle::resume_drop_ledger(store, &name("mydb"))
+        .await
+        .unwrap()
+        .is_none());
+    let dev_fence = dev.fence.expect("fenced");
+    for fence in [dev_fence, Fence::generate()] {
+        assert!(
+            lifecycle::resume_drop_branch(store, &name("mydb"), "dev", fence)
+                .await
+                .unwrap()
+                .is_none(),
+            "dev is not dropping"
+        );
+    }
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    assert_eq!(binding.state, BindingState::Active);
+    assert!(!binding.listing("dev").unwrap().dropped);
+
+    // A branch dropping under another fence is not the drop being resumed.
+    lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap();
+    assert!(
+        lifecycle::resume_drop_branch(store, &name("mydb"), "dev", Fence::generate())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lifecycle::resume_restore(store, &dropped.instance)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .get_dropped(&dropped.instance)
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .state,
+        DroppedState::Dropped
+    );
+    assert!(store.get_binding("mydb").await.unwrap().is_none());
+}
+
 pub async fn run_all<S, F, Fut>(mut make: F)
 where
     S: crate::NameServicePublisher,
@@ -1158,6 +1216,7 @@ where
     migration_registers_soft_dropped_ledgers(&make().await).await;
     interrupted_migration_resumes(&make().await).await;
     retracted_graph_source_index_resets(&make().await).await;
+    resuming_starts_nothing(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1197,6 +1256,7 @@ macro_rules! lifecycle_conformance_tests {
             migration_registers_soft_dropped_ledgers,
             interrupted_migration_resumes,
             retracted_graph_source_index_resets,
+            resuming_starts_nothing,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

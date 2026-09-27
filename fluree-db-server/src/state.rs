@@ -580,6 +580,11 @@ async fn build_direct_fluree(
         Some(ns) => Arc::new(builder.build_client_with_nameservice(ns).await?),
         None => Arc::new(builder.build_client().await?),
     };
+    // Only the worker that owns catch-up runs its ticks. Under Raft that is
+    // the leader-scope worker, which `Server::run` gives its own.
+    if config.indexing_enabled && catchup_sweeps == CatchupSweeps::Owned {
+        fluree.start_lifecycle_housekeeping(config.orphan_sweep_interval());
+    }
 
     tracing::info!(
         storage_type = config.storage_type_str(),

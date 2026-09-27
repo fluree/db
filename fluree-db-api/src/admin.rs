@@ -755,7 +755,7 @@ impl crate::Fluree {
         info!(ledger_name = %ledger_name, mode = ?mode, "Dropping whole ledger");
         match self.publisher()?.get_binding(&ledger_name).await? {
             Some(binding) => {
-                self.drop_bound_ledger(&ledger_name, binding.value, mode)
+                self.drop_bound_ledger(&ledger_name, binding.value, mode, false)
                     .await
             }
             None => {
@@ -771,12 +771,14 @@ impl crate::Fluree {
 
     /// Drop a ledger created under a name binding: the name is free at once,
     /// a soft drop keeps the data in the dropped-ledger registry, and a hard
-    /// drop deletes it. Resumes a drop already in progress.
-    async fn drop_bound_ledger(
+    /// drop deletes it. Resumes a drop already in progress; with `resume`,
+    /// does only that, and drops nothing when no drop is in progress.
+    pub(crate) async fn drop_bound_ledger(
         &self,
         ledger_name: &LedgerName,
         binding: NameBinding,
         mode: DropMode,
+        resume: bool,
     ) -> Result<DropReport> {
         let hard = matches!(mode, DropMode::Hard);
         let mut report = DropReport {
@@ -799,8 +801,14 @@ impl crate::Fluree {
         }
 
         let store = self.publisher()?;
-        let Some(dropped) = lifecycle::drop_ledger(store, ledger_name, hard).await? else {
-            // Freed by a concurrent drop between the read and the claim.
+        let dropped = if resume {
+            lifecycle::resume_drop_ledger(store, ledger_name).await?
+        } else {
+            lifecycle::drop_ledger(store, ledger_name, hard).await?
+        };
+        let Some(dropped) = dropped else {
+            // Freed by a concurrent drop between the read and the claim, or
+            // no drop to resume.
             return Ok(report);
         };
         if let Some(mgr) = &self.ledger_manager {
@@ -1067,16 +1075,19 @@ impl crate::Fluree {
         if self.publisher()?.get_binding(&name).await?.is_none() {
             return Err(ApiError::NotFound(format!("Branch not found: {ledger_id}")));
         }
-        self.drop_bound_branch(&name, &ledger_id).await
+        self.drop_bound_branch(&name, &ledger_id, None).await
     }
 
     /// Drop a branch of a ledger created under a name binding. The branch is
     /// hidden at once; its data goes now, or with its last child when it has
     /// children. A drop left unfinished resumes when dropped again.
-    async fn drop_bound_branch(
+    /// With `resume`, finishes only a drop of the branch under that fence
+    /// already in progress, and drops nothing otherwise.
+    pub(crate) async fn drop_bound_branch(
         &self,
         name: &LedgerName,
         ledger_id: &LedgerId,
+        resume: Option<fluree_db_nameservice::Fence>,
     ) -> Result<BranchDropReport> {
         let mut report = BranchDropReport {
             ledger_id: ledger_id.to_string(),
@@ -1084,22 +1095,32 @@ impl crate::Fluree {
             ..Default::default()
         };
         let store = self.publisher()?;
-        let begun = lifecycle::begin_drop_branch(store, name, ledger_id.branch())
-            .await
-            .map_err(|e| match e {
-                NameServiceError::NotFound(_) => {
-                    ApiError::NotFound(format!("Branch not found: {ledger_id}"))
-                }
-                NameServiceError::InvalidId(_) => ApiError::Http {
-                    status: 400,
-                    message: format!(
-                        "Cannot drop '{}': it is the root of ledger '{name}'. \
+        let begun = match resume {
+            Some(fence) => {
+                lifecycle::resume_drop_branch(store, name, ledger_id.branch(), fence).await
+            }
+            None => lifecycle::begin_drop_branch(store, name, ledger_id.branch())
+                .await
+                .map(Some),
+        };
+        let begun = begun.map_err(|e| match e {
+            NameServiceError::NotFound(_) => {
+                ApiError::NotFound(format!("Branch not found: {ledger_id}"))
+            }
+            NameServiceError::InvalidId(_) => ApiError::Http {
+                status: 400,
+                message: format!(
+                    "Cannot drop '{}': it is the root of ledger '{name}'. \
                          Use drop_ledger to remove the whole ledger.",
-                        ledger_id.branch()
-                    ),
-                },
-                e => e.into(),
-            })?;
+                    ledger_id.branch()
+                ),
+            },
+            e => e.into(),
+        })?;
+        let Some(begun) = begun else {
+            report.status = DropStatus::NotFound;
+            return Ok(report);
+        };
         let mut next = match begun {
             BranchDrop::Deferred { already: true } => {
                 report.status = DropStatus::AlreadyRetracted;

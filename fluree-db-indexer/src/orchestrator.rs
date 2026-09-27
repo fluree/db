@@ -974,6 +974,29 @@ impl std::fmt::Debug for TriggerHandle {
     }
 }
 
+/// Work that the node owning catch-up runs on every catch-up tick, besides
+/// indexing and collection: see [`IndexerHandle::set_housekeeping`].
+///
+/// Exactly one worker per nameservice owns catch-up (the Raft leader's;
+/// never a peer's), so this runs once per deployment, every
+/// [`IndexerConfig::catchup_interval`] and once at start-up. Nothing runs it
+/// while that interval is zero.
+#[async_trait::async_trait]
+pub trait Housekeeping: Send + Sync {
+    async fn tick(&self);
+}
+
+/// The housekeeping a worker's catch-up tick runs, shared with its handle so
+/// it can be installed once the worker is running.
+type HousekeepingSlot = Arc<std::sync::RwLock<Option<Arc<dyn Housekeeping>>>>;
+
+async fn run_housekeeping(slot: &HousekeepingSlot) {
+    let housekeeping = slot.read().ok().and_then(|h| h.clone());
+    if let Some(housekeeping) = housekeeping {
+        housekeeping.tick().await;
+    }
+}
+
 /// Handle for triggering background indexing
 ///
 /// Provides APIs for:
@@ -993,6 +1016,7 @@ pub struct IndexerHandle {
     /// maintenance run from outside the worker reads through the same cache
     /// rather than a directory of its own.
     artifact_cache_dir: Arc<Path>,
+    housekeeping: HousekeepingSlot,
     /// Holding this Arc bumps the shutdown trigger's strong count;
     /// dropping the last clone fires the worker's `shutdown_rx`.
     _shutdown: Arc<ShutdownTrigger>,
@@ -1285,6 +1309,14 @@ impl TriggerHandle {
 }
 
 impl IndexerHandle {
+    /// Run `housekeeping` on this worker's catch-up ticks, replacing any
+    /// installed before. A worker that does not own catch-up never runs it.
+    pub fn set_housekeeping(&self, housekeeping: Arc<dyn Housekeeping>) {
+        if let Ok(mut slot) = self.housekeeping.write() {
+            *slot = Some(housekeeping);
+        }
+    }
+
     /// Trigger indexing for a ledger with completion tracking. See
     /// [`TriggerHandle::trigger`].
     pub async fn trigger(&self, ledger_id: &LedgerId, min_t: i64) -> IndexCompletion {
@@ -1437,6 +1469,8 @@ pub struct BackgroundIndexerWorker {
     /// Branch listing the collector's sibling check reads; see
     /// [`BranchDirectory`].
     branch_directory: Arc<BranchDirectory>,
+    /// Shared with the handle; run on each catch-up tick.
+    housekeeping: HousekeepingSlot,
 }
 
 /// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
@@ -1493,6 +1527,7 @@ impl BackgroundIndexerWorker {
         let (shutdown, shutdown_rx) = ShutdownTrigger::pair();
         let maintenance: MaintenanceHolds = Arc::default();
         let gc_locks: GcLocks = Arc::default();
+        let housekeeping: HousekeepingSlot = Arc::default();
 
         let trigger = TriggerHandle {
             states: Arc::clone(&states),
@@ -1504,6 +1539,7 @@ impl BackgroundIndexerWorker {
         let handle = IndexerHandle {
             trigger: trigger.clone(),
             artifact_cache_dir: Arc::from(config.artifact_cache_dir()),
+            housekeeping: Arc::clone(&housekeeping),
             _shutdown: shutdown,
         };
 
@@ -1521,6 +1557,7 @@ impl BackgroundIndexerWorker {
             maintenance,
             gc_locks,
             branch_directory: Arc::default(),
+            housekeeping,
         };
 
         (worker, handle)
@@ -1616,13 +1653,14 @@ impl BackgroundIndexerWorker {
                 semaphore: Arc::clone(&self.gc_semaphore),
                 locks: Arc::clone(&self.gc_locks),
             };
+            let housekeeping = Arc::clone(&self.housekeeping);
             Some(AbortOnDrop(tokio::spawn(async move {
                 catch_up_sweep(&trigger, nameservice.as_ref()).await;
                 if interval.is_zero() {
                     debug!("indexer catch-up re-sweep disabled");
                     return;
                 }
-                run_catchup_sweeps(trigger, nameservice, interval, gc_tick).await;
+                run_catchup_sweeps(trigger, nameservice, interval, gc_tick, housekeeping).await;
             })))
         } else {
             debug!("indexer catch-up sweeps disabled; another worker owns catch-up");
@@ -2540,12 +2578,14 @@ fn stalled_ledgers(
 ///
 /// The same tick runs a collector pass over every ledger whose chain may
 /// exceed retention (see [`GcTick`]), so a ledger that stops publishing does
-/// not keep the versions its last burst left inside the age guard.
+/// not keep the versions its last burst left inside the age guard, and then
+/// any [`Housekeeping`] installed on the handle.
 async fn run_catchup_sweeps(
     handle: TriggerHandle,
     nameservice: Arc<dyn IndexingNameService>,
     interval: Duration,
     gc: GcTick,
+    housekeeping: HousekeepingSlot,
 ) {
     let mut ticker = tokio::time::interval(interval);
     // `Skip` rather than the default `Burst`: if a sweep overruns the period,
@@ -2565,6 +2605,7 @@ async fn run_catchup_sweeps(
         }
         Err(e) => warn!(error = %e, "start-up collector pass: all_records() failed"),
     }
+    run_housekeeping(&housekeeping).await;
 
     let mut last_seen: HashMap<LedgerId, i64> = HashMap::new();
     loop {
@@ -2584,6 +2625,7 @@ async fn run_catchup_sweeps(
         }
 
         gc.collect_idle(&records).await;
+        run_housekeeping(&housekeeping).await;
 
         last_seen = records
             .iter()
@@ -4909,6 +4951,42 @@ mod tests {
             "a ledger that stalls after start-up must be picked up by the periodic \
              re-sweep; otherwise the only escape is a restart or a manual reindex"
         );
+    }
+
+    /// Housekeeping runs on the ticks of the worker that owns catch-up, and
+    /// never on one that does not: that is what keeps it to one node.
+    #[tokio::test]
+    async fn catchup_ticks_run_the_installed_housekeeping() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Count(AtomicUsize);
+        #[async_trait::async_trait]
+        impl Housekeeping for Count {
+            async fn tick(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        async fn ticks(owns_catchup: bool) -> usize {
+            let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+            let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+            let config = IndexerConfig::default()
+                .with_catchup_interval(Duration::from_millis(10))
+                .with_catchup_sweeps(owns_catchup);
+            let (worker, handle) = BackgroundIndexerWorker::new(backend, ns, config);
+            let count = Arc::new(Count(AtomicUsize::new(0)));
+            let run_task = tokio::spawn(worker.run());
+            handle.set_housekeeping(count.clone());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            run_task.abort();
+            count.0.load(Ordering::SeqCst)
+        }
+
+        assert!(
+            ticks(true).await >= 2,
+            "the catch-up owner runs it each tick"
+        );
+        assert_eq!(ticks(false).await, 0, "no other worker runs it");
     }
 
     #[tokio::test]

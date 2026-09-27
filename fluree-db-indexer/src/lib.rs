@@ -62,7 +62,7 @@ pub use gc::{
 };
 pub use orchestrator::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
-    GcGuard, IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation,
+    GcGuard, Housekeeping, IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation,
     IndexStatusSnapshot, IndexerHandle, IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
 };
 #[cfg(feature = "embedded-orchestrator")]

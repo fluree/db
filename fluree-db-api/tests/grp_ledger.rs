@@ -23,6 +23,8 @@ mod it_ledger_info_named_graphs;
 mod it_ledger_lifecycle;
 #[path = "it_legacy_store.rs"]
 mod it_legacy_store;
+#[path = "it_lifecycle_housekeeping.rs"]
+mod it_lifecycle_housekeeping;
 #[path = "it_merge.rs"]
 mod it_merge;
 #[path = "it_merge_preview.rs"]

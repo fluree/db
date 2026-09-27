@@ -399,6 +399,30 @@ pub async fn begin_drop_branch<S: LifecycleStore + ?Sized>(
     name: &LedgerName,
     branch: &str,
 ) -> Result<BranchDrop> {
+    drop_branch_from(store, name, branch, None)
+        .await?
+        .ok_or_else(|| NameServiceError::not_found(format!("{name}:{branch}")))
+}
+
+/// [`begin_drop_branch`] for a drop of `branch` under `fence` that was
+/// started and stopped short. Returns `None`, dropping nothing, unless the
+/// branch is still listed as dropping under that fence: a branch created
+/// under the name since is left alone.
+pub async fn resume_drop_branch<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    branch: &str,
+    fence: Fence,
+) -> Result<Option<BranchDrop>> {
+    drop_branch_from(store, name, branch, Some(fence)).await
+}
+
+async fn drop_branch_from<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    branch: &str,
+    resume: Option<Fence>,
+) -> Result<Option<BranchDrop>> {
     let id = name.with_branch(branch)?;
     let not_found = || NameServiceError::not_found(id.to_string());
 
@@ -414,6 +438,9 @@ pub async fn begin_drop_branch<S: LifecycleStore + ?Sized>(
             )));
         }
         let listing = binding.listing(branch).ok_or_else(not_found)?.clone();
+        if resume.is_some_and(|fence| !listing.dropped || listing.fence != fence) {
+            return Ok(None);
+        }
         if listing.dropped {
             marked = Some((binding.root, listing.fence, true));
             break;
@@ -441,10 +468,10 @@ pub async fn begin_drop_branch<S: LifecycleStore + ?Sized>(
         .filter(|r| r.fence == Some(fence))
         .ok_or_else(not_found)?;
     if record.branches > 0 {
-        return Ok(BranchDrop::Deferred { already });
+        return Ok(Some(BranchDrop::Deferred { already }));
     }
     record.storage_root = Some(root);
-    Ok(BranchDrop::Purge(Box::new(record)))
+    Ok(Some(BranchDrop::Purge(Box::new(record))))
 }
 
 /// Forget a dropped branch once its storage is gone: take it out of the
@@ -539,6 +566,27 @@ pub async fn drop_ledger<S: LifecycleStore + ?Sized>(
     name: &LedgerName,
     hard: bool,
 ) -> Result<Option<DroppedOutcome>> {
+    drop_ledger_from(store, name, Some(hard)).await
+}
+
+/// Finish a drop of `name` that was started and stopped short, with the
+/// hardness it started with. Returns `None`, dropping nothing, unless the
+/// name's binding is dropping: a ledger that holds the name since is left
+/// alone.
+pub async fn resume_drop_ledger<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+) -> Result<Option<DroppedOutcome>> {
+    drop_ledger_from(store, name, None).await
+}
+
+/// [`drop_ledger`] with `start: Some(hard)`; [`resume_drop_ledger`] with
+/// `None`, which claims no drop of its own.
+async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    start: Option<bool>,
+) -> Result<Option<DroppedOutcome>> {
     // 1. Claim the drop.
     let (binding, version) = {
         let mut claimed = None;
@@ -557,6 +605,9 @@ pub async fn drop_ledger<S: LifecycleStore + ?Sized>(
                     )))
                 }
                 BindingState::Active | BindingState::Creating => {
+                    let Some(hard) = start else {
+                        return Ok(None);
+                    };
                     let dropping = NameBinding {
                         state: BindingState::Dropping { hard },
                         ..value
@@ -648,6 +699,27 @@ pub async fn restore_dropped<S: LifecycleStore + ?Sized>(
     store: &S,
     instance: &InstanceId,
 ) -> Result<Vec<NsRecord>> {
+    restore_from(store, instance, true)
+        .await
+        .map(Option::unwrap_or_default)
+}
+
+/// Finish a restore of `instance` that was started and stopped short.
+/// Returns `None`, restoring nothing, unless its entry is restoring.
+pub async fn resume_restore<S: LifecycleStore + ?Sized>(
+    store: &S,
+    instance: &InstanceId,
+) -> Result<Option<Vec<NsRecord>>> {
+    restore_from(store, instance, false).await
+}
+
+/// [`restore_dropped`] with `start`; [`resume_restore`] without, which
+/// begins no restore of its own.
+async fn restore_from<S: LifecycleStore + ?Sized>(
+    store: &S,
+    instance: &InstanceId,
+    start: bool,
+) -> Result<Option<Vec<NsRecord>>> {
     // 1. Mark the entry restoring, recording the fresh fences.
     let Some(Versioned {
         value: entry,
@@ -657,6 +729,7 @@ pub async fn restore_dropped<S: LifecycleStore + ?Sized>(
         return Err(NameServiceError::not_found(instance.to_string()));
     };
     let (fences, version) = match &entry.state {
+        DroppedState::Dropped if !start => return Ok(None),
         DroppedState::Dropped => {
             let fences: Vec<BranchFence> = entry
                 .branches
@@ -706,7 +779,9 @@ pub async fn restore_dropped<S: LifecycleStore + ?Sized>(
             // An interrupted attempt already made it visible.
             BindingState::Active => {
                 store.cas_dropped(instance, Some(version), None).await?;
-                return restored_records(store, &entry.name, &existing.value).await;
+                return restored_records(store, &entry.name, &existing.value)
+                    .await
+                    .map(Some);
             }
             BindingState::Creating | BindingState::Dropping { .. } => {
                 return Err(contended(&entry.name))
@@ -749,7 +824,7 @@ pub async fn restore_dropped<S: LifecycleStore + ?Sized>(
         RegistryCas::Conflict { .. } => return Err(contended(&entry.name)),
     }
     store.cas_dropped(instance, Some(version), None).await?;
-    Ok(records)
+    Ok(Some(records))
 }
 
 /// The live records a binding lists, with its root.
