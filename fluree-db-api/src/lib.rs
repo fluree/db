@@ -911,16 +911,31 @@ where
         }
     }
 
+    /// A prefix naming commit or txn blobs lists the commit tier. Any other
+    /// prefix (a ledger's root, the whole store) can match blobs on both, so
+    /// both are listed, each keeping only the addresses it serves.
     async fn list_prefix(
         &self,
         prefix: &str,
     ) -> std::result::Result<Vec<String>, fluree_db_core::Error> {
-        // Route based on prefix - commit/txn prefixes go to commit storage
         if Self::route_to_commit(prefix) {
-            self.commit.list_prefix(prefix).await
-        } else {
-            self.index.list_prefix(prefix).await
+            return self.commit.list_prefix(prefix).await;
         }
+        let mut listed: Vec<String> = self
+            .commit
+            .list_prefix(prefix)
+            .await?
+            .into_iter()
+            .filter(|address| Self::route_to_commit(address))
+            .collect();
+        listed.extend(
+            self.index
+                .list_prefix(prefix)
+                .await?
+                .into_iter()
+                .filter(|address| !Self::route_to_commit(address)),
+        );
+        Ok(listed)
     }
 }
 

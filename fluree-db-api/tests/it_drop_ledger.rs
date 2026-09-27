@@ -838,3 +838,56 @@ async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
     fluree.disconnect_ledger(child_id).await;
     assert!(fluree.db(child_id).await.expect("child still loads").t > 0);
 }
+
+async fn files_under(tier: &fluree_db_core::MemoryStorage, root: &str) -> Vec<String> {
+    use fluree_db_core::StorageRead;
+    tier.list_prefix(&format!("fluree:memory://{root}/"))
+        .await
+        .expect("list")
+}
+
+/// Purge lists an instance root once and on both storage tiers, so it also
+/// removes files that no branch of the dropped ledger names.
+#[tokio::test]
+async fn purge_deletes_an_instance_root_from_both_storage_tiers() {
+    use fluree_db_api::{ConnectionConfig, DroppedData, Fluree, NameServiceMode, TieredStorage};
+    use fluree_db_core::MemoryStorage;
+    use std::sync::Arc;
+
+    let (commit, index) = (MemoryStorage::new(), MemoryStorage::new());
+    let fluree = Fluree::new(
+        ConnectionConfig::memory(),
+        TieredStorage::new(commit.clone(), index.clone()),
+        NameServiceMode::ReadWrite(Arc::new(
+            fluree_db_nameservice::memory::MemoryNameService::new(),
+        )),
+    );
+    let ledger = fluree.create_ledger("tiered:main").await.expect("create");
+    let tx = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:name": "A"});
+    let ledger = fluree.insert(ledger, &tx).await.expect("insert").ledger;
+    fluree
+        .set_default_context("tiered:main", &json!({"ex": "http://example.org/"}))
+        .await
+        .expect("context");
+    let root = ledger.storage_namespace().root().to_string();
+    assert!(!files_under(&commit, &root).await.is_empty(), "commits");
+    assert!(!files_under(&index, &root).await.is_empty(), "config");
+
+    let report = fluree
+        .drop_ledger("tiered", DropMode::Soft)
+        .await
+        .expect("drop");
+    // A branch created as the ledger was dropped left files behind.
+    index.insert(
+        format!("fluree:memory://{root}/late/index/x"),
+        b"x".to_vec(),
+    );
+
+    let purged = fluree
+        .purge_dropped(report.instance.expect("instance").as_str())
+        .await
+        .expect("purge");
+    assert_eq!(purged.data, Some(DroppedData::Deleted), "{purged:?}");
+    assert_eq!(files_under(&commit, &root).await, Vec::<String>::new());
+    assert_eq!(files_under(&index, &root).await, Vec::<String>::new());
+}

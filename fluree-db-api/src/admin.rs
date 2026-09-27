@@ -563,6 +563,72 @@ impl WholeLedgerOperation {
     }
 }
 
+/// Delete everything under an instance root from one listing, which reaches
+/// every storage tier and any bytes a writer left there after losing a race
+/// with the drop. `@` is reserved in names, so no other ledger's files sit
+/// under the root. Returns `false`, having deleted nothing, when the root
+/// can't be listed.
+async fn purge_instance_root(
+    storage: &dyn fluree_db_core::Storage,
+    root: &StorageRoot,
+    branches: &[NsRecord],
+    report: &mut DropReport,
+) -> bool {
+    let method = storage.storage_method();
+    let files = match storage
+        .list_prefix(&format!("fluree:{method}://{root}/"))
+        .await
+    {
+        Ok(files) => files,
+        Err(e) => {
+            warn!(error = %e, %root, "cannot list instance root; purging per branch");
+            return false;
+        }
+    };
+    let failed: HashSet<String> = storage
+        .delete_many(&files)
+        .await
+        .into_iter()
+        .map(|(file, e)| {
+            report
+                .warnings
+                .push(format!("Failed to delete {file}: {e}"));
+            file
+        })
+        .collect();
+
+    // Credit each file to the branch whose folder holds it, the longest
+    // prefix winning since branch names may contain `/`.
+    let prefixes: Vec<String> = branches
+        .iter()
+        .map(|r| {
+            let namespace = root.namespace(r.ledger_id.branch());
+            format!("fluree:{method}://{}/", namespace.branch_prefix())
+        })
+        .collect();
+    let mut counts = vec![0usize; branches.len()];
+    for file in files.iter().filter(|f| !failed.contains(*f)) {
+        report.artifacts_deleted += 1;
+        if let Some((i, _)) = prefixes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| file.starts_with(p.as_str()))
+            .max_by_key(|(_, p)| p.len())
+        {
+            counts[i] += 1;
+        }
+    }
+    for (record, count) in branches.iter().zip(counts) {
+        report.branch_reports.push(BranchDropReport {
+            ledger_id: record.ledger_id.to_string(),
+            status: DropStatus::Dropped,
+            artifacts_deleted: count,
+            ..Default::default()
+        });
+    }
+    true
+}
+
 /// Sort branches so children come before their parents (leaf-first).
 ///
 /// Used by `drop_ledger` so that if the operation aborts mid-way the
@@ -763,22 +829,30 @@ impl crate::Fluree {
         let warnings_before = report.warnings.len();
         let mut branches = entry.branches.clone();
         sort_leaf_first(&mut branches);
-        for mut record in branches {
-            record.storage_root = Some(entry.root.clone());
-            let (count, warnings) = self.drop_artifacts(&record.ledger_id, &record).await;
+        let purged_root = match self.admin_storage() {
+            Some(storage) if entry.root.instance().is_some() => {
+                purge_instance_root(storage, &entry.root, &branches, report).await
+            }
+            _ => false,
+        };
+        if !purged_root {
+            for mut record in branches {
+                record.storage_root = Some(entry.root.clone());
+                let (count, warnings) = self.drop_artifacts(&record.ledger_id, &record).await;
+                report.artifacts_deleted += count;
+                report.branch_reports.push(BranchDropReport {
+                    ledger_id: record.ledger_id.to_string(),
+                    status: DropStatus::Dropped,
+                    artifacts_deleted: count,
+                    warnings: warnings.clone(),
+                    ..Default::default()
+                });
+                report.warnings.extend(warnings);
+            }
+            let (count, warnings) = self.drop_shared_artifacts(&entry.root).await;
             report.artifacts_deleted += count;
-            report.branch_reports.push(BranchDropReport {
-                ledger_id: record.ledger_id.to_string(),
-                status: DropStatus::Dropped,
-                artifacts_deleted: count,
-                warnings: warnings.clone(),
-                ..Default::default()
-            });
             report.warnings.extend(warnings);
         }
-        let (count, warnings) = self.drop_shared_artifacts(&entry.root).await;
-        report.artifacts_deleted += count;
-        report.warnings.extend(warnings);
 
         if report.warnings.len() > warnings_before {
             return DroppedData::Deleting;
@@ -1550,11 +1624,9 @@ impl crate::Fluree {
     /// branch has been dropped.
     ///
     /// Uses a two-path strategy:
-    /// - **Fast path**: list each known subprefix and batch delete. Per-
-    ///   subprefix enumeration is required so that `TieredStorage` routes
-    ///   commit/txn listings to the commit tier and index/config listings
-    ///   to the index tier — a single ledger-root list misses the commit
-    ///   tier entirely in split commit/index deployments.
+    /// - **Fast path**: list each known subprefix and batch delete. Each
+    ///   subprefix is listed on the one tier that holds it, and a branch
+    ///   folder never lists its sibling branches' folders.
     /// - **Slow path**: If `list_prefix` fails (e.g., IPFS), walks the commit
     ///   chain + index tree to collect all CIDs, derives storage addresses,
     ///   and deletes each individually.
@@ -1600,8 +1672,8 @@ impl crate::Fluree {
         };
 
         // Enumerate explicit subprefixes. `TieredStorage` routes by substring
-        // (`/commit/`, `/txn/` → commit tier; otherwise → index tier), so we
-        // must hit each one separately. `index/` covers index roots, garbage,
+        // (`/commit/`, `/txn/` → commit tier; otherwise → index tier), so
+        // each lists one tier. `index/` covers index roots, garbage,
         // and all object subkinds (branches, leaves, dicts when per-branch);
         // `config/` covers the LedgerConfig blob and the default-context blob,
         // both stored as `ContentKind::LedgerConfig`.
