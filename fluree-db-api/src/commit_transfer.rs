@@ -26,11 +26,11 @@ use crate::{Fluree, IndexConfig, LedgerHandle};
 use base64::Engine as _;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentId;
-use fluree_db_core::LedgerId;
 use fluree_db_core::{
     range_with_overlay, ContentAddressedWrite, ContentKind, Flake, GraphId, IndexType, Sid,
     TXN_META_GRAPH_ID,
 };
+use fluree_db_core::{LedgerId, StorageNamespace};
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
@@ -127,7 +127,7 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
     storage: &S,
     cid: &ContentId,
     bytes: &[u8],
-    ledger_id: &str,
+    namespace: &StorageNamespace,
 ) -> Result<()> {
     use fluree_db_core::commit::codec::verify_commit_blob;
 
@@ -163,7 +163,7 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
     };
 
     storage
-        .content_write_bytes_with_hash(kind, ledger_id, &digest_hex, bytes)
+        .content_write_bytes_with_hash(kind, namespace, &digest_hex, bytes)
         .await
         .map_err(|e| ApiError::internal(format!("failed to write {cid}: {e}")))?;
     Ok(())
@@ -599,7 +599,7 @@ impl Fluree {
             .ok_or_else(|| ApiError::config("push_commits requires a managed storage backend"))?;
         write_required_blobs(
             &storage,
-            base_state.ledger_id(),
+            &base_state.storage_namespace(),
             &request.blobs,
             &decoded,
             &merged,
@@ -610,13 +610,14 @@ impl Fluree {
         // Merged-in commits are written first. They are the parents, and a
         // failure part way through then leaves no stored commit whose parent
         // is absent.
-        write_commit_blobs(&storage, base_state.ledger_id(), &merged)
+        write_commit_blobs(&storage, &base_state.storage_namespace(), &merged)
             .await
             .map_err(PushError::into_api_error)?;
 
-        let stored_commits = write_commit_blobs(&storage, base_state.ledger_id(), &decoded)
-            .await
-            .map_err(PushError::into_api_error)?;
+        let stored_commits =
+            write_commit_blobs(&storage, &base_state.storage_namespace(), &decoded)
+                .await
+                .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
         let new_head_id = final_head.commit_id.clone();
@@ -1278,7 +1279,7 @@ async fn is_currently_asserted(
 
 async fn write_required_blobs<S>(
     storage: &S,
-    ledger_id: &str,
+    namespace: &StorageNamespace,
     provided: &HashMap<String, Base64Bytes>,
     decoded: &[PushCommitDecoded],
     merged: &[PushCommitDecoded],
@@ -1316,7 +1317,7 @@ where
         // (digest hex matches the legacy CAS hash during the transition period)
         let expected_hash = txn_id.digest_hex();
         let _res = storage
-            .content_write_bytes_with_hash(ContentKind::Txn, ledger_id, &expected_hash, &bytes)
+            .content_write_bytes_with_hash(ContentKind::Txn, namespace, &expected_hash, &bytes)
             .await
             .map_err(|e| PushError::Internal(e.to_string()))?;
     }
@@ -1326,13 +1327,13 @@ where
 
 async fn write_commit_blobs<S: Storage + ContentAddressedWrite + Clone + Send + Sync + 'static>(
     storage: &S,
-    ledger_id: &str,
+    namespace: &StorageNamespace,
     decoded: &[PushCommitDecoded],
 ) -> std::result::Result<Vec<StoredCommit>, PushError> {
     let mut stored = Vec::with_capacity(decoded.len());
     for (idx, c) in decoded.iter().enumerate() {
         let res = storage
-            .content_write_bytes(ContentKind::Commit, ledger_id, &c.bytes)
+            .content_write_bytes(ContentKind::Commit, namespace, &c.bytes)
             .await
             .map_err(|e| PushError::Internal(e.to_string()))?;
         if res.content_hash != c.digest_hex {
@@ -1856,7 +1857,7 @@ impl Fluree {
         handle: &LedgerHandle,
         response: &ExportCommitsResponse,
     ) -> Result<BulkImportResult> {
-        let ledger_id = handle.id();
+        let namespace = handle.snapshot().await.storage_namespace();
         let storage = self.admin_storage().ok_or_else(|| {
             ApiError::config("import_commits_bulk requires a managed storage backend")
         })?;
@@ -1869,7 +1870,7 @@ impl Fluree {
         for b64 in response.commits.iter().chain(&response.merged_commits) {
             let bytes = &b64.0;
             storage
-                .content_write_bytes(ContentKind::Commit, ledger_id, bytes)
+                .content_write_bytes(ContentKind::Commit, &namespace, bytes)
                 .await
                 .map_err(|e| ApiError::internal(format!("failed to write commit blob: {e}")))?;
             stored += 1;
@@ -1900,7 +1901,7 @@ impl Fluree {
             }
             let expected_hash = txn_id.digest_hex();
             storage
-                .content_write_bytes_with_hash(ContentKind::Txn, ledger_id, &expected_hash, bytes)
+                .content_write_bytes_with_hash(ContentKind::Txn, &namespace, &expected_hash, bytes)
                 .await
                 .map_err(|e| ApiError::internal(format!("failed to write txn blob: {e}")))?;
             blobs_stored += 1;
@@ -2108,6 +2109,12 @@ impl Fluree {
             .backend()
             .admin_storage_cloned()
             .ok_or_else(|| ApiError::config("restore_ledger requires a managed storage backend"))?;
+        let namespace = self
+            .nameservice()
+            .lookup(new_ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(new_ledger_id.to_string()))?
+            .storage_namespace();
 
         // Frames are decoded out of a growing byte buffer; `read` appends and
         // `drain` consumes whole frames as they complete. Decoding stays
@@ -2187,12 +2194,13 @@ impl Fluree {
                                     }
                                     bytes_in_flight += len;
                                     let storage_ref = &storage;
+                                    let namespace_ref = &namespace;
                                     in_flight.push(async move {
                                         ingest_cas_object(
                                             storage_ref,
                                             &cid,
                                             &payload,
-                                            new_ledger_id,
+                                            namespace_ref,
                                         )
                                         .await?;
                                         Ok::<usize, ApiError>(len)
@@ -2265,7 +2273,7 @@ impl Fluree {
         // Resolve the head CIDs from the manifest, then verify they were
         // actually ingested before pointing the nameservice at them — a
         // truncated or mismatched archive must not yield a dangling head.
-        let content = self.content_store(new_ledger_id);
+        let content = self.content_store(&namespace);
 
         let commit_head_id = manifest
             .get("commit_head_id")
@@ -2334,7 +2342,7 @@ impl Fluree {
                     root.ledger_id = new_ledger_id.to_string();
                     let restamped = root.encode();
                     let res = storage
-                        .content_write_bytes(ContentKind::IndexRoot, new_ledger_id, &restamped)
+                        .content_write_bytes(ContentKind::IndexRoot, &namespace, &restamped)
                         .await
                         .map_err(|e| {
                             ApiError::internal(format!(
@@ -2465,7 +2473,7 @@ impl Fluree {
         })?;
         write_required_blobs(
             &storage,
-            base_state.ledger_id(),
+            &base_state.storage_namespace(),
             &request.blobs,
             &decoded,
             &merged,
@@ -2474,13 +2482,14 @@ impl Fluree {
         .map_err(PushError::into_api_error)?;
 
         // Parents before children, as in `prepare_push`.
-        write_commit_blobs(&storage, base_state.ledger_id(), &merged)
+        write_commit_blobs(&storage, &base_state.storage_namespace(), &merged)
             .await
             .map_err(PushError::into_api_error)?;
 
-        let stored_commits = write_commit_blobs(&storage, base_state.ledger_id(), &decoded)
-            .await
-            .map_err(PushError::into_api_error)?;
+        let stored_commits =
+            write_commit_blobs(&storage, &base_state.storage_namespace(), &decoded)
+                .await
+                .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
         let new_ref = RefValue {

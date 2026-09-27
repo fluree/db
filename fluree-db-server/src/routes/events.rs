@@ -266,6 +266,7 @@ fn ledger_to_sse_event(record: &NsRecord) -> Event {
             "retracted": record.retracted,
             "source_branch": record.source_branch,
             "branches": record.branches,
+            "storage_root": record.storage_root,
         }),
         emitted_at: now_iso8601(),
     };
@@ -657,6 +658,7 @@ mod tests {
             retracted: false,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         };
         let id = ledger_event_id("test:main", &record);
         assert_eq!(id, "ledger:test:main:42:40");

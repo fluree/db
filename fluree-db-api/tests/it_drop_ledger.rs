@@ -9,7 +9,6 @@
 
 use crate::support::start_background_indexer_local;
 use fluree_db_api::{DropMode, DropStatus, FlureeBuilder, IndexConfig, LedgerState, Novelty};
-use fluree_db_core::address_path::ledger_id_to_path_prefix;
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
@@ -60,7 +59,9 @@ async fn drop_ledger_soft_mode_retracts_only() {
     // Files should still exist (commit prefix uses canonical storage path, no ':')
     let commit_prefix = format!(
         "fluree:file://{}/commit/",
-        ledger_id_to_path_prefix(ledger_id).unwrap()
+        fluree_db_core::StorageNamespace::parse_legacy(ledger_id)
+            .unwrap()
+            .branch_prefix()
     );
     let files = fluree
         .admin_storage()
@@ -96,7 +97,9 @@ async fn drop_ledger_hard_mode_deletes_files() {
     // Verify files exist before drop
     let commit_prefix = format!(
         "fluree:file://{}/commit/",
-        ledger_id_to_path_prefix(ledger_id).unwrap()
+        fluree_db_core::StorageNamespace::parse_legacy(ledger_id)
+            .unwrap()
+            .branch_prefix()
     );
     let files_before = fluree
         .admin_storage()
@@ -438,6 +441,7 @@ async fn drop_branch_releases_dictionary_blobs_only_the_branch_referenced() {
             fluree.backend(),
             &[BranchIndexHead {
                 ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                namespace: fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
                 index_head_id: head,
             }],
             None,
@@ -461,7 +465,8 @@ async fn drop_branch_releases_dictionary_blobs_only_the_branch_referenced() {
     assert_eq!(report.status, DropStatus::Dropped);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 
-    let store = fluree.content_store("fork-dicts:main");
+    let store = fluree
+        .content_store(&fluree_db_core::StorageNamespace::parse_legacy("fork-dicts:main").unwrap());
     for cid in &main_refs {
         assert!(
             store.has(cid).await.unwrap(),
@@ -551,7 +556,8 @@ async fn drop_ledger_cancels_pending_indexing() {
             // Verify both commit and index files are deleted
             // Commits use raw alias: fluree:file://drop-cancel-test:main/commit/
             // Indexes use normalized: fluree:file://drop-cancel-test/main/index/
-            let prefix = ledger_id_to_path_prefix(ledger_id).unwrap();
+            let namespace = fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap();
+            let prefix = namespace.branch_prefix();
             let commit_prefix = format!("fluree:file://{prefix}/commit/");
             let index_prefix = format!("fluree:file://{prefix}/index/");
 
@@ -610,7 +616,9 @@ async fn drop_ledger_hard_mode_deletes_even_when_retracted() {
     // Verify files still exist
     let commit_prefix = format!(
         "fluree:file://{}/commit/",
-        ledger_id_to_path_prefix(ledger_id).unwrap()
+        fluree_db_core::StorageNamespace::parse_legacy(ledger_id)
+            .unwrap()
+            .branch_prefix()
     );
     let files_before = fluree
         .admin_storage()

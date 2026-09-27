@@ -116,7 +116,10 @@ impl Bm25IndexProvider for FlureeIndexProvider<'_> {
 
         // If we have a suitable snapshot, load and return it
         if let Some(entry) = selection {
-            let cs = self.fluree.content_store(graph_source_id);
+            let cs = self
+                .fluree
+                .graph_source_store(graph_source_id)
+                .map_err(|e| QueryError::Internal(e.to_string()))?;
             let bytes = cs
                 .get(&entry.snapshot_id)
                 .await
@@ -158,7 +161,10 @@ impl Bm25IndexProvider for FlureeIndexProvider<'_> {
             let selection = manifest.select_snapshot(effective_as_of_t);
 
             if let Some(entry) = selection {
-                let cs = self.fluree.content_store(graph_source_id);
+                let cs = self
+                    .fluree
+                    .graph_source_store(graph_source_id)
+                    .map_err(|e| QueryError::Internal(e.to_string()))?;
                 let bytes = cs
                     .get(&entry.snapshot_id)
                     .await
@@ -332,7 +338,10 @@ impl FlureeIndexProvider<'_> {
 
         // Load snapshot bytes
         let snapshot_bytes = if let Some(entry) = selection {
-            let cs = self.fluree.content_store(graph_source_id);
+            let cs = self
+                .fluree
+                .graph_source_store(graph_source_id)
+                .map_err(|e| QueryError::Internal(e.to_string()))?;
             cs.get(&entry.snapshot_id)
                 .await
                 .map_err(|e| QueryError::Internal(format!("Storage error: {e}")))?
@@ -355,7 +364,10 @@ impl FlureeIndexProvider<'_> {
                 ))
             })?;
 
-            let cs = self.fluree.content_store(graph_source_id);
+            let cs = self
+                .fluree
+                .graph_source_store(graph_source_id)
+                .map_err(|e| QueryError::Internal(e.to_string()))?;
             cs.get(&entry.snapshot_id)
                 .await
                 .map_err(|e| QueryError::Internal(format!("Storage error: {e}")))?
@@ -586,7 +598,10 @@ impl FlureeIndexProvider<'_> {
         };
 
         // Load and deserialize via content store
-        let cs = self.fluree.content_store(graph_source_id);
+        let cs = self
+            .fluree
+            .graph_source_store(graph_source_id)
+            .map_err(|e| QueryError::Internal(e.to_string()))?;
         let bytes = cs
             .get(&index_id)
             .await

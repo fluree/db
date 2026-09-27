@@ -316,6 +316,7 @@ impl DynamoDbNameService {
             retracted,
             source_branch,
             branches,
+            storage_root: None,
         })
     }
 

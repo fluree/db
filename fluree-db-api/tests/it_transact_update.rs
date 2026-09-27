@@ -252,7 +252,8 @@ async fn update_where_bound_typed_string_delete_and_insert_use_same_datatype_sid
         .await
         .unwrap();
 
-    let content_store = fluree.content_store(ledger_id);
+    let content_store =
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
     let commit = load_commit_by_id(&content_store, &result.receipt.commit_id)
         .await
         .expect("load update commit");

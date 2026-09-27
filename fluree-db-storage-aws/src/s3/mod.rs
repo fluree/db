@@ -803,14 +803,14 @@ impl ContentAddressedWrite for S3Storage {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, CoreError> {
         let address = content_address(
             fluree_db_core::STORAGE_METHOD_S3,
             kind,
-            ledger_id,
+            namespace,
             content_hash_hex,
         );
         self.write_bytes(&address, bytes).await?;
@@ -824,11 +824,11 @@ impl ContentAddressedWrite for S3Storage {
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, CoreError> {
         let hash_hex = sha256_hex(bytes);
-        self.content_write_bytes_with_hash(kind, ledger_id, &hash_hex, bytes)
+        self.content_write_bytes_with_hash(kind, namespace, &hash_hex, bytes)
             .await
     }
 }

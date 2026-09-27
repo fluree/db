@@ -87,7 +87,7 @@ async fn incremental_cycles_compact_the_forward_pack_tail() {
                 roots.push(res.root_id.expect("root id"));
             }
 
-            let cs = fluree.content_store(ledger_id);
+            let cs = fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
             let decode = |bytes: &[u8]| {
                 fluree_db_binary_index::format::index_root::IndexRoot::decode(bytes)
                     .expect("decode root")
@@ -296,7 +296,8 @@ async fn a_namespace_that_goes_quiet_stays_bounded_and_readable() {
                     .root_id;
             }
 
-            let cs = fluree.content_store(ledger_id);
+            let cs = fluree
+                .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
             let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(
                 &cs.get(&last_root.expect("root id"))
                     .await

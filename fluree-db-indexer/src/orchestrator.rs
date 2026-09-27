@@ -47,7 +47,7 @@ use crate::{publish_index_result, IndexResult};
 #[cfg(feature = "embedded-orchestrator")]
 use fluree_db_core::Storage;
 use fluree_db_core::StorageBackend;
-use fluree_db_core::{LedgerId, LedgerName};
+use fluree_db_core::{LedgerId, LedgerName, StorageNamespace};
 use fluree_db_nameservice::{
     IndexingNameService, LedgerEventBus, NameServiceEvent, NsRecord, SubscriptionScope,
 };
@@ -837,12 +837,13 @@ impl GcPassContext {
     async fn run(
         &self,
         ledger_id: &LedgerId,
+        namespace: &StorageNamespace,
         root_id: &fluree_db_core::ContentId,
         gc: &GcGuard,
         in_flight: InFlightBuild,
     ) -> Result<crate::gc::CleanGarbageResult> {
         let cache_dir = self.config.artifact_cache_dir();
-        let store = self.backend.content_store(ledger_id);
+        let store = self.backend.content_store(namespace);
         let config = crate::gc::CleanGarbageConfig {
             max_old_indexes: Some(self.config.gc_max_old_indexes),
             min_time_garbage_mins: Some(self.config.gc_min_time_mins),
@@ -2279,6 +2280,7 @@ impl BackgroundIndexerWorker {
                         let gc_ctx = self.gc_context();
                         let gc_root_id = index_result.root_id.clone();
                         let gc_ledger_id = index_result.ledger_id.clone();
+                        let gc_namespace = record.storage_namespace();
                         let gc_index_t = index_result.index_t;
                         tokio::spawn(async move {
                             // Hold the permit and the per-ledger lock for the
@@ -2288,6 +2290,7 @@ impl BackgroundIndexerWorker {
                             if let Err(e) = gc_ctx
                                 .run(
                                     &gc_ledger_id,
+                                    &gc_namespace,
                                     &gc_root_id,
                                     &gc_guard,
                                     InFlightBuild::WaitOut,
@@ -2637,7 +2640,13 @@ impl GcTick {
             passes += 1;
             match self
                 .ctx
-                .run(&record.ledger_id, root_id, &guard, InFlightBuild::GiveUp)
+                .run(
+                    &record.ledger_id,
+                    &record.storage_namespace(),
+                    root_id,
+                    &guard,
+                    InFlightBuild::GiveUp,
+                )
                 .await
             {
                 Ok(result) => cleaned += result.indexes_cleaned,
@@ -3119,7 +3128,11 @@ mod tests {
 
         // Write via content_write_bytes (CID = SHA-256 of full blob)
         storage
-            .content_write_bytes(ContentKind::Commit, "test:main", &blob)
+            .content_write_bytes(
+                ContentKind::Commit,
+                &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+                &blob,
+            )
             .await
             .unwrap();
 
@@ -3580,7 +3593,10 @@ mod tests {
             semaphore: Arc::new(Semaphore::new(1)),
             locks: Arc::default(),
         };
-        let store = fluree_db_core::storage::content_store_for(storage.clone(), LEDGER);
+        let store = fluree_db_core::storage::content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+        );
 
         tick.ctx.maintenance.lock().unwrap().insert(id(LEDGER));
         tick.collect_idle(std::slice::from_ref(&record)).await;
@@ -3684,11 +3700,20 @@ mod tests {
 
         let gc = try_hold_gc(&locks, &name("db")).expect("free lock");
         let result = ctx
-            .run(&id(MAIN), &cid3, &gc, InFlightBuild::GiveUp)
+            .run(
+                &id(MAIN),
+                &StorageNamespace::legacy(&id(MAIN)),
+                &cid3,
+                &gc,
+                InFlightBuild::GiveUp,
+            )
             .await
             .unwrap();
 
-        let store = fluree_db_core::storage::content_store_for(storage.clone(), MAIN);
+        let store = fluree_db_core::storage::content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(MAIN).unwrap(),
+        );
         assert_eq!(result.indexes_cleaned, 1, "t=1 goes");
         assert_eq!(result.shared_deferred, 1);
         assert!(
@@ -5125,7 +5150,11 @@ mod embedded_tests {
 
         // Write via content_write_bytes (CID = SHA-256 of full blob)
         storage
-            .content_write_bytes(ContentKind::Commit, "test:main", &blob)
+            .content_write_bytes(
+                ContentKind::Commit,
+                &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+                &blob,
+            )
             .await
             .unwrap();
 

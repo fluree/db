@@ -100,7 +100,8 @@ async fn background_indexing_trigger_wait_then_load_index_root() {
                             .admin_storage_cloned()
                             .expect("test uses managed backend"),
                         &root_cid,
-                        "it/index-wait:main",
+                        &fluree_db_core::StorageNamespace::parse_legacy("it/index-wait:main")
+                            .unwrap(),
                     )
                     .await
                     .expect("load_ledger_snapshot(root_cid)");

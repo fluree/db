@@ -128,8 +128,11 @@ where
              set IndexerConfig::data_dir to a directory on an encrypted volume"
         );
     }
-    let ledger_id_path = fluree_db_core::address_path::ledger_id_to_path_prefix(ledger_id)
-        .unwrap_or_else(|_| ledger_id.replace(':', "/"));
+    // A local scratch directory keyed by the ledger id, not a storage key.
+    let ledger_id_path = match fluree_db_core::LedgerId::parse(ledger_id) {
+        Ok(id) => format!("{}/{}", id.name(), id.branch()),
+        Err(_) => ledger_id.replace(':', "/"),
+    };
     let session_id = uuid::Uuid::new_v4().to_string();
     let run_dir = data_dir
         .join(&ledger_id_path)

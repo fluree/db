@@ -32,6 +32,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
     entries: &[crate::spatial_hook::SpatialEntry],
     predicates: &run_index::PredicateDict,
     ledger_id: &str,
+    namespace: &fluree_db_core::StorageNamespace,
     storage: &S,
 ) -> Result<Vec<(GraphId, Vec<SpatialArenaRef>)>> {
     use sha2::{Digest, Sha256};
@@ -98,7 +99,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
         // Phase 2: Upload all collected blobs to CAS.
         for (expected_hash, blob_bytes) in &pending_blobs {
             let cas_result = storage
-                .content_write_bytes(ContentKind::SpatialIndex, ledger_id, blob_bytes)
+                .content_write_bytes(ContentKind::SpatialIndex, namespace, blob_bytes)
                 .await
                 .map_err(|e| IndexerError::StorageWrite(format!("spatial CAS write: {e}")))?;
             debug_assert_eq!(
@@ -139,7 +140,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
         let root_json = serde_json::to_vec(&write_result.root)
             .map_err(|e| IndexerError::Other(format!("spatial root serialize: {e}")))?;
         let root_cas = storage
-            .content_write_bytes(ContentKind::SpatialIndex, ledger_id, &root_json)
+            .content_write_bytes(ContentKind::SpatialIndex, namespace, &root_json)
             .await
             .map_err(|e| IndexerError::StorageWrite(format!("spatial root CAS write: {e}")))?;
         let root_cid = ContentId::from_hex_digest(spatial_codec, &root_cas.content_hash)

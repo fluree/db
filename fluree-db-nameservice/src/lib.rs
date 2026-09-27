@@ -120,7 +120,9 @@ pub use tracking::{MemoryTrackingStore, RemoteName, RemoteTrackingStore, Trackin
 pub use tracking_file::FileTrackingStore;
 
 use async_trait::async_trait;
-use fluree_db_core::{format_ledger_id, ContentId, IntoLedgerId, LedgerId};
+use fluree_db_core::{
+    format_ledger_id, ContentId, IntoLedgerId, LedgerId, StorageNamespace, StorageRoot,
+};
 use fluree_vocab::ns_types;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -194,6 +196,11 @@ pub struct NsRecord {
     /// until all children are dropped.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub branches: u32,
+
+    /// The folder holding the ledger's artifacts, when it is not the ledger's
+    /// name. `None` means the root is the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<StorageRoot>,
 }
 
 pub(crate) fn is_zero(v: &u32) -> bool {
@@ -217,7 +224,20 @@ impl NsRecord {
             config_id: None,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         }
+    }
+
+    /// The folder holding the ledger's artifacts.
+    pub fn storage_root(&self) -> StorageRoot {
+        self.storage_root
+            .clone()
+            .unwrap_or_else(|| StorageRoot::legacy(&self.ledger_id.ledger_name()))
+    }
+
+    /// Where this branch's artifacts live.
+    pub fn storage_namespace(&self) -> StorageNamespace {
+        self.storage_root().namespace(&self.branch)
     }
 
     /// Check if this record has an index
@@ -368,6 +388,11 @@ pub struct GraphSourceRecord {
 }
 
 impl GraphSourceRecord {
+    /// Where the graph source's artifacts live: always under its own id.
+    pub fn storage_namespace(&self) -> StorageNamespace {
+        StorageNamespace::graph_source(&self.graph_source_id)
+    }
+
     /// Create a new GraphSourceRecord with required fields
     pub fn new(
         name: impl Into<String>,

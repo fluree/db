@@ -170,12 +170,12 @@ impl ContentAddressedWrite for ResidencyStorage {
     async fn content_write_bytes_with_hash(
         &self,
         kind: fluree_db_core::content_kind::ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> fluree_db_core::Result<ContentWriteResult> {
         self.inner
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+            .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
             .await
     }
 }
@@ -245,7 +245,10 @@ fn residency_instance(
 /// A `ContentStore` over the same residency storage, for the recovery loop's
 /// drain-and-fetch side (the browser driver holds the equivalent handle).
 fn recovery_store(storage: &ResidencyStorage) -> impl ContentStore {
-    fluree_db_core::storage::content_store_for(storage.clone(), LEDGER)
+    fluree_db_core::storage::content_store_for(
+        storage.clone(),
+        &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+    )
 }
 
 // ============================================================================

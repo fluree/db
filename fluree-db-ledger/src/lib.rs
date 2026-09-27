@@ -220,7 +220,7 @@ impl LedgerState {
             return Self::load_with_store(store, record).await;
         }
 
-        let store = backend.content_store(&record.ledger_id);
+        let store = backend.content_store(&record.storage_namespace());
         Self::load_with_store(store, record).await
     }
 
@@ -533,6 +533,16 @@ impl LedgerState {
     /// Get the ledger ID
     pub fn ledger_id(&self) -> &fluree_db_core::LedgerId {
         &self.snapshot.ledger_id
+    }
+
+    /// Where this branch's artifacts live, from its nameservice record. A
+    /// state built without one (a new ledger's genesis) is at its id's
+    /// legacy namespace.
+    pub fn storage_namespace(&self) -> fluree_db_core::StorageNamespace {
+        match &self.ns_record {
+            Some(record) => record.storage_namespace(),
+            None => fluree_db_core::StorageNamespace::legacy(self.ledger_id()),
+        }
     }
 
     /// Check if novelty is at max capacity (should block new commits)
@@ -1200,7 +1210,10 @@ mod tests {
 
     /// Helper: store FIR6 root bytes via the content store and return the CID.
     async fn store_index_root(storage: &MemoryStorage, ledger_id: &str, index_t: i64) -> ContentId {
-        let store = content_store_for(storage.clone(), ledger_id);
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+        );
         let bytes = build_test_fir6(ledger_id, index_t);
         store.put(ContentKind::IndexRoot, &bytes).await.unwrap()
     }
@@ -1211,7 +1224,10 @@ mod tests {
         ledger_id: &str,
         commit: &fluree_db_novelty::Commit,
     ) -> ContentId {
-        let store = content_store_for(storage.clone(), ledger_id);
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+        );
         let blob = fluree_db_core::commit::codec::write_commit(commit, false, None).unwrap();
         store.put(ContentKind::Commit, &blob.bytes).await.unwrap()
     }
@@ -1321,7 +1337,10 @@ mod tests {
 
         // Create an FIR6 index root at t=1 and store via CAS
         let index_cid = store_index_root(&storage, "test:main", 1).await;
-        let store = content_store_for(storage.clone(), "test:main");
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
 
         // Apply the index
         state.apply_index(&index_cid, &store).await.unwrap();
@@ -1414,7 +1433,10 @@ mod tests {
 
         // Create an FIR6 root for a different ledger, but store under test:main's CAS space
         let bytes = build_test_fir6("other:ledger", 1);
-        let store = content_store_for(storage.clone(), "test:main");
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let index_cid = store.put(ContentKind::IndexRoot, &bytes).await.unwrap();
 
         // Should fail with ledger ID mismatch
@@ -1430,7 +1452,10 @@ mod tests {
         let index_cid_t2 = store_index_root(&storage, "test:main", 2).await;
 
         // Load the LedgerSnapshot from CAS for current state
-        let store = content_store_for(storage.clone(), "test:main");
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let root_bytes = store.get(&index_cid_t2).await.unwrap();
         let snapshot = LedgerSnapshot::from_root_bytes(&root_bytes).unwrap();
         let novelty = Novelty::new(2);
@@ -1441,7 +1466,10 @@ mod tests {
         let index_cid_t1 = store_index_root(&storage, "test:main", 1).await;
 
         // Should fail with stale index error
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let result = state.apply_index(&index_cid_t1, &cs).await;
         assert!(matches!(result, Err(LedgerError::StaleIndex { .. })));
     }
@@ -1454,7 +1482,10 @@ mod tests {
         let index_cid = store_index_root(&storage, "test:main", 1).await;
 
         // Load LedgerSnapshot from CAS
-        let store = content_store_for(storage.clone(), "test:main");
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let root_bytes = store.get(&index_cid).await.unwrap();
         let snapshot = LedgerSnapshot::from_root_bytes(&root_bytes).unwrap();
         let novelty = Novelty::new(1);
@@ -1464,12 +1495,18 @@ mod tests {
         // base_t so the bytes differ (and so does the CID). We can't
         // append trailing bytes — the FIR6 decoder enforces strict
         // trailing-byte validation now.
-        let store2 = content_store_for(storage.clone(), "test:main");
+        let store2 = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let bytes2 = build_test_fir6_with_base("test:main", 1, /* base_t */ 7);
         let index_cid_same = store2.put(ContentKind::IndexRoot, &bytes2).await.unwrap();
 
         // Should succeed as no-op (equal t)
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let result = state.apply_index(&index_cid_same, &cs).await;
         assert!(result.is_ok());
         // Index_t should still be 1

@@ -377,7 +377,7 @@ impl crate::Fluree {
             crate::ApiError::Config(format!("graph source '{graph_source_id}' has no mapping"))
         })?;
         let bytes = if let Ok(cid) = mapping_ref.source.parse::<fluree_db_core::ContentId>() {
-            self.content_store(graph_source_id)
+            self.graph_source_store(graph_source_id)?
                 .get(&cid)
                 .await
                 .map_err(|e| crate::ApiError::Config(format!("read mapping: {e}")))?

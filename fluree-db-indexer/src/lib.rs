@@ -54,7 +54,7 @@ pub use config::{
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
 pub use gc::{
-    clean_garbage, current_sibling_heads, execute_sweep, nested_ledgers, plan_garbage, plan_sweep,
+    clean_garbage, current_sibling_heads, execute_sweep, nested_roots, plan_garbage, plan_sweep,
     release_garbage_plan, shared_blob_policy_for, shared_refs_of_branches, siblings_of,
     write_garbage_record, BranchIndexHead, CleanGarbageConfig, CleanGarbageResult, GarbagePlan,
     GarbageRecord, SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_MAX_OLD_INDEXES,
@@ -525,7 +525,11 @@ mod publish_barrier_tests {
     async fn the_pointer_is_published_only_after_its_artifacts_are_flushed() {
         let dir = tempfile::tempdir().unwrap();
         let storage = FileStorage::new(dir.path());
-        let store = StorageContentStore::new(storage.clone(), "l:main".to_string(), "file");
+        let store = StorageContentStore::new(
+            storage.clone(),
+            fluree_db_core::StorageNamespace::parse_legacy("l:main").unwrap(),
+            "file",
+        );
         let root_id = store.put(ContentKind::IndexRoot, b"root").await.unwrap();
         store.put(ContentKind::IndexLeaf, b"leaf").await.unwrap();
         assert_eq!(storage.fsyncs_issued(), 0, "derived writes do not flush");

@@ -250,7 +250,7 @@ impl Fluree {
                 let cs = self
                     .content_store_for_record_or_id(
                         snapshot.ns_record.as_ref(),
-                        &snapshot.snapshot.ledger_id,
+                        &snapshot.storage_namespace(),
                     )
                     .await?;
                 let bytes = cs

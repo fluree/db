@@ -105,13 +105,13 @@ impl fluree_db_core::ContentAddressedWrite for CountingStorage {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> fluree_db_core::error::Result<fluree_db_core::storage::ContentWriteResult> {
         let result = self
             .inner
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+            .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
             .await?;
         self.note_address(&result.address);
         Ok(result)
@@ -226,7 +226,7 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
             assert_ne!(root1, root2, "root CID should change after update");
 
             // Sanity: both roots decode as IndexRoot and the second root remains queryable.
-            let cs = fluree.content_store(ledger_id);
+            let cs = fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
             let bytes1 = cs.get(&root1).await.expect("root1 bytes");
             let bytes2 = cs.get(&root2).await.expect("root2 bytes");
             let v1 = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes1)

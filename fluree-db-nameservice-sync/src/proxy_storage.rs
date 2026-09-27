@@ -661,7 +661,7 @@ impl ContentAddressedWrite for ProxyStorage {
     async fn content_write_bytes_with_hash(
         &self,
         _kind: ContentKind,
-        _ledger_alias: &str,
+        _namespace: &fluree_db_core::StorageNamespace,
         _content_hash_hex: &str,
         _bytes: &[u8],
     ) -> Result<ContentWriteResult> {
@@ -673,7 +673,7 @@ impl ContentAddressedWrite for ProxyStorage {
     async fn content_write_bytes(
         &self,
         _kind: ContentKind,
-        _ledger_alias: &str,
+        _namespace: &fluree_db_core::StorageNamespace,
         _bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         Err(CoreError::storage(
@@ -738,7 +738,7 @@ mod tests {
         let address = fluree_db_core::content_address(
             "file",
             ContentKind::Txn,
-            "mydb:main",
+            &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
             &id.digest_hex(),
         );
 
@@ -776,7 +776,7 @@ mod tests {
         let address = fluree_db_core::content_address(
             "file",
             ContentKind::Txn,
-            "mydb:main",
+            &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
             &id.digest_hex(),
         );
 
@@ -806,7 +806,7 @@ mod tests {
         let address = fluree_db_core::content_address(
             "file",
             ContentKind::Txn,
-            "mydb:main",
+            &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
             &id.digest_hex(),
         );
 
@@ -873,7 +873,12 @@ mod tests {
     /// `cid_and_ledger_from_address` recovers the correct CID and ledger.
     fn assert_roundtrip(kind: ContentKind, alias: &str, data: &[u8]) {
         let id = ContentId::new(kind, data);
-        let address = fluree_db_core::content_address("file", kind, alias, &id.digest_hex());
+        let address = fluree_db_core::content_address(
+            "file",
+            kind,
+            &fluree_db_core::StorageNamespace::parse_legacy(alias).unwrap(),
+            &id.digest_hex(),
+        );
         let (cid, ledger) = cid_and_ledger_from_address(&address).expect("should parse address");
         assert_eq!(cid, id, "CID mismatch for {address}");
         assert_eq!(ledger, alias, "ledger mismatch for {address}");
@@ -1002,8 +1007,12 @@ mod tests {
         ];
         for kind in recoverable {
             let id = ContentId::new(kind, b"x");
-            let address =
-                fluree_db_core::content_address("file", kind, "mydb:main", &id.digest_hex());
+            let address = fluree_db_core::content_address(
+                "file",
+                kind,
+                &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                &id.digest_hex(),
+            );
             let (cid, ledger) = cid_and_ledger_from_address(&address)
                 .unwrap_or_else(|| panic!("no round-trip for {kind:?} at {address}"));
             assert_eq!(cid, id, "CID mismatch for {kind:?}");
@@ -1020,8 +1029,12 @@ mod tests {
             ContentKind::AnnotationReverseLeaf,
         ] {
             let id = ContentId::new(kind, b"x");
-            let address =
-                fluree_db_core::content_address("file", kind, "mydb:main", &id.digest_hex());
+            let address = fluree_db_core::content_address(
+                "file",
+                kind,
+                &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                &id.digest_hex(),
+            );
             assert!(
                 cid_and_ledger_from_address(&address).is_none(),
                 "{kind:?} unexpectedly parsed — update this test AND the parser"
@@ -1035,7 +1048,7 @@ mod tests {
         let address = fluree_db_core::content_address(
             "s3",
             ContentKind::Commit,
-            "prod:main",
+            &fluree_db_core::StorageNamespace::parse_legacy("prod:main").unwrap(),
             &id.digest_hex(),
         );
         let (cid, ledger) = cid_and_ledger_from_address(&address).expect("should parse s3 address");

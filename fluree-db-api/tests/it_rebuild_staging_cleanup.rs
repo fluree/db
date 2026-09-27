@@ -132,7 +132,10 @@ async fn failed_rebuild_removes_its_session_directories() {
     let config = fluree_db_indexer::IndexerConfig::default().with_data_dir(data_dir.path());
 
     let result = fluree_db_indexer::rebuild_index_from_commits_with_store(
-        RangeReadsFail(fluree.content_store(ledger_id)),
+        RangeReadsFail(
+            fluree
+                .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        ),
         ledger_id,
         &record,
         config,
@@ -161,7 +164,7 @@ async fn successful_rebuild_removes_its_session_directories() {
     let config = fluree_db_indexer::IndexerConfig::default().with_data_dir(data_dir.path());
 
     fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
         ledger_id,
         &record,
         config,

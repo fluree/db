@@ -201,12 +201,20 @@ const BM25_IO_CONCURRENCY: usize = 32;
 /// Logs warnings on failure but does not propagate errors.
 async fn delete_old_snapshots(storage: &dyn Storage, graph_source_id: &str, cids: &[ContentId]) {
     use fluree_db_core::ContentKind;
+    let Ok(namespace) = fluree_db_core::StorageNamespace::parse_graph_source(graph_source_id)
+    else {
+        warn!(
+            graph_source_id,
+            "invalid graph source id; old BM25 snapshots not deleted"
+        );
+        return;
+    };
     let method = storage.storage_method();
     for cid in cids {
         let addr = fluree_db_core::content_address(
             method,
             ContentKind::GraphSourceSnapshot,
-            graph_source_id,
+            &namespace,
             &cid.digest_hex(),
         );
         if let Err(e) = storage.delete(&addr).await {
@@ -492,7 +500,7 @@ impl crate::Fluree {
         use fluree_db_query::bm25::serialize;
 
         let bytes = serialize(index)?;
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let snapshot_id = cs
             .put(fluree_db_core::ContentKind::GraphSourceSnapshot, &bytes)
             .await?;
@@ -510,7 +518,7 @@ impl crate::Fluree {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
         let mut prep = prepare_chunked(index)?;
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
 
         // Drain blobs for parallel writes — finalize_chunked_root only uses
         // prep.root + prep.leaflet_infos, not leaflet_blobs.
@@ -588,7 +596,7 @@ impl crate::Fluree {
         let bytes = serde_json::to_vec(manifest)?;
 
         // Write through the content store so it's stored at the CID-mapped address
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let index_id = cs
             .put(fluree_db_core::ContentKind::IndexRoot, &bytes)
             .await?;
@@ -622,7 +630,7 @@ impl crate::Fluree {
         {
             Some(record) if record.index_id.is_some() => {
                 let index_cid = record.index_id.as_ref().unwrap();
-                let cs = self.content_store(graph_source_id);
+                let cs = self.graph_source_store(graph_source_id)?;
                 let bytes = cs.get(index_cid).await?;
                 let manifest: Bm25Manifest = serde_json::from_slice(&bytes)?;
                 Ok(manifest)
@@ -647,7 +655,7 @@ impl crate::Fluree {
             crate::ApiError::NotFound(format!("No index for graph source: {graph_source_id}"))
         })?;
 
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let bytes = cs.get(&index_cid).await?;
         let manifest: Bm25Manifest = serde_json::from_slice(&bytes)?;
         Ok(manifest)
@@ -698,7 +706,7 @@ impl crate::Fluree {
                 ))
             })?;
 
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let bytes = cs.get(&selection.snapshot_id).await?;
 
         let index = self.load_bm25_from_bytes(graph_source_id, &bytes).await?;
@@ -719,7 +727,7 @@ impl crate::Fluree {
             crate::ApiError::NotFound(format!("No snapshots in manifest for: {graph_source_id}"))
         })?;
 
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let bytes = cs.get(&head.snapshot_id).await?;
         let index = self.load_bm25_from_bytes(graph_source_id, &bytes).await?;
         Ok(Arc::new(index))
@@ -744,7 +752,7 @@ impl crate::Fluree {
 
         if is_chunked_format(bytes) {
             let root = deserialize_chunked_root(bytes)?;
-            let cs = self.content_store(graph_source_id);
+            let cs = self.graph_source_store(graph_source_id)?;
             let cache = self.leaflet_cache();
 
             let leaflet_refs = root.leaflet_refs();
@@ -879,7 +887,7 @@ impl crate::Fluree {
         let needed_leaflets = root.leaflet_refs_for_terms(&term_idxs);
 
         // Fetch needed leaflets with caching + bounded concurrency
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let cache = self.leaflet_cache();
         let mut posting_lists = vec![PostingList::default(); root.next_term_idx() as usize];
 
@@ -1071,7 +1079,7 @@ impl crate::Fluree {
         let head = manifest.head().ok_or_else(|| {
             crate::ApiError::NotFound(format!("No snapshots in manifest for: {graph_source_id}"))
         })?;
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let bytes = cs.get(&head.snapshot_id).await?;
         let mut index = self.load_bm25_from_bytes(graph_source_id, &bytes).await?;
         let old_watermark = index.watermark.get(&source_ledger_alias).unwrap_or(0);
@@ -1137,7 +1145,7 @@ impl crate::Fluree {
         //    ledger is a branch.
         let mut affected_sids: HashSet<fluree_db_core::Sid> = HashSet::new();
         let store = self
-            .content_store_for_record_or_id(ledger.ns_record.as_ref(), &ledger.snapshot.ledger_id)
+            .content_store_for_record_or_id(ledger.ns_record.as_ref(), &ledger.storage_namespace())
             .await?;
         let stream = trace_first_parent_commits_by_id(store, head_commit_id.clone(), old_watermark);
         futures::pin_mut!(stream);
@@ -1351,7 +1359,7 @@ impl crate::Fluree {
         let head = manifest.head().ok_or_else(|| {
             crate::ApiError::NotFound(format!("No snapshots in manifest for: {graph_source_id}"))
         })?;
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let bytes = cs.get(&head.snapshot_id).await?;
         let mut index = self.load_bm25_from_bytes(graph_source_id, &bytes).await?;
         let old_watermark = index.watermark.get(&source_ledger).unwrap_or(0);
@@ -1481,7 +1489,7 @@ impl crate::Fluree {
             crate::ApiError::NotFound(format!("No snapshots in manifest for: {graph_source_id}"))
         })?;
 
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let bytes = cs.get(&head.snapshot_id).await?;
         let index = self.load_bm25_from_bytes(graph_source_id, &bytes).await?;
 
@@ -1733,12 +1741,17 @@ where {
         let method = storage.storage_method().to_string();
         let mut deleted = 0;
         let mut warnings = Vec::new();
+        let namespace = match fluree_db_core::StorageNamespace::parse_graph_source(graph_source_id)
+        {
+            Ok(namespace) => namespace,
+            Err(e) => return (0, vec![format!("Snapshots not deleted: {e}")]),
+        };
 
         for cid in manifest.all_snapshot_ids() {
             let addr = fluree_db_core::content_address(
                 &method,
                 fluree_db_core::ContentKind::GraphSourceSnapshot,
-                graph_source_id,
+                &namespace,
                 &cid.digest_hex(),
             );
             match storage.delete(&addr).await {

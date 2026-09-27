@@ -1565,7 +1565,10 @@ mod tests {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let (receipt, new_state) = commit(
             view,
             ns_registry,
@@ -1606,7 +1609,10 @@ mod tests {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let result = commit(
             view,
             ns_registry,
@@ -1632,7 +1638,10 @@ mod tests {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
 
         // First commit
         let txn1 = Txn::insert().with_insert(TripleTemplate::new(
@@ -1718,7 +1727,10 @@ mod tests {
             reindex_max_bytes: 100, // Smaller than the big flake
         };
 
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let result = commit(
             view,
             ns_registry,
@@ -1764,7 +1776,10 @@ mod tests {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let result = commit(
             view,
             ns_registry,
@@ -1811,9 +1826,14 @@ mod tests {
             .await
             .unwrap();
 
-        let cs = content_store_for(storage.clone(), "test:main");
-        let upload_cs: Arc<dyn ContentStore> =
-            Arc::new(content_store_for(storage.clone(), "test:main"));
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
+        let upload_cs: Arc<dyn ContentStore> = Arc::new(content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        ));
         let raw_txn = serde_json::json!({ "raw": "payload" });
         let raw_txn_bytes = serde_json::to_vec(&raw_txn).expect("serialize raw txn");
         let expected_cid = ContentId::new(ContentKind::Txn, &raw_txn_bytes);

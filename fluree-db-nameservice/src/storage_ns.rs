@@ -440,6 +440,7 @@ where
                 .source_branch
                 .or_else(|| main.branch_point.map(|bp| bp.source)),
             branches: main.branches,
+            storage_root: None,
         };
 
         // Merge index file if it has equal or higher t (READ-TIME merge rule)
@@ -1826,7 +1827,7 @@ mod tests {
         async fn content_write_bytes_with_hash(
             &self,
             _kind: fluree_db_core::ContentKind,
-            _ledger_id: &str,
+            _namespace: &fluree_db_core::StorageNamespace,
             content_hash_hex: &str,
             bytes: &[u8],
         ) -> fluree_db_core::Result<fluree_db_core::ContentWriteResult> {
@@ -1968,14 +1969,14 @@ mod tests {
         async fn content_write_bytes_with_hash(
             &self,
             kind: fluree_db_core::ContentKind,
-            ledger_id: &str,
+            namespace: &fluree_db_core::StorageNamespace,
             content_hash_hex: &str,
             bytes: &[u8],
         ) -> fluree_db_core::Result<fluree_db_core::ContentWriteResult> {
             fluree_db_core::ContentAddressedWrite::content_write_bytes_with_hash(
                 &self.inner,
                 kind,
-                ledger_id,
+                namespace,
                 content_hash_hex,
                 bytes,
             )

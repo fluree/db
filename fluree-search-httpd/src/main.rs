@@ -147,7 +147,8 @@ impl FileIndexLoader {
             None => return Ok(Bm25Manifest::new(graph_source_id)),
         };
 
-        let cs = fluree_db_core::content_store_for(self.storage.clone(), graph_source_id);
+        let cs =
+            fluree_db_core::content_store_for(self.storage.clone(), &record.storage_namespace());
         let bytes = cs
             .get(index_cid)
             .await
@@ -179,7 +180,11 @@ impl IndexLoader for FileIndexLoader {
             })?;
 
         // Load index bytes via content store
-        let cs = fluree_db_core::content_store_for(self.storage.clone(), graph_source_id);
+        let namespace = fluree_db_core::StorageNamespace::parse_graph_source(graph_source_id)
+            .map_err(|e| ServiceError::Internal {
+                message: format!("Invalid graph source id {graph_source_id}: {e}"),
+            })?;
+        let cs = fluree_db_core::content_store_for(self.storage.clone(), &namespace);
         let bytes = cs
             .get(&entry.snapshot_id)
             .await
@@ -254,11 +259,12 @@ impl VectorIndexLoader for FileVectorIndexLoader {
             address: graph_source_id.to_string(),
         })?;
 
+        let namespace = record.storage_namespace();
         let index_cid = record.index_id.ok_or_else(|| ServiceError::Internal {
             message: format!("No index CID for vector graph source: {graph_source_id}"),
         })?;
 
-        let cs = fluree_db_core::content_store_for(self.storage.clone(), graph_source_id);
+        let cs = fluree_db_core::content_store_for(self.storage.clone(), &namespace);
         let bytes = cs
             .get(&index_cid)
             .await

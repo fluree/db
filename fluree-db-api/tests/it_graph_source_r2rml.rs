@@ -5120,7 +5120,7 @@ async fn read_head_stamp(
         .expect("ledger exists");
     let head = rec.commit_head_id.expect("ledger has commits");
     let raw = fluree
-        .content_store(ledger)
+        .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger).unwrap())
         .get(&head)
         .await
         .expect("read head commit blob");

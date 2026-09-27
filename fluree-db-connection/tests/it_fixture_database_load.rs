@@ -103,9 +103,13 @@ async fn loads_fixture_database_and_scans_triples() {
     let db = match &conn {
         ConnectionHandle::File { storage, .. } => {
             let fresh = fluree_db_core::FileStorage::new(storage.base_path());
-            fluree_db_core::load_ledger_snapshot(&fresh, &root_id, TEST_LEDGER_ID)
-                .await
-                .unwrap()
+            fluree_db_core::load_ledger_snapshot(
+                &fresh,
+                &root_id,
+                &fluree_db_core::StorageNamespace::parse_legacy(TEST_LEDGER_ID).unwrap(),
+            )
+            .await
+            .unwrap()
         }
         _ => panic!("Expected File connection"),
     };

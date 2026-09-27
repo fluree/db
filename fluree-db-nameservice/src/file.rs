@@ -383,6 +383,7 @@ impl FileNameService {
                 .source_branch
                 .or_else(|| main.branch_point.map(|bp| bp.source)),
             branches: main.branches,
+            storage_root: None,
         };
 
         // Merge index file if it has equal or higher t (READ-TIME merge rule)

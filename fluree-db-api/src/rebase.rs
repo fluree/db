@@ -5,12 +5,12 @@
 //! upstream changes.
 
 use crate::error::{ApiError, Result};
-use fluree_db_core::LedgerId;
 use fluree_db_core::{
     range_with_overlay, ConflictKey, ContentId, Flake, IndexType, RangeMatch, RangeOptions,
     RangeTest, DEFAULT_GRAPH_ID,
 };
 use fluree_db_core::{trace_first_parent_commits_by_id, Commit};
+use fluree_db_core::{LedgerId, StorageNamespace};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
 use fluree_db_novelty::{compute_delta_keys, FactKey};
@@ -144,6 +144,8 @@ pub struct StagedRebase {
     pub branch: String,
     /// Fully-qualified branch id (`"<ledger>:<branch>"`).
     pub branch_id: LedgerId,
+    /// Where the branch's artifacts live.
+    pub branch_namespace: StorageNamespace,
     /// Source branch name (without ledger prefix).
     pub source: String,
     /// Fully-qualified source id.
@@ -318,6 +320,7 @@ impl crate::Fluree {
             .lookup(&branch_id)
             .await?
             .ok_or_else(|| ApiError::NotFound(branch_id.clone().to_string()))?;
+        let branch_namespace = branch_record.storage_namespace();
 
         // Refuse the root structurally — there's nothing to rebase onto.
         // "main" carries no special meaning here; a ledger whose root is
@@ -370,7 +373,7 @@ impl crate::Fluree {
         if is_fast_forward {
             // Copy the source index into the branch namespace
             // (best-effort, matches local single-node behavior).
-            self.copy_source_index(&source_id, &branch_id, &source_record)
+            self.copy_source_index(&source_id, &branch_id, &branch_namespace, &source_record)
                 .await;
 
             // Load the source's state under the branch's id so the
@@ -383,6 +386,7 @@ impl crate::Fluree {
             return Ok(StagedRebase {
                 branch: branch.to_string(),
                 branch_id,
+                branch_namespace,
                 source: source_name_owned,
                 source_id,
                 source_head_id: source_head_id.clone(),
@@ -415,7 +419,7 @@ impl crate::Fluree {
             .await?;
             compute_delta_keys(source_store, source_head_id.clone(), ancestor.t).await?
         } else {
-            let source_store = self.content_store(&source_id);
+            let source_store = self.content_store(&source_record.storage_namespace());
             compute_delta_keys(source_store, source_head_id.clone(), ancestor.t).await?
         };
 
@@ -540,7 +544,7 @@ impl crate::Fluree {
         // source's index and its own commits dropped out of every read.
         // Replay itself reads the source's state, never the copied index,
         // so nothing above needs this to have happened. Best-effort.
-        self.copy_source_index(&source_id, &branch_id, &source_record)
+        self.copy_source_index(&source_id, &branch_id, &branch_namespace, &source_record)
             .await;
 
         let new_head_id = pending_replays.last().map(|b| b.commit_id.clone());
@@ -549,6 +553,7 @@ impl crate::Fluree {
         Ok(StagedRebase {
             branch: branch.to_string(),
             branch_id,
+            branch_namespace,
             source: source_name_owned,
             source_id,
             source_head_id,
@@ -582,6 +587,7 @@ impl crate::Fluree {
         let StagedRebase {
             branch: _,
             branch_id,
+            branch_namespace,
             source: _,
             source_id: _,
             source_head_id,
@@ -603,7 +609,7 @@ impl crate::Fluree {
 
         if let Some(ref last_head_id) = new_head_id {
             if !pending_replays.is_empty() {
-                let content_store = self.content_store(&branch_id);
+                let content_store = self.content_store(&branch_namespace);
                 for blob in &pending_replays {
                     content_store
                         .put_with_id(&blob.commit_id, &blob.commit_bytes)
@@ -847,11 +853,12 @@ impl crate::Fluree {
         &self,
         source_id: &str,
         branch_id: &str,
+        branch: &StorageNamespace,
         source_record: &fluree_db_nameservice::NsRecord,
     ) {
         if let Some(ref index_cid) = source_record.index_head_id {
             if let Err(e) = self
-                .copy_index_to_branch(source_id, branch_id, index_cid)
+                .copy_index_to_branch(source_id, branch, index_cid)
                 .await
             {
                 tracing::warn!(

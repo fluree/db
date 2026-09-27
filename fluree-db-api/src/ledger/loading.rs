@@ -266,7 +266,11 @@ impl Fluree {
                 // Copy the source's index files into the new branch's
                 // namespace so it owns its own copy, safe from GC on source.
                 if let Err(e) = self
-                    .copy_index_to_branch(&source_id, &new_id, index_cid)
+                    .copy_index_to_branch(
+                        &source_id,
+                        &source_record.storage_root().namespace(new_branch),
+                        index_cid,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -304,7 +308,7 @@ impl Fluree {
     pub(crate) async fn copy_index_to_branch(
         &self,
         source_id: &str,
-        target_id: &str,
+        target: &fluree_db_core::StorageNamespace,
         index_cid: &fluree_db_core::ContentId,
     ) -> Result<()> {
         use fluree_db_binary_index::collect_root_cas_ids_expanded;
@@ -390,7 +394,7 @@ impl Fluree {
                 // durability instead of the instance's: page-cache now, one
                 // batched flush below before the pointer is published.
                 storage
-                    .content_write_bytes_with_hash(kind, target_id, &hex, &bytes)
+                    .content_write_bytes_with_hash(kind, target, &hex, &bytes)
                     .await
                     .map(|_| ())
                     .map_err(ApiError::from)
@@ -401,12 +405,12 @@ impl Fluree {
         .await?;
         storage.sync().await.map_err(|e| {
             ApiError::internal(format!(
-                "failed to flush index artifacts copied to {target_id}: {e}"
+                "failed to flush index artifacts copied to {target}: {e}"
             ))
         })?;
 
         tracing::info!(
-            source = %source_id, target = %target_id,
+            source = %source_id, target = %target,
             count = artifact_count,
             "copied index artifacts to branch namespace"
         );

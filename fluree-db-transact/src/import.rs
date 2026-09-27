@@ -124,7 +124,7 @@ mod inner {
     /// * `state` — mutable import state (carried across chunks)
     /// * `ttl` — Turtle input text
     /// * `storage` — storage backend for writing commit blobs
-    /// * `ledger_id` — ledger name for storage path construction
+    /// * `namespace` — where the commit blobs are written
     /// * `skolem_base` — document-scoped blank-node key, built by the caller
     ///   via `fluree_db_core::skolem::skolem_base`
     /// * `compress` — whether to zstd-compress the ops stream
@@ -133,7 +133,7 @@ mod inner {
         state: &mut ImportState,
         ttl: &str,
         storage: &S,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         skolem_base: &str,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
@@ -251,7 +251,7 @@ mod inner {
         let write_res = {
             use tracing::Instrument as _;
             storage
-                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .content_write_bytes(ContentKind::Commit, namespace, &result.bytes)
                 .instrument(tracing::debug_span!("import_store", t = new_t, blob_bytes))
                 .await?
         };
@@ -288,7 +288,7 @@ mod inner {
         ttl: &str,
         prelude: &TurtlePrelude,
         storage: &S,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         skolem_base: &str,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
@@ -410,7 +410,7 @@ mod inner {
         let write_res = {
             use tracing::Instrument as _;
             storage
-                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .content_write_bytes(ContentKind::Commit, namespace, &result.bytes)
                 .instrument(tracing::debug_span!("import_store", t = new_t, blob_bytes))
                 .await?
         };
@@ -452,7 +452,8 @@ mod inner {
     /// * `state` — mutable import state (carried across chunks)
     /// * `trig` — TriG input text (Turtle-compatible if no GRAPH blocks)
     /// * `storage` — storage backend for writing commit blobs
-    /// * `ledger_id` — ledger name for storage path construction
+    /// * `ledger_id` — the ledger's id, for its system graph IRIs
+    /// * `namespace` — where the commit blobs are written
     /// * `skolem_base` — document-scoped blank-node key, built by the caller
     ///   via `fluree_db_core::skolem::skolem_base`
     /// * `compress` — whether to zstd-compress the ops stream
@@ -462,6 +463,7 @@ mod inner {
         trig: &str,
         storage: &S,
         ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         skolem_base: &str,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
@@ -482,7 +484,7 @@ mod inner {
                 state,
                 trig,
                 storage,
-                ledger_id,
+                namespace,
                 skolem_base,
                 compress,
                 spool_dir,
@@ -802,7 +804,7 @@ mod inner {
         let write_res = {
             use tracing::Instrument as _;
             storage
-                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .content_write_bytes(ContentKind::Commit, namespace, &result.bytes)
                 .instrument(tracing::debug_span!(
                     "import_trig_store",
                     t = new_t,
@@ -1276,7 +1278,7 @@ mod inner {
         parsed: ParsedChunk,
         ns_delta: HashMap<u16, String>,
         storage: &S,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
     ) -> Result<ImportCommitResult>
     where
         S: ContentAddressedWrite,
@@ -1325,7 +1327,7 @@ mod inner {
             let blob_bytes = result.bytes.len();
 
             let write_res = storage
-                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .content_write_bytes(ContentKind::Commit, namespace, &result.bytes)
                 .await?;
 
             tracing::debug!(

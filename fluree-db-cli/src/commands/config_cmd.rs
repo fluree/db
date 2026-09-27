@@ -392,7 +392,14 @@ pub async fn run_set_origins(ledger: &str, file: &Path, dirs: &FlureeDir) -> Cli
 
     // Serialize to canonical bytes and store in CAS.
     let canonical_bytes = config.to_bytes();
-    let content_store = fluree.content_store(&ledger_id);
+    let namespace = fluree
+        .nameservice()
+        .lookup(&ledger_id)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?
+        .ok_or_else(|| CliError::NotFound(format!("ledger '{ledger_id}' not found")))?
+        .storage_namespace();
+    let content_store = fluree.content_store(&namespace);
     let cid = content_store
         .put(ContentKind::LedgerConfig, &canonical_bytes)
         .await

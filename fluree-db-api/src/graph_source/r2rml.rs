@@ -1110,7 +1110,7 @@ impl crate::Fluree {
                 let compiled = Self::compile_r2rml_content(content, media_type, "")?;
                 check(&compiled)?;
                 let cid = self
-                    .content_store(graph_source_id)
+                    .graph_source_store(graph_source_id)?
                     .put(
                         fluree_db_core::ContentKind::GraphSourceMapping,
                         content.as_bytes(),
@@ -2376,7 +2376,10 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
         // Try CID-based content store first (CAS-stored mappings),
         // fall back to raw storage read (legacy address-based mappings).
         let mapping_bytes = if let Ok(cid) = mapping_source.parse::<fluree_db_core::ContentId>() {
-            let cs = self.fluree.content_store(graph_source_id);
+            let cs = self
+                .fluree
+                .graph_source_store(graph_source_id)
+                .map_err(|e| QueryError::Internal(e.to_string()))?;
             cs.get(&cid).await.map_err(|e| {
                 QueryError::InvalidQuery(format!(
                     "Failed to load R2RML mapping (CID {mapping_source}): {e}"

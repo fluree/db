@@ -156,7 +156,6 @@ pub use dataset::{
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
-pub use fluree_db_core::storage::ledger_id_prefix_for_path;
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::VerifiedIdentity;
 pub use fluree_db_core::{
@@ -166,6 +165,7 @@ pub use fluree_db_core::{
 pub use fluree_db_core::{
     CommitId, ContentId, LedgerId, LedgerIdParseError, LedgerName, LedgerRef,
 };
+pub use fluree_db_core::{StorageNamespace, StorageRoot};
 pub use format::{
     sparql_service_description, AgentJsonContext, FormatError, FormatterConfig, OutputFormat,
     QueryOutput,
@@ -979,7 +979,7 @@ where
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, fluree_db_core::Error> {
@@ -987,12 +987,12 @@ where
         match kind {
             ContentKind::Commit | ContentKind::Txn => {
                 self.commit
-                    .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+                    .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
                     .await
             }
             _ => {
                 self.index
-                    .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+                    .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
                     .await
             }
         }
@@ -1001,17 +1001,17 @@ where
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, fluree_db_core::Error> {
         // Commit blobs + txn blobs go to commit storage.
         match kind {
             ContentKind::Commit | ContentKind::Txn => {
                 self.commit
-                    .content_write_bytes(kind, ledger_id, bytes)
+                    .content_write_bytes(kind, namespace, bytes)
                     .await
             }
-            _ => self.index.content_write_bytes(kind, ledger_id, bytes).await,
+            _ => self.index.content_write_bytes(kind, namespace, bytes).await,
         }
     }
 }
@@ -1185,23 +1185,23 @@ impl ContentAddressedWrite for AddressIdentifierResolverStorage {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, fluree_db_core::Error> {
         self.default
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+            .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
             .await
     }
 
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, fluree_db_core::Error> {
         self.default
-            .content_write_bytes(kind, ledger_id, bytes)
+            .content_write_bytes(kind, namespace, bytes)
             .await
     }
 }
@@ -3738,9 +3738,21 @@ impl Fluree {
         &self.backend
     }
 
-    /// Get a content store scoped to the given namespace/ledger ID.
-    pub fn content_store(&self, namespace_id: &str) -> Arc<dyn ContentStore> {
-        self.backend.content_store(namespace_id)
+    /// Get a content store scoped to one branch's storage namespace.
+    ///
+    /// Take the namespace from the branch's nameservice record
+    /// ([`NsRecord::storage_namespace`](fluree_db_nameservice::NsRecord::storage_namespace))
+    /// or loaded state ([`LedgerState::storage_namespace`]); a ledger id alone
+    /// does not say where its artifacts live.
+    pub fn content_store(&self, namespace: &StorageNamespace) -> Arc<dyn ContentStore> {
+        self.backend.content_store(namespace)
+    }
+
+    /// Get a content store for a graph source's artifacts, which always live
+    /// under its own id.
+    pub fn graph_source_store(&self, graph_source_id: &str) -> Result<Arc<dyn ContentStore>> {
+        let namespace = StorageNamespace::parse_graph_source(graph_source_id)?;
+        Ok(self.backend.content_store(&namespace))
     }
 
     /// Get a content store for `ledger_id` that walks branch ancestry on
@@ -3766,8 +3778,7 @@ impl Fluree {
     }
 
     /// Resolve a content store from an `Option<NsRecord>`, falling back
-    /// to the flat namespace store keyed by `fallback_id` when no record
-    /// is present.
+    /// to the flat store for `fallback` when no record is present.
     ///
     /// This collapses the recurring `match record { Some(...) => ..., None
     /// => ... }` pattern at every site that wants a branch-aware store
@@ -3775,13 +3786,13 @@ impl Fluree {
     pub(crate) async fn content_store_for_record_or_id(
         &self,
         record: Option<&fluree_db_nameservice::NsRecord>,
-        fallback_id: &str,
+        fallback: &StorageNamespace,
     ) -> Result<Arc<dyn ContentStore>> {
         Ok(fluree_db_nameservice::content_store_for_record_or_id(
             &self.backend,
             self.nameservice_mode.reader(),
             record,
-            fallback_id,
+            fallback,
         )
         .await?)
     }
@@ -5273,12 +5284,13 @@ impl Fluree {
             .await?
             .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
         let canonical_id = &record.ledger_id;
+        let namespace = record.storage_namespace();
 
         // Serialize and write context blob to CAS
         let context_bytes = serde_json::to_vec(context)
             .map_err(|e| ApiError::internal(format!("failed to serialize context: {e}")))?;
 
-        let cs = self.content_store(canonical_id);
+        let cs = self.content_store(&namespace);
         let new_cid = cs
             .put(ContentKind::LedgerConfig, &context_bytes)
             .await
@@ -5319,7 +5331,7 @@ impl Fluree {
                     // GC old blob if CID changed.
                     if let Some(old) = old_cid {
                         if old != new_cid {
-                            let cs = self.content_store(canonical_id);
+                            let cs = self.content_store(&namespace);
                             if let Err(e) = cs.release(&old).await {
                                 tracing::debug!(
                                     %e,
@@ -5347,7 +5359,7 @@ impl Fluree {
         }
 
         // All retries exhausted — best-effort GC the orphan blob we wrote.
-        let cs = self.content_store(canonical_id);
+        let cs = self.content_store(&namespace);
         if let Err(e) = cs.release(&new_cid).await {
             tracing::debug!(
                 %e,

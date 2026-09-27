@@ -691,12 +691,14 @@ pub async fn release_garbage_plan(
     sibling_candidates: Option<&[fluree_db_core::LedgerId]>,
     cache_dir: Option<&Path>,
 ) -> Result<CleanGarbageResult> {
-    let head = nameservice
+    let record = nameservice
         .lookup(ledger_id)
         .await
-        .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?
-        .and_then(|record| record.index_head_id);
-    let Some(head) = head else {
+        .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
+    let Some((head, namespace)) = record.and_then(|record| {
+        let namespace = record.storage_namespace();
+        record.index_head_id.map(|head| (head, namespace))
+    }) else {
         tracing::debug!(ledger_id = %ledger_id, "ledger has no index head; releasing nothing");
         return Ok(CleanGarbageResult::default());
     };
@@ -718,7 +720,7 @@ pub async fn release_garbage_plan(
         }
         None => SharedBlobPolicy::Defer,
     };
-    let store = backend.content_store(ledger_id);
+    let store = backend.content_store(&namespace);
     plan.release(store.as_ref(), &head, &shared_blobs).await
 }
 
@@ -887,7 +889,10 @@ mod tests {
 
     /// Build a content store from MemoryStorage for testing.
     fn test_store(storage: &MemoryStorage) -> impl ContentStore + '_ {
-        content_store_for(storage.clone(), LEDGER)
+        content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+        )
     }
 
     /// Build a minimal FIR6 root with the given t, prev_index, and garbage.

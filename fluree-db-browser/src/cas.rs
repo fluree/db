@@ -190,15 +190,19 @@ impl BrowserCasStorage {
         self.inner.residency.begin_query()
     }
 
-    /// The canonical storage address for a CID under `ledger`, using this
+    /// The canonical storage address for a CID under `namespace`, using this
     /// storage's method. `None` for CIDs whose kind has no distinct address
     /// (the annotation arenas).
-    pub fn address_for(&self, ledger: &str, cid: &ContentId) -> Option<String> {
+    pub fn address_for(
+        &self,
+        namespace: &fluree_db_core::StorageNamespace,
+        cid: &ContentId,
+    ) -> Option<String> {
         let kind = cid.content_kind()?;
         Some(fluree_db_core::content_address(
             self.storage_method(),
             kind,
-            ledger,
+            namespace,
             &cid.digest_hex(),
         ))
     }
@@ -208,12 +212,16 @@ impl BrowserCasStorage {
     /// reads. This is the fetch half of the miss-register drain loop —
     /// hand it the CIDs from the drained wants. Returns per-CID failures;
     /// empty means everything is resident.
-    pub async fn fetch_cids<I>(&self, ledger: &str, cids: I) -> Vec<(ContentId, CoreError)>
+    pub async fn fetch_cids<I>(
+        &self,
+        namespace: &fluree_db_core::StorageNamespace,
+        cids: I,
+    ) -> Vec<(ContentId, CoreError)>
     where
         I: IntoIterator<Item = ContentId>,
     {
         let futures = cids.into_iter().map(|cid| async move {
-            let result = match self.address_for(ledger, &cid) {
+            let result = match self.address_for(namespace, &cid) {
                 Some(address) => self.load(&address).await.map(|_| ()),
                 None => Err(CoreError::storage(format!(
                     "CID {cid} has no addressable storage kind"
@@ -233,14 +241,14 @@ impl BrowserCasStorage {
     /// retry primitive, for callers that hold the ledger context.
     pub async fn fetch_wants<I>(
         &self,
-        ledger: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         wants: I,
         pins: &PinSet,
     ) -> Vec<(ContentId, CoreError)>
     where
         I: IntoIterator<Item = Want>,
     {
-        self.fetch_cids_pinned(ledger, wants.into_iter().map(|w| w.cid), pins)
+        self.fetch_cids_pinned(namespace, wants.into_iter().map(|w| w.cid), pins)
             .await
     }
 
@@ -248,7 +256,7 @@ impl BrowserCasStorage {
     /// CID into `pins` so it survives until the pin set drops.
     pub async fn fetch_cids_pinned<I>(
         &self,
-        ledger: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         cids: I,
         pins: &PinSet,
     ) -> Vec<(ContentId, CoreError)>
@@ -256,7 +264,7 @@ impl BrowserCasStorage {
         I: IntoIterator<Item = ContentId>,
     {
         let cids: Vec<ContentId> = cids.into_iter().collect();
-        let mut failures = self.fetch_cids(ledger, cids.clone()).await;
+        let mut failures = self.fetch_cids(namespace, cids.clone()).await;
         for cid in &cids {
             if failures.iter().any(|(failed, _)| failed == cid) {
                 continue;
@@ -597,25 +605,25 @@ impl ContentAddressedWrite for BrowserCasStorage {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_alias: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         self.inner
             .proxy
-            .content_write_bytes_with_hash(kind, ledger_alias, content_hash_hex, bytes)
+            .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
             .await
     }
 
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_alias: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         self.inner
             .proxy
-            .content_write_bytes(kind, ledger_alias, bytes)
+            .content_write_bytes(kind, namespace, bytes)
             .await
     }
 }
@@ -658,6 +666,10 @@ pub(crate) mod tests {
 
     pub(crate) const API_BASE: &str = "http://origin.example/v1/fluree";
     pub(crate) const LEDGER: &str = "mydb:main";
+
+    pub(crate) fn ledger_namespace() -> fluree_db_core::StorageNamespace {
+        fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap()
+    }
 
     /// Shared state of the mock driver: canned objects by CID string, the
     /// persistent-cache contents, and observation logs.
@@ -807,7 +819,7 @@ pub(crate) mod tests {
         let address = fluree_db_core::content_address(
             "proxy",
             ContentKind::IndexLeaf,
-            LEDGER,
+            &ledger_namespace(),
             &id.digest_hex(),
         );
         (id, address, bytes)
@@ -1293,7 +1305,9 @@ pub(crate) mod tests {
             .map(|(id, _, _)| id.clone())
             .chain([missing.0.clone()])
             .collect();
-        let failures = storage.fetch_cids_pinned(LEDGER, wants, &pins).await;
+        let failures = storage
+            .fetch_cids_pinned(&ledger_namespace(), wants, &pins)
+            .await;
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].0, missing.0);
         assert!(matches!(failures[0].1, CoreError::NotFound(_)));
@@ -1328,7 +1342,8 @@ pub(crate) mod tests {
             .objects
             .insert(id.to_string(), (200, bytes.clone()));
         let (storage, io, driver) = storage_with(&state, &config());
-        let bridge = fluree_db_core::storage::content_store_for(storage.clone(), LEDGER);
+        let bridge =
+            fluree_db_core::storage::content_store_for(storage.clone(), &ledger_namespace());
 
         // Retry frames hold a query guard; eviction stays frozen throughout.
         let _guard = storage.query_guard();

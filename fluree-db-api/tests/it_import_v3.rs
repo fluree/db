@@ -821,7 +821,9 @@ ex:bob a ex:User ;
     let indexer_config = fluree_db_indexer::IndexerConfig::default();
 
     let index_result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store("test/v3-rebuild:main"),
+        fluree.content_store(
+            &fluree_db_core::StorageNamespace::parse_legacy("test/v3-rebuild:main").unwrap(),
+        ),
         "test/v3-rebuild:main",
         &ns_record,
         indexer_config,
@@ -993,7 +995,9 @@ ex:bob a ex:User ;
     let rebuild_config = fluree_db_indexer::IndexerConfig::default();
 
     let rebuild_result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store("test/v3-incr:main"),
+        fluree.content_store(
+            &fluree_db_core::StorageNamespace::parse_legacy("test/v3-incr:main").unwrap(),
+        ),
         "test/v3-incr:main",
         &ns_record,
         rebuild_config,
@@ -1067,7 +1071,9 @@ ex:bob a ex:User ;
     );
 
     let index_result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store("test/v3-incr:main"),
+        fluree.content_store(
+            &fluree_db_core::StorageNamespace::parse_legacy("test/v3-incr:main").unwrap(),
+        ),
         fluree.nameservice(),
         "test/v3-incr:main",
         indexer_config,
@@ -1267,7 +1273,9 @@ ex:remove a ex:User ;
     let indexer_config = fluree_db_indexer::IndexerConfig::default();
 
     let index_result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store("test/v3-retract:main"),
+        fluree.content_store(
+            &fluree_db_core::StorageNamespace::parse_legacy("test/v3-retract:main").unwrap(),
+        ),
         "test/v3-retract:main",
         &ns_record,
         indexer_config,

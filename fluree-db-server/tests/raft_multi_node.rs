@@ -1141,7 +1141,7 @@ async fn push_with_merges_through_a_follower() {
     let stored = cluster.nodes[0]
         ._state
         .fluree
-        .content_store(ledger)
+        .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger).unwrap())
         .get(&txn)
         .await;
     assert!(

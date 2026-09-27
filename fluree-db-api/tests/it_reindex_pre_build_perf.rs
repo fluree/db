@@ -177,7 +177,9 @@ async fn first_t_where_graph_registered_no_full_reads_when_iri_absent() {
         .expect("ns record");
     assert_eq!(record.commit_t, N as i64);
 
-    let counted = CountingContentStore::new(fluree.content_store(ledger_id));
+    let counted = CountingContentStore::new(
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+    );
     let counters = counted.counters();
     let head = record.commit_head_id.expect("head");
 
@@ -272,9 +274,13 @@ async fn first_t_where_graph_registered_returns_lowest_t_when_iri_present() {
         .expect("ns record");
     let head = record.commit_head_id.expect("head");
 
-    let probe = first_t_where_graph_registered(&fluree.content_store(ledger_id), &head, &cfg_iri)
-        .await
-        .expect("envelope walk");
+    let probe = first_t_where_graph_registered(
+        &fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+        &head,
+        &cfg_iri,
+    )
+    .await
+    .expect("envelope walk");
 
     assert_eq!(
         probe,

@@ -209,6 +209,7 @@ mod tests {
             default_context: None,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         }
     }
 

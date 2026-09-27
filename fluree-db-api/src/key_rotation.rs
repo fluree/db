@@ -277,14 +277,17 @@ impl Fluree {
             }
             units.push(Unit {
                 label: record.ledger_id.to_string(),
-                prefix: format!("fluree:{method}://{}/", record.ledger_id.path_prefix()),
+                prefix: format!(
+                    "fluree:{method}://{}/",
+                    record.storage_namespace().branch_prefix()
+                ),
             });
-            shared.insert(record.ledger_id.ledger_name());
+            shared.insert(record.storage_root());
         }
-        for name in shared {
+        for root in shared {
             units.push(Unit {
-                label: format!("{name} (shared dictionaries)"),
-                prefix: format!("fluree:{method}://{}/", name.shared_prefix()),
+                label: format!("{root} (shared dictionaries)"),
+                prefix: format!("fluree:{method}://{}/", root.shared_prefix()),
             });
         }
         if scope.is_none() {

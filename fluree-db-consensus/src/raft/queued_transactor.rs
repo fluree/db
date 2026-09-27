@@ -38,6 +38,7 @@ use fluree_db_api::{CommitReceipt, Fluree};
 use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
 use fluree_db_core::ContentId;
 use fluree_db_core::ContentKind;
+use fluree_db_core::StorageNamespace;
 use fluree_db_transact::CommitOptsRequest;
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -403,9 +404,12 @@ impl QueuedTransactor {
     /// to the caller, since the submission has already returned its
     /// terminal status.
     async fn release_envelope(&self, ledger_id: &str, request_cid: &ContentId) {
+        let Ok(namespace) = StorageNamespace::parse_legacy(ledger_id) else {
+            return;
+        };
         if let Err(err) = self
             .fluree
-            .content_store(ledger_id)
+            .content_store(&namespace)
             .release(request_cid)
             .await
         {
@@ -456,9 +460,15 @@ impl QueuedTransactor {
                 status: 500,
                 message: format!("QueuedRequest encode failed: {e}"),
             })?;
+        let namespace = StorageNamespace::parse_legacy(&full_ledger_id).map_err(|e| {
+            SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            }
+        })?;
         let request_cid = self
             .fluree
-            .content_store(&full_ledger_id)
+            .content_store(&namespace)
             .put(ContentKind::Txn, &bytes)
             .await
             .map_err(|e| SubmissionError::Execution {
@@ -785,7 +795,12 @@ impl Committer for QueuedTransactor {
         // Upload each commit's bytes to the per-ledger content store
         // and record its CID. The envelope carries only the CIDs;
         // the worker reads the bytes back when staging.
-        let content_store = self.fluree.content_store(&ledger_id);
+        let namespace =
+            StorageNamespace::parse_legacy(&ledger_id).map_err(|e| SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            })?;
+        let content_store = self.fluree.content_store(&namespace);
         let upload = |blobs: Vec<Vec<u8>>| {
             let content_store = content_store.clone();
             async move {

@@ -271,7 +271,7 @@ async fn seed_index_and_query(
         .expect("lookup")
         .expect("record");
     let result = fluree_db_indexer::build_index_for_record(
-        fluree.content_store(&ledger_id),
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(&ledger_id).unwrap()),
         &record,
         fluree_db_indexer::IndexerConfig::default().with_data_dir(data_dir),
     )

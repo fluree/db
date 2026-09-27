@@ -67,6 +67,8 @@ struct LedgerSseRecord {
     source_branch: Option<String>,
     #[serde(default)]
     branches: u32,
+    #[serde(default)]
+    storage_root: Option<fluree_db_core::StorageRoot>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -153,6 +155,7 @@ fn ledger_sse_to_ns_record(ledger_id: LedgerId, record: LedgerSseRecord) -> NsRe
         retracted: record.retracted,
         source_branch: record.source_branch,
         branches: record.branches,
+        storage_root: record.storage_root,
     }
 }
 

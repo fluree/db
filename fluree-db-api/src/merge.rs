@@ -10,11 +10,11 @@ use crate::ledger_manager::GuardedStagedCommit;
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::content_kind::ContentKind;
-use fluree_db_core::LedgerId;
 use fluree_db_core::{
     collect_dag_cids, collect_first_parent_cids, load_commit_by_id, CommonAncestor,
 };
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
+use fluree_db_core::{LedgerId, StorageNamespace};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::compute_delta_keys;
@@ -48,6 +48,8 @@ pub struct StagedMerge {
     pub source: String,
     /// Fully-qualified target id (`"<ledger>:<target>"`).
     pub target_id: LedgerId,
+    /// Where the target branch's artifacts live.
+    pub target_namespace: StorageNamespace,
     /// Fully-qualified source id (`"<ledger>:<source>"`).
     pub source_id: LedgerId,
     /// `true` when the target's HEAD was the common ancestor — the
@@ -311,6 +313,7 @@ impl crate::Fluree {
                 &resolved_target,
                 source_id,
                 target_id,
+                target_record.storage_namespace(),
                 &source_record,
                 &source_store,
                 ancestor.as_ref(),
@@ -348,6 +351,7 @@ impl crate::Fluree {
             target,
             source,
             target_id,
+            target_namespace,
             fast_forward,
             conflict_count,
             strategy,
@@ -379,7 +383,7 @@ impl crate::Fluree {
                 // No manager: the build loaded fresh state with no shared
                 // cache to detach or finalize.
                 None => {
-                    let content_store = self.content_store(&target_id);
+                    let content_store = self.content_store(&target_namespace);
                     let publisher = self.publisher()?;
                     let (receipt, _new_state) =
                         staged_commit.apply(&content_store, publisher).await?;
@@ -467,7 +471,7 @@ impl crate::Fluree {
         // that is the optimisation, not the fix.
         if let Some((index_cid, _index_t)) = source_index_for_publish {
             if let Err(e) = self
-                .copy_index_to_branch(&source_ledger_id, &target_id, &index_cid)
+                .copy_index_to_branch(&source_ledger_id, &target_namespace, &index_cid)
                 .await
             {
                 tracing::warn!(
@@ -499,6 +503,7 @@ impl crate::Fluree {
         resolved_target: &str,
         source_id: LedgerId,
         target_id: LedgerId,
+        target_namespace: StorageNamespace,
         source_record: &NsRecord,
         source_store: &impl ContentStore,
         ancestor: Option<&CommonAncestor>,
@@ -509,7 +514,7 @@ impl crate::Fluree {
     ) -> Result<StagedMerge> {
         let stop_at_t = ancestor.map(|a| a.t).unwrap_or(0);
         let commits_copied = self
-            .copy_commit_chain(source_store, &source_head_id, stop_at_t, &target_id)
+            .copy_commit_chain(source_store, &source_head_id, stop_at_t, &target_namespace)
             .await?;
 
         let current_head_t = ancestor.map(|a| a.t).unwrap_or(0);
@@ -517,6 +522,7 @@ impl crate::Fluree {
             target: resolved_target.to_string(),
             source: source_branch.to_string(),
             target_id,
+            target_namespace,
             source_ledger_id: source_record.ledger_id.clone(),
             source_id,
             fast_forward: true,
@@ -571,11 +577,12 @@ impl crate::Fluree {
 
         // Compute target delta. Use the same branch-aware store below when
         // loading the queryable target state for staging.
+        let target_namespace = target_record.storage_namespace();
         let target_store: BranchedContentStore = if target_record.source_branch.is_some() {
             LedgerState::build_branched_store(&self.nameservice_mode, target_record, self.backend())
                 .await?
         } else {
-            BranchedContentStore::leaf(self.content_store(&target_id))
+            BranchedContentStore::leaf(self.content_store(&target_namespace))
         };
         let target_delta =
             compute_delta_keys(target_store.clone(), target_head_id.clone(), ancestor.t).await?;
@@ -649,7 +656,7 @@ impl crate::Fluree {
         // self-contained for DAG walking. This must happen before the merge
         // commit is published.
         let commits_copied = self
-            .copy_commit_chain(source_store, &source_head_id, ancestor.t, &target_id)
+            .copy_commit_chain(source_store, &source_head_id, ancestor.t, &target_namespace)
             .await?;
 
         // With the lock held the staged base is authoritative — derive
@@ -693,6 +700,7 @@ impl crate::Fluree {
             target: resolved_target.to_string(),
             source: source_branch.to_string(),
             target_id,
+            target_namespace,
             source_ledger_id: source_record.ledger_id.clone(),
             source_id,
             fast_forward: false,
@@ -723,7 +731,7 @@ impl crate::Fluree {
         source_store: &impl ContentStore,
         head_id: &ContentId,
         stop_at_t: i64,
-        target_ledger_id: &str,
+        target: &StorageNamespace,
     ) -> Result<usize> {
         let storage = self
             .admin_storage()
@@ -746,7 +754,7 @@ impl crate::Fluree {
             storage
                 .content_write_bytes_with_hash(
                     ContentKind::Commit,
-                    target_ledger_id,
+                    target,
                     &cid.digest_hex(),
                     &bytes,
                 )
@@ -773,7 +781,7 @@ impl crate::Fluree {
                 storage
                     .content_write_bytes_with_hash(
                         ContentKind::Txn,
-                        target_ledger_id,
+                        target,
                         &txn_cid.digest_hex(),
                         &txn_bytes,
                     )

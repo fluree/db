@@ -363,7 +363,10 @@ impl Fluree {
         let mut view = view;
         if view.base().head_temporal.is_none() && view.base().head_commit_id.is_some() {
             let store = self
-                .content_store_for_record_or_id(view.base().ns_record.as_ref(), &txn.ledger_id)
+                .content_store_for_record_or_id(
+                    view.base().ns_record.as_ref(),
+                    &view.base().storage_namespace(),
+                )
                 .await?;
             view.base_mut()
                 .ensure_head_temporal(store.as_ref())
@@ -462,7 +465,7 @@ impl Fluree {
             }));
         }
 
-        let content_store = self.content_store(&txn.ledger_id);
+        let content_store = self.content_store(&head.storage_namespace());
         for pending in &txn.pending {
             content_store
                 .put_with_id(&pending.commit_id, &pending.bytes)

@@ -178,12 +178,13 @@ impl AwsConnectionHandle {
             )));
         }
 
+        let namespace = record.storage_namespace();
         let index_id = record.index_head_id.ok_or_else(|| {
             ConnectionError::not_found(format!("Ledger has no index yet: {ledger_id}"))
         })?;
 
         let storage = self.index_storage.clone();
-        Ok(fluree_db_core::load_ledger_snapshot(&storage, &index_id, ledger_id).await?)
+        Ok(fluree_db_core::load_ledger_snapshot(&storage, &index_id, &namespace).await?)
     }
 
     /// Look up a ledger record by ledger ID

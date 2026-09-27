@@ -1765,7 +1765,7 @@ async fn test_proxy_storage_raw_mode_returns_canonical_bytes() {
     let root_address = fluree_db_core::content_address(
         "file",
         ContentKind::IndexRoot,
-        "rawmode:test",
+        &fluree_db_core::StorageNamespace::parse_legacy("rawmode:test").unwrap(),
         &reindex_result.root_id.digest_hex(),
     );
     let direct_root_bytes = admin_storage
@@ -2507,7 +2507,12 @@ fn extract_spot_leaf_cid(root_bytes: &[u8]) -> String {
 /// (Needed by ProxyStorage tests that call `read_bytes(address)` directly.)
 fn leaf_address_from_cid(cid_str: &str, ledger_id: &str) -> String {
     let cid: ContentId = cid_str.parse().expect("leaf should be a valid CID");
-    fluree_db_core::content_address("file", ContentKind::IndexLeaf, ledger_id, &cid.digest_hex())
+    fluree_db_core::content_address(
+        "file",
+        ContentKind::IndexLeaf,
+        &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+        &cid.digest_hex(),
+    )
 }
 
 /// Test that policy filtering is applied to binary leaves (FLI3 → FLKB)
@@ -2916,7 +2921,11 @@ async fn test_object_endpoint_serves_ledger_scoped_advanced_kinds() {
         // Seed the artifact exactly where the writer would put it.
         let id = ContentId::new(kind, payload);
         let written = admin_storage
-            .content_write_bytes(kind, "advkinds:test", payload)
+            .content_write_bytes(
+                kind,
+                &fluree_db_core::StorageNamespace::parse_legacy("advkinds:test").unwrap(),
+                payload,
+            )
             .await
             .unwrap_or_else(|e| panic!("seed {kind:?}: {e}"));
         assert_eq!(
@@ -3008,7 +3017,11 @@ async fn test_object_endpoint_pins_graph_source_kinds_unserved() {
     let payload = b"bm25 snapshot bytes".as_slice();
     let snap_id = ContentId::new(ContentKind::GraphSourceSnapshot, payload);
     admin_storage
-        .content_write_bytes(ContentKind::GraphSourceSnapshot, "gsidx:main", payload)
+        .content_write_bytes(
+            ContentKind::GraphSourceSnapshot,
+            &fluree_db_core::StorageNamespace::parse_legacy("gsidx:main").unwrap(),
+            payload,
+        )
         .await
         .expect("seed graph-source snapshot");
 
@@ -3186,7 +3199,11 @@ async fn test_object_endpoint_immutable_caching_and_conditional_get() {
     let payload = b"hll sketch bytes".as_slice();
     let id = ContentId::new(ContentKind::StatsSketch, payload);
     admin_storage
-        .content_write_bytes(ContentKind::StatsSketch, "cachehdrs:test", payload)
+        .content_write_bytes(
+            ContentKind::StatsSketch,
+            &fluree_db_core::StorageNamespace::parse_legacy("cachehdrs:test").unwrap(),
+            payload,
+        )
         .await
         .expect("seed artifact");
 

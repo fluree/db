@@ -33,8 +33,8 @@
 use crate::error::ApiError;
 use fluree_db_core::task::TaskFailure;
 use fluree_db_core::{
-    ContentId, ContentKind, ContentStore, FuelExceededError, RemoteObject, Storage, StorageRead,
-    Tracker, TrackingTally,
+    ContentId, ContentKind, ContentStore, FuelExceededError, RemoteObject, Storage,
+    StorageNamespace, StorageRead, Tracker, TrackingTally,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -3698,10 +3698,22 @@ where
             tracing::info!(alias = %normalized_alias, "initialized new ledger in nameservice");
         }
 
+        // Where the ledger's artifacts go, from the record `init` wrote.
+        let namespace = nameservice
+            .lookup(&normalized_alias)
+            .await
+            .map_err(|e| ImportError::Storage(e.to_string()))?
+            .ok_or_else(|| {
+                ImportError::Storage(format!("ledger '{normalized_alias}' has no record"))
+            })?
+            .storage_namespace();
+
         // ---- Set up session directory for runs/indexes ----
-        let alias_prefix =
-            fluree_db_core::address_path::ledger_id_to_path_prefix(&normalized_alias)
-                .unwrap_or_else(|_| normalized_alias.replace(':', "/"));
+        // A local scratch directory keyed by the ledger id, not a storage key.
+        let alias_prefix = match fluree_db_core::LedgerId::parse(&normalized_alias) {
+            Ok(id) => format!("{}/{}", id.name(), id.branch()),
+            Err(_) => normalized_alias.replace(':', "/"),
+        };
 
         // Session dir under the import scratch base (see `derive_session_dir`).
         let sid = session_id();
@@ -3729,6 +3741,7 @@ where
             storage,
             nameservice,
             &normalized_alias,
+            &namespace,
             &chunk_source,
             &doc_ids,
             paths,
@@ -3848,6 +3861,7 @@ async fn run_pipeline_phases<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
+    namespace: &StorageNamespace,
     chunk_source: &std::sync::Arc<ChunkSource>,
     doc_ids: &DocIds,
     paths: PipelinePaths<'_>,
@@ -3862,6 +3876,7 @@ where
         storage,
         nameservice,
         alias,
+        namespace,
         chunk_source,
         doc_ids,
         paths.run_dir,
@@ -3907,6 +3922,7 @@ where
             storage,
             nameservice,
             alias,
+            namespace,
             build_input,
             config,
             import_result.total_commit_size,
@@ -3946,8 +3962,14 @@ where
     }
 
     // ---- Phase 7: Persist default context from turtle prefixes ----
-    if let Err(e) =
-        store_default_context(storage, nameservice, alias, &import_result.prefix_map).await
+    if let Err(e) = store_default_context(
+        storage,
+        nameservice,
+        alias,
+        namespace,
+        &import_result.prefix_map,
+    )
+    .await
     {
         tracing::warn!(%e, "failed to persist default context (non-fatal)");
     }
@@ -4034,6 +4056,7 @@ async fn run_import_chunks<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
+    namespace: &StorageNamespace,
     chunk_source: &std::sync::Arc<ChunkSource>,
     doc_ids: &DocIds,
     run_dir: &Path,
@@ -4134,6 +4157,7 @@ where
         storage: &'a S,
         nameservice: &'a dyn crate::NameServicePublisher,
         alias: &'a str,
+        namespace: &'a StorageNamespace,
         config: &'a ImportConfig,
         sort_write_semaphore: &'a Arc<tokio::sync::Semaphore>,
         vocab_dir: &'a Path,
@@ -4213,9 +4237,10 @@ where
                 }
 
                 let finalize_start = Instant::now();
-                let result = finalize_parsed_chunk(state, parsed, ns_delta, env.storage, env.alias)
-                    .await
-                    .map_err(|e| ImportError::Transact(e.to_string()))?;
+                let result =
+                    finalize_parsed_chunk(state, parsed, ns_delta, env.storage, env.namespace)
+                        .await
+                        .map_err(|e| ImportError::Transact(e.to_string()))?;
                 let finalize_ms = finalize_start.elapsed().as_millis();
 
                 // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake,
@@ -4543,6 +4568,7 @@ where
         storage,
         nameservice,
         alias,
+        namespace,
         config,
         sort_write_semaphore: &sort_write_semaphore,
         vocab_dir: &vocab_dir,
@@ -5059,6 +5085,7 @@ where
                     trig_content,
                     storage,
                     alias,
+                    namespace,
                     &doc.skolem_base(),
                     compress,
                     Some(&spool_dir),
@@ -5102,7 +5129,7 @@ where
                 .map_err(|e| ImportError::Transact(e.to_string()))?;
 
                 let ns_delta = compute_ns_delta(&parsed.new_codes, &mut published_codes);
-                finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, alias)
+                finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, namespace)
                     .await
                     .map_err(|e| ImportError::Transact(e.to_string()))?
             };
@@ -5312,6 +5339,7 @@ where
                         trig_content,
                         storage,
                         alias,
+                        namespace,
                         &DocChunk::whole(doc_ids.id(i)).skolem_base(),
                         compress,
                         Some(&spool_dir),
@@ -5360,7 +5388,7 @@ where
 
                     let ns_delta = compute_ns_delta(&parsed.new_codes, &mut published_codes);
 
-                    finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, alias)
+                    finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, namespace)
                         .await
                         .map_err(|e| ImportError::Transact(e.to_string()))?
                 };
@@ -6170,6 +6198,7 @@ async fn build_and_upload<S>(
     storage: &S,
     _nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
+    namespace: &StorageNamespace,
     input: IndexBuildInput<'_>,
     config: &ImportConfig,
     total_commit_size: u64,
@@ -6221,7 +6250,7 @@ where
 
     // Shared content store for dict upload, index upload, and other CAS operations.
     let content_store: std::sync::Arc<dyn fluree_db_core::ContentStore> = std::sync::Arc::new(
-        fluree_db_core::storage::content_store_for(storage.clone(), alias),
+        fluree_db_core::storage::content_store_for(storage.clone(), namespace),
     );
 
     // Start dict upload (reads flat files from run_dir, builds CoW trees, uploads to CAS).
@@ -6961,7 +6990,7 @@ where
         storage
             .content_write_bytes_with_hash(
                 fluree_db_core::ContentKind::IndexRoot,
-                alias,
+                namespace,
                 &root_digest,
                 &root_bytes,
             )
@@ -7213,6 +7242,7 @@ async fn store_default_context<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
+    namespace: &StorageNamespace,
     turtle_prefix_map: &HashMap<String, String>,
 ) -> std::result::Result<(), ImportError>
 where
@@ -7255,7 +7285,7 @@ where
         .map_err(|e| ImportError::Storage(format!("serialize default context: {e}")))?;
 
     // Write to CAS via ContentStore (returns CID)
-    let cs = fluree_db_core::content_store_for(storage.clone(), alias);
+    let cs = fluree_db_core::content_store_for(storage.clone(), namespace);
     let cid = cs
         .put(ContentKind::LedgerConfig, &context_bytes)
         .await
@@ -7298,7 +7328,7 @@ where
             let addr = fluree_db_core::content_address(
                 storage.storage_method(),
                 kind,
-                alias,
+                namespace,
                 &old_cid.digest_hex(),
             );
             if let Err(e) = storage.delete(&addr).await {

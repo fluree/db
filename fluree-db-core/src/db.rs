@@ -1100,17 +1100,17 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
 /// (typically the API layer) must load a `BinaryIndexStore` and attach a
 /// `BinaryRangeProvider` before serving range queries.
 ///
-/// The storage address is derived internally from the `ContentId` and
-/// `ledger_id` using the storage backend's method identifier.
+/// The storage address is derived internally from the `ContentId` and the
+/// branch's `namespace` using the storage backend's method identifier.
 pub async fn load_ledger_snapshot(
     storage: &(impl StorageRead + crate::storage::StorageMethod),
     root_id: &ContentId,
-    ledger_id: &str,
+    namespace: &crate::StorageNamespace,
 ) -> Result<LedgerSnapshot> {
     let root_address = crate::content_address(
         storage.storage_method(),
         ContentKind::IndexRoot,
-        ledger_id,
+        namespace,
         &root_id.digest_hex(),
     );
     let bytes = storage.read_bytes(&root_address).await?;

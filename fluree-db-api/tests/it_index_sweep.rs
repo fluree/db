@@ -152,7 +152,7 @@ async fn sweeping_a_real_ledger_reclaims_strays_and_leaves_queries_intact() {
     let stray_addr = fluree_db_core::content_address(
         storage.storage_method(),
         ContentKind::IndexLeaf,
-        ledger_id,
+        &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
         &stray.digest_hex(),
     );
     storage

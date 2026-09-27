@@ -583,7 +583,8 @@ async fn revert_records_reverted_commit_ids_in_txn_meta() {
         .await
         .unwrap();
 
-    let store = fluree.content_store("mydb:main");
+    let store =
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap());
     let _ = ContentStore::get(store.as_ref(), &report.new_head_id).await;
     let revert_commit = load_commit_by_id(store.as_ref(), &report.new_head_id)
         .await

@@ -164,7 +164,9 @@ async fn rebuild_issues_exactly_one_range_and_one_blob_fetch_per_commit() {
         .expect("ns record exists");
     assert_eq!(record.commit_t, N as i64);
 
-    let counted = CountingContentStore::new(fluree.content_store(ledger_id));
+    let counted = CountingContentStore::new(
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+    );
     let counters = counted.counters();
 
     let result = fluree_db_indexer::rebuild_index_from_commits_with_store(
@@ -214,7 +216,9 @@ async fn rebuild_fetch_concurrency_env_override_preserves_counts() {
         .expect("ns lookup")
         .expect("ns record exists");
 
-    let counted = CountingContentStore::new(fluree.content_store(ledger_id));
+    let counted = CountingContentStore::new(
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
+    );
     let counters = counted.counters();
 
     // K=1 reproduces the previous serial behavior and must still produce

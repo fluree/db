@@ -70,7 +70,7 @@ async fn reindex_with_tracker_reports_positive_fuel() {
 
     let tracker = enabled_tracker();
     let result = rebuild_index_from_commits_with_tracker(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
         tracker,
         ledger_id,
         &record,
@@ -112,7 +112,7 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
         .expect("ns lookup")
         .expect("record");
     let result = rebuild_index_from_commits_with_tracker(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
         enabled_tracker(),
         ledger_id,
         &record,
@@ -137,7 +137,7 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
         .expect("ns lookup")
         .expect("record");
     let result = build_index_for_record_with_tracker(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
         enabled_tracker(),
         &record,
         IndexerConfig::default(),
@@ -230,7 +230,7 @@ async fn non_tracked_rebuild_reports_fuel_none() {
         .expect("ns lookup")
         .expect("record");
     let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap()),
         ledger_id,
         &record,
         IndexerConfig::default(),

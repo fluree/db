@@ -54,7 +54,8 @@ async fn store_raw_txn_roundtrip_via_parallel_upload() {
         .expect("transaction should succeed with parallel raw-txn upload");
 
     // Fetch the commit blob, decode it, and confirm it references a txn CID.
-    let content_store = fluree.content_store(ledger_id);
+    let content_store =
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap());
     let commit_bytes = content_store
         .get(&result.receipt.commit_id)
         .await
@@ -105,7 +106,7 @@ async fn txn_cid_of(
     commit_id: &fluree_db_core::ContentId,
 ) -> fluree_db_core::ContentId {
     let bytes = fluree
-        .content_store(ledger_id)
+        .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
         .get(commit_id)
         .await
         .expect("commit blob readable");
@@ -170,7 +171,11 @@ async fn duplicate_body_failure_keeps_first_commits_txn_blob() {
     // had moved on.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
-        fluree.content_store(ledger_id).get(&txn_cid).await.is_ok(),
+        fluree
+            .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
+            .get(&txn_cid)
+            .await
+            .is_ok(),
         "first commit's raw-txn blob must survive the duplicate's failure"
     );
 
@@ -214,7 +219,7 @@ async fn verify_and_export_tolerate_missing_txn_blob() {
 
     // Simulate the production damage: the blob vanishes out from under the commit.
     fluree
-        .content_store(ledger_id)
+        .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
         .release(&txn_cid)
         .await
         .expect("release");
@@ -282,7 +287,7 @@ async fn push_accepts_commits_whose_txn_blob_is_missing() {
             .expect("commit succeeds");
         let txn_cid = txn_cid_of(fluree, ledger_id, &result.receipt.commit_id).await;
         fluree
-            .content_store(ledger_id)
+            .content_store(&fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
             .release(&txn_cid)
             .await
             .expect("release");

@@ -280,7 +280,7 @@ fn effective_did<'a>(
 /// Encodes the effective identity (so the commit records its author) and,
 /// for signed requests, spawns the raw-envelope upload in parallel so it
 /// overlaps with the rest of the pipeline.
-fn build_commit_opts(
+async fn build_commit_opts(
     did: Option<&str>,
     credential: &MaybeCredential,
     fluree: &Fluree,
@@ -291,7 +291,7 @@ fn build_commit_opts(
         None => CommitOpts::default(),
     };
     if let Some(raw_txn) = raw_txn_from_credential(credential) {
-        let content_store = fluree.content_store(handle.id());
+        let content_store = fluree.content_store(&handle.snapshot().await.storage_namespace());
         commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
     }
     commit_opts
@@ -1983,7 +1983,7 @@ pub(crate) async fn execute_transaction(
         };
 
         let did = effective_did(&prepared_transaction.governance, author);
-        let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
+        let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle).await;
 
         // `opts.eventTime`: caller-supplied event time for this commit
         // (backdated historical loads). Validated for RFC 3339 shape at the
@@ -2170,7 +2170,8 @@ pub(crate) async fn execute_turtle_transaction(
             credential,
             &state.fluree,
             &handle,
-        );
+        )
+        .await;
 
         // Tracking is header-driven and applies to every format.
         let tracking = tracking_from_headers(headers);
@@ -2264,7 +2265,8 @@ async fn execute_cypher_transact(
         credential,
         &state.fluree,
         &handle,
-    );
+    )
+    .await;
     let tracking = tracking_from_headers(headers);
 
     // A multi-clause statement runs through the sequential write driver
@@ -2493,7 +2495,8 @@ pub(crate) async fn submit_sparql_update(
         credential,
         &state.fluree,
         &handle,
-    );
+    )
+    .await;
 
     // The query is parsed and lowered inside the consensus layer, under the
     // ledger write lock — so namespace allocation shares the staging

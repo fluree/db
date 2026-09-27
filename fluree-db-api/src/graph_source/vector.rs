@@ -289,7 +289,7 @@ impl crate::Fluree {
         let bytes = serialize(index)?;
 
         // Write through the content store so it's stored at the CID-mapped address
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let index_id = cs
             .put(fluree_db_core::ContentKind::IndexRoot, &bytes)
             .await?;
@@ -325,7 +325,7 @@ impl crate::Fluree {
         })?;
 
         // Load from content store
-        let store = self.content_store(graph_source_id);
+        let store = self.graph_source_store(graph_source_id)?;
         let bytes = store.get(&index_cid).await?;
 
         // Deserialize
@@ -450,7 +450,7 @@ impl crate::Fluree {
         let ledger_t = ledger.t();
 
         // 3. Load existing index by CID
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let bytes = cs.get(&index_cid).await?;
         let mut index = deserialize(&bytes)?;
         let old_watermark = index.watermark.get(&source_ledger_alias).unwrap_or(0);
@@ -508,7 +508,7 @@ impl crate::Fluree {
         //    ledger is a branch.
         let mut affected_sids: HashSet<fluree_db_core::Sid> = HashSet::new();
         let commit_store = self
-            .content_store_for_record_or_id(ledger.ns_record.as_ref(), &ledger.snapshot.ledger_id)
+            .content_store_for_record_or_id(ledger.ns_record.as_ref(), &ledger.storage_namespace())
             .await?;
         let stream =
             trace_first_parent_commits_by_id(commit_store, head_commit_id.clone(), old_watermark);
@@ -699,7 +699,7 @@ impl crate::Fluree {
 
         // 3. Load existing index to get old watermark
         let old_watermark = if let Some(cid) = &record.index_id {
-            let cs = self.content_store(graph_source_id);
+            let cs = self.graph_source_store(graph_source_id)?;
             let bytes = cs.get(cid).await?;
             let old_index = deserialize(&bytes)?;
             old_index.watermark.get(&source_ledger_alias).unwrap_or(0)

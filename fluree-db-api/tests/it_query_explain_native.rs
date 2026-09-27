@@ -33,7 +33,7 @@ async fn index_and_load_db(
             .admin_storage_cloned()
             .expect("test uses managed backend"),
         &root_id,
-        &ledger_id,
+        &fluree_db_core::StorageNamespace::parse_legacy(&ledger_id).unwrap(),
     )
     .await
     .expect("load_ledger_snapshot(root)");

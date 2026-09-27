@@ -35,7 +35,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
     let root_address = fluree_db_core::storage::content_address(
         storage.storage_method(),
         fluree_db_core::ContentKind::IndexRoot,
-        ledger_id,
+        &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
         &root_id.digest_hex(),
     );
     let bytes = storage
@@ -45,7 +45,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
 
     let cs = std::sync::Arc::new(fluree_db_core::content_store_for(
         storage.clone(),
-        ledger_id,
+        &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
     ));
     let store = BinaryIndexStore::load_from_root_bytes(cs, &bytes, cache_dir, None)
         .await
@@ -215,7 +215,7 @@ async fn class_property_datatype_decrements_after_delete_non_last_instance() {
                 unreachable!("helper only returns Completed")
             };
             let root1 = root_id.expect("expected root_id after first index");
-            let loaded1 = load_ledger_snapshot(&storage, &root1, ledger_id)
+            let loaded1 = load_ledger_snapshot(&storage, &root1, &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
                 .await
                 .expect("load snapshot 1");
 
@@ -252,7 +252,7 @@ async fn class_property_datatype_decrements_after_delete_non_last_instance() {
                 unreachable!("helper only returns Completed")
             };
             let root2 = root_id.expect("expected root_id after incremental refresh");
-            let loaded2 = load_ledger_snapshot(&storage, &root2, ledger_id)
+            let loaded2 = load_ledger_snapshot(&storage, &root2, &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
                 .await
                 .expect("load snapshot 2");
 
@@ -342,9 +342,13 @@ async fn class_property_reattributed_after_retype() {
                 unreachable!("helper only returns Completed")
             };
             let root1 = root_id.expect("expected root_id after first index");
-            let loaded1 = load_ledger_snapshot(&storage, &root1, ledger_id)
-                .await
-                .expect("load snapshot 1");
+            let loaded1 = load_ledger_snapshot(
+                &storage,
+                &root1,
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 1");
 
             assert_eq!(
                 class_prop_datatype_total(
@@ -379,9 +383,13 @@ async fn class_property_reattributed_after_retype() {
                 unreachable!("helper only returns Completed")
             };
             let root2 = root_id.expect("expected root_id after incremental refresh");
-            let loaded2 = load_ledger_snapshot(&storage, &root2, ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root2,
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
 
             // Class instance counts (already correct).
             assert_eq!(
@@ -510,9 +518,13 @@ async fn ref_class_reattributed_after_subject_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
-                .await
-                .expect("load snapshot 1");
+            let loaded1 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root1"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 1");
             assert_eq!(
                 ref_class_total(
                     &loaded1,
@@ -546,9 +558,13 @@ async fn ref_class_reattributed_after_subject_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -627,9 +643,13 @@ async fn ref_class_reattributed_after_object_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
-                .await
-                .expect("load snapshot 1");
+            let loaded1 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root1"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 1");
             assert_eq!(
                 ref_class_total(
                     &loaded1,
@@ -663,9 +683,13 @@ async fn ref_class_reattributed_after_object_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -771,9 +795,13 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -867,9 +895,13 @@ async fn ref_class_attributed_when_object_typed_later() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
-                .await
-                .expect("load snapshot 1");
+            let loaded1 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root1"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 1");
             assert_eq!(
                 ref_class_total(
                     &loaded1,
@@ -903,9 +935,13 @@ async fn ref_class_attributed_when_object_typed_later() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -996,9 +1032,13 @@ async fn ref_class_attributed_when_subject_typed_later() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -1088,9 +1128,13 @@ async fn ref_class_attributed_when_both_endpoints_typed_later() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -1188,9 +1232,13 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
 
             // Rebuild must produce correct current-state stats.
             assert_eq!(
@@ -1291,7 +1339,7 @@ async fn property_and_class_statistics_persist_in_db_root() {
             assert!(index_t >= commit_t);
             let root_cid = root_id.expect("expected root_id after indexing");
 
-            let loaded = load_ledger_snapshot(&fluree.backend().admin_storage_cloned().expect("test uses managed backend"), &root_cid, ledger_id)
+            let loaded = load_ledger_snapshot(&fluree.backend().admin_storage_cloned().expect("test uses managed backend"), &root_cid, &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap())
             .await
             .expect("load_ledger_snapshot(root_cid)");
 
@@ -1394,7 +1442,7 @@ async fn class_statistics_decrement_after_delete_refresh() {
                     .admin_storage_cloned()
                     .expect("test uses managed backend"),
                 &root_cid,
-                ledger_id,
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
             )
             .await
             .expect("load_ledger_snapshot(root_cid)");
@@ -1459,7 +1507,7 @@ async fn statistics_work_with_memory_storage_when_indexed() {
                     .admin_storage_cloned()
                     .expect("test uses managed backend"),
                 &root_cid,
-                ledger_id,
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
             )
             .await
             .expect("load_ledger_snapshot(root_cid)");
@@ -2471,7 +2519,7 @@ async fn ndv_cardinality_estimates_are_accurate() {
                     .admin_storage_cloned()
                     .expect("test uses managed backend"),
                 &root_cid,
-                ledger_id,
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
             )
             .await
             .expect("load_ledger_snapshot(root_cid)");
@@ -2670,9 +2718,13 @@ async fn flat_property_ndv_survives_incremental_over_sketchless_base() {
                 unreachable!("helper only returns Completed")
             };
             let delta_root = root_id.expect("delta root id");
-            let delta_loaded = load_ledger_snapshot(&storage, &delta_root, ledger_id)
-                .await
-                .expect("load delta root");
+            let delta_loaded = load_ledger_snapshot(
+                &storage,
+                &delta_root,
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+            )
+            .await
+            .expect("load delta root");
             assert!(
                 delta_loaded.t > base_view.snapshot.t,
                 "the write must publish a newer root"
@@ -3133,7 +3185,7 @@ async fn large_dataset_statistics_accuracy() {
                     .admin_storage_cloned()
                     .expect("test uses managed backend"),
                 &root_cid,
-                ledger_id,
+                &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
             )
             .await
             .expect("load_ledger_snapshot(root_cid)");

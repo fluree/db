@@ -1213,7 +1213,7 @@ async fn merge_fast_forward_keeps_target_graph_registry_and_config() {
         .unwrap();
     let source_root = feature_ref.index_head_id.unwrap();
     assert!(fluree
-        .content_store("mydb:main")
+        .content_store(&fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap())
         .get(&source_root)
         .await
         .is_err());
@@ -1243,7 +1243,7 @@ async fn merge_fast_forward_keeps_target_graph_registry_and_config() {
 
     assert!(
         fluree
-            .content_store("mydb:main")
+            .content_store(&fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap())
             .get(&source_root)
             .await
             .is_err(),
@@ -1356,7 +1356,8 @@ async fn main_with_adopted_feature_index() -> fluree_db_api::Fluree {
     let source_store = fluree.branched_content_store("mydb:feature").await.unwrap();
     let root_bytes = source_store.get(&source_root).await.unwrap();
     let root = IndexRoot::decode(&root_bytes).unwrap();
-    let target_store = fluree.content_store("mydb:main");
+    let target_store =
+        fluree.content_store(&fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap());
     for cid in collect_root_cas_ids_expanded(&source_store, &root)
         .await
         .unwrap()
@@ -1469,7 +1470,9 @@ async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
         assert!(config.incremental_enabled);
         assert!(record.commit_t - record.index_t <= config.incremental_max_commits as i64);
         let result = fluree_db_indexer::build_index_for_record(
-            fluree.content_store("mydb:main"),
+            fluree.content_store(
+                &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
+            ),
             &record,
             config,
         )
@@ -1477,7 +1480,9 @@ async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
         .unwrap();
         let root = IndexRoot::decode(
             &fluree
-                .content_store("mydb:main")
+                .content_store(
+                    &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                )
                 .get(&result.root_id)
                 .await
                 .unwrap(),

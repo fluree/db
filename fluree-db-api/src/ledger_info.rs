@@ -21,7 +21,6 @@
 use crate::format::iri::IriCompactor;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::address_path::ledger_id_to_path_prefix;
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
 use fluree_db_core::load_commit_by_id;
@@ -590,10 +589,11 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
 
     // Pre-index fallback: if no graph stats from index, try loading the pre-index manifest
     if stats.graphs.is_none() {
-        let alias_prefix = ledger_id_to_path_prefix(&ledger.snapshot.ledger_id)
-            .unwrap_or_else(|_| ledger.snapshot.ledger_id.replace(':', "/"));
-        let manifest_addr_primary =
-            format!("fluree:file://{alias_prefix}/stats/pre-index-stats.json");
+        let namespace = ledger.storage_namespace();
+        let manifest_addr_primary = format!(
+            "fluree:file://{}/stats/pre-index-stats.json",
+            namespace.branch_prefix()
+        );
         if let Ok(bytes) = storage.read_bytes(&manifest_addr_primary).await {
             match parse_pre_index_manifest(&bytes) {
                 Ok(graphs) => {
@@ -631,7 +631,14 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
     // 4. Commit section (ALWAYS include, even if None). Dynamic JSON-LD document
     // (or `{"error":…}` on load failure), so kept as `JsonValue`.
     let commit = if let Some(head_cid) = &ledger.head_commit_id {
-        match build_commit_jsonld(storage, head_cid, &ledger.snapshot.ledger_id).await {
+        match build_commit_jsonld(
+            storage,
+            head_cid,
+            &ledger.snapshot.ledger_id,
+            &ledger.storage_namespace(),
+        )
+        .await
+        {
             Ok(commit_json) => commit_json,
             Err(e) => json!({ "error": format!("{}", e) }),
         }
@@ -896,8 +903,9 @@ async fn build_commit_jsonld<S: Storage + Clone>(
     storage: &S,
     head_id: &fluree_db_core::ContentId,
     alias: &str,
+    namespace: &fluree_db_core::StorageNamespace,
 ) -> Result<JsonValue> {
-    let store = fluree_db_core::content_store_for(storage.clone(), alias);
+    let store = fluree_db_core::content_store_for(storage.clone(), namespace);
     let commit = load_commit_by_id(&store, head_id)
         .await
         .map_err(|e| LedgerInfoError::CommitLoad(e.to_string()))?;
@@ -2860,6 +2868,7 @@ mod tests {
             retracted: false,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         };
 
         let json = ns_record_to_jsonld(&record);
@@ -2891,6 +2900,7 @@ mod tests {
             retracted: true,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         };
 
         let json = ns_record_to_jsonld(&record);

@@ -364,7 +364,7 @@ where
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> fluree_db_core::error::Result<ContentWriteResult> {
@@ -380,7 +380,7 @@ where
         // (file, s3, memory, etc.) while we store encrypted bytes
         let mut result = self
             .inner
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, &encrypted)
+            .content_write_bytes_with_hash(kind, namespace, content_hash_hex, &encrypted)
             .await?;
 
         // Restore plaintext size (inner storage reports encrypted size)
@@ -392,11 +392,11 @@ where
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         bytes: &[u8],
     ) -> fluree_db_core::error::Result<ContentWriteResult> {
         let hash_hex = sha256_hex(bytes);
-        self.content_write_bytes_with_hash(kind, ledger_id, &hash_hex, bytes)
+        self.content_write_bytes_with_hash(kind, namespace, &hash_hex, bytes)
             .await
     }
 }
@@ -715,7 +715,11 @@ mod tests {
 
         // Use content-addressed write
         let result = encrypted
-            .content_write_bytes(ContentKind::Commit, "mydb:main", plaintext)
+            .content_write_bytes(
+                ContentKind::Commit,
+                &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                plaintext,
+            )
             .await
             .unwrap();
 
@@ -758,7 +762,11 @@ mod tests {
         // which is how the binary-index reader sees the storage.
         let erased: Arc<dyn Storage> = Arc::new(encrypted);
         assert!(!erased.permits_plaintext_cache());
-        let cs = StorageContentStore::new(erased, "db:main", "memory");
+        let cs = StorageContentStore::new(
+            erased,
+            fluree_db_core::StorageNamespace::parse_legacy("db:main").unwrap(),
+            "memory",
+        );
         assert!(!cs.permits_plaintext_cache());
     }
 }

@@ -151,6 +151,15 @@ pub struct LedgerView {
 }
 
 impl LedgerView {
+    /// Where this branch's artifacts live; see
+    /// [`LedgerState::storage_namespace`](fluree_db_ledger::LedgerState::storage_namespace).
+    pub fn storage_namespace(&self) -> fluree_db_core::StorageNamespace {
+        match &self.ns_record {
+            Some(record) => record.storage_namespace(),
+            None => fluree_db_core::StorageNamespace::legacy(&self.snapshot.ledger_id),
+        }
+    }
+
     /// Build a view from ledger state.
     ///
     /// Note: `binary_store` is set to `None` here — callers that have a

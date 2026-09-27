@@ -183,7 +183,12 @@ mod tests {
     /// Helper: create a CID and its derived memory-storage address.
     fn cid_and_addr(kind: ContentKind, data: &[u8]) -> (ContentId, String) {
         let cid = ContentId::new(kind, data);
-        let addr = fluree_db_core::content_address("memory", kind, LEDGER, &cid.digest_hex());
+        let addr = fluree_db_core::content_address(
+            "memory",
+            kind,
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+            &cid.digest_hex(),
+        );
         (cid, addr)
     }
 
@@ -278,15 +283,22 @@ mod tests {
         let result = write_commit(&commit, false, None).expect("write_commit");
         let cid = ContentId::new(ContentKind::Commit, &result.bytes);
         let hash_hex = cid.digest_hex();
-        let addr =
-            fluree_db_core::content_address("memory", ContentKind::Commit, LEDGER, &hash_hex);
+        let addr = fluree_db_core::content_address(
+            "memory",
+            ContentKind::Commit,
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+            &hash_hex,
+        );
         storage.write_bytes(&addr, &result.bytes).await.unwrap();
         cid
     }
 
     /// Build a content store from MemoryStorage for testing.
     fn test_store(storage: &MemoryStorage) -> impl ContentStore + '_ {
-        content_store_for(storage.clone(), LEDGER)
+        content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -505,7 +517,7 @@ mod tests {
         let root_addr = fluree_db_core::content_address(
             "memory",
             ContentKind::IndexRoot,
-            LEDGER,
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
             &root_cid.digest_hex(),
         );
         storage.write_bytes(&root_addr, &root_bytes).await.unwrap();

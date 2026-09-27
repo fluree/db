@@ -48,7 +48,7 @@ use fluree_db_api::{
     StagedRebase, StagedRevert,
 };
 use fluree_db_core::task::panic_message;
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, StorageNamespace};
 use fluree_db_ledger::IndexConfig;
 use fluree_db_nameservice::{CommitPublisher, NameServiceError};
 use futures::FutureExt;
@@ -199,6 +199,15 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Where this branch's artifacts live. The worker holds no
+    /// nameservice record, so this is the branch's legacy namespace.
+    fn storage_namespace(&self) -> Result<StorageNamespace, WorkerError> {
+        self.ref_key
+            .id()
+            .map(|id| StorageNamespace::legacy(&id))
+            .map_err(|e| WorkerError::Transient(format!("invalid branch key: {e}")))
+    }
+
     fn new(
         ref_key: RefKey,
         shared_state: SharedState,
@@ -505,8 +514,10 @@ impl Worker {
     /// the worker's retry loop. `ContentStore::release` is
     /// idempotent on non-existent CIDs.
     async fn release_orphaned_commit_blob(&self, commit_id: &ContentId) {
-        let full_ledger_id = self.ref_key.ledger_id();
-        let content_store = self.staging.fluree.content_store(&full_ledger_id);
+        let Ok(namespace) = self.storage_namespace() else {
+            return;
+        };
+        let content_store = self.staging.fluree.content_store(&namespace);
         if let Err(err) = content_store.release(commit_id).await {
             warn!(
                 commit_id = %commit_id,
@@ -524,12 +535,12 @@ impl Worker {
     /// the operation being staged.
     async fn persist_staged_blobs(
         &self,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         commit_cid: &ContentId,
         staged: &fluree_db_transact::StagedCommit,
         op: &str,
     ) -> Result<(), WorkerError> {
-        let content_store = self.staging.fluree.content_store(ledger_id);
+        let content_store = self.staging.fluree.content_store(namespace);
         for (cid, bytes) in &staged.referenced_bytes {
             content_store
                 .put_with_id(cid, bytes)
@@ -561,11 +572,10 @@ impl Worker {
     }
 
     async fn load_envelope(&self, entry: &QueueEntry) -> Result<QueuedRequest, WorkerError> {
-        let ledger_id = self.ref_key.ledger_id();
         let bytes = self
             .staging
             .fluree
-            .content_store(&ledger_id)
+            .content_store(&self.storage_namespace()?)
             .get(&entry.request_cid)
             .await
             .map_err(|e| WorkerError::Transient(format!("CAS read of request_cid failed: {e}")))?;
@@ -741,8 +751,13 @@ impl Worker {
         // produced.
         let tally = staged_commit.tally.clone();
 
-        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "transact")
-            .await?;
+        self.persist_staged_blobs(
+            &self.storage_namespace()?,
+            &commit_cid,
+            &staged_commit,
+            "transact",
+        )
+        .await?;
 
         // Derive post-commit state but do NOT call finalize_commit
         // here — local install runs after the publish confirms the
@@ -789,6 +804,7 @@ impl Worker {
         let ledger_name = self.ref_key.ledger_name.clone();
         let branch = self.ref_key.branch.clone();
         let StagedRevert {
+            branch_namespace,
             reverted_commits,
             conflict_count,
             strategy: applied_strategy,
@@ -831,8 +847,7 @@ impl Worker {
         })?;
         let commit_t = staged_commit.commit.t;
 
-        let ledger_id = self.ref_key.ledger_id();
-        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "revert")
+        self.persist_staged_blobs(&branch_namespace, &commit_cid, &staged_commit, "revert")
             .await?;
 
         let (_receipt, new_state) = staged_commit
@@ -883,7 +898,10 @@ impl Worker {
             merged_commit_cids,
         } = push;
         let ledger_id = self.ref_key.ledger_id();
-        let content_store = self.staging.fluree.content_store(&ledger_id);
+        let content_store = self
+            .staging
+            .fluree
+            .content_store(&self.storage_namespace()?);
         // Read each commit's bytes back from CAS by CID. The
         // transactor wrote them before enqueueing, so a definitive
         // `NotFound` means the blob has been GC'd (or never landed)
@@ -971,7 +989,7 @@ impl Worker {
         let ledger_name = self.ref_key.ledger_name.clone();
         let StagedMerge {
             target,
-            target_id,
+            target_namespace,
             fast_forward,
             conflict_count,
             commits_copied,
@@ -1021,7 +1039,7 @@ impl Worker {
                     message: "build_merge_general produced staged commit without commit.id".into(),
                 })
             })?;
-            self.persist_staged_blobs(&target_id, &commit_cid, &staged, "merge")
+            self.persist_staged_blobs(&target_namespace, &commit_cid, &staged, "merge")
                 .await?;
             let (_receipt, new_state) = staged
                 .finalize_state()
@@ -1059,7 +1077,7 @@ impl Worker {
         let ledger_name = self.ref_key.ledger_name.clone();
         let branch = self.ref_key.branch.clone();
         let StagedRebase {
-            branch_id,
+            branch_namespace,
             source_head_id,
             source_head_t,
             fast_forward,
@@ -1098,7 +1116,7 @@ impl Worker {
             }
         };
 
-        let content_store = self.staging.fluree.content_store(&branch_id);
+        let content_store = self.staging.fluree.content_store(&branch_namespace);
         for replay in &pending_replays {
             content_store
                 .put_with_id(&replay.commit_id, &replay.commit_bytes)
