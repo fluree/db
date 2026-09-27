@@ -187,7 +187,9 @@ graph targets.
 - `403 Forbidden` - Not authorized for this ledger
 - `404 Not Found` - Ledger not found
 - `409 Conflict` - Optimistic-concurrency conflict that survived the server's
-  bounded reconcile-and-retry (rare; safe to retry the request)
+  bounded reconcile-and-retry (rare; safe to retry the request), or the ledger
+  was dropped, restored or replaced since the server loaded it
+  (`err:db/Fenced`; a retry runs against the current ledger)
 - `413 Payload Too Large` - Transaction exceeds size limit
 - `500 Internal Server Error` - Server error
 
@@ -1171,15 +1173,18 @@ as `/commit` above.
 
 ### POST /nameservice/refs/{alias}/init
 
-Create a ledger entry in the nameservice if it does not already exist.
-Idempotent.
+Create a ledger if it does not already exist, as [`/create`](#post-create)
+does. Idempotent.
 
 **Response:**
 
 ```json
-{ "created": true }   // new ledger entry was registered
-{ "created": false }  // already existed; no change
+{ "created": true }   // new ledger was created
+{ "created": false }  // this branch already existed; no change
 ```
+
+**Status Codes:**
+- `409 Conflict` - The alias names a branch that does not exist of a ledger that already holds the name. Create the branch with [`/branch`](#post-branch).
 
 ### GET /nameservice/snapshot
 

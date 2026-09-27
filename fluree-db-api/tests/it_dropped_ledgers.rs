@@ -224,3 +224,64 @@ async fn a_writer_from_before_a_drop_is_refused() {
     fluree.disconnect_ledger("mydb").await;
     assert_eq!(markers(&fluree, "mydb").await, json!(["old"]));
 }
+
+/// A second process drops and restores a ledger this one has cached. The
+/// restored ledger has the same head, so only its new fence tells the stale
+/// cache apart: the first write through it is refused, the refusal reloads
+/// the cache, and the next write succeeds.
+#[tokio::test]
+async fn a_cache_from_before_a_drop_reloads_after_the_refused_write() {
+    let (fluree, tmp) = file_fluree().await;
+    let elsewhere = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let marker = |value: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@graph": [{"@id": "ex:marker", "ex:value": value}]
+        })
+    };
+    let write = |value: serde_json::Value| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph("mydb")
+                .transact()
+                .insert(&value)
+                .commit()
+                .await
+        }
+    };
+    fluree.create_ledger("mydb").await.expect("create");
+    // Written through the cached handle, so the ledger is now cached.
+    write(marker("old")).await.expect("insert");
+
+    let instance = elsewhere
+        .drop_ledger("mydb", DropMode::Soft)
+        .await
+        .expect("drop")
+        .instance
+        .unwrap();
+    elsewhere
+        .restore_dropped(instance.as_str())
+        .await
+        .expect("restore");
+
+    let err = write(marker("late"))
+        .await
+        .expect_err("the cache holds the fence from before the drop");
+    assert!(
+        err.to_string().contains("dropped or replaced"),
+        "expected a fence refusal, got: {err}"
+    );
+    write(marker("late"))
+        .await
+        .expect("the refusal reloaded the cache");
+
+    let mut values = markers(&elsewhere, "mydb").await;
+    values
+        .as_array_mut()
+        .unwrap()
+        .sort_by_key(ToString::to_string);
+    assert_eq!(values, json!(["late", "old"]));
+}

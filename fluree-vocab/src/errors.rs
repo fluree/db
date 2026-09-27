@@ -84,6 +84,10 @@ pub const PAYLOAD_TOO_LARGE: &str = "err:db/PayloadTooLarge";
 /// Commit conflict (concurrent modification)
 pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
 
+/// A write from a writer that loaded the ledger before it was dropped,
+/// restored or replaced; reloading the ledger is the only way forward
+pub const FENCED: &str = "err:db/Fenced";
+
 /// Empty transaction (no flakes)
 pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 

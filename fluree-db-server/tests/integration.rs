@@ -2765,6 +2765,7 @@ async fn soft_drop_frees_the_name_and_keeps_the_ledger_restorable() {
 
     // Purging it frees its data.
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2779,6 +2780,20 @@ async fn soft_drop_frees_the_name_and_keeps_the_ledger_restorable() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(purged["status"], "purged");
     assert_eq!(purged["data"], "deleted");
+
+    // A malformed instance id is the caller's mistake.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/dropped/restore")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"instance": "nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

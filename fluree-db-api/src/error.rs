@@ -511,6 +511,18 @@ impl ApiError {
     /// Check if this error represents a "not found" condition.
     ///
     /// Matches both `ApiError::NotFound` and `ApiError::Ledger(LedgerError::NotFound)`.
+    /// A write refused because the writer loaded the ledger before it was
+    /// dropped, restored or replaced. Retrying on the same state cannot
+    /// succeed; the writer must reload the ledger.
+    pub fn is_fenced(&self) -> bool {
+        use fluree_db_nameservice::NameServiceError::Fenced;
+        matches!(
+            self,
+            ApiError::NameService(Fenced(_))
+                | ApiError::Transact(fluree_db_transact::TransactError::Nameservice(Fenced(_)))
+        )
+    }
+
     pub fn is_not_found(&self) -> bool {
         matches!(
             self,
@@ -622,12 +634,7 @@ impl ApiError {
             ApiError::InvalidBranch(_) => 400,
             ApiError::InvalidLedgerId(_) => 400,
             ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
-            // A writer whose ledger was dropped, restored or replaced since it
-            // loaded it: retrying on the same state cannot succeed.
-            ApiError::NameService(fluree_db_nameservice::NameServiceError::Fenced(_))
-            | ApiError::Transact(fluree_db_transact::TransactError::Nameservice(
-                fluree_db_nameservice::NameServiceError::Fenced(_),
-            )) => 409,
+            e if e.is_fenced() => 409,
             ApiError::BranchConflict(_) => 409,
             ApiError::NotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,

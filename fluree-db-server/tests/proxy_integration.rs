@@ -366,6 +366,53 @@ async fn test_storage_proxy_ns_record_for_existing_ledger() {
     );
 }
 
+/// `init` creates a ledger as `/create` does: under a name binding, so the
+/// record carries its instance root and a fence.
+#[tokio::test]
+async fn test_storage_proxy_init_creates_a_bound_ledger() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token(&signing_key, true);
+    let init = |alias: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/fluree/nameservice/refs/{alias}/init"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let (status, json) = json_body(app.clone().oneshot(init("initdb:main")).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["created"], true);
+
+    let (status, json) = json_body(app.clone().oneshot(init("initdb:main")).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["created"], false);
+
+    // One ledger per name: a branch comes from `/branch`, not `init`.
+    let resp = app.clone().oneshot(init("initdb:dev")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let record = state
+        .fluree
+        .nameservice()
+        .lookup("initdb:main")
+        .await
+        .unwrap()
+        .expect("record");
+    assert!(record.fence.is_some(), "{record:?}");
+    assert!(
+        record
+            .storage_root
+            .as_ref()
+            .and_then(fluree_db_core::StorageRoot::instance)
+            .is_some(),
+        "{record:?}"
+    );
+}
+
 /// Test that ledger-specific token scope is enforced
 #[tokio::test]
 async fn test_storage_proxy_ledger_scope_enforcement() {

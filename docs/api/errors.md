@@ -227,6 +227,20 @@ The request conflicts with current server state.
 - Handle concurrent modifications with retry logic
 - Check resource state before modifying
 
+**`err:db/Fenced`** — a write to a ledger that was dropped, restored or
+replaced since the server loaded it, or that a drop in progress has frozen.
+The server reloads the ledger when it refuses the write, so retrying the
+request runs it against whatever ledger holds the name now (or returns `404`
+if none does).
+
+```json
+{
+  "error": "Ledger was dropped or replaced since it was loaded: mydb:main",
+  "status": 409,
+  "@type": "err:db/Fenced"
+}
+```
+
 #### 413 Payload Too Large
 
 The request was refused because of its size. The server emits **two distinct
