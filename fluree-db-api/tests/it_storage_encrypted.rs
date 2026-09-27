@@ -280,7 +280,12 @@ async fn seed_index_and_query(
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index(&ledger_id, result.index_t, &result.root_id)
+        .publish_index_fenced(
+            &ledger_id,
+            crate::support::fence_of(fluree, &ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish index");
 

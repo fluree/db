@@ -5341,7 +5341,12 @@ impl Fluree {
 
             match self
                 .publisher()?
-                .push_config(canonical_id, current_config.as_ref(), &new_config)
+                .push_config_fenced(
+                    canonical_id,
+                    record.fence,
+                    current_config.as_ref(),
+                    &new_config,
+                )
                 .await?
             {
                 ConfigCasResult::Updated => {

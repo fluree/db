@@ -27,7 +27,7 @@ use crate::binding::{
     BranchRecordStore, DroppedLedger, Fence, FenceOutcome, LedgerRegistry, NameBinding,
     RegistryCas, Versioned,
 };
-use crate::ns_cas::{self, RecordKeys};
+use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
     merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
     NS_VERSION,
@@ -872,28 +872,36 @@ impl crate::BranchLifecycle for FileNameService {
         }
     }
 
-    async fn reset_head(&self, ledger_id: &str, snapshot: crate::NsRecordSnapshot) -> Result<()> {
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: crate::NsRecordSnapshot,
+    ) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
 
         let outcome = self
             .storage
             .compare_and_swap(&address, |bytes| {
-                let Some(data) = bytes else {
-                    return Ok(CasAction::Abort(()));
+                let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+                let Some(mut file) = current.filter(|f| !f.is_deleted()) else {
+                    return Ok(CasAction::Abort(fence.is_some()));
                 };
-                let mut file: NsFileV2 = deserialize_json(data)?;
+                if !file.admits(fence) {
+                    return Ok(CasAction::Abort(true));
+                }
                 file.apply_snapshot(&snapshot);
                 let new_bytes = serialize_json(&file)?;
                 Ok(CasAction::Write(new_bytes))
             })
             .await?;
 
-        if matches!(outcome, CasOutcome::Aborted(())) {
-            return Err(NameServiceError::not_found(ledger_id));
+        match outcome {
+            CasOutcome::Written => Ok(()),
+            CasOutcome::Aborted(true) => Err(NameServiceError::fenced(ledger_id)),
+            CasOutcome::Aborted(false) => Err(NameServiceError::not_found(ledger_id)),
         }
-
-        Ok(())
     }
 
     async fn pending_commit_cids(
@@ -1077,9 +1085,10 @@ impl LedgerLifecycle for FileNameService {
 
 #[async_trait]
 impl CommitPublisher for FileNameService {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
@@ -1093,10 +1102,13 @@ impl CommitPublisher for FileNameService {
             .storage
             .compare_and_swap(&address, |bytes| {
                 let cid_val = Some(cid_str.clone());
+                let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+                if !main_admits(current.as_ref(), fence) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
 
-                match bytes {
-                    Some(data) => {
-                        let mut file: NsFileV2 = deserialize_json(data)?;
+                match current.filter(|f| !f.is_deleted()) {
+                    Some(mut file) => {
                         // Strictly monotonic update
                         if commit_t > file.t {
                             file.commit_cid = cid_val;
@@ -1104,7 +1116,7 @@ impl CommitPublisher for FileNameService {
                             let new_bytes = serialize_json(&file)?;
                             Ok(CasAction::Write(new_bytes))
                         } else {
-                            Ok(CasAction::Abort(()))
+                            Ok(CasAction::Abort(Ok(())))
                         }
                     }
                     None => {
@@ -1140,6 +1152,9 @@ impl CommitPublisher for FileNameService {
             })
             .await?;
 
+        if matches!(outcome, CasOutcome::Aborted(Err(FenceRefused))) {
+            return Err(NameServiceError::fenced(ledger_id));
+        }
         if matches!(outcome, CasOutcome::Written) {
             if let Err(e) = self
                 .append_commit_index_entry(&ledger_name, &branch, commit_t, &cid_str)
@@ -1160,9 +1175,10 @@ impl CommitPublisher for FileNameService {
 
 #[async_trait]
 impl IndexPublisher for FileNameService {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -1170,15 +1186,15 @@ impl IndexPublisher for FileNameService {
         let address = Self::index_address(&ledger_name, &branch);
         let cid_str = index_id.to_string();
 
-        self.storage
+        let outcome = self
+            .storage
             .compare_and_swap(&address, |bytes| {
-                let mut fence = None;
-                if let Some(data) = bytes {
-                    let existing: NsIndexFileV2 = deserialize_json(data)?;
-                    if index_t <= existing.index.t {
-                        return Ok(CasAction::Abort(()));
-                    }
-                    fence = existing.fence;
+                let existing: Option<NsIndexFileV2> = bytes.map(deserialize_json).transpose()?;
+                if !index_admits(existing.as_ref(), fence) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
+                if existing.as_ref().is_some_and(|e| index_t <= e.index.t) {
+                    return Ok(CasAction::Abort(Ok(())));
                 }
 
                 let file = NsIndexFileV2 {
@@ -1195,15 +1211,19 @@ impl IndexPublisher for FileNameService {
             })
             .await?;
 
-        Ok(())
+        match outcome {
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
+            _ => Ok(()),
+        }
     }
 }
 
 #[async_trait]
 impl AdminPublisher for FileNameService {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -1211,15 +1231,15 @@ impl AdminPublisher for FileNameService {
         let address = Self::index_address(&ledger_name, &branch);
         let cid_str = index_id.to_string();
 
-        self.storage
+        let outcome = self
+            .storage
             .compare_and_swap(&address, |bytes| {
-                let (should_update, fence) = match bytes {
-                    Some(data) => {
-                        let existing: NsIndexFileV2 = deserialize_json(data)?;
-                        (index_t >= existing.index.t, existing.fence) // Allow equal
-                    }
-                    None => (true, None),
-                };
+                let existing: Option<NsIndexFileV2> = bytes.map(deserialize_json).transpose()?;
+                if !index_admits(existing.as_ref(), fence) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
+                // Allow equal
+                let should_update = existing.as_ref().is_none_or(|e| index_t >= e.index.t);
 
                 if should_update {
                     let file = NsIndexFileV2 {
@@ -1234,12 +1254,15 @@ impl AdminPublisher for FileNameService {
                     let new_bytes = serialize_json(&file)?;
                     Ok(CasAction::Write(new_bytes))
                 } else {
-                    Ok(CasAction::Abort(()))
+                    Ok(CasAction::Abort(Ok(())))
                 }
             })
             .await?;
 
-        Ok(())
+        match outcome {
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1518,9 +1541,10 @@ impl RefLookup for FileNameService {
 
 #[async_trait]
 impl RefPublisher for FileNameService {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -1542,6 +1566,9 @@ impl RefPublisher for FileNameService {
                     .storage
                     .compare_and_swap(&address, |bytes| {
                         let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+                        if !main_admits(existing.as_ref(), fence) {
+                            return Ok(CasAction::Abort(Err(FenceRefused)));
+                        }
 
                         let current_ref = existing.as_ref().map(|f| RefValue {
                             id: f
@@ -1558,14 +1585,14 @@ impl RefPublisher for FileNameService {
                             ref_values_match,
                             |actual| CasResult::Conflict { actual },
                         ) {
-                            return Ok(CasAction::Abort(conflict));
+                            return Ok(CasAction::Abort(Ok(conflict)));
                         }
                         // Monotonic guard: CommitHead requires strict new.t > current.t
                         if let Some(ref cur) = current_ref {
                             if new_clone.t <= cur.t {
-                                return Ok(CasAction::Abort(CasResult::Conflict {
+                                return Ok(CasAction::Abort(Ok(CasResult::Conflict {
                                     actual: Some(cur.clone()),
-                                }));
+                                })));
                             }
                         }
 
@@ -1607,7 +1634,10 @@ impl RefPublisher for FileNameService {
 
                 let result = match outcome {
                     CasOutcome::Written => CasResult::Updated,
-                    CasOutcome::Aborted(r) => r,
+                    CasOutcome::Aborted(Ok(r)) => r,
+                    CasOutcome::Aborted(Err(FenceRefused)) => {
+                        return Err(NameServiceError::fenced(ledger_id))
+                    }
                 };
                 let cas_us = phase.elapsed().as_micros() as u64;
                 let phase = std::time::Instant::now();
@@ -1670,6 +1700,9 @@ impl RefPublisher for FileNameService {
                     .compare_and_swap(&address, |bytes| {
                         let existing: Option<NsIndexFileV2> =
                             bytes.map(deserialize_json).transpose()?;
+                        if !index_admits(existing.as_ref(), fence) {
+                            return Ok(CasAction::Abort(Err(FenceRefused)));
+                        }
 
                         // When the separate index file doesn't exist yet,
                         // use the main file's inline index ref (matches get_ref
@@ -1695,15 +1728,15 @@ impl RefPublisher for FileNameService {
                             ref_values_match,
                             |actual| CasResult::Conflict { actual },
                         ) {
-                            return Ok(CasAction::Abort(conflict));
+                            return Ok(CasAction::Abort(Ok(conflict)));
                         }
 
                         // Monotonic guard: IndexHead allows new.t >= current.t
                         if let Some(ref cur) = current_ref {
                             if new_clone.t < cur.t {
-                                return Ok(CasAction::Abort(CasResult::Conflict {
+                                return Ok(CasAction::Abort(Ok(CasResult::Conflict {
                                     actual: Some(cur.clone()),
-                                }));
+                                })));
                             }
                         }
 
@@ -1714,7 +1747,7 @@ impl RefPublisher for FileNameService {
                                 cid: new_clone.id.as_ref().map(std::string::ToString::to_string),
                                 t: new_clone.t,
                             },
-                            fence: existing.as_ref().and_then(|f| f.fence),
+                            fence,
                             frozen: false,
                         };
                         let new_bytes = serialize_json(&file)?;
@@ -1724,7 +1757,10 @@ impl RefPublisher for FileNameService {
 
                 let result = match outcome {
                     CasOutcome::Written => CasResult::Updated,
-                    CasOutcome::Aborted(r) => r,
+                    CasOutcome::Aborted(Ok(r)) => r,
+                    CasOutcome::Aborted(Err(FenceRefused)) => {
+                        return Err(NameServiceError::fenced(ledger_id))
+                    }
                 };
 
                 Ok(result)
@@ -1751,9 +1787,10 @@ impl StatusLookup for FileNameService {
 
 #[async_trait]
 impl StatusPublisher for FileNameService {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
@@ -1768,6 +1805,9 @@ impl StatusPublisher for FileNameService {
             .storage
             .compare_and_swap(&address, |bytes| {
                 let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+                if !main_admits(existing.as_ref(), fence) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
 
                 let current = existing.as_ref().map(NsFileV2::to_status_value);
 
@@ -1778,15 +1818,15 @@ impl StatusPublisher for FileNameService {
                     |exp, actual| exp.v == actual.v && exp.payload == actual.payload,
                     |actual| StatusCasResult::Conflict { actual },
                 ) {
-                    return Ok(CasAction::Abort(conflict));
+                    return Ok(CasAction::Abort(Ok(conflict)));
                 }
 
                 // Monotonic guard: new.v > current.v
                 let current_v = current.as_ref().map(|c| c.v).unwrap_or(0);
                 if new_clone.v <= current_v {
-                    return Ok(CasAction::Abort(StatusCasResult::Conflict {
+                    return Ok(CasAction::Abort(Ok(StatusCasResult::Conflict {
                         actual: current,
-                    }));
+                    })));
                 }
 
                 // Apply update
@@ -1806,7 +1846,8 @@ impl StatusPublisher for FileNameService {
 
         match outcome {
             CasOutcome::Written => Ok(StatusCasResult::Updated),
-            CasOutcome::Aborted(r) => Ok(r),
+            CasOutcome::Aborted(Ok(r)) => Ok(r),
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
         }
     }
 }
@@ -1825,9 +1866,10 @@ impl ConfigLookup for FileNameService {
 
 #[async_trait]
 impl ConfigPublisher for FileNameService {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
@@ -1842,6 +1884,9 @@ impl ConfigPublisher for FileNameService {
             .storage
             .compare_and_swap(&address, |bytes| {
                 let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+                if !main_admits(existing.as_ref(), fence) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
 
                 let current = existing.as_ref().map(NsFileV2::to_config_value);
 
@@ -1852,15 +1897,15 @@ impl ConfigPublisher for FileNameService {
                     |exp, actual| exp.v == actual.v && exp.payload == actual.payload,
                     |actual| ConfigCasResult::Conflict { actual },
                 ) {
-                    return Ok(CasAction::Abort(conflict));
+                    return Ok(CasAction::Abort(Ok(conflict)));
                 }
 
                 // Monotonic guard: new.v > current.v
                 let current_v = current.as_ref().map(|c| c.v).unwrap_or(0);
                 if new_clone.v <= current_v {
-                    return Ok(CasAction::Abort(ConfigCasResult::Conflict {
+                    return Ok(CasAction::Abort(Ok(ConfigCasResult::Conflict {
                         actual: current,
-                    }));
+                    })));
                 }
 
                 // Apply update
@@ -1895,7 +1940,8 @@ impl ConfigPublisher for FileNameService {
 
         match outcome {
             CasOutcome::Written => Ok(ConfigCasResult::Updated),
-            CasOutcome::Aborted(r) => Ok(r),
+            CasOutcome::Aborted(Ok(r)) => Ok(r),
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
         }
     }
 }

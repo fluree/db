@@ -432,20 +432,27 @@ impl RaftIntegration {
                 .and_then(fluree_db_core::StorageRoot::instance)
                 .is_some()
             {
-                fluree_db_nameservice::lifecycle::mirror_record(publisher.as_ref(), &record).await
+                fluree_db_nameservice::lifecycle::mirror_record(publisher.as_ref(), &record)
+                    .await
+                    .map(Some)
             } else {
-                publisher.init(ledger_id).await
+                publisher.init(ledger_id).await.map(|()| None)
             };
-            match created {
-                Ok(()) | Err(NameServiceError::LedgerAlreadyExists(_)) => {}
+            // The fence the carried heads, config and status present.
+            let fence = match created {
+                Ok(fence) => fence,
+                Err(NameServiceError::LedgerAlreadyExists(_)) => None,
                 Err(e) => return Err(FileRegistryAdoptionError::replay(ledger_id, "init", e)),
-            }
+            };
             if record.commit_head_id.is_some() {
                 let head = RefValue {
                     id: record.commit_head_id.clone(),
                     t: record.commit_t,
                 };
-                match publisher.fast_forward_commit(ledger_id, &head, 3).await {
+                match publisher
+                    .fast_forward_commit_fenced(ledger_id, fence, &head, 3)
+                    .await
+                {
                     Ok(CasResult::Updated) => {}
                     // A retried replay finds its own prior write; a
                     // machine already AHEAD of the file registry means
@@ -487,7 +494,13 @@ impl RaftIntegration {
                     .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "index head", e))?;
                 if !current.as_ref().is_some_and(|c| c.t >= record.index_t) {
                     match publisher
-                        .compare_and_set_ref(ledger_id, RefKind::IndexHead, current.as_ref(), &idx)
+                        .compare_and_set_ref_fenced(
+                            ledger_id,
+                            fence,
+                            RefKind::IndexHead,
+                            current.as_ref(),
+                            &idx,
+                        )
                         .await
                     {
                         Ok(CasResult::Updated) => {}
@@ -535,7 +548,7 @@ impl RaftIntegration {
                 // config never moved off `unborn`. Nothing to carry.
                 if !current.as_ref().is_some_and(|c| c.v >= config.v) {
                     match publisher
-                        .push_config(ledger_id, current.as_ref(), &config)
+                        .push_config_fenced(ledger_id, fence, current.as_ref(), &config)
                         .await
                     {
                         Ok(ConfigCasResult::Updated) => {}
@@ -566,7 +579,7 @@ impl RaftIntegration {
                     .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "status", e))?;
                 if !current.as_ref().is_some_and(|c| c.v >= status.v) {
                     match publisher
-                        .push_status(ledger_id, current.as_ref(), &status)
+                        .push_status_fenced(ledger_id, fence, current.as_ref(), &status)
                         .await
                     {
                         Ok(StatusCasResult::Updated) => {}

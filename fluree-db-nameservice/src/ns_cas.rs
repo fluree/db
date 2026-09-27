@@ -273,3 +273,25 @@ where
     })
     .await
 }
+
+/// Whether a write presenting `fence` may change the main file `current`,
+/// its bytes as read: a live record [`admits`](NsFileV2::admits) it, and a
+/// missing or deleted one takes only an unfenced write, which creates it.
+pub(crate) fn main_admits(current: Option<&NsFileV2>, fence: Option<Fence>) -> bool {
+    match current.filter(|f| !f.is_deleted()) {
+        Some(file) => file.admits(fence),
+        None => fence.is_none(),
+    }
+}
+
+/// [`main_admits`] for an index file: a missing one takes only an unfenced
+/// write.
+pub(crate) fn index_admits(current: Option<&NsIndexFileV2>, fence: Option<Fence>) -> bool {
+    match current {
+        Some(file) => file.admits(fence),
+        None => fence.is_none(),
+    }
+}
+
+/// A compare-and-swap refused because the write's fence was not admitted.
+pub(crate) struct FenceRefused;

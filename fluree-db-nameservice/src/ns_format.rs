@@ -167,6 +167,12 @@ impl NsFileV2 {
         self.status == STATUS_DELETED
     }
 
+    /// Whether a write presenting `fence` may change this record, which must
+    /// not be a tombstone. See [`crate::fence_admits`].
+    pub(crate) fn admits(&self, fence: Option<crate::Fence>) -> bool {
+        !self.is_deleted() && crate::fence_admits(self.fence, self.status == STATUS_FROZEN, fence)
+    }
+
     /// The record this file and its index-only file describe, or `None` for
     /// a tombstone. The index file counts only when it carries this file's
     /// fence: one left by an earlier incarnation of the key is stale.
@@ -320,6 +326,15 @@ pub(crate) struct NsIndexFileV2 {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub frozen: bool,
+}
+
+impl NsIndexFileV2 {
+    /// Whether a write presenting `fence` may change this index file. A
+    /// fenced record's index file carries its fence from before the record
+    /// exists, so a fenced write needs no read of the main file.
+    pub(crate) fn admits(&self, fence: Option<crate::Fence>) -> bool {
+        crate::fence_admits(self.fence, self.frozen, fence)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

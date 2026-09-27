@@ -324,6 +324,36 @@ fn resolved_from_state(
     ))
 }
 
+/// `command` by a writer holding `fence`; see [`SmCommand::Fenced`].
+fn fenced_command(command: SmCommand, fence: Option<Fence>) -> SmCommand {
+    match fence {
+        Some(fence) => SmCommand::Fenced {
+            fence: fence.as_u64(),
+            command: Box::new(command),
+        },
+        None => command,
+    }
+}
+
+/// A refused fence as an error.
+fn check_fence_response(response: &SmResponse, ledger_id: &str) -> Result<()> {
+    match response {
+        SmResponse::FenceMismatch | SmResponse::FenceMissing | SmResponse::FenceFrozen => {
+            Err(NameServiceError::fenced(ledger_id))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The fence `key`'s branch carries and whether it is frozen, as
+/// [`fluree_db_nameservice::check_write_fence`] takes it.
+fn stored_fence(state: &NameServiceState, key: &RefKey) -> Option<(Option<Fence>, bool)> {
+    match state.fences.get(key) {
+        Some(f) => Some((Some(Fence::from_u64(f.fence)), f.frozen)),
+        None => record_from_state(state, &key.ledger_name, &key.branch).map(|_| (None, false)),
+    }
+}
+
 /// Where `key`'s artifacts live: under its ledger's binding root, or under
 /// its name for a ledger from before bindings.
 pub(crate) fn storage_namespace_in(
@@ -390,15 +420,22 @@ impl NameServiceLookup for RaftNameService {
 
 #[async_trait]
 impl IndexPublisher for RaftNameService {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        let cmd = build_advance_index_command(ledger_id, index_t, index_id)?;
+        let cmd = fenced_command(
+            build_advance_index_command(ledger_id, index_t, index_id)?,
+            fence,
+        );
         match self.raft.client_write(cmd).await {
-            Ok(resp) => map_advance_index_response(resp.data),
+            Ok(resp) => {
+                check_fence_response(&resp.data, ledger_id)?;
+                map_advance_index_response(resp.data)
+            }
             // A stepped-down leader's straggling publish call. The
             // new leader will run its own build; nothing for us to
             // do except not propagate the error. This swallow is
@@ -423,15 +460,22 @@ impl IndexPublisher for RaftNameService {
 
 #[async_trait]
 impl AdminPublisher for RaftNameService {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        let cmd = build_rewrite_index_command(ledger_id, index_t, index_id)?;
+        let cmd = fenced_command(
+            build_rewrite_index_command(ledger_id, index_t, index_id)?,
+            fence,
+        );
         match self.raft.client_write(cmd).await {
-            Ok(resp) => map_advance_index_response(resp.data),
+            Ok(resp) => {
+                check_fence_response(&resp.data, ledger_id)?;
+                map_advance_index_response(resp.data)
+            }
             // Unlike `publish_index`, no swallow here: this trait's
             // callers are one-shot admin operations (import's final
             // publish, the CLI index command) with no re-run story —
@@ -1158,12 +1202,26 @@ fn classify_apply_staged_commit_outcome(
 
 #[async_trait]
 impl CommitPublisher for RaftNameService {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
+        // The head applies through the branch's queue, which a drop
+        // clears, so the fence is checked here rather than in the state
+        // machine; see `state_machine::fenced_branch`.
+        {
+            let (name, branch) = split_ledger_id(ledger_id)?;
+            let state = self.state.read().await;
+            fluree_db_nameservice::check_write_fence(
+                ledger_id,
+                stored_fence(&state, &RefKey::new(name, branch)),
+                fence,
+            )?;
+        }
+
         // With forwarding enabled, a non-leader node ferries the
         // staged work to the current leader's `apply_staged_commit`
         // endpoint instead of attempting a local propose (which would
@@ -1908,9 +1966,16 @@ impl BranchLifecycle for RaftNameService {
         map_drop_branch_response(self.submit_lifecycle(cmd).await?)
     }
 
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
-        let cmd = build_reset_head_command(ledger_id, snapshot)?;
-        map_reset_head_response(self.submit_lifecycle(cmd).await?)
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
+    ) -> Result<()> {
+        let cmd = fenced_command(build_reset_head_command(ledger_id, snapshot)?, fence);
+        let response = self.submit_lifecycle(cmd).await?;
+        check_fence_response(&response, ledger_id)?;
+        map_reset_head_response(response)
     }
 }
 
@@ -1953,23 +2018,29 @@ impl RefLookup for RaftNameService {
 
 #[async_trait]
 impl RefPublisher for RaftNameService {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let cmd = SmCommand::CompareAndSetRef(RefCas {
-            ledger_id: ledger_name,
-            branch,
-            kind,
-            expected: expected.cloned(),
-            new: new.clone(),
-            applied_at_millis: crate::raft::current_millis(),
-        });
-        match self.submit_lifecycle(cmd).await? {
+        let cmd = fenced_command(
+            SmCommand::CompareAndSetRef(RefCas {
+                ledger_id: ledger_name,
+                branch,
+                kind,
+                expected: expected.cloned(),
+                new: new.clone(),
+                applied_at_millis: crate::raft::current_millis(),
+            }),
+            fence,
+        );
+        let response = self.submit_lifecycle(cmd).await?;
+        check_fence_response(&response, ledger_id)?;
+        match response {
             SmResponse::RefCasUpdated => Ok(CasResult::Updated),
             SmResponse::RefCasConflict { actual } => Ok(CasResult::Conflict { actual }),
             SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
@@ -2110,9 +2181,10 @@ impl StatusLookup for RaftNameService {
 
 #[async_trait]
 impl StatusPublisher for RaftNameService {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
@@ -2125,12 +2197,17 @@ impl StatusPublisher for RaftNameService {
         // reason: the apply compares and stores the command's bytes
         // verbatim.
         let (name, branch) = split_ledger_id(ledger_id)?;
-        let cmd = SmCommand::PushStatus {
-            ledger_id: format_ledger_id(&name, &branch),
-            expected: expected.map(StoredStatus::from),
-            new: StoredStatus::from(new),
-        };
-        match self.submit_lifecycle(cmd).await? {
+        let cmd = fenced_command(
+            SmCommand::PushStatus {
+                ledger_id: format_ledger_id(&name, &branch),
+                expected: expected.map(StoredStatus::from),
+                new: StoredStatus::from(new),
+            },
+            fence,
+        );
+        let response = self.submit_lifecycle(cmd).await?;
+        check_fence_response(&response, ledger_id)?;
+        match response {
             SmResponse::StatusUpdated => Ok(StatusCasResult::Updated),
             SmResponse::StatusConflict { actual } => Ok(StatusCasResult::Conflict {
                 actual: actual.as_ref().map(StatusValue::from),
@@ -2167,20 +2244,26 @@ impl ConfigLookup for RaftNameService {
 
 #[async_trait]
 impl ConfigPublisher for RaftNameService {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
         // Same canonicalize-before-propose contract as `push_status`.
         let (name, branch) = split_ledger_id(ledger_id)?;
-        let cmd = SmCommand::PushConfig(Box::new(ConfigUpdate {
-            ledger_id: format_ledger_id(&name, &branch),
-            expected: expected.map(StoredConfig::from),
-            new: StoredConfig::from(new),
-        }));
-        match self.submit_lifecycle(cmd).await? {
+        let cmd = fenced_command(
+            SmCommand::PushConfig(Box::new(ConfigUpdate {
+                ledger_id: format_ledger_id(&name, &branch),
+                expected: expected.map(StoredConfig::from),
+                new: StoredConfig::from(new),
+            })),
+            fence,
+        );
+        let response = self.submit_lifecycle(cmd).await?;
+        check_fence_response(&response, ledger_id)?;
+        match response {
             SmResponse::ConfigUpdated => Ok(ConfigCasResult::Updated),
             SmResponse::ConfigConflict { actual } => Ok(ConfigCasResult::Conflict {
                 actual: actual.as_ref().map(ConfigValue::from),

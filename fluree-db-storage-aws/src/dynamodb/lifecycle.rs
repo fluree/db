@@ -37,7 +37,100 @@ fn condition_failed<E: aws_sdk_dynamodb::error::ProvideErrorMetadata>(
         if se.err().code() == Some("ConditionalCheckFailedException"))
 }
 
+/// The clause a write presenting `fence` adds to its item's condition: the
+/// item carries that fence and is not frozen, or carries no fence for an
+/// unfenced write.
+struct FenceClause {
+    expr: &'static str,
+    names: &'static [(&'static str, &'static str)],
+    values: Vec<(&'static str, AttributeValue)>,
+}
+
+impl FenceClause {
+    fn new(fence: Option<Fence>) -> Self {
+        match fence {
+            Some(fence) => Self {
+                expr: "#fence = :fence AND (attribute_not_exists(#frozen) OR #frozen <> :frozen)",
+                names: &[("#fence", ATTR_FENCE), ("#frozen", ATTR_FROZEN)],
+                values: vec![
+                    (":fence", fence_value(fence)),
+                    (":frozen", AttributeValue::Bool(true)),
+                ],
+            },
+            None => Self {
+                expr: "attribute_not_exists(#fence)",
+                names: &[("#fence", ATTR_FENCE)],
+                values: Vec::new(),
+            },
+        }
+    }
+
+    /// `condition`, if any, joined with this clause.
+    fn condition(&self, condition: Option<&str>) -> String {
+        match condition {
+            Some(condition) => format!("({condition}) AND {}", self.expr),
+            None => self.expr.to_string(),
+        }
+    }
+}
+
+/// Condition an `UpdateItem` on `condition` and on its item admitting
+/// `fence`.
+pub(super) fn fenced_update_item(
+    mut request: aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder,
+    condition: Option<&str>,
+    fence: Option<Fence>,
+) -> aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder {
+    let clause = FenceClause::new(fence);
+    request = request.condition_expression(clause.condition(condition));
+    for (name, attr) in clause.names {
+        request = request.expression_attribute_names(*name, *attr);
+    }
+    for (name, value) in clause.values {
+        request = request.expression_attribute_values(name, value);
+    }
+    request
+}
+
+/// [`fenced_update_item`] for an update inside a transaction.
+pub(super) fn fenced_update(
+    mut update: aws_sdk_dynamodb::types::builders::UpdateBuilder,
+    condition: Option<&str>,
+    fence: Option<Fence>,
+) -> aws_sdk_dynamodb::types::builders::UpdateBuilder {
+    let clause = FenceClause::new(fence);
+    update = update.condition_expression(clause.condition(condition));
+    for (name, attr) in clause.names {
+        update = update.expression_attribute_names(*name, *attr);
+    }
+    for (name, value) in clause.values {
+        update = update.expression_attribute_values(name, value);
+    }
+    update
+}
+
 impl DynamoDbNameService {
+    /// Whether the item at `sk` refuses a write presenting `fence`: it does
+    /// not admit it, or it is missing and the write carries a fence. Read
+    /// after a conditional write failed, to tell a refused fence from a lost
+    /// race.
+    pub(super) async fn fence_refuses(
+        &self,
+        pk: &str,
+        sk: &str,
+        fence: Option<Fence>,
+    ) -> Result<bool> {
+        let Some(item) = self.get_item(pk, sk).await? else {
+            return Ok(fence.is_some());
+        };
+        let stored = item
+            .get(ATTR_FENCE)
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| s.parse().ok());
+        let frozen = item.get(ATTR_FROZEN).and_then(|v| v.as_bool().ok()) == Some(&true);
+        Ok(!fluree_db_nameservice::fence_admits(stored, frozen, fence))
+    }
+
     async fn get_item(&self, pk: &str, sk: &str) -> Result<Option<Item>> {
         let response = self
             .client

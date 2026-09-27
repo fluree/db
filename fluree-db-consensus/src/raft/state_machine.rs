@@ -842,6 +842,12 @@ pub enum Command {
     },
     /// Add `delta` to a branch's child count if it carries `fence`.
     AdjustChildren { key: RefKey, fence: u64, delta: i32 },
+    /// `command`, a write to one branch, by a writer holding `fence`:
+    /// applied only while the branch carries that fence and is not
+    /// frozen. The same write unwrapped is an unfenced write, which a
+    /// fenced branch refuses. See [`fenced_branch`] for the writes
+    /// covered.
+    Fenced { fence: u64, command: Box<Command> },
 }
 
 /// Postcard-safe JSON value tree with deterministic encoding:
@@ -1542,6 +1548,64 @@ impl NameServiceState {
 /// this command, used as a deterministic alternative to wall-clock
 /// time for any state-machine bookkeeping that needs it.
 pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
+    let (command, presented) = match command {
+        Command::Fenced { fence, command } => (*command, Some(fence)),
+        command => (command, None),
+    };
+    match fenced_branch(&command) {
+        Some(key) => {
+            if let Some(refused) = check_presented_fence(state, &key, presented) {
+                return refused;
+            }
+        }
+        None if presented.is_some() => return Response::FenceMismatch,
+        None => {}
+    }
+    apply_admitted(state, command, log_index)
+}
+
+/// The branch a write covered by the fence changes. The commit worker's
+/// [`Command::ApplyHead`] is not covered: it names the queue entry it
+/// applies, and a drop clears the branch's queue, so an entry staged
+/// before a drop can never apply after it.
+fn fenced_branch(command: &Command) -> Option<RefKey> {
+    let of_id = |ledger_id: &str| {
+        split_ledger_id(ledger_id)
+            .ok()
+            .map(|(name, branch)| RefKey::new(name, branch))
+    };
+    match command {
+        Command::AdvanceIndexHead(args) | Command::RewriteIndexHead(args) => {
+            Some(RefKey::new(&args.ledger_id, &args.branch))
+        }
+        Command::ResetHead {
+            ledger_id, branch, ..
+        } => Some(RefKey::new(ledger_id, branch)),
+        Command::CompareAndSetRef(args) => Some(RefKey::new(&args.ledger_id, &args.branch)),
+        Command::PushStatus { ledger_id, .. } => of_id(ledger_id),
+        Command::PushConfig(args) => of_id(&args.ledger_id),
+        _ => None,
+    }
+}
+
+/// Refuse a write presenting `presented` unless `key`'s branch admits it:
+/// a fenced branch takes only its own fence and nothing once frozen, and
+/// an unfenced one takes only unfenced writes.
+fn check_presented_fence(
+    state: &NameServiceState,
+    key: &RefKey,
+    presented: Option<u64>,
+) -> Option<Response> {
+    match (state.fences.get(key), presented) {
+        (Some(f), Some(p)) if f.fence == p && f.frozen => Some(Response::FenceFrozen),
+        (Some(f), Some(p)) if f.fence == p => None,
+        (Some(_), _) => Some(Response::FenceMismatch),
+        (None, Some(_)) => Some(Response::FenceMissing),
+        (None, None) => None,
+    }
+}
+
+fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
     match command {
         Command::AdvanceIndexHead(args) => advance_index_head(state, args),
         Command::RewriteIndexHead(args) => rewrite_index_head(state, args),
@@ -1631,6 +1695,8 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             applied_at_millis,
         } => delete_branch(state, key, fence, applied_at_millis),
         Command::AdjustChildren { key, fence, delta } => adjust_children(state, key, fence, delta),
+        // A wrapper nested in a wrapper covers no single branch write.
+        Command::Fenced { .. } => Response::FenceMismatch,
     }
 }
 

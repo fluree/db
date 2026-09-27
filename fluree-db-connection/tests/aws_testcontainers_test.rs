@@ -238,7 +238,7 @@ async fn localstack_s3_and_dynamodb_smoke() {
 
     // Publish index head
     let index_id = test_index_id("index:1");
-    aws.publish_index(alias, 1, &index_id)
+    aws.publish_index(alias, None, 1, &index_id)
         .await
         .expect("publish_index should succeed");
 

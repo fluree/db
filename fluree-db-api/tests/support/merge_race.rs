@@ -5,10 +5,11 @@ use async_trait::async_trait;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
-    ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceLookup,
-    NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
-    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    ConfigPublisher, ConfigValue, Fence, GraphSourceLookup, GraphSourcePublisher,
+    GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle,
+    NameServiceLookup, NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
+    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
+    StatusValue,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -111,8 +112,15 @@ impl BranchLifecycle for PausingNameService {
         self.inner.drop_branch(ledger_id).await
     }
 
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
-        self.inner.reset_head(ledger_id, snapshot).await
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
+    ) -> Result<()> {
+        self.inner
+            .reset_head_fenced(ledger_id, fence, snapshot)
+            .await
     }
 
     async fn pending_commit_cids(
@@ -145,14 +153,15 @@ impl LedgerLifecycle for PausingNameService {
 
 #[async_trait]
 impl CommitPublisher for PausingNameService {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_commit(ledger_id, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
             .await
     }
 
@@ -163,35 +172,40 @@ impl CommitPublisher for PausingNameService {
 
 #[async_trait]
 impl IndexPublisher for PausingNameService {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        self.inner.publish_index(ledger_id, index_t, index_id).await
+        self.inner
+            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .await
     }
 }
 
 #[async_trait]
 impl AdminPublisher for PausingNameService {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_index_allow_equal(ledger_id, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
             .await
     }
 }
 
 #[async_trait]
 impl RefPublisher for PausingNameService {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -204,7 +218,7 @@ impl RefPublisher for PausingNameService {
             self.resume.notified().await;
         }
         self.inner
-            .compare_and_set_ref(ledger_id, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
             .await
     }
 }
@@ -243,25 +257,31 @@ impl GraphSourcePublisher for PausingNameService {
 
 #[async_trait]
 impl StatusPublisher for PausingNameService {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
-        self.inner.push_status(ledger_id, expected, new).await
+        self.inner
+            .push_status_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 
 #[async_trait]
 impl ConfigPublisher for PausingNameService {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        self.inner.push_config(ledger_id, expected, new).await
+        self.inner
+            .push_config_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 

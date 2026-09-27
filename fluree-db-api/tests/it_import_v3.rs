@@ -852,8 +852,9 @@ ex:bob a ex:User ;
     fluree
         .publisher()
         .unwrap()
-        .publish_index(
+        .publish_index_fenced(
             "test/v3-rebuild:main",
+            crate::support::fence_of(&fluree, "test/v3-rebuild:main").await,
             index_result.index_t,
             &index_result.root_id,
         )
@@ -1009,8 +1010,9 @@ ex:bob a ex:User ;
     fluree
         .publisher()
         .unwrap()
-        .publish_index(
+        .publish_index_fenced(
             "test/v3-incr:main",
+            crate::support::fence_of(&fluree, "test/v3-incr:main").await,
             rebuild_result.index_t,
             &rebuild_result.root_id,
         )
@@ -1099,8 +1101,9 @@ ex:bob a ex:User ;
     fluree
         .publisher()
         .unwrap()
-        .publish_index(
+        .publish_index_fenced(
             "test/v3-incr:main",
+            crate::support::fence_of(&fluree, "test/v3-incr:main").await,
             index_result.index_t,
             &index_result.root_id,
         )
@@ -1289,8 +1292,9 @@ ex:remove a ex:User ;
     fluree
         .publisher()
         .unwrap()
-        .publish_index(
+        .publish_index_fenced(
             "test/v3-retract:main",
+            crate::support::fence_of(&fluree, "test/v3-retract:main").await,
             index_result.index_t,
             &index_result.root_id,
         )

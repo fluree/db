@@ -2880,7 +2880,12 @@ where
             // go to the device before the pointer that names them.
             let publish_result = match cs.sync().await {
                 Ok(()) => nameservice
-                    .publish_index(&ledger_addr, result.index_t, &result.root_id)
+                    .publish_index_fenced(
+                        &ledger_addr,
+                        result.fence,
+                        result.index_t,
+                        &result.root_id,
+                    )
                     .await
                     .map_err(|e| e.to_string()),
                 Err(e) => Err(format!("flush index artifacts: {e}")),
@@ -2996,7 +3001,7 @@ where
         )))
     })?;
     nameservice
-        .publish_index(&ledger_addr, result.index_t, &result.root_id)
+        .publish_index_fenced(&ledger_addr, result.fence, result.index_t, &result.root_id)
         .await
         .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
 

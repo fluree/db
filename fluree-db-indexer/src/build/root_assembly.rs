@@ -566,6 +566,7 @@ pub(crate) async fn encode_and_write_root_v6(
         },
         // Outer entry point fills fuel from the tracker tally.
         fuel: None,
+        fence: None,
     })
 }
 

@@ -8,7 +8,8 @@ use crate::config::SyncConfigStore;
 use crate::error::{Result, SyncError};
 use fluree_db_core::LedgerId;
 use fluree_db_nameservice::{
-    CasResult, RefKind, RefPublisher, RefValue, RemoteName, RemoteTrackingStore, TrackingRecord,
+    CasResult, Fence, NameServicePublisher, RefKind, RefPublisher, RefValue, RemoteName,
+    RemoteTrackingStore, TrackingRecord,
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -63,8 +64,9 @@ pub enum PushResult {
 
 /// Orchestrates sync operations between local and remote nameservices
 pub struct SyncDriver {
-    /// Local nameservice ref operations
-    local: Arc<dyn RefPublisher>,
+    /// Local nameservice. Its writes present each branch's current fence:
+    /// sync acts on whichever ledger holds the local alias now.
+    local: Arc<dyn NameServicePublisher>,
     /// Remote tracking store
     tracking: Arc<dyn RemoteTrackingStore>,
     /// Sync configuration
@@ -84,7 +86,7 @@ impl Debug for SyncDriver {
 impl SyncDriver {
     /// Create a new sync driver
     pub fn new(
-        local: Arc<dyn RefPublisher>,
+        local: Arc<dyn NameServicePublisher>,
         tracking: Arc<dyn RemoteTrackingStore>,
         config: Arc<dyn SyncConfigStore>,
     ) -> Self {
@@ -94,6 +96,18 @@ impl SyncDriver {
             config,
             clients: HashMap::new(),
         }
+    }
+
+    /// The fence `ledger_id`'s local writes present: its record's now.
+    async fn local_fence(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<Option<Fence>, fluree_db_nameservice::NameServiceError> {
+        Ok(self
+            .local
+            .lookup(ledger_id)
+            .await?
+            .and_then(|record| record.fence))
     }
 
     /// Register a client for a remote
@@ -202,12 +216,22 @@ impl SyncDriver {
             .await
             .map_err(SyncError::Nameservice)?;
 
+        let fence = self
+            .local_fence(local_alias)
+            .await
+            .map_err(SyncError::Nameservice)?;
         match &local_ref {
             None => {
                 // Local doesn't exist yet — create it via CAS
                 let result = self
                     .local
-                    .compare_and_set_ref(local_alias, RefKind::CommitHead, None, remote_commit)
+                    .compare_and_set_ref_fenced(
+                        local_alias,
+                        fence,
+                        RefKind::CommitHead,
+                        None,
+                        remote_commit,
+                    )
                     .await
                     .map_err(SyncError::Nameservice)?;
                 match result {
@@ -216,8 +240,9 @@ impl SyncDriver {
                         if let Some(remote_index) = remote_index.as_ref() {
                             let _ = self
                                 .local
-                                .compare_and_set_ref(
+                                .compare_and_set_ref_fenced(
                                     local_alias,
+                                    fence,
                                     RefKind::IndexHead,
                                     None,
                                     remote_index,
@@ -247,7 +272,7 @@ impl SyncDriver {
                     // Remote is ahead — fast-forward
                     let result = self
                         .local
-                        .fast_forward_commit(local_alias, remote_commit, 3)
+                        .fast_forward_commit_fenced(local_alias, fence, remote_commit, 3)
                         .await
                         .map_err(SyncError::Nameservice)?;
                     match result {
@@ -305,6 +330,7 @@ impl SyncDriver {
         new: &RefValue,
         max_retries: usize,
     ) -> std::result::Result<CasResult, fluree_db_nameservice::NameServiceError> {
+        let fence = self.local_fence(ledger_id).await?;
         for _ in 0..max_retries {
             let current = self.local.get_ref(ledger_id, RefKind::IndexHead).await?;
 
@@ -317,7 +343,13 @@ impl SyncDriver {
 
             match self
                 .local
-                .compare_and_set_ref(ledger_id, RefKind::IndexHead, current.as_ref(), new)
+                .compare_and_set_ref_fenced(
+                    ledger_id,
+                    fence,
+                    RefKind::IndexHead,
+                    current.as_ref(),
+                    new,
+                )
                 .await?
             {
                 CasResult::Updated => return Ok(CasResult::Updated),
@@ -527,7 +559,7 @@ mod tests {
         let remote_client = Arc::new(MockRemoteClient::new());
 
         let mut driver = SyncDriver::new(
-            local.clone() as Arc<dyn RefPublisher>,
+            local.clone() as Arc<dyn NameServicePublisher>,
             tracking as Arc<dyn RemoteTrackingStore>,
             config.clone() as Arc<dyn SyncConfigStore>,
         );

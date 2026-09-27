@@ -187,6 +187,33 @@ pub struct DroppedLedger {
     pub branches: Vec<NsRecord>,
 }
 
+/// Whether a write presenting `presented` may change a record carrying
+/// `fence`. A fenced record takes only its own fence, and nothing once
+/// frozen; a record from before fencing takes only unfenced writes.
+pub fn fence_admits(fence: Option<Fence>, frozen: bool, presented: Option<Fence>) -> bool {
+    fence == presented && !frozen
+}
+
+/// Refuse a write presenting `presented` to `record`, given as its fence and
+/// frozen flag or `None` when there is none, unless [`fence_admits`] it. A
+/// fenced write to a missing record is refused too: the branch was dropped
+/// since the writer loaded it, and publication never creates a record.
+pub fn check_write_fence(
+    ledger_id: &str,
+    record: Option<(Option<Fence>, bool)>,
+    presented: Option<Fence>,
+) -> Result<()> {
+    let admitted = match record {
+        Some((fence, frozen)) => fence_admits(fence, frozen, presented),
+        None => presented.is_none(),
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(NameServiceError::fenced(ledger_id))
+    }
+}
+
 /// A binding or registry entry with the version its next compare-and-swap
 /// must present.
 #[derive(Clone, Debug, PartialEq)]

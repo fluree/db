@@ -21,7 +21,7 @@ use crate::binding::{
     BranchRecordStore, DroppedLedger, Fence, FenceOutcome, LedgerRegistry, NameBinding,
     RegistryCas, Versioned,
 };
-use crate::ns_cas::{self, RecordKeys};
+use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
     merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
     NS_VERSION,
@@ -475,31 +475,64 @@ where
             CasOutcome::Written | CasOutcome::Aborted(()) => Ok(()),
         }
     }
+}
 
-    /// Atomic read-modify-write that returns an outcome decided by the closure.
-    ///
-    /// Unlike `cas_update`, this lets the closure signal "I decided not to update" as
-    /// a non-error condition, carrying an application-level result out.
-    async fn cas_update_with_outcome<T, F>(
+impl<S> StorageNameService<S>
+where
+    S: StorageCas + Debug + Send + Sync,
+{
+    /// [`cas_update`](Self::cas_update) for a write presenting a fence:
+    /// refused with [`NameServiceError::Fenced`] unless `admits` passes the
+    /// current value.
+    async fn cas_update_fenced<T, A, F>(
         &self,
+        ledger_id: &str,
         key: &str,
+        admits: A,
+        update_fn: F,
+    ) -> Result<()>
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+        A: Fn(Option<&T>) -> bool + Send + Sync,
+        F: Fn(Option<T>) -> Option<T> + Send + Sync,
+    {
+        self.cas_update_with_outcome_fenced(ledger_id, key, admits, |current| {
+            match update_fn(current) {
+                Some(value) => CasUpdateDecision::Apply(value),
+                None => CasUpdateDecision::Skip(CasResult::Updated),
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Atomic read-modify-write for a write presenting a fence, returning an
+    /// outcome the closure decides; see
+    /// [`cas_update_fenced`](Self::cas_update_fenced).
+    async fn cas_update_with_outcome_fenced<T, A, F>(
+        &self,
+        ledger_id: &str,
+        key: &str,
+        admits: A,
         update_fn: F,
     ) -> Result<CasUpdateOutcome>
     where
         T: Serialize + for<'de> Deserialize<'de>,
+        A: Fn(Option<&T>) -> bool + Send + Sync,
         F: Fn(Option<T>) -> CasUpdateDecision<T> + Send + Sync,
     {
         let outcome = self
             .storage
             .compare_and_swap(key, |current_bytes| {
                 let current: Option<T> = current_bytes.map(deserialize_json).transpose()?;
-
+                if !admits(current.as_ref()) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
                 match update_fn(current) {
                     CasUpdateDecision::Apply(value) => {
-                        let bytes = serialize_json(&value)?;
-                        Ok(CasAction::Write(bytes))
+                        Ok(CasAction::Write(serialize_json(&value)?))
                     }
-                    CasUpdateDecision::Skip(result) => Ok(CasAction::Abort(result)),
+                    CasUpdateDecision::Skip(result) => Ok(CasAction::Abort(Ok(result))),
                 }
             })
             .await
@@ -507,7 +540,8 @@ where
 
         match outcome {
             CasOutcome::Written => Ok(CasUpdateOutcome::Updated),
-            CasOutcome::Aborted(result) => Ok(CasUpdateOutcome::Skipped(result)),
+            CasOutcome::Aborted(Ok(result)) => Ok(CasUpdateOutcome::Skipped(result)),
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
         }
     }
 }
@@ -876,28 +910,36 @@ where
         }
     }
 
-    async fn reset_head(&self, ledger_id: &str, snapshot: crate::NsRecordSnapshot) -> Result<()> {
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: crate::NsRecordSnapshot,
+    ) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
 
         let outcome = self
             .storage
             .compare_and_swap(&key, |bytes| {
-                let Some(data) = bytes else {
-                    return Ok(CasAction::Abort(()));
+                let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+                let Some(mut file) = current.filter(|f| !f.is_deleted()) else {
+                    return Ok(CasAction::Abort(fence.is_some()));
                 };
-                let mut file: NsFileV2 = deserialize_json(data)?;
+                if !file.admits(fence) {
+                    return Ok(CasAction::Abort(true));
+                }
                 file.apply_snapshot(&snapshot);
                 let new_bytes = serialize_json(&file)?;
                 Ok(CasAction::Write(new_bytes))
             })
             .await?;
 
-        if matches!(outcome, CasOutcome::Aborted(())) {
-            return Err(NameServiceError::not_found(ledger_id));
+        match outcome {
+            CasOutcome::Written => Ok(()),
+            CasOutcome::Aborted(true) => Err(NameServiceError::fenced(ledger_id)),
+            CasOutcome::Aborted(false) => Err(NameServiceError::not_found(ledger_id)),
         }
-
-        Ok(())
     }
 }
 
@@ -994,9 +1036,10 @@ impl<S> CommitPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
@@ -1007,8 +1050,11 @@ where
         let branch_clone = branch.clone();
         let cid_str = commit_id.to_string();
 
-        self.cas_update::<NsFileV2, _>(&key, move |existing| {
-            match existing {
+        self.cas_update_fenced::<NsFileV2, _, _>(
+            ledger_id,
+            &key,
+            |current| main_admits(current, fence),
+            move |existing| match existing.filter(|f| !f.is_deleted()) {
                 Some(mut file) => {
                     // Only update if strictly newer
                     if commit_t > file.t {
@@ -1028,8 +1074,8 @@ where
                         commit_t,
                     ))
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -1044,9 +1090,10 @@ impl<S> IndexPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -1055,24 +1102,29 @@ where
 
         let cid_str = index_id.to_string();
 
-        self.cas_update::<NsIndexFileV2, _>(&key, move |existing| {
-            // Only update if strictly newer
-            if let Some(ref file) = existing {
-                if index_t <= file.index.t {
-                    return None;
+        self.cas_update_fenced::<NsIndexFileV2, _, _>(
+            ledger_id,
+            &key,
+            |current| index_admits(current, fence),
+            move |existing| {
+                // Only update if strictly newer
+                if let Some(ref file) = existing {
+                    if index_t <= file.index.t {
+                        return None;
+                    }
                 }
-            }
 
-            Some(NsIndexFileV2 {
-                context: ns_context(),
-                index: IndexRef {
-                    cid: Some(cid_str.clone()),
-                    t: index_t,
-                },
-                fence: existing.as_ref().and_then(|f| f.fence),
-                frozen: false,
-            })
-        })
+                Some(NsIndexFileV2 {
+                    context: ns_context(),
+                    index: IndexRef {
+                        cid: Some(cid_str.clone()),
+                        t: index_t,
+                    },
+                    fence,
+                    frozen: false,
+                })
+            },
+        )
         .await
     }
 }
@@ -1082,9 +1134,10 @@ impl<S> AdminPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -1092,26 +1145,31 @@ where
         let index_key = self.index_key(&ledger_name, &branch);
         let cid_str = index_id.to_string();
 
-        self.cas_update::<NsIndexFileV2, _>(&index_key, |existing| {
-            let should_update = match &existing {
-                Some(file) => index_t >= file.index.t, // Allow equal
-                None => true,
-            };
+        self.cas_update_fenced::<NsIndexFileV2, _, _>(
+            ledger_id,
+            &index_key,
+            |current| index_admits(current, fence),
+            |existing| {
+                let should_update = match &existing {
+                    Some(file) => index_t >= file.index.t, // Allow equal
+                    None => true,
+                };
 
-            if should_update {
-                Some(NsIndexFileV2 {
-                    context: ns_context(),
-                    index: IndexRef {
-                        cid: Some(cid_str.clone()),
-                        t: index_t,
-                    },
-                    fence: existing.as_ref().and_then(|f| f.fence),
-                    frozen: false,
-                })
-            } else {
-                None
-            }
-        })
+                if should_update {
+                    Some(NsIndexFileV2 {
+                        context: ns_context(),
+                        index: IndexRef {
+                            cid: Some(cid_str.clone()),
+                            t: index_t,
+                        },
+                        fence,
+                        frozen: false,
+                    })
+                } else {
+                    None
+                }
+            },
+        )
         .await
 
         // Note: StorageNameService has no event_tx (no Publication support),
@@ -1193,9 +1251,10 @@ impl<S> RefPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -1212,65 +1271,71 @@ where
                 let expect_exists = expected.is_some();
 
                 let outcome = self
-                    .cas_update_with_outcome::<NsFileV2, _>(&key, move |existing| {
-                        let current_ref = existing.as_ref().map(|f| RefValue {
-                            id: f
-                                .commit_cid
-                                .as_deref()
-                                .and_then(|s| s.parse::<ContentId>().ok()),
-                            t: f.t,
-                        });
+                    .cas_update_with_outcome_fenced::<NsFileV2, _, _>(
+                        ledger_id,
+                        &key,
+                        |current| main_admits(current, fence),
+                        move |existing| {
+                            let current_ref = existing.as_ref().map(|f| RefValue {
+                                id: f
+                                    .commit_cid
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<ContentId>().ok()),
+                                t: f.t,
+                            });
 
-                        // Compare expected with current
-                        match (expect_exists, &current_ref) {
-                            (false, None) => {
-                                // Create new record
-                                return CasUpdateDecision::Apply(
-                                    StorageNameService::<S>::new_main_file(
-                                        &ledger_name,
-                                        &branch,
-                                        new_cid_str.as_deref(),
-                                        new_t,
-                                    ),
-                                );
-                            }
-                            (false, Some(actual)) => {
-                                return CasUpdateDecision::Skip(CasResult::Conflict {
-                                    actual: Some(actual.clone()),
-                                });
-                            }
-                            (true, None) => {
-                                return CasUpdateDecision::Skip(CasResult::Conflict {
-                                    actual: None,
-                                });
-                            }
-                            (true, Some(actual)) => {
-                                // Compare by content id
-                                let identity_matches = match (&expected_id, &actual.id) {
-                                    (Some(a), Some(b)) => a == b,
-                                    (None, None) => true,
-                                    _ => false,
-                                };
-                                if !identity_matches {
+                            // Compare expected with current
+                            match (expect_exists, &current_ref) {
+                                (false, None) => {
+                                    // Create new record
+                                    return CasUpdateDecision::Apply(
+                                        StorageNameService::<S>::new_main_file(
+                                            &ledger_name,
+                                            &branch,
+                                            new_cid_str.as_deref(),
+                                            new_t,
+                                        ),
+                                    );
+                                }
+                                (false, Some(actual)) => {
                                     return CasUpdateDecision::Skip(CasResult::Conflict {
                                         actual: Some(actual.clone()),
                                     });
                                 }
-                                // Identity matches — check monotonic guard (strict for CommitHead)
-                                if new_t <= actual.t {
+                                (true, None) => {
                                     return CasUpdateDecision::Skip(CasResult::Conflict {
-                                        actual: Some(actual.clone()),
+                                        actual: None,
                                     });
                                 }
+                                (true, Some(actual)) => {
+                                    // Compare by content id
+                                    let identity_matches = match (&expected_id, &actual.id) {
+                                        (Some(a), Some(b)) => a == b,
+                                        (None, None) => true,
+                                        _ => false,
+                                    };
+                                    if !identity_matches {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: Some(actual.clone()),
+                                        });
+                                    }
+                                    // Identity matches — check monotonic guard (strict for CommitHead)
+                                    if new_t <= actual.t {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: Some(actual.clone()),
+                                        });
+                                    }
+                                }
                             }
-                        }
 
-                        // Apply the update
-                        let mut file = existing.unwrap();
-                        file.commit_cid = new_cid.as_ref().map(std::string::ToString::to_string);
-                        file.t = new_t;
-                        CasUpdateDecision::Apply(file)
-                    })
+                            // Apply the update
+                            let mut file = existing.unwrap();
+                            file.commit_cid =
+                                new_cid.as_ref().map(std::string::ToString::to_string);
+                            file.t = new_t;
+                            CasUpdateDecision::Apply(file)
+                        },
+                    )
                     .await?;
 
                 match outcome {
@@ -1286,85 +1351,94 @@ where
                 let expect_exists = expected.is_some();
 
                 let outcome = self
-                    .cas_update_with_outcome::<NsIndexFileV2, _>(&key, move |existing| {
-                        let current_ref = existing.as_ref().map(|f| RefValue {
-                            id: f
-                                .index
-                                .cid
-                                .as_deref()
-                                .and_then(|s| s.parse::<ContentId>().ok()),
-                            t: f.index.t,
-                        });
+                    .cas_update_with_outcome_fenced::<NsIndexFileV2, _, _>(
+                        ledger_id,
+                        &key,
+                        |current| index_admits(current, fence),
+                        move |existing| {
+                            let current_ref = existing.as_ref().map(|f| RefValue {
+                                id: f
+                                    .index
+                                    .cid
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<ContentId>().ok()),
+                                t: f.index.t,
+                            });
 
-                        match (expect_exists, &current_ref) {
-                            (false, None) => {
-                                // Create new index record
-                                return CasUpdateDecision::Apply(NsIndexFileV2 {
-                                    context: ns_context(),
-                                    index: IndexRef {
-                                        cid: new_cid.as_ref().map(std::string::ToString::to_string),
-                                        t: new_t,
-                                    },
-                                    fence: None,
-                                    frozen: false,
-                                });
-                            }
-                            (false, Some(actual)) => {
-                                return CasUpdateDecision::Skip(CasResult::Conflict {
-                                    actual: Some(actual.clone()),
-                                });
-                            }
-                            (true, None) => {
-                                // The separate index file doesn't exist yet.
-                                // get_ref returns Some(RefValue { id: None, t: 0 })
-                                // for a freshly created ledger (from the main file
-                                // fallback). Allow if the caller expected that empty
-                                // state; otherwise conflict.
-                                let expected_is_empty = expected_id.is_none();
-                                if !expected_is_empty {
-                                    return CasUpdateDecision::Skip(CasResult::Conflict {
-                                        actual: None,
+                            match (expect_exists, &current_ref) {
+                                (false, None) => {
+                                    // Create new index record
+                                    return CasUpdateDecision::Apply(NsIndexFileV2 {
+                                        context: ns_context(),
+                                        index: IndexRef {
+                                            cid: new_cid
+                                                .as_ref()
+                                                .map(std::string::ToString::to_string),
+                                            t: new_t,
+                                        },
+                                        fence,
+                                        frozen: false,
                                     });
                                 }
-                                // Treat as create — fall through to apply
-                                return CasUpdateDecision::Apply(NsIndexFileV2 {
-                                    context: ns_context(),
-                                    index: IndexRef {
-                                        cid: new_cid.as_ref().map(std::string::ToString::to_string),
-                                        t: new_t,
-                                    },
-                                    fence: None,
-                                    frozen: false,
-                                });
-                            }
-                            (true, Some(actual)) => {
-                                // Compare by content id
-                                let identity_matches = match (&expected_id, &actual.id) {
-                                    (Some(a), Some(b)) => a == b,
-                                    (None, None) => true,
-                                    _ => false,
-                                };
-                                if !identity_matches {
+                                (false, Some(actual)) => {
                                     return CasUpdateDecision::Skip(CasResult::Conflict {
                                         actual: Some(actual.clone()),
                                     });
                                 }
-                                // Non-strict for IndexHead: new.t >= current.t
-                                if new_t < actual.t {
-                                    return CasUpdateDecision::Skip(CasResult::Conflict {
-                                        actual: Some(actual.clone()),
+                                (true, None) => {
+                                    // The separate index file doesn't exist yet.
+                                    // get_ref returns Some(RefValue { id: None, t: 0 })
+                                    // for a freshly created ledger (from the main file
+                                    // fallback). Allow if the caller expected that empty
+                                    // state; otherwise conflict.
+                                    let expected_is_empty = expected_id.is_none();
+                                    if !expected_is_empty {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: None,
+                                        });
+                                    }
+                                    // Treat as create — fall through to apply
+                                    return CasUpdateDecision::Apply(NsIndexFileV2 {
+                                        context: ns_context(),
+                                        index: IndexRef {
+                                            cid: new_cid
+                                                .as_ref()
+                                                .map(std::string::ToString::to_string),
+                                            t: new_t,
+                                        },
+                                        fence,
+                                        frozen: false,
                                     });
                                 }
+                                (true, Some(actual)) => {
+                                    // Compare by content id
+                                    let identity_matches = match (&expected_id, &actual.id) {
+                                        (Some(a), Some(b)) => a == b,
+                                        (None, None) => true,
+                                        _ => false,
+                                    };
+                                    if !identity_matches {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: Some(actual.clone()),
+                                        });
+                                    }
+                                    // Non-strict for IndexHead: new.t >= current.t
+                                    if new_t < actual.t {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: Some(actual.clone()),
+                                        });
+                                    }
+                                }
                             }
-                        }
 
-                        let mut file = existing.unwrap();
-                        file.index = IndexRef {
-                            cid: new_cid.as_ref().map(std::string::ToString::to_string),
-                            t: new_t,
-                        };
-                        CasUpdateDecision::Apply(file)
-                    })
+                            let mut file = existing.unwrap();
+                            file.index = IndexRef {
+                                cid: new_cid.as_ref().map(std::string::ToString::to_string),
+                                t: new_t,
+                            };
+                            CasUpdateDecision::Apply(file)
+                        },
+                    )
                     .await?;
 
                 match outcome {
@@ -1656,9 +1730,10 @@ impl<S> StatusPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
@@ -1671,35 +1746,40 @@ where
         let outcome = self
             .storage
             .compare_and_swap(&key, |current_bytes| {
-                let Some(bytes) = current_bytes else {
-                    return Ok(CasAction::Abort(StatusCasResult::Conflict { actual: None }));
+                let current_file: Option<NsFileV2> =
+                    current_bytes.map(deserialize_json).transpose()?;
+                if !main_admits(current_file.as_ref(), fence) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
+                let Some(mut file) = current_file else {
+                    return Ok(CasAction::Abort(Ok(StatusCasResult::Conflict {
+                        actual: None,
+                    })));
                 };
-
-                let mut file: NsFileV2 = deserialize_json(bytes)?;
 
                 let current = file.to_status_value();
 
                 // Compare expected with current
                 match &expected {
                     None => {
-                        return Ok(CasAction::Abort(StatusCasResult::Conflict {
+                        return Ok(CasAction::Abort(Ok(StatusCasResult::Conflict {
                             actual: Some(current),
-                        }));
+                        })));
                     }
                     Some(exp) => {
                         if exp.v != current.v || exp.payload != current.payload {
-                            return Ok(CasAction::Abort(StatusCasResult::Conflict {
+                            return Ok(CasAction::Abort(Ok(StatusCasResult::Conflict {
                                 actual: Some(current),
-                            }));
+                            })));
                         }
                     }
                 }
 
                 // Monotonic guard: new.v > current.v
                 if new.v <= current.v {
-                    return Ok(CasAction::Abort(StatusCasResult::Conflict {
+                    return Ok(CasAction::Abort(Ok(StatusCasResult::Conflict {
                         actual: Some(current),
-                    }));
+                    })));
                 }
 
                 // Apply update
@@ -1719,7 +1799,8 @@ where
 
         match outcome {
             CasOutcome::Written => Ok(StatusCasResult::Updated),
-            CasOutcome::Aborted(result) => Ok(result),
+            CasOutcome::Aborted(Ok(result)) => Ok(result),
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
         }
     }
 }
@@ -1754,9 +1835,10 @@ impl<S> ConfigPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
@@ -1769,35 +1851,40 @@ where
         let outcome = self
             .storage
             .compare_and_swap(&key, |current_bytes| {
-                let Some(bytes) = current_bytes else {
-                    return Ok(CasAction::Abort(ConfigCasResult::Conflict { actual: None }));
+                let current_file: Option<NsFileV2> =
+                    current_bytes.map(deserialize_json).transpose()?;
+                if !main_admits(current_file.as_ref(), fence) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
+                let Some(mut file) = current_file else {
+                    return Ok(CasAction::Abort(Ok(ConfigCasResult::Conflict {
+                        actual: None,
+                    })));
                 };
-
-                let mut file: NsFileV2 = deserialize_json(bytes)?;
 
                 let current = file.to_config_value();
 
                 // Compare expected with current
                 match &expected {
                     None => {
-                        return Ok(CasAction::Abort(ConfigCasResult::Conflict {
+                        return Ok(CasAction::Abort(Ok(ConfigCasResult::Conflict {
                             actual: Some(current),
-                        }));
+                        })));
                     }
                     Some(exp) => {
                         if exp.v != current.v || exp.payload != current.payload {
-                            return Ok(CasAction::Abort(ConfigCasResult::Conflict {
+                            return Ok(CasAction::Abort(Ok(ConfigCasResult::Conflict {
                                 actual: Some(current),
-                            }));
+                            })));
                         }
                     }
                 }
 
                 // Monotonic guard: new.v > current.v
                 if new.v <= current.v {
-                    return Ok(CasAction::Abort(ConfigCasResult::Conflict {
+                    return Ok(CasAction::Abort(Ok(ConfigCasResult::Conflict {
                         actual: Some(current),
-                    }));
+                    })));
                 }
 
                 // Apply update
@@ -1831,7 +1918,8 @@ where
 
         match outcome {
             CasOutcome::Written => Ok(ConfigCasResult::Updated),
-            CasOutcome::Aborted(result) => Ok(result),
+            CasOutcome::Aborted(Ok(result)) => Ok(result),
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
         }
     }
 }

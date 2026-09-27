@@ -123,7 +123,12 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
     fluree
         .publisher()
         .expect("publisher")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish");
 

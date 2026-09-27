@@ -274,8 +274,11 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
 /// The record keeps its fence when it carries one; otherwise a local one is
 /// issued, since only this copy has to agree with it. Heads are copied as the
 /// record carries them, and an existing copy's heads are left for the caller
-/// to fast-forward.
-pub async fn mirror_record<S: LifecycleStore + ?Sized>(store: &S, record: &NsRecord) -> Result<()> {
+/// to fast-forward, presenting the returned fence.
+pub async fn mirror_record<S: LifecycleStore + ?Sized>(
+    store: &S,
+    record: &NsRecord,
+) -> Result<Fence> {
     let root = record.storage_root.clone();
     let Some((root, instance)) = root.and_then(|r| r.instance().map(|i| (r, i))) else {
         return Err(NameServiceError::invalid_id(format!(
@@ -333,7 +336,8 @@ pub async fn mirror_record<S: LifecycleStore + ?Sized>(store: &S, record: &NsRec
     copy.fence = Some(fence);
     copy.storage_root = None;
     copy.retracted = false;
-    insert_fenced(store, &copy).await
+    insert_fenced(store, &copy).await?;
+    Ok(fence)
 }
 
 /// What [`begin_drop_branch`] left to do.

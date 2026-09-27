@@ -22,7 +22,7 @@ use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, DEFAULT_BRANC
 use fluree_db_core::{ContentId, LedgerId};
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
-    ConfigPayload, ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher,
+    ConfigPayload, ConfigPublisher, ConfigValue, Fence, GraphSourceLookup, GraphSourcePublisher,
     GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle,
     NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup,
     RefPublisher, RefValue, StatusCasResult, StatusLookup, StatusPayload, StatusPublisher,
@@ -938,9 +938,10 @@ impl BranchLifecycle for DynamoDbNameService {
         }
     }
 
-    async fn reset_head(
+    async fn reset_head_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         snapshot: fluree_db_nameservice::NsRecordSnapshot,
     ) -> std::result::Result<(), NameServiceError> {
         let pk = Self::normalize(ledger_id)?;
@@ -982,6 +983,9 @@ impl BranchLifecycle for DynamoDbNameService {
             idx = idx.update_expression("SET #it = :it, #ua = :now REMOVE #ii");
         }
 
+        let head = lifecycle::fenced_update(head, None, fence);
+        let idx = lifecycle::fenced_update(idx, None, fence);
+
         // Combine into a single atomic transaction
         let txn = self
             .client
@@ -997,9 +1001,16 @@ impl BranchLifecycle for DynamoDbNameService {
                     .build(),
             );
 
-        txn.send()
-            .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB reset_head failed: {e}")))?;
+        if let Err(e) = txn.send().await {
+            if self.fence_refuses(&pk, SK_HEAD, fence).await?
+                || self.fence_refuses(&pk, SK_INDEX, fence).await?
+            {
+                return Err(NameServiceError::fenced(ledger_id));
+            }
+            return Err(NameServiceError::storage(format!(
+                "DynamoDB reset_head failed: {e}"
+            )));
+        }
 
         Ok(())
     }
@@ -1286,32 +1297,37 @@ impl LedgerLifecycle for DynamoDbNameService {
 
 #[async_trait]
 impl CommitPublisher for DynamoDbNameService {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> std::result::Result<(), NameServiceError> {
         let pk = Self::normalize(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
 
-        let result = self
+        let request = self
             .client
             .update_item()
             .table_name(&self.table_name)
             .key(ATTR_PK, AttributeValue::S(pk.clone()))
             .key(ATTR_SK, AttributeValue::S(SK_HEAD.to_string()))
-            .update_expression("SET #ci = :cid, #ct = :t, #ua = :now")
-            .condition_expression("attribute_exists(#pk) AND #ct < :t")
-            .expression_attribute_names("#pk", ATTR_PK)
-            .expression_attribute_names("#ci", ATTR_COMMIT_ID)
-            .expression_attribute_names("#ct", ATTR_COMMIT_T)
-            .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
-            .expression_attribute_values(":cid", AttributeValue::S(commit_id.to_string()))
-            .expression_attribute_values(":t", AttributeValue::N(commit_t.to_string()))
-            .expression_attribute_values(":now", AttributeValue::N(now))
-            .send()
-            .await;
+            .update_expression("SET #ci = :cid, #ct = :t, #ua = :now");
+        let result = lifecycle::fenced_update_item(
+            request,
+            Some("attribute_exists(#pk) AND #ct < :t"),
+            fence,
+        )
+        .expression_attribute_names("#pk", ATTR_PK)
+        .expression_attribute_names("#ci", ATTR_COMMIT_ID)
+        .expression_attribute_names("#ct", ATTR_COMMIT_T)
+        .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
+        .expression_attribute_values(":cid", AttributeValue::S(commit_id.to_string()))
+        .expression_attribute_values(":t", AttributeValue::N(commit_t.to_string()))
+        .expression_attribute_values(":now", AttributeValue::N(now))
+        .send()
+        .await;
 
         match result {
             Ok(_) => {
@@ -1320,6 +1336,9 @@ impl CommitPublisher for DynamoDbNameService {
                 Ok(())
             }
             Err(e) if Self::is_conditional_check_failed(&e) => {
+                if self.fence_refuses(&pk, SK_HEAD, fence).await? {
+                    return Err(NameServiceError::fenced(ledger_id));
+                }
                 // Distinguish stale (item exists, t >= new) from missing (not initialized).
                 if !self.meta_exists(&pk).await? {
                     return Err(NameServiceError::not_found(format!(
@@ -1341,13 +1360,14 @@ impl CommitPublisher for DynamoDbNameService {
 
 #[async_trait]
 impl IndexPublisher for DynamoDbNameService {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> std::result::Result<(), NameServiceError> {
-        self.update_index_item(ledger_id, index_t, index_id, "#it < :t")
+        self.update_index_item(ledger_id, index_t, index_id, "#it < :t", fence)
             .await
     }
 }
@@ -1466,11 +1486,15 @@ impl DynamoDbNameService {
         index_t: i64,
         index_id: &ContentId,
         condition: &str,
+        fence: Option<Fence>,
     ) -> std::result::Result<(), NameServiceError> {
         let pk = Self::normalize(ledger_id)?;
 
         // Guard: the ledger must be initialized (meta item must exist).
         if !self.meta_exists(&pk).await? {
+            if fence.is_some() {
+                return Err(NameServiceError::fenced(ledger_id));
+            }
             return Err(NameServiceError::not_found(format!(
                 "Ledger not initialized: {pk}"
             )));
@@ -1480,7 +1504,7 @@ impl DynamoDbNameService {
 
         // Fast path: assume the index item already exists (common case).
         let result = self
-            .send_index_update(&pk, index_id, index_t, &now, condition)
+            .send_index_update(&pk, index_id, index_t, &now, condition, fence)
             .await;
 
         match result {
@@ -1493,12 +1517,15 @@ impl DynamoDbNameService {
                 // condition to disambiguate.
                 let fallback = format!("attribute_not_exists(#it) OR {condition}");
                 let retry = self
-                    .send_index_update(&pk, index_id, index_t, &now, &fallback)
+                    .send_index_update(&pk, index_id, index_t, &now, &fallback, fence)
                     .await;
 
                 match retry {
                     Ok(_) => Ok(()),
                     Err(e) if Self::is_conditional_check_failed(&e) => {
+                        if self.fence_refuses(&pk, SK_INDEX, fence).await? {
+                            return Err(NameServiceError::fenced(ledger_id));
+                        }
                         // Item exists and index_t >= incoming t — stale publish.
                         Ok(())
                     }
@@ -1521,19 +1548,21 @@ impl DynamoDbNameService {
         index_t: i64,
         now: &str,
         condition_expression: &str,
+        fence: Option<Fence>,
     ) -> std::result::Result<
         aws_sdk_dynamodb::operation::update_item::UpdateItemOutput,
         aws_sdk_dynamodb::error::SdkError<
             aws_sdk_dynamodb::operation::update_item::UpdateItemError,
         >,
     > {
-        self.client
+        let request = self
+            .client
             .update_item()
             .table_name(&self.table_name)
             .key(ATTR_PK, AttributeValue::S(pk.to_string()))
             .key(ATTR_SK, AttributeValue::S(SK_INDEX.to_string()))
-            .update_expression("SET #ii = :iid, #it = :t, #ua = :now")
-            .condition_expression(condition_expression)
+            .update_expression("SET #ii = :iid, #it = :t, #ua = :now");
+        lifecycle::fenced_update_item(request, Some(condition_expression), fence)
             .expression_attribute_names("#ii", ATTR_INDEX_ID)
             .expression_attribute_names("#it", ATTR_INDEX_T)
             .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
@@ -1698,13 +1727,14 @@ impl DynamoDbNameService {
 
 #[async_trait]
 impl AdminPublisher for DynamoDbNameService {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> std::result::Result<(), NameServiceError> {
-        self.update_index_item(ledger_id, index_t, index_id, "#it <= :t")
+        self.update_index_item(ledger_id, index_t, index_id, "#it <= :t", fence)
             .await
     }
 }
@@ -1762,9 +1792,10 @@ impl RefLookup for DynamoDbNameService {
 
 #[async_trait]
 impl RefPublisher for DynamoDbNameService {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -1780,6 +1811,10 @@ impl RefPublisher for DynamoDbNameService {
             let current = self.get_ref(ledger_id, kind).await?;
             if current.is_some() {
                 return Ok(CasResult::Conflict { actual: current });
+            }
+            // A writer holding a fence never creates a record.
+            if fence.is_some() {
+                return Err(NameServiceError::fenced(ledger_id));
             }
             // Ledger ID is truly unknown — create via init with the ref pre-set.
             self.create_ledger_with_ref(&pk, ledger_id, kind, new)
@@ -1805,25 +1840,29 @@ impl RefPublisher for DynamoDbNameService {
 
         // ── Case 2: expected unborn (id=None, t=0) ──────────────────────
         if exp.id.is_none() && exp.t == 0 {
-            let mut request = self
+            let request = self
                 .client
                 .update_item()
                 .table_name(&self.table_name)
                 .key(ATTR_PK, AttributeValue::S(pk.clone()))
-                .key(ATTR_SK, AttributeValue::S(sk.to_string()))
-                .condition_expression(
+                .key(ATTR_SK, AttributeValue::S(sk.to_string()));
+            let mut request = lifecycle::fenced_update_item(
+                request,
+                Some(
                     "(attribute_not_exists(#id) OR attribute_type(#id, :null_type)) AND #t = :zero",
-                )
-                .expression_attribute_names("#id", id_attr)
-                .expression_attribute_names("#t", t_attr)
-                .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
-                .expression_attribute_values(":new_t", AttributeValue::N(new.t.to_string()))
-                .expression_attribute_values(
-                    ":now",
-                    AttributeValue::N(Self::now_epoch_ms().to_string()),
-                )
-                .expression_attribute_values(":null_type", AttributeValue::S("NULL".to_string()))
-                .expression_attribute_values(":zero", AttributeValue::N("0".to_string()));
+                ),
+                fence,
+            )
+            .expression_attribute_names("#id", id_attr)
+            .expression_attribute_names("#t", t_attr)
+            .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
+            .expression_attribute_values(":new_t", AttributeValue::N(new.t.to_string()))
+            .expression_attribute_values(
+                ":now",
+                AttributeValue::N(Self::now_epoch_ms().to_string()),
+            )
+            .expression_attribute_values(":null_type", AttributeValue::S("NULL".to_string()))
+            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()));
 
             let update_expr = if let Some(ref id) = new.id {
                 request = request
@@ -1843,6 +1882,9 @@ impl RefPublisher for DynamoDbNameService {
                     Ok(CasResult::Updated)
                 }
                 Err(e) if Self::is_conditional_check_failed(&e) => {
+                    if self.fence_refuses(&pk, sk, fence).await? {
+                        return Err(NameServiceError::fenced(ledger_id));
+                    }
                     let actual = self.get_ref(ledger_id, kind).await?;
                     Ok(CasResult::Conflict { actual })
                 }
@@ -1855,23 +1897,24 @@ impl RefPublisher for DynamoDbNameService {
         // ── Case 3: expected has id ─────────────────────────────────────
         let exp_id = exp.id.as_ref().expect("id must be Some in case 3");
 
-        let mut request = self
+        let request = self
             .client
             .update_item()
             .table_name(&self.table_name)
             .key(ATTR_PK, AttributeValue::S(pk.clone()))
-            .key(ATTR_SK, AttributeValue::S(sk.to_string()))
-            .condition_expression("#id = :exp_id AND #t = :exp_t")
-            .expression_attribute_names("#id", id_attr)
-            .expression_attribute_names("#t", t_attr)
-            .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
-            .expression_attribute_values(":new_t", AttributeValue::N(new.t.to_string()))
-            .expression_attribute_values(
-                ":now",
-                AttributeValue::N(Self::now_epoch_ms().to_string()),
-            )
-            .expression_attribute_values(":exp_id", AttributeValue::S(exp_id.to_string()))
-            .expression_attribute_values(":exp_t", AttributeValue::N(exp.t.to_string()));
+            .key(ATTR_SK, AttributeValue::S(sk.to_string()));
+        let mut request =
+            lifecycle::fenced_update_item(request, Some("#id = :exp_id AND #t = :exp_t"), fence)
+                .expression_attribute_names("#id", id_attr)
+                .expression_attribute_names("#t", t_attr)
+                .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
+                .expression_attribute_values(":new_t", AttributeValue::N(new.t.to_string()))
+                .expression_attribute_values(
+                    ":now",
+                    AttributeValue::N(Self::now_epoch_ms().to_string()),
+                )
+                .expression_attribute_values(":exp_id", AttributeValue::S(exp_id.to_string()))
+                .expression_attribute_values(":exp_t", AttributeValue::N(exp.t.to_string()));
 
         let update_expr = if let Some(ref id) = new.id {
             request =
@@ -1891,6 +1934,9 @@ impl RefPublisher for DynamoDbNameService {
                 Ok(CasResult::Updated)
             }
             Err(e) if Self::is_conditional_check_failed(&e) => {
+                if self.fence_refuses(&pk, sk, fence).await? {
+                    return Err(NameServiceError::fenced(ledger_id));
+                }
                 let actual = self.get_ref(ledger_id, kind).await?;
                 Ok(CasResult::Conflict { actual })
             }
@@ -2307,9 +2353,10 @@ impl StatusLookup for DynamoDbNameService {
 
 #[async_trait]
 impl StatusPublisher for DynamoDbNameService {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> std::result::Result<StatusCasResult, NameServiceError> {
@@ -2328,24 +2375,28 @@ impl StatusPublisher for DynamoDbNameService {
 
         // Build update expression
         let mut update_expr = "SET #st = :new_state, #sv = :new_v, #ua = :now".to_string();
-        let mut request = self
+        let request = self
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key(ATTR_PK, AttributeValue::S(pk))
-            .key(ATTR_SK, AttributeValue::S(SK_STATUS.to_string()))
-            .condition_expression("#sv = :expected_v AND #st = :expected_state")
-            .expression_attribute_names("#st", ATTR_STATUS)
-            .expression_attribute_names("#sv", ATTR_STATUS_V)
-            .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
-            .expression_attribute_values(":expected_v", AttributeValue::N(exp.v.to_string()))
-            .expression_attribute_values(
-                ":expected_state",
-                AttributeValue::S(exp.payload.state.clone()),
-            )
-            .expression_attribute_values(":new_state", AttributeValue::S(new.payload.state.clone()))
-            .expression_attribute_values(":new_v", AttributeValue::N(new.v.to_string()))
-            .expression_attribute_values(":now", AttributeValue::N(now));
+            .key(ATTR_PK, AttributeValue::S(pk.clone()))
+            .key(ATTR_SK, AttributeValue::S(SK_STATUS.to_string()));
+        let mut request = lifecycle::fenced_update_item(
+            request,
+            Some("#sv = :expected_v AND #st = :expected_state"),
+            fence,
+        )
+        .expression_attribute_names("#st", ATTR_STATUS)
+        .expression_attribute_names("#sv", ATTR_STATUS_V)
+        .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
+        .expression_attribute_values(":expected_v", AttributeValue::N(exp.v.to_string()))
+        .expression_attribute_values(
+            ":expected_state",
+            AttributeValue::S(exp.payload.state.clone()),
+        )
+        .expression_attribute_values(":new_state", AttributeValue::S(new.payload.state.clone()))
+        .expression_attribute_values(":new_v", AttributeValue::N(new.v.to_string()))
+        .expression_attribute_values(":now", AttributeValue::N(now));
 
         if !new.payload.extra.is_empty() {
             update_expr.push_str(", #sm = :new_meta");
@@ -2365,6 +2416,9 @@ impl StatusPublisher for DynamoDbNameService {
         match result {
             Ok(_) => Ok(StatusCasResult::Updated),
             Err(e) if Self::is_conditional_check_failed(&e) => {
+                if self.fence_refuses(&pk, SK_STATUS, fence).await? {
+                    return Err(NameServiceError::fenced(ledger_id));
+                }
                 let current = self.get_status(ledger_id).await?;
                 Ok(StatusCasResult::Conflict { actual: current })
             }
@@ -2450,9 +2504,10 @@ impl ConfigLookup for DynamoDbNameService {
 
 #[async_trait]
 impl ConfigPublisher for DynamoDbNameService {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> std::result::Result<ConfigCasResult, NameServiceError> {
@@ -2464,6 +2519,7 @@ impl ConfigPublisher for DynamoDbNameService {
             Some(ref k) if k == KIND_GRAPH_SOURCE => {
                 return Ok(ConfigCasResult::Conflict { actual: None })
             }
+            None if fence.is_some() => return Err(NameServiceError::fenced(ledger_id)),
             None => return Ok(ConfigCasResult::Conflict { actual: None }),
             _ => {}
         }
@@ -2480,7 +2536,7 @@ impl ConfigPublisher for DynamoDbNameService {
 
         // Condition: config_v must match expected
         let condition = if exp.v == 0 {
-            "(attribute_not_exists(#cv) OR #cv = :zero)"
+            "attribute_not_exists(#cv) OR #cv = :zero"
         } else {
             "#cv = :expected_v"
         };
@@ -2490,7 +2546,7 @@ impl ConfigPublisher for DynamoDbNameService {
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key(ATTR_PK, AttributeValue::S(pk))
+            .key(ATTR_PK, AttributeValue::S(pk.clone()))
             .key(ATTR_SK, AttributeValue::S(SK_CONFIG.to_string()))
             .expression_attribute_names("#cv", ATTR_CONFIG_V)
             .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
@@ -2540,8 +2596,7 @@ impl ConfigPublisher for DynamoDbNameService {
             update_expr.push_str(&format!(" REMOVE {}", remove_parts.join(", ")));
         }
 
-        let result = request
-            .condition_expression(condition)
+        let result = lifecycle::fenced_update_item(request, Some(condition), fence)
             .update_expression(update_expr)
             .send()
             .await;
@@ -2549,6 +2604,9 @@ impl ConfigPublisher for DynamoDbNameService {
         match result {
             Ok(_) => Ok(ConfigCasResult::Updated),
             Err(e) if Self::is_conditional_check_failed(&e) => {
+                if self.fence_refuses(&pk, SK_CONFIG, fence).await? {
+                    return Err(NameServiceError::fenced(ledger_id));
+                }
                 let current = self.get_config(ledger_id).await?;
                 Ok(ConfigCasResult::Conflict { actual: current })
             }

@@ -207,6 +207,15 @@ impl Worker {
             .map_err(|e| WorkerError::Transient(format!("no storage root for the branch: {e}")))
     }
 
+    /// The fence this branch's writes present, from the replicated state.
+    async fn branch_fence(&self) -> Option<fluree_db_nameservice::Fence> {
+        let state = self.shared_state.read().await;
+        state
+            .fences
+            .get(&self.ref_key)
+            .map(|f| fluree_db_nameservice::Fence::from_u64(f.fence))
+    }
+
     fn new(
         ref_key: RefKey,
         shared_state: SharedState,
@@ -1151,10 +1160,11 @@ impl Worker {
         commit_t: i64,
     ) -> Result<(), WorkerError> {
         let full_ledger_id = self.ref_key.ledger_id();
+        let fence = self.branch_fence().await;
         match self
             .publishing
             .commits
-            .publish_commit(&full_ledger_id, commit_t, &commit_id)
+            .publish_commit_fenced(&full_ledger_id, fence, commit_t, &commit_id)
             .await
         {
             Ok(()) => Ok(()),

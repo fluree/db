@@ -100,6 +100,10 @@ pub struct IndexResult {
     /// `None` when the build went through the plain non-tracking API. An
     /// already-current build reports `Some(0.0)` if tracking was enabled.
     pub fuel: Option<f64>,
+    /// The fence of the branch record the build started from, which the
+    /// publication of this root presents: a branch dropped or replaced
+    /// during the build refuses it.
+    pub fence: Option<fluree_db_nameservice::Fence>,
 }
 
 /// Statistics from index building
@@ -206,6 +210,7 @@ pub async fn build_index_for_record_with_tracker(
                     ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
                     stats: IndexStats::default(),
                     fuel,
+                    fence: None,
                 });
             }
         }
@@ -273,6 +278,10 @@ pub async fn build_index_for_record_with_tracker(
     }
     .instrument(span)
     .await
+    .map(|result| IndexResult {
+        fence: record.fence,
+        ..result
+    })
 }
 
 /// Snapshot the tracker's current decimal fuel total, or `None` when fuel
@@ -470,7 +479,12 @@ pub async fn publish_index_result(
         )))
     })?;
     publisher
-        .publish_index(&result.ledger_id, result.index_t, &result.root_id)
+        .publish_index_fenced(
+            &result.ledger_id,
+            result.fence,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .map_err(|e| IndexerError::NameService(e.to_string()))
 }
@@ -506,9 +520,10 @@ mod publish_barrier_tests {
 
     #[async_trait::async_trait]
     impl IndexPublisher for FlushesAtPublish {
-        async fn publish_index(
+        async fn publish_index_fenced(
             &self,
             _ledger_id: &str,
+            _fence: Option<fluree_db_nameservice::Fence>,
             _index_t: i64,
             _index_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
@@ -544,6 +559,7 @@ mod publish_barrier_tests {
             ledger_id: fluree_db_core::LedgerId::parse("l:main").unwrap(),
             stats: IndexStats::default(),
             fuel: None,
+            fence: None,
         };
         publish_index_result(&store, &publisher, &result)
             .await

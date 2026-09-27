@@ -622,6 +622,12 @@ impl ApiError {
             ApiError::InvalidBranch(_) => 400,
             ApiError::InvalidLedgerId(_) => 400,
             ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
+            // A writer whose ledger was dropped, restored or replaced since it
+            // loaded it: retrying on the same state cannot succeed.
+            ApiError::NameService(fluree_db_nameservice::NameServiceError::Fenced(_))
+            | ApiError::Transact(fluree_db_transact::TransactError::Nameservice(
+                fluree_db_nameservice::NameServiceError::Fenced(_),
+            )) => 409,
             ApiError::BranchConflict(_) => 409,
             ApiError::NotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,

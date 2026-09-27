@@ -242,6 +242,7 @@ impl crate::Fluree {
         let StagedRevert {
             branch_id,
             branch_namespace,
+            branch_fence,
             branch: branch_string,
             reverted_commits,
             conflict_count,
@@ -277,8 +278,10 @@ impl crate::Fluree {
                     error = %e,
                     "revert failed, rolling back nameservice state"
                 );
-                if let Err(rollback_err) =
-                    self.branch_admin()?.reset_head(&branch_id, snapshot).await
+                if let Err(rollback_err) = self
+                    .branch_admin()?
+                    .reset_head_fenced(&branch_id, branch_fence, snapshot)
+                    .await
                 {
                     tracing::error!(
                         branch = %branch_id,
@@ -453,6 +456,7 @@ impl crate::Fluree {
         // manager (embedded use with no shared cache), fall back to a
         // fresh storage load — there's nothing to protect against.
         let branch_namespace = branch_record.storage_namespace();
+        let branch_fence = branch_record.fence;
         let (write_guard, target_state) = self
             .lock_or_load(&branch_id, branch_store.clone(), branch_record)
             .await?;
@@ -482,6 +486,7 @@ impl crate::Fluree {
             return Ok(StagedRevert {
                 branch_id: branch_id.clone(),
                 branch_namespace,
+                branch_fence,
                 branch: branch.to_string(),
                 reverted_commits,
                 conflict_count,
@@ -539,6 +544,7 @@ impl crate::Fluree {
         Ok(StagedRevert {
             branch_id: branch_id.clone(),
             branch_namespace,
+            branch_fence,
             branch: branch.to_string(),
             reverted_commits,
             conflict_count,
@@ -633,6 +639,9 @@ pub struct StagedRevert {
     pub branch_id: LedgerId,
     /// Where the branch's artifacts live.
     pub branch_namespace: StorageNamespace,
+    /// The fence the branch's record carried when the revert was prepared,
+    /// which a rollback of its head presents.
+    pub branch_fence: Option<fluree_db_nameservice::Fence>,
     /// Branch name (without ledger prefix) — echoed onto the
     /// resulting receipt.
     pub branch: String,

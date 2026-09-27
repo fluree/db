@@ -2078,7 +2078,7 @@ If no ledger is found by name, the server tries the same name as a graph source 
 1. Parses input. `"mydb"` is the canonical form; any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) returns a `400`.
 2. Cancels and waits for pending background indexing on each branch.
 3. Marks the ledger as dropping. From here it reads as absent, no branch can be created, and creating the name returns `409` until the drop finishes.
-4. Records the ledger in the dropped-ledger registry, removes its branch records, and frees the name.
+4. Freezes every branch against writes, records the ledger in the dropped-ledger registry, removes its branch records, and frees the name. A write from anyone who loaded the ledger before the drop fails with `409`.
 5. Hard mode only: deletes the ledger's storage, every branch and its shared dictionaries, then removes the registry entry.
 6. Disconnects every branch from the ledger cache.
 
@@ -2145,6 +2145,8 @@ GET /dropped
 
 Restore a soft-dropped ledger under the name it was dropped under, with the
 data it had. A branch that was dropped before its ledger comes back dropped.
+A writer that loaded the ledger before it was dropped stays refused: its
+commits fail with `409`, as they do against a ledger that reuses the name.
 
 **URL:**
 ```

@@ -106,6 +106,24 @@ pub async fn rebuild_index_from_commits_with_store<C>(
 where
     C: ContentStore + Clone + Send + Sync + 'static,
 {
+    rebuild_from_store(commit_store, tracker, ledger_id, record, config)
+        .await
+        .map(|result| IndexResult {
+            fence: record.fence,
+            ..result
+        })
+}
+
+async fn rebuild_from_store<C>(
+    commit_store: C,
+    tracker: fluree_db_core::tracking::Tracker,
+    ledger_id: &str,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult>
+where
+    C: ContentStore + Clone + Send + Sync + 'static,
+{
     use futures::stream::StreamExt;
     use run_index::resolver::{RebuildChunk, SharedResolverState};
     use run_index::spool::SortedCommitInfo;

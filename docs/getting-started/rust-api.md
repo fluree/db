@@ -886,7 +886,9 @@ async fn main() -> Result<()> {
 | `DropMode::Hard` | Frees the name and deletes the ledger's data | **No** |
 
 `restore_dropped` fails with `ApiError::LedgerExists` when another ledger now
-holds the name. `purge_dropped` deletes a dropped ledger's data; it also
+holds the name. A `LedgerState` loaded before a drop cannot commit afterwards,
+to the dropped ledger, to one that reuses its name, or to it once restored:
+the commit fails with a `409` fence refusal, and the caller reloads. `purge_dropped` deletes a dropped ledger's data; it also
 finishes a hard drop whose deletion was interrupted (reported as
 `DroppedData::Deleting`).
 
@@ -899,7 +901,7 @@ reserved. The report's `name_released` and `instance` tell the two apart.
 1. Parses input (rejects non-default branch suffixes).
 2. Cancels and waits for pending background indexing on each branch.
 3. Marks the ledger as dropping: it reads as absent, and creating the name is refused until the drop finishes.
-4. Records the ledger in the dropped-ledger registry, removes its branch records, and frees the name.
+4. Freezes every branch, records the ledger in the dropped-ledger registry, removes its branch records, and frees the name.
 5. Hard mode: deletes the ledger's storage, then its registry entry.
 6. Disconnects each branch from the ledger cache.
 

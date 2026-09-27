@@ -969,8 +969,9 @@ where
             t: new_t,
         };
         let publish_result = nameservice
-            .compare_and_set_ref(
+            .compare_and_set_ref_fenced(
                 ledger_id_for_publish.as_str(),
+                base.fence(),
                 RefKind::CommitHead,
                 expected_head_ref.as_ref(),
                 &new_head_ref,
@@ -1433,12 +1434,15 @@ mod tests {
             self.inner.drop_branch(ledger_id).await
         }
 
-        async fn reset_head(
+        async fn reset_head_fenced(
             &self,
             ledger_id: &str,
+            fence: Option<fluree_db_nameservice::Fence>,
             snapshot: NsRecordSnapshot,
         ) -> fluree_db_nameservice::Result<()> {
-            self.inner.reset_head(ledger_id, snapshot).await
+            self.inner
+                .reset_head_fenced(ledger_id, fence, snapshot)
+                .await
         }
     }
 
@@ -1475,9 +1479,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RefPublisher for LosePublishRaceNameService {
-        async fn compare_and_set_ref(
+        async fn compare_and_set_ref_fenced(
             &self,
             ledger_id: &str,
+            fence: Option<fluree_db_nameservice::Fence>,
             kind: RefKind,
             _expected: Option<&RefValue>,
             new: &RefValue,
@@ -1491,7 +1496,7 @@ mod tests {
                 }),
                 RefKind::IndexHead => {
                     self.inner
-                        .compare_and_set_ref(ledger_id, kind, None, new)
+                        .compare_and_set_ref_fenced(ledger_id, fence, kind, None, new)
                         .await
                 }
             }
@@ -1511,14 +1516,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl fluree_db_nameservice::CommitPublisher for LosePublishRaceNameService {
-        async fn publish_commit(
+        async fn publish_commit_fenced(
             &self,
             ledger_id: &str,
+            fence: Option<fluree_db_nameservice::Fence>,
             commit_t: i64,
             commit_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
             self.inner
-                .publish_commit(ledger_id, commit_t, commit_id)
+                .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
                 .await
         }
 
@@ -1529,13 +1535,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl fluree_db_nameservice::IndexPublisher for LosePublishRaceNameService {
-        async fn publish_index(
+        async fn publish_index_fenced(
             &self,
             ledger_id: &str,
+            fence: Option<fluree_db_nameservice::Fence>,
             index_t: i64,
             index_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
-            self.inner.publish_index(ledger_id, index_t, index_id).await
+            self.inner
+                .publish_index_fenced(ledger_id, fence, index_t, index_id)
+                .await
         }
     }
 

@@ -147,13 +147,21 @@ impl PeerSyncTask {
             .and_then(fluree_db_core::StorageRoot::instance)
             .is_some()
         {
-            fluree_db_nameservice::lifecycle::mirror_record(ns, record).await
+            fluree_db_nameservice::lifecycle::mirror_record(ns, record)
+                .await
+                .map(Some)
         } else {
-            ns.init(&record.ledger_id).await
+            ns.init(&record.ledger_id).await.map(|()| None)
         };
-        match ensured {
-            Ok(()) => {}
-            Err(NameServiceError::LedgerAlreadyExists(_)) => {}
+        // The fence the local copy's writes present.
+        let fence = match ensured {
+            Ok(fence) => fence,
+            Err(NameServiceError::LedgerAlreadyExists(_)) => ns
+                .lookup(&record.ledger_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.fence),
             Err(e) => {
                 tracing::warn!(
                     alias = %record.ledger_id,
@@ -162,7 +170,7 @@ impl PeerSyncTask {
                 );
                 return;
             }
-        }
+        };
 
         // 2. Fast-forward commit head (if record has a commit)
         if record.commit_head_id.is_some() {
@@ -171,7 +179,7 @@ impl PeerSyncTask {
                 t: record.commit_t,
             };
             match ns
-                .fast_forward_commit(&record.ledger_id, &commit_head, 3)
+                .fast_forward_commit_fenced(&record.ledger_id, fence, &commit_head, 3)
                 .await
             {
                 Ok(CasResult::Updated) => {}
@@ -199,8 +207,9 @@ impl PeerSyncTask {
                         }
                     }
                     let force_result = ns
-                        .compare_and_set_ref(
+                        .compare_and_set_ref_fenced(
                             &record.ledger_id,
+                            fence,
                             RefKind::CommitHead,
                             actual.as_ref(),
                             &commit_head,
@@ -255,8 +264,9 @@ impl PeerSyncTask {
                 .ok()
                 .flatten();
             let index_result = ns
-                .compare_and_set_ref(
+                .compare_and_set_ref_fenced(
                     &record.ledger_id,
+                    fence,
                     RefKind::IndexHead,
                     current.as_ref(),
                     &index_head,

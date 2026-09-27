@@ -12,7 +12,7 @@ use fluree_db_core::ContentKind;
 use fluree_db_core::ContentStore;
 use fluree_db_nameservice::{
     ConfigLookup, ConfigPayload, ConfigValue, FileTrackingStore, LedgerConfig, RefKind, RefLookup,
-    RefPublisher, RemoteName, RemoteTrackingStore,
+    RemoteName, RemoteTrackingStore,
 };
 use fluree_db_nameservice_sync::{
     ingest_pack_stream, ingest_pack_stream_with_header, peek_pack_header, FetchResult,
@@ -133,8 +133,7 @@ async fn build_sync_driver(dirs: &FlureeDir) -> CliResult<(SyncDriver, Arc<TomlS
     let fluree = context::build_fluree(dirs)?;
     let config_store = Arc::new(TomlSyncConfigStore::new(dirs.config_dir().to_path_buf()));
 
-    // Get the nameservice as RefPublisher
-    let local: Arc<dyn RefPublisher> = fluree
+    let local: Arc<dyn fluree_db_nameservice::NameServicePublisher> = fluree
         .nameservice_mode()
         .publisher_arc()
         .ok_or_else(|| CliError::Config("sync requires a read-write nameservice".into()))?;
@@ -1754,10 +1753,16 @@ pub async fn run_clone_origin(
                 extra: existing_payload.extra,
             }),
         );
+        let fence = fluree
+            .nameservice()
+            .lookup(&local_id)
+            .await
+            .map_err(|e| CliError::Config(format!("clone failed (lookup): {e}")))?
+            .and_then(|record| record.fence);
         match fluree
             .publisher()
             .map_err(|e| CliError::Config(e.to_string()))?
-            .push_config(&local_id, current.as_ref(), &new_config)
+            .push_config_fenced(&local_id, fence, current.as_ref(), &new_config)
             .await
             .map_err(|e| CliError::Config(format!("clone failed (push config): {e}")))?
         {

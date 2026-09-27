@@ -146,6 +146,9 @@ pub struct StagedRebase {
     pub branch_id: LedgerId,
     /// Where the branch's artifacts live.
     pub branch_namespace: StorageNamespace,
+    /// The fence the branch's record carried when the rebase was prepared,
+    /// which its head publish presents.
+    pub branch_fence: Option<fluree_db_nameservice::Fence>,
     /// Source branch name (without ledger prefix).
     pub source: String,
     /// Fully-qualified source id.
@@ -248,6 +251,7 @@ impl crate::Fluree {
             let staged = self.prepare_rebase(ledger_name, branch, strategy).await?;
             let branch_id = staged.branch_id.clone();
             let rollback_snapshot = staged.rollback_snapshot.clone();
+            let branch_fence = staged.branch_fence;
 
             match self.apply_rebase(staged).await {
                 Ok(report) => Ok(report),
@@ -259,7 +263,7 @@ impl crate::Fluree {
                     );
                     if let Err(rollback_err) = self
                         .branch_admin()?
-                        .reset_head(&branch_id, rollback_snapshot)
+                        .reset_head_fenced(&branch_id, branch_fence, rollback_snapshot)
                         .await
                     {
                         tracing::error!(
@@ -373,8 +377,14 @@ impl crate::Fluree {
         if is_fast_forward {
             // Copy the source index into the branch namespace
             // (best-effort, matches local single-node behavior).
-            self.copy_source_index(&source_id, &branch_id, &branch_namespace, &source_record)
-                .await;
+            self.copy_source_index(
+                &source_id,
+                &branch_id,
+                &branch_namespace,
+                branch_record.fence,
+                &source_record,
+            )
+            .await;
 
             // Load the source's state under the branch's id so the
             // post-apply cache reflects the fast-forwarded branch.
@@ -387,6 +397,7 @@ impl crate::Fluree {
                 branch: branch.to_string(),
                 branch_id,
                 branch_namespace,
+                branch_fence: branch_record.fence,
                 source: source_name_owned,
                 source_id,
                 source_head_id: source_head_id.clone(),
@@ -544,8 +555,14 @@ impl crate::Fluree {
         // source's index and its own commits dropped out of every read.
         // Replay itself reads the source's state, never the copied index,
         // so nothing above needs this to have happened. Best-effort.
-        self.copy_source_index(&source_id, &branch_id, &branch_namespace, &source_record)
-            .await;
+        self.copy_source_index(
+            &source_id,
+            &branch_id,
+            &branch_namespace,
+            branch_record.fence,
+            &source_record,
+        )
+        .await;
 
         let new_head_id = pending_replays.last().map(|b| b.commit_id.clone());
         let new_head_t = current_state.t();
@@ -554,6 +571,7 @@ impl crate::Fluree {
             branch: branch.to_string(),
             branch_id,
             branch_namespace,
+            branch_fence: branch_record.fence,
             source: source_name_owned,
             source_id,
             source_head_id,
@@ -588,6 +606,7 @@ impl crate::Fluree {
             branch: _,
             branch_id,
             branch_namespace,
+            branch_fence,
             source: _,
             source_id: _,
             source_head_id,
@@ -620,7 +639,7 @@ impl crate::Fluree {
                 }
             }
             self.publisher()?
-                .publish_commit(&branch_id, new_head_t, last_head_id)
+                .publish_commit_fenced(&branch_id, branch_fence, new_head_t, last_head_id)
                 .await?;
         }
 
@@ -854,6 +873,7 @@ impl crate::Fluree {
         source_id: &str,
         branch_id: &str,
         branch: &StorageNamespace,
+        branch_fence: Option<fluree_db_nameservice::Fence>,
         source_record: &fluree_db_nameservice::NsRecord,
     ) {
         if let Some(ref index_cid) = source_record.index_head_id {
@@ -867,7 +887,7 @@ impl crate::Fluree {
                 );
             } else if let Some(publisher) = self.nameservice_mode.publisher() {
                 if let Err(e) = publisher
-                    .publish_index(branch_id, source_record.index_t, index_cid)
+                    .publish_index_fenced(branch_id, branch_fence, source_record.index_t, index_cid)
                     .await
                 {
                     tracing::warn!(%e, "failed to publish index for rebased branch");

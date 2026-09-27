@@ -641,8 +641,9 @@ impl crate::Fluree {
     /// 1. Stops background indexing on each branch.
     /// 2. Marks the ledger dropping: from here it reads as absent, and
     ///    creating the name is refused until the drop finishes.
-    /// 3. Saves the ledger in the dropped-ledger registry, deletes its branch
-    ///    records and frees the name.
+    /// 3. Freezes every branch, saves the ledger in the dropped-ledger
+    ///    registry, deletes its branch records and frees the name. Writers
+    ///    that loaded it before are refused from here on.
     /// 4. `Soft`: the ledger stays in the registry, where
     ///    [`restore_dropped`](Self::restore_dropped) brings it back and
     ///    [`purge_dropped`](Self::purge_dropped) deletes it. `Hard`: its
@@ -811,7 +812,8 @@ impl crate::Fluree {
     }
 
     /// Restore a soft-dropped ledger under the name it was dropped under.
-    /// Its branches come back with the data they had; a branch dropped
+    /// Its branches come back with the data they had, under fresh fences, so
+    /// writers that loaded it before the drop stay refused; a branch dropped
     /// before its ledger comes back dropped.
     ///
     /// Fails with a conflict when another ledger now holds the name.
@@ -2721,7 +2723,12 @@ impl crate::Fluree {
 
         // 5. Publish new index (allows same t for reindex via AdminPublisher)
         self.publisher()?
-            .publish_index_allow_equal(&ledger_id, index_result.index_t, &index_result.root_id)
+            .publish_index_allow_equal_fenced(
+                &ledger_id,
+                record.fence,
+                index_result.index_t,
+                &index_result.root_id,
+            )
             .await?;
 
         // Reindex can replace a damaged root at the same index t. A cached
@@ -2890,7 +2897,7 @@ impl crate::Fluree {
             }),
         );
         match publisher
-            .push_config(&ledger_id, current.as_ref(), &new_config)
+            .push_config_fenced(&ledger_id, record.fence, current.as_ref(), &new_config)
             .await?
         {
             ConfigCasResult::Updated => {}

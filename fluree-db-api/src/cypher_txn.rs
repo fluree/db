@@ -482,8 +482,9 @@ impl Fluree {
         };
         let publisher = self.publisher()?;
         let cas = publisher
-            .compare_and_set_ref(
+            .compare_and_set_ref_fenced(
                 &txn.ledger_id,
+                head.fence(),
                 RefKind::CommitHead,
                 txn.base_head.as_ref(),
                 &new_head,

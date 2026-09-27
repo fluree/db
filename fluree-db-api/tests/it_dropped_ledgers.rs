@@ -187,3 +187,40 @@ async fn purge_and_restore_reject_unknown_instances() {
         400
     );
 }
+
+/// A writer holding a ledger it loaded before a drop cannot commit: not
+/// into the dropped ledger, not into the ledger that reuses the name, and
+/// not into the original once restored, where its expected head would
+/// otherwise still match.
+#[tokio::test]
+async fn a_writer_from_before_a_drop_is_refused() {
+    let (fluree, _tmp) = file_fluree().await;
+    create_with_marker(&fluree, "mydb", "old").await;
+    let stale = fluree.ledger("mydb").await.expect("load");
+    let late = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:marker", "ex:value": "late"}]
+    });
+    let instance = fluree
+        .drop_ledger("mydb", DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .unwrap();
+    assert!(fluree.insert(stale.clone(), &late).await.is_err());
+
+    create_with_marker(&fluree, "mydb", "new").await;
+    assert!(fluree.insert(stale.clone(), &late).await.is_err());
+    assert_eq!(markers(&fluree, "mydb").await, json!(["new"]));
+
+    fluree.drop_ledger("mydb", DropMode::Hard).await.unwrap();
+    fluree.restore_dropped(instance.as_str()).await.unwrap();
+    let err = fluree.insert(stale, &late).await.unwrap_err();
+    assert!(
+        err.to_string().contains("dropped or replaced"),
+        "expected a fence refusal, got: {err}"
+    );
+    assert_eq!(err.status_code(), 409, "{err}");
+    fluree.disconnect_ledger("mydb").await;
+    assert_eq!(markers(&fluree, "mydb").await, json!(["old"]));
+}

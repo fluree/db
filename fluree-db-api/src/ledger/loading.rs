@@ -264,13 +264,14 @@ impl Fluree {
                 store, &name, new_branch, source, at_commit,
             )
             .await
-            .map(|_| ())
+            .map(|record| record.fence)
         } else {
             self.branch_admin()?
                 .create_branch(ledger_name, new_branch, source, at_commit)
                 .await
+                .map(|()| None)
         };
-        created.map_err(|e| match e {
+        let new_fence = created.map_err(|e| match e {
             NameServiceError::LedgerAlreadyExists(a) => ApiError::ledger_exists(a),
             other => other.into(),
         })?;
@@ -295,7 +296,7 @@ impl Fluree {
                     );
                 } else {
                     self.index_publisher()?
-                        .publish_index(&new_id, source_record.index_t, index_cid)
+                        .publish_index_fenced(&new_id, new_fence, source_record.index_t, index_cid)
                         .await?;
                 }
             }

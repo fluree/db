@@ -19,6 +19,7 @@
 //! prefixes (enforced by [`CompositeNameService::new`] only against other
 //! mounts, since local ledgers can be created later).
 
+use crate::Fence;
 use crate::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
@@ -284,9 +285,10 @@ impl ConfigLookup for CompositeNameService {
 
 #[async_trait]
 impl CommitPublisher for CompositeNameService {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
@@ -294,7 +296,7 @@ impl CommitPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .publish_commit(ledger_id, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
             .await
     }
 
@@ -308,16 +310,19 @@ impl CommitPublisher for CompositeNameService {
 
 #[async_trait]
 impl IndexPublisher for CompositeNameService {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
-        self.local.publish_index(ledger_id, index_t, index_id).await
+        self.local
+            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .await
     }
 }
 
@@ -370,11 +375,18 @@ impl BranchLifecycle for CompositeNameService {
         self.local.drop_branch(ledger_id).await
     }
 
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
+    ) -> Result<()> {
         if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
-        self.local.reset_head(ledger_id, snapshot).await
+        self.local
+            .reset_head_fenced(ledger_id, fence, snapshot)
+            .await
     }
 
     async fn pending_commit_cids(
@@ -399,9 +411,10 @@ impl BranchLifecycle for CompositeNameService {
 
 #[async_trait]
 impl AdminPublisher for CompositeNameService {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -409,16 +422,17 @@ impl AdminPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .publish_index_allow_equal(ledger_id, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
             .await
     }
 }
 
 #[async_trait]
 impl RefPublisher for CompositeNameService {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -427,7 +441,7 @@ impl RefPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .compare_and_set_ref(ledger_id, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
             .await
     }
 }
@@ -475,31 +489,37 @@ impl GraphSourcePublisher for CompositeNameService {
 
 #[async_trait]
 impl StatusPublisher for CompositeNameService {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
         if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
-        self.local.push_status(ledger_id, expected, new).await
+        self.local
+            .push_status_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 
 #[async_trait]
 impl ConfigPublisher for CompositeNameService {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
         if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
-        self.local.push_config(ledger_id, expected, new).await
+        self.local
+            .push_config_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 

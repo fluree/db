@@ -629,12 +629,291 @@ pub async fn mirror_binds_the_origin_instance<S: LifecycleStore + crate::NameSer
     ));
 }
 
+fn assert_fenced<T: std::fmt::Debug>(result: crate::Result<T>, write: &str) {
+    match result {
+        Err(NameServiceError::Fenced(_)) => {}
+        other => panic!("{write}: expected a fence refusal, got {other:?}"),
+    }
+}
+
+fn cid(kind: fluree_db_core::ContentKind, label: &str) -> fluree_db_core::ContentId {
+    fluree_db_core::ContentId::new(kind, label.as_bytes())
+}
+
+/// Advance `id`'s commit head to `t` presenting `fence`, by compare-and-set
+/// from its current head. (`publish_commit` is not general on every backend:
+/// the replicated one publishes only through its commit queue.)
+async fn advance_commit<S: crate::NameServicePublisher>(
+    store: &S,
+    id: &str,
+    fence: Option<Fence>,
+    t: i64,
+) {
+    let current = store.get_ref(id, crate::RefKind::CommitHead).await.unwrap();
+    let next = crate::RefValue {
+        id: Some(cid(
+            fluree_db_core::ContentKind::Commit,
+            &format!("{id}@{t}"),
+        )),
+        t,
+    };
+    assert_eq!(
+        store
+            .compare_and_set_ref_fenced(
+                id,
+                fence,
+                crate::RefKind::CommitHead,
+                current.as_ref(),
+                &next
+            )
+            .await
+            .unwrap(),
+        crate::CasResult::Updated
+    );
+}
+
+/// Try every kind of branch write against `id` presenting `fence`, and
+/// require each to be refused.
+async fn assert_every_write_refused<S: crate::NameServicePublisher>(
+    store: &S,
+    id: &str,
+    fence: Option<Fence>,
+) {
+    use fluree_db_core::ContentKind::{Commit, IndexRoot};
+    let commit = cid(Commit, "stale");
+    let index = cid(IndexRoot, "stale");
+    let head = |kind| async move { store.get_ref(id, kind).await.unwrap() };
+    let next = |t| crate::RefValue {
+        id: Some(commit.clone()),
+        t,
+    };
+    assert_fenced(
+        store.publish_commit_fenced(id, fence, 99, &commit).await,
+        "publish_commit",
+    );
+    let current = head(crate::RefKind::CommitHead).await;
+    assert_fenced(
+        store
+            .compare_and_set_ref_fenced(
+                id,
+                fence,
+                crate::RefKind::CommitHead,
+                current.as_ref(),
+                &next(99),
+            )
+            .await,
+        "compare_and_set_ref(commit)",
+    );
+    assert_fenced(
+        store
+            .fast_forward_commit_fenced(id, fence, &next(99), 3)
+            .await,
+        "fast_forward_commit",
+    );
+    assert_fenced(
+        store.publish_index_fenced(id, fence, 99, &index).await,
+        "publish_index",
+    );
+    assert_fenced(
+        store
+            .publish_index_allow_equal_fenced(id, fence, 99, &index)
+            .await,
+        "publish_index_allow_equal",
+    );
+    let current = head(crate::RefKind::IndexHead).await;
+    assert_fenced(
+        store
+            .compare_and_set_ref_fenced(
+                id,
+                fence,
+                crate::RefKind::IndexHead,
+                current.as_ref(),
+                &crate::RefValue {
+                    id: Some(index.clone()),
+                    t: 99,
+                },
+            )
+            .await,
+        "compare_and_set_ref(index)",
+    );
+    assert_fenced(
+        store
+            .reset_head_fenced(
+                id,
+                fence,
+                crate::NsRecordSnapshot {
+                    commit_head_id: None,
+                    commit_t: 0,
+                    index_head_id: None,
+                    index_t: 0,
+                },
+            )
+            .await,
+        "reset_head",
+    );
+    let status = store.get_status(id).await.unwrap();
+    let next_status = crate::StatusValue::new(
+        status.as_ref().map_or(1, |s| s.v + 1),
+        crate::StatusPayload::new("ready"),
+    );
+    assert_fenced(
+        store
+            .push_status_fenced(id, fence, status.as_ref(), &next_status)
+            .await,
+        "push_status",
+    );
+    let config = store.get_config(id).await.unwrap();
+    let next_config = crate::ConfigValue::new(config.as_ref().map_or(1, |c| c.v + 1), None);
+    assert_fenced(
+        store
+            .push_config_fenced(id, fence, config.as_ref(), &next_config)
+            .await,
+        "push_config",
+    );
+}
+
+/// Every write to a branch record presents the fence its writer loaded: a
+/// stale fence, or none, is refused; the branch's own fence is admitted.
+pub async fn writes_present_the_branch_fence<S: crate::NameServicePublisher>(store: &S) {
+    use fluree_db_core::ContentKind::{Commit, IndexRoot};
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let fence = created.fence;
+    assert_every_write_refused(store, "mydb:main", Some(Fence::generate())).await;
+    assert_every_write_refused(store, "mydb:main", None).await;
+
+    advance_commit(store, "mydb:main", fence, 1).await;
+    let head = store
+        .get_ref("mydb:main", crate::RefKind::CommitHead)
+        .await
+        .unwrap();
+    assert_eq!(head.as_ref().map(|h| h.t), Some(1));
+    let c2 = crate::RefValue {
+        id: Some(cid(Commit, "c2")),
+        t: 2,
+    };
+    assert_eq!(
+        store
+            .compare_and_set_ref_fenced(
+                "mydb:main",
+                fence,
+                crate::RefKind::CommitHead,
+                head.as_ref(),
+                &c2
+            )
+            .await
+            .unwrap(),
+        crate::CasResult::Updated
+    );
+    store
+        .publish_index_fenced("mydb:main", fence, 2, &cid(IndexRoot, "i2"))
+        .await
+        .unwrap();
+    store
+        .publish_index_allow_equal_fenced("mydb:main", fence, 2, &cid(IndexRoot, "i2b"))
+        .await
+        .unwrap();
+    let record = store.lookup("mydb:main").await.unwrap().unwrap();
+    assert_eq!((record.commit_t, record.index_t), (2, 2));
+    assert_eq!(record.index_head_id, Some(cid(IndexRoot, "i2b")));
+
+    let config = store.get_config("mydb:main").await.unwrap();
+    let next = crate::ConfigValue::new(config.as_ref().map_or(1, |c| c.v + 1), None);
+    assert_eq!(
+        store
+            .push_config_fenced("mydb:main", fence, config.as_ref(), &next)
+            .await
+            .unwrap(),
+        crate::ConfigCasResult::Updated
+    );
+    store
+        .reset_head_fenced(
+            "mydb:main",
+            fence,
+            crate::NsRecordSnapshot::from_record(&record),
+        )
+        .await
+        .unwrap();
+}
+
+/// A frozen branch takes no write, even under its own fence.
+pub async fn frozen_branch_refuses_writes<S: crate::NameServicePublisher>(store: &S) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let dev = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "fx", "dev", None)
+        .await
+        .unwrap();
+    lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap();
+    assert_every_write_refused(store, "mydb:dev", dev.fence).await;
+}
+
+/// A writer that loaded a ledger before it was dropped cannot publish into
+/// it, nor into the ledger that reuses its name, nor into it once restored.
+pub async fn stale_writers_are_refused_across_drop_and_restore<S: crate::NameServicePublisher>(
+    store: &S,
+) {
+    use fluree_db_core::ContentKind::Commit;
+    let old = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_fenced(
+        store
+            .publish_commit_fenced("mydb:main", old.fence, 5, &cid(Commit, "late"))
+            .await,
+        "publish after drop",
+    );
+    assert!(
+        store.raw_record("mydb:main").await.unwrap().is_none(),
+        "a refused publish must not recreate the record"
+    );
+
+    let replacement = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    assert_every_write_refused(store, "mydb:main", old.fence).await;
+    let record = store.lookup("mydb:main").await.unwrap().unwrap();
+    assert_eq!(record.commit_t, 0, "the stale writer left no trace");
+
+    lifecycle::drop_ledger(store, &name("mydb"), true)
+        .await
+        .unwrap();
+    lifecycle::restore_dropped(store, &dropped.instance)
+        .await
+        .unwrap();
+    assert_every_write_refused(store, "mydb:main", old.fence).await;
+    assert_every_write_refused(store, "mydb:main", replacement.fence).await;
+    let restored = store.get_binding("mydb").await.unwrap().unwrap().value;
+    advance_commit(store, "mydb:main", restored.fence_of("main"), 1).await;
+}
+
+/// A record from before fencing takes unfenced writes, and refuses a fenced
+/// one: no writer holding a fence can have loaded it.
+pub async fn unfenced_record_takes_unfenced_writes<S: crate::NameServicePublisher>(store: &S) {
+    use fluree_db_core::ContentKind::Commit;
+    assert!(store
+        .insert_record(&NsRecord::new(id("old:main")))
+        .await
+        .unwrap()
+        .is_none());
+    assert_fenced(
+        store
+            .publish_commit_fenced("old:main", Some(Fence::generate()), 1, &cid(Commit, "f"))
+            .await,
+        "fenced write to an unfenced record",
+    );
+    advance_commit(store, "old:main", None, 1).await;
+    assert_eq!(store.lookup("old:main").await.unwrap().unwrap().commit_t, 1);
+}
+
 /// Run every case in turn, each against a fresh backend from `make`: for
 /// backends too costly to set up once per test. Keep in step with
 /// [`lifecycle_conformance_tests!`](crate::lifecycle_conformance_tests).
 pub async fn run_all<S, F, Fut>(mut make: F)
 where
-    S: LifecycleStore + crate::NameServiceLookup,
+    S: crate::NameServicePublisher,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = S>,
 {
@@ -658,6 +937,10 @@ where
     frozen_record_refuses_new_children(&make().await).await;
     restore_keeps_dropped_branches_dropped(&make().await).await;
     mirror_binds_the_origin_instance(&make().await).await;
+    writes_present_the_branch_fence(&make().await).await;
+    frozen_branch_refuses_writes(&make().await).await;
+    stale_writers_are_refused_across_drop_and_restore(&make().await).await;
+    unfenced_record_takes_unfenced_writes(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -688,6 +971,10 @@ macro_rules! lifecycle_conformance_tests {
             frozen_record_refuses_new_children,
             restore_keeps_dropped_branches_dropped,
             mirror_binds_the_origin_instance,
+            writes_present_the_branch_fence,
+            frozen_branch_refuses_writes,
+            stale_writers_are_refused_across_drop_and_restore,
+            unfenced_record_takes_unfenced_writes,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

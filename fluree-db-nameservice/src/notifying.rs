@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::Fence;
 use async_trait::async_trait;
 use fluree_db_core::{ContentId, LedgerId};
 
@@ -116,8 +117,15 @@ where
         Ok(remaining)
     }
 
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
-        self.inner.reset_head(ledger_id, snapshot).await
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
+    ) -> Result<()> {
+        self.inner
+            .reset_head_fenced(ledger_id, fence, snapshot)
+            .await
     }
 
     // Pass-through wrapper: delegate so the inner backend's commit-CID index
@@ -172,14 +180,15 @@ impl<N> CommitPublisher for NotifyingNameService<N>
 where
     N: CommitPublisher,
 {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_commit(ledger_id, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerCommitPublished {
@@ -200,14 +209,15 @@ impl<N> IndexPublisher for NotifyingNameService<N>
 where
     N: IndexPublisher,
 {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_index(ledger_id, index_t, index_id)
+            .publish_index_fenced(ledger_id, fence, index_t, index_id)
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerIndexPublished {
@@ -228,14 +238,15 @@ impl<N> AdminPublisher for NotifyingNameService<N>
 where
     N: AdminPublisher,
 {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_index_allow_equal(ledger_id, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerIndexPublished {
@@ -270,16 +281,17 @@ impl<N> RefPublisher for NotifyingNameService<N>
 where
     N: RefPublisher,
 {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
         let result = self
             .inner
-            .compare_and_set_ref(ledger_id, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
             .await?;
 
         if matches!(result, CasResult::Updated) {
@@ -420,13 +432,16 @@ impl<N> StatusPublisher for NotifyingNameService<N>
 where
     N: StatusPublisher,
 {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
-        self.inner.push_status(ledger_id, expected, new).await
+        self.inner
+            .push_status_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 
@@ -453,13 +468,16 @@ impl<N> ConfigPublisher for NotifyingNameService<N>
 where
     N: ConfigPublisher,
 {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        self.inner.push_config(ledger_id, expected, new).await
+        self.inner
+            .push_config_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 

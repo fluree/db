@@ -688,7 +688,13 @@ impl Fluree {
 
         match self
             .publisher()?
-            .compare_and_set_ref(&ledger, RefKind::CommitHead, Some(&pre_push_head), &new_ref)
+            .compare_and_set_ref_fenced(
+                &ledger,
+                final_state.fence(),
+                RefKind::CommitHead,
+                Some(&pre_push_head),
+                &new_ref,
+            )
             .await?
         {
             CasResult::Updated => {}
@@ -1924,8 +1930,15 @@ impl Fluree {
         head_commit_id: &ContentId,
         head_t: i64,
     ) -> Result<()> {
-        self.set_ref(handle.id(), RefKind::CommitHead, head_commit_id, head_t)
-            .await
+        let fence = handle.snapshot().await.fence();
+        self.set_ref(
+            handle.id(),
+            fence,
+            RefKind::CommitHead,
+            head_commit_id,
+            head_t,
+        )
+        .await
     }
 
     /// Set the index head after pull/clone with index transfer.
@@ -1939,13 +1952,21 @@ impl Fluree {
         index_id: &ContentId,
         index_t: i64,
     ) -> Result<()> {
-        self.set_ref(handle.id(), RefKind::IndexHead, index_id, index_t)
+        let fence = handle.snapshot().await.fence();
+        self.set_ref(handle.id(), fence, RefKind::IndexHead, index_id, index_t)
             .await
     }
 
     /// Point `kind` of `ledger_id`'s record at `id`/`t`, by compare-and-swap
     /// against the head read just before.
-    async fn set_ref(&self, ledger_id: &str, kind: RefKind, id: &ContentId, t: i64) -> Result<()> {
+    async fn set_ref(
+        &self,
+        ledger_id: &str,
+        fence: Option<fluree_db_nameservice::Fence>,
+        kind: RefKind,
+        id: &ContentId,
+        t: i64,
+    ) -> Result<()> {
         let new_ref = RefValue {
             id: Some(id.clone()),
             t,
@@ -1953,7 +1974,7 @@ impl Fluree {
         let current_ref = self.publisher()?.get_ref(ledger_id, kind).await?;
         match self
             .publisher()?
-            .compare_and_set_ref(ledger_id, kind, current_ref.as_ref(), &new_ref)
+            .compare_and_set_ref_fenced(ledger_id, fence, kind, current_ref.as_ref(), &new_ref)
             .await?
         {
             CasResult::Updated => Ok(()),
@@ -2249,8 +2270,14 @@ impl Fluree {
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
 
-        self.set_ref(new_ledger_id, RefKind::CommitHead, &commit_cid, commit_t)
-            .await?;
+        self.set_ref(
+            new_ledger_id,
+            record.fence,
+            RefKind::CommitHead,
+            &commit_cid,
+            commit_t,
+        )
+        .await?;
 
         let mut index_t_out = None;
         if let Some(index_cid_str) = manifest.get("index_head_id").and_then(|v| v.as_str()) {
@@ -2315,8 +2342,14 @@ impl Fluree {
                 }
             };
 
-            self.set_ref(new_ledger_id, RefKind::IndexHead, &head_index_cid, index_t)
-                .await?;
+            self.set_ref(
+                new_ledger_id,
+                record.fence,
+                RefKind::IndexHead,
+                &head_index_cid,
+                index_t,
+            )
+            .await?;
             index_t_out = Some(index_t);
         }
 
@@ -2456,8 +2489,9 @@ impl Fluree {
         // 7) CAS update CommitHead.
         match self
             .publisher()?
-            .compare_and_set_ref(
+            .compare_and_set_ref_fenced(
                 base_state.ledger_id(),
+                base_state.fence(),
                 RefKind::CommitHead,
                 Some(&current_ref),
                 &new_ref,

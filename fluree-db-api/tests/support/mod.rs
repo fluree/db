@@ -296,6 +296,20 @@ pub async fn seed_user_with_ssn(
     fluree.insert(ledger0, &txn).await.expect("seed").ledger
 }
 
+/// The fence `ledger_id`'s writes present now: tests that publish directly
+/// load it through the branch's record, as any writer does.
+pub async fn fence_of(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> Option<fluree_db_nameservice::Fence> {
+    fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .and_then(|record| record.fence)
+}
+
 /// Rebuild and publish a binary index for the ledger's current commit head.
 ///
 /// Use this in regression tests that need to exercise the FIR6/binary-only
@@ -318,7 +332,7 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_fenced(ledger_id, record.fence, result.index_t, &result.root_id)
         .await
         .expect("publish index");
 }
@@ -344,7 +358,7 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_fenced(ledger_id, record.fence, result.index_t, &result.root_id)
         .await
         .expect("publish index");
 }

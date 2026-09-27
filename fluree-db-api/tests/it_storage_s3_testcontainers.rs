@@ -463,6 +463,8 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
         .expect("set_default_context");
 
     // Sanity: commits and a config blob landed in the bucket.
+    let namespace = fluree.storage_namespace(ledger_id).await.unwrap();
+    let branch_dir = format!("/{}/", namespace.branch_prefix());
     let keys_before = list_object_keys(&sdk_config, bucket).await;
     assert!(
         keys_before.iter().any(|k| k.contains("/commit/")),
@@ -471,7 +473,7 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
     assert!(
         keys_before
             .iter()
-            .any(|k| k.contains("/drop-test/main/config/")),
+            .any(|k| k.contains(&format!("{branch_dir}config/"))),
         "expected a config artifact before drop: {keys_before:?}"
     );
 
@@ -505,11 +507,10 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
     let stragglers: Vec<_> = keys_after
         .iter()
         .filter(|k| {
-            k.contains("/drop-test/main/commit/")
-                || k.contains("/drop-test/main/txn/")
-                || k.contains("/drop-test/main/index/")
-                || k.contains("/drop-test/main/config/")
-                || k.contains("/drop-test/@shared/dicts/")
+            ["commit/", "txn/", "index/", "config/"]
+                .iter()
+                .any(|kind| k.contains(&format!("{branch_dir}{kind}")))
+                || k.contains(&format!("/{}/dicts/", namespace.shared_prefix()))
         })
         .cloned()
         .collect();

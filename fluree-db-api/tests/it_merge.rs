@@ -1188,7 +1188,12 @@ async fn index_branch(fluree: &support::MemoryFluree, ledger_id: &str) {
     fluree
         .publisher()
         .unwrap()
-        .publish_index(ledger_id, built.index_t, &built.root_id)
+        .publish_index_fenced(
+            ledger_id,
+            crate::support::fence_of(fluree, ledger_id).await,
+            built.index_t,
+            &built.root_id,
+        )
         .await
         .unwrap();
 }
@@ -1375,7 +1380,12 @@ async fn main_with_adopted_feature_index() -> fluree_db_api::Fluree {
     fluree
         .publisher()
         .unwrap()
-        .publish_index("mydb:main", source.index_t, &source_root)
+        .publish_index_fenced(
+            "mydb:main",
+            crate::support::fence_of(&fluree, "mydb:main").await,
+            source.index_t,
+            &source_root,
+        )
         .await
         .unwrap();
     fluree
@@ -1509,7 +1519,12 @@ async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
         fluree
             .publisher()
             .unwrap()
-            .publish_index("mydb:main", result.index_t, &result.root_id)
+            .publish_index_fenced(
+                "mydb:main",
+                crate::support::fence_of(&fluree, "mydb:main").await,
+                result.index_t,
+                &result.root_id,
+            )
             .await
             .unwrap();
     }

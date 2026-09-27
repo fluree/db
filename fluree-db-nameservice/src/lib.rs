@@ -38,9 +38,9 @@ pub mod tracking;
 pub mod tracking_file;
 
 pub use binding::{
-    new_instance_id, read_all_resolved, read_resolved, resolve_for_read, resolve_record,
-    BindingState, BranchFence, BranchRecordStore, DroppedLedger, DroppedState, Fence, FenceOutcome,
-    LedgerRegistry, NameBinding, RegistryCas, Versioned,
+    check_write_fence, fence_admits, new_instance_id, read_all_resolved, read_resolved,
+    resolve_for_read, resolve_record, BindingState, BranchFence, BranchRecordStore, DroppedLedger,
+    DroppedState, Fence, FenceOutcome, LedgerRegistry, NameBinding, RegistryCas, Versioned,
 };
 pub use branched_store::{
     branched_content_store_for_id, branched_content_store_for_record,
@@ -597,7 +597,22 @@ pub trait BranchLifecycle: Debug + Send + Sync {
     ///
     /// # Errors
     /// Returns [`NotFound`](NameServiceError::NotFound) if the branch does not exist.
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()>;
+    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
+        self.reset_head_fenced(ledger_id, None, snapshot).await
+    }
+
+    /// [`reset_head`](Self::reset_head) by a writer holding `fence`.
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen; `None` writes only to a
+    /// record from before fencing. See [`binding::fence_admits`].
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
+    ) -> Result<()>;
 
     /// Return commit CIDs with `t > since_t`, sorted ascending by `t`, when the
     /// backend maintains a commit-CID index.
@@ -705,6 +720,23 @@ pub trait CommitPublisher: Debug + Send + Sync {
         ledger_id: &str,
         commit_t: i64,
         commit_id: &ContentId,
+    ) -> Result<()> {
+        self.publish_commit_fenced(ledger_id, None, commit_t, commit_id)
+            .await
+    }
+
+    /// [`publish_commit`](Self::publish_commit) by a writer holding `fence`.
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen; `None` writes only to a
+    /// record from before fencing. See [`binding::fence_admits`].
+    async fn publish_commit_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        commit_t: i64,
+        commit_id: &ContentId,
     ) -> Result<()>;
 
     /// Get the publishing ledger ID for a ledger.
@@ -734,6 +766,23 @@ pub trait IndexPublisher: Debug + Send + Sync {
     async fn publish_index(
         &self,
         ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        self.publish_index_fenced(ledger_id, None, index_t, index_id)
+            .await
+    }
+
+    /// [`publish_index`](Self::publish_index) by a writer holding `fence`.
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen; `None` writes only to a
+    /// record from before fencing. See [`binding::fence_admits`].
+    async fn publish_index_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()>;
@@ -803,6 +852,24 @@ pub trait AdminPublisher: Publisher {
     async fn publish_index_allow_equal(
         &self,
         ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        self.publish_index_allow_equal_fenced(ledger_id, None, index_t, index_id)
+            .await
+    }
+
+    /// [`publish_index_allow_equal`](Self::publish_index_allow_equal) by a
+    /// writer holding `fence`.
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen; `None` writes only to a
+    /// record from before fencing. See [`binding::fence_admits`].
+    async fn publish_index_allow_equal_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()>;
@@ -1103,6 +1170,26 @@ pub trait RefPublisher: RefLookup {
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
+    ) -> Result<CasResult> {
+        self.compare_and_set_ref_fenced(ledger_id, None, kind, expected, new)
+            .await
+    }
+
+    /// [`compare_and_set_ref`](Self::compare_and_set_ref) by a writer holding
+    /// `fence`. A refused fence is an error, not a [`CasResult::Conflict`]:
+    /// retrying cannot succeed.
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen; `None` writes only to a
+    /// record from before fencing. See [`binding::fence_admits`].
+    async fn compare_and_set_ref_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        kind: RefKind,
+        expected: Option<&RefValue>,
+        new: &RefValue,
     ) -> Result<CasResult>;
 
     /// Fast-forward the commit head with a retry loop.
@@ -1118,6 +1205,24 @@ pub trait RefPublisher: RefLookup {
         new: &RefValue,
         max_retries: usize,
     ) -> Result<CasResult> {
+        self.fast_forward_commit_fenced(ledger_id, None, new, max_retries)
+            .await
+    }
+
+    /// [`fast_forward_commit`](Self::fast_forward_commit) by a writer holding
+    /// `fence`.
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen; `None` writes only to a
+    /// record from before fencing. See [`binding::fence_admits`].
+    async fn fast_forward_commit_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        new: &RefValue,
+        max_retries: usize,
+    ) -> Result<CasResult> {
         for _ in 0..max_retries {
             let current = self.get_ref(ledger_id, RefKind::CommitHead).await?;
 
@@ -1129,7 +1234,13 @@ pub trait RefPublisher: RefLookup {
             }
 
             match self
-                .compare_and_set_ref(ledger_id, RefKind::CommitHead, current.as_ref(), new)
+                .compare_and_set_ref_fenced(
+                    ledger_id,
+                    fence,
+                    RefKind::CommitHead,
+                    current.as_ref(),
+                    new,
+                )
                 .await?
             {
                 CasResult::Updated => return Ok(CasResult::Updated),
@@ -1373,6 +1484,23 @@ pub trait StatusPublisher: StatusLookup {
         ledger_id: &str,
         expected: Option<&StatusValue>,
         new: &StatusValue,
+    ) -> Result<StatusCasResult> {
+        self.push_status_fenced(ledger_id, None, expected, new)
+            .await
+    }
+
+    /// [`push_status`](Self::push_status) by a writer holding `fence`.
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen; `None` writes only to a
+    /// record from before fencing. See [`binding::fence_admits`].
+    async fn push_status_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected: Option<&StatusValue>,
+        new: &StatusValue,
     ) -> Result<StatusCasResult>;
 }
 
@@ -1414,6 +1542,23 @@ pub trait ConfigPublisher: ConfigLookup {
     async fn push_config(
         &self,
         ledger_id: &str,
+        expected: Option<&ConfigValue>,
+        new: &ConfigValue,
+    ) -> Result<ConfigCasResult> {
+        self.push_config_fenced(ledger_id, None, expected, new)
+            .await
+    }
+
+    /// [`push_config`](Self::push_config) by a writer holding `fence`.
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen; `None` writes only to a
+    /// record from before fencing. See [`binding::fence_admits`].
+    async fn push_config_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult>;
@@ -1620,8 +1765,13 @@ where
         (**self).drop_branch(ledger_id).await
     }
 
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
-        (**self).reset_head(ledger_id, snapshot).await
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
+    ) -> Result<()> {
+        (**self).reset_head_fenced(ledger_id, fence, snapshot).await
     }
 
     async fn pending_commit_cids(
@@ -1660,14 +1810,15 @@ impl<T> CommitPublisher for Arc<T>
 where
     T: CommitPublisher + ?Sized,
 {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_commit(ledger_id, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
             .await
     }
 
@@ -1681,13 +1832,16 @@ impl<T> IndexPublisher for Arc<T>
 where
     T: IndexPublisher + ?Sized,
 {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        (**self).publish_index(ledger_id, index_t, index_id).await
+        (**self)
+            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .await
     }
 }
 
@@ -1696,14 +1850,15 @@ impl<T> AdminPublisher for Arc<T>
 where
     T: AdminPublisher + ?Sized,
 {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_index_allow_equal(ledger_id, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
             .await
     }
 }
@@ -1713,15 +1868,16 @@ impl<T> RefPublisher for Arc<T>
 where
     T: RefPublisher + ?Sized,
 {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
         (**self)
-            .compare_and_set_ref(ledger_id, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
             .await
     }
 }
@@ -1766,13 +1922,16 @@ impl<T> StatusPublisher for Arc<T>
 where
     T: StatusPublisher + ?Sized,
 {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
-        (**self).push_status(ledger_id, expected, new).await
+        (**self)
+            .push_status_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 
@@ -1781,13 +1940,16 @@ impl<T> ConfigPublisher for Arc<T>
 where
     T: ConfigPublisher + ?Sized,
 {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        (**self).push_config(ledger_id, expected, new).await
+        (**self)
+            .push_config_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 

@@ -50,6 +50,9 @@ pub struct StagedMerge {
     pub target_id: LedgerId,
     /// Where the target branch's artifacts live.
     pub target_namespace: StorageNamespace,
+    /// The fence the target's record carried when the merge was prepared,
+    /// which the head publish presents.
+    pub target_fence: Option<fluree_db_nameservice::Fence>,
     /// Fully-qualified source id (`"<ledger>:<source>"`).
     pub source_id: LedgerId,
     /// `true` when the target's HEAD was the common ancestor — the
@@ -150,6 +153,7 @@ impl crate::Fluree {
             let source_id = staged.source_id.clone();
             let target_id = staged.target_id.clone();
             let target_snapshot = staged.rollback_snapshot.clone();
+            let target_fence = staged.target_fence;
             let published_head = staged.new_head_id.clone();
 
             match self.apply_merge(staged).await {
@@ -184,7 +188,7 @@ impl crate::Fluree {
                     );
                     if let Err(rollback_err) = self
                         .branch_admin()?
-                        .reset_head(&target_id, target_snapshot)
+                        .reset_head_fenced(&target_id, target_fence, target_snapshot)
                         .await
                     {
                         tracing::error!(
@@ -307,7 +311,7 @@ impl crate::Fluree {
             lm.disconnect(&target_id).await;
         }
 
-        if is_fast_forward {
+        let staged = if is_fast_forward {
             self.build_merge_ff(
                 source_branch,
                 &resolved_target,
@@ -322,7 +326,7 @@ impl crate::Fluree {
                 rollback_snapshot,
                 target_head,
             )
-            .await
+            .await?
         } else {
             let ancestor = ancestor.expect("ancestor must exist when both heads are Some");
             self.build_merge_general(
@@ -339,8 +343,12 @@ impl crate::Fluree {
                 rollback_snapshot,
                 target_head,
             )
-            .await
-        }
+            .await?
+        };
+        Ok(StagedMerge {
+            target_fence: target_record.fence,
+            ..staged
+        })
     }
 
     /// Apply a [`StagedMerge`] through the local commit pipeline.
@@ -352,6 +360,7 @@ impl crate::Fluree {
             source,
             target_id,
             target_namespace,
+            target_fence,
             fast_forward,
             conflict_count,
             strategy,
@@ -421,7 +430,13 @@ impl crate::Fluree {
                 };
                 match self
                     .publisher()?
-                    .compare_and_set_ref(&target_id, RefKind::CommitHead, Some(&expected), &new_ref)
+                    .compare_and_set_ref_fenced(
+                        &target_id,
+                        target_fence,
+                        RefKind::CommitHead,
+                        Some(&expected),
+                        &new_ref,
+                    )
                     .await?
                 {
                     CasResult::Updated => {}
@@ -523,6 +538,7 @@ impl crate::Fluree {
             source: source_branch.to_string(),
             target_id,
             target_namespace,
+            target_fence: None,
             source_ledger_id: source_record.ledger_id.clone(),
             source_id,
             fast_forward: true,
@@ -701,6 +717,7 @@ impl crate::Fluree {
             source: source_branch.to_string(),
             target_id,
             target_namespace,
+            target_fence: None,
             source_ledger_id: source_record.ledger_id.clone(),
             source_id,
             fast_forward: false,

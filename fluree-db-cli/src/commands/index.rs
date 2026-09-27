@@ -96,7 +96,7 @@ pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOu
         .ok_or_else(|| {
             CliError::Config("write operations require a read-write nameservice".into())
         })?
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(ledger_id, result.fence, result.index_t, &result.root_id)
         .await
         .map_err(|e| CliError::Import(format!("failed to publish index: {e}")))?;
 

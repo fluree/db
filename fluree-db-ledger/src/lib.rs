@@ -535,6 +535,12 @@ impl LedgerState {
         &self.snapshot.ledger_id
     }
 
+    /// The fence this state's writes present, captured from its nameservice
+    /// record when it was loaded. `None` for a branch from before fencing.
+    pub fn fence(&self) -> Option<fluree_db_nameservice::Fence> {
+        self.ns_record.as_ref().and_then(|r| r.fence)
+    }
+
     /// Where this branch's artifacts live, from its nameservice record. A
     /// state built without one (a new ledger's genesis) is at its id's
     /// legacy namespace.

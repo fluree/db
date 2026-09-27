@@ -739,6 +739,7 @@ pub async fn incremental_index(
             ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
             stats: IndexStats::default(),
             fuel: None,
+            fence: None,
         });
     }
 
@@ -4074,6 +4075,7 @@ pub async fn incremental_index(
         },
         // Outer entry point fills fuel from the tracker tally.
         fuel: None,
+        fence: None,
     })
 }
 

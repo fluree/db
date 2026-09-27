@@ -423,10 +423,16 @@ pub async fn run_set_origins(ledger: &str, file: &Path, dirs: &FlureeDir) -> Cli
             extra: existing_payload.extra,
         }),
     );
+    let fence = fluree
+        .nameservice()
+        .lookup(&ledger_id)
+        .await
+        .map_err(|e| CliError::Config(format!("failed to look up ledger: {e}")))?
+        .and_then(|record| record.fence);
     match fluree
         .publisher()
         .map_err(|e| CliError::Config(e.to_string()))?
-        .push_config(&ledger_id, current.as_ref(), &new_config)
+        .push_config_fenced(&ledger_id, fence, current.as_ref(), &new_config)
         .await
         .map_err(|e| CliError::Config(format!("failed to set config: {e}")))?
     {

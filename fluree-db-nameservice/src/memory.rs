@@ -354,9 +354,15 @@ impl crate::BranchLifecycle for MemoryNameService {
         Ok(parent_new_count)
     }
 
-    async fn reset_head(&self, ledger_id: &str, snapshot: crate::NsRecordSnapshot) -> Result<()> {
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: crate::NsRecordSnapshot,
+    ) -> Result<()> {
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
+        check_fence(&records, &key, fence)?;
 
         let record = records
             .get_mut(&key)
@@ -423,14 +429,16 @@ impl LedgerLifecycle for MemoryNameService {
 
 #[async_trait]
 impl CommitPublisher for MemoryNameService {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
+        check_fence(&records, &key, fence)?;
 
         if let Some(record) = records.get_mut(&key) {
             // Only update if new_t > existing_t (strictly monotonic)
@@ -457,14 +465,16 @@ impl CommitPublisher for MemoryNameService {
 
 #[async_trait]
 impl IndexPublisher for MemoryNameService {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
+        check_fence(&records, &key, fence)?;
 
         if let Some(record) = records.get_mut(&key) {
             // Only update if new_t > existing_t (strictly monotonic)
@@ -487,14 +497,16 @@ impl IndexPublisher for MemoryNameService {
 
 #[async_trait]
 impl AdminPublisher for MemoryNameService {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
+        check_fence(&records, &key, fence)?;
 
         if let Some(record) = records.get_mut(&key) {
             // Allow update when new_t >= existing_t (not strictly monotonic)
@@ -539,15 +551,17 @@ impl RefLookup for MemoryNameService {
 
 #[async_trait]
 impl RefPublisher for MemoryNameService {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
+        check_fence(&records, &key, fence)?;
 
         let current_ref = records.get(&key).map(|r| match kind {
             RefKind::CommitHead => RefValue {
@@ -753,9 +767,10 @@ impl StatusLookup for MemoryNameService {
 
 #[async_trait]
 impl StatusPublisher for MemoryNameService {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
@@ -765,6 +780,7 @@ impl StatusPublisher for MemoryNameService {
         let current = {
             let status_values = self.status_values.read();
             let records = self.records.read();
+            check_fence(&records, &key, fence)?;
 
             if let Some(status) = status_values.get(&key).cloned() {
                 Some(status)
@@ -823,9 +839,10 @@ impl ConfigLookup for MemoryNameService {
 
 #[async_trait]
 impl ConfigPublisher for MemoryNameService {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
@@ -835,6 +852,7 @@ impl ConfigPublisher for MemoryNameService {
         let current = {
             let config_values = self.config_values.read();
             let records = self.records.read();
+            check_fence(&records, &key, fence)?;
 
             if let Some(config) = config_values.get(&key).cloned() {
                 Some(config)
@@ -875,6 +893,19 @@ impl ConfigPublisher for MemoryNameService {
 
         Ok(ConfigCasResult::Updated)
     }
+}
+
+/// Refuse a write presenting `fence` unless the record at `key` admits it.
+fn check_fence(
+    records: &HashMap<LedgerId, NsRecord>,
+    key: &LedgerId,
+    fence: Option<Fence>,
+) -> Result<()> {
+    crate::check_write_fence(
+        key.as_str(),
+        records.get(key).map(|r| (r.fence, r.frozen)),
+        fence,
+    )
 }
 
 #[cfg(test)]

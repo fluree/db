@@ -856,7 +856,12 @@ async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
         .nameservice_mode()
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish index");
 
@@ -959,7 +964,12 @@ async fn fulltext_configured_property_first_build_via_provider() {
         .nameservice_mode()
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish index");
 
@@ -1053,7 +1063,12 @@ async fn fulltext_configured_langtagged_literal_scores_via_arena() {
         .nameservice_mode()
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish index");
 
@@ -1155,7 +1170,12 @@ async fn fulltext_configured_incremental_adds_to_arena() {
         .nameservice_mode()
         .publisher()
         .expect("publisher")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish initial");
 
@@ -1195,7 +1215,12 @@ async fn fulltext_configured_incremental_adds_to_arena() {
         .nameservice_mode()
         .publisher()
         .expect("publisher")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish incremental");
 
@@ -1676,7 +1701,12 @@ async fn fulltext_configured_persisted_incremental_extends_arena() {
             .nameservice_mode()
             .publisher()
             .expect("publisher")
-            .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+            .publish_index_allow_equal_fenced(
+                ledger_id,
+                crate::support::fence_of(&fluree, ledger_id).await,
+                result.index_t,
+                &result.root_id,
+            )
             .await
             .expect("publish incremental");
     }
