@@ -792,3 +792,204 @@ pub async fn finish_purge<S: LifecycleStore + ?Sized>(
     store.cas_dropped(instance, Some(version), None).await?;
     Ok(())
 }
+
+/// What [`migrate_legacy`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// Names bound to the ledgers they held.
+    pub bound: Vec<String>,
+    /// Names whose soft-dropped ledgers moved to the dropped-ledger registry.
+    pub dropped: Vec<String>,
+}
+
+impl MigrationReport {
+    pub fn is_empty(&self) -> bool {
+        self.bound.is_empty() && self.dropped.is_empty()
+    }
+}
+
+/// The instance id the migration gives a ledger created before name
+/// bindings. Derived from the name, so an interrupted or concurrent
+/// migration writes the same bindings and registry entries; its zero
+/// timestamp keeps it apart from every generated id.
+pub fn legacy_instance(name: &str) -> InstanceId {
+    let digest = fluree_db_core::sha256_hex(format!("fluree:legacy-instance:{name}").as_bytes());
+    let random = u128::from_str_radix(&digest[..20], 16).expect("hex digest");
+    InstanceId::parse(&ulid::Ulid::from_parts(0, random).to_string())
+        .expect("a ULID is a valid instance id")
+}
+
+/// The fence the migration gives a branch record created before fencing,
+/// derived from its id for the same reason as [`legacy_instance`].
+fn legacy_fence(ledger_id: &str) -> Fence {
+    let digest = fluree_db_core::sha256_hex(format!("fluree:legacy-fence:{ledger_id}").as_bytes());
+    Fence::from_u64(u64::from_str_radix(&digest[..16], 16).expect("hex digest"))
+}
+
+/// A legacy ledger's root branch: `main` when it has one, and otherwise the
+/// first branch with no source.
+fn legacy_root_branch(records: &[NsRecord]) -> String {
+    let mut branches: Vec<&NsRecord> = records.iter().collect();
+    branches.sort_by(|a, b| a.branch.cmp(&b.branch));
+    branches
+        .iter()
+        .find(|r| r.branch == fluree_db_core::DEFAULT_BRANCH)
+        .or_else(|| branches.iter().find(|r| r.source_branch.is_none()))
+        .or_else(|| branches.first())
+        .map_or_else(
+            || fluree_db_core::DEFAULT_BRANCH.to_string(),
+            |r| r.branch.clone(),
+        )
+}
+
+/// Bind every ledger created before name bindings, so that no code path has
+/// to infer a binding from branch records:
+///
+/// - a name with a live branch is bound to its ledger, rooted at the name,
+///   and each of its records gets a fence; a retracted branch stays listed as
+///   dropped;
+/// - a name whose branches are all retracted was soft-dropped, and moves to
+///   the dropped-ledger registry, where it can be restored or purged, and its
+///   name is free.
+///
+/// Idempotent, and safe to run concurrently or to resume after a crash: the
+/// instance ids and fences it issues are derived from the names, and every
+/// step checks what an earlier attempt left.
+pub async fn migrate_legacy<S: LifecycleStore + ?Sized>(store: &S) -> Result<MigrationReport> {
+    // Records from before fencing, and records an interrupted migration
+    // fenced but may not have listed yet.
+    let mut by_name: std::collections::BTreeMap<String, Vec<NsRecord>> =
+        std::collections::BTreeMap::new();
+    for record in store.all_raw_records().await? {
+        let legacy = legacy_fence(record.ledger_id.as_ref());
+        if record.fence.is_none_or(|f| f == legacy) {
+            by_name.entry(record.name.clone()).or_default().push(record);
+        }
+    }
+
+    let mut report = MigrationReport::default();
+    for (name, records) in by_name {
+        let ledger_name = LedgerName::parse(&name)?;
+        let bound = store.get_binding(&name).await?;
+        let binding_is_legacy = bound
+            .as_ref()
+            .is_some_and(|b| b.value.instance == legacy_instance(&name));
+        let migrated = binding_is_legacy
+            && bound.as_ref().is_some_and(|b| {
+                records
+                    .iter()
+                    .all(|r| r.fence.is_some() && b.value.fence_of(&r.branch) == r.fence)
+            });
+        if migrated {
+            continue;
+        }
+        // A name bound since, by a ledger created over records that were all
+        // retracted, keeps its ledger; those records were soft-dropped.
+        if records.iter().any(|r| !r.retracted) && (bound.is_none() || binding_is_legacy) {
+            bind_legacy(store, &ledger_name, &records).await?;
+            report.bound.push(name);
+        } else {
+            register_legacy_drop(store, &ledger_name, records).await?;
+            report.dropped.push(name);
+        }
+    }
+    Ok(report)
+}
+
+async fn bind_legacy<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    records: &[NsRecord],
+) -> Result<()> {
+    let mut branches = Vec::with_capacity(records.len());
+    for record in records {
+        let id = record.ledger_id.to_string();
+        let fence = legacy_fence(&id);
+        if store.adopt_record(&id, fence).await? == FenceOutcome::Mismatch {
+            return Err(NameServiceError::storage(format!(
+                "cannot migrate {id}: its record was fenced by someone else"
+            )));
+        }
+        if record.retracted {
+            store.freeze_record(&id, fence).await?;
+        }
+        branches.push(BranchFence {
+            dropped: record.retracted,
+            ..BranchFence::new(&record.branch, fence)
+        });
+    }
+    branches.sort_by(|a, b| a.branch.cmp(&b.branch));
+
+    let binding = NameBinding {
+        instance: legacy_instance(name),
+        root: StorageRoot::legacy(name),
+        root_branch: legacy_root_branch(records),
+        state: BindingState::Active,
+        branches,
+    };
+    match store.cas_binding(name, None, Some(&binding)).await? {
+        RegistryCas::Updated { .. } => Ok(()),
+        // An earlier attempt bound it, perhaps without a branch it had not
+        // yet fenced then.
+        RegistryCas::Conflict {
+            actual: Some(existing),
+        } if existing.value.instance == binding.instance => {
+            let mut merged = existing.value.clone();
+            for b in &binding.branches {
+                if merged.listing(&b.branch).is_none() {
+                    merged.branches.push(b.clone());
+                }
+            }
+            if merged == existing.value {
+                return Ok(());
+            }
+            match store
+                .cas_binding(name, Some(existing.version), Some(&merged))
+                .await?
+            {
+                RegistryCas::Updated { .. } => Ok(()),
+                RegistryCas::Conflict { .. } => Err(contended(name)),
+            }
+        }
+        RegistryCas::Conflict { .. } => Err(contended(name)),
+    }
+}
+
+async fn register_legacy_drop<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    records: Vec<NsRecord>,
+) -> Result<()> {
+    let instance = legacy_instance(name);
+    let entry = DroppedLedger {
+        instance: instance.clone(),
+        state: DroppedState::Dropped,
+        dropped_at: now_ms(),
+        name: name.to_string(),
+        root: StorageRoot::legacy(name),
+        root_branch: legacy_root_branch(&records),
+        // Retracted by the drop of the whole ledger, so all come back.
+        branches: records
+            .iter()
+            .map(|r| NsRecord {
+                retracted: false,
+                frozen: false,
+                fence: None,
+                storage_root: None,
+                ..r.clone()
+            })
+            .collect(),
+    };
+    match store.cas_dropped(&instance, None, Some(&entry)).await? {
+        RegistryCas::Updated { .. } | RegistryCas::Conflict { actual: Some(_) } => {}
+        RegistryCas::Conflict { actual: None } => return Err(contended(name)),
+    }
+    for record in &records {
+        let id = record.ledger_id.to_string();
+        let fence = legacy_fence(&id);
+        if store.adopt_record(&id, fence).await? == FenceOutcome::Applied {
+            store.delete_record(&id, fence).await?;
+        }
+    }
+    Ok(())
+}

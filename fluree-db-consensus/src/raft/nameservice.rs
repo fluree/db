@@ -1783,6 +1783,20 @@ impl BranchRecordStore for RaftNameService {
         Ok(record_from_state(&state, &name, &branch))
     }
 
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        let state = self.state.read().await;
+        Ok(state
+            .ledgers
+            .iter()
+            .flat_map(|(name, ledger)| {
+                ledger
+                    .branches
+                    .iter()
+                    .filter_map(|branch| record_from_state(&state, name, branch))
+            })
+            .collect())
+    }
+
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
         let cmd = SmCommand::InsertBranchRecord(FencedBranchRecord {
             key: RefKey::new(&record.name, &record.branch),
@@ -1808,6 +1822,14 @@ impl BranchRecordStore for RaftNameService {
                 "unexpected insert response: {other:?}"
             ))),
         }
+    }
+
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let cmd = SmCommand::AdoptBranch {
+            key: ref_key_of(ledger_id)?,
+            fence: fence.as_u64(),
+        };
+        fence_outcome_from_response(self.submit_lifecycle(cmd).await?)
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {

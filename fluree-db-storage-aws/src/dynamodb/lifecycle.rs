@@ -431,6 +431,76 @@ impl DynamoDbNameService {
                 .and_then(|s| s.parse().ok())
         }))
     }
+
+    /// Bind the ledgers a binary from before name bindings left, once (see
+    /// [`fluree_db_nameservice::lifecycle::migrate_legacy`]), and record the
+    /// format so later starts skip it. Returns what it bound, or `None` when
+    /// the table was already current. Every node must run this version
+    /// first: an older binary writes without checking fences.
+    pub async fn migrate(
+        &self,
+    ) -> Result<Option<fluree_db_nameservice::lifecycle::MigrationReport>> {
+        use fluree_db_nameservice::migration::{check_format_version, FORMAT_VERSION};
+
+        if let Some(item) = self.get_item(PK_FORMAT, SK_META).await? {
+            let version = item
+                .get(ATTR_SCHEMA)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            check_format_version(version)?;
+            if version == FORMAT_VERSION {
+                return Ok(None);
+            }
+        }
+
+        let report = fluree_db_nameservice::lifecycle::migrate_legacy(self).await?;
+        self.client
+            .put_item()
+            .table_name(&self.table_name)
+            .item(ATTR_PK, AttributeValue::S(PK_FORMAT.to_string()))
+            .item(ATTR_SK, AttributeValue::S(SK_META.to_string()))
+            .item(ATTR_SCHEMA, AttributeValue::N(FORMAT_VERSION.to_string()))
+            .item(
+                ATTR_UPDATED_AT_MS,
+                AttributeValue::N(Self::now_epoch_ms().to_string()),
+            )
+            .send()
+            .await
+            .map_err(|e| storage_err("PutItem", e))?;
+        if !report.is_empty() {
+            tracing::info!(
+                bound = report.bound.len(),
+                dropped = report.dropped.len(),
+                "nameservice migrated to format {FORMAT_VERSION}"
+            );
+        }
+        Ok(Some(report))
+    }
+
+    /// Give the item at `sk` `fence`, if it carries none or already carries
+    /// it. Returns whether it carries `fence` afterwards.
+    async fn adopt_item(&self, pk: &str, sk: &str, fence: Fence) -> Result<bool> {
+        match self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk.to_string()))
+            .key(ATTR_SK, AttributeValue::S(sk.to_string()))
+            .update_expression("SET #fence = :fence")
+            .condition_expression(
+                "attribute_exists(pk) AND (attribute_not_exists(#fence) OR #fence = :fence)",
+            )
+            .expression_attribute_names("#fence", ATTR_FENCE)
+            .expression_attribute_values(":fence", fence_value(fence))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if condition_failed(&e) => Ok(false),
+            Err(e) => Err(storage_err("UpdateItem", e)),
+        }
+    }
 }
 
 #[async_trait]
@@ -507,6 +577,10 @@ impl LedgerRegistry for DynamoDbNameService {
 
 #[async_trait]
 impl BranchRecordStore for DynamoDbNameService {
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        self.list_raw_records().await
+    }
+
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let pk = Self::normalize(ledger_id)?;
         let items = self.query_metadata_items(&pk).await?;
@@ -561,6 +635,33 @@ impl BranchRecordStore for DynamoDbNameService {
         Err(NameServiceError::storage(format!(
             "could not insert the record for {pk}; retry"
         )))
+    }
+
+    /// Fences every item but the commit index, the meta item last, so a
+    /// crash part way leaves the record unfenced for the next attempt.
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let pk = Self::normalize(ledger_id)?;
+        match self.meta_fence(&pk).await? {
+            None => return Ok(FenceOutcome::Missing),
+            Some(Some(f)) if f == fence => return Ok(FenceOutcome::Applied),
+            Some(Some(_)) => return Ok(FenceOutcome::Mismatch),
+            Some(None) => {}
+        }
+        for item in self.record_items(&pk).await? {
+            match Self::sk_of(&item) {
+                Some(sk) if sk != SK_META => {
+                    self.adopt_item(&pk, sk, fence).await?;
+                }
+                _ => {}
+            }
+        }
+        if self.adopt_item(&pk, SK_META, fence).await? {
+            return Ok(FenceOutcome::Applied);
+        }
+        Ok(match self.meta_fence(&pk).await? {
+            None => FenceOutcome::Missing,
+            Some(_) => FenceOutcome::Mismatch,
+        })
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {

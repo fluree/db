@@ -3606,7 +3606,7 @@ GRAPH <urn:fluree:{ledger_id}#txn-meta> {{
     // Drop the index ref, reproducing a commits-only replica.
     let index_ref = db_dir
         .path()
-        .join("ns@v2")
+        .join("ns@v3")
         .join("test/unindexed-forgery")
         .join("main.index.json");
     if index_ref.exists() {
@@ -3689,7 +3689,7 @@ GRAPH <#txn-meta> {
     // where the forgery filter runs.
     let index_ref = db_dir
         .path()
-        .join("ns@v2")
+        .join("ns@v3")
         .join("test/sentinel-survives")
         .join("main.index.json");
     if index_ref.exists() {

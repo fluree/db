@@ -908,6 +908,129 @@ pub async fn unfenced_record_takes_unfenced_writes<S: crate::NameServicePublishe
     assert_eq!(store.lookup("old:main").await.unwrap().unwrap().commit_t, 1);
 }
 
+/// A branch record as a binary from before name bindings left it: unfenced.
+fn legacy_record(ledger_id: &str, source: Option<&str>, retracted: bool) -> NsRecord {
+    NsRecord {
+        source_branch: source.map(str::to_string),
+        retracted,
+        ..NsRecord::new(id(ledger_id))
+    }
+}
+
+/// The migration binds a ledger from before name bindings to its name,
+/// rooted where its data already is, and fences its records: from then on
+/// only a writer holding the fence can publish. A retracted branch stays
+/// listed as dropped. Running it again changes nothing.
+pub async fn migration_binds_legacy_ledgers<S: crate::NameServicePublisher>(store: &S) {
+    for record in [
+        legacy_record("mydb:main", None, false),
+        legacy_record("mydb:dev", Some("main"), false),
+        legacy_record("mydb:old", Some("main"), true),
+    ] {
+        assert!(store.insert_record(&record).await.unwrap().is_none());
+    }
+    advance_commit(store, "mydb:main", None, 1).await;
+
+    let report = lifecycle::migrate_legacy(store).await.unwrap();
+    assert_eq!(report.bound, vec!["mydb".to_string()]);
+    assert!(report.dropped.is_empty());
+
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    assert_eq!(binding.state, BindingState::Active);
+    assert_eq!(binding.instance, lifecycle::legacy_instance("mydb"));
+    assert_eq!(binding.root, StorageRoot::legacy(&name("mydb")));
+    assert_eq!(binding.root_branch, "main");
+    assert_eq!(binding.branches.len(), 3);
+    assert!(binding.listing("old").unwrap().dropped);
+
+    let main = store.lookup("mydb:main").await.unwrap().expect("main");
+    assert_eq!(main.fence, binding.fence_of("main"));
+    assert!(main.fence.is_some());
+    assert_eq!(main.commit_t, 1);
+    assert_eq!(
+        store.lookup("mydb:dev").await.unwrap().expect("dev").fence,
+        binding.fence_of("dev")
+    );
+    assert!(store
+        .lookup("mydb:old")
+        .await
+        .unwrap()
+        .is_none_or(|r| r.retracted));
+
+    assert_every_write_refused(store, "mydb:main", None).await;
+    advance_commit(store, "mydb:main", main.fence, 2).await;
+
+    assert!(lifecycle::migrate_legacy(store).await.unwrap().is_empty());
+    assert_eq!(
+        store.get_binding("mydb").await.unwrap().unwrap().value,
+        binding
+    );
+}
+
+/// A ledger whose branches were all retracted was soft-dropped: the
+/// migration moves it to the registry, frees its name, and it restores to
+/// its old root.
+pub async fn migration_registers_soft_dropped_ledgers<S: LifecycleStore>(store: &S) {
+    for record in [
+        legacy_record("gone:main", None, true),
+        legacy_record("gone:dev", Some("main"), true),
+    ] {
+        assert!(store.insert_record(&record).await.unwrap().is_none());
+    }
+
+    let report = lifecycle::migrate_legacy(store).await.unwrap();
+    assert_eq!(report.dropped, vec!["gone".to_string()]);
+    assert!(report.bound.is_empty());
+    assert!(store.get_binding("gone").await.unwrap().is_none());
+    assert!(store.raw_record("gone:main").await.unwrap().is_none());
+    assert!(store.raw_record("gone:dev").await.unwrap().is_none());
+
+    let instance = lifecycle::legacy_instance("gone");
+    let entry = store.get_dropped(&instance).await.unwrap().unwrap().value;
+    assert_eq!(entry.state, DroppedState::Dropped);
+    assert_eq!(entry.name, "gone");
+    assert_eq!(entry.root, StorageRoot::legacy(&name("gone")));
+    assert_eq!(entry.branches.len(), 2);
+    assert!(lifecycle::migrate_legacy(store).await.unwrap().is_empty());
+
+    let restored = lifecycle::restore_dropped(store, &instance).await.unwrap();
+    assert_eq!(restored.len(), 2);
+    let binding = store.get_binding("gone").await.unwrap().unwrap().value;
+    assert_eq!(binding.root, StorageRoot::legacy(&name("gone")));
+    assert!(binding.branches.iter().all(|b| !b.dropped));
+}
+
+/// A migration interrupted after fencing some of a ledger's records, before
+/// binding it, lists them all when it resumes.
+pub async fn interrupted_migration_resumes<S: crate::NameServicePublisher>(store: &S) {
+    for record in [
+        legacy_record("mydb:main", None, false),
+        legacy_record("mydb:dev", Some("main"), false),
+    ] {
+        assert!(store.insert_record(&record).await.unwrap().is_none());
+    }
+    lifecycle::migrate_legacy(store).await.unwrap();
+    let fence = store.raw_record("mydb:dev").await.unwrap().unwrap().fence;
+    // Roll back to the crash: the binding not yet written.
+    let binding = store.get_binding("mydb").await.unwrap().unwrap();
+    store
+        .cas_binding("mydb", Some(binding.version), None)
+        .await
+        .unwrap();
+    assert!(store
+        .insert_record(&legacy_record("mydb:feature", Some("main"), false))
+        .await
+        .unwrap()
+        .is_none());
+
+    let report = lifecycle::migrate_legacy(store).await.unwrap();
+    assert_eq!(report.bound, vec!["mydb".to_string()]);
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    assert_eq!(binding.branches.len(), 3);
+    assert_eq!(binding.fence_of("dev"), fence);
+    assert!(store.lookup("mydb:feature").await.unwrap().is_some());
+}
+
 /// Run every case in turn, each against a fresh backend from `make`: for
 /// backends too costly to set up once per test. Keep in step with
 /// [`lifecycle_conformance_tests!`](crate::lifecycle_conformance_tests).
@@ -941,6 +1064,9 @@ where
     frozen_branch_refuses_writes(&make().await).await;
     stale_writers_are_refused_across_drop_and_restore(&make().await).await;
     unfenced_record_takes_unfenced_writes(&make().await).await;
+    migration_binds_legacy_ledgers(&make().await).await;
+    migration_registers_soft_dropped_ledgers(&make().await).await;
+    interrupted_migration_resumes(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -975,6 +1101,9 @@ macro_rules! lifecycle_conformance_tests {
             frozen_branch_refuses_writes,
             stale_writers_are_refused_across_drop_and_restore,
             unfenced_record_takes_unfenced_writes,
+            migration_binds_legacy_ledgers,
+            migration_registers_soft_dropped_ledgers,
+            interrupted_migration_resumes,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

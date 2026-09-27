@@ -271,6 +271,12 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
     }
 }
 
+/// A nameservice that could not be brought to the current format.
+#[cfg(feature = "aws")]
+fn migration_failed(e: fluree_db_nameservice::NameServiceError) -> ConnectionError {
+    ConnectionError::storage(format!("Failed to migrate the nameservice: {e}"))
+}
+
 /// Create AWS connection from parsed JSON-LD config
 ///
 /// Uses StorageRegistry for storage sharing when the same @id is referenced
@@ -339,6 +345,7 @@ async fn create_aws_connection(
                             "Failed to create DynamoDB nameservice: {e}"
                         ))
                     })?;
+                Box::pin(ns.migrate()).await.map_err(migration_failed)?;
                 Arc::new(ns) as Arc<dyn aws::AwsNameServiceDyn>
             }
             PublisherType::Storage { storage } => {
@@ -353,6 +360,7 @@ async fn create_aws_connection(
                 };
                 // StorageNameService prefix is empty - S3Storage has the bucket prefix
                 let ns = StorageNameService::new((*ns_storage).clone(), "");
+                Box::pin(ns.migrate()).await.map_err(migration_failed)?;
                 Arc::new(ns) as Arc<dyn aws::AwsNameServiceDyn>
             }
             PublisherType::Unsupported { type_iri, .. } => {
@@ -372,6 +380,7 @@ async fn create_aws_connection(
                 .map_err(|e| {
                     ConnectionError::storage(format!("Failed to create DynamoDB nameservice: {e}"))
                 })?;
+            Box::pin(ns.migrate()).await.map_err(migration_failed)?;
             Arc::new(ns) as Arc<dyn aws::AwsNameServiceDyn>
         }
     };

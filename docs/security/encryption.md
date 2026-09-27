@@ -451,7 +451,7 @@ Encryption covers every blob written through the storage layer: commits,
 transactions, index roots, branches, leaves, dictionaries and arenas. These
 are outside it by design:
 
-- **The nameservice.** The file nameservice under `ns@v2/` and the DynamoDB or
+- **The nameservice.** The file nameservice under `ns@v3/` and the DynamoDB or
   S3 storage-backed nameservice hold, in plaintext: ledger and branch names,
   head commit and index root ids, default-context and config ids, and
   graph-source definitions including their configuration (for example a BM25
@@ -582,7 +582,7 @@ xxd -l 4 /var/lib/fluree/data/<ledger>/<branch>/commit/<file>
 # Unencrypted: another format's magic, for example FCV2, FLI3 or FIR6, or JSON
 ```
 
-Compare all four bytes: `FLI3` also starts with `46 4c`. Files under `ns@v2/`
+Compare all four bytes: `FLI3` also starts with `46 4c`. Files under `ns@v3/`
 and lock files are plaintext by design. After every start, confirm with
 `fluree encryption status`, which lists the key ids a node holds, or
 `GET /v1/fluree/encryption`, which returns `encrypted: true`.

@@ -1,7 +1,7 @@
-//! Shared ns@v2 format types used by both file-based and storage-backed nameservice
-//! implementations.
+//! Shared record format types used by both file-based and storage-backed
+//! nameservice implementations.
 //!
-//! These types represent the JSON structures stored in ns@v2 record files. Both
+//! These types represent the JSON structures stored in record files. Both
 //! `FileNameService` and `StorageNameService` serialize/deserialize these types,
 //! so they are defined once here to ensure consistency.
 
@@ -12,8 +12,9 @@ use crate::{
 use fluree_db_core::{ContentId, LedgerId};
 use serde::{Deserialize, Serialize};
 
-/// ns@v2 format version path segment.
-pub(crate) const NS_VERSION: &str = "ns@v2";
+/// The address version path segment. See [`crate::migration`] for the move
+/// from `ns@v2`, which binaries from before name bindings use.
+pub(crate) const NS_VERSION: &str = "ns@v3";
 
 /// `f:status` of a branch a drop has frozen: it accepts no more writes.
 pub(crate) const STATUS_FROZEN: &str = "frozen";
@@ -23,13 +24,13 @@ pub(crate) const STATUS_DELETED: &str = "deleted";
 /// `f:status` of a soft-dropped branch under the old lifecycle.
 pub(crate) const STATUS_RETRACTED: &str = "retracted";
 
-/// Create the standard ns@v2 context as JSON value.
+/// Create the standard ns@v3 context as JSON value.
 /// Uses object format with the `"f"` prefix mapping to the Fluree DB namespace.
 pub(crate) fn ns_context() -> serde_json::Value {
     serde_json::json!({"f": fluree_vocab::fluree::DB})
 }
 
-/// JSON structure for main ns@v2 record file.
+/// JSON structure for main ns@v3 record file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NsFileV2 {
     /// Context can be either a string or an object with prefix mappings
@@ -123,6 +124,11 @@ pub(crate) struct NsFileV2 {
     /// The fence a writer must present; see [`NsRecord::fence`].
     #[serde(rename = "f:fence", default, skip_serializing_if = "Option::is_none")]
     pub fence: Option<Fence>,
+
+    /// Fields this binary does not know, kept so that rewriting the record
+    /// preserves what a newer binary added.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl NsFileV2 {
@@ -159,6 +165,7 @@ impl NsFileV2 {
             branch_point: None,
             branches: record.branches,
             fence: record.fence,
+            extra: Default::default(),
         }
     }
 
@@ -278,7 +285,7 @@ impl NsFileV2 {
     }
 }
 
-/// Head pointers from a main ns@v2 file plus its optional index-only file,
+/// Head pointers from a main ns@v3 file plus its optional index-only file,
 /// using the read-time merge rule shared by `load_record`: the separate
 /// index file wins when its `t` is equal or higher.
 pub(crate) fn merge_heads(main: &NsFileV2, index_file: Option<&NsIndexFileV2>) -> LedgerHeads {
@@ -304,7 +311,7 @@ pub(crate) fn merge_heads(main: &NsFileV2, index_file: Option<&NsIndexFileV2>) -
     }
 }
 
-/// JSON structure for index-only ns@v2 file.
+/// JSON structure for index-only ns@v3 file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NsIndexFileV2 {
     /// Context can be either a string or an object with prefix mappings
@@ -326,6 +333,10 @@ pub(crate) struct NsIndexFileV2 {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub frozen: bool,
+
+    /// Fields this binary does not know; see [`NsFileV2::extra`].
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl NsIndexFileV2 {
@@ -353,7 +364,7 @@ pub(crate) struct IndexRef {
     pub t: i64,
 }
 
-/// JSON-LD representation of a branch point in an ns@v2 file.
+/// JSON-LD representation of a branch point in an ns@v3 file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BranchPointRef {
     #[serde(rename = "f:source")]
@@ -410,6 +421,7 @@ mod tests {
             branch_point: None,
             branches: 0,
             fence: None,
+            extra: Default::default(),
         }
     }
 
@@ -422,6 +434,7 @@ mod tests {
             },
             fence: None,
             frozen: false,
+            extra: Default::default(),
         }
     }
 

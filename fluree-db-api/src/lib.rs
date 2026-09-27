@@ -2496,6 +2496,8 @@ impl FlureeBuilder {
         // are applied before anything reads this tree.
         storage.recover_wal()?;
         let nameservice = FileNameService::with_storage(storage.clone());
+        // And a store from before name bindings moves to the current format.
+        nameservice.migrate_blocking()?;
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
@@ -2813,6 +2815,7 @@ impl FlureeBuilder {
 
         // Empty prefix: S3Storage already applies its own key prefix.
         let nameservice = StorageNameService::new(storage.clone(), "");
+        Box::pin(nameservice.migrate()).await?;
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
@@ -2894,6 +2897,7 @@ impl FlureeBuilder {
             .ensure_table()
             .await
             .map_err(|e| ApiError::config(format!("Failed to ensure DynamoDB table: {e}")))?;
+        Box::pin(dynamo_ns.migrate()).await?;
 
         let event_bus = self.resolve_event_bus();
         let notifying =
@@ -3324,6 +3328,7 @@ impl FlureeBuilder {
                 Some(ns) => (ns, tx::IndexingMode::Disabled),
                 None => {
                     let ns = FileNameService::with_storage(ns_storage);
+                    ns.migrate_blocking()?;
                     let notifying =
                         fluree_db_nameservice::NotifyingNameService::new(ns, event_bus.clone());
                     let indexing_mode = self.start_background_indexing(

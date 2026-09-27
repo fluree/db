@@ -250,6 +250,8 @@ The Raft log and snapshot encodings (postcard for `Command`, `Response`, and `Na
 
 Skipping versions is not supported. The safe path is N → N+1; for larger jumps, do them sequentially.
 
+v4.3 binds every ledger to its name (see [Storage](storage.md#upgrading-from-a-release-before-name-bindings)). A cluster moving from an earlier release does this once, on the first leader elected after the upgrade, through commands an older node cannot read — one more reason to finish the upgrade before a newly upgraded node leads.
+
 The Raft log's on-disk layout changed in v4.3 from one file per entry to append-only segments. A node folds its existing entry files into a segment the first time the new binary opens `--raft-storage-path`; the fold keeps the contiguous run above the purge cutoff, exactly what the old layout reported, and needs no operator action. It is per node, so it rolls with the upgrade above. An older binary cannot read segments; downgrading a node means restoring its `--raft-storage-path` from before the upgrade, or letting it rejoin as a fresh node and take a snapshot from the leader.
 
 ## Admin HTTP surface

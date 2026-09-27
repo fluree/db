@@ -243,9 +243,9 @@ async fn nameservice_slash_ledger_names_parity() {
     assert!(names.contains("tenant1/products"));
     assert!(names.contains("tenant2/orders"));
 
-    // Verify filesystem layout: ns@v2/{ledger-name}/{branch}.json
-    let ns_dir = tmp.path().join("ns@v2");
-    assert!(ns_dir.exists(), "ns@v2 directory should exist");
+    // Verify filesystem layout: ns@v3/{ledger-name}/{branch}.json
+    let ns_dir = tmp.path().join("ns@v3");
+    assert!(ns_dir.exists(), "ns@v3 directory should exist");
     assert!(
         ns_dir.join("tenant1").exists(),
         "tenant1 subdirectory should exist"

@@ -204,6 +204,27 @@ Each ledger or graph source is represented as multiple items under the same `pk`
 | `index` | Index head pointer | `index_id`, `index_t` |
 | `status` | Operational status | `status`, `status_v`, `status_meta` |
 
+### Name bindings, dropped ledgers and the format item
+
+Beside the branch records, the table holds three kinds of lifecycle item. None
+shares a partition with a branch record, so none enters a head read's range.
+
+| `pk` | `sk` | Holds |
+|------|------|-------|
+| `<name>` (no `:`) | `binding` | The name's binding, as JSON in `binding`: which ledger instance holds the name, where its data is stored, and each branch's fence |
+| `@<instance>` | `dropped` | A dropped ledger, as JSON in `entry`, restorable or purgeable by its instance id |
+| `@format` | `meta` | The nameservice format, in `schema`; written once by the upgrade (see [Upgrading](#upgrading-from-a-release-before-name-bindings)) |
+
+Binding and dropped-ledger items carry a version counter, `v`, and every change
+is conditional on it. A delete leaves the item as a tombstone without its value,
+so a version never repeats. Both project into GSI1, with kinds `binding` and
+`dropped_ledger`.
+
+Every item of a branch record also carries the branch's `fence` (16 hex
+digits), and a drop sets `frozen` on each. Every write is conditional on both,
+so a writer that loaded a ledger before it was dropped, restored or replaced is
+refused.
+
 ### Attribute Reference
 
 All items share these common attributes:
@@ -425,6 +446,11 @@ The DynamoDB nameservice uses the standard AWS SDK credential chain:
 
 ### Required IAM Permissions
 
+A policy that restricts which partition keys may be written
+(`dynamodb:LeadingKeys`) must allow bare ledger names and keys starting with
+`@`, as well as `name:branch` keys: see [Name bindings, dropped ledgers and the
+format item](#name-bindings-dropped-ledgers-and-the-format-item).
+
 Full permissions (recommended):
 
 ```json
@@ -568,6 +594,20 @@ Hard drops and branch-drop cascade cleanup require `dynamodb:DeleteItem`. Backen
    ```
 
 2. **Create Test Table** (same command as LocalStack, change `--endpoint-url` to `http://localhost:8000`)
+
+## Upgrading from a release before name bindings
+
+Releases before name bindings (4.2 and earlier) keep no bindings or fences. The
+first start of this release binds every ledger in the table to its name, gives
+each branch record a fence, and moves each ledger those releases soft-dropped
+into the list of dropped ledgers, where it can be restored or purged. It then
+writes the `@format` item, so later starts skip the step. Ledger data is not
+moved or rewritten.
+
+Older releases write without checking fences and know nothing of bindings, so
+upgrade every node before starting any: stop all nodes, upgrade them, then
+start them. Do not run an older release against the table afterwards. A release
+refuses to start against a table in a newer format than it understands.
 
 ## Production Considerations
 

@@ -134,7 +134,7 @@ impl crate::NameServiceLookup for MemoryNameService {
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
-        let records: Vec<NsRecord> = self.records.read().values().cloned().collect();
+        let records = BranchRecordStore::all_raw_records(self).await?;
         crate::read_all_resolved(self, records).await
     }
 
@@ -225,6 +225,10 @@ impl BranchRecordStore for MemoryNameService {
         Ok(self.records.read().get(&key).cloned())
     }
 
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        Ok(self.records.read().values().cloned().collect())
+    }
+
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
         let mut records = self.records.write();
         if let Some(existing) = records.get(&record.ledger_id) {
@@ -234,6 +238,21 @@ impl BranchRecordStore for MemoryNameService {
         stored.storage_root = None;
         records.insert(record.ledger_id.clone(), stored);
         Ok(None)
+    }
+
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let key = LedgerId::parse(ledger_id)?;
+        Ok(match self.records.write().get_mut(&key) {
+            None => FenceOutcome::Missing,
+            Some(record) => match record.fence {
+                None => {
+                    record.fence = Some(fence);
+                    FenceOutcome::Applied
+                }
+                Some(current) if current == fence => FenceOutcome::Applied,
+                Some(_) => FenceOutcome::Mismatch,
+            },
+        })
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {

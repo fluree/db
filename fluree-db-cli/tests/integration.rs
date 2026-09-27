@@ -3830,12 +3830,12 @@ fn cli_respects_custom_storage_path_in_config() {
         "custom storage directory should have been created"
     );
     assert!(
-        custom_storage.join("ns@v2").is_dir(),
+        custom_storage.join("ns@v3").is_dir(),
         "nameservice data should exist in custom storage"
     );
 
     // The default storage should NOT have the ledger data
-    let default_ns = tmp.path().join(".fluree/storage/ns@v2");
+    let default_ns = tmp.path().join(".fluree/storage/ns@v3");
     assert!(
         !default_ns.exists(),
         "default .fluree/storage should NOT contain ledger data when custom path is set"
@@ -3876,11 +3876,11 @@ fn cli_respects_custom_storage_path_via_config_flag() {
 
     // Data should be in the custom location, not in config_dir/storage
     assert!(
-        custom_storage.join("ns@v2").is_dir(),
+        custom_storage.join("ns@v3").is_dir(),
         "ledger data should be in custom storage path"
     );
     assert!(
-        !config_dir.join("storage/ns@v2").exists(),
+        !config_dir.join("storage/ns@v3").exists(),
         "config dir should NOT contain ledger data"
     );
 }

@@ -8,7 +8,7 @@ description = "Nameservice traits and implementations for Fluree DB"
 
 [features]
 default = ["native"]
-native = ["tokio/fs", "fluree-db-core/native"]
+native = ["tokio/fs", "tokio/rt", "fluree-db-core/native"]
 # The lifecycle conformance suite, for backend crates' tests.
 conformance = []
 

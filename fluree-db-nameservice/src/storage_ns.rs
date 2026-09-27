@@ -8,9 +8,9 @@
 //!
 //! # File Layout
 //!
-//! Uses the ns@v2 format compatible with legacy implementations:
-//! - `{prefix}/ns@v2/{ledger-name}/{branch}.json` - Main record (commit info)
-//! - `{prefix}/ns@v2/{ledger-name}/{branch}.index.json` - Index record (separate for indexer)
+//! Uses the ns@v3 format compatible with legacy implementations:
+//! - `{prefix}/ns@v3/{ledger-name}/{branch}.json` - Main record (commit info)
+//! - `{prefix}/ns@v3/{ledger-name}/{branch}.index.json` - Index record (separate for indexer)
 //!
 //! # Concurrency
 //!
@@ -71,7 +71,7 @@ impl<S: Debug> Debug for StorageNameService<S> {
 }
 
 // =============================================================================
-// Graph Source File Structures (ns@v2 format)
+// Graph Source File Structures (ns@v3 format)
 // =============================================================================
 
 /// JSON structure for graph source main config file
@@ -193,6 +193,7 @@ impl<S> StorageNameService<S> {
             branch_point: None,
             branches: 0,
             fence: None,
+            extra: Default::default(),
         }
     }
 }
@@ -418,7 +419,7 @@ where
             }
         };
 
-        // A graph-source record shares the `ns@v2/{name}/{branch}.json` key space
+        // A graph-source record shares the `ns@v3/{name}/{branch}.json` key space
         // with ledger records but uses a different schema (no `f:ledger`). Report
         // it as "not a ledger" (Ok(None)) so single-alias resolution yields a
         // clean not-found and callers fall back to graph-source resolution —
@@ -614,13 +615,88 @@ where
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
+        let records = BranchRecordStore::all_raw_records(self).await?;
+        crate::read_all_resolved(self, records).await
+    }
+}
+
+impl<S> StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    /// Bring a store written before name bindings to the current format,
+    /// once: see [`crate::migration`]. Returns what it bound, or `None` when
+    /// the store was already current. Safe to repeat, to resume, and to run
+    /// from several processes at once.
+    pub async fn migrate(&self) -> Result<Option<crate::lifecycle::MigrationReport>> {
+        use crate::migration::{FormatMarker, FORMAT_MARKER, LEGACY_NS_VERSION};
+
+        let marker_key = self.ns_root_key(FORMAT_MARKER);
+        match self.storage.read_bytes(&marker_key).await {
+            Ok(bytes) => {
+                FormatMarker::parse(&bytes)?;
+                return Ok(None);
+            }
+            Err(CoreError::NotFound(_)) => {}
+            Err(e) => {
+                return Err(NameServiceError::storage(format!(
+                    "reading the format marker: {e}"
+                )))
+            }
+        }
+
+        let legacy_root = if self.prefix.is_empty() {
+            format!("{LEGACY_NS_VERSION}/")
+        } else {
+            format!("{}/{LEGACY_NS_VERSION}/", self.prefix)
+        };
+        let keys = StorageList::list_prefix(&self.storage, &legacy_root)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("listing {legacy_root}: {e}")))?;
+        for key in keys {
+            let Some(relative) = key.strip_prefix(&legacy_root) else {
+                continue;
+            };
+            if relative.ends_with(".lock") || relative.ends_with(".tmp") {
+                continue;
+            }
+            let bytes = match self.storage.read_bytes(&key).await {
+                Ok(bytes) => bytes,
+                Err(CoreError::NotFound(_)) => continue,
+                Err(e) => {
+                    return Err(NameServiceError::storage(format!("reading {key}: {e}")));
+                }
+            };
+            self.storage
+                .insert(&self.ns_root_key(relative), &bytes)
+                .await
+                .map_err(|e| NameServiceError::storage(format!("copying {key}: {e}")))?;
+        }
+
+        let report = crate::lifecycle::migrate_legacy(self).await?;
+        let marker = serde_json::to_vec_pretty(&FormatMarker::current())?;
+        self.storage
+            .insert(&marker_key, &marker)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("writing the format marker: {e}")))?;
+        if !report.is_empty() {
+            tracing::info!(
+                bound = report.bound.len(),
+                dropped = report.dropped.len(),
+                "nameservice migrated from {LEGACY_NS_VERSION} to {NS_VERSION}"
+            );
+        }
+        Ok(Some(report))
+    }
+
+    async fn list_raw_records(&self) -> Result<Vec<NsRecord>> {
         let prefix = if self.prefix.is_empty() {
             NS_VERSION.to_string()
         } else {
             format!("{}/{}", self.prefix, NS_VERSION)
         };
 
-        // List all files under ns@v2
+        // List all files under ns@v3
         let keys = StorageList::list_prefix(&self.storage, &prefix)
             .await
             .map_err(|e| NameServiceError::storage(format!("Failed to list records: {e}")))?;
@@ -640,8 +716,7 @@ where
                 records.push(record);
             }
         }
-
-        crate::read_all_resolved(self, records).await
+        Ok(records)
     }
 }
 
@@ -725,6 +800,10 @@ impl<S> BranchRecordStore for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        self.list_raw_records().await
+    }
+
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let (name, branch) = split_ledger_id(ledger_id)?;
         let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
@@ -750,6 +829,20 @@ where
                 index: &index,
             },
             record,
+        )
+        .await
+    }
+
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
+        ns_cas::adopt_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            fence,
         )
         .await
     }
@@ -841,6 +934,7 @@ where
             }),
             branches: 0,
             fence: None,
+            extra: Default::default(),
         };
         let bytes = serde_json::to_vec_pretty(&file)
             .map_err(|e| NameServiceError::storage(e.to_string()))?;
@@ -977,6 +1071,7 @@ where
             branch_point: None,
             branches: 0,
             fence: None,
+            extra: Default::default(),
         };
 
         let bytes = serde_json::to_vec_pretty(&file)?;
@@ -1122,6 +1217,7 @@ where
                     },
                     fence,
                     frozen: false,
+                    extra: Default::default(),
                 })
             },
         )
@@ -1164,6 +1260,7 @@ where
                         },
                         fence,
                         frozen: false,
+                        extra: Default::default(),
                     })
                 } else {
                     None
@@ -1378,6 +1475,7 @@ where
                                         },
                                         fence,
                                         frozen: false,
+                                        extra: Default::default(),
                                     });
                                 }
                                 (false, Some(actual)) => {
@@ -1408,6 +1506,7 @@ where
                                         },
                                         fence,
                                         frozen: false,
+                                        extra: Default::default(),
                                     });
                                 }
                                 (true, Some(actual)) => {
@@ -1619,7 +1718,7 @@ where
             format!("{}/{}", self.prefix, NS_VERSION)
         };
 
-        // List all files under ns@v2
+        // List all files under ns@v3
         let keys = StorageList::list_prefix(&self.storage, &prefix)
             .await
             .map_err(|e| NameServiceError::storage(format!("Failed to list records: {e}")))?;
@@ -1637,7 +1736,7 @@ where
             }
 
             // Parse name and branch from key
-            // Key format: {prefix}/ns@v2/{name}/{branch}.json
+            // Key format: {prefix}/ns@v3/{name}/{branch}.json
             let path_part = if self.prefix.is_empty() {
                 key.strip_prefix(&format!("{NS_VERSION}/"))
             } else {
@@ -1958,7 +2057,7 @@ mod tests {
         // Create a mock storage for testing key generation
         // We can't easily test the full StorageNameService without a real storage impl
         let prefix = "ledgers";
-        let expected = format!("{prefix}/ns@v2/mydb/main.json");
+        let expected = format!("{prefix}/ns@v3/mydb/main.json");
         assert_eq!(
             expected,
             format!("{}/{}/{}/{}.json", prefix, NS_VERSION, "mydb", "main")
@@ -1968,13 +2067,13 @@ mod tests {
     #[test]
     fn test_ns_key_without_prefix() {
         let expected = format!("{}/{}/{}.json", NS_VERSION, "mydb", "main");
-        assert_eq!(expected, "ns@v2/mydb/main.json");
+        assert_eq!(expected, "ns@v3/mydb/main.json");
     }
 
     #[test]
     fn test_index_key() {
         let expected = format!("{}/{}/{}.index.json", NS_VERSION, "mydb", "main");
-        assert_eq!(expected, "ns@v2/mydb/main.index.json");
+        assert_eq!(expected, "ns@v3/mydb/main.index.json");
     }
 
     #[test]
@@ -2144,6 +2243,30 @@ mod tests {
 
     fn make_storage_ns() -> StorageNameService<MemoryCasStorage> {
         StorageNameService::new(MemoryCasStorage::new(), "test")
+    }
+
+    #[tokio::test]
+    async fn migrate_moves_a_legacy_store_to_the_current_address() {
+        let ns = make_storage_ns();
+        let mut record = NsRecord::new(LedgerId::parse("mydb:main").unwrap());
+        record.commit_t = 2;
+        record.commit_head_id = Some(ContentId::new(fluree_db_core::ContentKind::Commit, b"c"));
+        let legacy_key = "test/ns@v2/mydb/main.json";
+        ns.storage
+            .write_bytes(
+                legacy_key,
+                &serde_json::to_vec(&NsFileV2::for_record(&record)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let report = ns.migrate().await.unwrap().expect("migrated");
+        assert_eq!(report.bound, vec!["mydb".to_string()]);
+        let migrated = ns.lookup("mydb:main").await.unwrap().expect("bound");
+        assert!(migrated.fence.is_some());
+        assert_eq!(migrated.commit_t, 2);
+        assert!(ns.storage.read_bytes(legacy_key).await.is_ok());
+        assert!(ns.migrate().await.unwrap().is_none());
     }
 
     /// Wrapper that simulates a concurrent modification on the first
@@ -2687,7 +2810,7 @@ mod tests {
     }
 
     /// Regression (#1369): a graph-source record shares the
-    /// `ns@v2/{name}/{branch}.json` key space with ledger records but uses a
+    /// `ns@v3/{name}/{branch}.json` key space with ledger records but uses a
     /// different schema (no `f:ledger`). `lookup` must report it as a clean
     /// not-found (`Ok(None)`) instead of failing to deserialize `NsFileV2`
     /// ("missing field `f:ledger`"), so single-alias query/`use` resolution can

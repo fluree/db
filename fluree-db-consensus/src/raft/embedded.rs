@@ -217,11 +217,13 @@ impl EmbeddedRaftNode {
         )
         .with_config(config.liveness);
         let extra = config.extra_leader_tasks;
+        let raft_ns = integration.nameservice();
         let leader_watcher =
             spawn_leader_watcher(Arc::clone(&integration.raft), integration.id, move || {
                 let mut tasks = vec![
                     tokio::spawn(eviction.clone().run()),
                     tokio::spawn(liveness.clone().run()),
+                    tokio::spawn(migrate_nameservice(Arc::clone(&raft_ns))),
                 ];
                 if let Some(extra) = extra.as_ref() {
                     tasks.extend(extra());
@@ -326,6 +328,25 @@ pub async fn release_one(fluree: &Fluree, ledger_id: &str, cid: &ContentId) {
                     "failed to release envelope from content store; blob will leak"
                 );
             }
+        }
+    }
+}
+
+/// Bind the ledgers a cluster from before name bindings left in the
+/// replicated state (see
+/// [`fluree_db_nameservice::lifecycle::migrate_legacy`]). Runs on each new
+/// leader, since only the leader can propose; once bound, a run finds
+/// nothing to do.
+async fn migrate_nameservice(nameservice: Arc<crate::raft::nameservice::RaftNameService>) {
+    match fluree_db_nameservice::lifecycle::migrate_legacy(nameservice.as_ref()).await {
+        Ok(report) if report.is_empty() => {}
+        Ok(report) => tracing::info!(
+            bound = report.bound.len(),
+            dropped = report.dropped.len(),
+            "bound the ledgers created before name bindings"
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not bind the ledgers created before name bindings");
         }
     }
 }

@@ -536,8 +536,20 @@ where
         self.inner.raw_record(ledger_id).await
     }
 
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        self.inner.all_raw_records().await
+    }
+
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
         self.inner.insert_record(record).await
+    }
+
+    async fn adopt_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        self.inner.adopt_record(ledger_id, fence).await
     }
 
     async fn freeze_record(

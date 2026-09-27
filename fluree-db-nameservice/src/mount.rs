@@ -586,11 +586,27 @@ impl crate::BranchRecordStore for CompositeNameService {
         self.local.raw_record(ledger_id).await
     }
 
+    /// The local records only: mounted ones belong to their origin.
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        self.local.all_raw_records().await
+    }
+
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
         if let Some(err) = self.reject_mounted_write(&record.ledger_id) {
             return Err(err);
         }
         self.local.insert_record(record).await
+    }
+
+    async fn adopt_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.adopt_record(ledger_id, fence).await
     }
 
     async fn freeze_record(

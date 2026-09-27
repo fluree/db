@@ -14,7 +14,7 @@
 //! # Implementations
 //!
 //! - [`MemoryNameService`]: In-memory implementation for testing
-//! - [`FileNameService`]: File-based implementation using ns@v2 format
+//! - [`FileNameService`]: File-based implementation using ns@v3 format
 //! - [`StorageNameService`]: Storage-backed implementation using CAS operations
 
 pub mod binding;
@@ -28,6 +28,7 @@ pub mod file;
 pub mod ledger_config;
 pub mod lifecycle;
 pub mod memory;
+pub mod migration;
 pub mod mount;
 mod notifying;
 mod ns_cas;
@@ -352,7 +353,7 @@ impl GraphSourceType {
     /// (`https://ns.flur.ee/db#Bm25Index`) forms, plus fuzzy matching as fallback.
     pub fn from_type_string(s: &str) -> Self {
         match s {
-            // Compact forms (primary, used in ns@v2 files)
+            // Compact forms (primary, used in ns@v3 files)
             "f:Bm25Index" => GraphSourceType::Bm25,
             "f:HnswIndex" => GraphSourceType::Vector,
             "f:GeoIndex" => GraphSourceType::Geo,
@@ -377,7 +378,7 @@ impl GraphSourceType {
 ///
 /// Holds metadata for non-ledger graph sources (BM25, Vector, Geo, R2RML, Iceberg, etc.)
 /// stored in the nameservice. Graph source records are separate from ledger records but
-/// follow a similar ns@v2 storage pattern.
+/// follow a similar ns@v3 storage pattern.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSourceRecord {
     /// Canonical identifier for this graph source (e.g., "my-search:main")
@@ -911,7 +912,7 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     /// Creates or updates the graph source config in nameservice. This stores the
     /// definition (type, config, dependencies) but NOT the index state.
     ///
-    /// The config record is stored at `ns@v2/{name}/{branch}.json`.
+    /// The config record is stored at `ns@v3/{name}/{branch}.json`.
     async fn publish_graph_source(
         &self,
         name: &str,
@@ -925,7 +926,7 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     ///
     /// Only updates if: `new_index_t > existing_index_t` (strictly monotonic).
     ///
-    /// The index record is stored at `ns@v2/{name}/{branch}.index.json`,
+    /// The index record is stored at `ns@v3/{name}/{branch}.index.json`,
     /// separate from the config record to avoid contention.
     ///
     /// Config updates must NOT reset index watermark.
@@ -1046,9 +1047,9 @@ pub struct Subscription {
 /// `Copy` — small enum, pass by value at call sites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RefKind {
-    /// The commit head pointer (`f:commit` + `f:t` in ns@v2).
+    /// The commit head pointer (`f:commit` + `f:t` in ns@v3).
     CommitHead,
-    /// The index head pointer (`f:index` + `f:indexT` in ns@v2).
+    /// The index head pointer (`f:index` + `f:indexT` in ns@v3).
     IndexHead,
 }
 
@@ -1649,8 +1650,16 @@ where
         (**self).raw_record(ledger_id).await
     }
 
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        (**self).all_raw_records().await
+    }
+
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
         (**self).insert_record(record).await
+    }
+
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        (**self).adopt_record(ledger_id, fence).await
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {

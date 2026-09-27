@@ -313,11 +313,25 @@ pub trait BranchRecordStore: Debug + Send + Sync {
         unsupported("reading raw branch records")
     }
 
+    /// Every record as stored, live or not, under any binding or none.
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        unsupported("listing raw branch records")
+    }
+
     /// Insert `record`, which carries its fence, if no record exists at its
     /// key. Returns `None` when inserted, or the record already there.
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
         let _ = record;
         unsupported("inserting branch records")
+    }
+
+    /// Give a record from before fencing its first fence. Returns
+    /// [`FenceOutcome::Applied`] when the record carries `fence` afterwards,
+    /// including when it already did, and [`FenceOutcome::Mismatch`] when it
+    /// carries another.
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let _ = (ledger_id, fence);
+        unsupported("fencing branch records")
     }
 
     /// Mark the record frozen, if it carries `fence`.

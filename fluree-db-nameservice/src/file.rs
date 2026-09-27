@@ -1,8 +1,8 @@
-//! File-based nameservice implementation using ns@v2 format
+//! File-based nameservice implementation using ns@v3 format
 //!
-//! This implementation stores records as JSON files following the ns@v2 format:
-//! - `data/ns@v2/{ledger-name}/{branch}.json` - Main record (commit info)
-//! - `data/ns@v2/{ledger-name}/{branch}.index.json` - Index record (separate for indexer)
+//! This implementation stores records as JSON files following the ns@v3 format:
+//! - `data/ns@v3/{ledger-name}/{branch}.json` - Main record (commit info)
+//! - `data/ns@v3/{ledger-name}/{branch}.index.json` - Index record (separate for indexer)
 //!
 //! The separation of commit and index files allows transactors and indexers
 //! to update independently without contention.
@@ -27,6 +27,8 @@ use crate::binding::{
     BranchRecordStore, DroppedLedger, Fence, FenceOutcome, LedgerRegistry, NameBinding,
     RegistryCas, Versioned,
 };
+use crate::lifecycle::MigrationReport;
+use crate::migration::{FormatMarker, FORMAT_MARKER, LEGACY_NS_VERSION};
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
     merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
@@ -48,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
-/// File-based nameservice using ns@v2 format
+/// File-based nameservice using ns@v3 format
 #[derive(Clone)]
 pub struct FileNameService {
     /// File storage for atomic read-modify-write operations
@@ -63,9 +65,9 @@ impl Debug for FileNameService {
     }
 }
 
-/// JSON structure for graph source ns@v2 config record file
+/// JSON structure for graph source ns@v3 config record file
 ///
-/// Graph source records use the same ns@v2 path pattern but have different fields:
+/// Graph source records use the same ns@v3 path pattern but have different fields:
 /// - `@type` includes "f:IndexSource" (or "f:MappedSource") and a source-specific type
 /// - `f:graphSourceConfig` contains the graph source configuration as a JSON string
 /// - `f:graphSourceDependencies` lists dependent ledger IDs
@@ -120,7 +122,7 @@ struct GraphSourceIndexRef {
 
 /// JSON structure for graph source index record (separate from config)
 ///
-/// Stored at `ns@v2/{graph-source-name}/{branch}.index.json` to avoid contention
+/// Stored at `ns@v3/{graph-source-name}/{branch}.index.json` to avoid contention
 /// between config updates and index updates. Uses monotonic update rule:
 /// only write if new index_t > existing index_t.
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,6 +177,70 @@ impl FileNameService {
     /// Create a new file-based nameservice
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
         Self::with_storage(FileStorage::new(base_path))
+    }
+
+    /// Bring a store written before name bindings to the current format,
+    /// once: see [`crate::migration`]. Returns what it bound, or `None` when
+    /// the store was already current. Safe to repeat, to resume, and to run
+    /// from several processes at once.
+    pub async fn migrate(&self) -> Result<Option<MigrationReport>> {
+        let base = self.storage.base_path();
+        if let Some(marker) = read_format_marker(&base.join(NS_VERSION).join(FORMAT_MARKER))? {
+            warn_about_legacy_writes(base, &marker);
+            return Ok(None);
+        }
+
+        let legacy = base.join(LEGACY_NS_VERSION);
+        for relative in walk_files(&legacy)? {
+            let bytes = tokio::fs::read(legacy.join(&relative))
+                .await
+                .map_err(|e| NameServiceError::storage(format!("reading {relative}: {e}")))?;
+            self.storage
+                .insert(&format!("fluree:file://{NS_VERSION}/{relative}"), &bytes)
+                .await
+                .map_err(|e| NameServiceError::storage(format!("copying {relative}: {e}")))?;
+        }
+
+        let report = crate::lifecycle::migrate_legacy(self).await?;
+        let marker = serde_json::to_vec_pretty(&FormatMarker::current())?;
+        self.storage
+            .insert(
+                &format!("fluree:file://{NS_VERSION}/{FORMAT_MARKER}"),
+                &marker,
+            )
+            .await
+            .map_err(|e| NameServiceError::storage(format!("writing the format marker: {e}")))?;
+        if !report.is_empty() {
+            tracing::info!(
+                bound = report.bound.len(),
+                dropped = report.dropped.len(),
+                "nameservice migrated from {LEGACY_NS_VERSION} to {NS_VERSION}"
+            );
+        }
+        Ok(Some(report))
+    }
+
+    /// [`migrate`](Self::migrate) for synchronous startup, which may be on an
+    /// async runtime's thread: a current store is recognised without a
+    /// runtime, and a migration runs on a thread of its own.
+    pub fn migrate_blocking(&self) -> Result<Option<MigrationReport>> {
+        let base = self.storage.base_path();
+        if let Some(marker) = read_format_marker(&base.join(NS_VERSION).join(FORMAT_MARKER))? {
+            warn_about_legacy_writes(base, &marker);
+            return Ok(None);
+        }
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| NameServiceError::storage(format!("migration runtime: {e}")))?
+                        .block_on(self.migrate())
+                })
+                .join()
+                .map_err(|_| NameServiceError::storage("the nameservice migration panicked"))?
+        })
     }
 
     /// Share an already configured storage handle, so the nameservice
@@ -350,7 +416,7 @@ impl FileNameService {
         Ok(record.filter(|r| r.name == ledger_name && r.branch == branch))
     }
 
-    /// Read the ledger record stored at `ns@v2/{relative}.json`, taking its
+    /// Read the ledger record stored at `ns@v3/{relative}.json`, taking its
     /// identity from the file rather than the path: a path does not determine
     /// `name:branch` once names and branches may both contain `/`.
     async fn read_record_at(&self, relative: &str) -> Result<Option<NsRecord>> {
@@ -365,7 +431,7 @@ impl FileNameService {
             Err(e) => return Err(NameServiceError::from(e)),
         };
 
-        // A graph-source record shares the `ns@v2/{name}/{branch}.json` address
+        // A graph-source record shares the `ns@v3/{name}/{branch}.json` address
         // space with ledger records but uses a different schema (no `f:ledger`).
         // Report it as "not a ledger" (Ok(None)) so single-alias resolution
         // yields a clean not-found and callers fall back to graph-source
@@ -561,24 +627,86 @@ impl crate::NameServiceLookup for FileNameService {
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
-        let ns_dir = self.storage.base_path().join(NS_VERSION);
-        let mut records = Vec::new();
-
-        for relative in Self::walk_ns_json_files(&ns_dir).await? {
-            if relative.parent().is_none_or(|p| p.as_os_str().is_empty()) {
-                continue;
-            }
-            // Graph-source records are skipped by `read_record_at` (Ok(None)).
-            // A read failure must not silently shrink the result: callers
-            // that decide what to delete treat a missing branch as one with
-            // nothing to protect.
-            if let Some(record) = self.read_record_at(&ns_record_stem(&relative)).await? {
-                records.push(record);
-            }
-        }
-
+        let records = BranchRecordStore::all_raw_records(self).await?;
         crate::read_all_resolved(self, records).await
     }
+}
+
+/// The format marker at `path`, if the store has one.
+fn read_format_marker(path: &Path) -> Result<Option<FormatMarker>> {
+    match std::fs::read(path) {
+        Ok(bytes) => FormatMarker::parse(&bytes).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(NameServiceError::storage(format!(
+            "reading the format marker: {e}"
+        ))),
+    }
+}
+
+/// Every file under `root`, as a `/`-separated relative path, except lock
+/// and staging files.
+fn walk_files(root: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| NameServiceError::storage(format!("reading {dir:?}: {e}")))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| NameServiceError::storage(format!("reading {dir:?}: {e}")))?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".lock") || name.ends_with(".tmp") || !path.is_file() {
+                continue;
+            }
+            if let Ok(relative) = path.strip_prefix(root) {
+                files.push(ns_record_stem_with_suffix(relative));
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Warn when a binary from before name bindings has written to `ns@v2/`
+/// since the migration: this binary does not see those writes.
+fn warn_about_legacy_writes(base: &Path, marker: &FormatMarker) {
+    let legacy = base.join(LEGACY_NS_VERSION);
+    let Ok(files) = walk_files(&legacy) else {
+        return;
+    };
+    let since = std::time::UNIX_EPOCH + std::time::Duration::from_millis(marker.migrated_at as u64);
+    let written = files
+        .iter()
+        .filter(|relative| {
+            std::fs::metadata(legacy.join(relative))
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| modified > since)
+        })
+        .count();
+    if written > 0 {
+        tracing::warn!(
+            written,
+            "{written} nameservice files under {LEGACY_NS_VERSION}/ changed after the migration \
+             to {NS_VERSION}/, most likely by an older Fluree binary; this binary does not \
+             see those changes"
+        );
+    }
+}
+
+/// `a/b/main.json` with `/` separators on every platform.
+fn ns_record_stem_with_suffix(relative: &std::path::Path) -> String {
+    relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// `a/b/main.json` → `a/b/main`, with `/` separators on every platform.
@@ -681,6 +809,25 @@ impl LedgerRegistry for FileNameService {
 
 #[async_trait]
 impl BranchRecordStore for FileNameService {
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        let ns_dir = self.storage.base_path().join(NS_VERSION);
+        let mut records = Vec::new();
+
+        for relative in Self::walk_ns_json_files(&ns_dir).await? {
+            if relative.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+                continue;
+            }
+            // Graph-source records are skipped by `read_record_at` (Ok(None)).
+            // A read failure must not silently shrink the result: callers
+            // that decide what to delete treat a missing branch as one with
+            // nothing to protect.
+            if let Some(record) = self.read_record_at(&ns_record_stem(&relative)).await? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let (main, index) = Self::record_keys(ledger_id)?;
         ns_cas::raw_record(
@@ -702,6 +849,19 @@ impl BranchRecordStore for FileNameService {
                 index: &index,
             },
             record,
+        )
+        .await
+    }
+
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (main, index) = Self::record_keys(ledger_id)?;
+        ns_cas::adopt_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            fence,
         )
         .await
     }
@@ -789,6 +949,7 @@ impl crate::BranchLifecycle for FileNameService {
             }),
             branches: 0,
             fence: None,
+            extra: Default::default(),
         };
         let bytes = serde_json::to_vec_pretty(&file)?;
 
@@ -1030,6 +1191,7 @@ impl LedgerLifecycle for FileNameService {
             branch_point: None,
             branches: 0,
             fence: None,
+            extra: Default::default(),
         };
         let bytes = serde_json::to_vec_pretty(&file)?;
 
@@ -1144,6 +1306,7 @@ impl CommitPublisher for FileNameService {
                             branch_point: None,
                             branches: 0,
                             fence: None,
+                            extra: Default::default(),
                         };
                         let new_bytes = serialize_json(&file)?;
                         Ok(CasAction::Write(new_bytes))
@@ -1205,6 +1368,7 @@ impl IndexPublisher for FileNameService {
                     },
                     fence,
                     frozen: false,
+                    extra: Default::default(),
                 };
                 let new_bytes = serialize_json(&file)?;
                 Ok(CasAction::Write(new_bytes))
@@ -1250,6 +1414,7 @@ impl AdminPublisher for FileNameService {
                         },
                         fence,
                         frozen: false,
+                        extra: Default::default(),
                     };
                     let new_bytes = serialize_json(&file)?;
                     Ok(CasAction::Write(new_bytes))
@@ -1428,7 +1593,7 @@ impl GraphSourceLookup for FileNameService {
 
         let mut records = Vec::new();
 
-        // Walk the ns@v2 directory recursively
+        // Walk the ns@v3 directory recursively
         let mut stack = vec![ns_dir];
 
         while let Some(current_dir) = stack.pop() {
@@ -1455,7 +1620,7 @@ impl GraphSourceLookup for FileNameService {
 
                     if file_name.ends_with(".json") {
                         // Extract name and branch from path
-                        // Path structure: ns@v2/{name}/{branch}.json or ns@v2/{name}/{subdir}/.../{branch}.json
+                        // Path structure: ns@v3/{name}/{branch}.json or ns@v3/{name}/{subdir}/.../{branch}.json
                         let ns_dir_base = self.storage.base_path().join(NS_VERSION);
                         if let Ok(relative_path) = path.strip_prefix(&ns_dir_base) {
                             // relative_path is like "gs-name/main.json" or "tenant/gs/main.json"
@@ -1620,6 +1785,7 @@ impl RefPublisher for FileNameService {
                             branch_point: None,
                             branches: 0,
                             fence: None,
+                            extra: Default::default(),
                         });
 
                         // CID goes into the commit_cid field.
@@ -1749,6 +1915,7 @@ impl RefPublisher for FileNameService {
                             },
                             fence,
                             frozen: false,
+                            extra: Default::default(),
                         };
                         let new_bytes = serialize_json(&file)?;
                         Ok(CasAction::Write(new_bytes))
@@ -1961,6 +2128,148 @@ mod tests {
     use fluree_db_core::ContentKind;
     use tempfile::TempDir;
 
+    /// Write `record` as a binary from before name bindings would have: under
+    /// `ns@v2/`, unfenced, with its index head in the index file.
+    fn write_legacy_record(root: &Path, record: &NsRecord) {
+        let dir = root.join(LEGACY_NS_VERSION).join(&record.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = NsFileV2 {
+            index: None,
+            ..NsFileV2::for_record(record)
+        };
+        std::fs::write(
+            dir.join(format!("{}.json", record.branch)),
+            serde_json::to_vec_pretty(&main).unwrap(),
+        )
+        .unwrap();
+        if let Some(index) = &record.index_head_id {
+            let file = NsIndexFileV2 {
+                context: ns_context(),
+                index: IndexRef {
+                    cid: Some(index.to_string()),
+                    t: record.index_t,
+                },
+                fence: None,
+                frozen: false,
+                extra: Default::default(),
+            };
+            std::fs::write(
+                dir.join(format!("{}.index.json", record.branch)),
+                serde_json::to_vec_pretty(&file).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    fn legacy_record(id: &str, t: i64, retracted: bool) -> NsRecord {
+        let mut record = NsRecord::new(LedgerId::parse(id).unwrap());
+        record.commit_t = t;
+        record.commit_head_id = Some(ContentId::new(ContentKind::Commit, id.as_bytes()));
+        record.retracted = retracted;
+        record
+    }
+
+    #[tokio::test]
+    async fn migrate_moves_a_legacy_store_to_the_current_address() {
+        let temp = TempDir::new().unwrap();
+        let mut main = legacy_record("mydb:main", 3, false);
+        main.index_head_id = Some(ContentId::new(ContentKind::IndexRoot, b"index"));
+        main.index_t = 2;
+        write_legacy_record(temp.path(), &main);
+        write_legacy_record(temp.path(), &legacy_record("gone:main", 1, true));
+        let legacy_bytes = std::fs::read(temp.path().join("ns@v2/mydb/main.json")).unwrap();
+
+        let ns = FileNameService::new(temp.path());
+        let report = ns.migrate().await.unwrap().expect("migrated");
+        assert_eq!(report.bound, vec!["mydb".to_string()]);
+        assert_eq!(report.dropped, vec!["gone".to_string()]);
+
+        let migrated = ns.lookup("mydb:main").await.unwrap().expect("bound");
+        assert!(migrated.fence.is_some());
+        assert_eq!(migrated.commit_t, 3);
+        assert_eq!(migrated.index_head_id, main.index_head_id);
+        assert_eq!(migrated.index_t, 2);
+        assert!(ns.lookup("gone:main").await.unwrap().is_none());
+        assert_eq!(ns.list_dropped().await.unwrap().len(), 1);
+
+        // The old address is left for a rollback, and the marker makes the
+        // migration run once.
+        assert_eq!(
+            std::fs::read(temp.path().join("ns@v2/mydb/main.json")).unwrap(),
+            legacy_bytes
+        );
+        assert!(temp.path().join("ns@v3/@format.json").exists());
+        assert!(ns.migrate().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn migrate_blocking_runs_on_an_async_runtime_thread() {
+        let temp = TempDir::new().unwrap();
+        write_legacy_record(temp.path(), &legacy_record("mydb:main", 1, false));
+        let ns = FileNameService::new(temp.path());
+        let report = ns.migrate_blocking().unwrap().expect("migrated");
+        assert_eq!(report.bound, vec!["mydb".to_string()]);
+        assert!(ns.migrate_blocking().unwrap().is_none());
+        assert!(ns.lookup("mydb:main").await.unwrap().is_some());
+    }
+
+    /// A newer binary may add fields to a record; rewriting the record here
+    /// keeps them.
+    #[tokio::test]
+    async fn rewriting_a_record_keeps_fields_this_binary_does_not_know() {
+        let temp = TempDir::new().unwrap();
+        let ns = FileNameService::new(temp.path());
+        let record = crate::lifecycle::create_ledger(&ns, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        let path = temp.path().join(NS_VERSION).join("mydb/main.json");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["f:fromTheFuture"] = serde_json::json!({"kept": true});
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let head = crate::RefValue {
+            id: Some(ContentId::new(ContentKind::Commit, b"c")),
+            t: 1,
+        };
+        let current = ns
+            .get_ref("mydb:main", crate::RefKind::CommitHead)
+            .await
+            .unwrap();
+        assert_eq!(
+            ns.compare_and_set_ref_fenced(
+                "mydb:main",
+                record.fence,
+                crate::RefKind::CommitHead,
+                current.as_ref(),
+                &head
+            )
+            .await
+            .unwrap(),
+            crate::CasResult::Updated
+        );
+        let file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file["f:t"], 1);
+        assert_eq!(file["f:fromTheFuture"], serde_json::json!({"kept": true}));
+    }
+
+    #[tokio::test]
+    async fn a_store_in_a_newer_format_is_refused() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(NS_VERSION)).unwrap();
+        std::fs::write(
+            temp.path().join(NS_VERSION).join(FORMAT_MARKER),
+            br#"{"version": 4, "migrated_at": 0}"#,
+        )
+        .unwrap();
+        let err = FileNameService::new(temp.path())
+            .migrate()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("newer"), "{err}");
+    }
+
     /// Create a test ContentId from a label string (deterministic, reproducible).
     fn test_cid(label: &str) -> ContentId {
         ContentId::new(ContentKind::Commit, label.as_bytes())
@@ -2037,7 +2346,7 @@ mod tests {
             .unwrap();
 
         // Manually add index to main file
-        let main_path = temp.path().join("ns@v2/mydb/main.json");
+        let main_path = temp.path().join("ns@v3/mydb/main.json");
         let index_old_cid = ContentId::new(ContentKind::IndexRoot, b"index-old");
         let mut content: NsFileV2 =
             serde_json::from_str(&tokio::fs::read_to_string(&main_path).await.unwrap()).unwrap();

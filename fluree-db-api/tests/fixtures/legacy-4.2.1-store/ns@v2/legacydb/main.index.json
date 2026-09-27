@@ -1,0 +1,9 @@
+{
+  "@context": {
+    "f": "https://ns.flur.ee/db#"
+  },
+  "f:ledgerIndex": {
+    "f:cid": "baghybqabciqldgspdphew5dipocjefc7bxir7kcbfqr6upl7rjbgki77rpyogea",
+    "f:t": 1
+  }
+}

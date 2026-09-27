@@ -383,9 +383,8 @@ impl RaftIntegration {
     /// Returns how many ledger records were carried.
     pub async fn adopt_file_registry(&self) -> Result<usize, FileRegistryAdoptionError> {
         use fluree_db_nameservice::{
-            CasResult, ConfigCasResult, ConfigLookup, ConfigPublisher, LedgerLifecycle,
-            NameServiceError, NameServiceLookup, RefKind, RefLookup, RefPublisher, RefValue,
-            StatusCasResult, StatusLookup, StatusPublisher,
+            BranchRecordStore, ConfigCasResult, ConfigLookup, ConfigPublisher, LedgerRegistry,
+            RegistryCas, StatusCasResult, StatusLookup, StatusPublisher,
         };
 
         let Some(adoption) = &self.adoption else {
@@ -394,7 +393,6 @@ impl RaftIntegration {
         if adoption.marker.is_file() {
             return Ok(0);
         }
-        let registry = adoption.registry_root.join("ns@v2");
         let finish = |adopted: usize| -> Result<usize, FileRegistryAdoptionError> {
             std::fs::write(
                 &adoption.marker,
@@ -408,122 +406,116 @@ impl RaftIntegration {
         // before the corrected config ever got a turn, exactly like
         // the unconfigured case above, which also answers zero
         // without writing one.
-        if !registry.is_dir() {
+        if !adoption.registry_root.join("ns@v2").is_dir()
+            && !adoption.registry_root.join("ns@v3").is_dir()
+        {
             return Ok(0);
         }
         let file_ns = fluree_db_nameservice::file::FileNameService::new(&adoption.registry_root);
-        let records = file_ns
-            .all_records()
+        // A registry from before name bindings is bound first, so every
+        // ledger carries over with a binding, and a soft-dropped one as a
+        // dropped ledger.
+        file_ns
+            .migrate()
             .await
             .map_err(FileRegistryAdoptionError::Registry)?;
-
         let publisher = self.nameservice();
+
+        // Bindings and the dropped-ledger registry carry over as they are, so
+        // every ledger keeps its instance, storage root and fences.
+        let bindings: std::collections::HashMap<_, _> = file_ns
+            .list_bindings()
+            .await
+            .map_err(FileRegistryAdoptionError::Registry)?
+            .into_iter()
+            .collect();
+        for (name, binding) in &bindings {
+            match publisher
+                .cas_binding(name, None, Some(&binding.value))
+                .await
+            {
+                Ok(RegistryCas::Updated { .. }) => {}
+                // A retried replay finds its own prior write.
+                Ok(RegistryCas::Conflict {
+                    actual: Some(actual),
+                }) if actual.value == binding.value => {}
+                Ok(RegistryCas::Conflict { actual }) => {
+                    return Err(FileRegistryAdoptionError::Diverged {
+                        ledger_id: name.clone(),
+                        kind: "name binding",
+                        detail: format!("machine holds {actual:?}"),
+                    });
+                }
+                Err(e) => return Err(FileRegistryAdoptionError::replay(name, "name binding", e)),
+            }
+        }
+        for entry in file_ns
+            .list_dropped()
+            .await
+            .map_err(FileRegistryAdoptionError::Registry)?
+        {
+            let entry = entry.value;
+            match publisher
+                .cas_dropped(&entry.instance, None, Some(&entry))
+                .await
+            {
+                Ok(RegistryCas::Updated { .. } | RegistryCas::Conflict { actual: Some(_) }) => {}
+                Ok(RegistryCas::Conflict { actual: None }) => {
+                    return Err(FileRegistryAdoptionError::Diverged {
+                        ledger_id: entry.name.clone(),
+                        kind: "dropped ledger",
+                        detail: format!("{} was deleted mid-adoption", entry.instance),
+                    });
+                }
+                Err(e) => {
+                    return Err(FileRegistryAdoptionError::replay(
+                        &entry.name,
+                        "dropped ledger",
+                        e,
+                    ))
+                }
+            }
+        }
+
+        let records = file_ns
+            .all_raw_records()
+            .await
+            .map_err(FileRegistryAdoptionError::Registry)?;
         let mut adopted = 0usize;
         for record in records {
-            if record.retracted {
+            // Only a record its binding lists is live; any other is garbage.
+            let Some(listing) = bindings
+                .get(&record.name)
+                .and_then(|b| b.value.listing(&record.branch))
+                .filter(|l| record.fence == Some(l.fence))
+            else {
+                continue;
+            };
+            let ledger_id = &record.ledger_id;
+            // The record carries its heads and fence.
+            match publisher.insert_record(&record).await {
+                Ok(None) => {}
+                Ok(Some(existing)) if existing.fence == record.fence => {}
+                Ok(Some(existing)) => {
+                    return Err(FileRegistryAdoptionError::Diverged {
+                        ledger_id: ledger_id.to_string(),
+                        kind: "branch record",
+                        detail: format!("machine holds fence {:?}", existing.fence),
+                    });
+                }
+                Err(e) => {
+                    return Err(FileRegistryAdoptionError::replay(
+                        ledger_id,
+                        "branch record",
+                        e,
+                    ))
+                }
+            }
+            if listing.dropped {
                 continue;
             }
-            let ledger_id = &record.ledger_id;
-            // A ledger created under a name binding carries its binding over,
-            // so it keeps its instance root.
-            let created = if record
-                .storage_root
-                .as_ref()
-                .and_then(fluree_db_core::StorageRoot::instance)
-                .is_some()
-            {
-                fluree_db_nameservice::lifecycle::mirror_record(publisher.as_ref(), &record)
-                    .await
-                    .map(Some)
-            } else {
-                publisher.init(ledger_id).await.map(|()| None)
-            };
-            // The fence the carried heads, config and status present.
-            let fence = match created {
-                Ok(fence) => fence,
-                Err(NameServiceError::LedgerAlreadyExists(_)) => None,
-                Err(e) => return Err(FileRegistryAdoptionError::replay(ledger_id, "init", e)),
-            };
-            if record.commit_head_id.is_some() {
-                let head = RefValue {
-                    id: record.commit_head_id.clone(),
-                    t: record.commit_t,
-                };
-                match publisher
-                    .fast_forward_commit_fenced(ledger_id, fence, &head, 3)
-                    .await
-                {
-                    Ok(CasResult::Updated) => {}
-                    // A retried replay finds its own prior write; a
-                    // machine already AHEAD of the file registry means
-                    // raft writes happened, which the marker should
-                    // have prevented — still nothing to carry.
-                    Ok(CasResult::Conflict { actual })
-                        if actual.as_ref().is_some_and(|a| a.t >= record.commit_t) => {}
-                    Ok(CasResult::Conflict { actual }) => {
-                        return Err(FileRegistryAdoptionError::Diverged {
-                            ledger_id: ledger_id.clone().to_string(),
-                            kind: "commit head",
-                            detail: format!(
-                                "machine holds {actual:?}, registry carries t={}",
-                                record.commit_t
-                            ),
-                        });
-                    }
-                    Err(e) => {
-                        return Err(FileRegistryAdoptionError::replay(
-                            ledger_id,
-                            "commit head",
-                            e,
-                        ))
-                    }
-                }
-            }
-            if record.index_head_id.is_some() {
-                let idx = RefValue {
-                    id: record.index_head_id.clone(),
-                    t: record.index_t,
-                };
-                // Read-then-CAS: a freshly initialized ledger may hold
-                // an implicit empty index ref, and a retried replay
-                // holds the previous attempt's value — start from
-                // whatever is actually there.
-                let current = publisher
-                    .get_ref(ledger_id, RefKind::IndexHead)
-                    .await
-                    .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "index head", e))?;
-                if !current.as_ref().is_some_and(|c| c.t >= record.index_t) {
-                    match publisher
-                        .compare_and_set_ref_fenced(
-                            ledger_id,
-                            fence,
-                            RefKind::IndexHead,
-                            current.as_ref(),
-                            &idx,
-                        )
-                        .await
-                    {
-                        Ok(CasResult::Updated) => {}
-                        Ok(CasResult::Conflict { actual }) => {
-                            return Err(FileRegistryAdoptionError::Diverged {
-                                ledger_id: ledger_id.clone().to_string(),
-                                kind: "index head",
-                                detail: format!(
-                                    "machine holds {actual:?}, registry carries t={}",
-                                    record.index_t
-                                ),
-                            });
-                        }
-                        Err(e) => {
-                            return Err(FileRegistryAdoptionError::replay(
-                                ledger_id,
-                                "index head",
-                                e,
-                            ))
-                        }
-                    }
-                }
-            }
+            // The fence the carried config and status present.
+            let fence = record.fence;
             // Config and status replay read-then-CAS, exactly like the
             // index head above, for two reasons. An unreadable record
             // must refuse loudly rather than carry the ledger in with

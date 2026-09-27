@@ -325,7 +325,7 @@ The nameservice can be backed by various storage systems, each suited for differ
 #### File System (`FileNameService`)
 
 - **Use Case**: Single-server deployments, development, testing
-- **Storage**: Files in `ns@v2/` directory structure
+- **Storage**: Files in the `ns@v3/` directory structure
 - **Format**: JSON files per ledger (`{ledger}/{branch}.json`)
 - **Characteristics**: Simple, local, no external dependencies
 
@@ -783,7 +783,7 @@ Understanding how records evolve:
    - Storage backend health
 
 2. **Backup Strategy**: Include nameservice in backup plans
-   - File-based: Backup `ns@v2/` directory
+   - File-based: Backup the `ns@v3/` directory
    - Storage-based: Use backend backup mechanisms
 
 3. **Error Handling**: Handle nameservice errors gracefully

@@ -36,8 +36,9 @@ fn cid(kind: ContentKind, seed: u8) -> ContentId {
     ContentId::new(kind, &[seed])
 }
 
-/// Seed a file registry the way a life in the file posture would have:
-/// through the FileNameService's own publisher surface.
+/// Seed a file registry the way a life in the file posture before name
+/// bindings would have: through the FileNameService's own publisher surface,
+/// with unbound records, under the address those binaries used.
 async fn seed_file_registry(root: &std::path::Path) {
     let ns = FileNameService::new(root);
     for (ledger, commit_seed, commit_t, index_seed, index_t) in [
@@ -92,9 +93,10 @@ async fn seed_file_registry(root: &std::path::Path) {
             StatusCasResult::Updated
         ));
     }
-    // A tombstone must NOT carry.
+    // A soft-dropped ledger carries as a dropped ledger, not a live one.
     ns.init("adopted/gone").await.expect("init tombstone");
     ns.retract("adopted/gone").await.expect("retract");
+    std::fs::rename(root.join("ns@v3"), root.join("ns@v2")).expect("predecessor address");
 }
 
 async fn boot_initialized(
@@ -163,6 +165,17 @@ async fn a_file_registry_adopts_once_and_survives_a_partial_retry() {
         .await
         .expect("lookup")
         .is_none_or(|r| r.retracted));
+    let dropped = fluree_db_nameservice::LedgerRegistry::list_dropped(ns.as_ref())
+        .await
+        .expect("dropped ledgers");
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].value.name, "adopted/gone");
+    // Each carried ledger keeps the binding the migration gave it.
+    let binding = fluree_db_nameservice::LedgerRegistry::get_binding(ns.as_ref(), "adopted/one")
+        .await
+        .expect("binding")
+        .expect("adopted/one bound");
+    assert_eq!(one.fence, binding.value.fence_of("main"));
 
     // Config and status carry VERBATIM — watermark and payload both.
     // The machine reads an unset value as `unborn` / `initial`, so

@@ -133,6 +133,10 @@ pub const STATUS_RETRACTED: &str = "retracted";
 // with a branch record, so their sort keys never enter a head read's range.
 pub const SK_BINDING: &str = "binding";
 pub const SK_DROPPED: &str = "dropped";
+/// Partition key of the item recording the nameservice format, in its
+/// `schema` attribute: `@` keeps it apart from every name, and `format` is
+/// no instance id.
+pub const PK_FORMAT: &str = "@format";
 /// GSI1 kinds for listing bindings and dropped ledgers.
 pub const KIND_BINDING: &str = "binding";
 pub const KIND_DROPPED: &str = "dropped_ledger";

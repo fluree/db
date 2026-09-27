@@ -848,6 +848,9 @@ pub enum Command {
     /// fenced branch refuses. See [`fenced_branch`] for the writes
     /// covered.
     Fenced { fence: u64, command: Box<Command> },
+    /// Give a branch registered before fencing its first fence; applied
+    /// when it carries none or already carries `fence`.
+    AdoptBranch { key: RefKey, fence: u64 },
 }
 
 /// Postcard-safe JSON value tree with deterministic encoding:
@@ -1695,6 +1698,7 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             applied_at_millis,
         } => delete_branch(state, key, fence, applied_at_millis),
         Command::AdjustChildren { key, fence, delta } => adjust_children(state, key, fence, delta),
+        Command::AdoptBranch { key, fence } => adopt_branch(state, key, fence),
         // A wrapper nested in a wrapper covers no single branch write.
         Command::Fenced { .. } => Response::FenceMismatch,
     }
@@ -1854,6 +1858,28 @@ fn delete_branch(
 
 /// The child count lives on the branch's [`RefEntry`], or on its
 /// [`FenceState`] while it is unborn.
+fn adopt_branch(state: &mut NameServiceState, key: RefKey, fence: u64) -> Response {
+    if !is_registered(state, &key) {
+        return Response::FenceMissing;
+    }
+    match state.fences.get(&key) {
+        Some(f) if f.fence == fence => Response::FenceApplied,
+        Some(_) => Response::FenceMismatch,
+        None => {
+            state.fences.insert(
+                key,
+                FenceState {
+                    fence,
+                    frozen: false,
+                    source_branch: None,
+                    children: 0,
+                },
+            );
+            Response::FenceApplied
+        }
+    }
+}
+
 fn adjust_children(state: &mut NameServiceState, key: RefKey, fence: u64, delta: i32) -> Response {
     if let Some(refused) = check_fence(state, &key, fence) {
         return refused;

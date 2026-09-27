@@ -677,6 +677,16 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
     }
 
     async fn all_records(&self) -> std::result::Result<Vec<NsRecord>, NameServiceError> {
+        let records = self.list_raw_records().await?;
+        fluree_db_nameservice::read_all_resolved(self, records).await
+    }
+}
+
+impl DynamoDbNameService {
+    /// Every ledger record as stored.
+    pub(crate) async fn list_raw_records(
+        &self,
+    ) -> std::result::Result<Vec<NsRecord>, NameServiceError> {
         // 1. Query GSI1 for all ledger meta items
         let meta_items = self.query_gsi_by_kind(KIND_LEDGER).await?;
 
@@ -694,8 +704,7 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
                 records.push(record);
             }
         }
-
-        fluree_db_nameservice::read_all_resolved(self, records).await
+        Ok(records)
     }
 }
 

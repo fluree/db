@@ -129,6 +129,7 @@ fn empty_index_file(fence: Option<Fence>, frozen: bool) -> NsIndexFileV2 {
         index: IndexRef { cid: None, t: 0 },
         fence,
         frozen,
+        extra: Default::default(),
     }
 }
 
@@ -201,6 +202,68 @@ where
                 return Ok(CasAction::Abort(refused));
             }
             Ok(CasAction::Write(serialize_json(&file)?))
+        })
+        .await?;
+    Ok(match outcome {
+        CasOutcome::Written => FenceOutcome::Applied,
+        CasOutcome::Aborted(outcome) => outcome,
+    })
+}
+
+/// Give a record from before fencing its first fence; see
+/// [`BranchRecordStore::adopt_record`](crate::BranchRecordStore::adopt_record).
+///
+/// The index file takes the fence first: once the main record carries one,
+/// an index file without it reads as stale, and a fenced index write to a
+/// missing one is refused.
+pub(crate) async fn adopt_record<S>(
+    storage: &S,
+    keys: RecordKeys<'_>,
+    fence: Fence,
+) -> Result<FenceOutcome>
+where
+    S: StorageCas + StorageRead + ?Sized,
+{
+    let Some(bytes) = read_bytes(storage, keys.main).await? else {
+        return Ok(FenceOutcome::Missing);
+    };
+    let main: NsFileV2 = deserialize_json(&bytes)?;
+    match main.fence {
+        _ if main.is_deleted() => return Ok(FenceOutcome::Missing),
+        Some(current) if current == fence => return Ok(FenceOutcome::Applied),
+        Some(_) => return Ok(FenceOutcome::Mismatch),
+        None => {}
+    }
+
+    storage
+        .compare_and_swap(keys.index, |bytes| {
+            let file = match bytes.map(deserialize_json::<NsIndexFileV2>).transpose()? {
+                Some(file) if file.fence == Some(fence) => return Ok(CasAction::Abort(())),
+                Some(mut file) if file.fence.is_none() => {
+                    file.fence = Some(fence);
+                    file
+                }
+                _ => empty_index_file(Some(fence), false),
+            };
+            Ok(CasAction::Write(serialize_json(&file)?))
+        })
+        .await?;
+
+    let outcome = storage
+        .compare_and_swap(keys.main, |bytes| {
+            let Some(data) = bytes else {
+                return Ok(CasAction::Abort(FenceOutcome::Missing));
+            };
+            let mut file: NsFileV2 = deserialize_json(data)?;
+            match file.fence {
+                _ if file.is_deleted() => Ok(CasAction::Abort(FenceOutcome::Missing)),
+                Some(current) if current == fence => Ok(CasAction::Abort(FenceOutcome::Applied)),
+                Some(_) => Ok(CasAction::Abort(FenceOutcome::Mismatch)),
+                None => {
+                    file.fence = Some(fence);
+                    Ok(CasAction::Write(serialize_json(&file)?))
+                }
+            }
         })
         .await?;
     Ok(match outcome {

@@ -21,6 +21,8 @@ mod it_json_canonicalization;
 mod it_ledger_info_named_graphs;
 #[path = "it_ledger_lifecycle.rs"]
 mod it_ledger_lifecycle;
+#[path = "it_legacy_store.rs"]
+mod it_legacy_store;
 #[path = "it_merge.rs"]
 mod it_merge;
 #[path = "it_merge_preview.rs"]
