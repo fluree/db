@@ -485,6 +485,14 @@ name = "it_rebuild_fetch_counts"
 path = "tests/it_rebuild_fetch_counts.rs"
 
 [[test]]
+name = "it_rebuild_staging_cleanup"
+path = "tests/it_rebuild_staging_cleanup.rs"
+
+[[test]]
+name = "it_key_rotation"
+path = "tests/it_key_rotation.rs"
+
+[[test]]
 name = "it_credential"
 path = "tests/it_credential.rs"
 required-features = ["credential"]
@@ -614,6 +622,10 @@ harness = false
 
 [[bench]]
 name = "query_overlay_matrix"
+harness = false
+
+[[bench]]
+name = "query_hot_construct_formats"
 harness = false
 
 [[bench]]

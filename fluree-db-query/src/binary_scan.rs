@@ -214,6 +214,9 @@ pub struct BinaryScanOperator {
     object_bounds: Option<ObjectBounds>,
     /// Bound object value, if the triple pattern's object is a constant.
     bound_o: Option<FlakeValue>,
+    /// `bound_o` as its persisted `(o_type, o_key)` when it is an IRI the
+    /// store resolves. Cursor rows are then matched by id, with no decode.
+    bound_o_encoded: Option<(u16, u64)>,
     /// Pre-computed repeated-variable flags from the triple pattern.
     check_s_eq_o: bool,
     check_s_eq_p: bool,
@@ -740,6 +743,7 @@ impl BinaryScanOperator {
             index_hint,
             object_bounds,
             bound_o: None,
+            bound_o_encoded: None,
             check_s_eq_o,
             check_s_eq_p,
             check_p_eq_o,
@@ -1424,7 +1428,12 @@ impl BinaryScanOperator {
             // - object is bound (must filter)
             // - object bounds are present (must filter)
             // - object is emitted but late-materialization is disabled (e.g., overlay)
-            let needs_o_decode = self.bound_o.is_some()
+            if let Some(encoded) = self.bound_o_encoded {
+                if (o_type, o_key) != encoded {
+                    continue;
+                }
+            }
+            let needs_o_decode = (self.bound_o.is_some() && self.bound_o_encoded.is_none())
                 || self.object_bounds.is_some()
                 || (!late_materialize && self.o_var_pos.is_some());
             // BinaryGraphView::decode_value is novelty-aware: dict-backed types
@@ -1441,7 +1450,11 @@ impl BinaryScanOperator {
                 None
             };
 
-            if let Some(bound) = &self.bound_o {
+            if let Some(bound) = self
+                .bound_o
+                .as_ref()
+                .filter(|_| self.bound_o_encoded.is_none())
+            {
                 let Some(val) = decoded_o.as_ref() else {
                     return Err(QueryError::Internal(
                         "bound object requires object decoding".to_string(),
@@ -2080,6 +2093,7 @@ impl Operator for BinaryScanOperator {
         let (s_sid, p_sid, o_val) =
             Self::extract_bound_terms_snapshot(ctx.active_snapshot, &self.pattern);
         self.bound_o = o_val;
+        self.bound_o_encoded = None;
         let mut filter = Self::build_filter_from_snapshot_sids(
             ctx.active_snapshot,
             &self.pattern,
@@ -2193,6 +2207,7 @@ impl Operator for BinaryScanOperator {
                     Ok(Some(s_id)) => {
                         filter.o_type = Some(OType::IRI_REF.as_u16());
                         filter.o_key = Some(s_id);
+                        self.bound_o_encoded = Some((OType::IRI_REF.as_u16(), s_id));
                     }
                     Ok(None) => return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await,
                     // Genuine error — keep correctness by leaving the filter un-narrowed.

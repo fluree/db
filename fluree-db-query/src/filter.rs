@@ -22,6 +22,7 @@ use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::eval::PreparedBoolExpression;
 use crate::execute::build_where_operators_seeded;
+use crate::exists::any_solution;
 use crate::ir::triple::Ref;
 use crate::ir::{Expression, FlakeValue, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -45,45 +46,15 @@ use fluree_db_core::Sid;
 ///
 /// Returns `None` if no rows pass the filter.
 pub fn filter_batch(
-    batch: &Batch,
+    batch: Batch,
     expr: &PreparedBoolExpression,
-    schema: &Arc<[VarId]>,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<Batch>> {
-    let mut keep_indices: Vec<usize> = Vec::new();
-    for row_idx in 0..batch.len() {
-        let Some(row) = batch.row_view(row_idx) else {
-            continue;
-        };
-        if expr.eval_to_bool_non_strict(&row, Some(ctx))? {
-            keep_indices.push(row_idx);
-        }
+    let mut keep = Vec::with_capacity(batch.len());
+    for row in batch.rows() {
+        keep.push(expr.eval_to_bool_non_strict(&row, Some(ctx))?);
     }
-
-    if keep_indices.is_empty() {
-        return Ok(None);
-    }
-
-    // A zero-column batch (e.g. the unit solution from `ASK { FILTER(true) }`)
-    // carries its row count explicitly — `Batch::new` would infer len = 0 from
-    // the absent first column and silently drop the surviving rows (#1439).
-    if schema.is_empty() {
-        return Ok(Some(Batch::empty_schema_with_len(keep_indices.len())));
-    }
-
-    let columns: Vec<Vec<Binding>> = (0..schema.len())
-        .map(|col_idx| {
-            let src_col = batch
-                .column_by_idx(col_idx)
-                .expect("batch schema must match operator schema");
-            keep_indices
-                .iter()
-                .map(|&row_idx| src_col[row_idx].clone())
-                .collect()
-        })
-        .collect();
-
-    Ok(Some(Batch::new(schema.clone(), columns)?))
+    Ok(batch.filter_rows(&keep))
 }
 
 /// Check if an expression tree contains any `Expression::Exists` nodes.
@@ -293,61 +264,6 @@ fn is_uncorrelated_exists(patterns: &[Pattern], batch_schema: &[VarId]) -> bool 
     pattern_vars.is_disjoint(&schema_vars)
 }
 
-/// Evaluate an EXISTS subquery once (uncorrelated) using an empty seed.
-async fn eval_exists_uncorrelated(
-    patterns: &[Pattern],
-    negated: bool,
-    ctx: &ExecutionContext<'_>,
-    planning: &crate::temporal_mode::PlanningContext,
-) -> Result<bool> {
-    #[expect(clippy::box_default)]
-    let seed: BoxedOperator = Box::new(EmptyOperator::new());
-    let mut exists_op = build_where_operators_seeded(Some(seed), patterns, None, None, planning)?;
-
-    exists_op.open(ctx).await?;
-
-    let has_match = loop {
-        match exists_op.next_batch(ctx).await? {
-            Some(b) if !b.is_empty() => break true,
-            Some(_) => continue,
-            None => break false,
-        }
-    };
-
-    exists_op.close();
-    Ok(if negated { !has_match } else { has_match })
-}
-
-/// Evaluate an EXISTS subquery for a given row (correlated).
-///
-/// Seeds the subquery with the current row's bindings and checks if any
-/// result is produced.
-async fn eval_exists_for_row(
-    patterns: &[Pattern],
-    negated: bool,
-    batch: &Batch,
-    row_idx: usize,
-    ctx: &ExecutionContext<'_>,
-    planning: &crate::temporal_mode::PlanningContext,
-) -> Result<bool> {
-    let seed = SeedOperator::from_batch_row(batch, row_idx);
-    let mut exists_op =
-        build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
-
-    exists_op.open(ctx).await?;
-
-    let has_match = loop {
-        match exists_op.next_batch(ctx).await? {
-            Some(b) if !b.is_empty() => break true,
-            Some(_) => continue,
-            None => break false,
-        }
-    };
-
-    exists_op.close();
-    Ok(if negated { !has_match } else { has_match })
-}
-
 /// Evaluate a pattern comprehension for a given row (always correlated): run the
 /// subquery seeded with the row's bindings, evaluate `projection` per match, and
 /// collect the non-null results into a `Binding::List`.
@@ -405,9 +321,10 @@ fn pre_resolve_uncorrelated<'a>(
         match expr {
             Expression::Exists { patterns, negated } => {
                 if is_uncorrelated_exists(patterns, batch_schema) {
-                    let result =
-                        eval_exists_uncorrelated(patterns, *negated, ctx, planning).await?;
-                    Ok(Expression::Const(FlakeValue::Boolean(result)))
+                    #[expect(clippy::box_default)]
+                    let seed: BoxedOperator = Box::new(EmptyOperator::new());
+                    let found = any_solution(seed, patterns, None, planning, ctx).await?;
+                    Ok(Expression::Const(FlakeValue::Boolean(found != *negated)))
                 } else {
                     Ok(expr.clone())
                 }
@@ -538,9 +455,9 @@ fn resolve_exists_for_row<'a>(
                     }
                 }
 
-                let result =
-                    eval_exists_for_row(patterns, *negated, batch, row_idx, ctx, planning).await?;
-                Ok(Expression::Const(FlakeValue::Boolean(result)))
+                let seed = SeedOperator::from_batch_row(batch, row_idx);
+                let found = any_solution(Box::new(seed), patterns, None, planning, ctx).await?;
+                Ok(Expression::Const(FlakeValue::Boolean(found != *negated)))
             }
             Expression::PatternComprehension {
                 patterns,
@@ -612,9 +529,8 @@ pub(crate) async fn resolve_row_exists(
 /// If ALL EXISTS subexpressions are uncorrelated, phase 2 skips async work
 /// entirely and uses the fast synchronous `filter_batch` path.
 async fn filter_batch_with_exists(
-    batch: &Batch,
+    batch: Batch,
     expr: &Expression,
-    schema: &Arc<[VarId]>,
     ctx: &ExecutionContext<'_>,
     cache: Option<&ExistsSemijoinCache>,
     planning: &crate::temporal_mode::PlanningContext,
@@ -627,52 +543,24 @@ async fn filter_batch_with_exists(
     // to resolve, we can use the fast synchronous path.
     if !needs_metadata && !contains_exists(&partially_resolved) {
         let prepared = PreparedBoolExpression::new(partially_resolved);
-        return filter_batch(batch, &prepared, schema, ctx);
+        return filter_batch(batch, &prepared, ctx);
     }
 
     // Phase 2: resolve remaining correlated EXISTS (and metadata) per-row
-    let mut keep_indices: Vec<usize> = Vec::new();
-
-    for row_idx in 0..batch.len() {
+    let mut keep = Vec::with_capacity(batch.len());
+    for (row_idx, row) in batch.rows().enumerate() {
         let resolved_expr =
-            resolve_exists_for_row(&partially_resolved, batch, row_idx, ctx, cache, planning)
+            resolve_exists_for_row(&partially_resolved, &batch, row_idx, ctx, cache, planning)
                 .await?;
-        let Some(row) = batch.row_view(row_idx) else {
-            continue;
-        };
         let resolved_expr = if needs_metadata {
             crate::eval::metadata_resolve::resolve_row_metadata(&resolved_expr, &row, ctx).await?
         } else {
             resolved_expr
         };
-        let pass = resolved_expr.eval_to_bool_non_strict(&row, Some(ctx))?;
-        if pass {
-            keep_indices.push(row_idx);
-        }
+        keep.push(resolved_expr.eval_to_bool_non_strict(&row, Some(ctx))?);
     }
 
-    if keep_indices.is_empty() {
-        return Ok(None);
-    }
-
-    // See `filter_batch`: a zero-column batch carries its row count explicitly.
-    if schema.is_empty() {
-        return Ok(Some(Batch::empty_schema_with_len(keep_indices.len())));
-    }
-
-    let columns: Vec<Vec<Binding>> = (0..schema.len())
-        .map(|col_idx| {
-            let src_col = batch
-                .column_by_idx(col_idx)
-                .expect("batch schema must match operator schema");
-            keep_indices
-                .iter()
-                .map(|&row_idx| src_col[row_idx].clone())
-                .collect()
-        })
-        .collect();
-
-    Ok(Some(Batch::new(schema.clone(), columns)?))
+    Ok(batch.filter_rows(&keep))
 }
 
 /// Filter operator - applies a predicate to each row from child
@@ -796,9 +684,8 @@ impl Operator for FilterOperator {
             let needs_metadata = self.has_metadata && !ctx.allow_unfiltered();
             let filtered = if self.has_exists || needs_metadata {
                 filter_batch_with_exists(
-                    &batch,
+                    batch,
                     &self.expr,
-                    &self.schema,
                     ctx,
                     self.exists_semijoin.as_ref(),
                     &self.planning,
@@ -806,7 +693,7 @@ impl Operator for FilterOperator {
                 )
                 .await?
             } else {
-                filter_batch(&batch, &self.prepared_expr, &self.schema, ctx)?
+                filter_batch(batch, &self.prepared_expr, ctx)?
             };
 
             if let Some(filtered) = filtered {

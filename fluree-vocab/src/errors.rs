@@ -118,6 +118,9 @@ pub const NOT_FOUND: &str = "err:api/NotFound";
 /// Not acceptable (content negotiation failure)
 pub const NOT_ACCEPTABLE: &str = "err:api/NotAcceptable";
 
+/// Unsupported media type (request body format not accepted)
+pub const UNSUPPORTED_MEDIA_TYPE: &str = "err:api/UnsupportedMediaType";
+
 // =============================================================================
 // Parsing Errors (parse)
 // =============================================================================

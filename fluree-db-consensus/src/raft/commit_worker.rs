@@ -636,8 +636,26 @@ impl Worker {
             TransactionBody::JsonLdInsert(json) => staged.insert(json),
             TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
             TransactionBody::JsonLdUpdate(json) => staged.update(json),
-            TransactionBody::JsonLdGraphSync { graph_iri, body } => {
-                staged.sync_graph(graph_iri.as_str(), body)
+            TransactionBody::JsonLdGraphSync { graph_iri, body } => staged.sync_graph_payload(
+                crate::graph_sel(graph_iri),
+                fluree_db_api::GraphPayload::JsonLd(body),
+                false,
+            ),
+            TransactionBody::RdfGraphSync {
+                graph_iri,
+                text,
+                allow_empty,
+            } => staged.sync_graph_payload(
+                crate::graph_sel(graph_iri),
+                fluree_db_api::GraphPayload::Rdf(text),
+                *allow_empty,
+            ),
+            TransactionBody::GraphInsert { graph_iri, payload } => {
+                let payload = match payload {
+                    crate::GraphBody::JsonLd(json) => fluree_db_api::GraphPayload::JsonLd(json),
+                    crate::GraphBody::Rdf(text) => fluree_db_api::GraphPayload::Rdf(text),
+                };
+                staged.insert_graph_payload(crate::graph_sel(graph_iri), payload)
             }
             TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
             TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
@@ -680,10 +698,8 @@ impl Worker {
         // SHACL override gate reads it from here, not from the policy.
         builder = builder.server_identity(governance.server_identity.clone());
 
-        let Some((write_guard, staged_commit)) = builder
-            .build_commit()
-            .await
-            .map_err(|e| stage_failure(&format!("build_commit failed: {e}")))?
+        let Some((write_guard, staged_commit)) =
+            builder.build_commit().await.map_err(build_commit_failure)?
         else {
             // No-change transaction (e.g. a graph sync whose payload already
             // matches the graph): mirror the revert NoOp short-circuit —
@@ -1577,6 +1593,20 @@ fn stage_failure(message: &str) -> WorkerError {
     WorkerError::Transient(message.into())
 }
 
+/// A `build_commit` failure the request itself caused — malformed input
+/// (400) or a delta too large to ever commit (413) — fails the same way on
+/// every attempt, so it poisons now instead of spending the retry budget.
+/// Anything else can be rooted in this node's view (a commit or namespace
+/// conflict, policy or SHACL over lagging state) and stays transient.
+fn build_commit_failure(err: ApiError) -> WorkerError {
+    match err.status_code() {
+        400 | 413 => stage(PoisonReason::BodyMalformed {
+            error: err.to_string(),
+        }),
+        _ => stage_failure(&format!("build_commit failed: {err}")),
+    }
+}
+
 fn submission_to_stage(err: SubmissionError) -> WorkerError {
     WorkerError::Transient(err.to_string())
 }
@@ -1700,6 +1730,28 @@ mod tests {
 
     fn cid(seed: u8) -> ContentId {
         ContentId::new(ContentKind::Commit, &[seed])
+    }
+
+    #[test]
+    fn request_errors_from_build_commit_poison_without_retry() {
+        for status in [400, 413] {
+            assert!(
+                matches!(
+                    build_commit_failure(ApiError::http(status, "bad")),
+                    WorkerError::Stage(reason) if matches!(*reason, PoisonReason::BodyMalformed { .. })
+                ),
+                "{status}"
+            );
+        }
+        for status in [403, 409, 422, 500, 503] {
+            assert!(
+                matches!(
+                    build_commit_failure(ApiError::http(status, "maybe stale")),
+                    WorkerError::Transient(_)
+                ),
+                "{status}"
+            );
+        }
     }
 
     fn sample_transact_envelope() -> QueuedRequest {

@@ -74,6 +74,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`index`](index.md) | Build or update the binary index (incremental) |
 | [`reindex`](reindex.md) | Full reindex from commit history |
 | [`sweep`](sweep.md) | Reclaim index artifacts no index chain references |
+| [`encryption`](encryption.md) | Held encryption keys and key rotation (status, rotate, resume, pause, cancel, verify, generate-key) |
 | [`iceberg`](iceberg.md) | Map and manage Iceberg tables as graph sources (map, list, info, drop) |
 | [`delta`](delta.md) | Map and manage Delta Lake tables as graph sources (map, list, info, drop) |
 | [`sql`](sql.md) | Map and manage SQL tables as graph sources through a Trino-protocol endpoint (map, check, list, info, drop) |

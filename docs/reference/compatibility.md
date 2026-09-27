@@ -33,7 +33,7 @@ assert/retract introspection.
 Turtle 1.2 annotation syntax is accepted on ingest — `{| ... |}` annotation
 tails, the `~` reifier, `<< s p o >>` reified triples and
 `r rdf:reifies <<( s p o )>>` — on every Turtle write path (insert, upsert,
-import, graph sync), inside TriG `GRAPH { }` blocks, and in N-Triples and
+import, graph sync over the CLI or `/sync`), inside TriG `GRAPH { }` blocks, and in N-Triples and
 N-Quads files. All forms assert the base triple: Fluree reifies asserted
 edges, so `<< s p o >>` is asserting here where RDF 1.2 makes it
 non-asserting. The `VERSION "1.2"` / `@version`
@@ -97,6 +97,9 @@ Supported SPARQL features:
 - Subqueries (evaluated independently — an inner `ORDER BY`/`LIMIT`/`OFFSET` scopes the sub-SELECT before it joins the enclosing pattern, per SPARQL 1.1 §18.2; there are no correlated/LATERAL sub-SELECTs)
 - Blank-node property lists (`[ :p ?o ]`) in subject and object position
 - Property paths (`+`, `*`, `?`, `^`, `|`, `/`, `!` negated sets, and transitive over a sequence including inverse steps `(^a/b)+`; see [SPARQL docs](../query/sparql.md#property-paths))
+- MINUS, VALUES, and FILTER EXISTS / NOT EXISTS
+- SERVICE against local ledgers (`fluree:ledger:<name>`); remote HTTP endpoints are not supported
+- Result formats: SELECT/ASK as SPARQL-results JSON or XML, CSV or TSV; CONSTRUCT/DESCRIBE as JSON-LD, Turtle, N-Triples or RDF/XML (see [SPARQL output negotiation](../api/endpoints.md#post-queryledger))
 
 **Aggregate result types:** COUNT and SUM of integers return `xsd:integer` (per W3C spec), not `xsd:long`. SUM of mixed types and AVG return `xsd:double`.
 
@@ -124,28 +127,57 @@ Why: before this, a parsed value kept its offset and source lexical while it sat
 
 ### SPARQL 1.1 Update
 
-**Status:** Partial support
+**Status:** Supported, except remote `LOAD`
 
 Supported:
-- INSERT DATA (including `GRAPH <iri> { ... }` named-graph blocks)
-- DELETE DATA (including `GRAPH <iri> { ... }` named-graph blocks)
-- DELETE WHERE (default graph only — `GRAPH` blocks are rejected)
+- INSERT DATA and DELETE DATA, including `GRAPH <iri> { ... }` blocks
+- DELETE WHERE, including `GRAPH <iri>` and `GRAPH ?g` blocks
 - DELETE/INSERT WHERE, including the `DELETE { } WHERE { }` and
-  `INSERT { } WHERE { }` short forms, with optional `WITH`/`USING` clauses and
-  `GRAPH <iri> { ... }` blocks in templates
+  `INSERT { } WHERE { }` short forms, `WITH` / `USING` / `USING NAMED`, and
+  `GRAPH <iri>` or `GRAPH ?g` blocks in templates
+- Graph management: CLEAR and DROP (`GRAPH <iri>`, `DEFAULT`, `NAMED`, `ALL`),
+  CREATE, ADD, COPY and MOVE, each with `SILENT`
+- Several operations in one request, separated by `;`: they run in order, each
+  seeing the previous one's changes, and commit as one transaction
 
-Not yet supported:
-- Variable graph names (`GRAPH ?g { ... }`) in any update — only ground IRIs
-- `GRAPH` blocks inside DELETE WHERE
-- LOAD
-- CLEAR
-- DROP
-- CREATE
-- COPY, MOVE, ADD
+Differences from the specification:
+- Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op
+- Fluree has no empty named graph: `DROP` behaves like `CLEAR`, and `CREATE`
+  registers the graph without making it visible until it holds a triple, so
+  `CREATE` of an existing graph is not an error
+- The reserved `#config` and `#txn-meta` graphs cannot be the target of graph
+  management operations
 
-JSON-LD transactions remain available as an alternative write surface.
+See [SPARQL UPDATE](../query/sparql.md#sparql-update-restrictions). JSON-LD
+transactions remain available as an alternative write surface.
 
 **Specification:** https://www.w3.org/TR/sparql11-update/
+
+### SPARQL 1.1 Graph Store HTTP Protocol
+
+**Status:** Supported, indirect graph identification
+
+`GET`, `HEAD`, `PUT`, `POST` and `DELETE` on `/v1/fluree/data/{ledger}` with
+`?graph={iri}` or `?default`. `PUT` commits only the difference from the
+graph's current contents. `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML.
+Direct graph identification (the request URL as the graph IRI)
+is not supported. See [Graph Store Protocol](../api/graph-store.md).
+
+**Specification:** https://www.w3.org/TR/sparql11-http-rdf-update/
+
+### SPARQL Service Description
+
+**Status:** Supported
+
+A `GET` on `/v1/fluree/query` or `/v1/fluree/query/{ledger}` with no `query`
+parameter returns a description of the endpoint in JSON-LD, Turtle, N-Triples
+or RDF/XML, chosen by `Accept`. It names the endpoint, the SPARQL query
+language (`sd:SPARQLQuery` at versions 1.0 through 1.2, and `sd:SPARQL11Query`
+for older clients), the result formats, and simple entailment. See
+[Service description](../api/endpoints.md#service-description).
+
+**Specification:** https://www.w3.org/TR/sparql11-service-description/ and the
+SPARQL 1.2 Service Description draft
 
 ### SPARQL 1.2
 
@@ -240,11 +272,14 @@ These features are controlled at compile time via Cargo:
 | `iceberg` | No | Apache Iceberg/R2RML graph source support |
 | `shacl` | No | SHACL constraint validation (requires fluree-db-transact + fluree-db-shacl). Default in server/CLI. |
 | `graphql` | No | GraphQL endpoint over a schema derived from ledger data and SHACL shapes. Implies `shacl` (tier 2 reads shapes); pulls in `async-graphql`. Default in server/CLI. |
+| `sql` | No | SQL graph sources (R2RML over a Trino-protocol endpoint). Implies `iceberg` |
+| `delta` | No | Delta Lake graph sources (R2RML over Delta tables). Implies `iceberg` |
 | `vector` | No | Embedded vector similarity search (HNSW indexes via usearch) |
 | `ipfs` | No | IPFS-backed storage via Kubo HTTP RPC |
 | `search-remote-client` | No | HTTP client for remote BM25 and vector search services |
+| `residency` | No | Leaf-residency instrumentation for the query and index crates |
 | `aws-testcontainers` | No | Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers) |
-| `full` | No | Convenience bundle: `native`, `credential`, `iceberg`, `shacl`, `ipfs`, `graphql` |
+| `full` | No | Convenience bundle: `native`, `credential`, `iceberg`, `sql`, `shacl`, `ipfs`, `graphql` |
 
 Example:
 ```toml
@@ -260,8 +295,14 @@ fluree-db-api = { path = "../fluree-db-api", features = ["native", "credential"]
 | `credential` | Yes | Signed request verification (forwards to `fluree-db-api/credential`) |
 | `shacl` | Yes | SHACL constraint validation (forwards to `fluree-db-api/shacl`) |
 | `iceberg` | Yes | Apache Iceberg/R2RML graph source support (forwards to `fluree-db-api/iceberg`) |
+| `sql` | Yes | SQL graph sources over a Trino-protocol endpoint (forwards to `fluree-db-api/sql`) |
+| `delta` | Yes | Delta Lake graph sources (forwards to `fluree-db-api/delta`) |
+| `graphql` | Yes | GraphQL endpoints (forwards to `fluree-db-api/graphql`) |
+| `bolt` | Yes | Bolt protocol listener for Neo4j drivers; binds only when `bolt_listen_addr` is configured |
 | `aws` | No | AWS S3 storage + DynamoDB nameservice (forwards to `fluree-db-api/aws`) |
 | `oidc` | No | OIDC JWT verification via JWKS (RS256 tokens from external IdPs) |
+| `raft` | No | Raft-replicated clusters (see [Raft clusters](../operations/raft-clusters.md)) |
+| `mimalloc` | No | mimalloc as the global allocator |
 | `swagger-ui` | No | Swagger UI endpoint |
 | `otel` | No | OpenTelemetry tracing |
 
@@ -283,40 +324,9 @@ SPARQL `PRAGMA reasoning` directive) or per ledger (via
 [Query-time reasoning](../query/reasoning.md) and
 [Setting groups](../ledger-config/setting-groups.md).
 
-## Parsing Modes
-
-### Strict Mode (Default)
-
-Enforces strict compliance with standards:
-- Invalid IRIs rejected
-- Type mismatches rejected
-- Strict JSON-LD parsing
-
-```bash
-./fluree-db-server --strict-mode true
-```
-
-### Lenient Mode
-
-More permissive parsing:
-- Attempts to fix malformed IRIs
-- Coerces types when possible
-- Accepts non-standard syntax
-
-```bash
-./fluree-db-server --strict-mode false
-```
-
-Use lenient mode only when you fully control inputs and explicitly want permissive parsing behavior.
-
 ## API Versioning
 
-Current API version: v1
-
-**Version Header:**
-```http
-X-Fluree-API-Version: 1
-```
+Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 ### Behavior changes
 
@@ -371,29 +381,22 @@ Supported SPARQL versions:
 | Format | Read | Write |
 |--------|------|-------|
 | JSON-LD | Yes | Yes |
-| Turtle | Yes | Yes |
-| N-Triples | Yes | Yes |
+| Turtle | Yes | Yes (export, CONSTRUCT/DESCRIBE results, Graph Store `GET`) |
+| N-Triples | Yes | Yes (export, CONSTRUCT/DESCRIBE results, Graph Store `GET`) |
 | N-Quads | Yes | Yes |
 | TriG | Yes | Yes |
-| RDF/XML | No | CONSTRUCT/DESCRIBE results only |
+| RDF/XML | No | CONSTRUCT/DESCRIBE results and Graph Store `GET` only |
 
 Import accepts `.ttl`, `.nt`, `.nq`, `.trig`, and `.jsonld`/`.jsonl` files, each
 with transparent `.gz` / `.zst` decompression.
 
 ## Protocol Support
 
-### HTTP Versions
+### HTTP and TLS
 
-- HTTP/1.1: Fully supported
-- HTTP/2: Supported
-- HTTP/3: Planned
-
-### TLS Versions
-
-- TLS 1.2: Supported
-- TLS 1.3: Supported
-- SSL 3.0: Not supported (deprecated)
-- TLS 1.0/1.1: Not supported (deprecated)
+The server speaks HTTP/1.1 over plain TCP. It does not terminate TLS or serve
+HTTP/2 itself: put it behind a reverse proxy or load balancer for HTTPS and
+HTTP/2.
 
 ## Client Support
 
@@ -466,10 +469,9 @@ Fluree can import from:
 ### Export Formats
 
 Export Fluree data to:
-- Turtle files
-- JSON-LD documents
-- SPARQL CONSTRUCT results
-- Any RDF format
+- Turtle, N-Triples, N-Quads, TriG or JSON-LD, with `fluree export` or the export endpoint
+- SPARQL CONSTRUCT / DESCRIBE results as JSON-LD, Turtle, N-Triples or RDF/XML
+- One graph at a time through the Graph Store Protocol
 
 ## Feature Roadmap
 
@@ -477,10 +479,10 @@ Export Fluree data to:
 
 **Query:**
 - SPARQL property paths: nested transitive steps inside a composite repeated unit (`(a+/b)+`); `{n,m}` depth ranges
-- SPARQL 1.1 Federation (`SERVICE`)
-- Full SPARQL UPDATE (LOAD, CLEAR, DROP, CREATE, COPY, MOVE, ADD; variable graph names)
+- SPARQL 1.1 Federation: remote `SERVICE` endpoints (local-ledger `SERVICE` is supported)
+- Remote `LOAD` in SPARQL UPDATE
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
-- RDF 1.2 / SPARQL 1.2: triple terms as values and the triple-term accessor functions; Turtle-star output; the RDF 1.2 Turtle evaluation suite (blocked on triple terms)
+- RDF 1.2 / SPARQL 1.2: triple terms as values and the triple-term accessor functions; edge annotations in CONSTRUCT and Graph Store `GET` output (export already writes them); the RDF 1.2 Turtle evaluation suite (blocked on triple terms)
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)
@@ -538,9 +540,8 @@ Works with data engineering tools:
 
 ### Rust Version
 
-Building from source requires:
-- Rust 1.75.0 or later
-- Cargo 1.75.0 or later
+Building from source uses the Rust toolchain pinned in `rust-toolchain.toml`
+(currently 1.97.0), which `rustup` installs automatically.
 
 ### Dependencies
 

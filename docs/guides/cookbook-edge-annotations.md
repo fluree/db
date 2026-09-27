@@ -12,7 +12,7 @@ Throughout, the running example is employment: a `worksFor` edge that needs a `r
 |---|---|---|
 | JSON-LD writes, or you need named-graph edges, or literal-valued edges | **JSON-LD `@annotation`** | Most complete surface — covers everything below. |
 | A SPARQL 1.1/1.2 pipeline, or you're porting RDF-star data | **SPARQL 1.2 annotation tail** (`{\| \|}`, `~`, `rdf:reifies`) | Standards syntax. Default-graph only today. |
-| A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept `{\| \|}`, `~`, `<< >>` and `rdf:reifies <<( )>>`, and TriG `GRAPH { }` blocks accept them too (TriG via `upsert` / `import`) | Same on-disk shape as `@annotation`; the reified triple is asserted; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
+| A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept `{\| \|}`, `~`, `<< >>` and `rdf:reifies <<( )>>`, and TriG `GRAPH { }` blocks accept them too (TriG via `upsert` / `import` / `/sync`) | Same on-disk shape as `@annotation`; the reified triple is asserted; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
 
 ## Attach metadata to a relationship
 

@@ -435,9 +435,8 @@ impl crate::Fluree {
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         // Load reverted commits oldest-first then fold via the shared
         // accumulator: invert each flake's `op` (assertion ⇄ retraction),
-        // net per fact, and accumulate `namespace_delta`/`graph_delta` with
-        // earlier-wins semantics, matching the merge path's
-        // `collect_commit_data`.
+        // net per fact, and accumulate `namespace_delta` (earlier wins) and
+        // named graphs, matching the merge path's `collect_commit_data`.
         let mut commits = Vec::with_capacity(plan.ordered_commits.len());
         for commit_id in plan.ordered_commits.iter().rev() {
             commits.push(load_commit_by_id(&branch_store, commit_id).await?);
@@ -445,7 +444,7 @@ impl crate::Fluree {
         let CollectedCommitData {
             flakes: inverted,
             namespace_delta,
-            graph_delta,
+            graph_iris,
         } = collect_from_commits(commits, Fold::Undo);
 
         // Acquire state under the ledger write lock when a manager is
@@ -474,6 +473,7 @@ impl crate::Fluree {
                 &conflict_keys,
                 &strategy,
                 &namespace_delta,
+                &graph_iris,
             )
             .await?;
         let Some((view, outcome)) = staged_view else {
@@ -508,8 +508,8 @@ impl crate::Fluree {
         if !namespace_delta.is_empty() {
             commit_opts = commit_opts.with_namespace_delta(namespace_delta);
         }
-        if !graph_delta.is_empty() {
-            commit_opts = commit_opts.with_graph_delta(graph_delta);
+        if !graph_iris.is_empty() {
+            commit_opts = commit_opts.with_graph_iris(graph_iris);
         }
 
         // With the lock held the staged base is authoritative — derive

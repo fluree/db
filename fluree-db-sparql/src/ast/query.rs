@@ -581,6 +581,9 @@ pub struct DescribeQuery {
     pub where_clause: Option<WhereClause>,
     /// Solution modifiers
     pub modifiers: SolutionModifiers,
+    /// Byte offset just after the describe targets: where a dataset clause
+    /// belongs when the query has neither one nor a WHERE clause to precede.
+    pub dataset_offset: usize,
     /// Source span
     pub span: SourceSpan,
 }
@@ -593,6 +596,7 @@ impl DescribeQuery {
             dataset: None,
             where_clause: None,
             modifiers: SolutionModifiers::new(),
+            dataset_offset: span.end,
             span,
         }
     }

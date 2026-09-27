@@ -49,7 +49,7 @@ use async_trait::async_trait;
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::Instrument;
@@ -77,9 +77,9 @@ enum AggState {
     /// COUNT/COUNT(*) - just a counter
     Count { n: u64 },
     /// COUNT(DISTINCT) - HashSet of seen values
-    CountDistinct { seen: HashSet<GroupKeyOwned> },
+    CountDistinct { seen: FxHashSet<GroupKeyOwned> },
     /// COUNT(DISTINCT *) - HashSet of seen whole solutions
-    CountDistinctAll { seen: HashSet<Vec<GroupKeyOwned>> },
+    CountDistinctAll { seen: FxHashSet<Vec<GroupKeyOwned>> },
     /// SUM - exact-when-possible numeric accumulator with type promotion
     /// (xsd:integer → xsd:decimal → xsd:double). `poisoned` records a bound
     /// non-numeric member, which makes the whole aggregate a type error.
@@ -224,10 +224,10 @@ impl AggState {
         match func {
             AggregateFn::Count(_) | AggregateFn::CountAll => AggState::Count { n: 0 },
             AggregateFn::CountDistinct(_) => AggState::CountDistinct {
-                seen: HashSet::new(),
+                seen: FxHashSet::default(),
             },
             AggregateFn::CountDistinctAll(_) => AggState::CountDistinctAll {
-                seen: HashSet::new(),
+                seen: FxHashSet::default(),
             },
             AggregateFn::Sum { .. } => AggState::Sum {
                 acc: crate::aggregate::NumericAcc::new(),
@@ -656,6 +656,23 @@ pub(crate) fn flake_value_to_key(val: &FlakeValue, dtc: &DatatypeConstraint) -> 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CompositeGroupKey(pub(crate) Vec<GroupKeyOwned>);
 
+impl CompositeGroupKey {
+    /// Key over `bindings`, normalized so mixed-representation rows key
+    /// identically (see [`binding_to_group_key_normalized`]).
+    pub(crate) fn normalized<'a>(
+        bindings: impl IntoIterator<Item = &'a Binding>,
+        norm: &Option<crate::object_binding::EqualityNorm>,
+    ) -> Self {
+        let (store, gv) = crate::object_binding::EqualityNorm::parts(norm);
+        Self(
+            bindings
+                .into_iter()
+                .map(|b| binding_to_group_key_normalized(b, store, gv))
+                .collect(),
+        )
+    }
+}
+
 /// Per-group state: the key bindings and aggregate states
 struct GroupState {
     /// Original bindings for group key columns (for output)
@@ -679,7 +696,7 @@ pub struct GroupAggregateOperator {
     /// Aggregate specifications
     agg_specs: Vec<StreamingAggSpec>,
     /// Accumulated groups: composite_key -> group_state
-    groups: HashMap<CompositeGroupKey, GroupState>,
+    groups: hashbrown::HashMap<CompositeGroupKey, GroupState, FxBuildHasher>,
     /// If true, input is already partitioned by the GROUP BY key(s), so we can
     /// aggregate per-run without hashing each row into a map.
     partitioned: bool,
@@ -704,7 +721,7 @@ pub struct GroupAggregateOperator {
 }
 
 enum GroupEmitIter {
-    Hash(std::collections::hash_map::IntoIter<CompositeGroupKey, GroupState>),
+    Hash(hashbrown::hash_map::IntoIter<CompositeGroupKey, GroupState>),
     Vec(std::vec::IntoIter<GroupState>),
 }
 
@@ -767,7 +784,7 @@ impl GroupAggregateOperator {
             state: OperatorState::Created,
             group_key_indices,
             agg_specs,
-            groups: HashMap::new(),
+            groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
             partitioned,
             partitioned_groups: Vec::new(),
             emit_iter: None,
@@ -812,18 +829,14 @@ impl GroupAggregateOperator {
         })
     }
 
-    /// Extract composite group key from a row
-    fn extract_group_key(&self, batch: &Batch, row_idx: usize) -> CompositeGroupKey {
+    /// Write a row's composite group key into `key`, reusing its allocation.
+    fn fill_group_key(&self, batch: &Batch, row_idx: usize, key: &mut CompositeGroupKey) {
         let store = self.graph_view.as_ref().map(BinaryGraphView::store);
-        let keys: Vec<GroupKeyOwned> = self
-            .group_key_indices
-            .iter()
-            .map(|&col_idx| {
-                let binding = batch.get_by_col(row_idx, col_idx);
-                binding_to_group_key_normalized(binding, store, self.graph_view.as_ref())
-            })
-            .collect();
-        CompositeGroupKey(keys)
+        key.0.clear();
+        key.0.extend(self.group_key_indices.iter().map(|&col_idx| {
+            let binding = batch.get_by_col(row_idx, col_idx);
+            binding_to_group_key_normalized(binding, store, self.graph_view.as_ref())
+        }));
     }
 
     /// Compose one solution into a hashable key, for `COUNT(DISTINCT *)`.
@@ -1044,6 +1057,8 @@ impl Operator for GroupAggregateOperator {
                 }
 
                 // General path: hash-based accumulation.
+                let mut group_key =
+                    CompositeGroupKey(Vec::with_capacity(self.group_key_indices.len()));
                 loop {
                     // The hash-aggregate fold buffers `groups` proportional to distinct
                     // group cardinality and, over a fully-buffered join child, can run
@@ -1071,27 +1086,36 @@ impl Operator for GroupAggregateOperator {
                     for row_idx in 0..batch.len() {
                         input_rows += 1;
 
-                        // Extract composite group key
-                        let group_key = self.extract_group_key(&batch, row_idx);
-
-                        // Extract key bindings BEFORE the mutable borrow to avoid borrow conflict
-                        let key_bindings = self.extract_key_bindings(&batch, row_idx);
+                        // Probe with a reused key buffer: a row joining an
+                        // existing group allocates nothing.
+                        self.fill_group_key(&batch, row_idx, &mut group_key);
 
                         // COUNT(DISTINCT *) reads a whole solution, so compose
                         // it here too — before the group state is borrowed.
                         let row_keys = self.extract_row_keys(&batch, row_idx);
 
-                        // Pre-compute aggregate states initialization
-                        let agg_specs_ref = &self.agg_specs;
-
-                        // Get or create group state
-                        let group_state =
-                            self.groups.entry(group_key).or_insert_with(|| GroupState {
-                                key_bindings,
-                                agg_states: agg_specs_ref
-                                    .iter()
-                                    .map(|spec| AggState::new(&spec.function))
-                                    .collect(),
+                        // One hash per row; the key is cloned out of the
+                        // buffer only when it opens a new group. The closure
+                        // captures fields, not `self`, so it can run while
+                        // `groups` is borrowed.
+                        let (_, group_state) = self
+                            .groups
+                            .raw_entry_mut()
+                            .from_key(&group_key)
+                            .or_insert_with(|| {
+                                let state = GroupState {
+                                    key_bindings: self
+                                        .group_key_indices
+                                        .iter()
+                                        .map(|&col_idx| batch.get_by_col(row_idx, col_idx).clone())
+                                        .collect(),
+                                    agg_states: self
+                                        .agg_specs
+                                        .iter()
+                                        .map(|spec| AggState::new(&spec.function))
+                                        .collect(),
+                                };
+                                (group_key.clone(), state)
                             });
 
                         // Update each aggregate with this row's values
@@ -1263,6 +1287,7 @@ fn extract_numeric_with_gv(
 mod tests {
     use super::*;
     use fluree_db_core::LedgerSnapshot;
+    use std::collections::HashMap;
 
     fn make_test_snapshot() -> LedgerSnapshot {
         LedgerSnapshot::genesis("test/main")

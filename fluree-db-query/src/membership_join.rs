@@ -60,7 +60,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
-use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
+use crate::group_aggregate::CompositeGroupKey;
 use crate::ir::{Pattern, TriplePattern};
 use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -145,29 +145,24 @@ impl MembershipJoinOperator {
     }
 
     fn extract_key(&self, batch: &Batch, row_idx: usize) -> CompositeGroupKey {
-        let keys = self
-            .key_vars
-            .iter()
-            .map(|v| {
-                let (store, gv) = EqualityNorm::parts(&self.norm);
-                let binding = batch.get(row_idx, *v).unwrap_or(&Binding::Unbound);
-                binding_to_group_key_normalized(binding, store, gv)
-            })
-            .collect();
-        CompositeGroupKey(keys)
+        CompositeGroupKey::normalized(
+            self.key_vars
+                .iter()
+                .map(|v| batch.get(row_idx, *v).unwrap_or(&Binding::Unbound)),
+            &self.norm,
+        )
     }
 
     /// Drain the triple once (unseeded planned scan — overlay-merged and
     /// policy-filtered) into the key set.
     async fn build_key_set(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        let key_var_slice: Vec<VarId> = self.key_vars.clone();
         #[allow(clippy::box_default)]
         let seed: BoxedOperator = Box::new(EmptyOperator::new());
         let mut inner = build_where_operators_seeded(
             Some(seed),
             std::slice::from_ref(&Pattern::Triple(self.pattern.clone())),
             None,
-            Some(&key_var_slice),
+            Some(&self.key_vars),
             &self.planning,
         )?;
         let mut set = FxHashSet::default();
@@ -176,16 +171,7 @@ impl MembershipJoinOperator {
         while let Some(batch) = inner.next_batch(ctx).await? {
             ctx.check_cancelled()?;
             for row_idx in 0..batch.len() {
-                let key = self
-                    .key_vars
-                    .iter()
-                    .map(|v| {
-                        let (store, gv) = EqualityNorm::parts(&self.norm);
-                        let binding = batch.get(row_idx, *v).unwrap_or(&Binding::Unbound);
-                        binding_to_group_key_normalized(binding, store, gv)
-                    })
-                    .collect();
-                duplicate_ground_rows |= !set.insert(CompositeGroupKey(key));
+                duplicate_ground_rows |= !set.insert(self.extract_key(&batch, row_idx));
             }
         }
         inner.close();

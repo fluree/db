@@ -9,7 +9,7 @@
 //! capabilities. They work with memory/file/S3 admin backends but are not
 //! available on read-only storage.
 
-use crate::{error::ApiError, tx::IndexingMode, Result};
+use crate::{error::ApiError, tx::IndexingMode, GraphPayload, Result};
 use fluree_db_core::tracking::{Tracker, TrackingOptions};
 use fluree_db_core::ContentId;
 use fluree_db_core::{
@@ -22,6 +22,7 @@ use fluree_db_indexer::{
     siblings_of, BranchIndexHead, CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
 };
 use fluree_db_nameservice::{GraphSourceType, NsRecord};
+use fluree_db_transact::GraphSel;
 use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -173,8 +174,9 @@ pub struct SyncGraphOpts {
 pub struct SyncGraphReport {
     /// Full `ledger:branch` identifier the sync targeted.
     pub ledger_id: String,
-    /// Graph IRI that was synchronized (echoed for clarity).
-    pub graph_iri: String,
+    /// Graph IRI that was synchronized (echoed for clarity); `None` for the
+    /// default graph.
+    pub graph_iri: Option<String>,
     /// Flakes asserted by the delta (`payload − current`).
     pub asserted: usize,
     /// Flakes retracted by the delta (`current − payload`).
@@ -323,6 +325,25 @@ fn normalize_ledger_id(ledger_id: &str) -> String {
 ///   `rest` is non-empty.
 ///
 /// Returns the error message to surface as `400` on failure.
+/// A named sync target must be an absolute IRI and not one of the ledger's
+/// system graphs (staging re-checks by g_id).
+fn validate_sync_graph_iri(graph_iri: &str, ledger_id: &str) -> std::result::Result<(), String> {
+    use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+    if graph_iri.is_empty() {
+        return Err("graph IRI is required; sync targets exactly one named graph".to_string());
+    }
+    validate_absolute_iri(graph_iri)?;
+    if graph_iri == txn_meta_graph_iri(ledger_id) {
+        return Err(format!(
+            "Cannot sync the txn-meta system graph '{graph_iri}'"
+        ));
+    }
+    if graph_iri == config_graph_iri(ledger_id) {
+        return Err(format!("Cannot sync the config system graph '{graph_iri}'"));
+    }
+    Ok(())
+}
+
 fn validate_absolute_iri(value: &str) -> std::result::Result<(), String> {
     if value.is_empty() {
         return Err("graph IRI is required and cannot be empty".to_string());
@@ -1027,8 +1048,8 @@ impl crate::Fluree {
     /// asserts `payload − current`; unchanged facts produce no flakes, so an
     /// identical payload reports `committed = false` without creating a
     /// commit. The scope is exactly the named graph — the payload may not
-    /// address named graphs itself, and reserved system graphs (and the
-    /// default graph) are rejected.
+    /// address named graphs itself, and reserved system graphs are rejected.
+    /// [`Self::sync_graph_with`] also syncs the default graph.
     ///
     /// Like `CLEAR`/`COPY`/`MOVE` (and unlike DELETE-WHERE), the
     /// current-contents scan is not view-policy filtered: sync is an
@@ -1067,48 +1088,66 @@ impl crate::Fluree {
         txn_opts: fluree_db_transact::TxnOpts,
         policy: Option<crate::PolicyContext>,
     ) -> Result<SyncGraphReport> {
-        use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+        let graph = GraphSel::Graph(graph_iri.to_string());
+        let payload = GraphPayload::JsonLd(data);
+        self.sync_graph_with(ledger_id, &graph, payload, opts, txn_opts, policy)
+            .await
+    }
 
+    /// [`Self::sync_named_graph_with`] for Turtle, N-Triples or TriG text
+    /// (see [`GraphPayload::Rdf`] for how a TriG body names the graph).
+    pub async fn sync_named_graph_rdf_with(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+        text: &str,
+        opts: SyncGraphOpts,
+        txn_opts: fluree_db_transact::TxnOpts,
+        policy: Option<crate::PolicyContext>,
+    ) -> Result<SyncGraphReport> {
+        let graph = GraphSel::Graph(graph_iri.to_string());
+        let payload = GraphPayload::Rdf(text);
+        self.sync_graph_with(ledger_id, &graph, payload, opts, txn_opts, policy)
+            .await
+    }
+
+    /// Synchronize `graph`, the default graph or one named graph, with
+    /// `payload` (see [`Self::sync_named_graph`]). The general form the other
+    /// sync entry points delegate to.
+    pub async fn sync_graph_with(
+        &self,
+        ledger_id: &str,
+        graph: &GraphSel,
+        payload: GraphPayload<'_>,
+        opts: SyncGraphOpts,
+        txn_opts: fluree_db_transact::TxnOpts,
+        policy: Option<crate::PolicyContext>,
+    ) -> Result<SyncGraphReport> {
         let bad_request = |msg: String| ApiError::Http {
             status: 400,
             message: msg,
         };
-
-        if graph_iri.is_empty() {
-            return Err(bad_request(
-                "graph IRI is required; sync targets exactly one named graph".to_string(),
-            ));
-        }
-        validate_absolute_iri(graph_iri).map_err(bad_request)?;
-
         let ledger_id = normalize_ledger_id(ledger_id);
-
-        // Reject system graphs by IRI shape (staging re-checks by g_id).
-        if graph_iri == txn_meta_graph_iri(&ledger_id) {
-            return Err(bad_request(format!(
-                "Cannot sync the txn-meta system graph '{graph_iri}'"
-            )));
-        }
-        if graph_iri == config_graph_iri(&ledger_id) {
-            return Err(bad_request(format!(
-                "Cannot sync the config system graph '{graph_iri}'"
-            )));
-        }
+        let graph_iri = match graph {
+            GraphSel::Default => None,
+            GraphSel::Graph(iri) => {
+                validate_sync_graph_iri(iri, &ledger_id).map_err(bad_request)?;
+                Some(iri.clone())
+            }
+        };
+        let graph_label = graph_iri.as_deref().unwrap_or("default graph");
 
         // An explicitly empty payload clears the graph — require the
         // explicit opt-in so a truncated export cannot wipe it silently.
-        let explicitly_empty = data
-            .get("@graph")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(Vec::is_empty);
-        if explicitly_empty && !opts.allow_empty {
+        // Staging makes the same check for an RDF payload once parsed.
+        if payload.is_explicitly_empty_jsonld() && !opts.allow_empty {
             return Err(bad_request(
                 "sync payload is empty; this would clear the graph — set allowEmpty to confirm"
                     .to_string(),
             ));
         }
 
-        info!(ledger_id = %ledger_id, graph_iri = %graph_iri, dry_run = opts.dry_run, "Syncing named graph");
+        info!(ledger_id = %ledger_id, graph = graph_label, dry_run = opts.dry_run, "Syncing graph");
 
         let handle = self.ledger_cached(&ledger_id).await?;
         let pre_t = handle.t().await;
@@ -1122,8 +1161,9 @@ impl crate::Fluree {
             let stage_result = self
                 .stage_sync_transaction_tracked(
                     ledger_state,
-                    graph_iri,
-                    data,
+                    graph,
+                    payload,
+                    opts.allow_empty,
                     txn_opts,
                     None,
                     None,
@@ -1135,7 +1175,7 @@ impl crate::Fluree {
             let retracted = flakes.len() - asserted;
             return Ok(SyncGraphReport {
                 ledger_id,
-                graph_iri: graph_iri.to_string(),
+                graph_iri,
                 asserted,
                 retracted,
                 committed: false,
@@ -1146,7 +1186,7 @@ impl crate::Fluree {
 
         let mut builder = self
             .stage(&handle)
-            .sync_graph(graph_iri, data)
+            .sync_graph_payload(graph.clone(), payload, opts.allow_empty)
             .txn_opts(txn_opts);
         if let Some(policy) = policy {
             builder = builder.policy(policy);
@@ -1167,23 +1207,59 @@ impl crate::Fluree {
 
         info!(
             ledger_id = %ledger_id,
-            graph_iri = %graph_iri,
+            graph = graph_label,
             asserted = result.receipt.assert_count,
             retracted = result.receipt.retract_count,
             committed,
             t,
-            "Named graph synced",
+            "Graph synced",
         );
 
         Ok(SyncGraphReport {
             ledger_id,
-            graph_iri: graph_iri.to_string(),
+            graph_iri,
             asserted: result.receipt.assert_count,
             retracted: result.receipt.retract_count,
             committed,
             dry_run: false,
             t,
         })
+    }
+
+    /// Whether `graph` holds any triple at the ledger head. The default graph
+    /// always exists. A named graph exists while it has an asserted triple:
+    /// Fluree has no empty named graph, so a graph whose triples were all
+    /// retracted (a `DROP`, or a sync to empty) no longer exists. The ledger's
+    /// system graphs are never reported as existing.
+    ///
+    /// Not policy filtered: this answers whether the graph is there, not what
+    /// the caller may read of it.
+    pub async fn graph_exists(&self, ledger_id: &str, graph: &GraphSel) -> Result<bool> {
+        use fluree_db_core::comparator::IndexType;
+        use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+        use fluree_db_core::query_bounds::RangeTest;
+        use fluree_db_core::range::RangeMatch;
+
+        let GraphSel::Graph(iri) = graph else {
+            return Ok(true);
+        };
+        let handle = self.ledger_cached(ledger_id).await?;
+        let ledger = handle.snapshot().await.to_ledger_state();
+        let Some(g_id) = ledger.snapshot.graph_registry.graph_id_for_iri(iri) else {
+            return Ok(false);
+        };
+        if g_id < FIRST_USER_GRAPH_ID {
+            return Ok(false);
+        }
+        let opts = fluree_db_core::RangeOptions {
+            flake_limit: Some(1),
+            ..Default::default()
+        };
+        let flakes = ledger
+            .as_graph_db_ref(g_id)
+            .range_with_opts(IndexType::Spot, RangeTest::Eq, RangeMatch::new(), opts)
+            .await?;
+        Ok(!flakes.is_empty())
     }
 
     /// Cancel indexing, delete storage artifacts, purge nameservice record,

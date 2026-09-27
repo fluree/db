@@ -1,5 +1,5 @@
-//! `fluree sync` — make a named graph's contents exactly the supplied data,
-//! committing only the delta.
+//! `fluree sync` — make a graph's contents exactly the supplied data,
+//! committing only the delta. Without `--graph`, the default graph.
 //!
 //! The target graph is the constant of this command; the source of the
 //! desired contents is pluggable ([`SyncSource`]). Every source resolves to
@@ -15,14 +15,15 @@ use crate::detect;
 use crate::error::{CliError, CliResult};
 use crate::input;
 use fluree_db_api::server_defaults::FlureeDir;
-use fluree_db_api::{SyncGraphOpts, SyncGraphReport, TxnOpts};
+use fluree_db_api::{GraphPayload, GraphSel, SyncGraphOpts, SyncGraphReport, TxnOpts};
 use std::path::Path;
 
 /// Arguments for [`run`].
 pub struct SyncArgs<'a> {
     pub args: &'a [String],
     pub ledger: Option<&'a str>,
-    pub graph: &'a str,
+    /// Target named graph; `None` is the default graph.
+    pub graph: Option<&'a str>,
     pub expr: Option<&'a str>,
     pub file: Option<&'a Path>,
     pub format: Option<&'a str>,
@@ -68,9 +69,9 @@ impl SyncSource {
 }
 
 pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
-    if a.graph.is_empty() {
+    if a.graph == Some("") {
         return Err(CliError::Usage(
-            "--graph is required: sync targets exactly one named graph".to_string(),
+            "--graph needs an IRI; omit it to sync the default graph".to_string(),
         ));
     }
 
@@ -135,11 +136,15 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
         }
         LedgerMode::Local { fluree, alias } => {
             let policy_ctx = build_policy_ctx(&fluree, &alias, a.policy).await?;
+            let graph = match a.graph {
+                Some(iri) => GraphSel::Graph(iri.to_string()),
+                None => GraphSel::Default,
+            };
             let report = fluree
-                .sync_named_graph_with(
+                .sync_graph_with(
                     &alias,
-                    a.graph,
-                    &payload,
+                    &graph,
+                    GraphPayload::JsonLd(&payload),
                     SyncGraphOpts {
                         dry_run: a.dry_run,
                         allow_empty: a.allow_empty,
@@ -176,25 +181,31 @@ fn report_json(r: &SyncGraphReport) -> serde_json::Value {
 }
 
 fn print_local_report(r: &SyncGraphReport) {
+    let graph = match &r.graph_iri {
+        Some(iri) => format!("graph <{iri}>"),
+        None => "the default graph".to_string(),
+    };
     if r.dry_run {
         println!(
-            "Would sync graph <{}> in '{}': +{} asserted, -{} retracted (dry run; head t={}).",
-            r.graph_iri, r.ledger_id, r.asserted, r.retracted, r.t
+            "Would sync {graph} in '{}': +{} asserted, -{} retracted (dry run; head t={}).",
+            r.ledger_id, r.asserted, r.retracted, r.t
         );
     } else if r.committed {
         println!(
-            "Synced graph <{}> in '{}': +{} asserted, -{} retracted (t={}).",
-            r.graph_iri, r.ledger_id, r.asserted, r.retracted, r.t
+            "Synced {graph} in '{}': +{} asserted, -{} retracted (t={}).",
+            r.ledger_id, r.asserted, r.retracted, r.t
         );
     } else {
+        let mut graph = graph;
+        graph[..1].make_ascii_uppercase();
         println!(
-            "Graph <{}> in '{}' already matches the payload — no commit produced (t={}).",
-            r.graph_iri, r.ledger_id, r.t
+            "{graph} in '{}' already matches the payload — no commit produced (t={}).",
+            r.ledger_id, r.t
         );
     }
 }
 
-fn print_remote_response(graph: &str, value: &serde_json::Value, dry_run: bool) {
+fn print_remote_response(graph: Option<&str>, value: &serde_json::Value, dry_run: bool) {
     // Dry runs answer with the report shape; real runs with the standard
     // transact response (ledger, t, tx-id, ...).
     if dry_run {
@@ -204,8 +215,12 @@ fn print_remote_response(graph: &str, value: &serde_json::Value, dry_run: bool) 
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0)
         };
+        let graph = match graph {
+            Some(iri) => format!("graph <{iri}>"),
+            None => "the default graph".to_string(),
+        };
         println!(
-            "Would sync graph <{graph}>: +{} asserted, -{} retracted (dry run; head t={}).",
+            "Would sync {graph}: +{} asserted, -{} retracted (dry run; head t={}).",
             n("asserted"),
             n("retracted"),
             value

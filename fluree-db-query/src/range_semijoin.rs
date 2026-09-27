@@ -64,8 +64,7 @@ use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Pattern};
 use crate::join::{
-    batched_subject_probe_binary, make_dict_overlay, prepare_leaf_for_scan, LeafScan,
-    SubjectProbeParams,
+    batched_subject_probe_binary, make_dict_overlay, prepare_leaf_for_scan, SubjectProbeParams,
 };
 use crate::object_binding::{equality_norm, materialized_object_binding, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -75,9 +74,6 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-use fluree_db_binary_index::read::column_loader::{
-    load_leaflet_columns, load_leaflet_columns_cached, LeafletDecodeSpec,
-};
 use fluree_db_binary_index::read::column_types::{ColumnData, ColumnProjection, ColumnSet};
 use fluree_db_binary_index::{BinaryIndexStore, ColumnBatch, RunSortOrder};
 use fluree_db_core::o_type::{DecodeKind, OType};
@@ -668,7 +664,6 @@ impl RangeSemiJoinOperator {
             lower: envelope.lower.clone().map(|v| (v, true)),
             upper: envelope.upper.clone().map(|v| (v, true)),
         };
-        let cache = store.leaflet_cache();
         let narrow = ColumnSet::single(ColumnId::SId).union(ColumnSet::single(ColumnId::OKey));
         let mixed = narrow
             .union(ColumnSet::single(ColumnId::OType))
@@ -678,16 +673,10 @@ impl RangeSemiJoinOperator {
         // Pass 1: locate the in-range rows per leaflet and count them.
         let mut leaflets: Vec<WalkedLeaflet> = Vec::new();
         let mut total = 0usize;
-        for leaf in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
+        for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
             ctx.check_cancelled()?;
-            let LeafScan {
-                leaf_bytes,
-                header,
-                dir,
-                leaf_id,
-                ..
-            } = prepare_leaf_for_scan(store, leaf, false)?;
-            for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            let leaf = prepare_leaf_for_scan(store, leaf_entry, false)?;
+            for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
                 if entry.row_count == 0 || entry.p_const.is_some_and(|p| p != p_id) {
                     continue;
                 }
@@ -715,34 +704,11 @@ impl RangeSemiJoinOperator {
                     }
                     _ => None,
                 };
-                let decode_set = if key_range.is_some() { narrow } else { mixed };
-                let leaflet_idx_u32 = u32::try_from(leaflet_idx)
-                    .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                let batch = match &cache {
-                    Some(cache) => load_leaflet_columns_cached(
-                        &leaf_bytes,
-                        entry,
-                        dir.payload_base,
-                        cache,
-                        LeafletDecodeSpec {
-                            leaf_id,
-                            leaflet_idx: leaflet_idx_u32,
-                            order: header.order,
-                            decode_set,
-                        },
-                    ),
-                    None => load_leaflet_columns(
-                        &leaf_bytes,
-                        entry,
-                        dir.payload_base,
-                        &ColumnProjection {
-                            output: decode_set,
-                            internal: ColumnSet::EMPTY,
-                        },
-                        header.order,
-                    ),
-                }
-                .map_err(|e| QueryError::Internal(format!("load columns (range walk): {e}")))?;
+                let proj = ColumnProjection {
+                    output: if key_range.is_some() { narrow } else { mixed },
+                    internal: ColumnSet::EMPTY,
+                };
+                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None)?;
 
                 let keyed = match key_range {
                     Some((ot, lo, hi)) => {
