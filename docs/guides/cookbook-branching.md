@@ -29,7 +29,8 @@ fluree branch drop experiment
 
 - **Branches are isolated** — Transactions on one branch are invisible to others
 - **Branches are cheap** — Creating a branch doesn't copy data; it creates a new commit pointer
-- **Merge takes two shapes** — If the target hasn't advanced since the fork, the merge fast-forwards and the source's commits become the target's line. If it has, the merge folds the source's changes into one commit on the target, resolving overlapping edits by `--strategy`
+- **Merge takes two shapes** — If the target's head is on the source's line of commits, the merge fast-forwards and the source's commits become the target's line. Otherwise the merge folds the source's changes into one commit on the target, resolving overlapping edits by `--strategy`
+- **Merge runs in any direction.** A branch merges into the one it came from, into one created from it, or into a branch that shares an earlier commit. Use `--target` to name where the changes go
 - **Source branch survives merge** — After merging, the branch can continue receiving transactions
 
 ## Patterns
