@@ -102,6 +102,7 @@ async fn validate_file(
 
     let ledger_graph = fluree.graph(alias);
     match data_format {
+        detect::DataFormat::Trig => return Err(detect::trig_refused("validate")),
         detect::DataFormat::Turtle => {
             ledger_graph
                 .transact()
@@ -158,6 +159,7 @@ fn resolve_shapes_source(
         return Ok(
             match detect::detect_data_format(Some(path), &content, None)? {
                 detect::DataFormat::Turtle => ShapesSource::InlineTurtle(content),
+                detect::DataFormat::Trig => return Err(detect::trig_refused("--shacl")),
                 detect::DataFormat::JsonLd => {
                     ShapesSource::InlineJsonLd(serde_json::from_str(&content)?)
                 }

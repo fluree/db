@@ -2022,7 +2022,7 @@ fn export_all_graphs_nquads_on_never_indexed_ledger() {
 }
 
 /// A ledger with one triple in the default graph and one in a named graph,
-/// built through the bulk-import path (`insert` has no TriG reader).
+/// built through the bulk-import path.
 fn seed_two_graphs(tmp: &TempDir, ledger: &str) {
     let src = tmp.path().join(format!("{ledger}-src"));
     std::fs::create_dir_all(&src).unwrap();
@@ -2202,13 +2202,94 @@ fn export_all_graphs_round_trips_into_a_same_named_ledger() {
         .stdout(predicate::str::contains("urn:fluree").not());
 }
 
-/// `fluree export --format trig` now produces dataset files routinely, so
-/// feeding one back to `insert` is the obvious next thing to try. It cannot
-/// work — `insert` has nowhere to put a named graph — but it used to fail
-/// inside the Turtle parser with `expected subject, found 'GRAPH'`, which
-/// names neither the cause nor the command that does work.
+/// `fluree export --format trig` produces dataset files routinely, and
+/// feeding one back to an existing ledger is the obvious next thing to try.
+/// `insert` and `upsert` read TriG, by extension or by `--format` (#1849).
 #[test]
-fn insert_of_a_dataset_file_names_create_from() {
+fn insert_and_upsert_read_an_exported_trig_file() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "src");
+    let out = tmp.path().join("src.trig");
+    fluree_cmd(&tmp)
+        .args(["export", "src", "--format", "trig", "--all-graphs", "-o"])
+        .arg(&out)
+        .assert()
+        .success();
+
+    for (cmd, ledger, extra) in [
+        ("insert", "by-ext", &[][..]),
+        ("upsert", "by-flag", &["--format", "trig"][..]),
+    ] {
+        fluree_cmd(&tmp).args(["create", ledger]).assert().success();
+        fluree_cmd(&tmp)
+            .args([cmd, ledger])
+            .args(extra)
+            .arg("-f")
+            .arg(&out)
+            .assert()
+            .success();
+        fluree_cmd(&tmp)
+            .args([
+                "query",
+                ledger,
+                "--sparql",
+                "SELECT ?o WHERE { GRAPH <http://example.org/g1> { ?s ?p ?o } }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("in-g1"));
+        fluree_cmd(&tmp)
+            .args([
+                "query",
+                ledger,
+                "--sparql",
+                "SELECT ?o WHERE { <http://example.org/default1> <http://example.org/p> ?o }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("in-default"));
+    }
+}
+
+/// N-Quads is the dataset format no data command reads. It used to fail
+/// inside the Turtle parser on its fourth term, which names neither the cause
+/// nor the command that does work.
+#[test]
+fn insert_of_an_nquads_file_names_create_from() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
+    let src = tmp.path().join("data.nq");
+    std::fs::write(
+        &src,
+        "<http://example.org/s> <http://example.org/p> \"v\" <http://example.org/g1> .\n",
+    )
+    .unwrap();
+
+    // By extension.
+    fluree_cmd(&tmp)
+        .args(["insert", "ds", "-f"])
+        .arg(&src)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("N-Quads"))
+        .stderr(predicate::str::contains("fluree create <ledger> --from"));
+
+    // And by an explicit --format, which took a different path to the same
+    // dead end.
+    fluree_cmd(&tmp)
+        .args(["insert", "ds", "--format", "nquads", "-f"])
+        .arg(&src)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("fluree create <ledger> --from"));
+}
+
+/// `sync` replaces one graph, so a TriG file is refused with the commands
+/// that do read it, rather than a Turtle parse error on its first block.
+#[test]
+fn sync_of_a_trig_file_names_insert_and_upsert() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
@@ -2219,24 +2300,12 @@ fn insert_of_a_dataset_file_names_create_from() {
          <http://example.org/s> <http://example.org/p> \"v\" . }\n",
     )
     .unwrap();
-
-    // By extension.
     fluree_cmd(&tmp)
-        .args(["insert", "ds", "-f"])
+        .args(["sync", "ds", "-f"])
         .arg(&src)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("dataset format"))
-        .stderr(predicate::str::contains("fluree create <ledger> --from"));
-
-    // And by an explicit --format, which took a different path to the same
-    // dead end.
-    fluree_cmd(&tmp)
-        .args(["insert", "ds", "--format", "trig", "-f"])
-        .arg(&src)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("fluree create <ledger> --from"));
+        .stderr(predicate::str::contains("fluree insert"));
 }
 
 // ============================================================================

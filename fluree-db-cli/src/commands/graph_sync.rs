@@ -63,6 +63,7 @@ impl SyncSource {
                 detect::DataFormat::JsonLd => Ok(serde_json::from_str(&content)?),
                 detect::DataFormat::Turtle => fluree_graph_turtle::parse_to_json(&content)
                     .map_err(|e| CliError::Usage(format!("failed to parse Turtle: {e}"))),
+                detect::DataFormat::Trig => Err(detect::trig_refused("sync")),
             },
         }
     }
