@@ -35,7 +35,7 @@ fluree encryption generate-key
 | `--json` | Print the raw JSON response |
 | `--retire <ID>` | The key being retired (`rotate`, `verify`) |
 | `--dry-run` | Count what a rotation would rewrite without writing anything. The count is `progress.on_retired`, shown only with `--json` |
-| `--ledger <LEDGER>` | Limit the sweep to one ledger: a name covers every branch, a branch-qualified id only that branch. The ledger's shared dictionaries are included, graph sources are not |
+| `--ledger <LEDGER>` | Limit the sweep to one ledger: a name covers every branch, and every dropped ledger of that name, a branch-qualified id only that branch. The ledger's shared dictionaries are included, graph sources are not |
 | `--rate <BYTES/S>` | Cap rewritten plaintext bytes per second, as a number with an optional `kb`, `mb` or `gb` suffix. Suffixes are binary (`1mb` = 1 MiB); a bare number is bytes. Not stored: a resumed sweep runs unthrottled unless restarted with `rotate --rate` |
 | `--wait` | Poll status every two seconds until the record is no longer `running`, printing progress to stderr. A stalled or released record is still `running`, so `--wait` keeps waiting |
 
@@ -45,7 +45,7 @@ Every subcommand except `generate-key` needs `--remote` or `--connection-config`
 
 Every encrypted blob carries the id of the key that encrypted it. A storage configured with a key set (`AES256Keys` plus `AES256CurrentKey`) reads any held key and writes with the current one, so a rotation is a background sweep that rewrites, in place, every blob still on the retiring key. Addresses are hashes of plaintext, so nothing but the bytes at rest changes.
 
-The sweep is resumable. It walks in a fixed order (each ledger branch, then each ledger's shared dictionaries, then graph sources) and checkpoints its position and counters to a record in the same storage every thousand blobs or thirty seconds. That record is a cache of where the sweep stood; the truth is in the blob headers, so resuming from a stale record only re-reads a few of them.
+The sweep is resumable. It walks in a fixed order (each ledger branch, dropped ledgers included, then each ledger's shared dictionaries, then graph sources) and checkpoints its position and counters to a record in the same storage every thousand blobs or thirty seconds. That record is a cache of where the sweep stood; the truth is in the blob headers, so resuming from a stale record only re-reads a few of them.
 
 Under Raft the leader runs the sweep. A sweep does not always continue by itself after a restart or a change of leader; when status shows it `stalled` or `released`, run `fluree encryption resume`. See [Resuming after a restart or leader change](../security/encryption.md#resuming-after-a-restart-or-leader-change).
 

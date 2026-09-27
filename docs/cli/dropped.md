@@ -40,6 +40,8 @@ A dropped ledger is named by its **instance id**, not its name, because a new le
 
 A state of `restoring` or `purging` means that operation was interrupted; running it again finishes it. A server finishes interrupted drops, restores and purges on its own within a few minutes, and can run the sweep on a schedule; see [Periodic Maintenance](../operations/configuration.md#periodic-maintenance).
 
+On an encrypted store, [key rotation](encryption.md) rewrites a dropped ledger's data along with the live ledgers', so retiring a key never leaves a dropped ledger unreadable.
+
 Without `--remote`, the commands go to a locally running server when there is one (see [server integration](server-integration.md)), and otherwise to the local store. Pass `--direct` to skip the server.
 
 ## Examples

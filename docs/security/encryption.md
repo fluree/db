@@ -322,8 +322,9 @@ The record reports:
 
 - `state`: `running`, `paused`, `cancelled`, `failed`, `swept` or `completed`.
 - The holder, `dry_run`, `ledger_scope`, and progress: `units_done` of
-  `units_total` (each ledger branch, then each ledger's shared dictionaries,
-  then graph sources), the unit in progress and the last address done.
+  `units_total` (each ledger branch, dropped ledgers included, then each
+  ledger's shared dictionaries, then graph sources), the unit in progress
+  and the last address done.
 - Counters: `scanned`, `rewritten`, `already_current`, `on_other_keys`,
   `not_enveloped` (lock files and any blob written before encryption was
   enabled), `on_retired` (blobs found on the retiring key; in a
@@ -361,8 +362,13 @@ different key id than the record's replaces the record.
   encryption was enabled has no envelope, and the sweep counts it as not
   enveloped and leaves it alone. To encrypt an existing plaintext store, see
   [Enabling Encryption on Existing Data](#enabling-encryption-on-existing-data).
+- **Dropped ledgers are rotated.** A dropped ledger keeps its data until it
+  is purged, and a restore must be able to read it, so the sweep covers every
+  ledger in the dropped list, whether dropped, restoring or purging, and any
+  ledger part way through a create or drop.
 - **`--ledger` narrows the sweep, not the verification.** A ledger name
-  covers every branch of that ledger, a branch-qualified id only that branch;
+  covers every branch of that ledger and of any dropped ledger of that name,
+  a branch-qualified id only that branch;
   either way the ledger's shared dictionaries are included and graph sources
   are not. The scoped sweep's closing verification still counts the whole
   store, so it ends `swept` while anything else is still on the retiring key;

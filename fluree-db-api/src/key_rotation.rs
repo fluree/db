@@ -16,9 +16,10 @@ use crate::error::{ApiError, Result};
 use crate::Fluree;
 use fluree_db_core::storage::GRAPH_SOURCES_PATH_SEGMENT;
 use fluree_db_core::{EncryptionAdmin, Storage, StorageMethod, StorageRead, StorageWrite};
-use fluree_db_core::{LedgerId, LedgerName};
+use fluree_db_core::{LedgerId, LedgerName, StorageRoot};
+use fluree_db_nameservice::BindingState;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -254,9 +255,12 @@ impl Fluree {
 
     /// The sweep units in a fixed order: each ledger branch's own prefix,
     /// each ledger's shared dictionaries, and the graph-source artifacts.
+    ///
+    /// Ledgers that are not live are included: dropped ones, whose data a
+    /// restore must still read, and those part way through a create, drop
+    /// or restore. Branch units are ordered by prefix, which a drop or
+    /// restore leaves unchanged, so neither shifts a paused sweep's place.
     async fn key_rotation_units(&self, method: &str, scope: Option<&str>) -> Result<Vec<Unit>> {
-        let mut records = self.nameservice().all_records().await?;
-        records.sort_by(|a, b| a.ledger_id.cmp(&b.ledger_id));
         // A bare name scopes the whole ledger; `name:branch` one branch.
         let scope = scope
             .map(|s| match LedgerName::parse(s) {
@@ -264,26 +268,61 @@ impl Fluree {
                 Err(_) => LedgerId::parse(s).map(Ok),
             })
             .transpose()?;
-        let in_scope = |id: &LedgerId| match &scope {
+        let in_scope = |name: &str, branch: &str| match &scope {
             None => true,
-            Some(Ok(branch)) => id == branch,
-            Some(Err(name)) => id.name() == name.as_str(),
+            Some(Ok(id)) => id.name() == name && id.branch() == branch,
+            Some(Err(scope)) => scope.as_str() == name,
         };
-        let mut units = Vec::new();
+        // Branch prefix → label; the first source to name a prefix labels it.
+        let mut branches = BTreeMap::new();
         let mut shared = BTreeSet::new();
-        for record in &records {
-            if !in_scope(&record.ledger_id) {
-                continue;
+        let mut add = |root: StorageRoot, name: &str, branch: &str, label: String| {
+            if in_scope(name, branch) {
+                let prefix = root.namespace(branch).branch_prefix().to_string();
+                branches.entry(prefix).or_insert(label);
+                shared.insert(root);
             }
-            units.push(Unit {
-                label: record.ledger_id.to_string(),
-                prefix: format!(
-                    "fluree:{method}://{}/",
-                    record.storage_namespace().branch_prefix()
-                ),
-            });
-            shared.insert(record.storage_root());
+        };
+        for record in self.nameservice().all_records().await? {
+            let label = record.ledger_id.to_string();
+            add(
+                record.storage_root(),
+                record.ledger_id.name(),
+                record.ledger_id.branch(),
+                label,
+            );
         }
+        if let Some(store) = self.nameservice_mode.publisher() {
+            for (name, binding) in store.list_bindings().await? {
+                let state = match binding.value.state {
+                    BindingState::Active => continue,
+                    BindingState::Creating => "creating",
+                    BindingState::Dropping { .. } => "dropping",
+                    BindingState::Restoring => "restoring",
+                };
+                for listing in &binding.value.branches {
+                    let label = format!("{name}:{} ({state})", listing.branch);
+                    add(binding.value.root.clone(), &name, &listing.branch, label);
+                }
+            }
+            for entry in store.list_dropped().await? {
+                let entry = entry.value;
+                for record in &entry.branches {
+                    let label = format!(
+                        "{}:{} (dropped {})",
+                        entry.name, record.branch, entry.instance
+                    );
+                    add(entry.root.clone(), &entry.name, &record.branch, label);
+                }
+            }
+        }
+        let mut units: Vec<Unit> = branches
+            .into_iter()
+            .map(|(prefix, label)| Unit {
+                label,
+                prefix: format!("fluree:{method}://{prefix}/"),
+            })
+            .collect();
         for root in shared {
             units.push(Unit {
                 label: format!("{root} (shared dictionaries)"),

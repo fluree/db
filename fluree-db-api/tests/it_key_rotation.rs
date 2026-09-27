@@ -1,8 +1,9 @@
 //! Key rotation end to end on file storage: a dry run counts without
 //! writing, a scoped run leaves stragglers that verification reports, a
 //! full run re-envelopes everything and stamps completion, a record left
-//! by another holder is refused while fresh and taken over when stale, and
-//! the data reads back through a client holding only the new key.
+//! by another holder is refused while fresh and taken over when stale,
+//! dropped ledgers are covered, and the data reads back through a client
+//! holding only the new key.
 
 #![cfg(feature = "native")]
 
@@ -11,8 +12,9 @@ mod support;
 use fluree_db_api::key_rotation::{
     KeyRotationOptions, KeyRotationProgress, KeyRotationState, RECORD_PATH,
 };
-use fluree_db_api::{Fluree, FlureeBuilder};
+use fluree_db_api::{DropMode, Fluree, FlureeBuilder};
 use fluree_db_core::{StorageRead, StorageWrite};
+use fluree_db_nameservice::{lifecycle, BindingState, NameBinding};
 use serde_json::json;
 use std::path::Path;
 
@@ -356,4 +358,74 @@ async fn rotation_through_an_address_identifier_router() {
     assert!(done.rewritten > 0);
     assert_eq!(done.completion.expect("verified").remaining_on_retired, 0);
     assert_eq!(count_things(&fluree, "rot-routed").await, 20);
+}
+
+/// Put `ledger`'s binding in `state`, as the first step of a drop does.
+async fn set_binding_state(fluree: &Fluree, ledger: &str, state: BindingState) {
+    let store = fluree.publisher().unwrap();
+    let current = store.get_binding(ledger).await.unwrap().expect("binding");
+    let next = NameBinding {
+        state,
+        ..current.value
+    };
+    store
+        .cas_binding(ledger, Some(current.version), Some(&next))
+        .await
+        .unwrap();
+}
+
+/// A dropped ledger keeps its data for a restore, so rotation covers it, and
+/// the ledgers a crash left part way through a purge or a drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn rotation_covers_dropped_ledgers_and_unfinished_drops() {
+    let data = tempfile::TempDir::new().expect("tempdir");
+    let dropped = {
+        let fluree = client(data.path(), &[(1, KEY1)], 1).await;
+        seed(&fluree, "rot-dropped", 30).await;
+        seed(&fluree, "rot-purging", 10).await;
+        seed(&fluree, "rot-stuck", 20).await;
+        fluree
+            .create_branch("rot-dropped", "dev", None, None)
+            .await
+            .expect("branch");
+        let dev = fluree.ledger("rot-dropped:dev").await.expect("dev");
+        let tx =
+            json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:dev", "ex:name": "dev"});
+        fluree.insert(dev, &tx).await.expect("insert on dev");
+
+        let dropped = fluree
+            .drop_ledger("rot-dropped", DropMode::Soft)
+            .await
+            .expect("drop")
+            .instance
+            .expect("instance");
+        let purging = fluree
+            .drop_ledger("rot-purging", DropMode::Soft)
+            .await
+            .expect("drop")
+            .instance
+            .expect("instance");
+        lifecycle::begin_purge(fluree.publisher().unwrap(), &purging)
+            .await
+            .expect("begin purge");
+        set_binding_state(&fluree, "rot-stuck", BindingState::Dropping { hard: false }).await;
+        dropped
+    };
+
+    let fluree = client(data.path(), &[(1, KEY1), (2, KEY2)], 2).await;
+    let done = run_to_end(&fluree, opts(1)).await;
+    assert_eq!(done.state, KeyRotationState::Completed, "{done:?}");
+    assert_eq!(done.completion.expect("verified").remaining_on_retired, 0);
+
+    // Restored, the data reads back through a client holding key 2 alone.
+    drop(fluree);
+    let fluree = client(data.path(), &[(2, KEY2)], 2).await;
+    fluree
+        .restore_dropped(dropped.as_str())
+        .await
+        .expect("restore");
+    assert_eq!(count_things(&fluree, "rot-dropped").await, 30);
+    assert!(fluree.db("rot-dropped:dev").await.expect("dev").t > 0);
+    set_binding_state(&fluree, "rot-stuck", BindingState::Active).await;
+    assert_eq!(count_things(&fluree, "rot-stuck").await, 20);
 }
