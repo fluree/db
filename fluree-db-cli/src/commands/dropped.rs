@@ -38,6 +38,22 @@ pub async fn run(action: DroppedAction, dirs: &FlureeDir, direct: bool) -> CliRe
             target.finish(dirs).await;
             result
         }
+        DroppedAction::Sweep {
+            dry_run,
+            force,
+            remote,
+        } => {
+            if !dry_run && !force {
+                return Err(CliError::Usage(
+                    "use --force to confirm deletion, or --dry-run to list what would be deleted"
+                        .to_string(),
+                ));
+            }
+            let target = Target::resolve(dirs, remote.as_deref(), direct).await?;
+            let result = sweep(&target, dry_run).await;
+            target.finish(dirs).await;
+            result
+        }
     }
 }
 
@@ -173,5 +189,65 @@ async fn purge(target: &Target, instance: &str) -> CliResult<()> {
         Target::Local(fluree) => DropSummary::from_report(fluree.purge_dropped(instance).await?),
     };
     summary.print_purged();
+    Ok(())
+}
+
+/// What a sweep found, as the server reports it.
+#[derive(Deserialize)]
+struct Sweep {
+    orphans: Vec<Orphan>,
+    files_deleted: usize,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct Orphan {
+    root: String,
+    files: usize,
+}
+
+async fn sweep(target: &Target, dry_run: bool) -> CliResult<()> {
+    let sweep: Sweep = match target {
+        Target::Server { client, .. } => from_response(client.sweep_orphans(dry_run).await?)?,
+        Target::Local(fluree) => {
+            let report = fluree.sweep_orphan_instances(dry_run).await?;
+            Sweep {
+                orphans: report
+                    .orphans
+                    .into_iter()
+                    .map(|o| Orphan {
+                        root: o.root.to_string(),
+                        files: o.artifacts,
+                    })
+                    .collect(),
+                files_deleted: report.artifacts_deleted,
+                warnings: report.warnings,
+            }
+        }
+    };
+
+    if sweep.orphans.is_empty() {
+        println!("No unreferenced data found.");
+        return Ok(());
+    }
+    for orphan in &sweep.orphans {
+        println!("{}  ({} files)", orphan.root, orphan.files);
+    }
+    if dry_run {
+        println!(
+            "{} folder(s) would be deleted; run with --force to delete them",
+            sweep.orphans.len()
+        );
+    } else {
+        println!(
+            "Deleted {} file(s) from {} folder(s)",
+            sweep.files_deleted,
+            sweep.orphans.len()
+        );
+    }
+    for warning in &sweep.warnings {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
 }

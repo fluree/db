@@ -138,6 +138,8 @@ pub use admin::{
     GraphSourceDropReport,
     // Index maintenance
     IndexStatusResult,
+    OrphanInstance,
+    OrphanSweepReport,
     ReindexOptions,
     ReindexResult,
     SyncGraphOpts,

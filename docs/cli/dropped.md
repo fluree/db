@@ -1,6 +1,6 @@
 # fluree dropped
 
-List, restore or purge ledgers dropped with [`fluree drop`](drop.md).
+List, restore or purge ledgers dropped with [`fluree drop`](drop.md), and sweep away stored data that no ledger owns.
 
 ## Usage
 
@@ -8,6 +8,7 @@ List, restore or purge ledgers dropped with [`fluree drop`](drop.md).
 fluree dropped list
 fluree dropped restore <INSTANCE>
 fluree dropped purge <INSTANCE> --force
+fluree dropped sweep --dry-run | --force
 ```
 
 ## Subcommands
@@ -17,12 +18,14 @@ fluree dropped purge <INSTANCE> --force
 | `fluree dropped list` | Lists dropped ledgers, most recently dropped first. |
 | `fluree dropped restore <INSTANCE>` | Restores a dropped ledger under the name it was dropped under. |
 | `fluree dropped purge <INSTANCE> --force` | Deletes a dropped ledger's data. Irreversible. |
+| `fluree dropped sweep --force` | Deletes stored data that no ledger or dropped ledger owns. Irreversible. |
 
 ## Options
 
 | Option | Description |
 |--------|-------------|
-| `--force` | Confirms deletion. Required by `purge`. |
+| `--force` | Confirms deletion. Required by `purge`, and by `sweep` unless `--dry-run` is given. |
+| `--dry-run` | `sweep` only: lists what would be deleted, and deletes nothing. |
 | `--remote <NAME>` | Run against a configured remote server. |
 
 ## Description
@@ -33,6 +36,7 @@ A dropped ledger is named by its **instance id**, not its name, because a new le
 
 - **Restore** brings the ledger back under its name, with the branches and data it had. A branch dropped before the ledger stays dropped. Writers that loaded the ledger before it was dropped stay refused and must reload it. Restore fails if another ledger now holds the name; drop or rename that one first.
 - **Purge** deletes the data and removes the entry.
+- **Sweep** deletes the storage folders of ledgers that no longer exist and are not in the dropped list. These hold files written by a writer that was still running when its ledger was purged, and the data of a `create` that never finished. Live and dropped ledgers are never touched, nor is data stored under a ledger's name by versions before instance folders. Sweep lists the whole store, so it can take a while on a large object store; run it against the server that owns the storage, not a peer.
 
 A state of `restoring` or `purging` means that operation was interrupted; running it again finishes it.
 
@@ -47,6 +51,9 @@ fluree dropped restore 01J9Z6Q8W2M4T7XK3B5N1C0D9E
 
 fluree drop oldledger
 fluree dropped purge 01J9Z6Q8W2M4T7XK3B5N1C0D9E --force
+
+fluree dropped sweep --dry-run
+fluree dropped sweep --force
 ```
 
 ## Output
@@ -68,6 +75,12 @@ Restored ledger 'oldledger'
 Purge:
 ```
 Purged dropped ledger 'oldledger' (deleted 73 artifacts)
+```
+
+Sweep:
+```
+oldledger/@01J9Z6Q8W2M4T7XK3B5N1C0D9E  (1 files)
+Deleted 1 file(s) from 1 folder(s)
 ```
 
 ## Errors

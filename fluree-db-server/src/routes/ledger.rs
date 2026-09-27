@@ -504,6 +504,77 @@ pub async fn purge_dropped(State(state): State<Arc<AppState>>, request: Request)
     .into_response()
 }
 
+/// Asks for an orphan sweep; `dry_run` only reports what it would delete.
+#[derive(Deserialize, Default)]
+pub struct OrphanSweepRequest {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Serialize)]
+pub struct OrphanSweepResponse {
+    pub dry_run: bool,
+    /// Each unreferenced instance folder, `{name}/@{instance}`.
+    pub orphans: Vec<OrphanResponse>,
+    pub files_deleted: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct OrphanResponse {
+    pub root: String,
+    pub files: usize,
+}
+
+/// Delete instance folders no ledger or dropped ledger references
+///
+/// POST /fluree/dropped/sweep `{"dry_run": bool}` (body optional)
+///
+/// Runs where the nameservice that owns the storage is: a peer forwards.
+pub async fn sweep_orphans(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    async {
+        let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+            .await
+            .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+        let req: OrphanSweepRequest = if body.is_empty() {
+            OrphanSweepRequest::default()
+        } else {
+            serde_json::from_slice(&body)
+                .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?
+        };
+        let report = state
+            .fluree
+            .sweep_orphan_instances(req.dry_run)
+            .await
+            .map_err(ServerError::Api)?;
+        tracing::info!(
+            dry_run = report.dry_run,
+            orphans = report.orphans.len(),
+            files_deleted = report.artifacts_deleted,
+            "orphan sweep"
+        );
+        Ok::<_, ServerError>(Json(OrphanSweepResponse {
+            dry_run: report.dry_run,
+            orphans: report
+                .orphans
+                .into_iter()
+                .map(|o| OrphanResponse {
+                    root: o.root.to_string(),
+                    files: o.artifacts,
+                })
+                .collect(),
+            files_deleted: report.artifacts_deleted,
+            warnings: report.warnings,
+        }))
+    }
+    .await
+    .into_response()
+}
+
 // =============================================================================
 // Storage sweep
 // =============================================================================

@@ -438,7 +438,7 @@ pub enum Commands {
         remote: Option<String>,
     },
 
-    /// List, restore, or purge dropped ledgers
+    /// List, restore, or purge dropped ledgers, and sweep data none owns
     Dropped {
         #[command(subcommand)]
         action: DroppedAction,
@@ -1751,6 +1751,21 @@ pub enum DroppedAction {
     Purge {
         /// Instance id of the dropped ledger (from `fluree dropped list`)
         instance: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Delete stored data that no ledger or dropped ledger owns (irreversible)
+    Sweep {
+        /// Only list what would be deleted
+        #[arg(long, conflicts_with = "force")]
+        dry_run: bool,
 
         /// Required flag to confirm deletion
         #[arg(long)]

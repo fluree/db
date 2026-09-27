@@ -2198,6 +2198,51 @@ POST /dropped/purge
 - `400 Bad Request` - `instance` is not a valid instance id
 - `404 Not Found` - No dropped ledger has this instance id
 
+### POST /dropped/sweep
+
+Delete the storage folders that no ledger and no dropped ledger owns. These
+hold files written by a writer that was still running when its ledger was
+purged, and the data of a create that never finished. Live and dropped
+ledgers are never touched, nor is data stored under a ledger's name by
+versions before instance folders.
+
+Lists the whole store. A peer forwards the request to the transaction server,
+whose nameservice knows every ledger.
+
+**URL:**
+```
+POST /dropped/sweep
+```
+
+**Authentication:** Admin-protected.
+
+**Request Body (optional):**
+
+```json
+{ "dry_run": true }
+```
+
+`dry_run` reports what would be deleted and deletes nothing. It defaults to
+`false`.
+
+**Response:**
+
+```json
+{
+  "dry_run": false,
+  "orphans": [
+    { "root": "oldledger/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3", "files": 1 }
+  ],
+  "files_deleted": 1
+}
+```
+
+`warnings` is present when some deletions failed; sweep again to retry them.
+
+**Status Codes:**
+- `200 OK` - Swept (or, on a dry run, reported)
+- `400 Bad Request` - Invalid body
+
 ### GET /context/{ledger...}
 
 Get the default JSON-LD context for a ledger.

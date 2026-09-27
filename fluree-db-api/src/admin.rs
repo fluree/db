@@ -163,6 +163,25 @@ impl From<&DroppedLedger> for DroppedLedgerInfo {
     }
 }
 
+/// The instance folders an [orphan sweep](crate::Fluree::sweep_orphan_instances)
+/// found no ledger referencing.
+#[derive(Debug, Clone, Default)]
+pub struct OrphanSweepReport {
+    pub orphans: Vec<OrphanInstance>,
+    /// Files deleted across them: none on a dry run.
+    pub artifacts_deleted: usize,
+    pub dry_run: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrphanInstance {
+    /// `{name}/@{instance}`.
+    pub root: StorageRoot,
+    /// Files found under it.
+    pub artifacts: usize,
+}
+
 /// Report of what was deleted/retracted for a graph source
 #[derive(Debug, Clone, Default)]
 pub struct GraphSourceDropReport {
@@ -940,6 +959,83 @@ impl crate::Fluree {
             artifacts_deleted = report.artifacts_deleted,
             "Dropped ledger purged"
         );
+        Ok(report)
+    }
+
+    /// Delete the instance folders no ledger and no dropped ledger
+    /// references, or with `dry_run` only report them. They hold bytes a
+    /// writer stored after its ledger was purged, and the data of creates
+    /// that never finished.
+    ///
+    /// An instance is referenced by a binding or a registry entry from
+    /// before its first byte is written until after its folder is purged,
+    /// and its id is never reused, so a folder found unreferenced stays
+    /// unreferenced. Name roots (`{name}/…`, including `{name}/@shared/`)
+    /// are not instance folders and are never touched.
+    ///
+    /// Lists the whole store. Run it against the nameservice that owns the
+    /// storage: a peer's local copy may not know every ledger.
+    pub async fn sweep_orphan_instances(&self, dry_run: bool) -> Result<OrphanSweepReport> {
+        let storage = self.sweepable_storage()?;
+        let store = self.publisher()?;
+        let method = storage.storage_method();
+        let mut folders: std::collections::BTreeMap<StorageRoot, Vec<String>> = Default::default();
+        for address in storage.list_prefix(&format!("fluree:{method}://")).await? {
+            if let Some(root) = StorageRoot::instance_root_of(&address) {
+                folders.entry(root).or_default().push(address);
+            }
+        }
+
+        // Read after listing: every folder listed was referenced then, and
+        // still is unless it has since been purged.
+        let mut referenced: HashSet<InstanceId> = HashSet::new();
+        for (_, binding) in store.list_bindings().await? {
+            referenced.extend(binding.value.root.instance());
+            referenced.insert(binding.value.instance);
+        }
+        for entry in store.list_dropped().await? {
+            referenced.extend(entry.value.root.instance());
+            referenced.insert(entry.value.instance);
+        }
+
+        let mut report = OrphanSweepReport {
+            dry_run,
+            ..Default::default()
+        };
+        for (root, files) in folders {
+            let Some(instance) = root.instance() else {
+                continue;
+            };
+            // The listings are eventually consistent on some backends and
+            // not one snapshot on any: confirm by key, around the binding
+            // read, since a drop writes the registry entry before releasing
+            // the name and a restore claims the name before deleting it.
+            if referenced.contains(&instance)
+                || store.get_dropped(&instance).await?.is_some()
+                || store
+                    .get_binding(root.name())
+                    .await?
+                    .is_some_and(|b| b.value.instance == instance)
+                || store.get_dropped(&instance).await?.is_some()
+            {
+                continue;
+            }
+            report.orphans.push(OrphanInstance {
+                root: root.clone(),
+                artifacts: files.len(),
+            });
+            if dry_run {
+                continue;
+            }
+            let failed = storage.delete_many(&files).await;
+            report.artifacts_deleted += files.len() - failed.len();
+            report.warnings.extend(
+                failed
+                    .into_iter()
+                    .map(|(file, e)| format!("Failed to delete {file}: {e}")),
+            );
+            info!(%root, files = files.len(), "Orphaned instance folder swept");
+        }
         Ok(report)
     }
 

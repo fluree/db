@@ -124,6 +124,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Dropped ledgers stay in a registry until restored or purged.
         .route("/dropped/restore", post(ledger::restore_dropped))
         .route("/dropped/purge", post(ledger::purge_dropped))
+        // Deletes instance folders nothing references: storage-wide.
+        .route("/dropped/sweep", post(ledger::sweep_orphans))
         .route("/reindex", post(ledger::reindex))
         // Reclaims index artifacts no index chain references. Deletes storage
         // and holds the ledger against indexing, so it is admin-gated and

@@ -891,3 +891,95 @@ async fn purge_deletes_an_instance_root_from_both_storage_tiers() {
     assert_eq!(files_under(&commit, &root).await, Vec::<String>::new());
     assert_eq!(files_under(&index, &root).await, Vec::<String>::new());
 }
+
+/// The orphan sweep deletes instance folders nothing references, such as
+/// bytes a stale writer stored after its ledger was purged, and nothing
+/// else: not live or soft-dropped ledgers, and not a name root's `@shared`.
+#[tokio::test]
+async fn orphan_sweep_deletes_only_unreferenced_instance_folders() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let admin = fluree.admin_storage().expect("managed backend");
+    let tx = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:name": "A"});
+
+    let mut roots = std::collections::HashMap::new();
+    for name in ["live", "kept", "gone"] {
+        let ledger = fluree
+            .create_ledger(&format!("{name}:main"))
+            .await
+            .expect("create");
+        let ledger = fluree.insert(ledger, &tx).await.expect("insert").ledger;
+        roots.insert(name, ledger.storage_namespace().root().to_string());
+    }
+    let kept = fluree
+        .drop_ledger("kept", DropMode::Soft)
+        .await
+        .expect("drop kept")
+        .instance
+        .expect("instance");
+    fluree
+        .drop_ledger("gone", DropMode::Hard)
+        .await
+        .expect("drop gone");
+
+    // A writer that resolved `gone` before its drop stores a commit after
+    // the purge listed the folder; a create that never finished left one.
+    let late = format!("fluree:file://{}/main/commit/late.fcv2", roots["gone"]);
+    let abandoned = "abandoned/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3";
+    let name_root = [
+        "fluree:file://legacy/main/commit/c.fcv2",
+        "fluree:file://legacy/@shared/dicts/d",
+    ];
+    for address in [
+        late.as_str(),
+        &format!("fluree:file://{abandoned}/main/txn/t"),
+    ]
+    .into_iter()
+    .chain(name_root)
+    {
+        admin.write_bytes(address, b"x").await.expect("write");
+    }
+    let everything = |prefix: &str| {
+        let prefix = format!("fluree:file://{prefix}/");
+        async move {
+            let mut files = admin.list_prefix(&prefix).await.expect("list");
+            files.sort();
+            files
+        }
+    };
+    let live_files = everything(&roots["live"]).await;
+    let kept_files = everything(&roots["kept"]).await;
+
+    let dry = fluree.sweep_orphan_instances(true).await.expect("dry run");
+    let mut found: Vec<String> = dry.orphans.iter().map(|o| o.root.to_string()).collect();
+    found.sort();
+    assert_eq!(found, vec![abandoned.to_string(), roots["gone"].clone()]);
+    assert_eq!(dry.artifacts_deleted, 0);
+    assert!(
+        admin.exists(&late).await.expect("exists"),
+        "a dry run deletes nothing"
+    );
+
+    let swept = fluree.sweep_orphan_instances(false).await.expect("sweep");
+    assert_eq!(swept.orphans.len(), 2);
+    assert_eq!(swept.artifacts_deleted, 2, "{swept:?}");
+    assert!(everything(&roots["gone"]).await.is_empty());
+    assert!(everything(abandoned).await.is_empty());
+    // Background indexing may add files meanwhile; the sweep must remove none.
+    for (root, before) in [("live", live_files), ("kept", kept_files)] {
+        let after = everything(&roots[root]).await;
+        let removed: Vec<_> = before.iter().filter(|f| !after.contains(f)).collect();
+        assert!(removed.is_empty(), "the sweep deleted {root}'s {removed:?}");
+    }
+    for address in name_root {
+        assert!(admin.exists(address).await.expect("exists"), "{address}");
+    }
+
+    fluree
+        .restore_dropped(kept.as_str())
+        .await
+        .expect("the soft-dropped ledger still restores");
+    assert!(fluree.db("kept:main").await.expect("load kept").t > 0);
+}

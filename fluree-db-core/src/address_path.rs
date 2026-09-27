@@ -142,6 +142,35 @@ impl StorageRoot {
         InstanceId::parse(instance).ok()
     }
 
+    /// The ledger name this root sits under.
+    pub fn name(&self) -> &str {
+        self.0
+            .rsplit_once(INSTANCE_SEPARATOR)
+            .map_or(self.0.as_str(), |(name, _)| name)
+    }
+
+    /// The instance root holding a stored file: `mydb/@01JB…` for
+    /// `fluree:file://mydb/@01JB…/main/commit/x`. `None` for a file under a
+    /// name root (`mydb/main/…`, `mydb/@shared/…`) or outside any ledger.
+    ///
+    /// A name holds no `@`, so the first segment starting with one ends the
+    /// name, and it is an instance folder exactly when it names an instance.
+    pub fn instance_root_of(address: &str) -> Option<Self> {
+        let path = address.split_once("://").map_or(address, |(_, path)| path);
+        let mut name_len: usize = 0;
+        for segment in path.split('/') {
+            if let Some(instance) = segment.strip_prefix('@') {
+                let name = LedgerName::parse(path.get(..name_len.checked_sub(1)?)?).ok()?;
+                return Some(Self::for_instance(
+                    &name,
+                    &InstanceId::parse(instance).ok()?,
+                ));
+            }
+            name_len += segment.len() + 1;
+        }
+        None
+    }
+
     /// The namespace of `branch` under this root.
     pub fn namespace(&self, branch: &str) -> StorageNamespace {
         StorageNamespace::new(self.clone(), branch)
@@ -275,6 +304,40 @@ mod tests {
             ns.shared_prefix(),
             "acme/inventory/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3/@shared"
         );
+    }
+
+    #[test]
+    fn a_stored_file_names_its_instance_root() {
+        fn root(address: &str) -> Option<String> {
+            StorageRoot::instance_root_of(address).map(|r| r.to_string())
+        }
+        let id = "01JB8ZK4X5Y6Z7A8B9C0D1E2F3";
+        assert_eq!(
+            root(&format!("fluree:file://acme/inventory/@{id}/main/commit/x")),
+            Some(format!("acme/inventory/@{id}"))
+        );
+        assert_eq!(
+            root(&format!("fluree:s3://mydb/@{id}/@shared/dicts/d")),
+            Some(format!("mydb/@{id}"))
+        );
+        assert_eq!(
+            StorageRoot::parse(&format!("acme/inventory/@{id}"))
+                .unwrap()
+                .name(),
+            "acme/inventory"
+        );
+        assert_eq!(StorageRoot::parse("acme").unwrap().name(), "acme");
+
+        for outside in [
+            "fluree:file://mydb/main/commit/x".to_string(),
+            "fluree:file://mydb/@shared/dicts/d".to_string(),
+            format!("fluree:file://ns@v3/@dropped/{id}.json"),
+            "fluree:file://ns@v3/mydb/@binding.json".to_string(),
+            format!("fluree:file://@{id}/main/commit/x"),
+            format!("fluree:file://mydb/@{id}x/main/commit/x"),
+        ] {
+            assert_eq!(root(&outside), None, "{outside}");
+        }
     }
 
     #[test]

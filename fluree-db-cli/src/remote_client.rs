@@ -1943,6 +1943,23 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Sweep storage for instance folders nothing references. Calls
+    /// `POST {base_url}/dropped/sweep` with `{"dry_run": bool}`.
+    pub async fn sweep_orphans(
+        &self,
+        dry_run: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("dropped/sweep");
+        let body = serde_json::json!({ "dry_run": dry_run });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
     // =========================================================================
     // RDF export
     // =========================================================================
