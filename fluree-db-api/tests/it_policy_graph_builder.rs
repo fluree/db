@@ -376,9 +376,10 @@ async fn tracked_execute_enforces_and_reports_policy() {
 /// `view.policy()` is set. An unwrapped view hydrates forbidden nodes without
 /// changing the row count, so this asserts on node contents.
 ///
-/// No cross-check here. The `from`-driven builder re-loads an unwrapped view
-/// before formatting and leaks the denied property, so matching it would encode
-/// that leak. Tracked separately.
+/// No cross-check here. The `from`-driven builder had the same defect and is
+/// fixed in this same branch, covered by
+/// `it_policy_query_connection::crawl_hydration_honors_policy_on_a_single_ledger`,
+/// so comparing against it would only restate that test.
 #[tokio::test]
 async fn subject_crawl_omits_denied_property() {
     const LEDGER: &str = "repro/gqb-crawl:main";
