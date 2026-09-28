@@ -332,14 +332,9 @@ impl<'a> ViewQueryBuilder<'a> {
                     .await?
             }
         };
-        match self.view.policy() {
-            Some(policy) => Ok(result
-                .format_async_with_policy(self.view.as_graph_db_ref(), &format_config, policy)
-                .await?),
-            None => Ok(result
-                .format_async(self.view.as_graph_db_ref(), &format_config)
-                .await?),
-        }
+        Ok(result
+            .format_async_for_view(self.view, &format_config)
+            .await?)
     }
 
     /// Execute and return formatted string output.
@@ -612,14 +607,9 @@ impl<'a> DatasetQueryBuilder<'a> {
 
         // Use primary view's db for formatting
         if let Some(primary) = self.dataset.primary() {
-            match primary.policy() {
-                Some(policy) => Ok(result
-                    .format_async_with_policy(primary.as_graph_db_ref(), &format_config, policy)
-                    .await?),
-                None => Ok(result
-                    .format_async(primary.as_graph_db_ref(), &format_config)
-                    .await?),
-            }
+            Ok(result
+                .format_async_for_view(primary, &format_config)
+                .await?)
         } else {
             Err(ApiError::query("No primary view in dataset for formatting"))
         }

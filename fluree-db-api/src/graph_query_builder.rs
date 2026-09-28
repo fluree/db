@@ -307,14 +307,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     .await?
             }
         };
-        match view.policy() {
-            Some(policy) => Ok(result
-                .format_async_with_policy(view.as_graph_db_ref(), &format_config, policy)
-                .await?),
-            None => Ok(result
-                .format_async(view.as_graph_db_ref(), &format_config)
-                .await?),
-        }
+        Ok(result.format_async_for_view(&view, &format_config).await?)
     }
 
     /// Execute with tracking (fuel, time, policy stats).
@@ -554,14 +547,9 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
                     .await?
             }
         };
-        match self.view.policy() {
-            Some(policy) => Ok(result
-                .format_async_with_policy(self.view.as_graph_db_ref(), &format_config, policy)
-                .await?),
-            None => Ok(result
-                .format_async(self.view.as_graph_db_ref(), &format_config)
-                .await?),
-        }
+        Ok(result
+            .format_async_for_view(self.view, &format_config)
+            .await?)
     }
 
     /// Execute with tracking (fuel, time, policy stats).
