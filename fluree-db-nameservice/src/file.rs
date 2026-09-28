@@ -463,6 +463,9 @@ impl FileNameService {
             return Ok(None);
         }
         let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        if main.is_deleted() {
+            return Ok(None);
+        }
         let index_file: Option<NsIndexFileV2> = self
             .read_json_from_address(&Self::index_address(ledger_name, branch))
             .await?;
@@ -1435,7 +1438,7 @@ impl RefLookup for FileNameService {
             RefKind::CommitHead => {
                 let address = Self::ns_address(&ledger_name, &branch);
                 let main_file: Option<NsFileV2> = self.read_json_from_address(&address).await?;
-                match main_file {
+                match main_file.filter(|f| !f.is_deleted()) {
                     None => Ok(None),
                     Some(f) => Ok(Some(RefValue {
                         id: f
@@ -1447,6 +1450,13 @@ impl RefLookup for FileNameService {
                 }
             }
             RefKind::IndexHead => {
+                // A deleted record has no heads, whatever its index file says.
+                let main_address = Self::ns_address(&ledger_name, &branch);
+                let main_file: Option<NsFileV2> =
+                    self.read_json_from_address(&main_address).await?;
+                if main_file.as_ref().is_some_and(NsFileV2::is_deleted) {
+                    return Ok(None);
+                }
                 // Check separate index file first, then fall back to main file.
                 let index_address = Self::index_address(&ledger_name, &branch);
                 let index_file: Option<NsIndexFileV2> =
@@ -1464,9 +1474,6 @@ impl RefLookup for FileNameService {
                 }
 
                 // Fall back to main file's inline index.
-                let main_address = Self::ns_address(&ledger_name, &branch);
-                let main_file: Option<NsFileV2> =
-                    self.read_json_from_address(&main_address).await?;
                 match main_file {
                     None => Ok(None),
                     Some(f) => Ok(Some(RefValue {
@@ -1727,7 +1734,9 @@ impl StatusLookup for FileNameService {
 
         let main_file: Option<NsFileV2> = self.read_json_from_address(&address).await?;
 
-        Ok(main_file.map(|f| f.to_status_value()))
+        Ok(main_file
+            .filter(|f| !f.is_deleted())
+            .map(|f| f.to_status_value()))
     }
 }
 
@@ -1806,7 +1815,9 @@ impl ConfigLookup for FileNameService {
 
         let main_file: Option<NsFileV2> = self.read_json_from_address(&address).await?;
 
-        Ok(main_file.map(|f| f.to_config_value()))
+        Ok(main_file
+            .filter(|f| !f.is_deleted())
+            .map(|f| f.to_config_value()))
     }
 }
 

@@ -1230,6 +1230,125 @@ pub async fn stopped_create_is_rolled_back_unless_renewed<S: LifecycleStore>(sto
     assert!(store.get_binding("mydb").await.unwrap().is_some());
 }
 
+/// A creator rolled back while paused, resumed after another ledger took the
+/// name, finds that ledger's record at its key and deletes nothing.
+pub async fn a_rolled_back_creator_deletes_nothing<S: LifecycleStore + crate::NameServiceLookup>(
+    store: &S,
+) {
+    let stale = lifecycle::begin_create(store, &id("mydb")).await.unwrap();
+    let seen = store.get_binding("mydb").await.unwrap().unwrap().version;
+    lifecycle::rollback_create(store, "mydb", seen)
+        .await
+        .unwrap()
+        .expect("rolled back");
+    let live = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+
+    let resumed = NsRecord {
+        storage_root: None,
+        ..stale.record.clone()
+    };
+    assert!(matches!(
+        lifecycle::insert_fenced(store, &resumed).await.unwrap_err(),
+        NameServiceError::Conflict(_)
+    ));
+    let record = store
+        .lookup("mydb:main")
+        .await
+        .unwrap()
+        .expect("still live");
+    assert_eq!(record.fence, live.fence);
+}
+
+/// A restore that made its ledger visible and stopped before forgetting its
+/// entry leaves that entry restoring. Dropping the ledger replaces the entry
+/// rather than adopt it, so the stale restore cannot be resumed.
+pub async fn drop_replaces_a_finished_restores_entry<S: LifecycleStore>(store: &S) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    let stale = store
+        .get_dropped(&dropped.instance)
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    lifecycle::restore_dropped(store, &dropped.instance)
+        .await
+        .unwrap();
+    let fences = stale
+        .branches
+        .iter()
+        .map(|r| crate::BranchFence::new(&r.branch, Fence::generate()))
+        .collect();
+    let leftover = crate::DroppedLedger {
+        state: DroppedState::Restoring { fences },
+        ..stale
+    };
+    store
+        .cas_dropped(&dropped.instance, None, Some(&leftover))
+        .await
+        .unwrap();
+
+    lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .expect("dropped");
+    let entry = store
+        .get_dropped(&dropped.instance)
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    assert_eq!(entry.state, DroppedState::Dropped);
+    assert!(lifecycle::resume_restore(store, &dropped.instance)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        store.get_binding("mydb").await.unwrap().is_none(),
+        "stays dropped"
+    );
+}
+
+/// A create under way cannot be dropped: it has nothing a drop could keep.
+/// Rolling it back is what frees the name.
+pub async fn a_create_under_way_is_not_dropped<S: LifecycleStore>(store: &S) {
+    lifecycle::begin_create(store, &id("mydb")).await.unwrap();
+    assert!(matches!(
+        lifecycle::drop_ledger(store, &name("mydb"), true)
+            .await
+            .unwrap_err(),
+        NameServiceError::Conflict(_)
+    ));
+    assert_eq!(
+        store
+            .get_binding("mydb")
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .state,
+        BindingState::Creating
+    );
+}
+
+/// A dropped branch has no heads, status or config to read.
+pub async fn a_dropped_branch_reads_as_absent<S: crate::NameServicePublisher>(store: &S) {
+    use crate::RefKind;
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap();
+    assert!(store.heads("mydb:main").await.unwrap().is_none());
+    for kind in [RefKind::CommitHead, RefKind::IndexHead] {
+        assert!(store.get_ref("mydb:main", kind).await.unwrap().is_none());
+    }
+    assert!(store.get_status("mydb:main").await.unwrap().is_none());
+    assert!(store.get_config("mydb:main").await.unwrap().is_none());
+}
+
 pub async fn run_all<S, F, Fut>(mut make: F)
 where
     S: crate::NameServicePublisher,
@@ -1267,6 +1386,10 @@ where
     retracted_graph_source_index_resets(&make().await).await;
     resuming_starts_nothing(&make().await).await;
     stopped_create_is_rolled_back_unless_renewed(&make().await).await;
+    a_rolled_back_creator_deletes_nothing(&make().await).await;
+    drop_replaces_a_finished_restores_entry(&make().await).await;
+    a_create_under_way_is_not_dropped(&make().await).await;
+    a_dropped_branch_reads_as_absent(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1308,6 +1431,10 @@ macro_rules! lifecycle_conformance_tests {
             retracted_graph_source_index_resets,
             resuming_starts_nothing,
             stopped_create_is_rolled_back_unless_renewed,
+            a_rolled_back_creator_deletes_nothing,
+            drop_replaces_a_finished_restores_entry,
+            a_create_under_way_is_not_dropped,
+            a_dropped_branch_reads_as_absent,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

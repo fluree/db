@@ -33,7 +33,7 @@ fn now_ms() -> i64 {
 }
 
 fn contended(name: &str) -> NameServiceError {
-    NameServiceError::storage(format!(
+    NameServiceError::conflict(format!(
         "the name binding for '{name}' kept changing; retry"
     ))
 }
@@ -48,10 +48,18 @@ fn name_taken(name: &str, binding: Option<&NameBinding>) -> NameServiceError {
 }
 
 /// Insert `record` for a binding the caller holds. A record already at the
-/// key with another fence is garbage, since the caller's binding names the
-/// only fence that key can be live under, so it is deleted and the insert
-/// retried. A record carrying no fence predates fencing and is never deleted.
-async fn insert_fenced<S: LifecycleStore + ?Sized>(store: &S, record: &NsRecord) -> Result<()> {
+/// key with another fence is garbage while the caller's binding still lists
+/// the caller's fence, since that binding names the only fence the key can
+/// be live under, so it is deleted and the insert retried. The binding is
+/// read after the record: a record seen before the binding still listed the
+/// caller cannot be live under a later one, whose fence is fresh. A caller
+/// whose claim has gone deletes nothing: the record may belong to the
+/// ledger that took the name. A record carrying no fence predates fencing
+/// and is never deleted.
+pub(crate) async fn insert_fenced<S: LifecycleStore + ?Sized>(
+    store: &S,
+    record: &NsRecord,
+) -> Result<()> {
     for _ in 0..MAX_ATTEMPTS {
         let Some(existing) = store.insert_record(record).await? else {
             return Ok(());
@@ -65,6 +73,16 @@ async fn insert_fenced<S: LifecycleStore + ?Sized>(store: &S, record: &NsRecord)
                 record.ledger_id
             )));
         };
+        let claimed = store
+            .get_binding(&record.name)
+            .await?
+            .is_some_and(|b| b.value.fence_of(&record.branch) == record.fence);
+        if !claimed {
+            return Err(NameServiceError::conflict(format!(
+                "the claim on '{}' that this write was part of is gone",
+                record.name
+            )));
+        }
         store.delete_record(&record.ledger_id, garbage).await?;
     }
     Err(contended(&record.name))
@@ -155,7 +173,7 @@ pub async fn activate<S: LifecycleStore + ?Sized>(
 
 /// The error a create reports when it finds its claim on `name` gone.
 pub fn create_rolled_back(name: &str) -> NameServiceError {
-    NameServiceError::storage(format!(
+    NameServiceError::conflict(format!(
         "the create of '{name}' was rolled back before it finished"
     ))
 }
@@ -172,7 +190,7 @@ pub async fn abandon<S: LifecycleStore + ?Sized>(store: &S, pending: &PendingLed
         .await?
     {
         RegistryCas::Updated { .. } | RegistryCas::Conflict { actual: None } => Ok(()),
-        RegistryCas::Conflict { .. } => Err(NameServiceError::storage(format!(
+        RegistryCas::Conflict { .. } => Err(NameServiceError::conflict(format!(
             "the name binding for '{}' changed while rolling back its create",
             pending.record.name
         ))),
@@ -666,11 +684,18 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
                     break;
                 }
                 BindingState::Restoring => {
-                    return Err(NameServiceError::storage(format!(
+                    return Err(NameServiceError::conflict(format!(
                         "'{name}' is being restored; retry the drop once it finishes"
                     )))
                 }
-                BindingState::Active | BindingState::Creating => {
+                // A create under way owns the name until it activates or
+                // is rolled back; it has nothing a drop could keep.
+                BindingState::Creating => {
+                    return Err(NameServiceError::conflict(format!(
+                        "'{name}' is being created; roll the create back instead"
+                    )))
+                }
+                BindingState::Active => {
                     let Some(hard) = start else {
                         return Ok(None);
                     };
@@ -711,8 +736,12 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
         }
     }
 
-    // 3. Record the dropped ledger. An entry already there is this drop's
-    // own earlier attempt, written before any record was deleted.
+    // 3. Record the dropped ledger. A dropped or purging entry already there
+    // is this drop's own earlier attempt, written before any record was
+    // deleted. A restoring one is a restore that made the ledger visible
+    // and stopped before forgetting its entry: its copies predate the
+    // restore, and resuming it would bring the ledger back, so it is
+    // replaced.
     let entry = DroppedLedger {
         instance: binding.instance.clone(),
         state: if hard {
@@ -726,15 +755,24 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
         root_branch: binding.root_branch.clone(),
         branches: records,
     };
-    let entry = match store
-        .cas_dropped(&binding.instance, None, Some(&entry))
-        .await?
-    {
-        RegistryCas::Updated { .. } => entry,
-        RegistryCas::Conflict {
-            actual: Some(existing),
-        } => existing.value,
-        RegistryCas::Conflict { actual: None } => return Err(contended(name)),
+    let mut expected = None;
+    let entry = loop {
+        match store
+            .cas_dropped(&binding.instance, expected, Some(&entry))
+            .await?
+        {
+            RegistryCas::Updated { .. } => break entry,
+            RegistryCas::Conflict {
+                actual: Some(existing),
+            } => match existing.value.state {
+                DroppedState::Dropped | DroppedState::Purging => break existing.value,
+                DroppedState::Restoring { .. } if expected.is_none() => {
+                    expected = Some(existing.version);
+                }
+                DroppedState::Restoring { .. } => return Err(contended(name)),
+            },
+            RegistryCas::Conflict { actual: None } => return Err(contended(name)),
+        }
     };
 
     // 4. Delete the branch records.
@@ -821,7 +859,7 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
         }
         DroppedState::Restoring { fences } => (fences.clone(), version),
         DroppedState::Purging => {
-            return Err(NameServiceError::storage(format!(
+            return Err(NameServiceError::conflict(format!(
                 "dropped ledger {instance} is being purged"
             )))
         }
@@ -930,7 +968,7 @@ pub async fn begin_purge<S: LifecycleStore + ?Sized>(
     };
     match entry.state {
         DroppedState::Purging => Ok(entry),
-        DroppedState::Restoring { .. } => Err(NameServiceError::storage(format!(
+        DroppedState::Restoring { .. } => Err(NameServiceError::conflict(format!(
             "dropped ledger {instance} is being restored"
         ))),
         DroppedState::Dropped => {
@@ -958,7 +996,7 @@ pub async fn finish_purge<S: LifecycleStore + ?Sized>(
         return Ok(());
     };
     if value.state != DroppedState::Purging {
-        return Err(NameServiceError::storage(format!(
+        return Err(NameServiceError::conflict(format!(
             "dropped ledger {instance} is not being purged"
         )));
     }

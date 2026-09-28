@@ -136,9 +136,13 @@ fn empty_index_file(fence: Option<Fence>, frozen: bool) -> NsIndexFileV2 {
 /// Insert `record` unless a live record holds the key; see
 /// [`BranchRecordStore::insert_record`](crate::BranchRecordStore::insert_record).
 ///
-/// The index file is reset to the new fence before the record is created, so
-/// an index file an earlier incarnation left can never merge into the new
-/// record, and a stale indexer's write to it is refused from then on.
+/// The record is created first, and only its creator then resets the index
+/// file to its fence, so an insert that loses the race never touches the
+/// winner's index file. Until the reset, an index file an earlier
+/// incarnation left does not merge into the new record, since reads take an
+/// index file only under the record's own fence. An insert repeated under
+/// the fence the record already carries redoes the reset, which finishes one
+/// a crash interrupted.
 pub(crate) async fn insert_record<S>(
     storage: &S,
     keys: RecordKeys<'_>,
@@ -147,31 +151,80 @@ pub(crate) async fn insert_record<S>(
 where
     S: StorageCas + StorageRead + ?Sized,
 {
-    if let Some(existing) = read_record(storage, keys).await? {
-        return Ok(Some(existing));
+    let existing = match read_record(storage, keys).await? {
+        None => {
+            let main_bytes = serialize_json(&NsFileV2::for_record(record))?;
+            let outcome = storage
+                .compare_and_swap(keys.main, |bytes| {
+                    let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+                    match current {
+                        Some(file) if !file.is_deleted() => Ok(CasAction::Abort(())),
+                        _ => Ok(CasAction::Write(main_bytes.clone())),
+                    }
+                })
+                .await?;
+            match outcome {
+                CasOutcome::Written => {
+                    reset_index_file(storage, keys, record.fence).await?;
+                    return Ok(None);
+                }
+                CasOutcome::Aborted(()) => read_record(storage, keys).await?,
+            }
+        }
+        existing => existing,
+    };
+    if let Some(existing) = &existing {
+        if existing.fence.is_some() && existing.fence == record.fence {
+            reset_index_file(storage, keys, record.fence).await?;
+        }
     }
+    Ok(existing)
+}
 
-    let index_bytes = serialize_json(&empty_index_file(record.fence, false))?;
-    storage
-        .compare_and_swap(keys.index, |_| {
-            Ok(CasAction::<()>::Write(index_bytes.clone()))
-        })
-        .await?;
-
-    let main_bytes = serialize_json(&NsFileV2::for_record(record))?;
+/// Give the record at `keys` an index file under `fence` unless it has one:
+/// an empty one, replacing any an earlier incarnation left.
+///
+/// A caller paused since it saw the record may find it replaced by a later
+/// incarnation, whose index file it must not keep: the record is read again
+/// after the reset, and if it no longer carries `fence`, the file replaced is
+/// put back while the reset is still there.
+async fn reset_index_file<S>(storage: &S, keys: RecordKeys<'_>, fence: Option<Fence>) -> Result<()>
+where
+    S: StorageCas + StorageRead + ?Sized,
+{
+    let index_bytes = serialize_json(&empty_index_file(fence, false))?;
+    let replaced = parking_lot::Mutex::new(None);
     let outcome = storage
-        .compare_and_swap(keys.main, |bytes| {
-            let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+        .compare_and_swap(keys.index, |bytes| {
+            let current: Option<NsIndexFileV2> = bytes.map(deserialize_json).transpose()?;
             match current {
-                Some(file) if !file.is_deleted() => Ok(CasAction::Abort(())),
-                _ => Ok(CasAction::Write(main_bytes.clone())),
+                Some(file) if file.fence == fence => Ok(CasAction::Abort(())),
+                _ => {
+                    *replaced.lock() = bytes.map(<[u8]>::to_vec);
+                    Ok(CasAction::Write(index_bytes.clone()))
+                }
             }
         })
         .await?;
-    match outcome {
-        CasOutcome::Written => Ok(None),
-        CasOutcome::Aborted(()) => read_record(storage, keys).await,
+    if !matches!(outcome, CasOutcome::Written) {
+        return Ok(());
     }
+    let owner = read_record(storage, keys).await?.and_then(|r| r.fence);
+    if owner == fence {
+        return Ok(());
+    }
+    let Some(previous) = replaced.into_inner() else {
+        return Ok(());
+    };
+    storage
+        .compare_and_swap(keys.index, |bytes| match bytes {
+            Some(current) if current == index_bytes.as_slice() => {
+                Ok(CasAction::Write(previous.clone()))
+            }
+            _ => Ok(CasAction::<()>::Abort(())),
+        })
+        .await?;
+    Ok(())
 }
 
 /// Apply `change` to the main record if it carries `fence`. `change` may
@@ -354,3 +407,56 @@ pub(crate) fn index_admits(current: Option<&NsIndexFileV2>, fence: Option<Fence>
 
 /// A compare-and-swap refused because the write's fence was not admitted.
 pub(crate) struct FenceRefused;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::storage::MemoryStorage;
+    use fluree_db_core::StorageWrite;
+
+    const KEYS: RecordKeys<'static> = RecordKeys {
+        main: "fluree:memory://ns@v3/mydb/main.json",
+        index: "fluree:memory://ns@v3/mydb/main.index.json",
+    };
+
+    fn record() -> NsRecord {
+        let mut record = NsRecord::new("mydb:main");
+        record.fence = Some(Fence::generate());
+        record
+    }
+
+    async fn index_fence(storage: &MemoryStorage) -> Option<Fence> {
+        let bytes = storage.read_bytes(KEYS.index).await.unwrap();
+        serde_json::from_slice::<NsIndexFileV2>(&bytes)
+            .unwrap()
+            .fence
+    }
+
+    /// An index file left under another fence, by a crash between the two
+    /// writes or by a stale writer, is replaced when the insert is repeated
+    /// under the record's own fence; an insert under another fence leaves
+    /// the live record's index file alone.
+    #[tokio::test]
+    async fn only_the_records_own_insert_sets_its_index_file() {
+        let storage = MemoryStorage::new();
+        let record = record();
+        assert!(insert_record(&storage, KEYS, &record)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(index_fence(&storage).await, record.fence);
+
+        let stray = serialize_json(&empty_index_file(Some(Fence::generate()), false)).unwrap();
+        storage.write_bytes(KEYS.index, &stray).await.unwrap();
+        assert!(insert_record(&storage, KEYS, &record)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(index_fence(&storage).await, record.fence);
+
+        let rival = self::record();
+        let live = insert_record(&storage, KEYS, &rival).await.unwrap();
+        assert_eq!(live.and_then(|r| r.fence), record.fence);
+        assert_eq!(index_fence(&storage).await, record.fence);
+    }
+}

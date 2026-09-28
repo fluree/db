@@ -379,6 +379,9 @@ where
             return Ok(None);
         }
         let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        if main.is_deleted() {
+            return Ok(None);
+        }
         let index_file: Option<NsIndexFileV2> =
             self.read_json(&self.index_key(ledger_name, branch)).await?;
         Ok(Some(merge_heads(&main, index_file.as_ref())))
@@ -1073,7 +1076,7 @@ where
             RefKind::CommitHead => {
                 let key = self.ns_key(&ledger_name, &branch);
                 let file: Option<NsFileV2> = self.read_json(&key).await?;
-                Ok(file.map(|f| RefValue {
+                Ok(file.filter(|f| !f.is_deleted()).map(|f| RefValue {
                     id: f
                         .commit_cid
                         .as_deref()
@@ -1087,7 +1090,11 @@ where
                 let main_key = self.ns_key(&ledger_name, &branch);
                 let index_key = self.index_key(&ledger_name, &branch);
 
-                let main_file: Option<NsFileV2> = self.read_json(&main_key).await?;
+                // A deleted record has no heads, whatever its index file says.
+                let main_file: Option<NsFileV2> = self
+                    .read_json::<NsFileV2>(&main_key)
+                    .await?
+                    .filter(|f| !f.is_deleted());
                 let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
 
                 let main_index = main_file.as_ref().and_then(|f| {
@@ -1613,6 +1620,9 @@ where
         };
 
         let file: NsFileV2 = serde_json::from_slice(&data)?;
+        if file.is_deleted() {
+            return Ok(None);
+        }
 
         Ok(Some(file.to_status_value()))
     }
@@ -1718,6 +1728,9 @@ where
         };
 
         let file: NsFileV2 = serde_json::from_slice(&data)?;
+        if file.is_deleted() {
+            return Ok(None);
+        }
 
         Ok(Some(file.to_config_value()))
     }
