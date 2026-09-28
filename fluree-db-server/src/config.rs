@@ -495,7 +495,7 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_INDEXER_CATCHUP_INTERVAL_SECS", default_value_t = server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS)]
     pub indexer_catchup_interval_secs: u64,
 
-    /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 50% if ≥8GB)
+    /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 35% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
     #[arg(long, env = "FLUREE_CACHE_MAX_MB")]
