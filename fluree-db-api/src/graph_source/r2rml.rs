@@ -140,21 +140,64 @@ pub(crate) fn mapping_source_of(
 }
 
 /// The policy configuration a virtual source's record carries: its model
-/// ledger and its `default-allow`, either of which may be unset.
-pub(crate) fn policy_config_of(
-    record: &fluree_db_nameservice::GraphSourceRecord,
-) -> (Option<String>, Option<bool>) {
+/// ledger, with the instance of it recorded when the source was registered,
+/// and its `default-allow`. Any may be unset.
+#[derive(Debug, Default)]
+pub(crate) struct SourcePolicy {
+    pub model: Option<String>,
+    pub model_instance: Option<String>,
+    pub default_allow: Option<bool>,
+}
+
+pub(crate) fn policy_config_of(record: &fluree_db_nameservice::GraphSourceRecord) -> SourcePolicy {
     match record.source_type {
-        GraphSourceType::R2rml | GraphSourceType::Iceberg => {
-            IcebergGsConfig::from_json(&record.config)
-                .ok()
-                .map_or((None, None), |c| (c.model, c.default_allow))
-        }
+        GraphSourceType::R2rml | GraphSourceType::Iceberg => IcebergGsConfig::from_json(
+            &record.config,
+        )
+        .ok()
+        .map_or_else(SourcePolicy::default, |c| SourcePolicy {
+            model: c.model,
+            model_instance: c.model_instance,
+            default_allow: c.default_allow,
+        }),
         #[cfg(feature = "sql")]
         GraphSourceType::Sql => super::sql::policy_config(record),
         #[cfg(feature = "delta")]
         GraphSourceType::Delta => super::delta::policy_config(record),
-        _ => (None, None),
+        _ => SourcePolicy::default(),
+    }
+}
+
+impl crate::Fluree {
+    /// Refuse to govern a virtual source by a model ledger other than the one
+    /// it was registered with. A ledger dropped and created again under the
+    /// model's name is another ledger, and whoever created it chose its
+    /// policies. Restoring the dropped ledger lifts the refusal. A model that
+    /// is gone altogether fails the policy wrap that reads it.
+    pub(crate) async fn check_source_model(
+        &self,
+        record: &fluree_db_nameservice::GraphSourceRecord,
+    ) -> Result<()> {
+        let policy = policy_config_of(record);
+        let Some(model) = policy.model else {
+            return Ok(());
+        };
+        let current = self
+            .nameservice()
+            .lookup(&fluree_db_core::LedgerId::parse(&model)?)
+            .await
+            .map_err(|e| crate::ApiError::internal(e.to_string()))?
+            .filter(|r| !r.retracted)
+            .and_then(|r| r.instance());
+        match current {
+            Some(current) => super::source_instance::check_model_instance(
+                record,
+                &model,
+                policy.model_instance.as_deref(),
+                &current,
+            ),
+            None => Ok(()),
+        }
     }
 }
 
@@ -910,7 +953,8 @@ impl crate::Fluree {
 
         // 1. Validate configuration
         config.validate()?;
-        let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
+        let (model_instance, model_warnings) =
+            self.validate_source_model(config.model.as_deref()).await?;
 
         // 2. Test catalog connection (REST mode only — Direct mode verified at query time)
         let connection_tested = if config.is_rest() {
@@ -927,7 +971,8 @@ impl crate::Fluree {
         };
 
         // 3. Convert config to storage format
-        let iceberg_config = config.to_iceberg_gs_config();
+        let mut iceberg_config = config.to_iceberg_gs_config();
+        iceberg_config.model_instance = model_instance;
         let config_json = iceberg_config
             .to_json()
             .map_err(|e| crate::ApiError::Config(format!("Failed to serialize config: {e}")))?;
@@ -971,7 +1016,7 @@ impl crate::Fluree {
         info!(graph_source_id = %graph_source_id, "Creating R2RML graph source");
 
         config.validate()?;
-        let model_warnings = self
+        let (model_instance, model_warnings) = self
             .validate_source_model(config.iceberg.model.as_deref())
             .await?;
 
@@ -995,7 +1040,8 @@ impl crate::Fluree {
         };
 
         // Store config with CAS mapping address
-        let iceberg_config = config.to_iceberg_gs_config(&mapping_address);
+        let mut iceberg_config = config.to_iceberg_gs_config(&mapping_address);
+        iceberg_config.model_instance = model_instance;
         let config_json = iceberg_config
             .to_json()
             .map_err(|e| crate::ApiError::Config(format!("Failed to serialize config: {e}")))?;
@@ -5491,6 +5537,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         }
         .to_json()
@@ -6038,6 +6085,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         }
         .to_json()

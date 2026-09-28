@@ -3438,6 +3438,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         };
 
@@ -3561,6 +3562,7 @@ mod tests {
                 delete: None,
                 order_by: None,
                 model: None,
+                model_instance: None,
                 default_allow: None,
             };
             let stored = cfg.to_json().unwrap();

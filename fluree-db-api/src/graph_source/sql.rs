@@ -275,7 +275,8 @@ impl crate::Fluree {
         let graph_source_id = config.graph_source_id();
         info!(graph_source_id = %graph_source_id, "Creating SQL graph source");
         config.validate()?;
-        let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
+        let (model_instance, model_warnings) =
+            self.validate_source_model(config.model.as_deref()).await?;
 
         let registered = self
             .register_r2rml_mapping(
@@ -290,6 +291,7 @@ impl crate::Fluree {
         let compiled_for_probe = registered.compiled;
 
         let mut gs_config = config.to_gs_config(&mapping_address);
+        gs_config.model_instance = model_instance;
         let mut mapping_warnings = Vec::new();
         let connection_tested = match build_sql_client(&gs_config, self.secret_resolver()).await {
             Ok(client) => match client.execute_collect("SELECT 1").await {
@@ -773,10 +775,15 @@ pub(crate) fn mapping_source(record: &GraphSourceRecord) -> Option<MappingSource
         .and_then(|c| c.mapping)
 }
 
-pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Option<bool>) {
-    SqlGsConfig::from_json(&record.config)
-        .ok()
-        .map_or((None, None), |c| (c.model, c.default_allow))
+pub(crate) fn policy_config(record: &GraphSourceRecord) -> super::r2rml::SourcePolicy {
+    SqlGsConfig::from_json(&record.config).ok().map_or_else(
+        super::r2rml::SourcePolicy::default,
+        |c| super::r2rml::SourcePolicy {
+            model: c.model,
+            model_instance: c.model_instance,
+            default_allow: c.default_allow,
+        },
+    )
 }
 
 #[cfg(test)]

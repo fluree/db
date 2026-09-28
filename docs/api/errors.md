@@ -255,10 +255,12 @@ finishes may succeed.
 ```
 
 **`err:db/GraphSourceSuspended`** — a sync of a BM25 or vector index whose
-source ledger was dropped and replaced by another ledger of the same name.
-Retrying does not help: restore the dropped ledger, or drop the index and
-create it again to index the new ledger. See
-[When the Source Ledger Is Dropped](../indexing-and-search/bm25.md#when-the-source-ledger-is-dropped).
+source ledger was dropped and replaced by another ledger of the same name, or
+a query against an Iceberg, SQL or Delta source whose model ledger was.
+Retrying does not help: restore the dropped ledger, or drop the graph source
+and create it again over the new ledger. See
+[When the Source Ledger Is Dropped](../indexing-and-search/bm25.md#when-the-source-ledger-is-dropped)
+and [Iceberg → Access policy](../graph-sources/iceberg.md#where-policies-live-the-model-ledger).
 
 #### 413 Payload Too Large
 

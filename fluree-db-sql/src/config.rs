@@ -96,6 +96,11 @@ pub struct SqlGsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// The instance of the `model` ledger when the source was registered (see
+    /// the Iceberg config's field of the same name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_instance: Option<String>,
+
     /// Optional `default-allow` for governed requests that match no policy
     /// (see the Iceberg config's field of the same name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +140,7 @@ impl SqlGsConfig {
             request_timeout_secs: default_request_timeout(),
             mapping: None,
             model: None,
+            model_instance: None,
             default_allow: None,
             duplicate_subject_tables: Vec::new(),
             unverified_subject_tables: Vec::new(),

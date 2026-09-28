@@ -1048,6 +1048,16 @@ policy in the model that uses `f:query` — in the CLI output, and as
 `model_warnings` in the HTTP response — since the source will deny their
 targets.
 
+The source records which ledger the model was when it was registered, not
+just its name (`model_instance` in the stored config). If that ledger is
+dropped and another ledger is later created under the same name, the source
+is **suspended**: queries against it fail with `409`
+(`err:db/GraphSourceSuspended`) rather than apply whatever policies the new
+ledger holds. Restoring the dropped ledger (`fluree dropped restore`) lifts
+the suspension. To govern the source by the new ledger, drop the source and
+register it again. While the model is dropped and its name unused, governed
+queries fail with `ModelLedgerMissing`.
+
 ### Sources without a model under authentication
 
 On a server with data auth enabled every request carries an identity, which is
