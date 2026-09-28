@@ -4,20 +4,20 @@
 //! of its source branch's current HEAD, bringing the branch up to date with
 //! upstream changes.
 
+use crate::commit_data::{key_of, OwnChanges};
 use crate::error::{ApiError, Result};
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{
-    range_with_overlay, ConflictKey, ContentId, Flake, IndexType, RangeMatch, RangeOptions,
-    RangeTest, DEFAULT_GRAPH_ID,
+    range_with_overlay, BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake,
+    IndexType, RangeMatch, RangeOptions, RangeTest, DEFAULT_GRAPH_ID,
 };
-use fluree_db_core::{trace_first_parent_commits_by_id, Commit};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
-use fluree_db_novelty::{compute_delta_keys, FactKey};
+use fluree_db_novelty::{delta_keys_of, FactKey};
 use fluree_db_transact::{CommitOpts, NamespaceRegistry, StagedCommit};
-use futures::TryStreamExt;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
@@ -342,30 +342,32 @@ impl crate::Fluree {
         })?;
         let source_head_t = source_record.commit_t;
 
-        // Build a BranchedContentStore for reading commits across namespaces.
-        let branch_store = LedgerState::build_branched_store(
-            &self.nameservice_mode,
-            &branch_record,
-            self.backend(),
-        )
-        .await?;
+        // Branch-aware stores for reading commits across namespaces.
+        let branch_store = self.branch_store(&branch_record, &branch_id).await?;
+        let source_store = self.branch_store(&source_record, &source_id).await?;
 
-        // Compute common ancestor by walking commit chains.
         let branch_head_id = branch_record
             .commit_head_id
             .clone()
             .ok_or_else(|| ApiError::internal(format!("Branch {branch_id} has no commit head")))?;
-        let ancestor =
-            fluree_db_core::find_common_ancestor(&branch_store, &branch_head_id, &source_head_id)
-                .await?;
+
+        // What each side changed since they last shared a commit, by commit
+        // identity. The branch may have merged the source in, which puts the
+        // source's head on another clock than the branch's own commits.
+        let union_store = BranchedContentStore::with_parents(
+            Arc::new(branch_store.clone()) as Arc<dyn ContentStore>,
+            vec![source_store.clone()],
+        );
+        let diff =
+            fluree_db_core::diff_branches(&union_store, &branch_head_id, &source_head_id).await?;
 
         let pre_rebase_head_t = branch_record.commit_t;
         let pre_rebase_head_id = branch_record.commit_head_id.clone();
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         let source_name_owned = source_name.to_string();
 
-        // Fast-forward: branch has no unique commits beyond the ancestor.
-        let is_fast_forward = branch_head_id == ancestor.commit_id;
+        // Fast-forward: the branch has no commits of its own to replay.
+        let is_fast_forward = diff.source.commits.is_empty();
 
         if is_fast_forward {
             // Copy the source index into the branch namespace
@@ -403,28 +405,21 @@ impl crate::Fluree {
             });
         }
 
-        // Compute source delta: all (s,p,g) tuples modified on source since ancestor.
-        // The source may itself be a branch, so use a BranchedContentStore if it has
-        // a source_branch, otherwise a plain store.
-        let source_delta = if source_record.source_branch.is_some() {
-            let source_store = LedgerState::build_branched_store(
-                &self.nameservice_mode,
-                &source_record,
-                self.backend(),
-            )
-            .await?;
-            compute_delta_keys(source_store, source_head_id.clone(), ancestor.t).await?
-        } else {
-            let source_store = self.content_store(&source_id);
-            compute_delta_keys(source_store, source_head_id.clone(), ancestor.t).await?
-        };
+        // The keys the source changed since the two sides diverged.
+        let source_delta = delta_keys_of(&source_store, &diff.target.own).await?;
 
-        // Pass 1: stream branch commits to collect lightweight summaries
-        // (CID, t, conflict keys) without retaining flake payloads in memory.
+        // Pass 1: walk every commit on the branch's line to collect
+        // lightweight summaries (CID, t, conflict keys) without retaining
+        // flake payloads in memory.
+        //
+        // Merges on the line are replayed too, because a merge the branch
+        // made carries how it resolved that merge. A merge that brought the
+        // source in keeps only its resolution: the rest of its flakes are
+        // the source's own changes, which the replay base already holds.
         let summaries = scan_branch_commits(
-            branch_store.clone(),
-            branch_head_id,
-            ancestor.t,
+            &branch_store,
+            &diff.source.commits,
+            &diff.source.own,
             &source_delta,
         )
         .await?;
@@ -470,8 +465,11 @@ impl crate::Fluree {
                 continue;
             }
 
-            let commit =
+            let mut commit =
                 fluree_db_core::load_commit_by_id(&branch_store, &summary.commit_id).await?;
+            if let Some(keys) = &summary.resolution_keys {
+                commit.flakes.retain(|flake| keys.contains(&key_of(flake)));
+            }
 
             let flakes = self
                 .resolve_flakes(
@@ -881,31 +879,36 @@ struct CommitSummary {
     commit_id: ContentId,
     t: i64,
     conflict_keys: Vec<ConflictKey>,
+    /// For a merge that brought the source in, the keys whose flakes are
+    /// that merge's resolution. Every other flake it carries copies a change
+    /// the replay base already holds. `None` for a commit the branch made.
+    resolution_keys: Option<FxHashSet<ConflictKey>>,
 }
 
-/// Stream branch commits HEAD→oldest, extract conflict keys, and return
-/// lightweight summaries in oldest-first order. Full flake payloads are
-/// dropped after conflict key extraction so only summaries remain in memory.
-async fn scan_branch_commits<C: fluree_db_core::ContentStore + Clone + 'static>(
-    store: C,
-    head_id: ContentId,
-    stop_at_t: i64,
+/// Read the branch's line, oldest first, and extract each commit's conflict
+/// keys. Full flake payloads are dropped after that, so only summaries
+/// remain in memory.
+async fn scan_branch_commits<C: fluree_db_core::ContentStore + ?Sized>(
+    store: &C,
+    cids: &[ContentId],
+    own: &[ContentId],
     source_delta: &FxHashSet<ConflictKey>,
 ) -> Result<Vec<CommitSummary>> {
-    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
-    futures::pin_mut!(stream);
-
-    let mut summaries = Vec::new();
-    while let Some(commit) = stream.try_next().await? {
-        let conflict_keys = find_conflicting_keys(&commit.flakes, source_delta);
+    let mut changes = OwnChanges::new(own);
+    let mut summaries = Vec::with_capacity(cids.len());
+    for cid in cids {
+        let mut commit = fluree_db_core::load_commit_by_id(store, cid).await?;
+        let is_own = changes.is_own(cid);
+        changes.retain_changes(cid, &mut commit.flakes);
         summaries.push(CommitSummary {
-            commit_id: commit.id.expect("loaded commit should have an id"),
+            conflict_keys: find_conflicting_keys(&commit.flakes, source_delta),
+            // Pass 2 reloads the commit, so it needs the keys this pass
+            // kept. They are few: a merge resolves what both sides changed.
+            resolution_keys: (!is_own).then(|| commit.flakes.iter().map(key_of).collect()),
+            commit_id: cid.clone(),
             t: commit.t,
-            conflict_keys,
         });
     }
-
-    summaries.reverse();
     Ok(summaries)
 }
 
