@@ -295,6 +295,27 @@ fn cache_key(db: &GraphDb) -> Option<SchemaCacheKey> {
     })
 }
 
+/// Format a lowered GraphQL read's rows, filtered by the view's policy.
+///
+/// Every GraphQL root field lowers to a subgraph projection, so this is where the
+/// whole surface's policy filtering happens. Formatting without the view's policy
+/// expands subjects the request was denied, even though its rows were filtered.
+async fn hydrate_rows(
+    result: &crate::QueryResult,
+    db: &GraphDb,
+) -> std::result::Result<JsonValue, GqlError> {
+    crate::format::format_results_async(
+        result,
+        &result.context,
+        db.as_graph_db_ref(),
+        &crate::format::FormatterConfig::jsonld(),
+        db.policy(),
+        None,
+    )
+    .await
+    .map_err(|e| GqlError::Execution(e.to_string()))
+}
+
 fn hash_context(context: Option<&JsonValue>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -954,10 +975,7 @@ impl RootExecutor for LedgerExecutor {
             .query_with_options(&self.db, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
-        let rows = result
-            .to_jsonld_async(self.db.as_graph_db_ref())
-            .await
-            .map_err(|e| GqlError::Execution(e.to_string()))?;
+        let rows = hydrate_rows(&result, &self.db).await?;
         reshape::reshape(
             &lowered.shape,
             &self.schema.model,
@@ -1111,10 +1129,7 @@ impl LedgerExecutor {
             .query_with_options(view, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
-        let rows = result
-            .to_jsonld_async(view.as_graph_db_ref())
-            .await
-            .map_err(|e| GqlError::Execution(e.to_string()))?;
+        let rows = hydrate_rows(&result, view).await?;
         let objects = reshape::reshape(
             &lowered.shape,
             &self.schema.model,
