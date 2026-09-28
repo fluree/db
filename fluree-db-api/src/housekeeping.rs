@@ -7,13 +7,14 @@
 //! the operation it saw, so one that completed meanwhile, and anything created
 //! under its name since, are left alone.
 //!
-//! Creates are only reported. An import holds its create open for as long as
-//! it runs, so one that has not finished looks the same as one that never
-//! will.
+//! A create is rolled back instead, and only once its claim on the name has
+//! not moved for [`ABANDONED_CREATE_AFTER`]: an import holds its create open
+//! for as long as it runs, renewing the claim every minute. The rollback frees
+//! the name and deletes whatever the create wrote.
 //!
 //! With an interval set, it also runs the orphan sweep.
 
-use crate::admin::{DropMode, DropStatus};
+use crate::admin::{DropMode, DropReport, DropStatus};
 use crate::Fluree;
 use fluree_db_core::{InstanceId, LedgerName};
 use fluree_db_indexer::Housekeeping;
@@ -37,13 +38,44 @@ enum Unfinished {
     },
 }
 
-/// Each unfinished operation with the version of the item that moves when
-/// the operation does.
-type Observed = HashMap<Unfinished, u64>;
+/// How long a create's claim on its name must stay unchanged before the
+/// create is rolled back. Creates that write data before activating renew
+/// the claim every minute.
+pub const ABANDONED_CREATE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// Settings for [`Fluree::lifecycle_housekeeping_with`].
+#[derive(Clone, Debug)]
+pub struct HousekeepingOptions {
+    /// Run the orphan sweep at most this often, the first time one interval
+    /// after housekeeping starts; `None` never runs it.
+    pub orphan_sweep_interval: Option<Duration>,
+    /// Roll back a create whose claim on its name has stayed unchanged this
+    /// long, timed by this process.
+    pub abandoned_create_after: Duration,
+}
+
+impl Default for HousekeepingOptions {
+    fn default() -> Self {
+        Self {
+            orphan_sweep_interval: None,
+            abandoned_create_after: ABANDONED_CREATE_AFTER,
+        }
+    }
+}
+
+/// The version of the item that moves when an operation does, and when this
+/// process first saw it at that version.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Seen {
+    version: u64,
+    since: Instant,
+}
+
+type Observed = HashMap<Unfinished, Seen>;
 
 struct LifecycleHousekeeping {
     fluree: Weak<Fluree>,
-    orphan_sweep_interval: Option<Duration>,
+    options: HousekeepingOptions,
     previous: parking_lot::Mutex<Observed>,
     last_sweep: parking_lot::Mutex<Instant>,
 }
@@ -55,12 +87,31 @@ impl Housekeeping for LifecycleHousekeeping {
             return;
         };
         match observe(&fluree).await {
-            Ok(now) => {
-                let previous = std::mem::replace(&mut *self.previous.lock(), now.clone());
-                for (op, version) in &now {
-                    if previous.get(op) == Some(version) {
-                        resume(&fluree, op).await;
+            Ok(versions) => {
+                let now = Instant::now();
+                let previous = std::mem::take(&mut *self.previous.lock());
+                let seen: Observed = versions
+                    .into_iter()
+                    .map(|(op, version)| {
+                        let since = previous
+                            .get(&op)
+                            .filter(|p| p.version == version)
+                            .map_or(now, |p| p.since);
+                        (op, Seen { version, since })
+                    })
+                    .collect();
+                *self.previous.lock() = seen.clone();
+                for (op, seen) in &seen {
+                    // Unchanged since the last tick.
+                    if seen.since == now {
+                        continue;
                     }
+                    if matches!(op, Unfinished::Create(_))
+                        && seen.since.elapsed() < self.options.abandoned_create_after
+                    {
+                        continue;
+                    }
+                    resume(&fluree, op, seen.version).await;
                 }
             }
             Err(e) => warn!(error = %e, "lifecycle housekeeping: cannot list the nameservice"),
@@ -71,7 +122,7 @@ impl Housekeeping for LifecycleHousekeeping {
 
 impl LifecycleHousekeeping {
     async fn sweep_if_due(&self, fluree: &Fluree) {
-        let Some(interval) = self.orphan_sweep_interval else {
+        let Some(interval) = self.options.orphan_sweep_interval else {
             return;
         };
         {
@@ -94,10 +145,11 @@ impl LifecycleHousekeeping {
     }
 }
 
-/// Every operation the nameservice shows unfinished.
-async fn observe(fluree: &Fluree) -> crate::Result<Observed> {
+/// Every operation the nameservice shows unfinished, with the version of
+/// the item that moves when it does.
+async fn observe(fluree: &Fluree) -> crate::Result<HashMap<Unfinished, u64>> {
     let store = fluree.publisher()?;
-    let mut observed = Observed::new();
+    let mut observed = HashMap::new();
     for (name, binding) in store.list_bindings().await? {
         match binding.value.state {
             BindingState::Creating => {
@@ -148,16 +200,9 @@ async fn observe(fluree: &Fluree) -> crate::Result<Observed> {
     Ok(observed)
 }
 
-async fn resume(fluree: &Fluree, op: &Unfinished) {
+async fn resume(fluree: &Fluree, op: &Unfinished, version: u64) {
     let outcome = match op {
-        Unfinished::Create(name) => {
-            warn!(
-                ledger = %name,
-                "a create of '{name}' has not finished since the last check; if no create or \
-                 import of it is running, dropping it with --hard frees the name"
-            );
-            return;
-        }
+        Unfinished::Create(name) => rollback_create(fluree, name, version).await,
         Unfinished::Drop(name) => resume_drop(fluree, name).await,
         Unfinished::Restore(instance) => resume_restore(fluree, instance).await,
         Unfinished::Purge(instance) => fluree
@@ -178,6 +223,29 @@ async fn resume(fluree: &Fluree, op: &Unfinished) {
         Err(e) if e.is_not_found() => debug!(?op, error = %e, "nothing left to resume"),
         Err(e) => warn!(?op, error = %e, "cannot resume an interrupted operation"),
     }
+}
+
+/// Free the name a stopped create holds, then delete what it wrote. Only an
+/// instance root is deleted whole; a create always makes one.
+async fn rollback_create(fluree: &Fluree, name: &str, version: u64) -> crate::Result<()> {
+    let Some(binding) = lifecycle::rollback_create(fluree.publisher()?, name, version).await?
+    else {
+        return Ok(());
+    };
+    let mut report = DropReport::default();
+    if let (Some(storage), Some(_)) = (fluree.admin_storage(), binding.root.instance()) {
+        crate::admin::purge_instance_root(storage, &binding.root, &[], &mut report).await;
+    }
+    for warning in &report.warnings {
+        warn!(ledger = %name, %warning, "a rolled-back create's data left behind");
+    }
+    info!(
+        ledger = %name,
+        instance = %binding.instance,
+        files_deleted = report.artifacts_deleted,
+        "rolled back a create whose claim on the name stopped being renewed"
+    );
+    Ok(())
 }
 
 async fn resume_drop(fluree: &Fluree, name: &str) -> crate::Result<()> {
@@ -227,8 +295,8 @@ async fn resume_branch_drop(
 
 impl Fluree {
     /// Housekeeping for [`IndexerHandle::set_housekeeping`](fluree_db_indexer::IndexerHandle::set_housekeeping):
-    /// finishes the drops, restores and purges a crash interrupted, reports
-    /// creates that have not finished, and, given an interval, runs
+    /// finishes the drops, restores and purges a crash interrupted, rolls
+    /// back creates that stopped, and, given an interval, runs
     /// [`sweep_orphan_instances`](Self::sweep_orphan_instances) at most that
     /// often, the first time one interval after it starts.
     ///
@@ -238,9 +306,21 @@ impl Fluree {
         self: &Arc<Self>,
         orphan_sweep_interval: Option<Duration>,
     ) -> Arc<dyn Housekeeping> {
+        self.lifecycle_housekeeping_with(HousekeepingOptions {
+            orphan_sweep_interval,
+            ..HousekeepingOptions::default()
+        })
+    }
+
+    /// [`lifecycle_housekeeping`](Self::lifecycle_housekeeping) with every
+    /// setting given.
+    pub fn lifecycle_housekeeping_with(
+        self: &Arc<Self>,
+        options: HousekeepingOptions,
+    ) -> Arc<dyn Housekeeping> {
         Arc::new(LifecycleHousekeeping {
             fluree: Arc::downgrade(self),
-            orphan_sweep_interval,
+            options,
             previous: parking_lot::Mutex::default(),
             last_sweep: parking_lot::Mutex::new(Instant::now()),
         })

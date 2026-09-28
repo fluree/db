@@ -1,5 +1,6 @@
 //! Lifecycle housekeeping: finishing the drops, restores and purges a crash
-//! interrupted, leaving creates alone, and the scheduled orphan sweep.
+//! interrupted, rolling back creates that stopped, and the scheduled orphan
+//! sweep.
 //!
 //! Each test leaves the nameservice exactly as a crash at one step would,
 //! then drives the housekeeping's ticks directly. An operation is resumed on
@@ -185,31 +186,96 @@ async fn a_branch_drop_stopped_before_deleting_is_finished() {
     assert!(fluree.db("branched:main").await.unwrap().t > 0);
 }
 
-/// An import holds its create open while it runs, so an unfinished create
-/// is never rolled back.
+/// Housekeeping that rolls a stopped create back as soon as it has seen its
+/// claim unchanged on two ticks.
+fn rolling_back_at_once(fluree: &Arc<Fluree>) -> Arc<dyn fluree_db_indexer::Housekeeping> {
+    fluree.lifecycle_housekeeping_with(fluree_db_api::HousekeepingOptions {
+        abandoned_create_after: std::time::Duration::ZERO,
+        ..Default::default()
+    })
+}
+
+/// A create that stopped is rolled back: the name is free again and what it
+/// wrote is deleted.
 #[tokio::test]
-async fn an_unfinished_create_is_left_alone() {
+async fn a_stopped_create_is_rolled_back() {
     let (_tmp, fluree) = fluree_with(&[]).await;
-    lifecycle::begin_create(
+    let pending = lifecycle::begin_create(
         fluree.publisher().unwrap(),
         &LedgerId::parse("importing:main").unwrap(),
     )
     .await
     .unwrap();
+    let root = pending.root.to_string();
+    let written = format!("fluree:file://{root}/main/commit/x.fcv2");
+    let storage = fluree.admin_storage().unwrap();
+    storage.write_bytes(&written, b"x").await.unwrap();
 
-    let housekeeping = fluree.lifecycle_housekeeping(None);
+    let housekeeping = rolling_back_at_once(&fluree);
+    housekeeping.tick().await;
+    assert!(
+        fluree
+            .publisher()
+            .unwrap()
+            .get_binding("importing")
+            .await
+            .unwrap()
+            .is_some(),
+        "the first tick only looks"
+    );
+    housekeeping.tick().await;
+
+    let store = fluree.publisher().unwrap();
+    assert!(store.get_binding("importing").await.unwrap().is_none());
+    assert!(store.raw_record("importing:main").await.unwrap().is_none());
+    assert_eq!(files_under(&fluree, &root).await, 0, "its data deleted");
+    assert!(lifecycle::activate(store, &pending).await.is_err());
+    fluree
+        .create_ledger("importing:main")
+        .await
+        .expect("the name is free");
+}
+
+/// A create whose claim is renewed between ticks, as a running import's is,
+/// is left alone, and so is a stopped one until its claim has been still for
+/// the configured time.
+#[tokio::test]
+async fn a_running_create_is_left_alone() {
+    let (_tmp, fluree) = fluree_with(&[]).await;
+    let store = fluree.publisher().unwrap();
+    let mut renewed = lifecycle::begin_create(store, &LedgerId::parse("importing:main").unwrap())
+        .await
+        .unwrap();
+    lifecycle::begin_create(store, &LedgerId::parse("stopped:main").unwrap())
+        .await
+        .unwrap();
+
+    let eager = rolling_back_at_once(&fluree);
+    let patient = fluree.lifecycle_housekeeping(None);
     for _ in 0..3 {
-        housekeeping.tick().await;
+        assert!(lifecycle::renew_claim(store, &mut renewed).await.unwrap());
+        eager.tick().await;
+        patient.tick().await;
     }
-
-    let binding = fluree
-        .publisher()
-        .unwrap()
+    let binding = store
         .get_binding("importing")
         .await
         .unwrap()
         .expect("still claimed");
     assert_eq!(binding.value.state, BindingState::Creating);
+    lifecycle::activate(store, &renewed)
+        .await
+        .expect("activates");
+
+    // `eager` has rolled back the stopped create; `patient` would not have.
+    assert!(store.get_binding("stopped").await.unwrap().is_none());
+    lifecycle::begin_create(store, &LedgerId::parse("stopped:main").unwrap())
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        patient.tick().await;
+    }
+    assert!(store.get_binding("stopped").await.unwrap().is_some());
 }
 
 /// A drop that finishes between two ticks, followed by a new ledger under

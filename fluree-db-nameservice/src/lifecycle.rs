@@ -149,14 +149,19 @@ pub async fn activate<S: LifecycleStore + ?Sized>(
         .await?
     {
         RegistryCas::Updated { .. } => Ok(()),
-        RegistryCas::Conflict { .. } => Err(NameServiceError::storage(format!(
-            "the create of '{name}' was rolled back before it finished"
-        ))),
+        RegistryCas::Conflict { .. } => Err(create_rolled_back(name)),
     }
 }
 
+/// The error a create reports when it finds its claim on `name` gone.
+pub fn create_rolled_back(name: &str) -> NameServiceError {
+    NameServiceError::storage(format!(
+        "the create of '{name}' was rolled back before it finished"
+    ))
+}
+
 /// Undo a pending ledger: delete its record, then its claim on the name.
-/// Its storage, if any was written, is left for the orphan sweep.
+/// Storage is not touched; the caller deletes what it wrote.
 pub async fn abandon<S: LifecycleStore + ?Sized>(store: &S, pending: &PendingLedger) -> Result<()> {
     for b in &pending.binding.branches {
         let id = LedgerId::from_parts(&pending.record.name, &b.branch)?;
@@ -172,6 +177,60 @@ pub async fn abandon<S: LifecycleStore + ?Sized>(store: &S, pending: &PendingLed
             pending.record.name
         ))),
     }
+}
+
+/// Renew a pending create's claim on its name, so the maintenance scan does
+/// not take the create for abandoned: the binding is written back
+/// unchanged, which moves its version. Returns `false` when the claim is
+/// gone, the create having been rolled back.
+pub async fn renew_claim<S: LifecycleStore + ?Sized>(
+    store: &S,
+    pending: &mut PendingLedger,
+) -> Result<bool> {
+    match store
+        .cas_binding(
+            &pending.record.name,
+            Some(pending.version),
+            Some(&pending.binding),
+        )
+        .await?
+    {
+        RegistryCas::Updated { version: Some(v) } => {
+            pending.version = v;
+            Ok(true)
+        }
+        RegistryCas::Updated { version: None } => Err(NameServiceError::storage(
+            "binding write returned no version",
+        )),
+        RegistryCas::Conflict { .. } => Ok(false),
+    }
+}
+
+/// Roll back a create that stopped: `name`'s binding, seen `Creating` at
+/// `version`. The name is freed before the records are deleted, so a
+/// creator that was only paused finds its claim gone and stops; a record
+/// left by a crash in between is garbage no binding lists. Returns the
+/// binding rolled back, whose root holds whatever the create wrote, or
+/// `None` when the binding has moved on since it was seen.
+pub async fn rollback_create<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &str,
+    version: u64,
+) -> Result<Option<NameBinding>> {
+    let Some(current) = store.get_binding(name).await? else {
+        return Ok(None);
+    };
+    if current.version != version || current.value.state != BindingState::Creating {
+        return Ok(None);
+    }
+    if let RegistryCas::Conflict { .. } = store.cas_binding(name, Some(version), None).await? {
+        return Ok(None);
+    }
+    for b in &current.value.branches {
+        let id = LedgerId::from_parts(name, &b.branch)?;
+        store.delete_record(&id, b.fence).await?;
+    }
+    Ok(Some(current.value))
 }
 
 /// Create an empty ledger: [`begin_create`] then [`activate`].

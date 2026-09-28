@@ -38,7 +38,7 @@ A dropped ledger is named by its **instance id**, not its name, because a new le
 - **Purge** deletes the data and removes the entry.
 - **Sweep** deletes the storage folders of ledgers that no longer exist and are not in the dropped list. These hold files written by a writer that was still running when its ledger was purged, and the data of a `create` that never finished. Live and dropped ledgers are never touched, nor is data stored under a ledger's name by versions before instance folders. Sweep lists the whole store, so it can take a while on a large object store; run it against the server that owns the storage, not a peer.
 
-A state of `restoring` or `purging` means that operation was interrupted; running it again finishes it. A server finishes interrupted drops, restores and purges on its own within a few minutes, and can run the sweep on a schedule; see [Periodic Maintenance](../operations/configuration.md#periodic-maintenance).
+A state of `restoring` or `purging` means that operation was interrupted; running it again finishes it. A server finishes interrupted drops, restores and purges on its own within a few minutes, rolls back a create or import that stopped once it has gone ten minutes without renewing its claim on the name, and can run the sweep on a schedule; see [Periodic Maintenance](../operations/configuration.md#periodic-maintenance).
 
 On an encrypted store, [key rotation](encryption.md) rewrites a dropped ledger's data along with the live ledgers', so retiring a key never leaves a dropped ledger unreadable.
 

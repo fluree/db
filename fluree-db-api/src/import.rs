@@ -3674,7 +3674,7 @@ where
             .lookup(&normalized_alias)
             .await
             .map_err(|e| ImportError::Storage(e.to_string()))?;
-        let (namespace, fence, pending) = match existing {
+        let (namespace, fence, mut pending) = match existing {
             Some(record) if record.commit_t > 0 || record.commit_head_id.is_some() => {
                 return Err(ImportError::Transact(format!(
                     "import requires a fresh ledger, but '{}' already has commits (t={})",
@@ -3726,7 +3726,7 @@ where
             index_dir: &index_dir,
         };
         let chunk_source = std::sync::Arc::new(chunk_source);
-        let pipeline_result = run_pipeline_phases(
+        let pipeline = run_pipeline_phases(
             storage,
             nameservice,
             &normalized_alias,
@@ -3737,8 +3737,20 @@ where
             paths,
             config,
             pipeline_start,
-        )
-        .await;
+        );
+        // A new ledger's claim is renewed while the import runs, which can
+        // take hours, so housekeeping does not take it for abandoned.
+        let pipeline_result = match pending.as_mut() {
+            Some(claim) => crate::ledger::while_claimed(nameservice, claim, pipeline)
+                .await
+                .unwrap_or_else(|| {
+                    Err(ImportError::Storage(
+                        fluree_db_nameservice::lifecycle::create_rolled_back(&claim.record.name)
+                            .to_string(),
+                    ))
+                }),
+            None => pipeline.await,
+        };
 
         // Cleanup session dir on both success and failure to avoid accumulating
         // hundreds of GB of orphaned temp files from failed imports.
@@ -3772,10 +3784,15 @@ where
             (result, _) => result,
         };
         if let (Err(_), Some(pending)) = (&pipeline_result, &pending) {
-            // Its data is left for the orphan sweep: nothing references the
-            // instance once the claim is gone.
+            // Release the claim, then delete what the import wrote: nothing
+            // references the instance once the claim is gone.
             if let Err(e) = fluree_db_nameservice::lifecycle::abandon(nameservice, pending).await {
                 tracing::warn!(alias = %normalized_alias, error = %e, "failed to release a failed import's claim on the name");
+            }
+            let mut report = crate::admin::DropReport::default();
+            crate::admin::purge_instance_root(storage, &pending.root, &[], &mut report).await;
+            for warning in &report.warnings {
+                tracing::warn!(alias = %normalized_alias, %warning, "a failed import's data left behind");
             }
         }
 

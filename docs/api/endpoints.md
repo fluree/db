@@ -847,7 +847,10 @@ Authorization: Bearer <token>   (admin token when configured)
 On any mid-stream failure the partially-created ledger is rolled back, so a
 failed import never leaves a live, half-ingested ledger behind. The rollback
 removes only the ledger the import created, and the import can be retried
-under the same name.
+under the same name. If the server stops mid-import,
+[periodic maintenance](../operations/configuration.md#periodic-maintenance)
+rolls the ledger back once its claim on the name has gone ten minutes
+without renewal.
 
 **Example:**
 

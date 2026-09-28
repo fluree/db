@@ -1191,6 +1191,45 @@ pub async fn resuming_starts_nothing<S: LifecycleStore>(store: &S) {
     assert!(store.get_binding("mydb").await.unwrap().is_none());
 }
 
+/// A create that stops is rolled back only at the version it was seen at: a
+/// renewed claim is left alone, and a rolled-back creator can neither renew
+/// nor activate. The name is free again afterwards.
+pub async fn stopped_create_is_rolled_back_unless_renewed<S: LifecycleStore>(store: &S) {
+    let mut pending = lifecycle::begin_create(store, &id("mydb")).await.unwrap();
+    let seen = store.get_binding("mydb").await.unwrap().unwrap().version;
+
+    assert!(lifecycle::renew_claim(store, &mut pending).await.unwrap());
+    assert!(
+        lifecycle::rollback_create(store, "mydb", seen)
+            .await
+            .unwrap()
+            .is_none(),
+        "renewed since it was seen"
+    );
+    assert!(store.raw_record("mydb:main").await.unwrap().is_some());
+
+    let seen = store.get_binding("mydb").await.unwrap().unwrap().version;
+    let rolled_back = lifecycle::rollback_create(store, "mydb", seen)
+        .await
+        .unwrap()
+        .expect("rolled back");
+    assert_eq!(rolled_back.instance, pending.instance);
+    assert!(store.get_binding("mydb").await.unwrap().is_none());
+    assert!(store.raw_record("mydb:main").await.unwrap().is_none());
+
+    assert!(!lifecycle::renew_claim(store, &mut pending).await.unwrap());
+    assert!(lifecycle::activate(store, &pending).await.is_err());
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+
+    // An active ledger is not a create to roll back.
+    let active = store.get_binding("mydb").await.unwrap().unwrap().version;
+    assert!(lifecycle::rollback_create(store, "mydb", active)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store.get_binding("mydb").await.unwrap().is_some());
+}
+
 pub async fn run_all<S, F, Fut>(mut make: F)
 where
     S: crate::NameServicePublisher,
@@ -1227,6 +1266,7 @@ where
     interrupted_migration_resumes(&make().await).await;
     retracted_graph_source_index_resets(&make().await).await;
     resuming_starts_nothing(&make().await).await;
+    stopped_create_is_rolled_back_unless_renewed(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1267,6 +1307,7 @@ macro_rules! lifecycle_conformance_tests {
             interrupted_migration_resumes,
             retracted_graph_source_index_resets,
             resuming_starts_nothing,
+            stopped_create_is_rolled_back_unless_renewed,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

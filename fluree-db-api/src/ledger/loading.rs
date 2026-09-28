@@ -484,6 +484,66 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
     }
 }
 
+/// How often a create that writes its data before activating renews its
+/// claim on the name: well inside the time lifecycle housekeeping waits for
+/// a claim to move before it rolls the create back.
+pub(crate) const CLAIM_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `work`, a create writing its data, while renewing `pending`'s claim
+/// on the name every [`CLAIM_RENEW_INTERVAL`]. `None` when the claim was
+/// lost, housekeeping having rolled the create back: `work` is dropped
+/// unfinished. A renewal that fails for another reason is retried at the
+/// next interval.
+pub(crate) async fn while_claimed<F: std::future::Future>(
+    store: &dyn crate::NameServicePublisher,
+    pending: &mut PendingLedger,
+    work: F,
+) -> Option<F::Output> {
+    renewing_every(CLAIM_RENEW_INTERVAL, store, pending, work).await
+}
+
+async fn renewing_every<F: std::future::Future>(
+    interval: std::time::Duration,
+    store: &dyn crate::NameServicePublisher,
+    pending: &mut PendingLedger,
+    work: F,
+) -> Option<F::Output> {
+    // No timer runs in a browser, and nothing there rolls creates back.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (interval, store, pending);
+        Some(work.await)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut work = std::pin::pin!(work);
+        let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                out = &mut work => return Some(out),
+                _ = renew.tick() => {
+                    match fluree_db_nameservice::lifecycle::renew_claim(store, pending).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                ledger = %pending.record.ledger_id,
+                                "a create's claim on the name was rolled back; stopping it"
+                            );
+                            return None;
+                        }
+                        Err(e) => tracing::warn!(
+                            ledger = %pending.record.ledger_id,
+                            error = %e,
+                            "could not renew a create's claim on the name; retrying"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Claim `ledger_id`'s name in `store` for a new ledger, not yet visible:
 /// the caller writes its data, then activates or abandons it.
 pub(crate) async fn claim_name(
@@ -494,5 +554,61 @@ pub(crate) async fn claim_name(
         Ok(pending) => Ok(pending),
         Err(NameServiceError::LedgerAlreadyExists(a)) => Err(ApiError::ledger_exists(a)),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use fluree_db_nameservice::{lifecycle, LedgerRegistry};
+    use std::time::Duration;
+
+    async fn claimed(store: &MemoryNameService) -> PendingLedger {
+        lifecycle::begin_create(store, &LedgerId::parse("slow:main").unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn version(store: &MemoryNameService) -> Option<u64> {
+        store.get_binding("slow").await.unwrap().map(|v| v.version)
+    }
+
+    /// The claim moves while the work runs, and the create can activate
+    /// afterwards.
+    #[tokio::test]
+    async fn the_claim_is_renewed_while_the_work_runs() {
+        let store = MemoryNameService::new();
+        let mut pending = claimed(&store).await;
+        let before = version(&store).await;
+
+        let work = tokio::time::sleep(Duration::from_millis(200));
+        let out = renewing_every(Duration::from_millis(20), &store, &mut pending, work).await;
+        assert!(out.is_some());
+        assert!(version(&store).await > before, "renewed");
+        lifecycle::activate(&store, &pending)
+            .await
+            .expect("activates");
+    }
+
+    /// A claim rolled back under a running create stops the work.
+    #[tokio::test]
+    async fn a_lost_claim_stops_the_work() {
+        let store = MemoryNameService::new();
+        let mut pending = claimed(&store).await;
+        let seen = version(&store).await.unwrap();
+        lifecycle::rollback_create(&store, "slow", seen)
+            .await
+            .unwrap()
+            .expect("rolled back");
+
+        let out = renewing_every(
+            Duration::from_millis(20),
+            &store,
+            &mut pending,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(out.is_none());
     }
 }

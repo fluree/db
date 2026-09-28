@@ -2026,13 +2026,17 @@ impl Fluree {
 
         // A restore brings in a whole ledger, so it claims the whole name,
         // and nobody sees the ledger until its heads are in place.
-        let pending = self.claim_name(&new_ledger_id).await?;
-        let restored = match self.restore_into_created(&pending.record, reader).await {
-            Ok(result) => fluree_db_nameservice::lifecycle::activate(self.publisher()?, &pending)
+        let mut pending = self.claim_name(&new_ledger_id).await?;
+        let store = self.publisher()?;
+        let record = pending.record.clone();
+        let restoring = self.restore_into_created(&record, reader);
+        let restored = match crate::ledger::while_claimed(store, &mut pending, restoring).await {
+            Some(Ok(result)) => fluree_db_nameservice::lifecycle::activate(store, &pending)
                 .await
                 .map(|()| result)
                 .map_err(ApiError::from),
-            Err(e) => Err(e),
+            Some(Err(e)) => Err(e),
+            None => Err(fluree_db_nameservice::lifecycle::create_rolled_back(&record.name).into()),
         };
         if restored.is_err() {
             self.discard_restored(&pending).await;

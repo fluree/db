@@ -587,7 +587,7 @@ impl WholeLedgerOperation {
 /// with the drop. `@` is reserved in names, so no other ledger's files sit
 /// under the root. Returns `false`, having deleted nothing, when the root
 /// can't be listed.
-async fn purge_instance_root(
+pub(crate) async fn purge_instance_root(
     storage: &dyn fluree_db_core::Storage,
     root: &StorageRoot,
     branches: &[NsRecord],

@@ -39,6 +39,8 @@ pub mod authorization;
 #[cfg(not(target_arch = "wasm32"))]
 mod housekeeping;
 pub use authorization::PolicyAuthorization;
+#[cfg(not(target_arch = "wasm32"))]
+pub use housekeeping::{HousekeepingOptions, ABANDONED_CREATE_AFTER};
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
