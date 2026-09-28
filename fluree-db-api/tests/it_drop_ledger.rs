@@ -816,3 +816,50 @@ async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
     fluree.disconnect_ledger(child_id).await;
     assert!(fluree.db(child_id).await.expect("child still loads").t > 0);
 }
+
+/// A branch drop that cannot list ledgers must fail before touching anything:
+/// deleting the record while keeping the files would leave them unreachable.
+#[tokio::test]
+async fn drop_branch_fails_intact_when_ledgers_cannot_be_listed() {
+    use fluree_db_api::{Fluree, NameServiceMode};
+    use std::sync::Arc;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+    let txn = |id: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@graph": [{"@id": id, "ex:val": 1}]
+        })
+    };
+    let main = fluree.create_ledger("drop-listing").await.unwrap();
+    fluree.insert(main, &txn("ex:a")).await.unwrap();
+    fluree
+        .create_branch("drop-listing", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("drop-listing:dev").await.unwrap();
+    fluree.insert(dev, &txn("ex:b")).await.unwrap();
+    let dev_commits = tmp.path().join("drop-listing/dev/commit");
+    assert!(dev_commits.read_dir().unwrap().next().is_some());
+
+    let failing = Arc::new(crate::race_nameservice::PausingNameService::new(
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+    ));
+    failing.fail_listings();
+    let dropper = Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        NameServiceMode::ReadWrite(failing),
+    );
+    assert!(dropper.drop_branch("drop-listing", "dev").await.is_err());
+
+    let record = fluree
+        .nameservice()
+        .lookup("drop-listing:dev")
+        .await
+        .unwrap();
+    assert!(record.is_some_and(|r| !r.retracted), "record must survive");
+    assert!(dev_commits.read_dir().unwrap().next().is_some());
+}

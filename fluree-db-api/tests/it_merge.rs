@@ -8,8 +8,7 @@ use crate::support;
 use fluree_db_api::{ConflictStrategy, FlureeBuilder};
 use serde_json::json;
 
-#[path = "support/merge_race.rs"]
-mod race_nameservice;
+use crate::race_nameservice;
 
 /// Extract sorted name strings from query result rows.
 fn extract_names(rows: &serde_json::Value) -> Vec<String> {

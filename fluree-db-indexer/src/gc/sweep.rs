@@ -361,7 +361,7 @@ where
 ///
 /// Index artifacts are per-branch, so each branch contributes its own `index/`
 /// prefix. Dict blobs are shared across a ledger's branches and live in one
-/// namespace, listed once. Files under a `nested` ledger's own prefix are
+/// namespace, listed once. Files under a `nested` ledger's own prefixes are
 /// excluded: ledger names may contain `/`, so `a/main/index/child:main` keeps
 /// its commits inside `a:main`'s index directory.
 async fn swept_addresses<S>(
@@ -385,11 +385,7 @@ where
         "fluree:{method}://{}/dicts/",
         ledger_name.shared_prefix()
     ));
-    let foreign: Vec<String> = nested
-        .iter()
-        // The whole name: its branches and its `@shared/` namespace alike.
-        .map(|id| format!("fluree:{method}://{}/", id.name()))
-        .collect();
+    let foreign = nested_prefixes(method, nested);
 
     let mut scanned = HashSet::new();
     for prefix in &prefixes {
@@ -404,6 +400,20 @@ where
     }
 
     Ok(scanned)
+}
+
+/// Address prefixes that `nested` ledgers own: each branch's directory and
+/// the ledger's `@shared/` namespace. Not the whole name, which for a ledger
+/// named `{parent}/{branch}` is the parent branch's own directory.
+pub fn nested_prefixes(method: &str, nested: &[LedgerId]) -> Vec<String> {
+    let mut prefixes: Vec<String> = nested
+        .iter()
+        .flat_map(|id| [id.path_prefix(), id.shared_prefix()])
+        .map(|prefix| format!("fluree:{method}://{prefix}/"))
+        .collect();
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
 }
 
 /// The ledgers whose storage can nest under `ledger_name`'s: every recorded
@@ -589,6 +599,34 @@ mod tests {
                 "another ledger's file was planned for deletion: {addr}"
             );
         }
+    }
+
+    /// A ledger named `mydb/main` owns `mydb/main/{branch}/`, not `mydb/main/`,
+    /// which is `mydb:main`'s own directory: excluding the whole name would
+    /// keep every orphan the parent branch has.
+    #[tokio::test]
+    async fn a_nested_ledger_named_like_a_branch_leaves_its_orphans_planned() {
+        let storage = MemoryStorage::new();
+        let roots = write_chain(&storage, MAIN, 1, &dict_cid(b"live-dict")).await;
+        let (_, orphan) = cid_and_addr_for(MAIN, ContentKind::IndexLeaf, b"unreferenced");
+        storage.write_bytes(&orphan, b"leaf").await.unwrap();
+        let branches = heads(&[(MAIN, roots.last())]);
+
+        let unaware = plan_sweep(&storage, &name(NAME), &branches, &[], None)
+            .await
+            .unwrap();
+        assert!(unaware.orphans.contains(&orphan), "fixture has no orphan");
+
+        let records = [
+            fluree_db_nameservice::NsRecord::new(MAIN),
+            fluree_db_nameservice::NsRecord::new("mydb/main:trunk"),
+        ];
+        let nested = nested_ledgers(&records, &name(NAME));
+        assert_eq!(nested, [LedgerId::parse("mydb/main:trunk").unwrap()]);
+        let plan = plan_sweep(&storage, &name(NAME), &branches, &nested, None)
+            .await
+            .unwrap();
+        assert!(plan.orphans.contains(&orphan), "{:?}", plan.orphans);
     }
 
     /// Everything an intact chain references stays live, so a healthy ledger

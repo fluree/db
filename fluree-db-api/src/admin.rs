@@ -15,9 +15,10 @@ use fluree_db_core::ContentId;
 use fluree_db_core::{format_ledger_id, DEFAULT_BRANCH};
 use fluree_db_core::{LedgerId, LedgerName};
 use fluree_db_indexer::{
-    current_sibling_heads, execute_sweep, nested_ledgers, plan_garbage, plan_sweep,
-    rebuild_index_from_commits_with_tracker, release_garbage_plan, shared_refs_of_branches,
-    siblings_of, BranchIndexHead, CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
+    current_sibling_heads, execute_sweep, nested_ledgers, nested_prefixes, plan_garbage,
+    plan_sweep, rebuild_index_from_commits_with_tracker, release_garbage_plan,
+    shared_refs_of_branches, siblings_of, BranchIndexHead, CleanGarbageConfig, MaintenanceGuard,
+    SweepPlan, SweepResult,
 };
 use fluree_db_nameservice::{GraphSourceType, NsRecord};
 use fluree_db_transact::GraphSel;
@@ -624,6 +625,7 @@ impl crate::Fluree {
         // drop_graph_source path, potentially deleting an unrelated graph
         // source with the same name.
         let all = self.nameservice().all_records().await?;
+        let nested = nested_ledgers(&all, &ledger_name);
         let mut branches: Vec<NsRecord> = all
             .into_iter()
             .filter(|r| r.ledger_id.name() == ledger_name.as_str())
@@ -680,7 +682,9 @@ impl crate::Fluree {
             };
 
             if matches!(mode, DropMode::Hard) {
-                let (count, warnings) = self.drop_artifacts(&branch.ledger_id, Some(branch)).await;
+                let (count, warnings) = self
+                    .drop_artifacts(&branch.ledger_id, Some(branch), &nested)
+                    .await;
                 br.artifacts_deleted += count;
                 br.warnings.extend(warnings);
             }
@@ -1261,6 +1265,14 @@ impl crate::Fluree {
         record: Option<&NsRecord>,
         report: &mut BranchDropReport,
     ) -> Result<Option<u32>> {
+        // Before anything is deleted: without the listing that says which
+        // nested ledgers share this branch's prefixes, the drop must fail
+        // while the record still names the files.
+        let nested = nested_ledgers(
+            &self.nameservice().all_records().await?,
+            &ledger_id.ledger_name(),
+        );
+
         if let IndexingMode::Background(handle) = &self.indexing_mode {
             handle.cancel(ledger_id).await;
             handle.wait_for_idle(ledger_id).await;
@@ -1275,7 +1287,7 @@ impl crate::Fluree {
         // Branch path: only the per-branch artifacts. The rest of
         // `@shared/dicts/` stays — sibling/parent branches reference it — and
         // is wiped by `drop_ledger` once every branch is gone.
-        let (count, warnings) = self.drop_artifacts(ledger_id, record).await;
+        let (count, warnings) = self.drop_artifacts(ledger_id, record, &nested).await;
         report.artifacts_deleted += count;
         report.warnings.extend(warnings);
 
@@ -1483,6 +1495,7 @@ impl crate::Fluree {
         &self,
         ledger_id: &LedgerId,
         record: Option<&fluree_db_nameservice::NsRecord>,
+        nested: &[LedgerId],
     ) -> (usize, Vec<String>) {
         let mut warnings = Vec::new();
         let storage = match self.admin_storage() {
@@ -1500,22 +1513,8 @@ impl crate::Fluree {
 
         // Ledger names may contain `/`, so another ledger's files can sit
         // under this branch's prefixes (`a/main/index/child:main` inside
-        // `a:main`'s `index/`). Without the listing that says which, refuse
-        // to delete rather than guess: leftovers are recoverable, deleting
-        // another ledger's data is not.
-        let foreign: Vec<String> = match self.nameservice().all_records().await {
-            Ok(records) => nested_ledgers(&records, &ledger_id.ledger_name())
-                .iter()
-                // The whole name: its branches and its `@shared/` namespace alike.
-                .map(|id| format!("fluree:{storage_method}://{}/", id.name()))
-                .collect(),
-            Err(e) => {
-                warnings.push(format!(
-                    "Not deleting artifacts for '{ledger_id}': could not list ledgers to exclude nested ones: {e}"
-                ));
-                return (0, warnings);
-            }
-        };
+        // `a:main`'s `index/`).
+        let foreign = nested_prefixes(storage_method, nested);
 
         // Enumerate explicit subprefixes. `TieredStorage` routes by substring
         // (`/commit/`, `/txn/` → commit tier; otherwise → index tier), so we

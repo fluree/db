@@ -1,6 +1,9 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "support/merge_race.rs"]
+mod race_nameservice;
+
 #[path = "it_branch.rs"]
 mod it_branch;
 #[path = "it_branch_shacl.rs"]
