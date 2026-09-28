@@ -240,11 +240,10 @@ curl http://localhost:8090/v1/fluree/info/mydb:main
 - Remove unnecessary joins
 - Use more specific patterns
 
-**Increase timeout:**
+**Increase timeout:** the limit is server-wide (default 15 minutes; `0` disables it), not per
+request:
 ```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Timeout: 60000" \
-  -d '{...}'
+FLUREE_QUERY_TIMEOUT_MS=1800000 fluree server run
 ```
 
 ## POLICY_DENIED
