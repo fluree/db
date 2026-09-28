@@ -176,7 +176,8 @@ pub async fn resolve_graph_ref(
     // references the same (M, graph, t). Writeback below on miss.
     // The per-request memo is populated alongside so subsequent
     // resolutions in this same request short-circuit at (5a).
-    if let Some(hit) = ctx.fluree.governance_cache().get(&key) {
+    let cache_key = (ns_record.instance(), key.clone());
+    if let Some(hit) = ctx.fluree.governance_cache().get(&cache_key) {
         ctx.memo.insert(key.clone(), hit.clone());
         return Ok(hit);
     }
@@ -213,7 +214,7 @@ pub async fn resolve_graph_ref(
     // work, not duplicate semantics. Single-flight is a possible
     // future optimization but not a correctness requirement.
     ctx.memo.insert(key.clone(), arc.clone());
-    ctx.fluree.governance_cache().insert(key, arc.clone());
+    ctx.fluree.governance_cache().insert(cache_key, arc.clone());
     Ok(arc)
 }
 

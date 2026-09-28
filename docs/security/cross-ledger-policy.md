@@ -652,8 +652,8 @@ clients can branch on the specific failure.
 
 There is no explicit invalidation channel. The cache key includes
 the model ledger's `resolved_t` (its commit head at the time of
-capture), so new commits to M produce new cache keys
-automatically. The next request after M advances captures the
+capture) and its instance, so new commits to M, and a new ledger
+under M's name, produce new cache keys automatically. The next request after M advances captures the
 new head; older entries age out under the cache's LRU/TinyLFU
 policy.
 
