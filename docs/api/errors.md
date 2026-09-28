@@ -227,6 +227,41 @@ The request conflicts with current server state.
 - Handle concurrent modifications with retry logic
 - Check resource state before modifying
 
+**`err:db/Fenced`** — a write to a ledger that was dropped, restored or
+replaced since the server loaded it, or that a drop in progress has frozen.
+The server reloads the ledger when it refuses the write, so retrying the
+request runs it against whatever ledger holds the name now (or returns `404`
+if none does).
+
+```json
+{
+  "error": "Ledger was dropped or replaced since it was loaded: mydb:main",
+  "status": 409,
+  "@type": "err:db/Fenced"
+}
+```
+
+**`err:db/LifecycleConflict`** — a create, drop, restore or purge that another
+one got to first: the name is being created, dropped or restored, or the
+dropped ledger is being restored or purged. Retrying once that operation
+finishes may succeed.
+
+```json
+{
+  "error": "Conflict: 'mydb' is being restored; retry the drop once it finishes",
+  "status": 409,
+  "@type": "err:db/LifecycleConflict"
+}
+```
+
+**`err:db/GraphSourceSuspended`** — a sync of a BM25 or vector index whose
+source ledger was dropped and replaced by another ledger of the same name, or
+a query against an Iceberg, SQL or Delta source whose model ledger was.
+Retrying does not help: restore the dropped ledger, or drop the graph source
+and create it again over the new ledger. See
+[When the Source Ledger Is Dropped](../indexing-and-search/bm25.md#when-the-source-ledger-is-dropped)
+and [Iceberg → Access policy](../graph-sources/iceberg.md#where-policies-live-the-model-ledger).
+
 #### 413 Payload Too Large
 
 The request was refused because of its size. The server emits **two distinct

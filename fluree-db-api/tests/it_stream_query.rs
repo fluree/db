@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 async fn seed_three() -> (support::MemoryFluree, support::MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "stream/sel:main");
+    let ledger0 = support::genesis_ledger(&fluree, "stream/sel:main").await;
     let seed = json!({
         "@context": { "a": "http://a.co/" },
         "@graph": [
@@ -129,7 +129,7 @@ async fn sparql_select_streams_rows() {
 
 /// Seed a single named subject into `ledger_id` on a shared Fluree instance.
 async fn seed_named(fluree: &support::MemoryFluree, ledger_id: &str, name: &str) {
-    let ledger0 = support::genesis_ledger(fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(fluree, ledger_id).await;
     let seed = json!({
         "@context": { "a": "http://a.co/" },
         "@graph": [{ "@id": format!("http://a.co/{name}"), "a:name": name }]

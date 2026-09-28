@@ -5,7 +5,7 @@
 //!
 //! ## Pipeline overview (Tier 2: parallel local IDs + remap)
 //!
-//! 1. **Create ledger** — `nameservice.init(ledger_id)`
+//! 1. **Create ledger** — claim the name; the ledger is published at the end
 //! 2. **Parse + commit** — parallel chunk parsing with chunk-local IDs written
 //!    to spool files, serial commit finalization
 //! 3. **Dict merge** — merge chunk-local subject/string dicts into global dicts,
@@ -33,8 +33,8 @@
 use crate::error::ApiError;
 use fluree_db_core::task::TaskFailure;
 use fluree_db_core::{
-    ContentId, ContentKind, ContentStore, FuelExceededError, RemoteObject, Storage, StorageRead,
-    Tracker, TrackingTally,
+    ContentId, ContentKind, ContentStore, FuelExceededError, RemoteObject, Storage,
+    StorageNamespace, StorageRead, Tracker, TrackingTally,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -64,6 +64,7 @@ use tracing::Instrument;
 async fn publish_import_commit_head(
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
+    fence: Option<fluree_db_nameservice::Fence>,
     t: i64,
     commit_id: &ContentId,
 ) -> std::result::Result<(), ImportError> {
@@ -74,7 +75,7 @@ async fn publish_import_commit_head(
         t,
     };
     match nameservice
-        .fast_forward_commit(alias, &new_ref, 5)
+        .fast_forward_commit_fenced(alias, fence, &new_ref, 5)
         .await
         .map_err(|e| ImportError::Storage(e.to_string()))?
     {
@@ -3667,41 +3668,41 @@ where
             ),
         };
 
-        // ---- Phase 1: Create ledger (init nameservice) ----
-        // Check if ledger already exists
-        let ns_record = nameservice
+        // ---- Phase 1: Create the ledger, or take the empty one there ----
+        // A new ledger stays invisible until the import has published it.
+        let existing = nameservice
             .lookup(&normalized_alias)
             .await
             .map_err(|e| ImportError::Storage(e.to_string()))?;
-
-        let needs_init = match &ns_record {
-            None => true,
-            Some(record) if record.retracted => {
-                // Ledger was dropped — safe to re-create.
-                tracing::info!(alias = %normalized_alias, "re-initializing retracted ledger");
-                true
-            }
+        let (namespace, fence, mut pending) = match existing {
             Some(record) if record.commit_t > 0 || record.commit_head_id.is_some() => {
                 return Err(ImportError::Transact(format!(
                     "import requires a fresh ledger, but '{}' already has commits (t={})",
                     normalized_alias, record.commit_t
                 )));
             }
-            Some(_) => false,
+            Some(record) if !record.retracted => (record.storage_namespace(), record.fence, None),
+            _ => {
+                let id = fluree_db_core::LedgerId::parse(&normalized_alias)
+                    .map_err(|e| ImportError::Storage(e.to_string()))?;
+                let pending = crate::ledger::claim_name(nameservice, &id)
+                    .await
+                    .map_err(|e| ImportError::Storage(e.to_string()))?;
+                tracing::info!(alias = %normalized_alias, instance = %pending.instance, "claimed the name for a new ledger");
+                (
+                    pending.record.storage_namespace(),
+                    pending.record.fence,
+                    Some(pending),
+                )
+            }
         };
 
-        if needs_init {
-            nameservice
-                .init(&normalized_alias)
-                .await
-                .map_err(|e| ImportError::Storage(e.to_string()))?;
-            tracing::info!(alias = %normalized_alias, "initialized new ledger in nameservice");
-        }
-
         // ---- Set up session directory for runs/indexes ----
-        let alias_prefix =
-            fluree_db_core::address_path::ledger_id_to_path_prefix(&normalized_alias)
-                .unwrap_or_else(|_| normalized_alias.replace(':', "/"));
+        // A local scratch directory keyed by the ledger id, not a storage key.
+        let alias_prefix = match fluree_db_core::LedgerId::parse(&normalized_alias) {
+            Ok(id) => format!("{}/{}", id.name(), id.branch()),
+            Err(_) => normalized_alias.replace(':', "/"),
+        };
 
         // Session dir under the import scratch base (see `derive_session_dir`).
         let sid = session_id();
@@ -3725,17 +3726,31 @@ where
             index_dir: &index_dir,
         };
         let chunk_source = std::sync::Arc::new(chunk_source);
-        let pipeline_result = run_pipeline_phases(
+        let pipeline = run_pipeline_phases(
             storage,
             nameservice,
             &normalized_alias,
+            &namespace,
+            fence,
             &chunk_source,
             &doc_ids,
             paths,
             config,
             pipeline_start,
-        )
-        .await;
+        );
+        // A new ledger's claim is renewed while the import runs, which can
+        // take hours, so housekeeping does not take it for abandoned.
+        let pipeline_result = match pending.as_mut() {
+            Some(claim) => crate::ledger::while_claimed(nameservice, claim, pipeline)
+                .await
+                .unwrap_or_else(|| {
+                    Err(ImportError::Storage(
+                        fluree_db_nameservice::lifecycle::create_rolled_back(&claim.record.name)
+                            .to_string(),
+                    ))
+                }),
+            None => pipeline.await,
+        };
 
         // Cleanup session dir on both success and failure to avoid accumulating
         // hundreds of GB of orphaned temp files from failed imports.
@@ -3757,6 +3772,28 @@ where
                 session_dir = %session_dir.display(),
                 "cleanup disabled; import artifacts retained"
             );
+        }
+
+        let pipeline_result = match (pipeline_result, &pending) {
+            (Ok(result), Some(pending)) => {
+                fluree_db_nameservice::lifecycle::activate(nameservice, pending)
+                    .await
+                    .map(|()| result)
+                    .map_err(|e| ImportError::Storage(e.to_string()))
+            }
+            (result, _) => result,
+        };
+        if let (Err(_), Some(pending)) = (&pipeline_result, &pending) {
+            // Release the claim, then delete what the import wrote: nothing
+            // references the instance once the claim is gone.
+            if let Err(e) = fluree_db_nameservice::lifecycle::abandon(nameservice, pending).await {
+                tracing::warn!(alias = %normalized_alias, error = %e, "failed to release a failed import's claim on the name");
+            }
+            let mut report = crate::admin::DropReport::default();
+            crate::admin::purge_instance_root(storage, &pending.root, &[], &mut report).await;
+            for warning in &report.warnings {
+                tracing::warn!(alias = %normalized_alias, %warning, "a failed import's data left behind");
+            }
         }
 
         match pipeline_result {
@@ -3848,6 +3885,8 @@ async fn run_pipeline_phases<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
+    namespace: &StorageNamespace,
+    fence: Option<fluree_db_nameservice::Fence>,
     chunk_source: &std::sync::Arc<ChunkSource>,
     doc_ids: &DocIds,
     paths: PipelinePaths<'_>,
@@ -3862,6 +3901,8 @@ where
         storage,
         nameservice,
         alias,
+        namespace,
+        fence,
         chunk_source,
         doc_ids,
         paths.run_dir,
@@ -3907,6 +3948,7 @@ where
             storage,
             nameservice,
             alias,
+            namespace,
             build_input,
             config,
             import_result.total_commit_size,
@@ -3924,7 +3966,7 @@ where
                 .await
                 .map_err(|e| ImportError::Storage(format!("flush index artifacts: {e}")))?;
             nameservice
-                .publish_index(alias, index_result.index_t, &index_result.root_id)
+                .publish_index_fenced(alias, fence, index_result.index_t, &index_result.root_id)
                 .await
                 .map_err(|e| ImportError::Storage(format!("publish index: {e}")))?;
             tracing::info!(
@@ -3946,8 +3988,15 @@ where
     }
 
     // ---- Phase 7: Persist default context from turtle prefixes ----
-    if let Err(e) =
-        store_default_context(storage, nameservice, alias, &import_result.prefix_map).await
+    if let Err(e) = store_default_context(
+        storage,
+        nameservice,
+        alias,
+        fence,
+        namespace,
+        &import_result.prefix_map,
+    )
+    .await
     {
         tracing::warn!(%e, "failed to persist default context (non-fatal)");
     }
@@ -4034,6 +4083,8 @@ async fn run_import_chunks<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
+    namespace: &StorageNamespace,
+    fence: Option<fluree_db_nameservice::Fence>,
     chunk_source: &std::sync::Arc<ChunkSource>,
     doc_ids: &DocIds,
     run_dir: &Path,
@@ -4134,6 +4185,8 @@ where
         storage: &'a S,
         nameservice: &'a dyn crate::NameServicePublisher,
         alias: &'a str,
+        fence: Option<fluree_db_nameservice::Fence>,
+        namespace: &'a StorageNamespace,
         config: &'a ImportConfig,
         sort_write_semaphore: &'a Arc<tokio::sync::Semaphore>,
         vocab_dir: &'a Path,
@@ -4213,9 +4266,10 @@ where
                 }
 
                 let finalize_start = Instant::now();
-                let result = finalize_parsed_chunk(state, parsed, ns_delta, env.storage, env.alias)
-                    .await
-                    .map_err(|e| ImportError::Transact(e.to_string()))?;
+                let result =
+                    finalize_parsed_chunk(state, parsed, ns_delta, env.storage, env.namespace)
+                        .await
+                        .map_err(|e| ImportError::Transact(e.to_string()))?;
                 let finalize_ms = finalize_start.elapsed().as_millis();
 
                 // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake,
@@ -4280,6 +4334,7 @@ where
                     publish_import_commit_head(
                         env.nameservice,
                         env.alias,
+                        env.fence,
                         result.t,
                         &result.commit_id,
                     )
@@ -4543,6 +4598,8 @@ where
         storage,
         nameservice,
         alias,
+        fence,
+        namespace,
         config,
         sort_write_semaphore: &sort_write_semaphore,
         vocab_dir: &vocab_dir,
@@ -5059,6 +5116,7 @@ where
                     trig_content,
                     storage,
                     alias,
+                    namespace,
                     &doc.skolem_base(),
                     compress,
                     Some(&spool_dir),
@@ -5102,7 +5160,7 @@ where
                 .map_err(|e| ImportError::Transact(e.to_string()))?;
 
                 let ns_delta = compute_ns_delta(&parsed.new_codes, &mut published_codes);
-                finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, alias)
+                finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, namespace)
                     .await
                     .map_err(|e| ImportError::Transact(e.to_string()))?
             };
@@ -5145,7 +5203,8 @@ where
                 elapsed_secs: run_start.elapsed().as_secs_f64(),
             });
             if config.publish_every > 0 && (idx + 1).is_multiple_of(config.publish_every) {
-                publish_import_commit_head(nameservice, alias, result.t, &result.commit_id).await?;
+                publish_import_commit_head(nameservice, alias, fence, result.t, &result.commit_id)
+                    .await?;
             }
         }
 
@@ -5312,6 +5371,7 @@ where
                         trig_content,
                         storage,
                         alias,
+                        namespace,
                         &DocChunk::whole(doc_ids.id(i)).skolem_base(),
                         compress,
                         Some(&spool_dir),
@@ -5360,7 +5420,7 @@ where
 
                     let ns_delta = compute_ns_delta(&parsed.new_codes, &mut published_codes);
 
-                    finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, alias)
+                    finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, namespace)
                         .await
                         .map_err(|e| ImportError::Transact(e.to_string()))?
                 };
@@ -5404,8 +5464,14 @@ where
                     elapsed_secs: run_start.elapsed().as_secs_f64(),
                 });
                 if config.publish_every > 0 && (i + 1).is_multiple_of(config.publish_every) {
-                    publish_import_commit_head(nameservice, alias, result.t, &result.commit_id)
-                        .await?;
+                    publish_import_commit_head(
+                        nameservice,
+                        alias,
+                        fence,
+                        result.t,
+                        &result.commit_id,
+                    )
+                    .await?;
                 }
             }
         }
@@ -5417,7 +5483,7 @@ where
         .clone()
         .ok_or_else(|| ImportError::Storage("no commit head after import".to_string()))?;
 
-    publish_import_commit_head(nameservice, alias, state.t, &commit_head_id).await?;
+    publish_import_commit_head(nameservice, alias, fence, state.t, &commit_head_id).await?;
     tracing::info!(t = state.t, "published final commit head");
 
     // ---- Spawn txn-meta "meta chunk" build in background ----
@@ -6170,6 +6236,7 @@ async fn build_and_upload<S>(
     storage: &S,
     _nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
+    namespace: &StorageNamespace,
     input: IndexBuildInput<'_>,
     config: &ImportConfig,
     total_commit_size: u64,
@@ -6221,7 +6288,7 @@ where
 
     // Shared content store for dict upload, index upload, and other CAS operations.
     let content_store: std::sync::Arc<dyn fluree_db_core::ContentStore> = std::sync::Arc::new(
-        fluree_db_core::storage::content_store_for(storage.clone(), alias),
+        fluree_db_core::storage::content_store_for(storage.clone(), namespace),
     );
 
     // Start dict upload (reads flat files from run_dir, builds CoW trees, uploads to CAS).
@@ -6961,7 +7028,7 @@ where
         storage
             .content_write_bytes_with_hash(
                 fluree_db_core::ContentKind::IndexRoot,
-                alias,
+                namespace,
                 &root_digest,
                 &root_bytes,
             )
@@ -7213,6 +7280,8 @@ async fn store_default_context<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
+    fence: Option<fluree_db_nameservice::Fence>,
+    namespace: &StorageNamespace,
     turtle_prefix_map: &HashMap<String, String>,
 ) -> std::result::Result<(), ImportError>
 where
@@ -7255,7 +7324,7 @@ where
         .map_err(|e| ImportError::Storage(format!("serialize default context: {e}")))?;
 
     // Write to CAS via ContentStore (returns CID)
-    let cs = fluree_db_core::content_store_for(storage.clone(), alias);
+    let cs = fluree_db_core::content_store_for(storage.clone(), namespace);
     let cid = cs
         .put(ContentKind::LedgerConfig, &context_bytes)
         .await
@@ -7285,7 +7354,7 @@ where
     );
 
     nameservice
-        .push_config(alias, current_config.as_ref(), &new_config)
+        .push_config_fenced(alias, fence, current_config.as_ref(), &new_config)
         .await
         .map_err(|e| ImportError::Storage(format!("push default context config: {e}")))?;
 
@@ -7298,7 +7367,7 @@ where
             let addr = fluree_db_core::content_address(
                 storage.storage_method(),
                 kind,
-                alias,
+                namespace,
                 &old_cid.digest_hex(),
             );
             if let Err(e) = storage.delete(&addr).await {
@@ -7761,7 +7830,7 @@ mod resource_model_tests {
 mod publish_import_commit_head_tests {
     use super::*;
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{LedgerLifecycle, RefKind, RefLookup};
+    use fluree_db_nameservice::{RefKind, RefLookup};
 
     fn cid(label: &str) -> ContentId {
         ContentId::new(ContentKind::Commit, label.as_bytes())
@@ -7778,10 +7847,13 @@ mod publish_import_commit_head_tests {
         let ns = MemoryNameService::new();
         let alias = "importdb:main";
 
-        // The importer initializes the ledger before its first publish.
-        ns.init(alias).await.expect("init");
+        // The importer creates the ledger before its first publish.
+        let fence = fluree_db_nameservice::testing::create(&ns, alias)
+            .await
+            .expect("create")
+            .fence;
 
-        publish_import_commit_head(&ns, alias, 1, &cid("t1"))
+        publish_import_commit_head(&ns, alias, fence, 1, &cid("t1"))
             .await
             .expect("initial publish creates the head");
         let head = ns
@@ -7792,15 +7864,15 @@ mod publish_import_commit_head_tests {
         assert_eq!(head.t, 1);
         assert_eq!(head.id, Some(cid("t1")));
 
-        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+        publish_import_commit_head(&ns, alias, fence, 5, &cid("t5"))
             .await
             .expect("checkpoint fast-forwards");
 
-        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+        publish_import_commit_head(&ns, alias, fence, 5, &cid("t5"))
             .await
             .expect("republish of the exact head is a no-op success");
 
-        let err = publish_import_commit_head(&ns, alias, 5, &cid("other"))
+        let err = publish_import_commit_head(&ns, alias, fence, 5, &cid("other"))
             .await
             .expect_err("equal t under a different id is a divergence");
         assert!(
@@ -7808,7 +7880,7 @@ mod publish_import_commit_head_tests {
             "unexpected error: {err}"
         );
 
-        let err = publish_import_commit_head(&ns, alias, 3, &cid("t3"))
+        let err = publish_import_commit_head(&ns, alias, fence, 3, &cid("t3"))
             .await
             .expect_err("a head past the published t is a divergence");
         assert!(

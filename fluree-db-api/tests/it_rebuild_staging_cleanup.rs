@@ -7,9 +7,9 @@
 #![cfg(feature = "native")]
 
 use async_trait::async_trait;
-use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, Novelty};
+use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState};
 use fluree_db_core::error::Result as StorageResult;
-use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot};
+use fluree_db_core::{ContentId, ContentKind, ContentStore};
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
@@ -57,7 +57,10 @@ impl ContentStore for RangeReadsFail {
 }
 
 async fn seed_commits(fluree: &fluree_db_api::Fluree, ledger_id: &str, n: usize) -> LedgerState {
-    let mut ledger = LedgerState::new(LedgerSnapshot::genesis(ledger_id), Novelty::new(0));
+    let mut ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     let idx_cfg = IndexConfig {
         reindex_min_bytes: 0,
         reindex_max_bytes: 10_000_000,
@@ -132,7 +135,7 @@ async fn failed_rebuild_removes_its_session_directories() {
     let config = fluree_db_indexer::IndexerConfig::default().with_data_dir(data_dir.path());
 
     let result = fluree_db_indexer::rebuild_index_from_commits_with_store(
-        RangeReadsFail(fluree.content_store(ledger_id)),
+        RangeReadsFail(fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap())),
         ledger_id,
         &record,
         config,
@@ -161,7 +164,7 @@ async fn successful_rebuild_removes_its_session_directories() {
     let config = fluree_db_indexer::IndexerConfig::default().with_data_dir(data_dir.path());
 
     fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         ledger_id,
         &record,
         config,

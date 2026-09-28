@@ -31,7 +31,7 @@ const NAME: &str = "https://www.w3.org/ns/activitystreams#name";
 #[tokio::test]
 async fn per_node_graph_insert_upsert_lands_in_named_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = support::genesis_ledger(&fluree, "mat/named-graph:main");
+    let ledger = support::genesis_ledger(&fluree, "mat/named-graph:main").await;
 
     // The exact shape `nodes_by_graph_to_doc` emits for a named graph: each node
     // carries a per-node `@graph` STRING. `@type` goes via insert (idempotent
@@ -75,7 +75,7 @@ async fn per_node_graph_insert_upsert_lands_in_named_graph() {
 #[tokio::test]
 async fn same_iri_in_two_graphs_stays_isolated_and_unions_types() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = support::genesis_ledger(&fluree, "mat/named-graph-iso:main");
+    let ledger = support::genesis_ledger(&fluree, "mat/named-graph-iso:main").await;
 
     // Same IRI, two graphs — the per-(tenant,user) override boundary. In G1 it is
     // additionally an Announce (a retweet); the additive @type union must hold
@@ -133,7 +133,7 @@ async fn envelope_form_is_rejected_by_insert() {
     // empty. This is exactly the failure every data-bearing table hit before the
     // fix, and the reason `nodes_by_graph_to_doc` uses the per-node `@graph` string.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = support::genesis_ledger(&fluree, "mat/named-graph-envelope:main");
+    let ledger = support::genesis_ledger(&fluree, "mat/named-graph-envelope:main").await;
     let envelope = json!([{ "@id": G1, "@graph": [{ "@id": S, "@type": [ARTICLE] }] }]);
     let res = fluree.insert(ledger, &envelope).await;
     assert!(

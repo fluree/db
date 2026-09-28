@@ -184,6 +184,7 @@ impl SseClient {
                 Ok(Some(SseClientEvent::Retracted {
                     kind: data.kind,
                     resource_id: data.resource_id,
+                    instance: data.instance,
                 }))
             }
             Some("snapshot-complete") => {

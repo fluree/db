@@ -861,6 +861,66 @@ async fn model_ledger_supplies_policies_and_hierarchy() {
     assert_eq!(rows(r.clone()), 0, "{r}");
 }
 
+/// A source keeps the model ledger it was registered with. Once that ledger
+/// is dropped and another created under its name, the source is suspended
+/// rather than governed by whatever policies the new ledger holds; restoring
+/// the dropped ledger lifts the suspension.
+#[tokio::test]
+async fn a_model_ledger_created_again_under_its_name_suspends_the_source() {
+    async fn names_policy(fluree: &fluree_db_api::Fluree, allow: bool) {
+        let ledger = fluree.create_ledger("swapped:main").await.expect("model");
+        fluree
+            .insert(
+                ledger,
+                &json!({
+                    "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+                    "@id": "ex:names", "@type": "f:AccessPolicy", "f:action": { "@id": "f:view" },
+                    "f:onProperty": [{ "@id": "ex:name" }], "f:allow": allow
+                }),
+            )
+            .await
+            .expect("seed model");
+    }
+    let fluree = setup().await;
+    names_policy(&fluree, false).await;
+    let cfg = R2rmlCreateConfig::new_direct("local-swapped", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle")
+        .with_model("swapped:main");
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("governed source");
+
+    let (select, r#where) = name_query();
+    let query = json!({
+        "@context": context(), "from": "local-swapped:main",
+        "select": select, "where": r#where, "opts": { "default-allow": true }
+    });
+    let names = || fluree.query_from().jsonld(&query).execute_formatted();
+    let rows = |v: Value| v.as_array().map_or(0, Vec::len);
+    assert_eq!(rows(names().await.unwrap()), 0, "the model denies names");
+
+    let dropped = fluree
+        .drop_ledger("swapped", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .unwrap();
+    names_policy(&fluree, true).await;
+    let err = names().await.expect_err("governed by another ledger");
+    assert!(
+        matches!(err, fluree_db_api::ApiError::GraphSourceSuspended(_)),
+        "{err}"
+    );
+
+    fluree
+        .drop_ledger("swapped", fluree_db_api::DropMode::Hard)
+        .await
+        .unwrap();
+    fluree.restore_dropped(dropped.as_str()).await.unwrap();
+    assert_eq!(rows(names().await.unwrap()), 0, "governed again");
+}
+
 /// `--model` is validated when the source is registered, and policies the
 /// source will never be able to evaluate are reported up front.
 #[tokio::test]

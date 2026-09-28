@@ -115,7 +115,7 @@ async fn incremental_arena_seal_then_arena_backed_query() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after_insert = fluree
                 .insert(ledger0, &annotated_insert())
                 .await
@@ -229,7 +229,7 @@ async fn full_rebuild_without_authoritative_falls_back_to_scan() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after_insert = fluree
                 .insert(ledger0, &annotated_insert())
                 .await
@@ -305,7 +305,7 @@ async fn post_defensive_drop_stays_in_scan_fallback() {
 
     local_a
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after_a = fluree
                 .insert(ledger0, &annotated_insert())
                 .await
@@ -461,7 +461,7 @@ async fn had_annotation_arena_sticky_survives_defensive_drop() {
 
     local_a
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after_a = fluree
                 .insert(ledger0, &annotated_insert())
                 .await
@@ -579,7 +579,7 @@ async fn indexer_pass_without_provider_marks_arena_history_owned() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after = fluree
                 .insert(ledger0, &annotated_insert())
                 .await
@@ -635,7 +635,7 @@ async fn storage_inspection_finds_arena_artifacts() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after = fluree
                 .insert(ledger0, &annotated_insert())
                 .await
@@ -751,7 +751,7 @@ async fn non_annotation_ledger_skips_inject_annotations() {
         .build_memory();
     let ledger_id = "it/edge-annotations-indexed:non-annotation-skip";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let plain_insert = json!({
         "@context": ctx(),
         "@graph": [
@@ -858,7 +858,7 @@ async fn explain_tags_annotation_role_and_uses_arena_stats() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after = fluree
                 .insert(ledger0, &annotated_insert())
                 .await
@@ -1007,7 +1007,7 @@ async fn reindex_seals_arena_when_caller_supplies_only_a_provider() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/edge-annotations-indexed:reindex-seals-arena-caller-provider";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     fluree
         .insert(ledger0, &annotated_insert())
@@ -1059,7 +1059,7 @@ async fn reindex_seals_arena_when_caching_enabled_no_provider_in_opts() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/edge-annotations-indexed:reindex-seals-arena";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     fluree
         .insert(ledger0, &annotated_insert())
@@ -1108,7 +1108,7 @@ async fn reindex_seals_arena_without_ledger_caching() {
         .without_ledger_caching()
         .build_memory();
     let ledger_id = "it/edge-annotations-indexed:reindex-seals-arena-no-cache";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     fluree
         .insert(ledger0, &annotated_insert())
@@ -1153,7 +1153,7 @@ async fn wildcard_annotation_query_streams_from_the_arena() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after_insert = fluree
                 .insert(
                     ledger0,
@@ -1280,7 +1280,7 @@ async fn transfer_named_to_named_survives_reindex() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let seeded = fluree
                 .insert(
                     ledger0,
@@ -1379,7 +1379,7 @@ async fn transfer_default_to_named_synthesized_anchor_survives_reindex() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             // Default-graph annotated edge — NO f:reifiesGraph anchor exists.
             let seeded = fluree
                 .insert(
@@ -1514,7 +1514,7 @@ async fn seal_memory_lpg_graph_insert() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "bisect/mem-lpg:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -1585,7 +1585,7 @@ async fn arena_probe_matches_literal_object_annotation() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after_insert = fluree
                 .insert(
                     ledger0,
@@ -1680,7 +1680,7 @@ async fn indexed_named_graph_annotation_stays_writable() {
 
     let committed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &annotate(json!({"@id": "ex:claim1", "ex:confidence": 0.9})),
         )
         .await
@@ -1786,7 +1786,7 @@ async fn deleting_an_indexed_named_graph_edge_cascades_to_its_claim() {
 
     let committed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &json!({
                 "@context": ctx(),
                 "@id": "ex:alice",
@@ -1846,7 +1846,7 @@ async fn deleting_an_indexed_named_graph_claim_body_cascades_its_bundle() {
 
     let committed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &json!({
                 "@context": ctx(),
                 "@id": "ex:alice",
@@ -1910,7 +1910,7 @@ async fn an_indexed_reifier_pointed_at_a_second_edge_is_still_refused() {
 
     let committed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &json!({
                 "@context": ctx(),
                 "@id": "ex:alice",

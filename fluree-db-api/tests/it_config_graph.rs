@@ -24,7 +24,7 @@ fn config_graph_iri(ledger_id: &str) -> String {
 async fn config_graph_reserved_at_gid2() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-gid2:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Transact anything to materialize the ledger
     fluree
@@ -53,7 +53,7 @@ async fn config_graph_reserved_at_gid2() {
 async fn config_write_trig_roundtrip() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-trig:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
     let trig = format!(
@@ -99,7 +99,7 @@ async fn config_write_trig_roundtrip() {
 async fn config_write_json_ld() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-jsonld:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
 
@@ -150,7 +150,7 @@ async fn config_write_json_ld() {
 async fn config_write_rejects_unknown_reasoning_mode() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-bad-reasoning:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let config_iri = config_graph_iri(ledger_id);
 
     let trig = format!(
@@ -185,7 +185,7 @@ async fn config_write_rejects_unknown_reasoning_mode() {
 async fn config_write_accepts_reasoning_modes() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-good-reasoning:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let config_iri = config_graph_iri(ledger_id);
 
     let trig = format!(
@@ -234,7 +234,7 @@ async fn config_write_accepts_reasoning_modes() {
 async fn policy_defaults_apply() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-policy-apply:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // 1. Seed data and a policy class in the default graph
     let result = fluree
@@ -317,7 +317,7 @@ async fn policy_defaults_apply() {
 async fn reasoning_defaults_apply() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-reasoning-apply:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // 1. Seed ontology + data: ex:childName rdfs:subPropertyOf ex:name
     let result = fluree
@@ -424,7 +424,7 @@ async fn reasoning_defaults_apply() {
 async fn reasoning_none_disables_by_default() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-reasoning-none:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // 1. Seed ontology + data: ex:childName rdfs:subPropertyOf ex:name
     let result = fluree
@@ -510,7 +510,7 @@ async fn reasoning_none_disables_by_default() {
 async fn per_graph_override() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-per-graph:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
 
@@ -563,7 +563,7 @@ async fn per_graph_override() {
 async fn override_control_none_blocks() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-override-none:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // 1. Seed data
     let result = fluree
@@ -633,7 +633,7 @@ async fn override_control_none_blocks() {
 async fn override_control_identity_restricted() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-identity:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
 
@@ -751,7 +751,7 @@ async fn names_through_policy(
 async fn policy_override_identity_restricted_end_to_end() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-identity-e2e:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let ledger = fluree
         .insert(
             ledger,
@@ -833,7 +833,7 @@ async fn override_monotonicity() {
     // Case A: ledger-wide AllowAll + per-graph OverrideNone → tightened to OverrideNone
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-mono-a:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
     let trig = format!(
@@ -877,7 +877,7 @@ async fn override_monotonicity() {
     // Case B: ledger-wide OverrideNone + per-graph AllowAll → ledger-wide blocks per-graph entirely
     let fluree_b = FlureeBuilder::memory().build_memory();
     let ledger_id_b = "it/config-mono-b:main";
-    let ledger_b = genesis_ledger(&fluree_b, ledger_id_b);
+    let ledger_b = genesis_ledger(&fluree_b, ledger_id_b).await;
 
     let config_iri_b = config_graph_iri(ledger_id_b);
     let trig_b = format!(
@@ -933,7 +933,7 @@ async fn override_monotonicity() {
 async fn empty_config_returns_none() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-empty:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Transact data (no config)
     fluree
@@ -966,7 +966,7 @@ async fn empty_config_returns_none() {
 async fn multiple_configs_lexicographic_tiebreaker() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-tiebreak:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
 
@@ -1017,7 +1017,7 @@ async fn multiple_configs_lexicographic_tiebreaker() {
 async fn config_time_travel_consistent() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-timetravel:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // t=1: seed data (no config)
     let result1 = fluree
@@ -1086,7 +1086,7 @@ async fn config_time_travel_consistent() {
 async fn shacl_config_disables_validation() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-disable:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Step 1: Seed a SHACL shape requiring ex:name on ex:Person
     let result = fluree
@@ -1180,7 +1180,7 @@ async fn shacl_config_disables_validation() {
 async fn shacl_config_warn_mode() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-warn:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed a SHACL shape
     let result = fluree
@@ -1256,7 +1256,7 @@ async fn shacl_config_warn_mode() {
 async fn shacl_shapes_source_points_to_named_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-shapes-source:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Write the shape into a named graph (ex:shapes), NOT the default graph.
     // Same transaction also writes config pointing `f:shapesSource` at that
@@ -1332,7 +1332,7 @@ async fn shacl_shapes_source_points_to_named_graph() {
 async fn shacl_shapes_source_excludes_default_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-shapes-source-exclusive:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Stash a shape in the DEFAULT graph that would fail the violating data.
     let result = fluree
@@ -1423,7 +1423,7 @@ async fn shacl_shapes_source_excludes_default_graph() {
 async fn shacl_class_value_set_in_shapes_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-class-value-set:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Shapes graph carries BOTH the shape and the value-set vocabulary (the US
     // states). Config points `f:shapesSource` at it.
@@ -1541,7 +1541,7 @@ async fn shacl_class_value_set_in_shapes_graph() {
 async fn shacl_per_graph_disable_honored() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-pergraph-disable:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed a shape + enable SHACL ledger-wide, AND disable SHACL for a
     // specific named graph (ex:scratch). Writes that land in ex:scratch
@@ -1639,7 +1639,7 @@ async fn shacl_per_graph_disable_honored() {
 async fn shacl_per_graph_mode_warn_vs_reject() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-pergraph-mode:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Ledger-wide SHACL enabled in Reject mode. Named graph ex:scratch
     // overridden to Warn mode. Shape applies to both.
@@ -1734,7 +1734,7 @@ async fn shacl_per_graph_mode_warn_vs_reject() {
 async fn shacl_per_graph_mode_applies_to_graph_variable_targets() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-pergraph-graph-var:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
     let trig = format!(
@@ -1827,7 +1827,7 @@ async fn seed_person_shape_and_named_graphs(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let config_iri = config_graph_iri(ledger_id);
     let trig = format!(
         r#"
@@ -1981,7 +1981,7 @@ async fn shacl_reads_the_named_graph_the_write_lands_in() {
 async fn shacl_default_shapes_exist_heuristic() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-heuristic:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed SHACL shapes — no config graph at all
     let result = fluree
@@ -2040,7 +2040,7 @@ async fn shacl_default_shapes_exist_heuristic() {
 async fn shacl_no_shapes_no_config_skips() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-noop:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // No shapes, no config — any data should succeed
     fluree
@@ -2070,7 +2070,7 @@ async fn shacl_no_shapes_no_config_skips() {
 async fn shacl_turtle_insert_rejected_when_violating() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-turtle-reject:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed a SHACL shape requiring ex:name on every ex:Person.
     let result = fluree
@@ -2127,7 +2127,7 @@ async fn shacl_turtle_insert_rejected_when_violating() {
 async fn shacl_turtle_insert_warn_mode_logs_but_succeeds() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-turtle-warn:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed the shape first.
     let result = fluree
@@ -2197,7 +2197,7 @@ async fn shacl_turtle_insert_warn_mode_logs_but_succeeds() {
 async fn datalog_config_disables_reasoning() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/datalog-disable:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Write config: datalog disabled, no overrides permitted
     let config_iri = config_graph_iri(ledger_id);
@@ -2245,7 +2245,7 @@ async fn datalog_config_disables_reasoning() {
 async fn datalog_config_blocks_query_time_rules() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/datalog-no-rules:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Write config: datalog enabled but query-time rules blocked
     let config_iri = config_graph_iri(ledger_id);
@@ -2297,7 +2297,7 @@ async fn datalog_config_blocks_query_time_rules() {
 async fn datalog_override_control_identity_restricted() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/datalog-identity:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Write config: datalog disabled with identity-restricted override
     let config_iri = config_graph_iri(ledger_id);
@@ -2369,7 +2369,7 @@ async fn datalog_override_control_identity_restricted() {
 async fn merge_shacl_opts_unit_test() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/shacl-merge:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Write config with SHACL in Warn mode
     let config_iri = config_graph_iri(ledger_id);
@@ -2444,7 +2444,7 @@ async fn write_unique_config(
 async fn unique_basic_enforcement() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/unique-basic:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Step 1: Add enforceUnique annotation + seed data
     let result = fluree
@@ -2497,7 +2497,7 @@ async fn unique_basic_enforcement() {
 async fn unique_not_enabled_no_enforcement() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/unique-not-enabled:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Add enforceUnique annotation + data but NO config enabling it
     let result = fluree
@@ -2537,7 +2537,7 @@ async fn unique_not_enabled_no_enforcement() {
 async fn unique_config_not_retroactive() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/unique-not-retroactive:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Step 1: Add annotation only
     let result = fluree
@@ -2590,7 +2590,7 @@ async fn unique_config_not_retroactive() {
 async fn unique_intra_txn_bulk() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/unique-bulk:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Step 1: Add annotation
     let result = fluree
@@ -2643,7 +2643,7 @@ async fn unique_intra_txn_bulk() {
 async fn unique_different_values_allowed() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/unique-diff-vals:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Add annotation + first subject
     let result = fluree
@@ -2695,7 +2695,7 @@ async fn unique_different_values_allowed() {
 async fn upsert_enforce_unique_self_conflict_should_be_noop() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/unique-self-upsert:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Step 1: Add enforceUnique annotation on ex:userId + seed an entity
     let result = fluree
@@ -2782,7 +2782,7 @@ async fn upsert_enforce_unique_self_conflict_should_be_noop() {
 async fn failed_upsert_does_not_corrupt_in_memory_state() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/unique-no-corrupt:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Step 1: Add enforceUnique annotation + seed two entities with distinct values
     let result = fluree
@@ -2874,7 +2874,7 @@ async fn failed_upsert_does_not_corrupt_in_memory_state() {
 async fn fulltext_defaults_round_trip() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-rt:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
     let trig = format!(
@@ -2944,7 +2944,7 @@ async fn fulltext_defaults_round_trip() {
 async fn fulltext_defaults_per_graph_override_additive() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-override:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
     let target_graph = "urn:test:productCatalog";
@@ -3030,7 +3030,7 @@ async fn fulltext_defaults_per_graph_override_additive() {
 async fn fulltext_defaults_override_none_blocks_per_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-override-none:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
     let target_graph = "urn:test:productCatalog";
@@ -3107,7 +3107,7 @@ async fn configured_fulltext_properties_for_indexer_shape() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-indexer-shape:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
     let target_graph = "urn:test:productCatalog";
@@ -3248,7 +3248,7 @@ async fn configured_fulltext_properties_for_indexer_shape() {
 async fn policy_source_unknown_graph_fails_closed() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/policy-source-unknown:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Some data in the default graph (irrelevant to the assertion, but proves
     // the fallback would have had something to enforce against).
@@ -3311,7 +3311,7 @@ async fn policy_source_unknown_graph_fails_closed() {
 async fn policy_source_cross_ledger_fails_closed() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/policy-source-xledger:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -3385,7 +3385,7 @@ async fn policy_source_cross_ledger_fails_closed() {
 async fn constraints_source_unknown_graph_fails_closed() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/constraints-source-unknown:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed annotation + data
     let r1 = fluree
@@ -3460,7 +3460,7 @@ async fn constraints_source_unknown_graph_fails_closed() {
 async fn constraints_source_cross_ledger_fails_closed() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/constraints-source-xledger:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -3539,7 +3539,7 @@ async fn constraints_source_cross_ledger_fails_closed() {
 /// `<urn:config:reasoning>` (plus any list-node triples they need).
 async fn assert_reasoning_modes_shape_engages(ledger_id: &str, modes_stmts: &str) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let result = fluree
         .insert(
@@ -3642,7 +3642,7 @@ async fn seed_default_allow_ledger(
     ledger_id: &str,
     configured_default_allow: Option<bool>,
 ) {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let result = fluree
         .insert(
             ledger,
@@ -3843,7 +3843,7 @@ async fn seed_reasoning_defaults_with(
     extra_stmts: &str,
 ) -> fluree_db_api::Fluree {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let result = fluree
         .insert(
@@ -4141,7 +4141,7 @@ async fn seed_shacl_mode_ledger(
     ledger_id: &str,
     shacl_group_trig: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let result = fluree
         .insert(
             ledger,
@@ -4440,7 +4440,7 @@ async fn shacl_heuristic_without_config_ignores_requested_warn_mode() {
     use fluree_db_core::ledger_config::ValidationMode;
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "it/shacl-heuristic-no-config:main");
+    let ledger = genesis_ledger(&fluree, "it/shacl-heuristic-no-config:main").await;
     // Shapes, deliberately with no config graph written afterwards.
     let result = fluree
         .insert(
@@ -4792,7 +4792,7 @@ async fn reasoning_override_identity_restricted_sparql() {
 async fn datalog_override_identity_restricted_end_to_end() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-datalog-identity-e2e:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let ledger = fluree
         .insert(
             ledger,

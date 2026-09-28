@@ -31,7 +31,7 @@ fn ctx() -> JsonValue {
 async fn correlated_multi_pattern_optional_counts_per_group_with_left_join() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/optional:hashjoin";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // People, forums (with member edges), and posts (creator + container edges).
     //
@@ -142,7 +142,7 @@ async fn correlated_multi_pattern_optional_counts_per_group_with_left_join() {
 async fn batched_optional_matches_materialized_values_against_scan_produced_corr() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/optional:hashjoin-values";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Same shape as the IC5 test: members per forum, posts with creator+container.
     //   F1 -> {bob, carol}, posts p1(bob), p2(carol)

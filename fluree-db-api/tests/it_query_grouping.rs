@@ -22,7 +22,7 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
 async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
     let insert = json!({
         "@context": ctx,
@@ -320,7 +320,7 @@ async fn sparql_12_syntax_checks_rejected() {
 /// onto one `?b`, so `?a` dying mid-chain is what WHERE-level early dedup
 /// would otherwise use to collapse rows.
 async fn seed_fanin(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
     let insert = json!({
         "@context": ctx,

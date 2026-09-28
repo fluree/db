@@ -94,7 +94,7 @@ fn non_identity(pairs: &[String]) -> Vec<String> {
 async fn issue_1723_sameterm_answers_the_unfolded_result() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "issue1723-sameterm:main");
+    let ledger0 = genesis_ledger(&fluree, "issue1723-sameterm:main").await;
     let ledger = fluree
         .insert(ledger0, &seed())
         .await
@@ -147,7 +147,7 @@ async fn issue_1723_sameterm_answers_the_unfolded_result() {
 async fn issue_1723_value_equality_answer_is_unchanged() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "issue1723-eq:main");
+    let ledger0 = genesis_ledger(&fluree, "issue1723-eq:main").await;
     let ledger = fluree
         .insert(ledger0, &seed())
         .await

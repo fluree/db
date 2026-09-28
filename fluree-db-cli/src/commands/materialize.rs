@@ -254,12 +254,12 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
                 .archive_ledger(&twin_ledger, true, &mut file)
                 .await
                 .map_err(|e| CliError::Import(format!("write pack: {e}")))?;
-            // #1529 review (minor): `fluree drop` rejects a `:branch` suffix and
-            // requires `--force`, so print the whole-ledger id + --force (the old
-            // advice `fluree drop {twin_ledger}` failed twice as written).
+            // #1529 review (minor): `fluree drop` rejects a `:branch` suffix, so
+            // print the whole-ledger id; `--hard --force` frees the disk as well.
             println!(
                 "Twin packed to {} ({} flakes). The source twin ledger '{twin_ledger}' stays \
-                 registered locally; drop it with `fluree drop {} --force` when no longer needed.",
+                 registered locally; drop it with `fluree drop {} --hard --force` when no longer \
+                 needed.",
                 path.display(),
                 result.flake_count,
                 ledger_name_no_branch(&twin_ledger),

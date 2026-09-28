@@ -16,7 +16,7 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
 
 async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     // Seed dataset with typed birthDate fields used by aggregate tests.
@@ -629,7 +629,7 @@ async fn select_expr_if_branches_on_age() {
 }
 
 async fn seed_receipt_line_items_jsonld(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -724,7 +724,7 @@ async fn aggregates_arithmetic_over_min_max_jsonld() {
 ///   a1 --p1--> b1 --p2--> {10, 20}
 ///   a2 --p1--> b1
 async fn seed_chain_fan_in(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@graph": [

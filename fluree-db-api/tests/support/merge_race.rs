@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
-    ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceLookup,
+    ConfigPublisher, ConfigValue, Fence, GraphSourceLookup, GraphSourcePublisher,
+    GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads, NameServiceLookup,
     NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
     RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
@@ -95,24 +95,15 @@ impl NameServiceLookup for PausingNameService {
 
 #[async_trait]
 impl BranchLifecycle for PausingNameService {
-    async fn create_branch(
+    async fn reset_head_fenced(
         &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
     ) -> Result<()> {
         self.inner
-            .create_branch(ledger_name, new_branch, source_branch, at_commit)
+            .reset_head_fenced(ledger_id, fence, snapshot)
             .await
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        self.inner.drop_branch(ledger_id).await
-    }
-
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
-        self.inner.reset_head(ledger_id, snapshot).await
     }
 
     async fn pending_commit_cids(
@@ -129,30 +120,16 @@ impl BranchLifecycle for PausingNameService {
 }
 
 #[async_trait]
-impl LedgerLifecycle for PausingNameService {
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        self.inner.init(ledger_id).await
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        self.inner.retract(ledger_id).await
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        self.inner.purge(ledger_id).await
-    }
-}
-
-#[async_trait]
 impl CommitPublisher for PausingNameService {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_commit(ledger_id, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
             .await
     }
 
@@ -163,35 +140,40 @@ impl CommitPublisher for PausingNameService {
 
 #[async_trait]
 impl IndexPublisher for PausingNameService {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        self.inner.publish_index(ledger_id, index_t, index_id).await
+        self.inner
+            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .await
     }
 }
 
 #[async_trait]
 impl AdminPublisher for PausingNameService {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_index_allow_equal(ledger_id, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
             .await
     }
 }
 
 #[async_trait]
 impl RefPublisher for PausingNameService {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -204,7 +186,7 @@ impl RefPublisher for PausingNameService {
             self.resume.notified().await;
         }
         self.inner
-            .compare_and_set_ref(ledger_id, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
             .await
     }
 }
@@ -239,28 +221,130 @@ impl GraphSourcePublisher for PausingNameService {
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
         self.inner.retract_graph_source(name, branch).await
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        self.inner.reset_graph_source_index(name, branch).await
+    }
 }
 
 #[async_trait]
 impl StatusPublisher for PausingNameService {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
-        self.inner.push_status(ledger_id, expected, new).await
+        self.inner
+            .push_status_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 
 #[async_trait]
 impl ConfigPublisher for PausingNameService {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        self.inner.push_config(ledger_id, expected, new).await
+        self.inner
+            .push_config_fenced(ledger_id, fence, expected, new)
+            .await
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::LedgerRegistry for PausingNameService {
+    async fn get_binding(
+        &self,
+        name: &str,
+    ) -> Result<Option<fluree_db_nameservice::Versioned<fluree_db_nameservice::NameBinding>>> {
+        self.inner.get_binding(name).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&fluree_db_nameservice::NameBinding>,
+    ) -> Result<fluree_db_nameservice::RegistryCas<fluree_db_nameservice::NameBinding>> {
+        self.inner.cas_binding(name, expected, new).await
+    }
+
+    async fn list_bindings(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            fluree_db_nameservice::Versioned<fluree_db_nameservice::NameBinding>,
+        )>,
+    > {
+        self.inner.list_bindings().await
+    }
+
+    async fn get_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+    ) -> Result<Option<fluree_db_nameservice::Versioned<fluree_db_nameservice::DroppedLedger>>>
+    {
+        self.inner.get_dropped(instance).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+        expected: Option<u64>,
+        new: Option<&fluree_db_nameservice::DroppedLedger>,
+    ) -> Result<fluree_db_nameservice::RegistryCas<fluree_db_nameservice::DroppedLedger>> {
+        self.inner.cas_dropped(instance, expected, new).await
+    }
+
+    async fn list_dropped(
+        &self,
+    ) -> Result<Vec<fluree_db_nameservice::Versioned<fluree_db_nameservice::DroppedLedger>>> {
+        self.inner.list_dropped().await
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::BranchRecordStore for PausingNameService {
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        self.inner.raw_record(ledger_id).await
+    }
+
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        self.inner.all_raw_records().await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        self.inner.insert_record(record).await
+    }
+
+    async fn adopt_record(
+        &self,
+        ledger_id: &str,
+        fence: fluree_db_nameservice::Fence,
+    ) -> Result<fluree_db_nameservice::FenceOutcome> {
+        self.inner.adopt_record(ledger_id, fence).await
+    }
+
+    async fn freeze_record(
+        &self,
+        ledger_id: &str,
+        fence: fluree_db_nameservice::Fence,
+    ) -> Result<fluree_db_nameservice::FenceOutcome> {
+        self.inner.freeze_record(ledger_id, fence).await
+    }
+
+    async fn delete_record(
+        &self,
+        ledger_id: &str,
+        fence: fluree_db_nameservice::Fence,
+    ) -> Result<fluree_db_nameservice::FenceOutcome> {
+        self.inner.delete_record(ledger_id, fence).await
     }
 }

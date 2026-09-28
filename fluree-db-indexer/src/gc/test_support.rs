@@ -100,6 +100,11 @@ pub(crate) fn cid_and_addr_for(
     data: &[u8],
 ) -> (ContentId, String) {
     let cid = ContentId::new(kind, data);
-    let addr = content_address("memory", kind, ledger_id, &cid.digest_hex());
+    let addr = content_address(
+        "memory",
+        kind,
+        &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+        &cid.digest_hex(),
+    );
     (cid, addr)
 }

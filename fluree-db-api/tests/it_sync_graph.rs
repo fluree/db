@@ -37,7 +37,7 @@ fn payload_v2() -> JsonValue {
 
 /// Seed a ledger with one default-graph triple and one triple in OTHER_IRI.
 async fn seed(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> i64 {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let trig = format!(
         r#"
         @prefix ex: <http://example.org/> .

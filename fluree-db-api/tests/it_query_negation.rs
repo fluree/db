@@ -51,7 +51,7 @@ fn filter_rows_subject_ex(v: &serde_json::Value) -> serde_json::Value {
 }
 
 async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = ctx_ex();
 
     let insert = json!({
@@ -400,7 +400,7 @@ async fn inner_filter_not_exists_vs_minus_behavior() {
     // Scenario: demonstrates that NOT-EXISTS sees existing bindings for filter,
     // while MINUS does not (i.e. filter inside MINUS can't reference outer vars).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "negation:inner-filters");
+    let ledger0 = genesis_ledger(&fluree, "negation:inner-filters").await;
     let ctx = ctx_ex();
 
     let insert = json!({
@@ -540,7 +540,7 @@ async fn filter_not_exists_expression_equals_pattern_level() {
 /// alice's only acquaintance works somewhere but alice doesn't; carol works at
 /// a different org than her acquaintance; dave's acquaintance has no employer.
 async fn seed_knows_works_for(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ttl = r"@prefix ex: <http://example.com/> .
 ex:alice ex:knows ex:bob .
 ex:bob ex:worksFor ex:acme .

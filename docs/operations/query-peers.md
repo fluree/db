@@ -32,6 +32,21 @@ The transaction server exposes a Server-Sent Events (SSE) stream that emits **na
 - **`ledger=<ledger_id>`**: subscribe to a ledger ID (`name:branch`, repeatable)
 - **`graph-source=<graph_source_id>`**: subscribe to a graph source ID (`name:branch`, repeatable)
 
+### Events
+
+| Event | Sent when | Payload |
+|-------|-----------|---------|
+| `ns-record` | A ledger or graph source is created, restored or updated, or a branch is created | `kind` (`ledger` or `graph-source`), `resource_id`, `record`, `emitted_at`. A ledger's `record` carries its heads (`commit_head_id`, `commit_t`, `index_head_id`, `index_t`), its `storage_root` and its `instance`. |
+| `ns-retracted` | A ledger branch or graph source is dropped | `kind`, `resource_id`, `emitted_at`, and for a ledger branch, the `instance` it belonged to when the server knows it |
+
+On connecting, a subscriber first receives an `ns-record` for each resource in scope. The same event may be sent more than once.
+
+Every ledger has an **instance** id, fixed when it is created. A ledger dropped and created again under the same name gets a new instance and starts again from `t` 0, so heads compare only within one instance:
+
+- A record with another instance than the one a peer holds replaces it, whatever its `t`.
+- A retraction naming another instance than the one a peer holds is older than that ledger, and the peer ignores it.
+- A retraction without an `instance` applies to whatever the peer holds under the name.
+
 ### Authentication and authorization
 
 The `/v1/fluree/events` endpoint can be configured to require Bearer tokens:

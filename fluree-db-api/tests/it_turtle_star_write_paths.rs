@@ -85,7 +85,7 @@ async fn confidences(
 #[tokio::test]
 async fn upsert_turtle_accepts_named_reifier_and_annotation_is_queryable() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert:named");
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert-named:main").await;
 
     let turtle = with_prefixes(
         "ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source \"hr\" |} .\n",
@@ -144,7 +144,7 @@ async fn upsert_turtle_accepts_named_reifier_and_annotation_is_queryable() {
 #[tokio::test]
 async fn upsert_turtle_replaces_the_annotation_body_on_re_upsert() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert:replace");
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert-replace:main").await;
 
     let first = fluree
         .upsert_turtle(
@@ -184,14 +184,14 @@ async fn upsert_turtle_and_insert_turtle_agree_on_the_claim_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
     let inserted = fluree
         .insert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-parity:insert"),
+            genesis_ledger(&fluree, "it/turtle-star-parity-insert:main").await,
             &turtle,
         )
         .await
         .expect("insert_turtle");
     let upserted = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-parity:upsert"),
+            genesis_ledger(&fluree, "it/turtle-star-parity-upsert:main").await,
             &turtle,
         )
         .await
@@ -221,17 +221,17 @@ async fn rdf_reifies_triple_term_is_accepted_by_upsert_and_sync() {
     let fluree = FlureeBuilder::memory().build_memory();
     let upserted = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-upsert:rdf-reifies"),
+            genesis_ledger(&fluree, "it/turtle-star-upsert-rdf-reifies:main").await,
             &with_prefixes(turtle),
         )
         .await
         .expect("upsert_turtle with rdf:reifies <<( )>>");
     assert_eq!(confidences(&fluree, &upserted.ledger, None).await, ["0.9"]);
 
-    let ledger_id = "it/turtle-star-sync:rdf-reifies";
+    let ledger_id = "it/turtle-star-sync-rdf-reifies:main";
     fluree
         .insert_turtle(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
         )
         .await
@@ -253,10 +253,10 @@ async fn upserting_trig_that_moves_an_anonymous_annotation_adds_a_claim() {
     // apart: a different payload mints a different reifier, and the first
     // claim stays on the edge it was written for.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/trig-star-upsert:moved-anonymous-annotation";
+    let ledger_id = "it/trig-star-upsert-moved-anonymous-annotation:main";
     fluree
         .insert_turtle(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
         )
         .await
@@ -290,10 +290,10 @@ async fn upserting_trig_with_a_version_directive_keeps_the_prefixes_after_it() {
     // `VERSION "1.2"` carries no trailing dot, so a TriG scanner that skips
     // unknown statements to the next `.` folds the following `@prefix` into it.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/trig-star-upsert:version-directive";
+    let ledger_id = "it/trig-star-upsert-version-directive:main";
     fluree
         .insert_turtle(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
         )
         .await
@@ -325,7 +325,7 @@ async fn annotated_type_edge_is_accepted_by_insert_and_refused_by_upsert() {
     // The direct Turtle path reifies the type edge like any other edge.
     let committed = fluree
         .insert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-type-edge:insert"),
+            genesis_ledger(&fluree, "it/turtle-star-type-edge-insert:main").await,
             &turtle,
         )
         .await
@@ -345,7 +345,7 @@ async fn annotated_type_edge_is_accepted_by_insert_and_refused_by_upsert() {
     // instead of dropping the claim or failing deep in the parser.
     let err = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-type-edge:upsert"),
+            genesis_ledger(&fluree, "it/turtle-star-type-edge-upsert:main").await,
             &turtle,
         )
         .await
@@ -368,7 +368,7 @@ async fn one_named_reifier_on_two_edges_is_rejected_on_every_turtle_path() {
     let fluree = FlureeBuilder::memory().build_memory();
     let err = fluree
         .insert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-reuse:insert"),
+            genesis_ledger(&fluree, "it/turtle-star-reuse-insert:main").await,
             &turtle,
         )
         .await
@@ -378,7 +378,7 @@ async fn one_named_reifier_on_two_edges_is_rejected_on_every_turtle_path() {
 
     let err = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-reuse:upsert"),
+            genesis_ledger(&fluree, "it/turtle-star-reuse-upsert:main").await,
             &turtle,
         )
         .await
@@ -391,13 +391,13 @@ async fn one_named_reifier_on_two_edges_is_rejected_on_every_turtle_path() {
 async fn sync_named_graph_accepts_turtle_star_payload() {
     const GRAPH: &str = "http://example.org/graphs/claims";
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/turtle-star-sync:claims";
+    let ledger_id = "it/turtle-star-sync-claims:main";
     // Sync addresses a ledger by id, so it has to exist: seed one
     // default-graph triple (the way `fluree graph sync` finds a ledger the
     // user created earlier).
     fluree
         .insert_turtle(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
         )
         .await
@@ -456,10 +456,10 @@ async fn named_graph_annotation_survives_indexing_and_re_sync() {
     // which reaches it through a plain JSON-LD write.
     const GRAPH: &str = "http://example.org/graphs/claims";
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/turtle-star-sync:indexed-named-graph";
+    let ledger_id = "it/turtle-star-sync-indexed-named-graph:main";
     fluree
         .insert_turtle(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
         )
         .await
@@ -621,10 +621,10 @@ async fn sync(
 #[tokio::test]
 async fn re_syncing_without_a_claims_line_drops_just_that_claim() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/turtle-star-sync:drop-a-line";
+    let ledger_id = "it/turtle-star-sync-drop-a-line:main";
     fluree
         .insert_turtle(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
         )
         .await
@@ -665,10 +665,10 @@ async fn re_syncing_without_a_claims_line_drops_just_that_claim() {
 #[tokio::test]
 async fn re_syncing_an_anonymous_annotated_edge_can_change_its_object() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/turtle-star-sync:change-object";
+    let ledger_id = "it/turtle-star-sync-change-object:main";
     fluree
         .insert_turtle(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
         )
         .await
@@ -699,7 +699,7 @@ async fn re_syncing_an_anonymous_annotated_edge_can_change_its_object() {
 #[tokio::test]
 async fn upserting_a_named_claim_can_change_the_fact_it_describes() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert:repoint");
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert-repoint:main").await;
 
     let first = fluree
         .upsert_turtle(ledger0, &with_prefixes("ex:alice ex:age 42 ~ ex:c1 .\n"))
@@ -740,7 +740,7 @@ async fn re_upserting_an_anonymous_annotation_replaces_it_rather_than_duplicatin
     // `{| … |}` has no author-supplied identity, so "replace the body, keep
     // the edge" has to hold on an identity the write path derives itself.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert:anon-replace");
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert-anon-replace:main").await;
     let turtle = with_prefixes("ex:alice ex:knows ex:bob {| ex:confidence 0.9 |} .\n");
 
     let first = fluree
@@ -787,7 +787,7 @@ async fn re_upserting_parallel_annotations_is_a_no_op() {
     // edge once per claim, so the accumulator sees it twice; an identical
     // re-upsert must still net to nothing rather than committing the surplus.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert:parallel-noop");
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert-parallel-noop:main").await;
     let turtle = with_prefixes(
         "ex:alice ex:knows ex:bob ~ ex:c1 {| ex:confidence 0.9 |} \
          ~ ex:c2 {| ex:confidence 0.7 |} .\n",
@@ -820,10 +820,10 @@ async fn an_unchanged_anonymous_claim_re_syncs_as_a_no_op() {
     // The docs said anonymous reifiers make every sync run commit a delta.
     // This is the test that decides whether that is true.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/turtle-star-sync:anon-noop";
+    let ledger_id = "it/turtle-star-sync-anon-noop:main";
     fluree
         .insert_turtle(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
         )
         .await
@@ -859,10 +859,10 @@ async fn a_changed_anonymous_claim_body_is_replaced_on_sync() {
     // pinned by `re_upserting_an_anonymous_annotation_replaces_it_rather_than_
     // duplicating`. Naming the reifier gives replacement on both.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/turtle-star-sync:anon-changed-body";
+    let ledger_id = "it/turtle-star-sync-anon-changed-body:main";
     fluree
         .insert_turtle(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
         )
         .await

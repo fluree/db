@@ -25,7 +25,7 @@ fn ctx() -> JsonValue {
 /// Everything is bare namespace-0 names, matching Cypher's default
 /// resolution of `n.name` / `n.secret`.
 async fn seed(fluree: &support::MemoryFluree, ledger_id: &str) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,

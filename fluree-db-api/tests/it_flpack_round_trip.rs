@@ -36,7 +36,7 @@ async fn export_ledger_to_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &str)
         .as_ref()
         .expect("ledger should have commits");
 
-    let content_store = fluree.content_store(ledger_id);
+    let content_store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
 
     let missing_commits = compute_missing_commits(
         &content_store,
@@ -153,6 +153,7 @@ async fn import_ledger_from_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &st
         .create_ledger(ledger_id)
         .await
         .expect("create ledger for import");
+    let namespace = fluree.storage_namespace(ledger_id).await.unwrap();
 
     let mut pos = read_stream_preamble(data).expect("valid preamble");
     let admin_storage = fluree
@@ -177,7 +178,7 @@ async fn import_ledger_from_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &st
             }
             PackFrame::Data { cid, payload } => {
                 assert!(saw_header, "data frame before header");
-                ingest_pack_frame(&cid, &payload, &admin_storage, ledger_id)
+                ingest_pack_frame(&cid, &payload, &admin_storage, &namespace)
                     .await
                     .unwrap_or_else(|e| panic!("ingest failed for {cid}: {e}"));
                 objects += 1;
@@ -244,8 +245,10 @@ async fn flpack_export_import_round_trip() {
         .build()
         .expect("build source");
 
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
 
     let insert_data = json!({
         "@context": {
@@ -365,8 +368,10 @@ async fn flpack_export_import_round_trip_with_index() {
 
     local
         .run_until(async {
-            let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-            let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+            let src_state = src_fluree
+                .create_ledger(src_ledger)
+                .await
+                .expect("create ledger");
 
             let insert_data = json!({
                 "@context": {
@@ -516,8 +521,10 @@ async fn flpack_restore_ledger_api_round_trip() {
         .build()
         .expect("build source");
 
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
 
     let insert_data = json!({
         "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" },
@@ -593,8 +600,10 @@ async fn flpack_restore_bare_name_normalizes_to_main() {
     let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
         .build()
         .expect("build source");
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:test", "ex:value": "hello"
@@ -660,8 +669,10 @@ async fn flpack_preserves_default_context() {
         .expect("build source");
 
     // Populate, then set a default context on the source.
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:a", "ex:v": "1"
@@ -743,8 +754,10 @@ async fn flpack_restore_restamps_index_root_ledger_id() {
 
     local
         .run_until(async {
-            let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-            let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+            let src_state = src_fluree
+                .create_ledger(src_ledger)
+                .await
+                .expect("create ledger");
             let insert = json!({
                 "@context": {"ex": "http://example.org/ns/"},
                 "@graph": [
@@ -787,7 +800,7 @@ async fn flpack_restore_restamps_index_root_ledger_id() {
                 .expect("restored record");
             let index_id = rec.index_head_id.expect("restored index head id");
             let root_bytes = dst_fluree
-                .content_store(dst_ledger)
+                .content_store(&dst_fluree.storage_namespace(dst_ledger).await.unwrap())
                 .get(&index_id)
                 .await
                 .expect("read restored index root");
@@ -835,7 +848,8 @@ async fn flpack_restore_restamps_index_root_ledger_id() {
 }
 
 /// A truncated archive (missing the End frame) must fail and leave no ledger
-/// behind — the half-created ledger is rolled back.
+/// behind — the half-created ledger is rolled back, and the restore can be
+/// retried under the same name.
 #[tokio::test]
 async fn flpack_restore_rolls_back_on_truncated_stream() {
     let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
@@ -846,37 +860,94 @@ async fn flpack_restore_rolls_back_on_truncated_stream() {
     let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
         .build()
         .expect("build source");
-    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
-    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:test", "ex:value": "hello"
     });
     src_fluree.insert(src_state, &insert).await.expect("insert");
 
-    let mut pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+    let full_pack = export_ledger_to_bytes(&src_fluree, src_ledger).await;
     // Lop off the trailing End frame (and a bit more) to simulate truncation.
-    pack_bytes.truncate(pack_bytes.len() / 2);
+    let truncated = full_pack[..full_pack.len() / 2].to_vec();
 
     let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
         .build()
         .expect("build destination");
-    let mut reader = std::io::Cursor::new(pack_bytes);
+    let mut reader = std::io::Cursor::new(truncated);
     let err = dst_fluree.restore_ledger(dst_ledger, &mut reader).await;
     assert!(err.is_err(), "truncated archive should fail");
 
-    // Rollback hard-drops the half-created ledger. A drop leaves a retracted
-    // tombstone rather than purging the nameservice entry, so the guarantee is
-    // "no live ledger": the record is either absent or marked retracted (never
-    // a queryable head pointing at partially-ingested data).
+    // Rollback purges the half-created record rather than retracting it, so
+    // nothing reserves the name.
     let record = dst_fluree
         .nameservice()
         .lookup(dst_ledger)
         .await
         .expect("lookup");
     assert!(
-        record.is_none_or(|r| r.retracted),
-        "failed restore must leave no live ledger (rolled back / retracted)"
+        record.is_none(),
+        "failed restore must leave no record behind: {record:?}"
+    );
+
+    let mut reader = std::io::Cursor::new(full_pack);
+    dst_fluree
+        .restore_ledger(dst_ledger, &mut reader)
+        .await
+        .expect("retrying the restore under the same name must succeed");
+    assert!(dst_fluree.ledger_exists(dst_ledger).await.expect("exists"));
+}
+
+/// A restore into a name that already holds a live ledger on another branch
+/// is refused, and the live ledger is untouched. Before, the restore created a
+/// second root branch under the name, and when it failed its rollback dropped
+/// the whole name, taking the live ledger with it.
+#[tokio::test]
+async fn flpack_restore_refuses_name_held_on_another_branch() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let live = "flpack-test/held:main";
+    let target = "flpack-test/held:other";
+
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let state = fluree.create_ledger(live).await.expect("create ledger");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:test", "ex:value": "hello"
+    });
+    fluree.insert(state, &insert).await.expect("insert");
+
+    // Truncated, so a restore that got past the name check would fail and
+    // exercise the rollback.
+    let mut pack_bytes = export_ledger_to_bytes(&fluree, live).await;
+    pack_bytes.truncate(pack_bytes.len() / 2);
+
+    let mut reader = std::io::Cursor::new(pack_bytes);
+    let err = fluree
+        .restore_ledger(target, &mut reader)
+        .await
+        .expect_err("a name held by a live ledger must be refused");
+    assert!(
+        matches!(err, fluree_db_api::ApiError::LedgerExists(_)),
+        "expected LedgerExists, got: {err}"
+    );
+
+    assert!(
+        fluree.ledger_exists(live).await.expect("exists"),
+        "the live ledger must survive a refused restore"
+    );
+    assert!(
+        fluree
+            .nameservice()
+            .lookup(target)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "a refused restore must not register the target"
     );
 }
 
@@ -890,8 +961,10 @@ async fn flpack_stream_structure_is_valid() {
         .build()
         .expect("build");
 
-    let db = fluree_db_core::LedgerSnapshot::genesis(ledger_id);
-    let state = fluree_db_api::LedgerState::new(db, fluree_db_api::Novelty::new(0));
+    let state = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let insert = json!({
         "@context": {"ex": "http://example.org/ns/"},

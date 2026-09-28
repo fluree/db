@@ -32,7 +32,7 @@ async fn apply_trig(
 /// Seed a transitive-property chain that derives 3 facts under OWL2-RL:
 /// `a partOf b partOf c partOf d` ⇒ `a-c`, `b-d`, `a-d`.
 async fn seed_transitive_chain(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let _ = apply_trig(
         fluree,
         ledger,
@@ -288,7 +288,7 @@ async fn query_budget_overrides_permissive_config_budget() {
 
 /// Seed a few plain entities (no OWL) for datalog rules to scan.
 async fn seed_entities(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let _ = apply_trig(
         fluree,
         ledger,
@@ -378,7 +378,7 @@ async fn datalog_query_budget_caps_fixpoint_and_surfaces_in_tracking() {
 async fn fact_cap_holds_within_a_single_round() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-budget-in-round:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let mut trig = String::from(
         "@prefix ex: <http://example.org/> .\n\
          @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
@@ -414,7 +414,7 @@ async fn fact_cap_holds_within_a_single_round() {
 /// Seed a transitive chain of `n` nodes. The closure is `n*(n-1)/2` facts, so
 /// the size is a tuning dial for budget tests.
 async fn seed_chain_of(fluree: &fluree_db_api::Fluree, ledger_id: &str, n: usize) {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let mut trig = String::from(
         "@prefix ex: <http://example.org/> .\n\
          @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
@@ -494,7 +494,7 @@ async fn memory_budget_ignores_seed_facts() {
     // this; scoping the total to derived facts does not.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-budget-memory-seed:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let mut trig = String::from(
         "@prefix ex: <http://example.org/> .\n\
          @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
@@ -537,7 +537,7 @@ async fn already_stored_entailments_do_not_trip_the_fact_cap() {
     // then cached.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-budget-stored-entailments:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let mut trig = String::from(
         "@prefix ex: <http://example.org/> .\n\
          @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\

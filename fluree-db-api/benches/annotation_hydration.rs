@@ -278,7 +278,7 @@ async fn seed_non_annotation_ledger(n: usize) -> (fluree_db_api::Fluree, String)
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = format!("bench/non-annotation-hydration:{n}");
-    let mut state = make_genesis(&fluree, &ledger_id);
+    let mut state = make_genesis(&fluree, &ledger_id).await;
     for i in 0..n {
         let txn = json!({
             "@context": { "ex": "http://example.org/" },
@@ -312,7 +312,7 @@ async fn seed_ledger_and_optionally_seal(n: usize, seal: bool) -> (fluree_db_api
 
     // Bulk insert: one base edge plus N annotations on it. We do
     // this in chunks of 1000 to keep transaction sizes reasonable.
-    let mut state = make_genesis(&fluree, &ledger_id);
+    let mut state = make_genesis(&fluree, &ledger_id).await;
     let chunk_size = 1000usize;
     let mut emitted = 0usize;
     let base = json!({
@@ -393,12 +393,14 @@ async fn seed_ledger_and_optionally_seal(n: usize, seal: bool) -> (fluree_db_api
     (fluree, ledger_id)
 }
 
-fn make_genesis(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> fluree_db_api::LedgerState {
-    let canonical = fluree_db_core::ledger_id::normalize_ledger_id(ledger_id)
-        .unwrap_or_else(|_| ledger_id.to_string());
-    let snapshot = fluree_db_core::LedgerSnapshot::genesis(&canonical);
-    let _ = fluree;
-    fluree_db_api::LedgerState::new(snapshot, fluree_db_api::Novelty::new(0))
+async fn make_genesis(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger")
 }
 
 criterion_group!(benches, bench_annotation_hydration);

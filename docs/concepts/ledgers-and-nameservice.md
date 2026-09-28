@@ -49,13 +49,22 @@ Ledgers are created implicitly through the first transaction and persist until e
 4. Background indexing process creates queryable indexes
 5. Index ID is published to the nameservice when complete
 
-**Retraction:**
+**One ledger per name:**
 
-Ledgers can be marked as retracted (soft delete), which:
-- Marks the ledger as inactive in the nameservice
-- Preserves storage artifacts
-- Prevents normal load/create/write paths from treating the alias as active
-- Keeps the alias reserved until an administrator purges or otherwise repairs the nameservice record
+A name holds one ledger at a time, with the branches created from it. Each
+ledger gets storage of its own under its name (`mydb/@{instance}/`), so a
+ledger created under a reused name never shares files with the one before it.
+
+**Dropping:**
+
+Dropping a ledger frees its name at once. A soft drop keeps the ledger's data
+in the dropped-ledger registry, where it can be restored under its name or
+purged; a hard drop deletes the data. See [`POST /drop`](../api/endpoints.md#post-drop)
+and [`GET /dropped`](../api/endpoints.md#get-dropped).
+
+A ledger created by an earlier version keeps the older behaviour until it is
+migrated: its storage lives directly under its name, and a soft drop marks
+it retracted, keeping the name reserved.
 
 ## The Nameservice
 
@@ -316,7 +325,7 @@ The nameservice can be backed by various storage systems, each suited for differ
 #### File System (`FileNameService`)
 
 - **Use Case**: Single-server deployments, development, testing
-- **Storage**: Files in `ns@v2/` directory structure
+- **Storage**: Files in the `ns@v3/` directory structure
 - **Format**: JSON files per ledger (`{ledger}/{branch}.json`)
 - **Characteristics**: Simple, local, no external dependencies
 
@@ -542,10 +551,12 @@ is the root on most ledgers, but the refusal is structural: a ledger created
 as `mydb:trunk` has `trunk` as its root, and `drop_branch("mydb", "trunk")`
 will be refused. Conversely, a non-root branch named `"main"` is droppable.
 
-Branches use **reference counting** (`branches` field on `NsRecord`) to track child branches. This enables safe deletion:
+A ledger's name binding lists each of its branches with the branch it was created from. A branch's child count (the `branches` field on its `NsRecord`) is the number of branches listed from it, and it decides what a drop does:
 
-- **Leaf branch** (no children, `branches == 0`): Fully dropped — storage artifacts are deleted, the NsRecord is purged, and the parent's child count is decremented. If the parent was previously retracted and its count reaches 0, it is cascade-dropped.
+- **Leaf branch** (no children, `branches == 0`): Fully dropped — storage artifacts are deleted, the NsRecord is purged, and the branch is unlisted, which takes it off its parent's count. If the parent was previously retracted and its count reaches 0, it is cascade-dropped.
 - **Branch with children** (`branches > 0`): Retracted (hidden from listings, transactions rejected) but storage is preserved so children can still read parent data via `BranchedContentStore` fallback. When the last child is dropped and the count reaches 0, the retracted branch is automatically cascade-purged.
+
+A branch create lists the branch before it writes the branch's record, and confirms the listing after. A create that stops in between leaves a branch that reads as absent: creating the branch again takes it over, and [periodic maintenance](../operations/configuration.md#periodic-maintenance) rolls it back. Until then it holds its source's data, as a child would.
 
 **Rust API:**
 ```rust
@@ -774,7 +785,7 @@ Understanding how records evolve:
    - Storage backend health
 
 2. **Backup Strategy**: Include nameservice in backup plans
-   - File-based: Backup `ns@v2/` directory
+   - File-based: Backup the `ns@v3/` directory
    - Storage-based: Use backend backup mechanisms
 
 3. **Error Handling**: Handle nameservice errors gracefully

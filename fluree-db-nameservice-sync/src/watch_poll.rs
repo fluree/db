@@ -57,14 +57,18 @@ impl crate::watch::RemoteWatch for PollRemoteWatch {
                         for record in snapshot.ledgers {
                             let key = record.ledger_id.clone();
                             if record.retracted {
-                                if prev_ledgers.contains_key(&key) {
-                                    yield RemoteEvent::LedgerRetracted { ledger_id: key.clone() };
+                                if let Some(prev) = prev_ledgers.get(&key) {
+                                    yield RemoteEvent::LedgerRetracted {
+                                        ledger_id: key.clone(),
+                                        instance: prev.instance(),
+                                    };
                                 }
                             } else if let Some(prev) = prev_ledgers.get(&key) {
                                 if prev.commit_t != record.commit_t
                                     || prev.index_t != record.index_t
                                     || prev.commit_head_id != record.commit_head_id
                                     || prev.index_head_id != record.index_head_id
+                                    || prev.storage_root != record.storage_root
                                 {
                                     yield RemoteEvent::LedgerUpdated(record.clone());
                                 }
@@ -76,9 +80,12 @@ impl crate::watch::RemoteWatch for PollRemoteWatch {
                         }
 
                         // Check for removed ledgers (present in prev but not in current)
-                        for key in prev_ledgers.keys() {
+                        for (key, prev) in &prev_ledgers {
                             if !current_ledgers.contains_key(key) {
-                                yield RemoteEvent::LedgerRetracted { ledger_id: key.clone() };
+                                yield RemoteEvent::LedgerRetracted {
+                                    ledger_id: key.clone(),
+                                    instance: prev.instance(),
+                                };
                             }
                         }
 
@@ -209,6 +216,9 @@ mod tests {
             default_context: None,
             source_branch: None,
             branches: 0,
+            storage_root: None,
+            fence: None,
+            frozen: false,
         }
     }
 

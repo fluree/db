@@ -11,6 +11,8 @@ mod it_branch_time_travel;
 mod it_drop_ledger;
 #[path = "it_drop_named_graph.rs"]
 mod it_drop_named_graph;
+#[path = "it_dropped_ledgers.rs"]
+mod it_dropped_ledgers;
 #[path = "it_graph_scoped_writes.rs"]
 mod it_graph_scoped_writes;
 #[path = "it_json_canonicalization.rs"]
@@ -19,6 +21,10 @@ mod it_json_canonicalization;
 mod it_ledger_info_named_graphs;
 #[path = "it_ledger_lifecycle.rs"]
 mod it_ledger_lifecycle;
+#[path = "it_legacy_store.rs"]
+mod it_legacy_store;
+#[path = "it_lifecycle_housekeeping.rs"]
+mod it_lifecycle_housekeeping;
 #[path = "it_merge.rs"]
 mod it_merge;
 #[path = "it_merge_preview.rs"]

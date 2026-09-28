@@ -51,6 +51,7 @@ pub async fn fetch_and_ingest_pack<S: ContentAddressedWrite>(
     ledger_id: &str,
     request: &PackRequest,
     storage: &S,
+    namespace: &fluree_db_core::StorageNamespace,
     auth_token: Option<&str>,
 ) -> Result<PackIngestResult> {
     let url = format!(
@@ -90,7 +91,7 @@ pub async fn fetch_and_ingest_pack<S: ContentAddressedWrite>(
     }
 
     // Stream the response body and decode frames.
-    ingest_pack_stream(response, storage, ledger_id).await
+    ingest_pack_stream(response, storage, namespace).await
 }
 
 /// Decode and ingest all frames from an HTTP response stream.
@@ -104,7 +105,7 @@ pub async fn fetch_and_ingest_pack<S: ContentAddressedWrite>(
 pub async fn ingest_pack_stream<S: ContentAddressedWrite>(
     response: reqwest::Response,
     storage: &S,
-    ledger_id: &str,
+    namespace: &fluree_db_core::StorageNamespace,
 ) -> Result<PackIngestResult> {
     let mut stream = response.bytes_stream();
     let mut buf = BytesMut::new();
@@ -167,7 +168,7 @@ pub async fn ingest_pack_stream<S: ContentAddressedWrite>(
                                 ));
                             }
                             result.total_bytes += payload.len() as u64;
-                            ingest_pack_frame(&cid, &payload, storage, ledger_id).await?;
+                            ingest_pack_frame(&cid, &payload, storage, namespace).await?;
 
                             // Categorize by content kind.
                             match cid.content_kind() {
@@ -329,7 +330,7 @@ pub async fn ingest_pack_stream_with_header<S: ContentAddressedWrite>(
     stream: &mut (impl futures::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>
               + Unpin),
     storage: &S,
-    ledger_id: &str,
+    namespace: &fluree_db_core::StorageNamespace,
 ) -> Result<PackIngestResult> {
     let mut buf = initial_buf;
     let mut result = PackIngestResult::default();
@@ -355,7 +356,7 @@ pub async fn ingest_pack_stream_with_header<S: ContentAddressedWrite>(
                     }
                     PackFrame::Data { cid, payload } => {
                         result.total_bytes += payload.len() as u64;
-                        ingest_pack_frame(&cid, &payload, storage, ledger_id).await?;
+                        ingest_pack_frame(&cid, &payload, storage, namespace).await?;
 
                         match cid.content_kind() {
                             Some(ContentKind::Commit) => result.commits_stored += 1,
@@ -419,7 +420,7 @@ pub async fn ingest_pack_frame<S: ContentAddressedWrite>(
     cid: &ContentId,
     bytes: &[u8],
     storage: &S,
-    ledger_id: &str,
+    namespace: &fluree_db_core::StorageNamespace,
 ) -> Result<()> {
     // Reject unknown content kinds early.
     let kind = cid.content_kind().ok_or_else(|| {
@@ -448,7 +449,7 @@ pub async fn ingest_pack_frame<S: ContentAddressedWrite>(
     };
 
     storage
-        .content_write_bytes_with_hash(kind, ledger_id, &digest_hex, bytes)
+        .content_write_bytes_with_hash(kind, namespace, &digest_hex, bytes)
         .await
         .map_err(|e| SyncError::PackProtocol(format!("failed to write {cid}: {e}")))?;
 

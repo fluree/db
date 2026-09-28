@@ -31,7 +31,7 @@ async fn policy_applies_to_named_graph_queries() {
     local
         .run_until(async move {
             // Seed a named graph via TriG
-            let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+            let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
             let trig = r#"
                 @prefix ex: <http://example.org/ns/> .
                 @prefix schema: <http://schema.org/> .

@@ -52,7 +52,7 @@ async fn explain_no_stats_reports_none_and_reason() {
     let _env = HashJoinEnv::acquire();
     // Scenario: explain-no-stats-test
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "no-stats:main");
+    let ledger0 = genesis_ledger(&fluree, "no-stats:main").await;
 
     // Ensure the `ex` namespace is allocated (so query parsing can encode IRIs),
     // but do NOT run indexing so stats remain unavailable.
@@ -87,7 +87,7 @@ async fn explain_no_stats_reports_none_and_reason() {
 async fn explain_sparql_no_stats_reports_none_and_reason() {
     let _env = HashJoinEnv::acquire();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "no-stats-sparql:main");
+    let ledger0 = genesis_ledger(&fluree, "no-stats-sparql:main").await;
 
     let ledger = fluree
         .insert(
@@ -123,7 +123,7 @@ async fn explain_physical_plan_present_and_concretely_named() {
     // Validate it is present and operators resolve to concrete names (the
     // default op_name() must see through dyn dispatch, not report "dyn Operator").
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "physical-names:main");
+    let ledger0 = genesis_ledger(&fluree, "physical-names:main").await;
 
     let ledger = fluree
         .insert(
@@ -193,7 +193,7 @@ async fn explain_physical_object_subject_join_shows_hash_join_decision() {
     // the rejected hash-join reason. FLUREE_HASH_JOIN=1: the hash join is chosen.
     let env = HashJoinEnv::acquire(); // AUTO mode; restored (and serialized) via guard
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "physical-join:main");
+    let ledger0 = genesis_ledger(&fluree, "physical-join:main").await;
     let ledger = fluree
         .insert(
             ledger0,
@@ -258,7 +258,7 @@ async fn explain_logical_estimates_are_bound_var_aware() {
     // stats the defaults differ (bound-subject vs property-scan), so this catches a
     // node rendered with an empty bound set.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "logical-bound:main");
+    let ledger0 = genesis_ledger(&fluree, "logical-bound:main").await;
     let ledger = fluree
         .insert(
             ledger0,
@@ -297,7 +297,7 @@ async fn explain_physical_plan_surfaces_fast_path() {
     // planner selects it at build time, so plan.physical names the fast-path
     // operator (label-tagged) — the signal the pattern-level views cannot give.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "physical-fastpath:main");
+    let ledger0 = genesis_ledger(&fluree, "physical-fastpath:main").await;
 
     let ledger = fluree
         .insert(
@@ -340,7 +340,7 @@ async fn explain_physical_expands_subquery_inner_plan() {
     // The SubqueryOperator builds its subplan lazily, so explain rebuilds it
     // (build-only) and exposes it under a `SubqueryBody` node.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "physical-subquery:main");
+    let ledger0 = genesis_ledger(&fluree, "physical-subquery:main").await;
     let ledger = fluree
         .insert(
             ledger0,
@@ -395,7 +395,7 @@ async fn explain_logical_plan_preserves_compound_structure() {
     // available even without stats. Verify a triple + OPTIONAL render as a
     // `triple` node and an `optional` node containing its inner triple.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "logical-compound:main");
+    let ledger0 = genesis_ledger(&fluree, "logical-compound:main").await;
 
     let ledger = fluree
         .insert(
@@ -465,7 +465,7 @@ fn count_distinct_nodes(node: &serde_json::Value) -> usize {
 /// physical plan for `sparql`.
 async fn chain_physical_plan(sparql: &str) -> serde_json::Value {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "dedup-plan:main");
+    let ledger0 = genesis_ledger(&fluree, "dedup-plan:main").await;
     let ledger = fluree
         .insert(
             ledger0,

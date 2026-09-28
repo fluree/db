@@ -117,6 +117,7 @@ impl ServerError {
                 }
             }
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
+            ServerError::Api(ApiError::GraphSourceSuspended(_)) => errors::GRAPH_SOURCE_SUSPENDED,
 
             // Index operations
             ServerError::Api(ApiError::IndexTimeout(_)) => errors::INDEX_TIMEOUT,
@@ -172,6 +173,9 @@ impl ServerError {
 
             ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
+            // Not retryable, unlike the conflicts below: the writer must reload.
+            ServerError::Api(e) if e.is_fenced() => errors::FENCED,
+            ServerError::Api(e) if e.is_lifecycle_conflict() => errors::LIFECYCLE_CONFLICT,
             // Optimistic-concurrency conflicts: a distinct, retryable class so
             // clients can branch on `@type` (and the 409 status below).
             ServerError::Api(ApiError::Transact(
@@ -215,6 +219,12 @@ impl ServerError {
             // Auth/Policy (requires credential feature)
             #[cfg(feature = "credential")]
             ServerError::Api(ApiError::Credential(_)) => errors::INVALID_CREDENTIAL,
+
+            ServerError::Api(
+                ApiError::InvalidLedgerId(_)
+                | ApiError::InvalidBranch(_)
+                | ApiError::NameService(NameServiceError::InvalidId(_)),
+            ) => errors::BAD_REQUEST,
 
             // System errors
             ServerError::Api(ApiError::Connection(_)) => errors::CONNECTION,
@@ -273,6 +283,8 @@ impl ServerError {
             ServerError::Api(e) if e.is_not_found() => StatusCode::NOT_FOUND,
 
             // 409 - Conflict
+            ServerError::Api(e) if e.is_fenced() => StatusCode::CONFLICT,
+            ServerError::Api(e) if e.is_lifecycle_conflict() => StatusCode::CONFLICT,
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
             // Optimistic-concurrency / namespace-allocation conflicts are
             // retryable: 409 lets clients distinguish "retry" from a 400 "bad
@@ -363,7 +375,7 @@ impl ServerError {
 
             // 500 - Internal Server Error (server-side errors and catch-all)
             ServerError::Api(ApiError::Connection(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::NameService(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::Api(e @ ApiError::NameService(_)) => api_status(e),
             ServerError::Api(ApiError::Core(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Api(ApiError::Ledger(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Api(ApiError::Novelty(_)) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -382,9 +394,10 @@ impl ServerError {
             // so callers can branch on the specific failure.
             ServerError::Api(ApiError::CrossLedger(_)) => StatusCode::BAD_GATEWAY,
 
-            // Catch any new ApiError variants as 500
+            // Variants without a server-specific status take the API's own
+            // (500 for anything it does not classify).
             #[allow(unreachable_patterns)]
-            ServerError::Api(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::Api(e) => api_status(e),
         }
     }
 
@@ -427,6 +440,10 @@ impl ServerError {
     pub fn unsupported_media_type(msg: impl Into<String>) -> Self {
         ServerError::UnsupportedMediaType(msg.into())
     }
+}
+
+fn api_status(e: &ApiError) -> StatusCode {
+    StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 impl From<fluree_db_api::LedgerIdParseError> for ServerError {
@@ -673,6 +690,37 @@ mod tests {
         ));
         assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
         assert_eq!(se.error_type(), errors::CATALOG_ACCESS_DENIED);
+    }
+
+    #[test]
+    fn a_fenced_write_is_409_whichever_path_raises_it() {
+        for api in [
+            ApiError::NameService(NameServiceError::fenced("db:main")),
+            ApiError::Transact(fluree_db_api::TransactError::Nameservice(
+                NameServiceError::fenced("db:main"),
+            )),
+        ] {
+            let se = ServerError::Api(api);
+            assert_eq!(se.status_code(), StatusCode::CONFLICT);
+            assert_eq!(se.error_type(), errors::FENCED);
+        }
+    }
+
+    #[test]
+    fn api_errors_without_a_server_status_keep_their_own() {
+        let invalid_instance = ServerError::Api(ApiError::InvalidLedgerId(
+            fluree_db_core::LedgerIdParseError::new("expected a 26-character ULID"),
+        ));
+        assert_eq!(invalid_instance.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid_instance.error_type(), errors::BAD_REQUEST);
+
+        let branch_conflict = ServerError::Api(ApiError::BranchConflict("dev".into()));
+        assert_eq!(branch_conflict.status_code(), StatusCode::CONFLICT);
+
+        let nameservice = ServerError::Api(ApiError::NameService(NameServiceError::storage(
+            "disk full",
+        )));
+        assert_eq!(nameservice.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

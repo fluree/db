@@ -59,7 +59,7 @@ async fn reindex_and_load(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedge
 async fn generic_duration_round_trips_through_binary_index() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "duration-index:roundtrip";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -118,7 +118,7 @@ async fn generic_duration_round_trips_through_binary_index() {
 async fn generic_duration_matches_bound_object_after_reindex() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "duration-index:bound";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -154,7 +154,7 @@ async fn generic_duration_matches_bound_object_after_reindex() {
 async fn generic_duration_bound_object_count_after_reindex() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "duration-index:count";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -195,7 +195,7 @@ async fn generic_duration_bound_object_count_after_reindex() {
 async fn year_month_duration_bound_object_count_after_reindex() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "duration-index:ym-count";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -235,7 +235,7 @@ async fn year_month_duration_bound_object_count_after_reindex() {
 async fn day_time_duration_bound_object_count_after_reindex() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "duration-index:dt-count";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -276,7 +276,7 @@ async fn day_time_duration_bound_object_count_after_reindex() {
 async fn generic_duration_non_canonical_input_canonicalizes_on_reindex() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "duration-index:non-canonical";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -313,7 +313,7 @@ async fn generic_duration_non_canonical_input_canonicalizes_on_reindex() {
 async fn negative_generic_duration_round_trips_through_binary_index() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "duration-index:negative";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -350,7 +350,7 @@ async fn negative_generic_duration_round_trips_through_binary_index() {
 async fn generic_duration_novelty_over_binary_base_round_trips() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "duration-index:novelty-overlay";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Base: an unrelated triple so the index has content, then reindex.
     let base = json!({
@@ -390,7 +390,7 @@ async fn generic_duration_novelty_over_binary_base_round_trips() {
 async fn generic_duration_retraction_cancels_indexed_row() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "duration-index:retract";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),

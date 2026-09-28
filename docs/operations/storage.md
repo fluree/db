@@ -291,36 +291,57 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 
 ```text
 /var/lib/fluree/
-├── ns@v2/                    # Nameservice records
+├── ns@v3/                        # Nameservice records
+│   ├── @format.json              # Nameservice format
+│   ├── @dropped/                 # Dropped ledgers, by instance id
 │   ├── mydb/
-│   │   ├── main.json        # Ledger metadata
+│   │   ├── @binding.json         # Which instance holds the name, and its branches
+│   │   ├── main.json             # Branch record: heads, status, fence
 │   │   └── dev.json
 │   └── customers/
-│       └── main.json
+│       └── ...
 ├── mydb/
-│   ├── main/
-│   │   ├── commit/          # Commit blobs (*.fcv2)
-│   │   ├── txn/             # Transaction metadata (*.json)
-│   │   ├── config/          # Ledger config blobs
-│   │   └── index/
-│   │       ├── roots/       # Index root descriptors (*.fir6)
-│   │       ├── objects/
-│   │       │   ├── branches/
-│   │       │   ├── leaves/
-│   │       │   └── history/
-│   │       ├── garbage/
-│   │       ├── stats/
-│   │       └── spatial/
-│   ├── dev/
-│   │   └── ...
-│   └── @shared/
-│       └── dicts/           # Dictionaries shared by all branches
-└── graph-sources/            # Graph sources
+│   ├── @01JB8ZK4X5Y6Z7A8B9C0D1E2F3/   # One incarnation of the name, by instance id
+│   │   ├── main/
+│   │   │   ├── commit/           # Commit blobs (*.fcv2)
+│   │   │   ├── txn/              # Transaction metadata (*.json)
+│   │   │   ├── config/           # Ledger config blobs
+│   │   │   └── index/
+│   │   │       ├── roots/        # Index root descriptors (*.fir6)
+│   │   │       ├── objects/
+│   │   │       │   ├── branches/
+│   │   │       │   ├── leaves/
+│   │   │       │   └── history/
+│   │   │       ├── garbage/
+│   │   │       ├── stats/
+│   │   │       └── spatial/
+│   │   ├── dev/
+│   │   │   └── ...
+│   │   └── @shared/
+│   │       └── dicts/            # Dictionaries shared by all branches
+│   └── @01JC2QW7.../             # The next mydb, created after that one was dropped
+└── graph-sources/                # Graph sources
     └── products-search/
         └── main/
             ├── mapping/
             └── snapshots/
 ```
+
+Every ledger lives in a folder of its own under its name: dropping a ledger and
+creating another under the same name never mixes their data, and backing up
+`mydb/` captures every incarnation. A ledger created by a release before name
+bindings (4.2 and earlier) keeps its data at the name itself — `mydb/main/…`,
+`mydb/@shared/…` — and goes on working there.
+
+### Upgrading from a release before name bindings
+
+Releases 4.2 and earlier keep the nameservice under `ns@v2/`. The first start of
+this release copies it to `ns@v3/` and binds each ledger to its name where its
+data already is; no ledger data is moved. It then retires `ns@v2/`, keeping its
+files under `ns@v2.bak/`, so a 4.2 process still running against the store
+fails rather than writing where this release never looks. Every process that
+shares the store must be upgraded together. See
+[Upgrading from 4.2 and earlier](upgrading-from-4.2.md).
 
 ### File Formats
 
@@ -472,22 +493,24 @@ you want a crash's leftovers preserved for a post-mortem.
 
 ```text
 s3://fluree-prod-data/
+├── ns@v3/                        # Nameservice, when it is S3-backed
 ├── mydb/
-│   ├── main/
-│   │   ├── commit/
-│   │   ├── txn/
-│   │   ├── config/
-│   │   └── index/
-│   │       ├── roots/
-│   │       ├── objects/
-│   │       │   ├── branches/
-│   │       │   ├── leaves/
-│   │       │   └── history/
-│   │       ├── garbage/
-│   │       ├── stats/
-│   │       └── spatial/
-│   └── @shared/
-│       └── dicts/
+│   └── @01JB8ZK4X5Y6Z7A8B9C0D1E2F3/
+│       ├── main/
+│       │   ├── commit/
+│       │   ├── txn/
+│       │   ├── config/
+│       │   └── index/
+│       │       ├── roots/
+│       │       ├── objects/
+│       │       │   ├── branches/
+│       │       │   ├── leaves/
+│       │       │   └── history/
+│       │       ├── garbage/
+│       │       ├── stats/
+│       │       └── spatial/
+│       └── @shared/
+│           └── dicts/
 └── graph-sources/
     └── products-search/
         └── main/

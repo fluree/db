@@ -13,7 +13,7 @@ use serde_json::json;
 async fn undecodable_encoded_bindings_are_errors() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "materializer-decode-errors:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let subject = "https://example.org/s";
     fluree
         .insert(

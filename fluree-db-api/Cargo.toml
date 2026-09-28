@@ -155,6 +155,8 @@ fluree-test-support = { path = "../fluree-test-support" }
 fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+# The lifecycle conformance suite, run here against DynamoDB on LocalStack.
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false, features = ["conformance"] }
 wiremock = { workspace = true }
 # Residency-mode read arms for the wasm read-path recovery tests
 # (it_residency_retry): dev-only feature unification — production native

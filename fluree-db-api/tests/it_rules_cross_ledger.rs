@@ -26,7 +26,7 @@ async fn data_ledger_query_pulls_rules_from_model_ledger() {
     // --- M (model ledger): stash a grandparent rule in a named graph.
     let model_id = "test/cross-ledger-rules/model:main";
     let rules_graph_iri = "http://example.org/governance/rules";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     let rule_tx = json!({
         "@context": {
@@ -54,7 +54,7 @@ async fn data_ledger_query_pulls_rules_from_model_ledger() {
 
     // --- D (data ledger): wire f:rulesSource → M's rules graph.
     let data_id = "test/cross-ledger-rules/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let cfg = config_iri(data_id);
     let cfg_trig = format!(
@@ -131,7 +131,7 @@ async fn cross_ledger_rules_with_default_graph_selector() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-rules/default-graph-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     // Insert the rule into M's *default* graph (no GRAPH wrapper).
     let rule_doc = json!({
@@ -156,7 +156,7 @@ async fn cross_ledger_rules_with_default_graph_selector() {
 
     // D's config points at M's default graph via f:defaultGraph.
     let data_id = "test/cross-ledger-rules/default-graph-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let cfg = config_iri(data_id);
     let cfg_trig = format!(
         r"
@@ -257,7 +257,7 @@ async fn cross_ledger_f_txn_meta_graph_selector_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-rules/txn-meta-selector-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     // Commit one trivial fact so M is published to the nameservice;
     // the resolver looks up M by id before reaching the selector
     // check, and an unpublished M short-circuits as ModelLedgerMissing.
@@ -274,7 +274,7 @@ async fn cross_ledger_f_txn_meta_graph_selector_rejected() {
         .expect("publish M");
 
     let data_id = "test/cross-ledger-rules/txn-meta-selector-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let cfg = config_iri(data_id);
     let cfg_trig = format!(
@@ -329,7 +329,7 @@ async fn missing_model_ledger_surfaces_cross_ledger_error() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let data_id = "test/cross-ledger-rules/missing-model:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let cfg = config_iri(data_id);
     let cfg_trig = format!(
@@ -385,7 +385,7 @@ async fn dataset_query_pulls_rules_from_model_ledger() {
 
     let model_id = "test/cross-ledger-rules/model-ds:main";
     let rules_graph_iri = "http://example.org/governance/rules";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     let rule_tx = json!({
         "@context": {
@@ -412,7 +412,7 @@ async fn dataset_query_pulls_rules_from_model_ledger() {
         .expect("seed M with grandparent rule");
 
     let data_id = "test/cross-ledger-rules/data-ds:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let cfg = config_iri(data_id);
     let cfg_trig = format!(
@@ -453,7 +453,7 @@ async fn dataset_query_pulls_rules_from_model_ledger() {
         .expect("insert family data into D");
 
     let other_id = "test/cross-ledger-rules/other-ds:main";
-    let other = genesis_ledger(&fluree, other_id);
+    let other = genesis_ledger(&fluree, other_id).await;
     fluree
         .insert(
             other,

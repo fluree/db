@@ -32,11 +32,11 @@
 #![cfg(feature = "native")]
 
 use async_trait::async_trait;
-use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, Novelty};
+use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState};
 use fluree_db_core::error::Result as StorageResult;
 use fluree_db_core::{
     config_graph_iri, first_t_where_graph_registered, ContentId, ContentKind, ContentStore,
-    GraphRegistrationProbe, LedgerSnapshot,
+    GraphRegistrationProbe,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -132,8 +132,10 @@ async fn seed_no_config_commits(
     ledger_id: &str,
     n: usize,
 ) -> LedgerState {
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let mut ledger = LedgerState::new(db0, Novelty::new(0));
+    let mut ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     let no_auto = IndexConfig {
         reindex_min_bytes: 1_000_000_000,
         reindex_max_bytes: 1_000_000_000,
@@ -177,7 +179,9 @@ async fn first_t_where_graph_registered_no_full_reads_when_iri_absent() {
         .expect("ns record");
     assert_eq!(record.commit_t, N as i64);
 
-    let counted = CountingContentStore::new(fluree.content_store(ledger_id));
+    let counted = CountingContentStore::new(
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
+    );
     let counters = counted.counters();
     let head = record.commit_head_id.expect("head");
 
@@ -233,8 +237,10 @@ async fn first_t_where_graph_registered_returns_lowest_t_when_iri_present() {
          }}\n"
     );
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let mut ledger = LedgerState::new(db0, Novelty::new(0));
+    let mut ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     ledger = fluree
         .stage_owned(ledger)
         .upsert_turtle(&trig)
@@ -272,9 +278,13 @@ async fn first_t_where_graph_registered_returns_lowest_t_when_iri_present() {
         .expect("ns record");
     let head = record.commit_head_id.expect("head");
 
-    let probe = first_t_where_graph_registered(&fluree.content_store(ledger_id), &head, &cfg_iri)
-        .await
-        .expect("envelope walk");
+    let probe = first_t_where_graph_registered(
+        &fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
+        &head,
+        &cfg_iri,
+    )
+    .await
+    .expect("envelope walk");
 
     assert_eq!(
         probe,

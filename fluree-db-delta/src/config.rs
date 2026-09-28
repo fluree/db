@@ -45,6 +45,10 @@ pub struct DeltaGsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// The instance of the `model` ledger when the source was registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_instance: Option<String>,
+
     /// Default-allow for policy evaluation when the request leaves it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_allow: Option<bool>,

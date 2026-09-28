@@ -33,7 +33,7 @@ fn ctx() -> serde_json::Value {
 async fn insert_with_annotation_succeeds_under_m1() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:insert";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -54,7 +54,7 @@ async fn insert_with_annotation_succeeds_under_m1() {
 async fn insert_with_edge_alias_succeeds_under_m1() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:edge-alias";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -75,7 +75,7 @@ async fn insert_with_edge_alias_succeeds_under_m1() {
 async fn insert_with_reifies_unsupported() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:reifies-insert";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -102,7 +102,7 @@ async fn query_inline_annotation_returns_matching_role() {
     // fail this test.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:query-inline";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -183,7 +183,7 @@ async fn query_reifies_form_runs_with_visibility_check() {
     // alongside the f:reifies* lookups acts as the visibility check.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:query-reifies";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),

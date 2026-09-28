@@ -73,27 +73,27 @@ impl ConnectionHandle {
         }
     }
 
-    /// Load a database by root content ID and ledger ID.
+    /// Load a database by root content ID and the branch's storage namespace.
     ///
-    /// The storage address is derived from the `ContentId` and `ledger_id`
+    /// The storage address is derived from the `ContentId` and `namespace`
     /// using the storage backend's method identifier.
     pub async fn load_ledger_snapshot(
         &self,
         root_id: &fluree_db_core::ContentId,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
     ) -> Result<LedgerSnapshot> {
         match self {
             #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
             ConnectionHandle::File { storage, .. } => {
-                Ok(fluree_db_core::load_ledger_snapshot(storage, root_id, ledger_id).await?)
+                Ok(fluree_db_core::load_ledger_snapshot(storage, root_id, namespace).await?)
             }
             ConnectionHandle::Memory { storage, .. } => {
-                Ok(fluree_db_core::load_ledger_snapshot(storage, root_id, ledger_id).await?)
+                Ok(fluree_db_core::load_ledger_snapshot(storage, root_id, namespace).await?)
             }
             #[cfg(feature = "aws")]
             ConnectionHandle::Aws(c) => {
                 let storage = c.index_storage().clone();
-                Ok(fluree_db_core::load_ledger_snapshot(&storage, root_id, ledger_id).await?)
+                Ok(fluree_db_core::load_ledger_snapshot(&storage, root_id, namespace).await?)
             }
         }
     }
@@ -160,7 +160,7 @@ pub fn connect(config_json: &serde_json::Value) -> Result<ConnectionHandle> {
 ///     ]
 /// });
 /// let conn = connect_async(&config).await?;
-/// let db = conn.load_ledger_snapshot(&root_id, "mydb:main").await?;
+/// let db = conn.load_ledger_snapshot(&root_id, &record.storage_namespace()).await?;
 /// ```
 pub async fn connect_async(config_json: &serde_json::Value) -> Result<ConnectionHandle> {
     // Check if this is JSON-LD format
@@ -271,6 +271,12 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
     }
 }
 
+/// A nameservice that could not be brought to the current format.
+#[cfg(feature = "aws")]
+fn migration_failed(e: fluree_db_nameservice::NameServiceError) -> ConnectionError {
+    ConnectionError::storage(format!("Failed to migrate the nameservice: {e}"))
+}
+
 /// Create AWS connection from parsed JSON-LD config
 ///
 /// Uses StorageRegistry for storage sharing when the same @id is referenced
@@ -339,6 +345,7 @@ async fn create_aws_connection(
                             "Failed to create DynamoDB nameservice: {e}"
                         ))
                     })?;
+                Box::pin(ns.migrate()).await.map_err(migration_failed)?;
                 Arc::new(ns) as Arc<dyn aws::AwsNameServiceDyn>
             }
             PublisherType::Storage { storage } => {
@@ -353,6 +360,7 @@ async fn create_aws_connection(
                 };
                 // StorageNameService prefix is empty - S3Storage has the bucket prefix
                 let ns = StorageNameService::new((*ns_storage).clone(), "");
+                Box::pin(ns.migrate()).await.map_err(migration_failed)?;
                 Arc::new(ns) as Arc<dyn aws::AwsNameServiceDyn>
             }
             PublisherType::Unsupported { type_iri, .. } => {
@@ -372,6 +380,7 @@ async fn create_aws_connection(
                 .map_err(|e| {
                     ConnectionError::storage(format!("Failed to create DynamoDB nameservice: {e}"))
                 })?;
+            Box::pin(ns.migrate()).await.map_err(migration_failed)?;
             Arc::new(ns) as Arc<dyn aws::AwsNameServiceDyn>
         }
     };

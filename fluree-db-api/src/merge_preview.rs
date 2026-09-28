@@ -427,7 +427,7 @@ impl crate::Fluree {
             )
             .await?
         } else {
-            BranchedContentStore::leaf(self.content_store(&target_id))
+            BranchedContentStore::leaf(self.content_store(&target_record.storage_namespace()))
         };
 
         let source_head = source_record.commit_head_id.clone();

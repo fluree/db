@@ -19,16 +19,16 @@
 //! prefixes (enforced by [`CompositeNameService::new`] only against other
 //! mounts, since local ledgers can be created later).
 
+use crate::Fence;
 use crate::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
-    NameServiceLookup, NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
-    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
-    StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, NameServiceError, NameServiceLookup,
+    NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
+    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::{ContentId, LedgerId};
+use fluree_db_core::{ContentId, LedgerId, StorageRoot};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -74,6 +74,11 @@ impl RemoteMount {
     fn localize_record(&self, mut record: NsRecord) -> Result<NsRecord> {
         record.name = format!("{}/{}", self.prefix, record.ledger_id.name());
         record.ledger_id = LedgerId::from_parts(&record.name, record.ledger_id.branch())?;
+        // Addresses route to the mount by prefix, so an instance root moves
+        // under it too. A name root follows the localized name already.
+        if let Some(root) = record.storage_root.take() {
+            record.storage_root = Some(StorageRoot::parse(&format!("{}/{root}", self.prefix))?);
+        }
         Ok(record)
     }
 
@@ -279,9 +284,10 @@ impl ConfigLookup for CompositeNameService {
 
 #[async_trait]
 impl CommitPublisher for CompositeNameService {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
@@ -289,7 +295,7 @@ impl CommitPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .publish_commit(ledger_id, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
             .await
     }
 
@@ -303,73 +309,36 @@ impl CommitPublisher for CompositeNameService {
 
 #[async_trait]
 impl IndexPublisher for CompositeNameService {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
-        self.local.publish_index(ledger_id, index_t, index_id).await
-    }
-}
-
-#[async_trait]
-impl LedgerLifecycle for CompositeNameService {
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        // Also prevents creating a local ledger that would shadow a mount.
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.init(ledger_id).await
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.retract(ledger_id).await
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.purge(ledger_id).await
+        self.local
+            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .await
     }
 }
 
 #[async_trait]
 impl BranchLifecycle for CompositeNameService {
-    async fn create_branch(
+    async fn reset_head_fenced(
         &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
     ) -> Result<()> {
-        if let Some(err) = self.reject_mounted_write(ledger_name) {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
         self.local
-            .create_branch(ledger_name, new_branch, source_branch, at_commit)
+            .reset_head_fenced(ledger_id, fence, snapshot)
             .await
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.drop_branch(ledger_id).await
-    }
-
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.reset_head(ledger_id, snapshot).await
     }
 
     async fn pending_commit_cids(
@@ -394,9 +363,10 @@ impl BranchLifecycle for CompositeNameService {
 
 #[async_trait]
 impl AdminPublisher for CompositeNameService {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -404,16 +374,17 @@ impl AdminPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .publish_index_allow_equal(ledger_id, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
             .await
     }
 }
 
 #[async_trait]
 impl RefPublisher for CompositeNameService {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -422,7 +393,7 @@ impl RefPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .compare_and_set_ref(ledger_id, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
             .await
     }
 }
@@ -466,35 +437,157 @@ impl GraphSourcePublisher for CompositeNameService {
         }
         self.local.retract_graph_source(name, branch).await
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        if let Some(err) = self.reject_mounted_write(name) {
+            return Err(err);
+        }
+        self.local.reset_graph_source_index(name, branch).await
+    }
 }
 
 #[async_trait]
 impl StatusPublisher for CompositeNameService {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
         if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
-        self.local.push_status(ledger_id, expected, new).await
+        self.local
+            .push_status_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 
 #[async_trait]
 impl ConfigPublisher for CompositeNameService {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
         if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
-        self.local.push_config(ledger_id, expected, new).await
+        self.local
+            .push_config_fenced(ledger_id, fence, expected, new)
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle: local only. A mounted ledger's records arrive already resolved
+// by its origin, which owns its binding.
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::LedgerRegistry for CompositeNameService {
+    async fn get_binding(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::Versioned<crate::NameBinding>>> {
+        if self.mount_for(name).is_some() {
+            return Ok(None);
+        }
+        self.local.get_binding(name).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&crate::NameBinding>,
+    ) -> Result<crate::RegistryCas<crate::NameBinding>> {
+        if let Some(err) = self.reject_mounted_write(name) {
+            return Err(err);
+        }
+        self.local.cas_binding(name, expected, new).await
+    }
+
+    async fn list_bindings(&self) -> Result<Vec<(String, crate::Versioned<crate::NameBinding>)>> {
+        self.local.list_bindings().await
+    }
+
+    async fn get_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+    ) -> Result<Option<crate::Versioned<crate::DroppedLedger>>> {
+        self.local.get_dropped(instance).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+        expected: Option<u64>,
+        new: Option<&crate::DroppedLedger>,
+    ) -> Result<crate::RegistryCas<crate::DroppedLedger>> {
+        self.local.cas_dropped(instance, expected, new).await
+    }
+
+    async fn list_dropped(&self) -> Result<Vec<crate::Versioned<crate::DroppedLedger>>> {
+        self.local.list_dropped().await
+    }
+}
+
+#[async_trait]
+impl crate::BranchRecordStore for CompositeNameService {
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        if self.mount_for(ledger_id).is_some() {
+            return Ok(None);
+        }
+        self.local.raw_record(ledger_id).await
+    }
+
+    /// The local records only: mounted ones belong to their origin.
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        self.local.all_raw_records().await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        if let Some(err) = self.reject_mounted_write(&record.ledger_id) {
+            return Err(err);
+        }
+        self.local.insert_record(record).await
+    }
+
+    async fn adopt_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.adopt_record(ledger_id, fence).await
+    }
+
+    async fn freeze_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.freeze_record(ledger_id, fence).await
+    }
+
+    async fn delete_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.delete_record(ledger_id, fence).await
     }
 }
 
@@ -502,6 +595,7 @@ impl ConfigPublisher for CompositeNameService {
 mod tests {
     use super::*;
     use crate::memory::MemoryNameService;
+    use crate::testing::CurrentFence;
 
     fn mounted_composite() -> (Arc<MemoryNameService>, CompositeNameService) {
         let local = Arc::new(MemoryNameService::new());
@@ -517,7 +611,9 @@ mod tests {
     #[tokio::test]
     async fn lookup_routes_by_prefix_and_localizes() {
         let (remote, composite) = mounted_composite();
-        remote.init("inventory:main").await.expect("init remote");
+        crate::testing::create(&remote, "inventory:main")
+            .await
+            .unwrap();
 
         let record = composite
             .lookup("acme/inventory:main")
@@ -536,10 +632,35 @@ mod tests {
             .is_none());
     }
 
+    /// A mounted ledger's instance root moves under the mount prefix, where
+    /// its addresses route to the mount's storage.
+    #[tokio::test]
+    async fn lookup_localizes_an_instance_root() {
+        let (remote, composite) = mounted_composite();
+        let created = crate::lifecycle::create_ledger(
+            remote.as_ref(),
+            &LedgerId::parse("inventory").unwrap(),
+        )
+        .await
+        .unwrap();
+        let remote_root = created.storage_root.unwrap();
+
+        let record = composite
+            .lookup("acme/inventory:main")
+            .await
+            .unwrap()
+            .expect("mounted record found");
+        let root = record.storage_root.expect("instance root");
+        assert_eq!(root.as_str(), format!("acme/{remote_root}"));
+        assert_eq!(root.instance(), remote_root.instance());
+    }
+
     #[tokio::test]
     async fn local_aliases_route_to_local_publisher() {
         let (_remote, composite) = mounted_composite();
-        composite.init("books:main").await.expect("init local");
+        crate::testing::create(&composite, "books:main")
+            .await
+            .unwrap();
         let record = composite
             .lookup("books:main")
             .await
@@ -551,12 +672,13 @@ mod tests {
     #[tokio::test]
     async fn writes_to_mounted_aliases_are_rejected() {
         let (remote, composite) = mounted_composite();
-        remote.init("inventory:main").await.expect("init remote");
-
-        let err = composite
-            .init("acme/other:main")
+        crate::testing::create(&remote, "inventory:main")
             .await
-            .expect_err("init on mount must fail");
+            .expect("create on the remote");
+
+        let err = crate::testing::create(&composite, "acme/other:main")
+            .await
+            .expect_err("create on mount must fail");
         assert!(
             err.to_string().contains("read-only remote mount"),
             "unexpected error: {err}"
@@ -577,7 +699,9 @@ mod tests {
     async fn prefix_requires_separator() {
         let (_remote, composite) = mounted_composite();
         // "acmecorp:main" starts with "acme" but is not under the mount.
-        composite.init("acmecorp:main").await.expect("local init");
+        crate::testing::create(&composite, "acmecorp:main")
+            .await
+            .unwrap();
         let record = composite
             .lookup("acmecorp:main")
             .await

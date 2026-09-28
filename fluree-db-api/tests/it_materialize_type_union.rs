@@ -42,7 +42,7 @@ async fn additive_type_union_across_sources() {
     // upserts its predicate; source "entity_type" inserts a SECOND class on the
     // same subject. Both classes must survive.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = support::genesis_ledger(&fluree, "mat/typeunion:main");
+    let ledger = support::genesis_ledger(&fluree, "mat/typeunion:main").await;
 
     // Source A ("article"): @type via insert, predicate via upsert.
     let ledger = fluree
@@ -87,7 +87,7 @@ async fn single_upsert_carrying_type_clobbers() {
     // Control: the OLD behavior (a single upsert that carries @type) replaces
     // rdf:type per predicate, so the second writer clobbers the first class.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = support::genesis_ledger(&fluree, "mat/typeclobber:main");
+    let ledger = support::genesis_ledger(&fluree, "mat/typeclobber:main").await;
 
     let ledger = fluree
         .upsert(

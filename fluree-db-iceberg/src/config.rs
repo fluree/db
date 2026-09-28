@@ -67,6 +67,11 @@ pub struct IcebergGsConfig {
     /// A virtual source has no ledger of its own to hold either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The instance of the `model` ledger when the source was registered. A
+    /// ledger created again under that name is another ledger, and does not
+    /// govern this source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_instance: Option<String>,
     /// Optional `default-allow` for governed requests that carry policy inputs
     /// but match no policy — the same tri-state as a native ledger's
     /// `f:defaultAllow` config. Lets an admin declare a source readable under
@@ -615,6 +620,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         };
         let result = config.validate();
@@ -632,6 +638,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         };
         assert!(config.validate().is_err());
@@ -652,6 +659,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         };
         let result = config.validate();
@@ -672,6 +680,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         };
         let result = config.validate();
@@ -702,6 +711,7 @@ mod tests {
                 delete: None,
                 order_by: None,
                 model: None,
+                model_instance: None,
                 default_allow: None,
             };
             if crate::local_guard::local_roots().is_none() {
@@ -737,6 +747,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         };
         assert!(config.validate().is_err());
@@ -755,6 +766,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         };
         let result = config.validate();
@@ -858,6 +870,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         };
 
@@ -880,6 +893,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            model_instance: None,
             default_allow: None,
         };
 

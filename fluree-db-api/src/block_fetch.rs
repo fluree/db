@@ -440,7 +440,7 @@ pub async fn apply_policy_filter(
 ///
 /// This is the primary entry point for block retrieval. It:
 /// 1. Checks the CID's content kind against the allowlist
-/// 2. Derives the storage address internally from `(storage_method, kind, ledger_id, digest)`
+/// 2. Derives the storage address internally from `(storage_method, kind, namespace, digest)`
 /// 3. Reads raw bytes from storage
 /// 4. Detects whether the block is an FLI3 leaf (defense-in-depth, even when kind is `IndexLeaf`)
 /// 5. Under `PolicyEnforced`: leaf blocks are always decoded+filtered (never raw)
@@ -457,7 +457,7 @@ pub async fn apply_policy_filter(
 /// - **`TrustedInternal`**: all blocks returned as raw bytes.
 pub async fn fetch_and_decode_block<S: Storage + Clone + 'static>(
     storage: &S,
-    ledger_id: &str,
+    namespace: &fluree_db_core::StorageNamespace,
     cid: &ContentId,
     ledger_ctx: Option<&LedgerBlockContext<'_>>,
     mode: &EnforcementMode,
@@ -474,7 +474,7 @@ pub async fn fetch_and_decode_block<S: Storage + Clone + 'static>(
 
     // 3. Derive storage address internally
     let method = storage.storage_method();
-    let address = content_address(method, kind, ledger_id, &cid.digest_hex());
+    let address = content_address(method, kind, namespace, &cid.digest_hex());
 
     // 4. Read raw bytes from storage
     let bytes = storage.read_bytes(&address).await.map_err(|e| {

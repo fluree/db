@@ -366,6 +366,53 @@ async fn test_storage_proxy_ns_record_for_existing_ledger() {
     );
 }
 
+/// `init` creates a ledger as `/create` does: under a name binding, so the
+/// record carries its instance root and a fence.
+#[tokio::test]
+async fn test_storage_proxy_init_creates_a_bound_ledger() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token(&signing_key, true);
+    let init = |alias: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/fluree/nameservice/refs/{alias}/init"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let (status, json) = json_body(app.clone().oneshot(init("initdb:main")).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["created"], true);
+
+    let (status, json) = json_body(app.clone().oneshot(init("initdb:main")).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["created"], false);
+
+    // One ledger per name: a branch comes from `/branch`, not `init`.
+    let resp = app.clone().oneshot(init("initdb:dev")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let record = state
+        .fluree
+        .nameservice()
+        .lookup("initdb:main")
+        .await
+        .unwrap()
+        .expect("record");
+    assert!(record.fence.is_some(), "{record:?}");
+    assert!(
+        record
+            .storage_root
+            .as_ref()
+            .and_then(fluree_db_core::StorageRoot::instance)
+            .is_some(),
+        "{record:?}"
+    );
+}
+
 /// Test that ledger-specific token scope is enforced
 #[tokio::test]
 async fn test_storage_proxy_ledger_scope_enforcement() {
@@ -1510,7 +1557,7 @@ async fn test_proxy_storage_read_bytes_hint_returns_flkb_for_leaf() {
     );
     let root_bytes = root_resp.bytes().await.expect("read root bytes");
     let leaf_cid = extract_spot_leaf_cid(&root_bytes);
-    let leaf_address = leaf_address_from_cid(&leaf_cid, "peer:test");
+    let leaf_address = leaf_address_from_cid(&leaf_cid, &state, "peer:test").await;
 
     // Create ProxyStorage pointing to our test server
     let proxy_storage = ProxyStorage::new(server_url.clone(), token, ProxyReadMode::Filtered);
@@ -1655,7 +1702,7 @@ async fn test_proxy_storage_read_bytes_leaf_returns_flkb_under_policy() {
     );
     let root_bytes = root_resp.bytes().await.expect("read root bytes");
     let leaf_cid = extract_spot_leaf_cid(&root_bytes);
-    let leaf_address = leaf_address_from_cid(&leaf_cid, "raw:test");
+    let leaf_address = leaf_address_from_cid(&leaf_cid, &state, "raw:test").await;
 
     // Create ProxyStorage pointing to our test server
     let proxy_storage = ProxyStorage::new(server_url.clone(), token, ProxyReadMode::Filtered);
@@ -1765,7 +1812,11 @@ async fn test_proxy_storage_raw_mode_returns_canonical_bytes() {
     let root_address = fluree_db_core::content_address(
         "file",
         ContentKind::IndexRoot,
-        "rawmode:test",
+        &state
+            .fluree
+            .storage_namespace("rawmode:test")
+            .await
+            .unwrap(),
         &reindex_result.root_id.digest_hex(),
     );
     let direct_root_bytes = admin_storage
@@ -1773,7 +1824,7 @@ async fn test_proxy_storage_raw_mode_returns_canonical_bytes() {
         .await
         .expect("direct root read");
     let leaf_cid = extract_spot_leaf_cid(&direct_root_bytes);
-    let leaf_address = leaf_address_from_cid(&leaf_cid, "rawmode:test");
+    let leaf_address = leaf_address_from_cid(&leaf_cid, &state, "rawmode:test").await;
     let direct_leaf_bytes = admin_storage
         .read_bytes(&leaf_address)
         .await
@@ -2505,9 +2556,14 @@ fn extract_spot_leaf_cid(root_bytes: &[u8]) -> String {
 
 /// Derive the storage address for a leaf from its CID string.
 /// (Needed by ProxyStorage tests that call `read_bytes(address)` directly.)
-fn leaf_address_from_cid(cid_str: &str, ledger_id: &str) -> String {
+async fn leaf_address_from_cid(cid_str: &str, state: &AppState, ledger_id: &str) -> String {
     let cid: ContentId = cid_str.parse().expect("leaf should be a valid CID");
-    fluree_db_core::content_address("file", ContentKind::IndexLeaf, ledger_id, &cid.digest_hex())
+    fluree_db_core::content_address(
+        "file",
+        ContentKind::IndexLeaf,
+        &state.fluree.storage_namespace(ledger_id).await.unwrap(),
+        &cid.digest_hex(),
+    )
 }
 
 /// Test that policy filtering is applied to binary leaves (FLI3 → FLKB)
@@ -2916,7 +2972,15 @@ async fn test_object_endpoint_serves_ledger_scoped_advanced_kinds() {
         // Seed the artifact exactly where the writer would put it.
         let id = ContentId::new(kind, payload);
         let written = admin_storage
-            .content_write_bytes(kind, "advkinds:test", payload)
+            .content_write_bytes(
+                kind,
+                &state
+                    .fluree
+                    .storage_namespace("advkinds:test")
+                    .await
+                    .unwrap(),
+                payload,
+            )
             .await
             .unwrap_or_else(|e| panic!("seed {kind:?}: {e}"));
         assert_eq!(
@@ -3008,7 +3072,11 @@ async fn test_object_endpoint_pins_graph_source_kinds_unserved() {
     let payload = b"bm25 snapshot bytes".as_slice();
     let snap_id = ContentId::new(ContentKind::GraphSourceSnapshot, payload);
     admin_storage
-        .content_write_bytes(ContentKind::GraphSourceSnapshot, "gsidx:main", payload)
+        .content_write_bytes(
+            ContentKind::GraphSourceSnapshot,
+            &fluree_db_core::StorageNamespace::parse_legacy("gsidx:main").unwrap(),
+            payload,
+        )
         .await
         .expect("seed graph-source snapshot");
 
@@ -3120,6 +3188,99 @@ async fn test_events_accepts_per_ledger_subscription_over_http() {
         );
     }
 }
+/// The next ledger event on `body` of type `event`, as its JSON payload.
+async fn next_sse_event(
+    body: &mut axum::body::BodyDataStream,
+    parser: &mut fluree_sse::SseParser,
+    pending: &mut std::collections::VecDeque<fluree_sse::SseEvent>,
+    event: &str,
+) -> JsonValue {
+    use futures::StreamExt;
+    let deadline = std::time::Duration::from_secs(10);
+    tokio::time::timeout(deadline, async {
+        loop {
+            while let Some(next) = pending.pop_front() {
+                if next.event_type.as_deref() == Some(event) {
+                    return serde_json::from_str(&next.data).expect("event JSON");
+                }
+            }
+            let chunk = body.next().await.expect("stream open").expect("chunk");
+            pending.extend(parser.feed(&chunk));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {event} event within {deadline:?}"))
+}
+
+/// Peers learn which ledger an event is about: a create sends the record
+/// with its instance, a drop names the instance it retracts, and a ledger
+/// created again under the name arrives as another instance.
+#[tokio::test]
+async fn test_events_name_the_ledger_instance() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state);
+    let post = |uri: &str, body: JsonValue| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/fluree/events?all=true")
+                .header("Accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body().into_data_stream();
+    let mut parser = fluree_sse::SseParser::new();
+    let mut pending = std::collections::VecDeque::new();
+
+    let create = serde_json::json!({ "ledger": "sse-life:main" });
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/fluree/create", create.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = next_sse_event(&mut body, &mut parser, &mut pending, "ns-record").await;
+    assert_eq!(created["resource_id"], "sse-life:main");
+    let instance = created["record"]["instance"].clone();
+    assert!(instance.is_string(), "{created}");
+
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/fluree/drop",
+            serde_json::json!({ "ledger": "sse-life" }),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let retracted = next_sse_event(&mut body, &mut parser, &mut pending, "ns-retracted").await;
+    assert_eq!(retracted["resource_id"], "sse-life:main");
+    assert_eq!(retracted["instance"], instance, "{retracted}");
+
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/fluree/create", create))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let again = next_sse_event(&mut body, &mut parser, &mut pending, "ns-record").await;
+    assert_eq!(again["resource_id"], "sse-life:main");
+    assert!(again["record"]["instance"].is_string(), "{again}");
+    assert_ne!(again["record"]["instance"], instance);
+}
+
 // =============================================================================
 // Browser-Readiness Header Tests (CORS, immutable caching, conditional GET)
 // =============================================================================
@@ -3186,7 +3347,15 @@ async fn test_object_endpoint_immutable_caching_and_conditional_get() {
     let payload = b"hll sketch bytes".as_slice();
     let id = ContentId::new(ContentKind::StatsSketch, payload);
     admin_storage
-        .content_write_bytes(ContentKind::StatsSketch, "cachehdrs:test", payload)
+        .content_write_bytes(
+            ContentKind::StatsSketch,
+            &state
+                .fluree
+                .storage_namespace("cachehdrs:test")
+                .await
+                .unwrap(),
+            payload,
+        )
         .await
         .expect("seed artifact");
 

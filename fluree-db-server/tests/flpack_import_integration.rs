@@ -5,8 +5,7 @@
 //! and verifies the restored ledger is queryable.
 
 use axum::body::Body;
-use fluree_db_api::{GraphDb, LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::GraphDb;
 use fluree_db_server::config::ServerConfig;
 use fluree_db_server::{routes::build_router, AppState, TelemetryConfig};
 use http::{Request, StatusCode};
@@ -104,8 +103,11 @@ async fn make_archive(state: &Arc<AppState>, src_ledger: &str) -> Vec<u8> {
             { "@id": "ex:bob", "@type": "ex:User", "schema:name": "Bob" }
         ]
     });
-    let db = LedgerSnapshot::genesis(src_ledger);
-    let ledger_state = LedgerState::new(db, Novelty::new(0));
+    let ledger_state = state
+        .fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
     state
         .fluree
         .insert(ledger_state, &insert)
@@ -156,8 +158,11 @@ async fn import_endpoint_restores_ledger_under_new_name() {
             { "@id": "ex:bob", "@type": "ex:User", "schema:name": "Bob" }
         ]
     });
-    let db = LedgerSnapshot::genesis(src_ledger);
-    let ledger_state = LedgerState::new(db, Novelty::new(0));
+    let ledger_state = state
+        .fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
     state
         .fluree
         .insert(ledger_state, &insert)
@@ -236,8 +241,11 @@ async fn import_endpoint_rejects_duplicate_name() {
         "@context": {"ex": "http://example.org/ns/"},
         "@id": "ex:x", "ex:v": "1"
     });
-    let db = LedgerSnapshot::genesis(src_ledger);
-    let ledger_state = LedgerState::new(db, Novelty::new(0));
+    let ledger_state = state
+        .fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create ledger");
     state
         .fluree
         .insert(ledger_state, &insert)

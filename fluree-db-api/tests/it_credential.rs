@@ -53,7 +53,7 @@ async fn seed_credential_ledger(
     did_root: &str,
     did_pleb: &str,
 ) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     // Seed an open record.
     let seeded = fluree

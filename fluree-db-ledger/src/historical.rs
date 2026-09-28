@@ -108,7 +108,7 @@ impl HistoricalLedgerView {
             return Self::load_at_with_store(store, record, target_t).await;
         }
 
-        let store = backend.content_store(&record.ledger_id);
+        let store = backend.content_store(&record.storage_namespace());
         Self::load_at_with_store(store, record, target_t).await
     }
 
@@ -610,9 +610,18 @@ mod tests {
         ledger_id: &str,
         commit: &fluree_db_novelty::Commit,
     ) -> ContentId {
-        use fluree_db_nameservice::{CasResult, RefPublisher, RefValue};
+        use fluree_db_nameservice::testing::CurrentFence;
+        use fluree_db_nameservice::{CasResult, NameServiceLookup, RefValue};
 
-        let store = content_store_for(storage.clone(), ledger_id);
+        if ns.lookup(ledger_id).await.unwrap().is_none() {
+            fluree_db_nameservice::testing::create_at_name_root(ns, ledger_id)
+                .await
+                .unwrap();
+        }
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+        );
         let blob = fluree_db_core::commit::codec::write_commit(commit, false, None).unwrap();
         let cid = store.put(ContentKind::Commit, &blob.bytes).await.unwrap();
         let new = RefValue {

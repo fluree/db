@@ -35,7 +35,7 @@ async fn seed_federated_ledgers(fluree: &MemoryFluree) {
     // Authors
     let _ = fluree
         .insert(
-            genesis_ledger(fluree, "test/authors:main"),
+            genesis_ledger(fluree, "test/authors:main").await,
             &json!({
                 "@context": ["https://schema.org", ctx_schema()],
                 "@graph": [
@@ -50,7 +50,7 @@ async fn seed_federated_ledgers(fluree: &MemoryFluree) {
     // Books
     let _ = fluree
         .insert(
-            genesis_ledger(fluree, "test/books:main"),
+            genesis_ledger(fluree, "test/books:main").await,
             &json!({
                 "@context": ["https://schema.org", ctx_schema()],
                 "@graph": [
@@ -65,7 +65,7 @@ async fn seed_federated_ledgers(fluree: &MemoryFluree) {
     // Movies
     let _ = fluree
         .insert(
-            genesis_ledger(fluree, "test/movies:main"),
+            genesis_ledger(fluree, "test/movies:main").await,
             &json!({
                 "@context": ["https://schema.org", ctx_schema()],
                 "@graph": [
@@ -89,7 +89,7 @@ fn normalize_flat_results(v: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 async fn seed_people_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": context_ex_schema(),
         "@graph": [
@@ -105,7 +105,7 @@ async fn seed_people_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLed
 }
 
 async fn seed_people2_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": context_ex_schema(),
         "@graph": [

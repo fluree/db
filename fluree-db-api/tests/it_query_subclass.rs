@@ -11,7 +11,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 async fn seed_schema_creative_work(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     // Seed a Movie + Book instance, plus schema class hierarchy:
     // Book subClassOf CreativeWork
@@ -198,7 +198,7 @@ async fn subclass_expansion_requires_explicit_reasoning() {
 }
 
 async fn seed_humanoid(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = json!({
         "id":"@id",
         "type":"@type",
@@ -340,7 +340,7 @@ async fn subclass_inferencing_after_load_issue_core_48() {
 async fn subclass_nested_stages() {
     // Scenario: subclass-nested-stages
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "query/subclass:nested-stages");
+    let ledger0 = genesis_ledger(&fluree, "query/subclass:nested-stages").await;
 
     let db1 = fluree
         .insert(

@@ -14,24 +14,38 @@
 //! # Implementations
 //!
 //! - [`MemoryNameService`]: In-memory implementation for testing
-//! - [`FileNameService`]: File-based implementation using ns@v2 format
+//! - [`FileNameService`]: File-based implementation using ns@v3 format
 //! - [`StorageNameService`]: Storage-backed implementation using CAS operations
 
+pub mod binding;
 pub mod branched_store;
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
 mod error;
 mod event_bus;
 #[cfg(feature = "native")]
 pub mod file;
 pub mod ledger_config;
+pub mod lifecycle;
 pub mod memory;
+pub mod migration;
 pub mod mount;
 mod notifying;
+mod ns_cas;
 pub(crate) mod ns_format;
 pub mod storage_ns;
+#[cfg(any(test, feature = "conformance"))]
+pub mod testing;
 pub mod tracking;
 #[cfg(feature = "native")]
 pub mod tracking_file;
 
+pub use binding::{
+    check_write_fence, fence_admits, lookup_resolved, new_instance_id, read_all_resolved,
+    read_resolved, resolve_record, BindingState, BranchFence, BranchRecordStore, DroppedLedger,
+    DroppedState, ExtraFields, Fence, FenceOutcome, LedgerRegistry, NameBinding, RegistryCas,
+    Versioned,
+};
 pub use branched_store::{
     branched_content_store_for_id, branched_content_store_for_record,
     branched_content_store_for_record_or_id, build_branched_store, content_store_for_record_or_id,
@@ -120,7 +134,9 @@ pub use tracking::{MemoryTrackingStore, RemoteName, RemoteTrackingStore, Trackin
 pub use tracking_file::FileTrackingStore;
 
 use async_trait::async_trait;
-use fluree_db_core::{format_ledger_id, ContentId, IntoLedgerId, LedgerId};
+use fluree_db_core::{
+    format_ledger_id, ContentId, InstanceId, IntoLedgerId, LedgerId, StorageNamespace, StorageRoot,
+};
 use fluree_vocab::ns_types;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -194,6 +210,20 @@ pub struct NsRecord {
     /// until all children are dropped.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub branches: u32,
+
+    /// The folder holding the ledger's artifacts, when it is not the ledger's
+    /// name. `None` means the root is the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<StorageRoot>,
+
+    /// The fence a writer must present to publish to this branch. The record
+    /// is live only while its ledger's name binding lists this fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<Fence>,
+
+    /// Set by a drop: the branch accepts no more writes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub frozen: bool,
 }
 
 pub(crate) fn is_zero(v: &u32) -> bool {
@@ -217,7 +247,34 @@ impl NsRecord {
             config_id: None,
             source_branch: None,
             branches: 0,
+            storage_root: None,
+            fence: None,
+            frozen: false,
         }
+    }
+
+    /// The folder holding the ledger's artifacts.
+    pub fn storage_root(&self) -> StorageRoot {
+        self.storage_root
+            .clone()
+            .unwrap_or_else(|| StorageRoot::legacy(&self.ledger_id.ledger_name()))
+    }
+
+    /// The ledger this branch belongs to, from the root a lookup resolved:
+    /// the instance its root names, or for a root at the name, from before
+    /// name bindings, the instance the migration derives from the name.
+    /// `None` for a record read without its binding.
+    pub fn instance(&self) -> Option<InstanceId> {
+        let root = self.storage_root.as_ref()?;
+        Some(
+            root.instance()
+                .unwrap_or_else(|| lifecycle::legacy_instance(&self.ledger_id.ledger_name())),
+        )
+    }
+
+    /// Where this branch's artifacts live.
+    pub fn storage_namespace(&self) -> StorageNamespace {
+        self.storage_root().namespace(&self.branch)
     }
 
     /// Check if this record has an index
@@ -311,7 +368,7 @@ impl GraphSourceType {
     /// (`https://ns.flur.ee/db#Bm25Index`) forms, plus fuzzy matching as fallback.
     pub fn from_type_string(s: &str) -> Self {
         match s {
-            // Compact forms (primary, used in ns@v2 files)
+            // Compact forms (primary, used in ns@v3 files)
             "f:Bm25Index" => GraphSourceType::Bm25,
             "f:HnswIndex" => GraphSourceType::Vector,
             "f:GeoIndex" => GraphSourceType::Geo,
@@ -336,7 +393,7 @@ impl GraphSourceType {
 ///
 /// Holds metadata for non-ledger graph sources (BM25, Vector, Geo, R2RML, Iceberg, etc.)
 /// stored in the nameservice. Graph source records are separate from ledger records but
-/// follow a similar ns@v2 storage pattern.
+/// follow a similar ns@v3 storage pattern.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSourceRecord {
     /// Canonical identifier for this graph source (e.g., "my-search:main")
@@ -368,6 +425,11 @@ pub struct GraphSourceRecord {
 }
 
 impl GraphSourceRecord {
+    /// Where the graph source's artifacts live: always under its own id.
+    pub fn storage_namespace(&self) -> StorageNamespace {
+        StorageNamespace::graph_source(&self.graph_source_id)
+    }
+
     /// Create a new GraphSourceRecord with required fields
     pub fn new(
         name: impl Into<String>,
@@ -494,64 +556,36 @@ pub trait NameServiceLookup:
     }
 }
 
-/// Branch lifecycle writes — create, drop, and non-monotonic head reset.
+/// Branch writes outside publication: non-monotonic head reset and the
+/// commit-CID index. Branches are created and dropped by the
+/// [`lifecycle`] protocols.
 ///
 /// Implementations that can't durably write (e.g., a Raft state-machine
 /// projection where writes flow through consensus proposals instead) should
-/// skip this trait entirely. Implementations of [`create_branch`](Self::create_branch)
-/// typically need to read the source branch to derive the starting commit
-/// head — they get that capability from also implementing
-/// [`NameServiceLookup`], not from a supertrait bound here.
+/// skip this trait entirely.
 #[async_trait]
 pub trait BranchLifecycle: Debug + Send + Sync {
-    /// Create a new branch for a ledger.
-    ///
-    /// Creates a new [`NsRecord`] for `ledger_name:new_branch` with its
-    /// [`source_branch`](NsRecord::source_branch) set to record the parent.
-    ///
-    /// When `at_commit` is `None`, the new branch starts at the source
-    /// branch's current commit head. When `at_commit` is
-    /// `Some((commit_id, commit_t))`, the new branch starts at the supplied
-    /// historical commit instead — callers are responsible for verifying
-    /// that the commit is reachable from the source branch before passing
-    /// it in.
-    ///
-    /// Also increments the source branch's `branches` count to track
-    /// the child reference for safe deletion.
-    ///
-    /// # Errors
-    /// Returns [`LedgerAlreadyExists`](NameServiceError::LedgerAlreadyExists)
-    /// if the branch already exists.
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
-    ) -> Result<()>;
-
-    /// Drop a branch, purging its nameservice record and decrementing
-    /// the parent branch's child count.
-    ///
-    /// Returns `Some(new_count)` with the parent's updated `branches` count
-    /// if the dropped branch had a parent, or `None` if it had no parent
-    /// (i.e., was the root branch).
-    ///
-    /// # Errors
-    /// Returns [`NotFound`](NameServiceError::NotFound) if the branch
-    /// record does not exist.
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>>;
-
     /// Force-reset a branch's commit head and index head to a previously
     /// captured snapshot.
     ///
-    /// Unlike [`Publisher::publish_commit`] and [`Publisher::publish_index`],
-    /// this bypasses monotonic guards — the new `t` values may be lower than
+    /// Unlike [`CommitPublisher::publish_commit_fenced`] and
+    /// [`IndexPublisher::publish_index_fenced`], this bypasses monotonic guards — the new `t` values may be lower than
     /// the current ones. Used to roll back a branch after a failed rebase.
     ///
     /// # Errors
     /// Returns [`NotFound`](NameServiceError::NotFound) if the branch does not exist.
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()>;
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen, so a write presenting
+    /// `None`, or to a record that does not exist, is always refused. See
+    /// [`binding::fence_admits`].
+    async fn reset_head_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
+    ) -> Result<()>;
 
     /// Return commit CIDs with `t > since_t`, sorted ascending by `t`, when the
     /// backend maintains a commit-CID index.
@@ -608,55 +642,25 @@ impl NsRecordSnapshot {
     }
 }
 
-/// Ledger lifecycle writes — create, retract, purge.
-///
-/// Mirrors [`BranchLifecycle`] for ledger-level operations. The
-/// methods all mutate the nameservice record's existence (create
-/// it / mark it retracted / remove it), as opposed to advancing
-/// pointers on an existing record.
-#[async_trait]
-pub trait LedgerLifecycle: Debug + Send + Sync {
-    /// Initialize a new ledger in the nameservice
-    ///
-    /// Creates a minimal NsRecord for a new ledger with no commits yet.
-    /// Only succeeds if no record exists for this ledger ID.
-    ///
-    /// # Arguments
-    /// * `ledger_id` - The normalized ledger ID (e.g., "mydb:main")
-    ///
-    /// # Errors
-    /// Returns an error if a record already exists (including retracted records).
-    async fn init(&self, ledger_id: &str) -> Result<()>;
-
-    /// Retract a ledger (soft drop)
-    ///
-    /// Marks the ledger as retracted. Future lookups will return the record
-    /// with `retracted: true`. The record is preserved so the alias cannot
-    /// be reused until `purge` is called.
-    async fn retract(&self, ledger_id: &str) -> Result<()>;
-
-    /// Purge a ledger record entirely (hard drop)
-    ///
-    /// Removes the nameservice record so the alias can be reused.
-    /// Default implementation falls back to `retract` for backends
-    /// that don't support full removal.
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        self.retract(ledger_id).await
-    }
-}
-
 /// Commit-head publishing — what the transactor calls after each
 /// successful commit.
 #[async_trait]
 pub trait CommitPublisher: Debug + Send + Sync {
     /// Publish a new commit
     ///
-    /// Only updates if: `(not exists) OR (new_t > existing_t)`
+    /// Only updates if `new_t > existing_t`.
     ///
     /// This is called by the transactor after each successful commit.
-    async fn publish_commit(
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen, so a write presenting
+    /// `None`, or to a record that does not exist, is always refused. See
+    /// [`binding::fence_admits`].
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()>;
@@ -678,31 +682,39 @@ pub trait CommitPublisher: Debug + Send + Sync {
 pub trait IndexPublisher: Debug + Send + Sync {
     /// Publish a new index
     ///
-    /// Only updates if: `(not exists) OR (new_t > existing_t)` - STRICTLY monotonic.
+    /// Only updates if `new_t > existing_t` - STRICTLY monotonic.
     ///
     /// This is called by the indexer after successfully writing new index roots.
     /// The index is published to a separate file/attribute to avoid contention
     /// with commit publishing.
     ///
     /// Note: "equal t prefers index file" is a READ-TIME merge rule, not a write rule.
-    async fn publish_index(
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen, so a write presenting
+    /// `None`, or to a record that does not exist, is always refused. See
+    /// [`binding::fence_admits`].
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()>;
 }
 
 /// Combined write trait for nameservice records. A supertrait
-/// composition of the three responsibility-aligned write traits —
-/// types that implement all three get `Publisher` automatically.
+/// composition of the responsibility-aligned write traits — types that
+/// implement both get `Publisher` automatically.
 ///
 /// Used as a `dyn` bound where callers genuinely need the full
 /// write surface; the carved-off traits ([`IndexPublisher`],
-/// [`CommitPublisher`], [`LedgerLifecycle`]) are what to reach for
-/// when only one slice is needed.
-pub trait Publisher: IndexPublisher + CommitPublisher + LedgerLifecycle {}
-impl<T> Publisher for T where T: IndexPublisher + CommitPublisher + LedgerLifecycle + ?Sized {}
+/// [`CommitPublisher`]) are what to reach for when only one slice is
+/// needed. Records are created and removed only by the
+/// [`lifecycle`] protocols.
+pub trait Publisher: IndexPublisher + CommitPublisher {}
+impl<T> Publisher for T where T: IndexPublisher + CommitPublisher + ?Sized {}
 
 /// Combined read-write nameservice trait.
 ///
@@ -754,9 +766,16 @@ pub trait AdminPublisher: Publisher {
     ///
     /// Note: This does NOT allow t < existing_t to preserve invariants for time-travel
     /// and snapshot history.
-    async fn publish_index_allow_equal(
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen, so a write presenting
+    /// `None`, or to a record that does not exist, is always refused. See
+    /// [`binding::fence_admits`].
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()>;
@@ -798,7 +817,7 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     /// Creates or updates the graph source config in nameservice. This stores the
     /// definition (type, config, dependencies) but NOT the index state.
     ///
-    /// The config record is stored at `ns@v2/{name}/{branch}.json`.
+    /// The config record is stored at `ns@v3/{name}/{branch}.json`.
     async fn publish_graph_source(
         &self,
         name: &str,
@@ -812,7 +831,7 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     ///
     /// Only updates if: `new_index_t > existing_index_t` (strictly monotonic).
     ///
-    /// The index record is stored at `ns@v2/{name}/{branch}.index.json`,
+    /// The index record is stored at `ns@v3/{name}/{branch}.index.json`,
     /// separate from the config record to avoid contention.
     ///
     /// Config updates must NOT reset index watermark.
@@ -830,6 +849,13 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     /// Marks the graph source as retracted. Future lookups will return the record
     /// with `retracted: true`.
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()>;
+
+    /// Clear the index head of a retracted graph source, so one created again
+    /// under its name starts from no index at all. Otherwise the new index
+    /// could not be published below the dropped one's `t`, as it must when
+    /// it indexes a ledger that replaced the dropped one's. A live source is
+    /// left as it is.
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()>;
 }
 
 /// Subscription scope for filtering nameservice events.
@@ -884,21 +910,31 @@ pub enum NameServiceEvent {
         index_id: ContentId,
         index_t: i64,
     },
-    /// A branch's authoritative state went away: fired for retract
-    /// (soft tombstone), `drop_branch`, and purge alike. The event
-    /// carries only the exact `ledger:branch` id, and consumers use
-    /// it uniformly to evict per-branch state, so the distinction
-    /// between those transitions isn't conveyed.
+    /// A branch's authoritative state went away: fired for a ledger drop,
+    /// a branch drop, and purge alike. Consumers use it uniformly to evict
+    /// per-branch state, so the distinction between those transitions
+    /// isn't conveyed.
     ///
-    /// Known limitation: a query peer reacting to this always
-    /// applies a local retract (tombstone), even when the origin
-    /// hard-dropped or purged the branch. The divergence is benign
-    /// and self-healing — a later re-creation of the alias overwrites
-    /// the peer's tombstone via `init`, and `retracted` reads
-    /// identically to `not-found` for a peer's query path.
-    /// Distinguishing the transitions would need separate event
-    /// variants threaded through the SSE peer-sync protocol.
-    LedgerRetracted { ledger_id: LedgerId },
+    /// `instance` names the ledger the branch belonged to, so a consumer
+    /// holding a later ledger under the same name can tell the event is
+    /// not about it. `None` when no binding listed the record as it was
+    /// deleted: a branch drop unlists the branch first, and a record left
+    /// by an interrupted operation is listed by none. The name holds the
+    /// same ledger across a branch drop, so nothing is lost there.
+    LedgerRetracted {
+        ledger_id: LedgerId,
+        #[serde(default)]
+        instance: Option<InstanceId>,
+    },
+    /// A branch became visible: a create, import or restore finished, a
+    /// branch was created, or a peer copied one. `instance` tells it from
+    /// an earlier ledger that held the name. May be announced again, and
+    /// before the branch can be looked up, so consumers look it up and
+    /// treat it as idempotent.
+    LedgerCreated {
+        ledger_id: LedgerId,
+        instance: InstanceId,
+    },
     /// A graph source config was published/updated.
     GraphSourceConfigPublished {
         graph_source_id: LedgerId,
@@ -933,9 +969,9 @@ pub struct Subscription {
 /// `Copy` — small enum, pass by value at call sites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RefKind {
-    /// The commit head pointer (`f:commit` + `f:t` in ns@v2).
+    /// The commit head pointer (`f:commit` + `f:t` in ns@v3).
     CommitHead,
-    /// The index head pointer (`f:index` + `f:indexT` in ns@v2).
+    /// The index head pointer (`f:index` + `f:indexT` in ns@v3).
     IndexHead,
 }
 
@@ -960,7 +996,7 @@ pub struct RefValue {
 /// [`NameServiceLookup`] returns it via [`NameServiceLookup::heads`], and
 /// backends that can fetch both refs in one round trip override the default.
 /// Carries identities (CIDs), not just watermarks, so the values can feed
-/// staleness checks and [`RefPublisher::compare_and_set_ref`] directly.
+/// staleness checks and [`RefPublisher::compare_and_set_ref_fenced`] directly.
 ///
 /// The two refs are read together but not necessarily atomically (file
 /// backends keep them in separate files), so `index.t > commit.t` is a
@@ -1044,16 +1080,26 @@ pub trait RefPublisher: RefLookup {
     /// Atomic compare-and-set.
     ///
     /// Updates the ref **only if** the current identity matches `expected`.
-    /// Pass `expected = None` for initial creation (ref must not exist).
+    /// Every branch has both refs from its creation, an unborn branch's as
+    /// `RefValue { id: None, t: 0 }`.
     ///
     /// The kind-dependent monotonic guard is also checked:
     /// - `CommitHead`: `new.t > current.t`
     /// - `IndexHead`: `new.t >= current.t`
     ///
     /// Returns [`CasResult::Conflict`] (with the actual value) on mismatch.
-    async fn compare_and_set_ref(
+    /// A refused fence is an error, not a [`CasResult::Conflict`]: retrying
+    /// cannot succeed.
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen, so a write presenting
+    /// `None`, or to a record that does not exist, is always refused. See
+    /// [`binding::fence_admits`].
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -1066,9 +1112,16 @@ pub trait RefPublisher: RefLookup {
     /// current ref and retries if the update is still a fast-forward.
     /// Returns [`CasResult::Conflict`] once it determines the ref has
     /// diverged (`current.t >= new.t` after re-read).
-    async fn fast_forward_commit(
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen, so a write presenting
+    /// `None`, or to a record that does not exist, is always refused. See
+    /// [`binding::fence_admits`].
+    async fn fast_forward_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         new: &RefValue,
         max_retries: usize,
     ) -> Result<CasResult> {
@@ -1083,7 +1136,13 @@ pub trait RefPublisher: RefLookup {
             }
 
             match self
-                .compare_and_set_ref(ledger_id, RefKind::CommitHead, current.as_ref(), new)
+                .compare_and_set_ref_fenced(
+                    ledger_id,
+                    fence,
+                    RefKind::CommitHead,
+                    current.as_ref(),
+                    new,
+                )
                 .await?
             {
                 CasResult::Updated => return Ok(CasResult::Updated),
@@ -1322,9 +1381,16 @@ pub trait StatusPublisher: StatusLookup {
     /// # Returns
     /// - `Updated` — successfully updated
     /// - `Conflict { actual }` — current didn't match expected
-    async fn push_status(
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen, so a write presenting
+    /// `None`, or to a record that does not exist, is always refused. See
+    /// [`binding::fence_admits`].
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult>;
@@ -1365,9 +1431,16 @@ pub trait ConfigPublisher: ConfigLookup {
     /// # Returns
     /// - `Updated` — successfully updated
     /// - `Conflict { actual }` — current didn't match expected
-    async fn push_config(
+    ///
+    /// `fence` is the fence the writer captured when it loaded the branch.
+    /// The write is refused with [`NameServiceError::Fenced`] unless the
+    /// record carries that fence and is not frozen, so a write presenting
+    /// `None`, or to a record that does not exist, is always refused. See
+    /// [`binding::fence_admits`].
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult>;
@@ -1389,6 +1462,8 @@ pub trait NameServicePublisher:
     + GraphSourcePublisher
     + StatusPublisher
     + ConfigPublisher
+    + LedgerRegistry
+    + BranchRecordStore
 {
 }
 
@@ -1399,7 +1474,82 @@ impl<T> NameServicePublisher for T where
         + GraphSourcePublisher
         + StatusPublisher
         + ConfigPublisher
+        + LedgerRegistry
+        + BranchRecordStore
 {
+}
+
+#[async_trait]
+impl<T> LedgerRegistry for Arc<T>
+where
+    T: LedgerRegistry + ?Sized,
+{
+    async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
+        (**self).get_binding(name).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&NameBinding>,
+    ) -> Result<RegistryCas<NameBinding>> {
+        (**self).cas_binding(name, expected, new).await
+    }
+
+    async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
+        (**self).list_bindings().await
+    }
+
+    async fn get_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+    ) -> Result<Option<Versioned<DroppedLedger>>> {
+        (**self).get_dropped(instance).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &fluree_db_core::InstanceId,
+        expected: Option<u64>,
+        new: Option<&DroppedLedger>,
+    ) -> Result<RegistryCas<DroppedLedger>> {
+        (**self).cas_dropped(instance, expected, new).await
+    }
+
+    async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
+        (**self).list_dropped().await
+    }
+}
+
+#[async_trait]
+impl<T> BranchRecordStore for Arc<T>
+where
+    T: BranchRecordStore + ?Sized,
+{
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        (**self).raw_record(ledger_id).await
+    }
+
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        (**self).all_raw_records().await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        (**self).insert_record(record).await
+    }
+
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        (**self).adopt_record(ledger_id, fence).await
+    }
+
+    async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        (**self).freeze_record(ledger_id, fence).await
+    }
+
+    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        (**self).delete_record(ledger_id, fence).await
+    }
 }
 
 #[async_trait]
@@ -1480,24 +1630,13 @@ impl<T> BranchLifecycle for Arc<T>
 where
     T: BranchLifecycle + ?Sized,
 {
-    async fn create_branch(
+    async fn reset_head_fenced(
         &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: NsRecordSnapshot,
     ) -> Result<()> {
-        (**self)
-            .create_branch(ledger_name, new_branch, source_branch, at_commit)
-            .await
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        (**self).drop_branch(ledger_id).await
-    }
-
-    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
-        (**self).reset_head(ledger_id, snapshot).await
+        (**self).reset_head_fenced(ledger_id, fence, snapshot).await
     }
 
     async fn pending_commit_cids(
@@ -1514,36 +1653,19 @@ where
 }
 
 #[async_trait]
-impl<T> LedgerLifecycle for Arc<T>
-where
-    T: LedgerLifecycle + ?Sized,
-{
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        (**self).init(ledger_id).await
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        (**self).retract(ledger_id).await
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        (**self).purge(ledger_id).await
-    }
-}
-
-#[async_trait]
 impl<T> CommitPublisher for Arc<T>
 where
     T: CommitPublisher + ?Sized,
 {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_commit(ledger_id, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
             .await
     }
 
@@ -1557,13 +1679,16 @@ impl<T> IndexPublisher for Arc<T>
 where
     T: IndexPublisher + ?Sized,
 {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        (**self).publish_index(ledger_id, index_t, index_id).await
+        (**self)
+            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .await
     }
 }
 
@@ -1572,14 +1697,15 @@ impl<T> AdminPublisher for Arc<T>
 where
     T: AdminPublisher + ?Sized,
 {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_index_allow_equal(ledger_id, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
             .await
     }
 }
@@ -1589,15 +1715,16 @@ impl<T> RefPublisher for Arc<T>
 where
     T: RefPublisher + ?Sized,
 {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
         (**self)
-            .compare_and_set_ref(ledger_id, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
             .await
     }
 }
@@ -1635,6 +1762,10 @@ where
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
         (**self).retract_graph_source(name, branch).await
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        (**self).reset_graph_source_index(name, branch).await
+    }
 }
 
 #[async_trait]
@@ -1642,13 +1773,16 @@ impl<T> StatusPublisher for Arc<T>
 where
     T: StatusPublisher + ?Sized,
 {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
-        (**self).push_status(ledger_id, expected, new).await
+        (**self)
+            .push_status_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 
@@ -1657,13 +1791,16 @@ impl<T> ConfigPublisher for Arc<T>
 where
     T: ConfigPublisher + ?Sized,
 {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        (**self).push_config(ledger_id, expected, new).await
+        (**self)
+            .push_config_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 

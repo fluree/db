@@ -218,17 +218,25 @@ The `--remote-name` flag allows publishing under a different name on the remote 
 
 ### `fluree drop <name> --remote <name>` (admin-protected)
 
-- `POST {api_base_url}/drop` with `{"ledger": "<name>", "hard": true}`
+- `POST {api_base_url}/drop` with `{"ledger": "<name>", "hard": false}` (`true` with `--hard`)
 
-Drops a ledger or graph source on the remote server. The CLI sends `hard: true` (no soft-drop surface today). The server resolves `name` as a ledger first, then as a graph source — see the [`fluree drop` graph source fallback](#fluree-drop-name-graph-source-fallback) section below for the resolution order and response shape.
+Drops a ledger or graph source on the remote server. The server resolves `name` as a ledger first, then as a graph source — see the [`fluree drop` graph source fallback](#fluree-drop-name-graph-source-fallback) section below for the resolution order and response shape. For a soft-dropped ledger the CLI prints the response's `instance`, by which `fluree dropped restore` and `fluree dropped purge` name it.
 
-When `--remote` is omitted, the CLI auto-routes through a locally running `fluree server start` if `server.meta.json` is present and the PID is alive, falling back to direct local execution otherwise. Pass `--direct` to skip auto-routing. The `--force` flag is required in all modes to confirm deletion.
+When `--remote` is omitted, the CLI auto-routes through a locally running `fluree server start` if `server.meta.json` is present and the PID is alive, falling back to direct local execution otherwise. Pass `--direct` to skip auto-routing. `--hard` requires `--force` in all modes to confirm deletion.
 
 Active-ledger handling:
 
 - **`--remote <name>`** (explicit): never touches local state. Remote storage is separate; the local active-ledger pointer and local storage are unaffected.
 - **Auto-route** (no `--remote`, server running): same on-disk storage as `--direct`, so a successful drop also clears the local active-ledger pointer if it matched the dropped name.
 - **`--direct`** (no `--remote`, no server): clears the active-ledger pointer if it matched.
+
+### `fluree dropped list|restore|purge --remote <name>` (admin-protected)
+
+- `list`: `GET {api_base_url}/dropped`
+- `restore <instance>`: `POST {api_base_url}/dropped/restore` with `{"instance": "<id>"}`
+- `purge <instance>`: `POST {api_base_url}/dropped/purge` with `{"instance": "<id>"}`
+
+Response shapes are in the [API reference](../api/endpoints.md). Auto-routing and `--direct` work as for `fluree drop`.
 
 ### `fluree create <name> --from <file>.flpack` (native ledger import)
 
@@ -2317,7 +2325,7 @@ Existing endpoint, extended with graph source fallback. Resolution order:
 
 - `POST {api_base_url}/drop`
 
-Existing endpoint, extended with graph source fallback. Request body is unchanged: `{ "ledger": "<name>", "hard": true }`.
+Existing endpoint, extended with graph source fallback. Request body is unchanged: `{ "ledger": "<name>", "hard": true|false }`.
 
 **Resolution order:**
 
@@ -2587,6 +2595,7 @@ fluree query mydb 'SELECT * WHERE { ?s ?p ?o }' --remote origin --at 1  # time-t
 fluree query mydb 'SELECT * WHERE { ?s ?p ?o }' --remote origin --at 1 --explain --format json  # time-travel explain via /explain/{ledger}
 fluree create empty-db --remote origin  # should create an empty ledger on the remote
 fluree export mydb --remote origin --format ledger -o mydb-remote.flpack  # archive remote ledger
-fluree drop my-gs --force      # should drop the graph source locally
-fluree drop local-db --remote origin --force  # should drop the published ledger on the remote
+fluree drop my-gs              # should drop the graph source locally
+fluree drop local-db --remote origin  # should drop the published ledger on the remote, keeping its data
+fluree dropped list --remote origin   # should list it with its instance id
 ```

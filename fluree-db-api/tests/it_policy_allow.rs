@@ -9,7 +9,7 @@ use serde_json::json;
 
 /// Helper to seed test data with users having sensitive SSN property.
 async fn seed_user_data(fluree: &support::MemoryFluree, ledger_id: &str) {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let txn = json!({
         "@context": {
@@ -700,7 +700,7 @@ async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
     local
         .run_until(async move {
             let ledger_id ="policy/onclass-novelty-prop:main";
-            let ledger0 = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -839,7 +839,7 @@ async fn policy_onclass_governs_subclass_instances() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "policy/onclass-subclass:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Schema first (separate transaction), then data.
     let ledger1 = fluree
@@ -906,7 +906,7 @@ async fn policy_onproperty_governs_subproperties() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "policy/onproperty-subprop:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let ledger1 = fluree
         .insert(
@@ -980,7 +980,7 @@ async fn policy_onclass_governs_subclass_via_cross_ledger_schema() {
 
     // Model ledger M: the ontology graph.
     let model_id = "policy/xl-schema-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let ontology_iri = "http://example.org/governance/ontology";
     fluree
         .stage_owned(model)
@@ -1000,7 +1000,7 @@ async fn policy_onclass_governs_subclass_via_cross_ledger_schema() {
     // Data ledger D: config points the schema source at M; data has a
     // Manager and an untyped-in-hierarchy Contractor.
     let data_id = "policy/xl-schema-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let config_iri = format!("urn:fluree:{data_id}#config");
     let r1 = fluree
         .stage_owned(data)
@@ -1078,7 +1078,7 @@ async fn multiple_targeted_query_rules_any_allow_grants_stably() {
     let ctx = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
     fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &json!({"@context": ctx, "@graph": [
                 {"@id": "ex:acme", "@type": "ex:Supplier"},
                 {"@id": "ex:acme-rome", "@type": "ex:SupplierRecord", "ex:canonical": {"@id": "ex:acme"}},

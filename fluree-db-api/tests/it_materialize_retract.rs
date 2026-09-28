@@ -17,7 +17,7 @@ const NAME: &str = "https://www.w3.org/ns/activitystreams#name";
 #[tokio::test]
 async fn materialize_retract_shape_actually_retracts() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "mat/retract:main");
+    let ledger0 = support::genesis_ledger(&fluree, "mat/retract:main").await;
 
     let seed = json!({
         "@graph": [
@@ -66,7 +66,7 @@ async fn materialize_retract_shape_actually_retracts() {
 async fn materialize_retract_bare_string_is_noop() {
     // Control: the bare-string binding (the shipped bug) retracts nothing.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "mat/retract-bare:main");
+    let ledger0 = support::genesis_ledger(&fluree, "mat/retract-bare:main").await;
     let seed = json!({
         "@graph": [
             { "@id": "https://example.org/Actor%2F1", "https://www.w3.org/ns/activitystreams#name": "Alice" }

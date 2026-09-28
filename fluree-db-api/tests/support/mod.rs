@@ -15,8 +15,7 @@
 
 pub mod span_capture;
 
-use fluree_db_api::{LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::LedgerState;
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 
@@ -243,24 +242,21 @@ pub async fn decode_annotations_for_subject(
     keys
 }
 
-/// Create a genesis ledger state for the given ledger ID.
-///
-/// This is the Rust equivalent of `(fluree/create conn "ledger")` prior to the first commit:
-/// the nameservice has no record yet, and `commit()` will create one via `publish_commit()`.
-pub fn genesis_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    genesis_ledger_for_fluree(fluree, ledger_id)
+/// Create the ledger `ledger_id` and return its genesis state, ready for its
+/// first commit: the Rust equivalent of `(fluree/create conn "ledger")`.
+pub async fn genesis_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    genesis_ledger_for_fluree(fluree, ledger_id).await
 }
 
 /// Generic version of `genesis_ledger` for any `Fluree` storage backend.
-///
-/// The ledger ID is normalized to canonical `name:branch` form (e.g., `"mydb"` → `"mydb:main"`)
-/// so that the `LedgerSnapshot.ledger_id` matches the canonical form used by the nameservice and
-/// content-addressed storage paths.
-pub fn genesis_ledger_for_fluree(_fluree: &fluree_db_api::Fluree, ledger_id: &str) -> LedgerState {
-    let canonical = fluree_db_core::ledger_id::normalize_ledger_id(ledger_id)
-        .unwrap_or_else(|_| ledger_id.to_string());
-    let db = LedgerSnapshot::genesis(&canonical);
-    LedgerState::new(db, Novelty::new(0))
+pub async fn genesis_ledger_for_fluree(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> LedgerState {
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .unwrap_or_else(|e| panic!("create {ledger_id}: {e}"))
 }
 
 // =============================================================================
@@ -276,7 +272,7 @@ pub async fn seed_user_with_ssn(
     user_id: &str,
     ssn: &str,
 ) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let txn = json!({
         "@context": {
             "ex": "http://example.org/ns/",
@@ -296,6 +292,20 @@ pub async fn seed_user_with_ssn(
     fluree.insert(ledger0, &txn).await.expect("seed").ledger
 }
 
+/// The fence `ledger_id`'s writes present now: tests that publish directly
+/// load it through the branch's record, as any writer does.
+pub async fn fence_of(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> Option<fluree_db_nameservice::Fence> {
+    fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .and_then(|record| record.fence)
+}
+
 /// Rebuild and publish a binary index for the ledger's current commit head.
 ///
 /// Use this in regression tests that need to exercise the FIR6/binary-only
@@ -308,7 +318,7 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&record.storage_namespace()),
         ledger_id,
         &record,
         fluree_db_indexer::IndexerConfig::default(),
@@ -318,7 +328,7 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_fenced(ledger_id, record.fence, result.index_t, &result.root_id)
         .await
         .expect("publish index");
 }
@@ -335,7 +345,7 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::build_index_for_record(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&record.storage_namespace()),
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )
@@ -344,7 +354,7 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_fenced(ledger_id, record.fence, result.index_t, &result.root_id)
         .await
         .expect("publish index");
 }
@@ -668,7 +678,7 @@ pub fn people_data() -> JsonValue {
 
 /// Seed the "people" dataset used by JSON-LD filter/optional/union tests.
 pub async fn seed_people_filter_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -726,7 +736,7 @@ pub async fn seed_people_filter_dataset(fluree: &MemoryFluree, ledger_id: &str) 
 
 /// Seed the "people" dataset used by JSON-LD compound query tests.
 pub async fn seed_people_compound_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {
             "id":"@id",
@@ -748,7 +758,7 @@ pub async fn seed_people_compound_dataset(fluree: &MemoryFluree, ledger_id: &str
 ///
 /// Includes `schema:ssn` so view-policy behavior can be tested.
 pub async fn seed_people_with_ssn(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let txn = json!({
         "@context": {
@@ -890,28 +900,20 @@ pub async fn run_collector_and_fork_drop_scenario(
                 .hold_gc(&fluree_db_api::LedgerName::parse(ledger_name).unwrap())
                 .await,
         );
-        let head = fluree
+        let record = fluree
             .nameservice()
             .lookup(&ledger_id)
             .await
             .expect("lookup")
-            .expect("record")
-            .index_head_id;
-        let refs = shared_refs_of_branches(
-            fluree.backend(),
-            &[BranchIndexHead {
-                ledger_id: fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
-                index_head_id: head,
-            }],
-            None,
-        )
-        .await
-        .expect("walk chain");
+            .expect("record");
+        let refs = shared_refs_of_branches(fluree.backend(), &[BranchIndexHead::of(&record)], None)
+            .await
+            .expect("walk chain");
         assert!(
             !refs.is_empty(),
             "{stage}: {ledger_id} references no dictionaries"
         );
-        let store = fluree.content_store(&ledger_id);
+        let store = fluree.content_store(&record.storage_namespace());
         for cid in &refs {
             assert!(
                 store.has(cid).await.expect("has"),
@@ -938,7 +940,7 @@ pub async fn run_collector_and_fork_drop_scenario(
     assert_dicts_present(main_id.clone(), "main alone").await;
 
     // The collector really ran: the first version is past retention.
-    let store = fluree.content_store(&main_id);
+    let store = fluree.content_store(&fluree.storage_namespace(&main_id).await.unwrap());
     let mut collected = false;
     for _ in 0..100 {
         if !store.has(&first_root).await.expect("has") {

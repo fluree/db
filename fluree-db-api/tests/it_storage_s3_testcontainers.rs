@@ -463,6 +463,8 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
         .expect("set_default_context");
 
     // Sanity: commits and a config blob landed in the bucket.
+    let namespace = fluree.storage_namespace(ledger_id).await.unwrap();
+    let branch_dir = format!("/{}/", namespace.branch_prefix());
     let keys_before = list_object_keys(&sdk_config, bucket).await;
     assert!(
         keys_before.iter().any(|k| k.contains("/commit/")),
@@ -471,7 +473,7 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
     assert!(
         keys_before
             .iter()
-            .any(|k| k.contains("/drop-test/main/config/")),
+            .any(|k| k.contains(&format!("{branch_dir}config/"))),
         "expected a config artifact before drop: {keys_before:?}"
     );
 
@@ -505,11 +507,10 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
     let stragglers: Vec<_> = keys_after
         .iter()
         .filter(|k| {
-            k.contains("/drop-test/main/commit/")
-                || k.contains("/drop-test/main/txn/")
-                || k.contains("/drop-test/main/index/")
-                || k.contains("/drop-test/main/config/")
-                || k.contains("/drop-test/@shared/dicts/")
+            ["commit/", "txn/", "index/", "config/"]
+                .iter()
+                .any(|kind| k.contains(&format!("{branch_dir}{kind}")))
+                || k.contains(&format!("/{}/dicts/", namespace.shared_prefix()))
         })
         .cloned()
         .collect();
@@ -756,4 +757,92 @@ async fn s3_testcontainers_build_client_honours_aes256_key() {
         .await
         .expect("to_jsonld_async");
     assert_eq!(results, json!([["ex:alice", "Alice"], ["ex:bob", "Bob"]]));
+}
+
+/// The nameservice lifecycle conformance suite against DynamoDB, each case on
+/// a fresh table in one LocalStack.
+#[tokio::test]
+async fn dynamodb_lifecycle_conformance() {
+    let (_lock, _container, endpoint) = start_localstack("dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let mut case = 0;
+    fluree_db_nameservice::conformance::run_all(|| {
+        case += 1;
+        let table = format!("lifecycle-conformance-{case}");
+        let sdk_config = sdk_config.clone();
+        async move {
+            ensure_dynamodb_table(&sdk_config, &table).await;
+            DynamoDbNameService::from_client(aws_sdk_dynamodb::Client::new(&sdk_config), table)
+        }
+    })
+    .await;
+}
+
+/// A table a newer binary has marked with a newer format is refused at
+/// startup, and a binding in a state this binary does not know is refused
+/// rather than read as a free name.
+#[tokio::test]
+async fn dynamodb_refuses_a_newer_format() {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    use fluree_db_nameservice::NameServiceLookup;
+    use fluree_db_storage_aws::dynamodb::schema::{
+        ATTR_BINDING, ATTR_PK, ATTR_SCHEMA, ATTR_SK, PK_FORMAT, SK_BINDING, SK_META,
+    };
+
+    let (_lock, _container, endpoint) = start_localstack("dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let client = aws_sdk_dynamodb::Client::new(&sdk_config);
+
+    ensure_dynamodb_table(&sdk_config, "upgrade-newer-format").await;
+    client
+        .put_item()
+        .table_name("upgrade-newer-format")
+        .item(ATTR_PK, AttributeValue::S(PK_FORMAT.to_string()))
+        .item(ATTR_SK, AttributeValue::S(SK_META.to_string()))
+        .item(ATTR_SCHEMA, AttributeValue::N("4".to_string()))
+        .send()
+        .await
+        .expect("put format item");
+    let ns = DynamoDbNameService::from_client(client.clone(), "upgrade-newer-format".into());
+    let err = ns.migrate().await.expect_err("newer format");
+    assert!(err.to_string().contains("newer"), "{err}");
+
+    ensure_dynamodb_table(&sdk_config, "upgrade-unknown-state").await;
+    let ns = DynamoDbNameService::from_client(client.clone(), "upgrade-unknown-state".into());
+    let id = fluree_db_core::LedgerId::parse("mydb:main").unwrap();
+    fluree_db_nameservice::lifecycle::create_ledger(&ns, &id)
+        .await
+        .expect("create");
+    let item = client
+        .get_item()
+        .table_name("upgrade-unknown-state")
+        .key(ATTR_PK, AttributeValue::S("mydb".to_string()))
+        .key(ATTR_SK, AttributeValue::S(SK_BINDING.to_string()))
+        .consistent_read(true)
+        .send()
+        .await
+        .expect("get binding")
+        .item
+        .expect("binding item");
+    let json = item[ATTR_BINDING].as_s().expect("binding json");
+    assert!(json.contains(r#""state":"active""#), "{json}");
+    client
+        .update_item()
+        .table_name("upgrade-unknown-state")
+        .key(ATTR_PK, AttributeValue::S("mydb".to_string()))
+        .key(ATTR_SK, AttributeValue::S(SK_BINDING.to_string()))
+        .update_expression("SET #b = :b")
+        .expression_attribute_names("#b", ATTR_BINDING)
+        .expression_attribute_values(
+            ":b",
+            AttributeValue::S(json.replace(r#""state":"active""#, r#""state":"archived""#)),
+        )
+        .send()
+        .await
+        .expect("rewrite binding");
+
+    assert!(ns.lookup("mydb:main").await.is_err());
+    assert!(fluree_db_nameservice::lifecycle::create_ledger(&ns, &id)
+        .await
+        .is_err());
 }

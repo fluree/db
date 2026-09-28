@@ -26,15 +26,16 @@ use crate::{Fluree, IndexConfig, LedgerHandle};
 use base64::Engine as _;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentId;
-use fluree_db_core::LedgerId;
 use fluree_db_core::{
     range_with_overlay, ContentAddressedWrite, ContentKind, Flake, GraphId, IndexType, Sid,
     TXN_META_GRAPH_ID,
 };
+use fluree_db_core::{LedgerId, StorageNamespace};
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
-use fluree_db_nameservice::{CasResult, NsRecordSnapshot, RefKind, RefValue};
+use fluree_db_nameservice::lifecycle::PendingLedger;
+use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::{
     drop_forged_commit_flakes, generate_commit_flakes, stamp_graph_on_commit_flakes,
     warn_if_forged_commit_flakes_dropped, Novelty,
@@ -127,7 +128,7 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
     storage: &S,
     cid: &ContentId,
     bytes: &[u8],
-    ledger_id: &str,
+    namespace: &StorageNamespace,
 ) -> Result<()> {
     use fluree_db_core::commit::codec::verify_commit_blob;
 
@@ -163,7 +164,7 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
     };
 
     storage
-        .content_write_bytes_with_hash(kind, ledger_id, &digest_hex, bytes)
+        .content_write_bytes_with_hash(kind, namespace, &digest_hex, bytes)
         .await
         .map_err(|e| ApiError::internal(format!("failed to write {cid}: {e}")))?;
     Ok(())
@@ -599,7 +600,7 @@ impl Fluree {
             .ok_or_else(|| ApiError::config("push_commits requires a managed storage backend"))?;
         write_required_blobs(
             &storage,
-            base_state.ledger_id(),
+            &base_state.storage_namespace(),
             &request.blobs,
             &decoded,
             &merged,
@@ -610,13 +611,14 @@ impl Fluree {
         // Merged-in commits are written first. They are the parents, and a
         // failure part way through then leaves no stored commit whose parent
         // is absent.
-        write_commit_blobs(&storage, base_state.ledger_id(), &merged)
+        write_commit_blobs(&storage, &base_state.storage_namespace(), &merged)
             .await
             .map_err(PushError::into_api_error)?;
 
-        let stored_commits = write_commit_blobs(&storage, base_state.ledger_id(), &decoded)
-            .await
-            .map_err(PushError::into_api_error)?;
+        let stored_commits =
+            write_commit_blobs(&storage, &base_state.storage_namespace(), &decoded)
+                .await
+                .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
         let new_head_id = final_head.commit_id.clone();
@@ -686,7 +688,13 @@ impl Fluree {
 
         match self
             .publisher()?
-            .compare_and_set_ref(&ledger, RefKind::CommitHead, Some(&pre_push_head), &new_ref)
+            .compare_and_set_ref_fenced(
+                &ledger,
+                final_state.fence(),
+                RefKind::CommitHead,
+                Some(&pre_push_head),
+                &new_ref,
+            )
             .await?
         {
             CasResult::Updated => {}
@@ -1278,7 +1286,7 @@ async fn is_currently_asserted(
 
 async fn write_required_blobs<S>(
     storage: &S,
-    ledger_id: &str,
+    namespace: &StorageNamespace,
     provided: &HashMap<String, Base64Bytes>,
     decoded: &[PushCommitDecoded],
     merged: &[PushCommitDecoded],
@@ -1316,7 +1324,7 @@ where
         // (digest hex matches the legacy CAS hash during the transition period)
         let expected_hash = txn_id.digest_hex();
         let _res = storage
-            .content_write_bytes_with_hash(ContentKind::Txn, ledger_id, &expected_hash, &bytes)
+            .content_write_bytes_with_hash(ContentKind::Txn, namespace, &expected_hash, &bytes)
             .await
             .map_err(|e| PushError::Internal(e.to_string()))?;
     }
@@ -1326,13 +1334,13 @@ where
 
 async fn write_commit_blobs<S: Storage + ContentAddressedWrite + Clone + Send + Sync + 'static>(
     storage: &S,
-    ledger_id: &str,
+    namespace: &StorageNamespace,
     decoded: &[PushCommitDecoded],
 ) -> std::result::Result<Vec<StoredCommit>, PushError> {
     let mut stored = Vec::with_capacity(decoded.len());
     for (idx, c) in decoded.iter().enumerate() {
         let res = storage
-            .content_write_bytes(ContentKind::Commit, ledger_id, &c.bytes)
+            .content_write_bytes(ContentKind::Commit, namespace, &c.bytes)
             .await
             .map_err(|e| PushError::Internal(e.to_string()))?;
         if res.content_hash != c.digest_hex {
@@ -1856,7 +1864,7 @@ impl Fluree {
         handle: &LedgerHandle,
         response: &ExportCommitsResponse,
     ) -> Result<BulkImportResult> {
-        let ledger_id = handle.id();
+        let namespace = handle.snapshot().await.storage_namespace();
         let storage = self.admin_storage().ok_or_else(|| {
             ApiError::config("import_commits_bulk requires a managed storage backend")
         })?;
@@ -1869,7 +1877,7 @@ impl Fluree {
         for b64 in response.commits.iter().chain(&response.merged_commits) {
             let bytes = &b64.0;
             storage
-                .content_write_bytes(ContentKind::Commit, ledger_id, bytes)
+                .content_write_bytes(ContentKind::Commit, &namespace, bytes)
                 .await
                 .map_err(|e| ApiError::internal(format!("failed to write commit blob: {e}")))?;
             stored += 1;
@@ -1900,7 +1908,7 @@ impl Fluree {
             }
             let expected_hash = txn_id.digest_hex();
             storage
-                .content_write_bytes_with_hash(ContentKind::Txn, ledger_id, &expected_hash, bytes)
+                .content_write_bytes_with_hash(ContentKind::Txn, &namespace, &expected_hash, bytes)
                 .await
                 .map_err(|e| ApiError::internal(format!("failed to write txn blob: {e}")))?;
             blobs_stored += 1;
@@ -1922,36 +1930,15 @@ impl Fluree {
         head_commit_id: &ContentId,
         head_t: i64,
     ) -> Result<()> {
-        let ledger_id = handle.id();
-        let new_ref = RefValue {
-            id: Some(head_commit_id.clone()),
-            t: head_t,
-        };
-
-        // Read current head for CAS.
-        let current_ref = self
-            .publisher()?
-            .get_ref(ledger_id, RefKind::CommitHead)
-            .await?;
-
-        match self
-            .publisher()?
-            .compare_and_set_ref(
-                ledger_id,
-                RefKind::CommitHead,
-                current_ref.as_ref(),
-                &new_ref,
-            )
-            .await?
-        {
-            CasResult::Updated => Ok(()),
-            CasResult::Conflict { actual } => Err(ApiError::http(
-                409,
-                format!(
-                    "commit head changed during clone finalization (expected {current_ref:?}, actual {actual:?})"
-                ),
-            )),
-        }
+        let fence = handle.snapshot().await.fence();
+        self.set_ref(
+            handle.id(),
+            fence,
+            RefKind::CommitHead,
+            head_commit_id,
+            head_t,
+        )
+        .await
     }
 
     /// Set the index head after pull/clone with index transfer.
@@ -1965,32 +1952,36 @@ impl Fluree {
         index_id: &ContentId,
         index_t: i64,
     ) -> Result<()> {
-        let ledger_id = handle.id();
+        let fence = handle.snapshot().await.fence();
+        self.set_ref(handle.id(), fence, RefKind::IndexHead, index_id, index_t)
+            .await
+    }
+
+    /// Point `kind` of `ledger_id`'s record at `id`/`t`, by compare-and-swap
+    /// against the head read just before.
+    async fn set_ref(
+        &self,
+        ledger_id: &str,
+        fence: Option<fluree_db_nameservice::Fence>,
+        kind: RefKind,
+        id: &ContentId,
+        t: i64,
+    ) -> Result<()> {
         let new_ref = RefValue {
-            id: Some(index_id.clone()),
-            t: index_t,
+            id: Some(id.clone()),
+            t,
         };
-
-        let current_ref = self
-            .publisher()?
-            .get_ref(ledger_id, RefKind::IndexHead)
-            .await?;
-
+        let current_ref = self.publisher()?.get_ref(ledger_id, kind).await?;
         match self
             .publisher()?
-            .compare_and_set_ref(
-                ledger_id,
-                RefKind::IndexHead,
-                current_ref.as_ref(),
-                &new_ref,
-            )
+            .compare_and_set_ref_fenced(ledger_id, fence, kind, current_ref.as_ref(), &new_ref)
             .await?
         {
             CasResult::Updated => Ok(()),
             CasResult::Conflict { actual } => Err(ApiError::http(
                 409,
                 format!(
-                    "index head changed during transfer (expected {current_ref:?}, actual {actual:?})"
+                    "{kind:?} changed during transfer (expected {current_ref:?}, actual {actual:?})"
                 ),
             )),
         }
@@ -2012,9 +2003,12 @@ impl Fluree {
     /// The new name is independent of the source ledger's name — CAS objects
     /// are content-addressed, so only the nameservice pointer uses the name.
     ///
-    /// On any failure after the empty ledger is created, the half-created
-    /// ledger is hard-dropped so a partial restore never leaves a head
-    /// pointing at incompletely-ingested data.
+    /// Returns [`ApiError::LedgerExists`] if the name already holds a live
+    /// ledger on any branch.
+    ///
+    /// The ledger stays invisible until it is fully restored. On any failure
+    /// its claim on the name is released and the data it wrote deleted, so
+    /// the restore can be retried.
     pub async fn restore_ledger<R>(
         &self,
         new_ledger_id: &str,
@@ -2028,64 +2022,62 @@ impl Fluree {
         // callers may pass a bare `name` (the CLI does), which `create_ledger`
         // would register as `name:main` while raw-id storage writes would land
         // in the wrong namespace.
-        let new_ledger_id = LedgerId::parse(new_ledger_id)?.to_string();
-        let new_ledger_id = new_ledger_id.as_str();
+        let new_ledger_id = LedgerId::parse(new_ledger_id)?;
 
-        // Create the empty target first. `create_ledger` errors if the name is
-        // already taken — callers map that to a 409 / usage error.
-        self.create_ledger(new_ledger_id).await?;
+        // A restore brings in a whole ledger, so it claims the whole name,
+        // and nobody sees the ledger until its heads are in place.
+        let mut pending = self.claim_name(&new_ledger_id).await?;
+        let store = self.publisher()?;
+        let record = pending.record.clone();
+        let restoring = self.restore_into_created(&record, reader);
+        let restored = match crate::ledger::while_claimed(store, &mut pending, restoring).await {
+            Some(Ok(result)) => fluree_db_nameservice::lifecycle::activate(store, &pending)
+                .await
+                .map(|()| result)
+                .map_err(ApiError::from),
+            Some(Err(e)) => Err(e),
+            None => Err(fluree_db_nameservice::lifecycle::create_rolled_back(&record.name).into()),
+        };
+        if restored.is_err() {
+            self.discard_restored(&pending).await;
+        }
+        restored
+    }
 
-        match self.restore_into_created(new_ledger_id, reader).await {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                // Roll back so we never leave a ledger whose head points at
-                // partially-ingested data. `restore_ledger` only reaches here
-                // after `create_ledger` succeeded, which means the name did not
-                // previously exist — so dropping the whole name removes only
-                // what this restore created, never a pre-existing sibling.
-                // Soft drop (retract the nameservice pointer) is the right
-                // rollback: it cannot fail on file deletion, and any CAS blobs
-                // already written are harmless content-addressed orphans (a
-                // retry rewrites identical bytes; GC reclaims them otherwise).
-                // `drop_ledger` takes the bare name, so strip the branch suffix.
-                // (admin::drop_ledger is native-only; on wasm32 the orphaned
-                // name is left for the server/external admin to reap.)
-                #[cfg(target_arch = "wasm32")]
-                error!(
-                    ledger = %new_ledger_id,
-                    "restore rollback (drop_ledger) unavailable on wasm32"
-                );
-                #[cfg(not(target_arch = "wasm32"))]
-                match fluree_db_core::ledger_id::split_ledger_id(new_ledger_id) {
-                    Ok((name, _branch)) => {
-                        if let Err(drop_err) = self.drop_ledger(&name, crate::DropMode::Soft).await
-                        {
-                            error!(
-                                ledger = %new_ledger_id,
-                                error = %drop_err,
-                                "failed to roll back partially-restored ledger after restore error"
-                            );
-                        }
-                    }
-                    Err(parse_err) => {
-                        error!(
-                            ledger = %new_ledger_id,
-                            error = %parse_err,
-                            "could not parse ledger id to roll back partially-restored ledger"
-                        );
-                    }
-                }
-                Err(e)
+    /// Undo a restore that failed: release its claim on the name, so the
+    /// restore can be retried, then delete what it wrote, which nothing
+    /// references once the claim is gone.
+    async fn discard_restored(&self, pending: &PendingLedger) {
+        let abandoned = match self.publisher() {
+            Ok(store) => fluree_db_nameservice::lifecycle::abandon(store, pending)
+                .await
+                .map_err(ApiError::from),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = abandoned {
+            error!(
+                ledger = %pending.record.ledger_id,
+                error = %e,
+                "failed to release a failed restore's claim on the name"
+            );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(storage) = self.admin_storage() {
+            let mut report = crate::admin::DropReport::default();
+            crate::admin::purge_instance_root(storage, &pending.root, &[], &mut report).await;
+            for warning in &report.warnings {
+                tracing::warn!(ledger = %pending.record.ledger_id, %warning, "partially-restored data left behind");
             }
         }
     }
 
-    /// Stream-decode a `.flpack` into the already-created `new_ledger_id` and
-    /// finalize its heads. Split out from [`Fluree::restore_ledger`] so the
-    /// caller can roll back on any error returned here.
+    /// Stream-decode a `.flpack` into the pending ledger whose root branch is
+    /// `record` and finalize its heads. Split out from
+    /// [`Fluree::restore_ledger`] so the caller can roll back on any error
+    /// returned here.
     async fn restore_into_created<R>(
         &self,
-        new_ledger_id: &str,
+        record: &NsRecord,
         reader: &mut R,
     ) -> Result<RestoreResult>
     where
@@ -2101,6 +2093,8 @@ impl Fluree {
             .backend()
             .admin_storage_cloned()
             .ok_or_else(|| ApiError::config("restore_ledger requires a managed storage backend"))?;
+        let new_ledger_id = record.ledger_id.as_str();
+        let namespace = record.storage_namespace();
 
         // Frames are decoded out of a growing byte buffer; `read` appends and
         // `drain` consumes whole frames as they complete. Decoding stays
@@ -2180,12 +2174,13 @@ impl Fluree {
                                     }
                                     bytes_in_flight += len;
                                     let storage_ref = &storage;
+                                    let namespace_ref = &namespace;
                                     in_flight.push(async move {
                                         ingest_cas_object(
                                             storage_ref,
                                             &cid,
                                             &payload,
-                                            new_ledger_id,
+                                            namespace_ref,
                                         )
                                         .await?;
                                         Ok::<usize, ApiError>(len)
@@ -2258,7 +2253,7 @@ impl Fluree {
         // Resolve the head CIDs from the manifest, then verify they were
         // actually ingested before pointing the nameservice at them — a
         // truncated or mismatched archive must not yield a dangling head.
-        let content = self.content_store(new_ledger_id);
+        let content = self.content_store(&namespace);
 
         let commit_head_id = manifest
             .get("commit_head_id")
@@ -2278,8 +2273,14 @@ impl Fluree {
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
 
-        let handle = self.ledger_cached(new_ledger_id).await?;
-        self.set_commit_head(&handle, &commit_cid, commit_t).await?;
+        self.set_ref(
+            new_ledger_id,
+            record.fence,
+            RefKind::CommitHead,
+            &commit_cid,
+            commit_t,
+        )
+        .await?;
 
         let mut index_t_out = None;
         if let Some(index_cid_str) = manifest.get("index_head_id").and_then(|v| v.as_str()) {
@@ -2327,7 +2328,7 @@ impl Fluree {
                     root.ledger_id = new_ledger_id.to_string();
                     let restamped = root.encode();
                     let res = storage
-                        .content_write_bytes(ContentKind::IndexRoot, new_ledger_id, &restamped)
+                        .content_write_bytes(ContentKind::IndexRoot, &namespace, &restamped)
                         .await
                         .map_err(|e| {
                             ApiError::internal(format!(
@@ -2344,8 +2345,14 @@ impl Fluree {
                 }
             };
 
-            self.set_index_head(&handle, &head_index_cid, index_t)
-                .await?;
+            self.set_ref(
+                new_ledger_id,
+                record.fence,
+                RefKind::IndexHead,
+                &head_index_cid,
+                index_t,
+            )
+            .await?;
             index_t_out = Some(index_t);
         }
 
@@ -2372,7 +2379,7 @@ impl Fluree {
             })?;
             // Re-points config + bumps configV via the standard CAS path; the
             // re-put of the (content-addressed) blob is idempotent.
-            self.set_default_context(new_ledger_id, &ctx_json).await?;
+            self.push_default_context(record, &ctx_json).await?;
         }
 
         Ok(RestoreResult {
@@ -2458,7 +2465,7 @@ impl Fluree {
         })?;
         write_required_blobs(
             &storage,
-            base_state.ledger_id(),
+            &base_state.storage_namespace(),
             &request.blobs,
             &decoded,
             &merged,
@@ -2467,13 +2474,14 @@ impl Fluree {
         .map_err(PushError::into_api_error)?;
 
         // Parents before children, as in `prepare_push`.
-        write_commit_blobs(&storage, base_state.ledger_id(), &merged)
+        write_commit_blobs(&storage, &base_state.storage_namespace(), &merged)
             .await
             .map_err(PushError::into_api_error)?;
 
-        let stored_commits = write_commit_blobs(&storage, base_state.ledger_id(), &decoded)
-            .await
-            .map_err(PushError::into_api_error)?;
+        let stored_commits =
+            write_commit_blobs(&storage, &base_state.storage_namespace(), &decoded)
+                .await
+                .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
         let new_ref = RefValue {
@@ -2484,8 +2492,9 @@ impl Fluree {
         // 7) CAS update CommitHead.
         match self
             .publisher()?
-            .compare_and_set_ref(
+            .compare_and_set_ref_fenced(
                 base_state.ledger_id(),
+                base_state.fence(),
                 RefKind::CommitHead,
                 Some(&current_ref),
                 &new_ref,

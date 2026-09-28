@@ -49,7 +49,7 @@ fn iri_matches(value: &JsonValue, compact: &str, expanded: &str) -> bool {
 
 async fn seed_single_annotation(ledger_id: &str) -> (MemoryFluree, MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let txn = json!({
         "@context": ctx(),
         "@id": "ex:alice",
@@ -70,7 +70,7 @@ async fn parallel_annotations_on_one_edge_return_one_row_per_occurrence() {
     // contract for `Pattern::EdgeAnnotation`.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:parallel";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Insert two parallel annotations on the same edge. Each annotation
     // has an explicit @id so they can be told apart on retract paths
@@ -156,7 +156,7 @@ async fn annotation_lowers_with_top_level_ledger_key_in_body() {
     // and zero queryable annotations.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:body-ledger";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "ledger": ledger_id,
@@ -216,7 +216,7 @@ async fn single_object_body_ledger_insert_lowers_annotation_and_drops_routing_ke
     // where annotation lowering buries the original node inside `@graph`.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:single-object-body-ledger";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "ledger": ledger_id,
@@ -307,7 +307,7 @@ async fn update_insert_clause_mints_annotation_constant() {
     // caused the whole insert clause to silently no-op.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:update-insert-const";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
     let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
@@ -354,7 +354,7 @@ async fn update_insert_clause_mints_annotation_for_where_bound_edges() {
     // distinct annotation (no blank-node collision across solutions).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:update-insert-where-bound";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({
         "@context": ctx(),
@@ -420,7 +420,7 @@ async fn update_insert_clause_anonymous_annotation_reifies() {
     // Anonymous (blank-node) annotation minted through an update insert clause.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:update-insert-anon";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
     let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
@@ -451,7 +451,7 @@ async fn update_delete_and_insert_annotation_in_one_txn() {
     // (by the annotation's @id) while minting a fresh annotated edge.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:update-delete-and-insert";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({
         "@context": ctx(),
@@ -492,7 +492,7 @@ async fn update_insert_clause_explicit_id_annotation_reifies() {
     // Explicit-`@id` annotation minted through an update insert clause.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:update-insert-explicit-id";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
     let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
@@ -526,7 +526,7 @@ async fn update_insert_clause_parallel_annotations_reify() {
     // rejected on every surface; parallels are expressed as repeated edges).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:update-insert-parallel";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
     let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
@@ -561,7 +561,7 @@ async fn update_insert_clause_literal_valued_edge_reifies() {
     // insert clause: base value + reified annotation both land.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:update-insert-literal";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
     let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
@@ -621,7 +621,7 @@ async fn update_anonymous_annotation_metadata_via_where_binding() {
     // (new metadata survives), so the edited role is reachable.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:update-anon-metadata";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({
         "@context": ctx(),
@@ -660,7 +660,7 @@ async fn update_delete_by_selector_retracts_anonymous_annotation() {
     // `@id`) must retract an anonymous annotation, leaving zero annotations.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:update-delete-selector-anon";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let seed = json!({
         "@context": ctx(),
@@ -700,7 +700,7 @@ async fn bare_triple_pattern_returns_one_row_per_edge_regardless_of_annotations(
     // cardinality through the `@annotation` / `@reifies` IR variants.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:bare-multiplicity";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Two annotations on the same edge.
     let txn = json!({
@@ -749,7 +749,7 @@ async fn select_distinct_collapses_parallel_annotations_when_projecting_edge_onl
     // projection columns (?person, ?org) collapses to one row.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:select-distinct";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -877,7 +877,7 @@ async fn retracting_base_edge_cascades_f_reifies_bundle() {
     //     annotation — proving the bundle was orphaned, not cleaned.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:cascade-base-retract";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // 1. Insert an annotated edge.
     let insert = json!({
@@ -981,7 +981,7 @@ async fn subject_expansion_emits_annotation_block_for_annotated_edge() {
     // wildcard-hydration filter already handles).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:expand-annotation";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -1104,7 +1104,7 @@ async fn first_annotation_through_incremental_index_flips_has_annotations() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
             // Step 1: plain insert → indexed root with no annotations.
             let plain = json!({
@@ -1225,7 +1225,7 @@ async fn cascade_fires_for_indexed_annotation_when_edge_is_retracted() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
             let txn = json!({
                 "@context": ctx(),
@@ -1318,7 +1318,7 @@ async fn subject_expansion_finds_annotation_after_reindex() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
             // Insert an annotated edge. The lowering produces
             // f:reifies* flakes that land in the novelty overlay.
@@ -1404,7 +1404,7 @@ async fn subject_expansion_emits_no_annotation_when_edge_has_none() {
     // has_annotations gate / empty-iter path.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:expand-no-annotation";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -1457,7 +1457,7 @@ async fn cascade_cleans_up_anonymous_annotation_metadata() {
     // would extend cleanup to those; not in scope here.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:cascade-anonymous-metadata";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Insert with an *anonymous* annotation (no @id on the
     // annotation block — the lowering mints a blank-node SID).
@@ -1523,7 +1523,7 @@ async fn retracting_all_annotation_metadata_cleans_bundle_too() {
     // the whole annotation.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:metadata-retract-cleans-bundle";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -1610,7 +1610,7 @@ async fn replacing_annotation_metadata_in_one_txn_keeps_bundle() {
     // but loses its edge attachment.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:metadata-replacement";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -1681,7 +1681,7 @@ async fn retracting_partial_annotation_metadata_keeps_bundle() {
     // body metadata.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:metadata-retract-partial";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -1743,7 +1743,7 @@ async fn cascade_lpg_mode_cleans_explicit_iri_metadata_too() {
     // RDF mode), which preserves the metadata.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:cascade-lpg-cleans-explicit";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -1795,7 +1795,7 @@ async fn cascade_keeps_explicit_iri_annotation_metadata() {
     // subject.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:cascade-explicit-keeps-metadata";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -1852,7 +1852,7 @@ async fn variable_predicate_scan_hides_f_reifies_in_named_graph() {
     // to every graph, not only the default graph.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:variable-predicate-named-graph";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -1931,7 +1931,7 @@ async fn variable_predicate_scan_hides_f_reifies() {
     // existing filter on the binary-cursor path.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:variable-predicate-no-leak";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -2002,7 +2002,7 @@ async fn opts_include_system_facts_does_not_relax_direct_mention_firewall() {
     // contract-level boundary.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:opts-include-direct-still-rejected";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let _ = fluree
         .insert(
             ledger0,
@@ -2046,7 +2046,7 @@ async fn opts_include_system_facts_surfaces_f_reifies() {
     // filter hides them (covered by `variable_predicate_scan_hides_f_reifies`).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:opts-include-system-facts";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -2108,7 +2108,7 @@ async fn opts_include_system_facts_propagates_through_dataset_path() {
     // opt-in works whichever path the api dispatcher picks.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:opts-dataset-path";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let _ = fluree
         .insert(
             ledger0,
@@ -2172,7 +2172,7 @@ async fn opts_include_system_facts_works_for_ask_queries() {
     // opt-in set.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:opts-ask";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let _ = fluree
         .insert(
             ledger0,
@@ -2252,7 +2252,7 @@ async fn history_query_surfaces_f_reifies_events() {
     // opt-in.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:history-surfaces-reifies";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -2317,7 +2317,7 @@ async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
     // sees the user's `ex:role` but not any `f:reifies*` predicate.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:wildcard-hides-reifies";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -2393,7 +2393,7 @@ async fn wildcard_subject_hydration_hides_anonymous_annotation_sids() {
     // surfaces as `null` rather than `{"@id": "_:bnode_x", ...}`.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:wildcard-hides-anon-anns";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Anonymous annotation: no `@id` → blank-node SID minted by
     // the transactor.
@@ -2445,7 +2445,7 @@ async fn wildcard_subject_hydration_keeps_explicit_iri_annotations_visible() {
     // pass through unchanged.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:wildcard-keeps-explicit-anns";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -2496,7 +2496,7 @@ async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
     // active in the overlay.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:cascade-named-graph";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -2598,7 +2598,7 @@ async fn annotation_in_named_graph_insert_succeeds() {
     // the lowering-side guarantee.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:named-graph-insert";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let txn = json!({
         "@context": ctx(),
@@ -2626,7 +2626,7 @@ async fn delete_by_annotation_id_retracts_only_targeted_occurrence() {
     // shape — exactly that occurrence, not the base edge.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-by-id";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -2728,7 +2728,7 @@ async fn delete_by_annotation_id_lpg_mode_cleans_explicit_iri_body() {
     // `delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode`.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-by-id-lpg-cleans-body";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -2814,7 +2814,7 @@ async fn delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode() {
     // pins the opt-in cleanup path.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-by-id-rdf-body";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -2888,7 +2888,7 @@ async fn delete_by_annotation_id_named_graph_retracts_in_correct_graph() {
     // continues to surface it).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-by-id-named-graph";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -2982,7 +2982,7 @@ async fn delete_by_annotation_selector_retracts_matching_occurrence() {
     // the base edge intact.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-selector-basic";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -3073,7 +3073,7 @@ async fn delete_by_annotation_selector_lpg_mode_cleans_explicit_iri_body() {
     // annotation's body, not just the f:reifies* bundle.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-selector-lpg";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -3155,7 +3155,7 @@ async fn delete_by_annotation_selector_named_graph_retracts_in_correct_graph() {
     // assertion survives.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-selector-named-graph";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -3240,7 +3240,7 @@ async fn delete_by_annotation_selector_avoids_user_var_collision() {
     // literal "Alice" and bind nothing.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-selector-var-collision";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -3323,7 +3323,7 @@ async fn multi_source_default_pairs_annotations_per_source_graph() {
     // flipped correctness test it became.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:cross-graph-misjoin";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -3425,7 +3425,7 @@ async fn multi_source_default_wildcard_does_not_panic_on_synthetic_var() {
     // user-visible bindings.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:multi-source-wildcard";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -3498,7 +3498,7 @@ async fn graph_wrapped_query_correctly_pairs_annotations_per_graph() {
     // This is the workaround documented on the bug pinning test.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:graph-wrapped-correct";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -3612,7 +3612,7 @@ async fn edgekey_roundtrip_for_literal(
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = format!("it-edge-annotations-edgekey-roundtrip-{test_label}");
-    let ledger0 = genesis_ledger(&fluree, &ledger_id);
+    let ledger0 = genesis_ledger(&fluree, &ledger_id).await;
 
     let mut literal_with_ann = literal_value
         .as_object()
@@ -3863,7 +3863,7 @@ async fn assert_turtle_star_matches_jsonld(
     use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let jsonld_committed = fluree
         .insert(ledger0, &jsonld_txn)
@@ -3977,7 +3977,7 @@ async fn turtle_star_named_reifier_matches_jsonld_named_annotation() {
     use fluree_vocab::reifies_iris;
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:named-reifier");
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:named-reifier").await;
 
     let jsonld_txn = json!({
         "@context": ctx(),
@@ -4113,7 +4113,7 @@ async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/trig-star:named-graph";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let graph_iri = "http://example.org/hr-graph";
 
     let jsonld_committed = fluree
@@ -4310,7 +4310,7 @@ async fn turtle_star_repeated_anonymous_occurrences_mint_fresh_reifiers() {
     use fluree_db_core::edge::EdgeKey;
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:repeated-anon");
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:repeated-anon").await;
 
     let jsonld_txn = json!({
         "@context": ctx(),
@@ -4390,7 +4390,7 @@ async fn turtle_star_anonymous_mints_never_collide_with_user_bnode_labels() {
     use fluree_db_core::value::FlakeValue;
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:anon-user-label-collision");
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:anon-user-label-collision").await;
 
     let turtle = "@prefix ex: <http://example.org/> .\n\
          _:b1 ex:name \"Bob\" .\n\
@@ -4487,7 +4487,7 @@ async fn delete_by_id_retracts_literal_annotation_bundle() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-literal-delete-by-id";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -4560,7 +4560,7 @@ async fn delete_by_id_retracts_literal_annotation_bundle() {
 async fn subject_expansion_promotes_annotated_literal_to_value_object() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-literal-hydrate-plain";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -4623,7 +4623,7 @@ async fn subject_expansion_promotes_annotated_literal_to_value_object() {
 async fn subject_expansion_virtual_projection_on_annotated_literal_includes_value() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-virtual-projection";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -4682,7 +4682,7 @@ async fn subject_expansion_virtual_projection_on_annotated_literal_includes_valu
 async fn subject_expansion_promotes_annotated_lang_tagged_literal() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-literal-hydrate-lang";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -4743,7 +4743,7 @@ async fn delete_by_selector_retracts_literal_annotation_disambiguating_on_body()
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-literal-delete-selector";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Two parallel annotations on the same literal edge, distinguished
     // by selector body.
@@ -4845,7 +4845,7 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-literal-delete-lang";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert = json!({
         "@context": ctx(),
@@ -4947,7 +4947,7 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
 async fn cross_language_annotation_does_not_cross_match() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-cross-language";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Two annotations on different subjects, same predicate, same
     // lexical object value, different `@language` tags. Each
@@ -5159,7 +5159,7 @@ async fn annotations_survive_restart_from_commits() {
     // ---------- Session 1: insert ----------
     {
         let fluree = FlureeBuilder::file(&path).build().expect("build");
-        let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+        let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
         let insert = json!({
             "@context": ctx(),
             "@id": "ex:alice",
@@ -5254,7 +5254,7 @@ async fn annotations_survive_restart_from_commits() {
 async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:policy-hides-base";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Insert the annotated edge.
     let insert = json!({
@@ -5562,7 +5562,7 @@ async fn transfer_named_to_named_rewrites_reifies_graph_anchor() {
     let ledger_id = "it/edge-annotations:xfer-named-to-named";
     let g1 = "http://example.org/g1";
     let g2 = "http://example.org/g2";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
 
     let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{g1}> TO <{g2}>")).await;
@@ -5618,7 +5618,7 @@ async fn transfer_named_to_named_move_rehomes_and_clears_source() {
     let ledger_id = "it/edge-annotations:xfer-named-to-named-move";
     let g1 = "http://example.org/g1";
     let g2 = "http://example.org/g2";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
 
     let ledger = run_graph_mgmt(&fluree, ledger, &format!("MOVE <{g1}> TO <{g2}>")).await;
@@ -5660,7 +5660,7 @@ async fn transfer_named_to_default_drops_reifies_graph_anchor() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:xfer-named-to-default";
     let g1 = "http://example.org/g1";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
 
     let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{g1}> TO DEFAULT")).await;
@@ -5713,7 +5713,7 @@ async fn add_across_graphs_with_reifier_collision_errors() {
     let ledger_id = "it/edge-annotations:add-reifier-collision";
     let g1 = "http://example.org/g1";
     let g2 = "http://example.org/g2";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ledger = seed_named_annotation_for_edge(
         &fluree, ledger0, g1, "ex:alice", "ex:acme", "ex:r1", "Engineer",
     )
@@ -5762,7 +5762,7 @@ async fn copy_and_move_over_reifier_collision_succeed() {
         let ledger_id = format!("it/edge-annotations:{}-collision-ok", verb.to_lowercase());
         let g1 = "http://example.org/g1";
         let g2 = "http://example.org/g2";
-        let ledger0 = genesis_ledger(&fluree, &ledger_id);
+        let ledger0 = genesis_ledger(&fluree, &ledger_id).await;
         let ledger = seed_named_annotation_for_edge(
             &fluree, ledger0, g1, "ex:alice", "ex:acme", "ex:r1", "Engineer",
         )
@@ -5823,7 +5823,7 @@ async fn copy_onto_identical_annotation_tolerates_same_t_churn() {
     let ledger_id = "it/edge-annotations:copy-identical-churn";
     let g1 = "http://example.org/g1";
     let g2 = "http://example.org/g2";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
     let ledger = seed_named_annotation(&fluree, ledger, g2, "ex:emp/alice-acme", "Engineer").await;
 
@@ -5859,7 +5859,7 @@ async fn add_same_edge_same_reifier_succeeds() {
     let ledger_id = "it/edge-annotations:add-same-edge-ok";
     let g1 = "http://example.org/g1";
     let g2 = "http://example.org/g2";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     // Identical edge + reifier + payload in BOTH graphs.
     let ledger = seed_named_annotation_for_edge(
         &fluree, ledger0, g1, "ex:alice", "ex:acme", "ex:r1", "Engineer",
@@ -5904,7 +5904,7 @@ async fn transfer_named_to_default_move_and_add() {
         let fluree = FlureeBuilder::memory().build_memory();
         let ledger_id = format!("it/edge-annotations:xfer-n2d-{}", verb.to_lowercase());
         let g1 = "http://example.org/g1";
-        let ledger0 = genesis_ledger(&fluree, &ledger_id);
+        let ledger0 = genesis_ledger(&fluree, &ledger_id).await;
         let ledger =
             seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
 
@@ -5941,7 +5941,7 @@ async fn multi_hop_copy_rehomes_anchor_each_hop() {
     let ga = "http://example.org/ga";
     let gb = "http://example.org/gb";
     let gc = "http://example.org/gc";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ledger = seed_named_annotation(&fluree, ledger0, ga, "ex:emp/alice-acme", "Engineer").await;
 
     let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{ga}> TO <{gb}>")).await;
@@ -5978,7 +5978,7 @@ async fn copy_with_explicit_reifier_reads_scoped_per_graph() {
     let ledger_id = "it/edge-annotations:cross-graph-reads";
     let g1 = "http://example.org/g1";
     let g2 = "http://example.org/g2";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     // Explicit reifier @id — the shape the question is about.
     let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
 
@@ -6031,7 +6031,7 @@ async fn count_shapes_read_only_the_reifies_lookups_they_need() {
     // still bind, and a constant endpoint still constrains.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:elided-count";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [
@@ -6123,7 +6123,7 @@ async fn count_shapes_read_only_the_reifies_lookups_they_need() {
 /// them a self-loop, for the elided-chain tests below.
 async fn seed_elided_chain_edges(ledger_id: &str) -> (MemoryFluree, MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let txn = json!({
         "@context": ctx(),
         "@id": "ex:alice",
@@ -6345,7 +6345,7 @@ async fn one_reifier_on_the_same_edge_in_two_graphs_writes_in_one_transaction() 
 
     let committed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &json!({
                 "@context": {"ex": "http://example.org/"},
                 "@graph": [
@@ -6398,7 +6398,7 @@ async fn replaying_a_commit_does_not_refuse_a_reifier_an_older_build_wrote() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:replayed-commit";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let sid = |ns: u16, name: &str| Sid::new(ns, name);
     let reifies = |local: &str| {
@@ -6668,7 +6668,10 @@ async fn annotation_form_delete_matrix() {
         // Labels carry `@` (as in `@annotation`), which ledger ids reserve.
         let ledger_id = format!("ann-matrix/{}:main", label.replace([' ', '@'], "-"));
         let seeded = fluree
-            .insert_turtle(genesis_ledger(&fluree, &ledger_id), ANNOTATION_MATRIX_SEED)
+            .insert_turtle(
+                genesis_ledger(&fluree, &ledger_id).await,
+                ANNOTATION_MATRIX_SEED,
+            )
             .await
             .expect("seed the annotated edge");
         assert_eq!(seeded.ledger.t(), 1, "[{label}] seed must commit");
@@ -6729,7 +6732,10 @@ async fn annotation_form_delete_retracts_the_base_edge_in_both_spellings() {
         let fluree = FlureeBuilder::memory().build_memory();
         let ledger_id = format!("ann-base/{}:main", label.replace(' ', "-"));
         fluree
-            .insert_turtle(genesis_ledger(&fluree, &ledger_id), ANNOTATION_MATRIX_SEED)
+            .insert_turtle(
+                genesis_ledger(&fluree, &ledger_id).await,
+                ANNOTATION_MATRIX_SEED,
+            )
             .await
             .expect("seed");
         fluree
@@ -6761,7 +6767,10 @@ async fn base_edge_retraction_detaches_sibling_reifiers_the_delete_never_named()
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "ann-sibling-cascade:main";
     fluree
-        .insert_turtle(genesis_ledger(&fluree, ledger_id), ANNOTATION_MATRIX_SEED)
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id).await,
+            ANNOTATION_MATRIX_SEED,
+        )
         .await
         .expect("seed");
 

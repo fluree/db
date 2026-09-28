@@ -15,7 +15,7 @@ use serde_json::json;
 #[tokio::test]
 async fn inline_ontology_subclass_drives_rdfs_reasoning() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/inline-ontology/subclass:main");
+    let ledger = genesis_ledger(&fluree, "test/inline-ontology/subclass:main").await;
 
     // Seed an instance whose type is a subclass of the target the
     // query asks for. With no schema axioms, the query won't see it.
@@ -86,7 +86,7 @@ async fn inline_ontology_does_not_persist_after_query() {
     // second query must NOT see the inline axioms — they were
     // transient.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/inline-ontology/transient:main");
+    let ledger = genesis_ledger(&fluree, "test/inline-ontology/transient:main").await;
 
     let seed = json!({
         "@context": {"ex": "http://example.org/ns/"},

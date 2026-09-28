@@ -24,7 +24,7 @@ fn ctx_datatype() -> JsonValue {
 }
 
 async fn seed_people_for_datatype(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = ctx_datatype();
 
     let insert = json!({
@@ -47,7 +47,7 @@ async fn seed_people_for_datatype(fluree: &MemoryFluree, ledger_id: &str) -> Mem
 async fn mixed_datatypes_query_matches_only_requested_type() {
     // Scenario: mixed-datatypes-test (adapted to analytical select; avoids subject crawl)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "ledger/datatype:main");
+    let ledger0 = genesis_ledger(&fluree, "ledger/datatype:main").await;
     let ctx = ctx_datatype();
 
     let insert = json!({
@@ -133,7 +133,7 @@ async fn custom_datatype_equality_matches_indexed_and_novelty_rows_after_reindex
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "people:custom-datatype-overlay";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = ctx_datatype();
 
     let base_insert = json!({
@@ -277,7 +277,7 @@ async fn datatype_filter_with_datatype_function() {
 #[tokio::test]
 async fn datatype_function_compares_against_xsd_iri_in_sparql() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "dt-iri:main");
+    let ledger0 = genesis_ledger(&fluree, "dt-iri:main").await;
     fluree
         .insert(
             ledger0,
@@ -359,7 +359,7 @@ async fn datatype_filter_value_object_by_type_constant() {
 async fn language_binding_lang_function() {
     // Scenario: language-binding-test / LANG(?val)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "lang-test:main");
+    let ledger0 = genesis_ledger(&fluree, "lang-test:main").await;
     let ctx = ctx_datatype();
 
     let insert = json!({
@@ -413,7 +413,7 @@ async fn language_binding_lang_function() {
 async fn language_binding_value_object_language_variable() {
     // Test binding @language to a variable: {"@value": "?val", "@language": "?lang"}
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "lang-test:main");
+    let ledger0 = genesis_ledger(&fluree, "lang-test:main").await;
     let ctx = ctx_datatype();
 
     let insert = json!({
@@ -468,7 +468,7 @@ async fn language_binding_value_object_language_variable() {
 #[tokio::test]
 async fn langstring_same_value_different_tags_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "langbug:main");
+    let ledger0 = genesis_ledger(&fluree, "langbug:main").await;
     let ctx = ctx_datatype();
 
     let insert = json!({
@@ -521,7 +521,7 @@ async fn langstring_same_value_different_tags_indexed_overlay() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "langbug:indexed";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = ctx_datatype();
 
     // Base insert with an indexed langString (populates persisted lang dict with "de").
@@ -846,7 +846,7 @@ async fn double_export_uses_canonical_lexical_form() {
 #[tokio::test]
 async fn langstring_delete_one_variant_keeps_others() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "langbug:delete");
+    let ledger0 = genesis_ledger(&fluree, "langbug:delete").await;
     let ctx = ctx_datatype();
 
     let insert = json!({
@@ -900,7 +900,7 @@ async fn language_binding_rejects_type_and_language_conflict() {
     // and @language. E.g. {"@value": "?val", "@type": "xsd:integer", "@language": "en"}
     // must be rejected at parse time.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "lang-conflict:main");
+    let ledger0 = genesis_ledger(&fluree, "lang-conflict:main").await;
     let ctx = ctx_datatype();
 
     let insert = json!({
@@ -931,7 +931,7 @@ async fn language_binding_rejects_type_and_language_conflict() {
 async fn json_datatype_insert_query_and_filter() {
     // Test @json datatype: store arbitrary JSON, deserialize on query
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "json-test:main");
+    let ledger0 = genesis_ledger(&fluree, "json-test:main").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1077,7 +1077,7 @@ async fn transaction_binding_at_t_variable() {
     // Test @t binding: {"@value": "?val", "@t": "?txn"} binds the transaction time
     // This is a Fluree-specific extension to JSON-LD query syntax.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "t-binding-test:main");
+    let ledger0 = genesis_ledger(&fluree, "t-binding-test:main").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1158,7 +1158,7 @@ async fn decimal_string_input_becomes_bigdecimal_preserves_precision() {
     // String input with xsd:decimal → BigDecimal with precision preserved
     // This tests the datatype-aware deserialization from storage
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "decimal-test:precision");
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:precision").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1231,7 +1231,7 @@ async fn decimal_json_number_input_is_exact() {
     // so 3.13 stores as the exact decimal 3.13, not the nearest binary
     // double.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "decimal-test:json-number");
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:json-number").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1318,7 +1318,7 @@ async fn decimal_json_number_input_is_exact() {
 async fn decimal_sort_order_with_mixed_numeric_types() {
     // Test sort order works correctly across Long, Double, and BigDecimal
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "decimal-test:sort");
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:sort").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1387,7 +1387,7 @@ async fn decimal_equality_across_types() {
     // - Range scans use this ordering, so Long(3), Double(3.0), BigDecimal(3) are adjacent
     // - trim_to_range includes all flakes where cmp(flake, bound) == Equal
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "decimal-test:equality");
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:equality").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1451,7 +1451,7 @@ async fn decimal_equality_across_types() {
 async fn decimal_filter_comparison_across_types() {
     // Test filter comparisons work across Long, Double, BigDecimal
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "decimal-test:filter");
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:filter").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1500,7 +1500,7 @@ async fn decimal_filter_comparison_across_types() {
 async fn decimal_invalid_string_should_error() {
     // Invalid string for xsd:decimal should error during query coercion
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "decimal-test:invalid");
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:invalid").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1534,7 +1534,7 @@ async fn decimal_invalid_string_should_error() {
 async fn decimal_non_integral_to_integer_should_error() {
     // Non-integral value with xsd:integer should error
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "decimal-test:non-integral");
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:non-integral").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1573,7 +1573,7 @@ async fn decimal_non_integral_to_integer_should_error() {
 async fn decimal_number_to_boolean_should_error() {
     // Number with xsd:boolean should error
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "decimal-test:num-to-bool");
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:num-to-bool").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1611,7 +1611,7 @@ async fn decimal_number_to_boolean_should_error() {
 async fn values_typed_literal_string_to_integer_coercion() {
     // VALUES clause should apply the same coercion as WHERE patterns
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "values-test:coerce");
+    let ledger0 = genesis_ledger(&fluree, "values-test:coerce").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1656,7 +1656,7 @@ async fn values_typed_literal_string_to_integer_coercion() {
 async fn values_incompatible_type_returns_no_matches() {
     // VALUES clause with incompatible @value/@type should throw a type coercion error.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "values-test:no-match");
+    let ledger0 = genesis_ledger(&fluree, "values-test:no-match").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1695,7 +1695,7 @@ async fn values_decimal_string_becomes_bigdecimal() {
     // VALUES with string + xsd:decimal should create BigDecimal
     // Both transaction and query now coerce string decimals to BigDecimal
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "values-test:decimal");
+    let ledger0 = genesis_ledger(&fluree, "values-test:decimal").await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1859,7 +1859,7 @@ async fn float_typed_integer_values_survive_indexing() {
 #[tokio::test]
 async fn indexed_inline_numerics_roundtrip_through_distinct_filter_sum() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "nums:main");
+    let ledger0 = genesis_ledger(&fluree, "nums:main").await;
     let ctx = ctx_datatype();
     fluree
         .insert(

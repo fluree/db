@@ -36,7 +36,7 @@ fn config_iri(ledger_id: &str) -> String {
 
 /// Default-graph data, one ordinary user graph, and a marked config graph.
 async fn seed(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> fluree_db_api::LedgerState {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let cfg = config_iri(ledger_id);
     let trig = format!(
         r#"
@@ -183,7 +183,7 @@ async fn jsonld_config_graph_selector_matches_its_sparql_twin() {
 async fn ledger_info_resolves_reserved_graphs_by_exact_iri_not_suffix() {
     let fluree = FlureeBuilder::memory().build_memory();
     let lid = "rg-suffix:main";
-    let ledger = genesis_ledger(&fluree, lid);
+    let ledger = genesis_ledger(&fluree, lid).await;
     let cfg = config_iri(lid);
     let evil = "http://evil.example/x#config";
     let evil_tm = "http://evil.example/x#txn-meta";

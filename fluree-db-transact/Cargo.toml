@@ -68,6 +68,7 @@ shacl = ["dep:fluree-db-shacl"]
 import = ["dep:fluree-db-indexer"]
 
 [dev-dependencies]
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false, features = ["conformance"] }
 tokio.workspace = true
 
 [lints]

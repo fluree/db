@@ -193,6 +193,7 @@ pub(crate) mod dependency_index;
 mod helpers;
 mod provider;
 mod result;
+mod source_instance;
 
 #[cfg(feature = "vector")]
 mod vector;
@@ -291,6 +292,8 @@ pub use iceberg_validate::ValidateR2rmlResponse;
 
 #[cfg(feature = "iceberg")]
 pub use config::{R2rmlCreateConfig, R2rmlMappingInput};
+
+pub use source_instance::index_is_suspended;
 
 // Re-export result types
 pub use result::Bm25CreateResult;

@@ -25,8 +25,8 @@ fn ctx() -> JsonValue {
 #[tokio::test]
 async fn cypher_match_labeled_node_finds_jsonld_typed_subject() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:typed-node";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger_id = "it/cypher-typed-node:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Insert: ex:alice rdf:type ex:Person + ex:name
     let txn = json!({
@@ -57,7 +57,7 @@ async fn cypher_untyped_single_hop_excludes_labels_and_data_properties() {
     // `-->` must follow only relationships: not `rdf:type` (the class node is
     // not a neighbor) and not data properties (literals are not nodes).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-hop-edge-set");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-untyped-hop-edge-set:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -99,7 +99,7 @@ async fn cypher_untyped_single_hop_excludes_labels_and_data_properties() {
 async fn cypher_untyped_undirected_hop_excludes_labels_and_data_properties() {
     // Same edge-set rule for the undirected `--` (forward ∪ reverse union).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-undirected-edge-set");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-untyped-undirected-edge-set:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -152,7 +152,7 @@ async fn cypher_value_only_rel_var_matches_unreified_edges() {
     // (`RETURN e`, `type(e)`) must match plain-RDF edges that carry no
     // `f:reifies*` bundle (typed-pattern matches on imported data).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:value-only-rel-var");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-value-only-rel-var:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -210,7 +210,7 @@ async fn cypher_value_only_rel_var_keeps_parallel_reified_edges_distinct() {
     // Reified parallel edges (Cypher-created) share one base triple; a
     // value-only rel var must still yield one row per relationship.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:value-only-parallel");
+    let mut l = genesis_ledger(&fluree, "it/cypher-value-only-parallel:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -235,8 +235,8 @@ async fn cypher_value_only_rel_var_keeps_parallel_reified_edges_distinct() {
 #[tokio::test]
 async fn cypher_property_accessor_in_where_filters_results() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:prop-accessor-where";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger_id = "it/cypher-prop-accessor-where:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Three Person nodes with different ages.
     let txn = json!({
@@ -268,8 +268,8 @@ async fn cypher_property_accessor_is_nullable_for_missing_property() {
     // lack the property. A mandatory-join lowering would
     // unconditionally drop them.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:nullable-prop";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger_id = "it/cypher-nullable-prop:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Alice has an age; Bob doesn't.
     let txn = json!({
@@ -311,7 +311,7 @@ async fn cypher_property_accessor_is_nullable_for_missing_property() {
 #[tokio::test]
 async fn cypher_parse_error_returns_clear_diagnostic() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:parse-error");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-parse-error:main").await;
     let db = graphdb_from_ledger(&ledger0);
 
     // Garbage Cypher.
@@ -322,7 +322,7 @@ async fn cypher_parse_error_returns_clear_diagnostic() {
 #[tokio::test]
 async fn cypher_bare_node_pattern_rejected_at_lower() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:bare-node");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-bare-node:main").await;
     let db = graphdb_from_ledger(&ledger0);
 
     let r = fluree.query_cypher(&db, "MATCH (n) RETURN n").await;
@@ -335,7 +335,7 @@ async fn cypher_var_length_unbounded_bound_relationship_variable_enumerates() {
     // enumerates paths under relationship-uniqueness (Enumerate mode). On an
     // empty ledger the pattern matches nothing — the point is it no longer rejects.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-bound");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-varlen-bound:main").await;
     let db = graphdb_from_ledger(&ledger0);
 
     let r = fluree
@@ -349,7 +349,7 @@ async fn cypher_var_length_unbounded_bound_relationship_variable_enumerates() {
 async fn transact_cypher_create_round_trips_to_jsonld_query() {
     // End-to-end: Cypher CREATE → stage → JSON-LD read sees the data.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:transact-create");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-transact-create:main").await;
 
     let result = fluree
         .transact_cypher(ledger0, "CREATE (n:Person)")
@@ -369,7 +369,7 @@ async fn transact_cypher_create_round_trips_to_jsonld_query() {
 async fn transact_cypher_set_property_replaces_old_value() {
     // End-to-end: seed via JSON-LD, MATCH … SET via Cypher, read back.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-prop");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-set-prop:main").await;
 
     let txn = json!({
         "@context": ctx(),
@@ -403,7 +403,7 @@ async fn transact_cypher_set_property_replaces_old_value() {
 #[tokio::test]
 async fn transact_cypher_set_map_replace_preserves_labels_and_relationships() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-map-replace");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-set-map-replace:main").await;
 
     let committed = fluree
         .insert(
@@ -473,7 +473,7 @@ async fn transact_cypher_set_map_replace_preserves_labels_and_relationships() {
 #[tokio::test]
 async fn transact_cypher_match_where_set_filters_target_rows() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-where-set");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-match-where-set:main").await;
 
     let committed = fluree
         .insert(
@@ -508,7 +508,7 @@ async fn transact_cypher_match_where_set_filters_target_rows() {
 #[tokio::test]
 async fn transact_cypher_match_where_is_null_set() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-where-null");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-match-where-null:main").await;
 
     let committed = fluree
         .insert(
@@ -544,7 +544,7 @@ async fn transact_cypher_match_where_is_null_set() {
 async fn transact_cypher_match_create_links_existing_nodes() {
     // MATCH binds Alice and Bob; CREATE links them with a new edge.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-create");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-match-create:main").await;
 
     let txn = json!({
         "@context": ctx(),
@@ -575,7 +575,7 @@ async fn transact_cypher_match_create_links_existing_nodes() {
 #[tokio::test]
 async fn transact_cypher_match_where_create_links_existing_nodes() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-where-create");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-match-where-create:main").await;
 
     let committed = fluree
         .insert(
@@ -613,7 +613,7 @@ async fn transact_cypher_match_where_create_links_existing_nodes() {
 #[tokio::test]
 async fn transact_cypher_match_create_mints_new_node_per_match() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-create-new");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-match-create-new:main").await;
 
     let txn = json!({
         "@context": ctx(),
@@ -645,7 +645,7 @@ async fn transact_cypher_match_create_mints_new_node_per_match() {
 #[tokio::test]
 async fn transact_cypher_set_label_adds_type() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-label");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-set-label:main").await;
 
     let txn = json!({
         "@context": ctx(),
@@ -676,7 +676,7 @@ async fn transact_cypher_set_label_adds_type() {
 #[tokio::test]
 async fn transact_cypher_set_null_removes_property() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-null");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-set-null:main").await;
     let txn = json!({
         "@context": ctx(),
         "@id": "alice", "@type": "Person", "name": "Alice", "age": 25,
@@ -702,7 +702,7 @@ async fn transact_cypher_set_null_removes_property() {
 #[tokio::test]
 async fn transact_cypher_remove_property_retracts_value() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:remove-prop");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-remove-prop:main").await;
 
     let txn = json!({
         "@context": ctx(),
@@ -729,7 +729,7 @@ async fn transact_cypher_remove_property_retracts_value() {
 #[tokio::test]
 async fn cypher_query_with_parameter_filters() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:param-read");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-param-read:main").await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [
@@ -755,7 +755,7 @@ async fn cypher_query_with_parameter_filters() {
 #[tokio::test]
 async fn cypher_query_missing_parameter_errors() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:param-missing");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-param-missing:main").await;
     let db = graphdb_from_ledger(&ledger0);
 
     // No params supplied for `$name`.
@@ -769,7 +769,7 @@ async fn cypher_query_missing_parameter_errors() {
 #[tokio::test]
 async fn transact_cypher_with_parameters_creates_node() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:param-write");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-param-write:main").await;
 
     let params = json!({ "name": "Dana", "age": 27 });
     let result = fluree
@@ -794,7 +794,7 @@ async fn transact_cypher_unwind_map_param_batches_node_inserts() {
     // The idiomatic driver batched insert: one parameter carrying N rows,
     // UNWIND, CREATE one node per row, commit once.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-map");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-unwind-map:main").await;
 
     let params = json!({
         "batch": [
@@ -851,7 +851,7 @@ async fn transact_cypher_unwind_inline_range_batches_node_inserts() {
     // Inline constant UNWIND source on a write (`UNWIND range(1, 100) AS x`)
     // — desugars through the same path as `UNWIND $list`.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-inline-range");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-unwind-inline-range:main").await;
 
     let result = fluree
         .transact_cypher(
@@ -886,7 +886,7 @@ async fn transact_cypher_unwind_inline_range_batches_node_inserts() {
 async fn transact_cypher_unwind_inline_list_batches_node_inserts() {
     // Inline list-literal UNWIND on a write.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-inline-list");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-unwind-inline-list:main").await;
 
     let result = fluree
         .transact_cypher(
@@ -920,7 +920,7 @@ async fn transact_cypher_create_return_node() {
     // `CREATE (n:UserTemp {id: 1}) RETURN n` (single vertex write with
     // RETURN) — one row carrying the created node id.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:create-return-node");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-create-return-node:main").await;
     let (result, rows) = fluree
         .transact_cypher_returning(ledger0, r#"CREATE (n:UserTemp {id: 1}) RETURN n"#, None)
         .await
@@ -949,7 +949,7 @@ async fn transact_cypher_match_create_return_edge() {
     // `MATCH (a),(b) CREATE (a)-[e:Temp]->(b) RETURN e` (single edge write
     // with RETURN) — one row per WHERE solution.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:create-return-edge");
+    let mut l = genesis_ledger(&fluree, "it/cypher-create-return-edge:main").await;
     for stmt in [
         r#"CREATE (a:User {id: 1})"#,
         r#"CREATE (b:User {id: 2})"#,
@@ -1000,7 +1000,7 @@ async fn transact_cypher_match_create_return_edge() {
 #[tokio::test]
 async fn transact_cypher_return_of_matched_var_is_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:write-return-matched");
+    let l = genesis_ledger(&fluree, "it/cypher-write-return-matched:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (a:User {id: 1})"#)
         .await
@@ -1019,7 +1019,7 @@ async fn transact_cypher_create_bare_anonymous_node() {
     // node commits (via the hidden db:Node marker) and stays invisible to
     // labeled matches.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:create-bare");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-create-bare:main").await;
     let result = fluree
         .transact_cypher(ledger0, "CREATE ()")
         .await
@@ -1048,7 +1048,7 @@ async fn transact_cypher_create_var_only_node_has_empty_labels() {
     // `CREATE (n)` — fresh node, no labels/props; labels(n) must hide the
     // db:Node existence marker.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:create-var-only");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-create-var-only:main").await;
     let l = fluree
         .transact_cypher(ledger0, "CREATE (n)")
         .await
@@ -1076,7 +1076,7 @@ async fn transact_cypher_create_var_only_node_has_empty_labels() {
 async fn transact_cypher_unwind_scalar_list_param_batches_inserts() {
     // Scalar-list UNWIND CREATE referencing the bare alias.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-scalar");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-unwind-scalar:main").await;
 
     let params = json!({ "ids": [1, 2, 3, 4] });
     let result = fluree
@@ -1106,7 +1106,7 @@ async fn transact_cypher_unwind_empty_batch_errors_empty_transaction() {
     // no-op success; today it surfaces the engine's EmptyTransaction guard.
     // Pinned here as a known limitation (graceful no-op is a follow-up).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-empty");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-unwind-empty:main").await;
 
     let err = fluree
         .transact_cypher_with_params(
@@ -1124,7 +1124,7 @@ async fn seed_nodes_with_ids(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -1148,7 +1148,7 @@ async fn transact_cypher_unwind_map_param_batches_edge_inserts() {
     // existing nodes by id, one edge per row, committed once. Desugars to a
     // VALUES join.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:unwind-edges").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-unwind-edges:main").await;
 
     let params = json!({ "pairs": [{"from": 1, "to": 2}, {"from": 2, "to": 3}] });
     let result = fluree
@@ -1191,7 +1191,7 @@ async fn transact_cypher_optional_match_before_create_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = fluree
         .transact_cypher(
-            genesis_ledger(&fluree, "it/cypher:optional-create"),
+            genesis_ledger(&fluree, "it/cypher-optional-create:main").await,
             r#"CREATE (a:Person {name: "Alice"})"#,
         )
         .await
@@ -1212,7 +1212,7 @@ async fn transact_cypher_anonymous_create_reifies_for_named_read() {
     // Every Cypher relationship reifies (LPG identity), so an anonymous CREATE
     // is visible to a *named* read and carries identity.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:anon-create-reified");
+    let mut l = genesis_ledger(&fluree, "it/cypher-anon-create-reified:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -1247,7 +1247,7 @@ async fn cypher_collect_inside_expression_rejected() {
     // a list function (`size(collect(x))`), but not nested in arithmetic /
     // comparison where it would silently evaluate to null.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:collect-in-expr").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-collect-in-expr:main").await;
     let db = graphdb_from_ledger(&l);
 
     for q in [
@@ -1272,7 +1272,7 @@ async fn cypher_collect_through_with() {
     // `collect()` projected by a WITH must flow out as a real list to the next
     // stage (it was previously deferred). Alice KNOWS Bob & Carol; Bob KNOWS Carol.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_call_graph(&fluree, "it/cypher:collect-with").await;
+    let l = seed_call_graph(&fluree, "it/cypher-collect-with:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Raw list carried through the WITH boundary.
@@ -1360,7 +1360,7 @@ async fn cypher_aggregate_composed_into_expression() {
     // Aggregates nested in a larger expression (IC3 total, IC10 score, IC14):
     // `count(*) * 2`, `count(n) + 1`, `count(*) + count(*)`.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:agg-expr").await; // 3 Person nodes
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-agg-expr:main").await; // 3 Person nodes
     let db = graphdb_from_ledger(&l);
 
     let doubled = fluree
@@ -1401,7 +1401,7 @@ async fn cypher_aggregate_composed_into_expression() {
 #[tokio::test]
 async fn cypher_aggregate_expression_argument() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:agg-expression-arg").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-agg-expression-arg:main").await;
     let db = graphdb_from_ledger(&l);
 
     let result = fluree
@@ -1417,7 +1417,7 @@ async fn cypher_aggregate_expression_argument() {
 #[tokio::test]
 async fn cypher_xor_expression_filters_rows() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:xor").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-xor:main").await;
     let db = graphdb_from_ledger(&l);
 
     let rows = fluree
@@ -1433,7 +1433,7 @@ async fn cypher_xor_expression_filters_rows() {
 #[tokio::test]
 async fn cypher_modulus_expression_filters_rows() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:modulus").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-modulus:main").await;
     let db = graphdb_from_ledger(&l);
 
     let rows = fluree
@@ -1449,7 +1449,7 @@ async fn cypher_modulus_expression_filters_rows() {
 #[tokio::test]
 async fn cypher_with_star_carries_visible_vars_only() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:with-star").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-with-star:main").await;
     let db = graphdb_from_ledger(&l);
 
     let result = fluree
@@ -1478,7 +1478,7 @@ async fn cypher_with_star_carries_visible_vars_only() {
 #[tokio::test]
 async fn cypher_labels_returns_rdf_type_strings() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:labels-fn");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-labels-fn:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -1531,7 +1531,7 @@ async fn cypher_labels_returns_rdf_type_strings() {
 #[tokio::test]
 async fn cypher_type_returns_named_relationship_type() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:type-fn");
+    let mut l = genesis_ledger(&fluree, "it/cypher-type-fn:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -1562,7 +1562,7 @@ async fn cypher_relationship_value_semantics() {
     // relationship-value surface: type(r), startNode(r)/endNode(r), r.prop, and
     // properties(r).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:rel-value");
+    let l = genesis_ledger(&fluree, "it/cypher-rel-value:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -1599,7 +1599,7 @@ async fn cypher_order_by_property_accessor_grouping_key() {
     // alias) must work under aggregation — it should behave like ORDER BY the
     // alias, not mint a fresh post-grouping sort var.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:order-prop-group").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-order-prop-group:main").await;
     let db = graphdb_from_ledger(&l);
 
     let via_accessor = fluree
@@ -1631,7 +1631,7 @@ async fn transact_cypher_unwind_edge_with_property_batches() {
     // row's reifier is a distinct (per-solution) blank node — so the two edges
     // get distinct `since` values without colliding.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:unwind-edge-props").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-unwind-edge-props:main").await;
 
     let params = json!({
         "pairs": [
@@ -1687,7 +1687,7 @@ async fn transact_cypher_unwind_edge_missing_id_drops_only_that_row() {
     // the batch still commits (the value of the VALUES-join model over a
     // cross-product unroll).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:unwind-edges-missing").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-unwind-edges-missing:main").await;
 
     let params = json!({ "pairs": [{"from": 1, "to": 2}, {"from": 1, "to": 99}] });
     let result = fluree
@@ -1716,7 +1716,7 @@ async fn transact_cypher_unwind_edge_missing_id_drops_only_that_row() {
 async fn transact_cypher_unwind_optional_match_create_rejected() {
     // OPTIONAL MATCH endpoints could be unbound → a partial reifier bundle.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:unwind-optional").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-unwind-optional:main").await;
     let err = fluree
         .transact_cypher_with_params(
             l,
@@ -1733,7 +1733,7 @@ async fn transact_cypher_unwind_optional_match_create_rejected() {
 async fn transact_cypher_unwind_whole_row_value_rejected() {
     // Using the whole map element as a value (not a field) is deferred.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-whole");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-unwind-whole:main").await;
 
     let params = json!({ "batch": [{"name": "Alice"}] });
     let err = fluree
@@ -1751,7 +1751,7 @@ async fn transact_cypher_unwind_whole_row_value_rejected() {
 async fn transact_cypher_set_relationship_property() {
     // Bind a relationship variable in a write MATCH and update its metadata.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:set-rel-prop");
+    let mut l = genesis_ledger(&fluree, "it/cypher-set-rel-prop:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -1802,7 +1802,7 @@ async fn transact_cypher_set_relationship_property() {
 #[tokio::test]
 async fn transact_cypher_bare_delete_removes_relationship_free_node() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:delete-clean");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-delete-clean:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -1841,7 +1841,7 @@ async fn transact_cypher_bare_delete_removes_relationship_free_node() {
 #[tokio::test]
 async fn transact_cypher_bare_delete_errors_when_node_has_relationships() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:delete-guarded");
+    let mut l = genesis_ledger(&fluree, "it/cypher-delete-guarded:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -1870,7 +1870,7 @@ async fn transact_cypher_bare_delete_errors_when_node_has_relationships() {
 #[tokio::test]
 async fn transact_cypher_detach_delete_removes_node_and_both_directions() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:detach-delete");
+    let mut l = genesis_ledger(&fluree, "it/cypher-detach-delete:main").await;
 
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
@@ -1933,7 +1933,7 @@ async fn transact_cypher_detach_delete_works_on_indexed_data() {
     // delete, so the var-predicate scans and the reifier cascade run against
     // indexed flakes (not novelty/overlay).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:detach-delete-indexed";
+    let ledger_id = "it/cypher-detach-delete-indexed:main";
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
         fluree
@@ -1945,7 +1945,7 @@ async fn transact_cypher_detach_delete_works_on_indexed_data() {
 
     local
         .run_until(async move {
-            let mut l = genesis_ledger(&fluree, ledger_id);
+            let mut l = genesis_ledger(&fluree, ledger_id).await;
             let mut last_t = 0;
             for stmt in [
                 r#"CREATE (a:Person {name: "Alice"})"#,
@@ -2005,7 +2005,7 @@ async fn transact_cypher_detach_delete_works_on_indexed_data() {
 /// A mixed-type relationship chain Alice -KNOWS-> Bob -FOLLOWS-> Carol -KNOWS->
 /// Dave, every node a `:Person` with a `name` data property. Returns the ledger.
 async fn untyped_path_chain(fluree: &support::MemoryFluree, name: &str) -> support::MemoryLedger {
-    let l = genesis_ledger(fluree, name);
+    let l = genesis_ledger(fluree, name).await;
     fluree
         .transact_cypher(
             l,
@@ -2040,7 +2040,7 @@ async fn cypher_untyped_path_bounded_follows_mixed_edge_types() {
     // properties (`name`), `rdf:type` (the `:Person` class), and the reifier
     // sidecar are not edges, so they are never traversed.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = untyped_path_chain(&fluree, "it/cypher:untyped-bounded").await;
+    let l = untyped_path_chain(&fluree, "it/cypher-untyped-bounded:main").await;
     let rows = cypher_names(
         &fluree,
         &l,
@@ -2053,7 +2053,7 @@ async fn cypher_untyped_path_bounded_follows_mixed_edge_types() {
 #[tokio::test]
 async fn cypher_untyped_path_unbounded_reaches_whole_chain() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = untyped_path_chain(&fluree, "it/cypher:untyped-unbounded").await;
+    let l = untyped_path_chain(&fluree, "it/cypher-untyped-unbounded:main").await;
     let rows = cypher_names(
         &fluree,
         &l,
@@ -2075,7 +2075,7 @@ async fn cypher_untyped_path_diamond_lower_bound_is_consistent() {
     // doesn't suppress the longer in-range path. Bound-unbound (RETURN x) and
     // bound-bound (RETURN exists) must agree.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:untyped-diamond");
+    let l = genesis_ledger(&fluree, "it/cypher-untyped-diamond:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -2118,7 +2118,7 @@ async fn cypher_untyped_path_unbounded_lower_bound_above_one_is_rejected() {
     // `-[*2..]->` (unbounded, lower bound > 1) can't be evaluated soundly — it
     // must be rejected with a clear error.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:untyped-unbounded-lo");
+    let l = genesis_ledger(&fluree, "it/cypher-untyped-unbounded-lo:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (a:Person {name: "Alice"})"#)
         .await
@@ -2140,7 +2140,7 @@ async fn cypher_untyped_path_revisit_intermediate_bound_bound() {
     // requires revisiting B at depth 2. The bound-bound form (path_exists) must
     // agree with the bound-unbound form: both find D.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:untyped-revisit");
+    let l = genesis_ledger(&fluree, "it/cypher-untyped-revisit:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -2185,7 +2185,7 @@ async fn cypher_untyped_path_revisit_intermediate_bound_bound() {
 #[tokio::test]
 async fn cypher_untyped_path_lower_bound_excludes_near_nodes() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = untyped_path_chain(&fluree, "it/cypher:untyped-lo").await;
+    let l = untyped_path_chain(&fluree, "it/cypher-untyped-lo:main").await;
     // `*2..3` from Alice: Carol (2) and Dave (3), but NOT Bob (1 hop).
     let rows = cypher_names(
         &fluree,
@@ -2202,7 +2202,7 @@ async fn cypher_untyped_path_single_hop_excludes_rdf_type_class() {
     // wildcard scan followed `rdf:type` (a Ref to the `Person` class) it would
     // also surface the class node — proving the reserved-predicate exclusion.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = untyped_path_chain(&fluree, "it/cypher:untyped-1hop").await;
+    let l = untyped_path_chain(&fluree, "it/cypher-untyped-1hop:main").await;
     let db = graphdb_from_ledger(&l);
     let count = fluree
         .query_cypher(
@@ -2219,7 +2219,7 @@ async fn cypher_untyped_path_single_hop_excludes_rdf_type_class() {
 async fn cypher_untyped_path_incoming_direction() {
     // `<-[*1..2]-` into Dave: Carol (1 back) and Bob (2 back), not Alice (3).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = untyped_path_chain(&fluree, "it/cypher:untyped-incoming").await;
+    let l = untyped_path_chain(&fluree, "it/cypher-untyped-incoming:main").await;
     let rows = cypher_names(
         &fluree,
         &l,
@@ -2234,7 +2234,7 @@ async fn cypher_map_literal_projection_renders_native_object() {
     // `RETURN {…}` builds a map value; cypher-json renders it as a native JSON
     // object with bare scalars (not RDF value-objects).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:map-literal");
+    let l = genesis_ledger(&fluree, "it/cypher-map-literal:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice", age: 30})"#)
         .await
@@ -2282,7 +2282,7 @@ async fn cypher_pattern_comprehension() {
     // `[(a)-[:KNOWS]->(b) | b.name]` — a correlated subquery collecting a
     // projection per match, returned as a list per outer row.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:pattern-comp");
+    let l = genesis_ledger(&fluree, "it/cypher-pattern-comp:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -2359,7 +2359,7 @@ async fn cypher_pattern_comprehension_outer_var_and_nested_async() {
     // subquery (EXISTS / a nested pattern comprehension). A chain
     // Alice->Bob->Carol plus a disconnected Zed.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:pattern-comp-outer");
+    let l = genesis_ledger(&fluree, "it/cypher-pattern-comp-outer:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -2453,7 +2453,7 @@ async fn seed_call_graph(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let l = genesis_ledger(fluree, ledger_id);
+    let l = genesis_ledger(fluree, ledger_id).await;
     fluree
         .transact_cypher(
             l,
@@ -2471,7 +2471,7 @@ async fn cypher_call_subquery_uncorrelated_broadcasts() {
     // `CALL { … }` with no scope clause runs once; its single value is broadcast
     // to every outer row.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_call_graph(&fluree, "it/cypher:call-uncorr").await;
+    let l = seed_call_graph(&fluree, "it/cypher-call-uncorr:main").await;
     let db = graphdb_from_ledger(&l);
 
     let cj = fluree
@@ -2499,7 +2499,7 @@ async fn cypher_call_subquery_correlated_aggregate() {
     // inside drops a zero-match import (Carol has no outgoing KNOWS); OPTIONAL
     // MATCH retains it as 0.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_call_graph(&fluree, "it/cypher:call-corr-agg").await;
+    let l = seed_call_graph(&fluree, "it/cypher-call-corr-agg:main").await;
     let db = graphdb_from_ledger(&l);
 
     let cj = fluree
@@ -2541,7 +2541,7 @@ async fn cypher_call_subquery_correlated_aggregate() {
 async fn cypher_call_subquery_correlated_row_expanding() {
     // A correlated CALL with no aggregate expands to one row per inner match.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_call_graph(&fluree, "it/cypher:call-expand").await;
+    let l = seed_call_graph(&fluree, "it/cypher-call-expand:main").await;
     let db = graphdb_from_ledger(&l);
 
     let cj = fluree
@@ -2569,7 +2569,7 @@ async fn cypher_call_subquery_correlated_aggregate_join_mode() {
     // must still produce per-person counts, not a single global count broadcast
     // to every row. 12 people, each knowing exactly the next two (mod 12).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:call-joinmode");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-call-joinmode:main").await;
     let n = 12;
     let people: Vec<JsonValue> = (0..n)
         .map(|i| {
@@ -2618,7 +2618,7 @@ async fn cypher_call_subquery_union() {
     // `CALL { … UNION … }` — branches share a column shape; correlation flows
     // into each branch. Alice KNOWS Bob & Carol; Bob KNOWS Carol.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_call_graph(&fluree, "it/cypher:call-union").await;
+    let l = seed_call_graph(&fluree, "it/cypher-call-union:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Correlated UNION: per person, union two filtered branches.
@@ -2743,7 +2743,7 @@ async fn cypher_call_subquery_union() {
 async fn cypher_call_subquery_import_all() {
     // `CALL (*)` imports the whole visible outer scope.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_call_graph(&fluree, "it/cypher:call-star").await;
+    let l = seed_call_graph(&fluree, "it/cypher-call-star:main").await;
     let db = graphdb_from_ledger(&l);
 
     // (*) behaves like an explicit import of the referenced outer var `p`.
@@ -2813,7 +2813,7 @@ async fn cypher_call_subquery_import_all() {
 async fn cypher_call_subquery_nested() {
     // A nested CALL sees the variables imported by its enclosing CALL.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_call_graph(&fluree, "it/cypher:call-nested").await;
+    let l = seed_call_graph(&fluree, "it/cypher-call-nested:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Nested explicit import: the inner CALL (p) correlates on the outer CALL's
@@ -2888,7 +2888,7 @@ async fn cypher_call_subquery_nested() {
 #[tokio::test]
 async fn cypher_call_subquery_rejections() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_call_graph(&fluree, "it/cypher:call-reject").await;
+    let l = seed_call_graph(&fluree, "it/cypher-call-reject:main").await;
     let db = graphdb_from_ledger(&l);
 
     // A write inside CALL is deferred.
@@ -2971,7 +2971,7 @@ async fn cypher_call_subquery_rejections() {
 #[tokio::test]
 async fn cypher_scalar_functions_extended() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:scalar-ext");
+    let l = genesis_ledger(&fluree, "it/cypher-scalar-ext:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {id: 1})"#)
         .await
@@ -3027,7 +3027,7 @@ async fn cypher_scalar_functions_extended() {
 #[tokio::test]
 async fn cypher_id_function_returns_iri() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:id-fn");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-id-fn:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -3055,7 +3055,7 @@ async fn cypher_id_function_returns_iri() {
 async fn cypher_map_projection() {
     // `n{.key}` selectors, a `key: expr` entry, and `n{.*}` (all properties).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:map-projection");
+    let l = genesis_ledger(&fluree, "it/cypher-map-projection:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice", age: 30})"#)
         .await
@@ -3102,7 +3102,7 @@ async fn cypher_map_projection() {
 #[tokio::test]
 async fn cypher_map_projection_mixed_star_is_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:map-projection-mixed");
+    let l = genesis_ledger(&fluree, "it/cypher-map-projection-mixed:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
         .await
@@ -3121,7 +3121,7 @@ async fn cypher_map_projection_mixed_star_is_rejected() {
 #[tokio::test]
 async fn cypher_list_comprehension_arithmetic_and_filter() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:listcomp");
+    let l = genesis_ledger(&fluree, "it/cypher-listcomp:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
         .await
@@ -3145,7 +3145,7 @@ async fn cypher_list_comprehension_arithmetic_and_filter() {
 #[tokio::test]
 async fn cypher_reduce_folds_a_list() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:reduce");
+    let l = genesis_ledger(&fluree, "it/cypher-reduce:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
         .await
@@ -3166,7 +3166,7 @@ async fn cypher_reduce_folds_a_list() {
 #[tokio::test]
 async fn cypher_list_predicates() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:listpred");
+    let l = genesis_ledger(&fluree, "it/cypher-listpred:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
         .await
@@ -3196,7 +3196,7 @@ async fn cypher_list_predicates() {
 async fn cypher_comprehension_member_access_map_param() {
     // Loop-local member access on a map element ($people is a list of maps).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:listcomp-map");
+    let l = genesis_ledger(&fluree, "it/cypher-listcomp-map:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
         .await
@@ -3229,7 +3229,7 @@ async fn cypher_comprehension_member_access_map_param() {
 async fn cypher_comprehension_member_access_node() {
     // Loop-local member access on a node element (collect → list of nodes).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:listcomp-node");
+    let l = genesis_ledger(&fluree, "it/cypher-listcomp-node:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -3259,7 +3259,7 @@ async fn cypher_comprehension_member_access_node() {
 #[tokio::test]
 async fn cypher_comprehension_null_and_nonlist_input() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:listcomp-null");
+    let l = genesis_ledger(&fluree, "it/cypher-listcomp-null:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
         .await
@@ -3288,7 +3288,7 @@ async fn cypher_scalar_string_and_math_functions() {
     // (math). `rand()` is wired but non-deterministic, so it's exercised in
     // a range check separately.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:scalar-fns");
+    let l = genesis_ledger(&fluree, "it/cypher-scalar-fns:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice", score: 2.4})"#)
         .await
@@ -3320,7 +3320,7 @@ async fn cypher_properties_and_keys() {
     // properties(n) → a map of all data properties; keys(n) → their names. Both
     // exclude the label (rdf:type) and any relationship edges.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:properties");
+    let l = genesis_ledger(&fluree, "it/cypher-properties:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -3372,7 +3372,7 @@ async fn cypher_map_value_reused_and_nested() {
     // round-trip (the `try_eval_to_binding` Map passthrough), and maps nest
     // maps/lists.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:map-nested");
+    let l = genesis_ledger(&fluree, "it/cypher-map-nested:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice", age: 30})"#)
         .await
@@ -3423,7 +3423,7 @@ async fn cypher_properties_preserves_language_and_list_order() {
     // properties(n) must keep a `rdf:langString`'s @language (visible in JSON-LD
     // output) and render an `@list` property in its stored order.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:props-lang");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-props-lang:main").await;
     let txn = json!({
         "@context": ctx(),
         "@id": "alice",
@@ -3458,7 +3458,7 @@ async fn cypher_properties_preserves_language_and_list_order() {
 async fn cypher_object_param_used_as_map_value() {
     // An object `$param` substitutes to a map value usable in a projection.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:map-param");
+    let l = genesis_ledger(&fluree, "it/cypher-map-param:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
         .await
@@ -3490,7 +3490,7 @@ async fn transact_cypher_merge_creates_then_is_a_noop() {
     // MERGE = find-or-create: the first run creates the node, the second run
     // finds the existing one and inserts nothing (single-Txn NOT EXISTS guard).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge");
+    let l = genesis_ledger(&fluree, "it/cypher-merge:main").await;
 
     let l = fluree
         .transact_cypher(l, r#"MERGE (n:Person {name: "Alice"})"#)
@@ -3531,7 +3531,7 @@ async fn transact_cypher_with_computed_alias_carries_into_set() {
     // WITH before a write: a computed projection (`a.birthYear + 30 AS adultAt`)
     // is carried into the SET and actually lands as a stored value.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:with-computed");
+    let l = genesis_ledger(&fluree, "it/cypher-with-computed:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (a:Person {name: "Alice", birthYear: 1990})"#)
         .await
@@ -3567,7 +3567,7 @@ async fn transact_cypher_with_computed_alias_carries_into_set() {
 async fn transact_cypher_with_filter_gates_a_write() {
     // WITH ... WHERE filters which matched rows reach the write.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:with-filter");
+    let l = genesis_ledger(&fluree, "it/cypher-with-filter:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -3611,7 +3611,7 @@ async fn transact_cypher_with_before_delete_is_rejected_not_silent() {
     // `WITH a DELETE r` (r dropped by WITH) must error through the real
     // classifier→lowering path, not silently delete the out-of-scope edge.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:with-delete");
+    let l = genesis_ledger(&fluree, "it/cypher-with-delete:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -3648,7 +3648,7 @@ async fn transact_cypher_merge_relationship_creates_then_is_a_noop() {
     // both endpoints and the edge; the second finds the path and inserts
     // nothing (one NOT EXISTS guard over the whole pattern).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel:main").await;
 
     let stmt = r#"MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#;
     let edge_q = "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name";
@@ -3697,7 +3697,7 @@ async fn transact_cypher_merge_relationship_creates_then_is_a_noop() {
 async fn transact_cypher_merge_relationship_on_create_set_endpoint() {
     // ON CREATE SET targeting an endpoint node var fires only on the create run.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-on-create");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel-on-create:main").await;
 
     let stmt = r#"MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})
                   ON CREATE SET b.note = "fresh""#;
@@ -3721,7 +3721,7 @@ async fn transact_cypher_merge_relationship_bound_endpoints_is_per_row_find_or_c
     // and one existing Alice->Bob edge; then MERGE every Person→Person pair.
     // Existing edges are left alone; only the missing ones are created.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-bound");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel-bound:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -3788,7 +3788,7 @@ async fn transact_cypher_merge_relationship_on_create_set_bound_head() {
     // ON CREATE SET targeting a MATCH-bound endpoint (the head) fires only when
     // the edge is created, and writes onto the existing bound node.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-oncreate-head");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel-oncreate-head:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -3837,7 +3837,7 @@ async fn transact_cypher_merge_relationship_bound_head_new_tail() {
     // Mixed: bound head + a new tail node introduced by the MERGE. Per matched
     // Person, find-or-create a Pet named Rex.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-newtail");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel-newtail:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (a:Person {name: "Alice"})"#)
         .await
@@ -3881,7 +3881,7 @@ async fn transact_cypher_merge_on_match_set_fires_only_on_match() {
     // Conditional write: ON CREATE SET on first (absent) run, ON MATCH SET on
     // the second (present) run.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-on-match");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-on-match:main").await;
 
     let stmt = r#"MERGE (n:Person {name: "Alice"})
                   ON CREATE SET n.origin = "created"
@@ -3945,7 +3945,7 @@ async fn transact_cypher_merge_trailing_set_applies_on_both_branches() {
     // The upsert idiom: `MERGE (n {key}) SET …` — the SET runs after the
     // MERGE on the create AND the match branch.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-trailing-set");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-trailing-set:main").await;
 
     // First run: node absent → created, trailing SET applies.
     let l = fluree
@@ -4004,7 +4004,7 @@ async fn transact_cypher_merge_trailing_set_applies_on_both_branches() {
 async fn transact_cypher_merge_on_create_and_trailing_set_combine() {
     // ON CREATE SET fires only on create; the trailing SET fires on both runs.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-oncreate-trailing");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-oncreate-trailing:main").await;
 
     let l = fluree
         .transact_cypher(
@@ -4055,7 +4055,7 @@ async fn transact_cypher_merge_on_create_and_trailing_set_combine() {
 async fn transact_cypher_merge_trailing_set_map_merge_with_params() {
     // The canonical ETL statement: MERGE (n {key: $k}) SET n += $props.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-set-map");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-set-map:main").await;
 
     let params = json!({ "id": 42, "props": { "name": "Eve", "age": 30 } });
     let l = fluree
@@ -4118,7 +4118,7 @@ async fn transact_cypher_match_set_map_merge_param() {
     // `SET n += $map` after a plain MATCH (the same whole-map param the MERGE
     // upsert uses, through the ordinary MATCH … SET lowering).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:match-set-map-param");
+    let l = genesis_ledger(&fluree, "it/cypher-match-set-map-param:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (n:User {id: 7, name: "Ann"})"#)
         .await
@@ -4153,7 +4153,7 @@ async fn transact_cypher_match_set_map_merge_param() {
 #[tokio::test]
 async fn transact_cypher_merge_on_create_set_fires_only_on_create() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-on-create");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-on-create:main").await;
 
     // Create Bob with role=admin via ON CREATE SET.
     let l = fluree
@@ -4210,7 +4210,7 @@ async fn transact_cypher_merge_relationship_with_properties_is_per_value() {
     // `MERGE (a)-[:T {p: v}]->(b)` matches only an edge whose annotation
     // carries those values; a different value creates a parallel edge.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-props");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel-props:main").await;
 
     let l = fluree
         .transact_cypher(l, r#"CREATE (:City {name: "X"}), (:Country {name: "Y"})"#)
@@ -4282,7 +4282,7 @@ async fn transact_cypher_merge_relationship_on_match_set_updates_annotation() {
     // a conditional write: first run creates (ON CREATE fires on the rel
     // var), second run updates the annotation property.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-on-match");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel-on-match:main").await;
 
     let stmt = r#"MERGE (a:City {name: "X"})-[r:IN]->(b:Country {name: "Y"})
                   ON CREATE SET r.checks = 1
@@ -4332,7 +4332,7 @@ async fn transact_cypher_merge_relationship_on_match_set_updates_annotation() {
 #[tokio::test]
 async fn transact_cypher_merge_relationship_trailing_set_applies_on_both_branches() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-trailing");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel-trailing:main").await;
 
     let stmt =
         |year: i64| format!(r#"MERGE (a:U {{id: 1}})-[r:F]->(b:U {{id: 2}}) SET r.at = {year}"#);
@@ -4384,7 +4384,7 @@ async fn transact_cypher_script_executes_statements_sequentially() {
     // earlier ones' effects (the MATCH in statement 3 binds nodes created by
     // statements 1–2).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:script");
+    let l = genesis_ledger(&fluree, "it/cypher-script:main").await;
     let t0 = l.t();
 
     let script = r#"
@@ -4423,7 +4423,7 @@ async fn transact_cypher_accepts_trailing_semicolon() {
     // A single statement terminated with `;` (the cypher-shell habit) is one
     // statement, not a rejected multi-statement script.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:trailing-semi");
+    let l = genesis_ledger(&fluree, "it/cypher-trailing-semi:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (:Person {name: "Ada"});"#)
         .await
@@ -4443,7 +4443,7 @@ async fn transact_cypher_accepts_trailing_semicolon() {
 #[tokio::test]
 async fn transact_cypher_script_return_on_last_statement_only() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:script-return");
+    let l = genesis_ledger(&fluree, "it/cypher-script-return:main").await;
 
     // RETURN on the final statement answers rows.
     let (result, rows) = fluree
@@ -4476,7 +4476,7 @@ async fn transact_cypher_delete_relationship_removes_edge() {
     // `DELETE r` retracts the relationship's base edge; the reifier cascade
     // clears the bundle. The endpoint nodes survive.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:delete-rel");
+    let mut l = genesis_ledger(&fluree, "it/cypher-delete-rel:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -4529,7 +4529,7 @@ async fn transact_cypher_delete_relationship_rejects_parallel_edges() {
     // triple. Deleting one by retracting the base edge would disturb the
     // other, so `DELETE r` must reject when parallel siblings exist.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:delete-rel-parallel");
+    let mut l = genesis_ledger(&fluree, "it/cypher-delete-rel-parallel:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -4562,7 +4562,7 @@ async fn transact_cypher_delete_relationship_requires_named_endpoints() {
     // `DELETE r` needs both endpoints named so the parallel-edge probe can
     // group by them. An anonymous endpoint is rejected.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:delete-rel-anon");
+    let mut l = genesis_ledger(&fluree, "it/cypher-delete-rel-anon:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -4584,7 +4584,7 @@ async fn transact_cypher_write_rejects_duplicate_relationship_variable() {
     // would make the parallel-edge probe (first occurrence) and the delete
     // lowering (last occurrence) disagree, so the write MATCH rejects it.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:dup-rel-var");
+    let mut l = genesis_ledger(&fluree, "it/cypher-dup-rel-var:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -4608,7 +4608,7 @@ async fn transact_cypher_bare_delete_rejects_optional_only_target() {
     // can be unbound on some rows, where the relationship probe would bind an
     // unrelated node and false-trigger the guard.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:delete-optional");
+    let mut l = genesis_ledger(&fluree, "it/cypher-delete-optional:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -4631,7 +4631,7 @@ async fn seed_knows_chain(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -4653,7 +4653,7 @@ async fn seed_knows_chain(
 #[tokio::test]
 async fn cypher_collect_gathers_values_into_list() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:collect");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-collect:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -4701,7 +4701,7 @@ async fn cypher_collect_empty_input_returns_empty_list() {
     // Cypher: an implicit aggregation over zero matched rows still yields one
     // row; collect() of nothing is the empty list `[]`.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:collect-empty").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-collect-empty:main").await;
     let db = graphdb_from_ledger(&l);
 
     for q in [
@@ -4726,7 +4726,7 @@ async fn cypher_collect_empty_input_returns_empty_list() {
 #[tokio::test]
 async fn cypher_order_by_collect_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:order-collect").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-order-collect:main").await;
     let db = graphdb_from_ledger(&l);
 
     for q in [
@@ -4745,7 +4745,7 @@ async fn cypher_order_by_collect_rejected() {
 async fn cypher_with_collect_carries_list() {
     // collect() projected by WITH now flows out as a real list (was deferred).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:with-collect").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-with-collect:main").await;
     let db = graphdb_from_ledger(&l);
 
     let cj = fluree
@@ -4769,7 +4769,7 @@ async fn cypher_with_collect_carries_list() {
 async fn cypher_collect_distinct_dedupes() {
     // Two friends share the name "Bob"; collect(DISTINCT) keeps one.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:collect-distinct");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-collect-distinct:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -4826,7 +4826,7 @@ async fn cypher_undirected_relationship_matches_both_orientations() {
     // `-[:KNOWS]-` from Bob finds Alice (reverse: Alice KNOWS Bob, via Opst)
     // and Carol (forward: Bob KNOWS Carol).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:undirected").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-undirected:main").await;
     let db = graphdb_from_ledger(&l);
 
     let rows = fluree
@@ -4846,7 +4846,7 @@ async fn cypher_undirected_relationship_matches_both_orientations() {
 #[tokio::test]
 async fn cypher_var_length_bounded_directed() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:varlen-bounded").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-varlen-bounded:main").await;
     let db = graphdb_from_ledger(&l);
 
     // *1..2 from Alice → Bob (1 hop), Carol (2 hops).
@@ -4881,7 +4881,7 @@ async fn cypher_var_length_unregistered_namespace_returns_no_rows() {
     // unbounded path must then yield zero rows, not a query error — matching
     // how the bounded (string-IRI) path and absent labels behave.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "it/cypher:varlen-unregistered");
+    let ledger = genesis_ledger(&fluree, "it/cypher-varlen-unregistered:main").await;
     let db = graphdb_from_ledger(&ledger);
 
     for path in ["*", "*0..", "*1..3", "*2"] {
@@ -4901,7 +4901,7 @@ async fn cypher_var_length_relationship_uniqueness_no_self_rows() {
     // Bounded var-length on a cyclic/undirected graph must not return spurious
     // self-rows from edge reuse (`a-b-a`). Graph: a(1)-knows-b(2)-knows-c(3).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-uniq");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-varlen-uniq:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -4947,7 +4947,7 @@ async fn cypher_enumerate_path_relationship_uniqueness_traverses_cycle() {
     // revisited — which node-distinctness would wrongly drop. An unbounded typed
     // path binding (`p = (a)-[:R*]->(x)`) routes through Enumerate mode.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:enum-relunique");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-enum-relunique:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -4996,7 +4996,7 @@ async fn cypher_enumerate_path_relationship_uniqueness_traverses_cycle() {
 #[tokio::test]
 async fn cypher_var_length_exact_hops() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:varlen-exact").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-varlen-exact:main").await;
     let db = graphdb_from_ledger(&l);
 
     // *2 from Alice → exactly Carol.
@@ -5013,7 +5013,7 @@ async fn cypher_var_length_exact_hops() {
 #[tokio::test]
 async fn cypher_var_length_unbounded_transitive() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:varlen-unbounded").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-varlen-unbounded:main").await;
     let db = graphdb_from_ledger(&l);
 
     // `*` = one-or-more (PropertyPath OneOrMore) from Alice → Bob, Carol, Dave.
@@ -5051,7 +5051,7 @@ async fn cypher_path_enumeration_vs_reachability() {
     // Bounded var-length ENUMERATES paths (2 rows); unbounded is REACHABILITY
     // (D reached once → 1 row). Documents the current semantic boundary.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:path-enum");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-path-enum:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -5102,7 +5102,7 @@ async fn cypher_path_enumeration_vs_reachability() {
 #[tokio::test]
 async fn cypher_shortest_path_length_directed() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:sp-directed").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-sp-directed:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Alice -> Bob -> Carol -> Dave; directed shortestPath Alice→Dave = 3 hops.
@@ -5129,7 +5129,7 @@ async fn cypher_shortest_path_node_predicate_pushed_into_search() {
     // minor); the shortest ALL-ADULT path is 3 hops a→carol→dave→z. A
     // post-filter would find a→bob→z, reject it, and wrongly return empty.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:sp-node-pred");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-sp-node-pred:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -5213,8 +5213,8 @@ async fn cypher_shortest_path_batched_lane_respects_novelty() {
     // novelty shortcut edges shorten the path, novelty retracts of base
     // edges break it, and novelty-only endpoints join the search.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:sp-novelty";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger_id = "it/cypher-sp-novelty:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -5364,7 +5364,7 @@ async fn cypher_relationships_of_path() {
     // relationships(p) yields one relationship value per hop; type/startNode/
     // endNode work off each. Alice -> Bob -> Carol -> Dave.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:rels-of-path").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-rels-of-path:main").await;
     let db = graphdb_from_ledger(&l);
 
     let cj = fluree
@@ -5396,7 +5396,7 @@ async fn cypher_relationships_incoming_direction() {
     // order. For an incoming path `(b)<-[:KNOWS]-(a)` the edge is a→b, so the
     // relationship's startNode is `a` even though `b` is the path's first node.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:rels-incoming").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-rels-incoming:main").await;
     let db = graphdb_from_ledger(&l);
 
     let cj = fluree
@@ -5424,7 +5424,7 @@ async fn cypher_var_length_rel_and_path_binding() {
     // Bounded var-length: bind a relationship variable as a rel list and a path
     // variable. Alice -> Bob -> Carol -> Dave.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:varlen-bind").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-varlen-bind:main").await;
     let db = graphdb_from_ledger(&l);
 
     // `-[r:KNOWS*1..2]->` binds r to the list of relationships on each match.
@@ -5488,7 +5488,7 @@ async fn cypher_shortest_path_untyped_wildcard() {
     // relationship type, skipping rdf:type and data properties. The chain
     // mixes KNOWS and LIKES edges, so a single-type search can't reach Dave.
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut l = genesis_ledger(&fluree, "it/cypher:sp-untyped");
+    let mut l = genesis_ledger(&fluree, "it/cypher-sp-untyped:main").await;
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
@@ -5560,7 +5560,7 @@ async fn cypher_shortest_path_untyped_skips_type_and_data_edges() {
     // The wildcard edge-set must not treat rdf:type or a data property as a
     // hop: two nodes sharing only a class have no path.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:sp-untyped-edge-set");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-sp-untyped-edge-set:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -5595,7 +5595,7 @@ async fn cypher_shortest_path_untyped_skips_type_and_data_edges() {
 #[tokio::test]
 async fn cypher_shortest_path_length_undirected() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:sp-undirected").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-sp-undirected:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Undirected search from the middle reaches Alice in 1 hop (Bob<-Alice).
@@ -5617,7 +5617,7 @@ async fn cypher_shortest_path_length_undirected() {
 #[tokio::test]
 async fn cypher_shortest_path_no_path_drops_row() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:sp-nopath").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-sp-nopath:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Directed Dave→Alice has no path (chain is one-way). Mandatory MATCH
@@ -5643,7 +5643,7 @@ async fn cypher_path_enumeration_unbounded_free_end() {
     // `p = (a)-[:T*]->(b)` with b unbound: one row per trail (relationship-unique).
     // Chain Alice→Bob→Carol→Dave gives paths of length 1, 2, 3 from Alice.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:enum-free").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-enum-free:main").await;
     let db = graphdb_from_ledger(&l);
 
     let out = fluree
@@ -5668,7 +5668,7 @@ async fn cypher_path_enumeration_unbounded_free_end() {
 async fn cypher_path_enumeration_bound_end_filters() {
     // A bound end keeps only paths ending there; a diamond yields both.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:enum-diamond");
+    let l = genesis_ledger(&fluree, "it/cypher-enum-diamond:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -5705,7 +5705,7 @@ async fn cypher_path_enumeration_bound_end_filters() {
 async fn cypher_rel_var_binding_on_unbounded_path() {
     // `-[r:T*]->` binds the relationship list per enumerated path.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:enum-relvar").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-enum-relvar:main").await;
     let db = graphdb_from_ledger(&l);
 
     let out = fluree
@@ -5733,7 +5733,7 @@ async fn cypher_rel_var_binding_on_unbounded_path() {
 #[tokio::test]
 async fn cypher_path_enumeration_untyped_and_fixed_hop() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:enum-untyped").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-enum-untyped:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Untyped wildcard with a path binding.
@@ -5773,7 +5773,7 @@ async fn cypher_path_enumeration_untyped_and_fixed_hop() {
 #[tokio::test]
 async fn cypher_path_enumeration_zero_length_and_cycles() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:enum-zero-cycle");
+    let l = genesis_ledger(&fluree, "it/cypher-enum-zero-cycle:main").await;
     // A→B and B→A: a 2-cycle.
     let l = fluree
         .transact_cypher(
@@ -5830,7 +5830,7 @@ async fn cypher_path_enumeration_zero_length_and_cycles() {
 async fn cypher_path_enumeration_undirected_binding() {
     // Undirected var-length with a binding routes through enumeration.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:enum-undirected").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-enum-undirected:main").await;
     let db = graphdb_from_ledger(&l);
 
     let out = fluree
@@ -5856,7 +5856,7 @@ async fn cypher_multi_hop_fixed_path_value() {
     // `p = (a)-[:T]->(b)-[:T]->(c)` — a multi-hop fixed chain builds the
     // path value from interleaved nodes and per-hop relationship values.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:multi-hop-path").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-multi-hop-path:main").await;
     let db = graphdb_from_ledger(&l);
 
     let out = fluree
@@ -5910,7 +5910,7 @@ async fn cypher_var_length_property_filter_on_bounded_range() {
     // `-[:T*1..2 {p: v}]->` matches per hop on the edge annotation values.
     // A -[w:1]-> B -[w:1]-> C, plus A -[w:2]-> C directly.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:varlen-props");
+    let l = genesis_ledger(&fluree, "it/cypher-varlen-props:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -5957,7 +5957,7 @@ async fn cypher_var_length_property_filter_on_bounded_range() {
 #[tokio::test]
 async fn cypher_shortest_path_optional_null_for_missing() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_knows_chain(&fluree, "it/cypher:sp-optional").await;
+    let l = seed_knows_chain(&fluree, "it/cypher-sp-optional:main").await;
     let db = graphdb_from_ledger(&l);
 
     // IC13 shape: OPTIONAL MATCH keeps the row with a null path when no path
@@ -5980,7 +5980,7 @@ async fn cypher_shortest_path_optional_null_for_missing() {
 #[tokio::test]
 async fn cypher_all_shortest_paths_returns_each_minimal_path() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:all-sp");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-all-sp:main").await;
     // Diamond: a→b→d and a→c→d are two distinct 2-hop shortest paths a..d.
     let l = fluree
         .insert(
@@ -6031,7 +6031,7 @@ async fn cypher_all_shortest_paths_honors_lower_hop_bound() {
     // length-1 path is excluded, so the shortest qualifying length is 2 — the
     // distance-finalizing BFS would otherwise stop at the hidden length-1 path.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:sp-minhops");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-sp-minhops:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -6071,7 +6071,7 @@ async fn cypher_all_shortest_paths_honors_lower_hop_bound() {
 async fn cypher_shortest_path_single_honors_lower_hop_bound() {
     // Single shortestPath with `*2..` must also skip the length-1 shortcut.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:sp-single-minhops");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-sp-single-minhops:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -6114,7 +6114,7 @@ async fn seed_exists_graph(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -6137,7 +6137,7 @@ async fn seed_exists_graph(
 #[tokio::test]
 async fn cypher_exists_bare_pattern_form() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_exists_graph(&fluree, "it/cypher:exists-bare").await;
+    let l = seed_exists_graph(&fluree, "it/cypher-exists-bare:main").await;
     let db = graphdb_from_ledger(&l);
 
     let out = fluree
@@ -6156,7 +6156,7 @@ async fn cypher_exists_bare_pattern_form() {
 #[tokio::test]
 async fn cypher_exists_subquery_match_form() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_exists_graph(&fluree, "it/cypher:exists-match").await;
+    let l = seed_exists_graph(&fluree, "it/cypher-exists-match:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Subquery form with an explicit MATCH but no inner WHERE.
@@ -6176,7 +6176,7 @@ async fn cypher_exists_subquery_match_form() {
 #[tokio::test]
 async fn cypher_exists_subquery_inner_where() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_exists_graph(&fluree, "it/cypher:exists-inner-where").await;
+    let l = seed_exists_graph(&fluree, "it/cypher-exists-inner-where:main").await;
     let db = graphdb_from_ledger(&l);
 
     // The IC4 shape: subquery form with an inner WHERE. Person 1 KNOWS 3 and 4
@@ -6203,7 +6203,7 @@ async fn cypher_exists_subquery_inner_where() {
 #[tokio::test]
 async fn cypher_exists_inner_where_excludes_when_unmet() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_exists_graph(&fluree, "it/cypher:exists-inner-where-neg").await;
+    let l = seed_exists_graph(&fluree, "it/cypher-exists-inner-where-neg:main").await;
     let db = graphdb_from_ledger(&l);
 
     // No friend with id > 100, so the filtered existence test fails and the
@@ -6223,7 +6223,7 @@ async fn cypher_exists_inner_where_excludes_when_unmet() {
 #[tokio::test]
 async fn cypher_not_exists_subquery_inner_where() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_exists_graph(&fluree, "it/cypher:not-exists-inner-where").await;
+    let l = seed_exists_graph(&fluree, "it/cypher-not-exists-inner-where:main").await;
     let db = graphdb_from_ledger(&l);
 
     // NOT EXISTS with an inner WHERE: person 1 has no friend with id > 100,
@@ -6253,7 +6253,7 @@ async fn cypher_exists_in_map_projection_computed_entry() {
     // resolved per row (not fall through to a synchronous `false`). Person 1
     // KNOWS others → true; persons 2/3/4 have no outgoing KNOWS → false.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_exists_graph(&fluree, "it/cypher:exists-in-map").await;
+    let l = seed_exists_graph(&fluree, "it/cypher-exists-in-map:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Map projection: `p{id: ..., hasFriends: EXISTS { ... }}`.
@@ -6304,7 +6304,7 @@ async fn cypher_create_list_valued_property_stores_each_element() {
     // IU1 (AddPerson) shape: a node with a list-valued literal property
     // (email[]) becomes a multi-valued RDF predicate — one flake per element.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:list-prop");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-list-prop:main").await;
     let committed = fluree
         .transact_cypher(
             ledger0,
@@ -6342,7 +6342,7 @@ async fn cypher_create_list_valued_property_stores_each_element() {
 async fn cypher_create_empty_list_property_stores_nothing() {
     // An empty list property stores no flake (like a null).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:empty-list-prop");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-empty-list-prop:main").await;
     let committed = fluree
         .transact_cypher(
             ledger0,
@@ -6374,7 +6374,7 @@ async fn cypher_iu8_friendship_with_edge_property() {
     // IU8 (AddFriendship): MATCH two persons, CREATE a KNOWS edge carrying a
     // creationDate property; read the edge property back.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:iu8").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-iu8:main").await;
     let committed = fluree
         .transact_cypher(
             l,
@@ -6407,7 +6407,7 @@ async fn cypher_iu1_inline_relationship_with_edge_property() {
     // IU1 (AddPerson) shape: a single CREATE joining new nodes with a typed
     // relationship that carries a property (studyAt classYear).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:iu1-inline-edge");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-iu1-inline-edge:main").await;
     let committed = fluree
         .transact_cypher(
             ledger0,
@@ -6435,7 +6435,7 @@ async fn cypher_multi_clause_create_builds_node_then_edges() {
     // IU1 builds a node then links it; verify multiple CREATE clauses in one
     // statement compose (node, node, then the relationship between them).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:multi-create");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-multi-create:main").await;
     let committed = fluree
         .transact_cypher(
             ledger0,
@@ -6467,7 +6467,7 @@ async fn cypher_unwind_batch_list_valued_field() {
     // is itself a JSON array (email[]). The node unroller must accept it and
     // store one flake per element.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-list-field");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-unwind-list-field:main").await;
     let params = json!({
         "people": [
             {"id": 1, "email": ["a@x.com", "b@y.com"]},
@@ -6511,7 +6511,7 @@ async fn cypher_unwind_batch_list_valued_field() {
 async fn cypher_set_list_valued_property_replaces() {
     // SET n.prop = [...] replaces the multi-valued predicate.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-list");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-set-list:main").await;
     let l = fluree
         .transact_cypher(
             ledger0,
@@ -6556,7 +6556,7 @@ async fn cypher_set_list_valued_property_replaces() {
 async fn cypher_set_plus_equals_list_valued_property() {
     // SET n += {prop: [...]} also stores a multi-valued predicate.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:setpluseq-list");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-setpluseq-list:main").await;
     let l = fluree
         .transact_cypher(ledger0, r#"CREATE (n:Person {id: 1, name: "Alice"})"#)
         .await
@@ -6599,7 +6599,7 @@ async fn cypher_merge_on_create_set_list_valued_property() {
     // MERGE ... ON CREATE SET n.prop = [...] stores a multi-valued predicate
     // when the node is created.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:merge-oncreate-list");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-merge-oncreate-list:main").await;
     let committed = fluree
         .transact_cypher(
             ledger0,
@@ -6637,7 +6637,7 @@ async fn seed_alice_friends(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -6672,7 +6672,7 @@ async fn cypher_size_of_collect() {
     let fluree = FlureeBuilder::memory().build_memory();
     let v = list_fn_value(
         &fluree,
-        "it/cypher:size-collect",
+        "it/cypher-size-collect:main",
         r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN size(collect(f.name)) AS v"#,
     )
     .await;
@@ -6684,7 +6684,7 @@ async fn cypher_head_and_last_of_collect() {
     let fluree = FlureeBuilder::memory().build_memory();
     let h = list_fn_value(
         &fluree,
-        "it/cypher:head-collect",
+        "it/cypher-head-collect:main",
         r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN head(collect(f.name)) AS v"#,
     )
     .await;
@@ -6692,7 +6692,7 @@ async fn cypher_head_and_last_of_collect() {
 
     let last = list_fn_value(
         &fluree,
-        "it/cypher:last-collect",
+        "it/cypher-last-collect:main",
         r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN last(collect(f.name)) AS v"#,
     )
     .await;
@@ -6704,7 +6704,7 @@ async fn cypher_reverse_and_tail_of_collect() {
     let fluree = FlureeBuilder::memory().build_memory();
     let rev = list_fn_value(
         &fluree,
-        "it/cypher:reverse-collect",
+        "it/cypher-reverse-collect:main",
         r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN reverse(collect(f.name)) AS v"#,
     )
     .await;
@@ -6712,7 +6712,7 @@ async fn cypher_reverse_and_tail_of_collect() {
 
     let tail = list_fn_value(
         &fluree,
-        "it/cypher:tail-collect",
+        "it/cypher-tail-collect:main",
         r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN tail(collect(f.name)) AS v"#,
     )
     .await;
@@ -6725,7 +6725,7 @@ async fn cypher_size_of_string() {
     let fluree = FlureeBuilder::memory().build_memory();
     let v = list_fn_value(
         &fluree,
-        "it/cypher:size-string",
+        "it/cypher-size-string:main",
         r#"MATCH (a:Person {name:"Alice"}) RETURN size(a.name) AS v"#,
     )
     .await;
@@ -6735,7 +6735,7 @@ async fn cypher_size_of_string() {
 #[tokio::test]
 async fn cypher_list_literal_expression() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:list-literal").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-list-literal:main").await;
     let db = graphdb_from_ledger(&l);
 
     // A list literal mixing a node id and name.
@@ -6770,7 +6770,7 @@ async fn cypher_list_literal_expression() {
 async fn cypher_structured_collect_of_tuples() {
     // IC1's collect tier: collecting per-row tuples into a list of lists.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:struct-collect").await; // ids 1,2,3
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-struct-collect:main").await; // ids 1,2,3
     let db = graphdb_from_ledger(&l);
 
     let pairs = fluree
@@ -6794,7 +6794,7 @@ async fn cypher_structured_collect_of_tuples() {
 async fn cypher_size_of_structured_collect() {
     // List functions compose over a structured collect.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:size-struct-collect").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-size-struct-collect:main").await;
     let db = graphdb_from_ledger(&l);
 
     let n = fluree
@@ -6816,7 +6816,7 @@ async fn seed_ic1_chain(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -6839,7 +6839,7 @@ async fn cypher_ic1_distance_ranking() {
     // KNOWS distance within 1..3 hops via length(shortestPath(...)). Eve (4
     // hops) is excluded; ordered by distance.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_ic1_chain(&fluree, "it/cypher:ic1-distance").await;
+    let l = seed_ic1_chain(&fluree, "it/cypher-ic1-distance:main").await;
     let db = graphdb_from_ledger(&l);
 
     let out = fluree
@@ -6868,7 +6868,7 @@ async fn cypher_ic1_distance_ranking() {
 async fn cypher_order_by_expression_key() {
     // ORDER BY a general expression key (IC1's `toInteger(id)` tiebreaker).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:order-expr");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-order-expr:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -6910,7 +6910,7 @@ async fn cypher_order_by_expression_key() {
 #[tokio::test]
 async fn cypher_nodes_of_path_and_range() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_ic1_chain(&fluree, "it/cypher:nodes-range").await; // Alice→Bob→Carol→Dave→Eve
+    let l = seed_ic1_chain(&fluree, "it/cypher-nodes-range:main").await; // Alice→Bob→Carol→Dave→Eve
     let db = graphdb_from_ledger(&l);
 
     // nodes(path) returns the node sequence (as IRIs); a 3-hop path has 4 nodes.
@@ -6976,7 +6976,7 @@ async fn cypher_ic14_connection_paths_via_all_shortest() {
     // IC14 core: every shortest connection path between two persons, returned
     // as its node sequence. Diamond graph A→B→D and A→C→D → two 2-hop paths.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-paths");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-ic14-paths:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -7019,7 +7019,7 @@ async fn cypher_unwind_runtime_list() {
     // UNWIND a runtime list expression (not a literal/param list) fans each
     // input row out over the elements.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_ic1_chain(&fluree, "it/cypher:unwind-runtime").await;
+    let l = seed_ic1_chain(&fluree, "it/cypher-unwind-runtime:main").await;
     let db = graphdb_from_ledger(&l);
 
     // UNWIND range(1,3).
@@ -7069,7 +7069,7 @@ async fn cypher_alternation_transitive_path() {
     // transitive path. The closure follows HAS_TYPE once, then IS_SUBCLASS_OF up
     // the class hierarchy. tagA -HAS_TYPE-> tc1 -IS_SUBCLASS_OF-> tc2 -> tcRoot.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:alt-transitive");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-alt-transitive:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -7128,7 +7128,7 @@ async fn cypher_path_pairs_and_list_indexing() {
     // pathPairs(p) explodes a path into consecutive node pairs; pair[0]/pair[1]
     // index each two-element pair. The building block for IC14 per-edge weight.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_ic1_chain(&fluree, "it/cypher:path-pairs").await; // Alice→Bob→Carol→Dave→Eve
+    let l = seed_ic1_chain(&fluree, "it/cypher-path-pairs:main").await; // Alice→Bob→Carol→Dave→Eve
     let db = graphdb_from_ledger(&l);
 
     // Alice→Bob→Carol→Dave = 3 edges → 3 pairs; index endpoints as IRIs.
@@ -7215,7 +7215,7 @@ async fn cypher_ic14_weighted_paths() {
     //   pair (A,B): 2 msgs   pair (B,D): 1 msg   → path A→B→D weight 3
     //   pair (A,C): 0 msgs   pair (C,D): 5 msgs  → path A→C→D weight 5
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-weight");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-ic14-weight:main").await;
     let mut graph = vec![
         json!({"@id":"a","@type":"Person","name":"A","KNOWS":[{"@id":"b"},{"@id":"c"}]}),
         json!({"@id":"b","@type":"Person","name":"B","KNOWS":{"@id":"d"}}),
@@ -7311,7 +7311,7 @@ async fn cypher_ic14_faithful_ldbc_weight() {
     //   (p2,p3): two of p3's Comments reply to p2's Posts           → 2.0
     //     path p0-p2-p3 weight = 2.0
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-faithful");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-ic14-faithful:main").await;
     let person = |id: &str, knows: JsonValue| json!({"@id": format!("{id}"), "@type":"Person", "pid": id, "KNOWS": knows});
     // Comment `c` by `creator` replying to message `target`.
     let comment = |c: &str, creator: &str, target: &str| {
@@ -7388,7 +7388,7 @@ async fn cypher_ic14_equal_weight_paths_stay_separate() {
     // a distinct-weight fixture (cypher_ic14_faithful_ldbc_weight) can't catch
     // the fusion because the weights already separate the rows.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-equal-weight");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-ic14-equal-weight:main").await;
     let person = |id: &str, knows: JsonValue| json!({"@id": format!("{id}"), "@type":"Person", "pid": id, "KNOWS": knows});
     let comment = |c: &str, creator: &str, target: &str| {
         json!({"@id": format!("{c}"), "@type":"Comment",
@@ -7470,7 +7470,7 @@ async fn cypher_ic14_paths_as_name_lists() {
     // returned as a list of the persons' names — `UNWIND nodes(p)` + per-path
     // `collect`, grouped by the path. Diamond A→B→D / A→C→D → two paths.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-name-lists");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-ic14-name-lists:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -7527,7 +7527,7 @@ async fn cypher_ic14_paths_as_name_lists() {
 async fn cypher_unwind_single_path_collect() {
     // A single shortest path collected into one name list (implicit aggregation).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_ic1_chain(&fluree, "it/cypher:unwind-single").await;
+    let l = seed_ic1_chain(&fluree, "it/cypher-unwind-single:main").await;
     let db = graphdb_from_ledger(&l);
 
     let out = fluree
@@ -7556,7 +7556,7 @@ async fn cypher_var_length_relationship_uniqueness_allows_cycle_closure() {
     // edge, so relationship-uniqueness allows it (Neo4j parity) — node-
     // uniqueness wrongly excluded it (revisits node A).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:triangle");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-triangle:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -7613,7 +7613,7 @@ async fn cypher_with_limit_then_match_truncates_and_drives_downstream() {
     // consumer — so the MATCH ran first as an unseeded scan: empty results, or an
     // ignored limit. The fix restricts correlation inputs to PRECEDING siblings.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:with-limit-match");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-with-limit-match:main").await;
 
     // hub KNOWS m1,m2,m3 ; each mN KNOWS exactly one xN.
     let txn = json!({
@@ -7698,7 +7698,7 @@ async fn cypher_var_length_then_with_distinct_multivar_drives_downstream() {
     // consumer and collapsing the consumer's bindings. The fix defers a consumer
     // of an uncorrelated subquery's output vars until after the subquery.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic6-var-length-with");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-ic6-var-length-with:main").await;
 
     // hub(0) reaches friend(100) via 3 KNOWS*1..2 paths (direct + via 1 + via 2).
     // friend authored 4 posts, each tagged Knot AND DavidFoster.
@@ -7756,7 +7756,7 @@ async fn cypher_power_binds_tighter_than_unary_minus() {
     // accepts a sign (`2 ^ -3` = 0.125), and `^` is right-associative
     // (`-2 ^ 2 ^ 2` = -(2^(2^2)) = -16).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_nodes_with_ids(&fluree, "it/cypher:power-precedence").await;
+    let l = seed_nodes_with_ids(&fluree, "it/cypher-power-precedence:main").await;
     let db = graphdb_from_ledger(&l);
 
     for (expr, want) in [("-2 ^ 2", -4.0), ("2 ^ -3", 0.125), ("-2 ^ 2 ^ 2", -16.0)] {
@@ -7781,7 +7781,7 @@ async fn cypher_power_binds_tighter_than_unary_minus() {
 #[tokio::test]
 async fn cypher_explain_reports_sid_encoded_plan() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:explain");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-explain:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -7824,7 +7824,7 @@ async fn cypher_explain_reports_sid_encoded_plan() {
 #[tokio::test]
 async fn cypher_explain_substitutes_params_like_execution() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:explain-params");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-explain-params:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -7870,7 +7870,7 @@ async fn cypher_with_where_property_equality_folds_to_seek() {
     // optional-filter fold must turn it into a required triple (seek) without
     // changing rows — including multi-valued properties and absent properties.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:with-where-fold");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-with-where-fold:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -7923,7 +7923,7 @@ async fn cypher_with_where_property_equality_folds_to_seek() {
 async fn cypher_anonymous_hop_chain_fuses_to_reachability_under_distinct() {
     // Diamond + tail: a→b1→c, a→b2→c, c→d. Two 2-hop walks reach c.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:chain-fusion");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-chain-fusion:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -8010,8 +8010,8 @@ async fn cypher_anonymous_hop_chain_fuses_to_reachability_under_distinct() {
 #[tokio::test]
 async fn cypher_class_anchored_histogram_and_scalars_match_pipeline() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:class-agg";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger_id = "it/cypher-class-agg:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let committed = fluree
         .insert(
             ledger0,
@@ -8086,8 +8086,8 @@ async fn cypher_class_anchored_histogram_and_scalars_match_pipeline() {
 #[tokio::test]
 async fn cypher_class_anchored_fold_declines_without_containment() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:class-agg-decline";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger_id = "it/cypher-class-agg-decline:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let committed = fluree
         .insert(
             ledger0,
@@ -8136,8 +8136,8 @@ async fn cypher_class_anchored_fold_declines_without_containment() {
 #[tokio::test]
 async fn cypher_class_anchored_filtered_histogram_matches_pipeline() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:class-agg-filtered";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger_id = "it/cypher-class-agg-filtered:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let committed = fluree
         .insert(
             ledger0,
@@ -8225,8 +8225,8 @@ async fn cypher_class_anchored_filtered_histogram_matches_pipeline() {
 #[tokio::test]
 async fn cypher_equality_seek_correct_under_predicate_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:eq-seek-novelty";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger_id = "it/cypher-eq-seek-novelty:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx_json = json!({});
     fluree
         .insert(
@@ -8314,7 +8314,7 @@ async fn cypher_vocab_context_resolves_bare_names_to_rdf_iris() {
     // bare Cypher identifiers resolve to full IRIs and reach RDF-style
     // data — both reads and the hydrated node identity.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:vocab-compat");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-vocab-compat:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -8372,7 +8372,7 @@ async fn cypher_labels_and_type_compact_like_db_labels() {
     // round-trips (no blind last-#/segment stripping — a relationship
     // typed `http://other.example/kb#order` must not come back "order").
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:label-naming");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-label-naming:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -8445,7 +8445,7 @@ async fn cypher_backticked_names_round_trip_without_splitting() {
     // (sid_for_iri) and the read path (the lowering's namespace-0 arm)
     // both keep it intact, so backticked exotic names round-trip.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:backtick-names");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-backtick-names:main").await;
     let committed = fluree
         .transact_cypher(
             ledger0,
@@ -8500,7 +8500,7 @@ async fn cypher_backticked_names_round_trip_without_splitting() {
 #[tokio::test]
 async fn cypher_temporal_constructors_in_return_and_where() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:temporal-read");
+    let l = genesis_ledger(&fluree, "it/cypher-temporal-read:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (:Thing {name: "x"})"#)
         .await
@@ -8526,7 +8526,7 @@ async fn cypher_temporal_constructors_in_return_and_where() {
 #[tokio::test]
 async fn cypher_temporal_constructors_write_and_compare() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:temporal-write");
+    let l = genesis_ledger(&fluree, "it/cypher-temporal-write:main").await;
 
     // Constructors as property values in CREATE.
     let l = fluree
@@ -8585,7 +8585,7 @@ async fn cypher_temporal_constructors_write_and_compare() {
 #[tokio::test]
 async fn cypher_zero_arg_datetime_and_date_write_statement_timestamp() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:temporal-now");
+    let l = genesis_ledger(&fluree, "it/cypher-temporal-now:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (:Tick {n: 1, at: datetime(), on: date()})"#)
         .await
@@ -8619,7 +8619,7 @@ async fn cypher_temporal_component_map_constructors() {
     // Component maps fold to the same typed values the lexical forms build:
     // in reads (accessors + comparisons) and as write property values.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:temporal-components");
+    let l = genesis_ledger(&fluree, "it/cypher-temporal-components:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -8670,7 +8670,7 @@ async fn cypher_temporal_component_map_constructors() {
 #[tokio::test]
 async fn cypher_zero_arg_localdatetime_is_now() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:localdatetime-now");
+    let l = genesis_ledger(&fluree, "it/cypher-localdatetime-now:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (:T {name: "x"})"#)
         .await
@@ -8694,7 +8694,7 @@ async fn cypher_zero_arg_localdatetime_is_now() {
 #[tokio::test]
 async fn cypher_temporal_constructor_bad_literal_errors() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:temporal-bad");
+    let l = genesis_ledger(&fluree, "it/cypher-temporal-bad:main").await;
     let err = fluree
         .transact_cypher(l, r#"CREATE (:E {at: datetime("not-a-date")})"#)
         .await;
@@ -8715,7 +8715,7 @@ async fn cypher_schema_ddl_is_a_noop_write() {
     // Framework migrations (spring-data, neo4j-migrations) run index /
     // constraint DDL at startup. Fluree indexes everything: accept as no-ops.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:schema-ddl");
+    let l = genesis_ledger(&fluree, "it/cypher-schema-ddl:main").await;
     let t0 = l.t();
 
     let l = fluree
@@ -8762,7 +8762,7 @@ async fn cypher_schema_ddl_is_a_noop_write() {
 #[tokio::test]
 async fn cypher_show_indexes_and_constraints_answer_zero_rows() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:show-schema");
+    let l = genesis_ledger(&fluree, "it/cypher-show-schema:main").await;
     let db = graphdb_from_ledger(&l);
 
     for stmt in [
@@ -8789,7 +8789,7 @@ async fn seed_procedure_graph(
     fluree: &support::MemoryFluree,
     ledger_id: &str,
 ) -> support::MemoryLedger {
-    let l = genesis_ledger(fluree, ledger_id);
+    let l = genesis_ledger(fluree, ledger_id).await;
     fluree
         .transact_cypher(
             l,
@@ -8826,7 +8826,7 @@ async fn cypher_call_db_labels_lists_labels_from_novelty() {
     // Neo4j Browser's first act on connect. Data is novelty-only here —
     // the stats merge must see labels that have never been indexed.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_procedure_graph(&fluree, "it/cypher:proc-labels").await;
+    let l = seed_procedure_graph(&fluree, "it/cypher-proc-labels:main").await;
     let db = graphdb_from_ledger(&l);
 
     let labels = string_column(&fluree, &db, "CALL db.labels()").await;
@@ -8854,7 +8854,7 @@ async fn cypher_call_db_labels_lists_labels_from_novelty() {
 #[tokio::test]
 async fn cypher_call_relationship_types_and_property_keys_split_by_datatype() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_procedure_graph(&fluree, "it/cypher:proc-types-keys").await;
+    let l = seed_procedure_graph(&fluree, "it/cypher-proc-types-keys:main").await;
     let db = graphdb_from_ledger(&l);
 
     // KNOWS is the only ref-object predicate (rdf:type is excluded — it is
@@ -8871,7 +8871,7 @@ async fn cypher_call_relationship_types_and_property_keys_split_by_datatype() {
 async fn cypher_call_procedures_answer_from_head_index_stats_too() {
     // Same answers once the data is indexed and novelty is empty.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:proc-indexed";
+    let ledger_id = "it/cypher-proc-indexed:main";
     seed_procedure_graph(&fluree, ledger_id).await;
     rebuild_and_publish_index(&fluree, ledger_id).await;
     let db = fluree.db(ledger_id).await.expect("indexed view");
@@ -8887,7 +8887,7 @@ async fn cypher_call_procedures_answer_from_head_index_stats_too() {
 #[tokio::test]
 async fn cypher_call_dbms_components_reports_compat_identity() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:proc-components");
+    let l = genesis_ledger(&fluree, "it/cypher-proc-components:main").await;
     let db = graphdb_from_ledger(&l);
 
     let jsonld = fluree
@@ -8911,7 +8911,7 @@ async fn cypher_call_dbms_components_reports_compat_identity() {
 #[tokio::test]
 async fn cypher_call_db_schema_visualization_returns_one_row() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_procedure_graph(&fluree, "it/cypher:proc-schema-viz").await;
+    let l = seed_procedure_graph(&fluree, "it/cypher-proc-schema-viz:main").await;
     let db = graphdb_from_ledger(&l);
 
     let jsonld = fluree
@@ -8932,7 +8932,7 @@ async fn cypher_call_db_schema_visualization_returns_one_row() {
 #[tokio::test]
 async fn cypher_call_apoc_meta_data_attributes_schema_per_label() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_procedure_graph(&fluree, "it/cypher:proc-meta-data").await;
+    let l = seed_procedure_graph(&fluree, "it/cypher-proc-meta-data:main").await;
     let db = graphdb_from_ledger(&l);
 
     let jsonld = fluree
@@ -8979,7 +8979,7 @@ async fn cypher_call_apoc_meta_data_answers_langchain_schema_queries() {
     // The three exact queries LangChain's Neo4jGraph issues to build its
     // schema description — the reason this shim exists.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_procedure_graph(&fluree, "it/cypher:proc-langchain").await;
+    let l = seed_procedure_graph(&fluree, "it/cypher-proc-langchain:main").await;
     let db = graphdb_from_ledger(&l);
 
     let run = |stmt: &'static str| {
@@ -9048,7 +9048,7 @@ async fn cypher_exists_in_projection_evaluates_per_row() {
     // EXISTS { pattern } in RETURN projection (IC7/IC10 shape) must evaluate
     // per row, not constant-false.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:exists-proj");
+    let l = genesis_ledger(&fluree, "it/cypher-exists-proj:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -9083,7 +9083,7 @@ async fn cypher_exists_in_projection_with_both_endpoints_bound() {
     // collapsing to constant false (the IC7 shape). It must resolve per row —
     // bare, inside CASE, and in a WITH projection.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:exists-both-bound");
+    let l = genesis_ledger(&fluree, "it/cypher-exists-both-bound:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -9144,7 +9144,7 @@ async fn cypher_exists_in_projection_with_both_endpoints_bound() {
 #[tokio::test]
 async fn cypher_foreach_unrolls_constant_lists() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:foreach");
+    let l = genesis_ledger(&fluree, "it/cypher-foreach:main").await;
 
     // Pure CREATE body: one distinct node per element.
     let l = fluree
@@ -9212,7 +9212,7 @@ async fn cypher_null_literal_in_expressions() {
     // `null` is a first-class expression value: projected as JSON null,
     // never equal to anything, detected by IS NULL, skipped by coalesce.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:null-lit");
+    let l = genesis_ledger(&fluree, "it/cypher-null-lit:main").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (:P {name: "A"})"#)
         .await
@@ -9261,7 +9261,7 @@ async fn cypher_null_literal_in_expressions() {
 #[tokio::test]
 async fn cypher_call_procedure_errors_are_actionable() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:proc-errors");
+    let l = genesis_ledger(&fluree, "it/cypher-proc-errors:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Unknown procedure names the supported set.
@@ -9315,7 +9315,7 @@ async fn cypher_keyword_alias_names_output_column_and_binds_downstream() {
     // names — a deliberate leniency over strict openCypher. The alias must
     // both name the output column and remain referenceable downstream.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:keyword-alias");
+    let l = genesis_ledger(&fluree, "it/cypher-keyword-alias:main").await;
     let l = fluree
         .insert(
             l,
@@ -9362,7 +9362,7 @@ async fn transact_cypher_merge_relationship_per_row_on_match_set() {
     // ON MATCH SET fires on the pre-existing edge, ON CREATE SET on the newly
     // created one — atomically, in a single commit.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-per-row-onmatch");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel-per-row-onmatch:main").await;
 
     // Seed Alice, Bob, Carol and one existing Alice-KNOWS->Bob edge.
     let l = fluree
@@ -9435,7 +9435,7 @@ async fn transact_cypher_merge_relationship_per_row_on_match_only_all_existing()
     // When every matched row already has the edge, only ON MATCH SET fires and
     // no new edges are created — still a single commit.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-per-row-onmatch-only");
+    let l = genesis_ledger(&fluree, "it/cypher-merge-rel-per-row-onmatch-only:main").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -9477,7 +9477,7 @@ async fn transact_cypher_unwind_batch_node_merge_upsert() {
     // with a trailing SET applied on both branches. Two passes prove upsert:
     // first pass creates, second pass updates without duplicating.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:unwind-node-merge");
+    let l = genesis_ledger(&fluree, "it/cypher-unwind-node-merge:main").await;
 
     let batch1 = json!({ "batch": [
         {"id": "1", "name": "Alice"},
@@ -9536,7 +9536,7 @@ async fn transact_cypher_unwind_batch_node_merge_upsert() {
 async fn transact_cypher_unwind_batch_node_merge_on_create_on_match() {
     // Per-row node upsert with distinct ON CREATE vs ON MATCH branches.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cypher:unwind-node-merge-oncreate");
+    let l = genesis_ledger(&fluree, "it/cypher-unwind-node-merge-oncreate:main").await;
     // Seed id 1 so the next pass matches it and creates id 2.
     let l = fluree
         .transact_cypher_with_params(
@@ -9580,7 +9580,7 @@ async fn transact_cypher_unwind_batch_node_merge_on_create_on_match() {
 #[tokio::test]
 async fn cypher_regex_match_is_full_string() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:regex");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-regex:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -9669,7 +9669,7 @@ async fn cypher_untyped_rel_var_on_reified_edges_batched_probe() {
     // (parallel annotations fan out) and the synthesized relationship
     // value must fill in when none does — same rows as the per-row path.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:reified-relvar");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-reified-relvar:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -9732,7 +9732,7 @@ async fn cypher_untyped_rel_var_on_reified_edges_batched_probe() {
 #[tokio::test]
 async fn cypher_untyped_rel_prop_read_matches_reified_edges_only() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-rel-prop");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-untyped-rel-prop:main").await;
     let committed = fluree
         .insert(
             ledger0,
@@ -9781,8 +9781,8 @@ async fn cypher_untyped_rel_prop_read_matches_reified_edges_only() {
 #[tokio::test]
 async fn cypher_untyped_rel_prop_read_survives_indexing() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/cypher:untyped-rel-prop-indexed";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger_id = "it/cypher-untyped-rel-prop-indexed:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -9824,7 +9824,7 @@ async fn cypher_untyped_rel_prop_read_survives_indexing() {
 #[tokio::test]
 async fn cypher_untyped_rel_prop_read_large_unwind() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-rel-unwind");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-untyped-rel-unwind:main").await;
     let n = 300;
     let nodes: Vec<JsonValue> = (0..n)
         .map(|i| {
@@ -9889,7 +9889,7 @@ async fn seed_claims_chain(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -9940,7 +9940,7 @@ async fn cypher_union_branch_rel_var_name_collision_keeps_both_branches() {
     // `EdgeAnnotation`, which matches only reified edges, and Bob silently
     // vanished from a query over plain-RDF data.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:union-relvar-collision");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-union-relvar-collision:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -9996,7 +9996,7 @@ async fn cypher_list_iteration_loop_var_does_not_capture_a_same_named_rel_var() 
     // variable of the `all(...)` and the relationship variable of the hop that
     // has to match the plain edge.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:loop-var-name-collision");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-loop-var-name-collision:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -10056,7 +10056,7 @@ async fn cypher_list_iteration_loop_var_does_not_capture_a_same_named_rel_var() 
 #[tokio::test]
 async fn cypher_var_length_bound_rel_var_reads_per_hop_annotations() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_claims_chain(&fluree, "it/cypher:varlen-hop-annotations").await;
+    let l = seed_claims_chain(&fluree, "it/cypher-varlen-hop-annotations:main").await;
     let db = graphdb_from_ledger(&l);
 
     // `all(...)` over the bound list: Alice→Bob (0.9) and Alice→Bob→Carol
@@ -10130,7 +10130,7 @@ async fn cypher_var_length_relationships_of_bounded_path_reads_per_hop_annotatio
     // path value — `Binding::Path.edges` is `(start, predicate, end)` with no
     // reifier slot, so computing it from the path value answers null.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_claims_chain(&fluree, "it/cypher:varlen-path-annotations").await;
+    let l = seed_claims_chain(&fluree, "it/cypher-varlen-path-annotations:main").await;
     let db = graphdb_from_ledger(&l);
 
     assert_eq!(
@@ -10190,7 +10190,7 @@ async fn cypher_aggregating_with_drops_the_identity_list_instead_of_grouping_it(
     // reifier, so the per-hop properties read null while `size()`, `type()`
     // and the endpoints stay correct.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_claims_chain(&fluree, "it/cypher:varlen-aggregating-with").await;
+    let l = seed_claims_chain(&fluree, "it/cypher-varlen-aggregating-with:main").await;
     let db = graphdb_from_ledger(&l);
 
     // Bounded range under a path variable, then an aggregating WITH.
@@ -10280,7 +10280,7 @@ async fn cypher_var_length_unreified_hops_degrade_to_null_not_dropped() {
     // property surface is empty. A bare `EdgeAnnotation` would have dropped
     // the whole path, taking `any(...)` and the list comprehension with it.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-mixed-reification");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-varlen-mixed-reification:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -10360,7 +10360,7 @@ async fn cypher_var_length_parallel_claims_multiply_rows_like_a_single_hop() {
     // answer — parallel relationships are distinct relationships — and it is
     // exactly what a single `-[r:T]->` hop already does.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-parallel-claims");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-varlen-parallel-claims:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -10480,7 +10480,7 @@ async fn cypher_multi_hop_path_property_read_refused_with_a_remedy() {
     // the equivalent `*N..N` range both read the real annotations), so refuse
     // it and name the spellings that work.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:multi-hop-path-props");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-multi-hop-path-props:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -10600,7 +10600,7 @@ async fn cypher_var_length_enumerated_property_read_refused_with_a_remedy() {
     // so a property read over their elements can only answer null. Refuse it,
     // and name the edit that moves the pattern onto the route that works.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_claims_chain(&fluree, "it/cypher:varlen-enumerate-refusal").await;
+    let l = seed_claims_chain(&fluree, "it/cypher-varlen-enumerate-refusal:main").await;
     let db = graphdb_from_ledger(&l);
 
     for (q, remedy) in [
@@ -10779,7 +10779,7 @@ async fn cypher_properties_over_an_extracted_hop_is_refused_on_identity_less_rou
     // actionable error on every route. `properties()` and `keys()` have no
     // such restriction, which is what left this one open.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_claims_chain(&fluree, "it/cypher:extracted-hop-properties").await;
+    let l = seed_claims_chain(&fluree, "it/cypher-extracted-hop-properties:main").await;
     let db = graphdb_from_ledger(&l);
 
     for q in [
@@ -10883,7 +10883,7 @@ async fn cypher_var_length_probes_of_different_types_do_not_share_a_drain() {
     // annotation for the LIKES edge and degrade it to the synthesized
     // relationship value — a silent null where a confidence is stored.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-two-types");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-varlen-two-types:main").await;
     let l = fluree
         .insert(
             ledger0,
@@ -10936,7 +10936,7 @@ async fn seed_works_for_graph(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let l = genesis_ledger(fluree, ledger_id);
+    let l = genesis_ledger(fluree, ledger_id).await;
     fluree
         .transact_cypher(
             l,
@@ -10959,7 +10959,7 @@ async fn cypher_null_from_optional_match_matches_nothing_in_later_match() {
     // hoist the MATCH above the OPTIONAL MATCH: that seeded `o` with every
     // located company and returned all six person×city pairs (#1924).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-later-match").await;
+    let ledger = seed_works_for_graph(&fluree, "it/cypher-null-later-match:main").await;
     let rows = cypher_rows(
         &fluree,
         &graphdb_from_ledger(&ledger),
@@ -10977,7 +10977,7 @@ async fn cypher_null_from_optional_match_stays_null_in_later_optional_match() {
     // Bob's null `o` must not let the second OPTIONAL MATCH bind it to every
     // located company: he keeps one row with a null city.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-later-optional").await;
+    let ledger = seed_works_for_graph(&fluree, "it/cypher-null-later-optional:main").await;
     let rows = cypher_rows(
         &fluree,
         &graphdb_from_ledger(&ledger),
@@ -11003,7 +11003,7 @@ async fn cypher_write_where_null_from_optional_match_stays_null() {
     // same null semantics: Bob's null `o` must not bind the second OPTIONAL
     // MATCH to every located company and SET both cities on him.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-write-where").await;
+    let ledger = seed_works_for_graph(&fluree, "it/cypher-null-write-where:main").await;
     let ledger = fluree
         .transact_cypher(
             ledger,
@@ -11037,7 +11037,7 @@ async fn cypher_null_from_optional_match_matches_nothing_inside_exists() {
     // Cypher's null semantics hold inside an EXISTS body too: Bob's null `o`
     // must not act as a free variable that finds some located company.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-exists").await;
+    let ledger = seed_works_for_graph(&fluree, "it/cypher-null-exists:main").await;
     let rows = cypher_rows(
         &fluree,
         &graphdb_from_ledger(&ledger),

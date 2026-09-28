@@ -37,6 +37,18 @@ pub enum NameServiceError {
     #[error("Ledger already exists: {0}")]
     LedgerAlreadyExists(String),
 
+    /// A write from a writer whose fence the branch record no longer
+    /// accepts: the ledger was dropped, restored, or replaced since the
+    /// writer loaded it, or a drop has frozen the branch.
+    #[error("Ledger was dropped or replaced since it was loaded: {0}")]
+    Fenced(String),
+
+    /// Another lifecycle operation holds the name or the dropped ledger
+    /// (a create, drop, restore or purge under way), or took it from this
+    /// one. Retrying once it finishes may succeed.
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     /// The underlying state machine rejected the propose with a
     /// terminal failure that retrying won't fix — typically a
     /// state-machine invariant the apply path surfaced, or a
@@ -119,6 +131,17 @@ impl NameServiceError {
     /// Create a ledger already exists error
     pub fn ledger_already_exists(id: impl Into<String>) -> Self {
         Self::LedgerAlreadyExists(id.into())
+    }
+
+    /// Create a [`Self::Fenced`] error for a stale writer.
+    pub fn fenced(id: impl Into<String>) -> Self {
+        Self::Fenced(id.into())
+    }
+
+    /// Create a [`Self::Conflict`] error for an operation another one
+    /// holds or took.
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self::Conflict(msg.into())
     }
 
     /// Create an [`Self::ApplyRejected`] error signaling a terminal

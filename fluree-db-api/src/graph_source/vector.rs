@@ -14,6 +14,10 @@ use crate::graph_source::result::{
     VectorCreateResult, VectorDropResult, VectorStalenessCheck, VectorSyncResult,
 };
 #[cfg(feature = "vector")]
+use crate::graph_source::source_instance::{
+    check_source_instance, instance_of, is_suspended, SOURCE_INSTANCE,
+};
+#[cfg(feature = "vector")]
 use crate::Result;
 #[cfg(feature = "vector")]
 use fluree_db_core::{ledger_id::split_ledger_id, ContentId, ContentStore};
@@ -182,6 +186,7 @@ impl crate::Fluree {
 
         // 5. Publish graph source record to nameservice
         let config_json = serde_json::to_string(&serde_json::json!({
+            SOURCE_INSTANCE: instance_of(ledger.storage_namespace().root()).to_string(),
             "embedding_property": config.embedding_property,
             "dimensions": config.dimensions,
             "metric": format!("{:?}", metric),
@@ -193,6 +198,12 @@ impl crate::Fluree {
             }
         }))?;
 
+        // A source dropped under this name left its index head, which this
+        // index may sit below: over a ledger that replaced the one it
+        // indexed, its `t` starts again.
+        self.publisher()?
+            .reset_graph_source_index(&config.name, config.effective_branch())
+            .await?;
         self.publisher()?
             .publish_graph_source(
                 &config.name,
@@ -289,7 +300,7 @@ impl crate::Fluree {
         let bytes = serialize(index)?;
 
         // Write through the content store so it's stored at the CID-mapped address
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let index_id = cs
             .put(fluree_db_core::ContentKind::IndexRoot, &bytes)
             .await?;
@@ -325,7 +336,7 @@ impl crate::Fluree {
         })?;
 
         // Load from content store
-        let store = self.content_store(graph_source_id);
+        let store = self.graph_source_store(graph_source_id)?;
         let bytes = store.get(&index_cid).await?;
 
         // Deserialize
@@ -361,10 +372,14 @@ impl crate::Fluree {
 
         // Check minimum head across all dependencies
         let mut ledger_t: Option<i64> = None;
+        let mut suspended = false;
         for dep in &record.dependencies {
             let ledger_record = self.nameservice().lookup(dep).await?.ok_or_else(|| {
                 crate::ApiError::NotFound(format!("Source ledger not found: {dep}"))
             })?;
+            if *dep == source_ledger {
+                suspended = is_suspended(&record, dep, &ledger_record.storage_root())?;
+            }
             ledger_t = Some(match ledger_t {
                 Some(cur) => cur.min(ledger_record.commit_t),
                 None => ledger_record.commit_t,
@@ -372,9 +387,10 @@ impl crate::Fluree {
         }
         let ledger_t = ledger_t.unwrap_or(0);
 
+        // Another ledger's head says nothing about how far behind this index is.
         let index_t = record.index_t;
-        let is_stale = index_t < ledger_t;
-        let lag = ledger_t - index_t;
+        let is_stale = !suspended && index_t < ledger_t;
+        let lag = if suspended { 0 } else { ledger_t - index_t };
 
         Ok(VectorStalenessCheck {
             graph_source_id: graph_source_id.to_string(),
@@ -383,6 +399,7 @@ impl crate::Fluree {
             ledger_t,
             is_stale,
             lag,
+            suspended,
         })
     }
 }
@@ -447,10 +464,15 @@ impl crate::Fluree {
 
         // 2. Load source ledger to get current state
         let ledger = self.ledger(&source_ledger_alias).await?;
+        check_source_instance(
+            &record,
+            &source_ledger_alias,
+            ledger.storage_namespace().root(),
+        )?;
         let ledger_t = ledger.t();
 
         // 3. Load existing index by CID
-        let cs = self.content_store(graph_source_id);
+        let cs = self.graph_source_store(graph_source_id)?;
         let bytes = cs.get(&index_cid).await?;
         let mut index = deserialize(&bytes)?;
         let old_watermark = index.watermark.get(&source_ledger_alias).unwrap_or(0);
@@ -508,7 +530,7 @@ impl crate::Fluree {
         //    ledger is a branch.
         let mut affected_sids: HashSet<fluree_db_core::Sid> = HashSet::new();
         let commit_store = self
-            .content_store_for_record_or_id(ledger.ns_record.as_ref(), &ledger.snapshot.ledger_id)
+            .content_store_for_record_or_id(ledger.ns_record.as_ref(), &ledger.storage_namespace())
             .await?;
         let stream =
             trace_first_parent_commits_by_id(commit_store, head_commit_id.clone(), old_watermark);
@@ -695,11 +717,16 @@ impl crate::Fluree {
 
         // 2. Load source ledger
         let ledger = self.ledger(&source_ledger_alias).await?;
+        check_source_instance(
+            &record,
+            &source_ledger_alias,
+            ledger.storage_namespace().root(),
+        )?;
         let ledger_t = ledger.t();
 
         // 3. Load existing index to get old watermark
         let old_watermark = if let Some(cid) = &record.index_id {
-            let cs = self.content_store(graph_source_id);
+            let cs = self.graph_source_store(graph_source_id)?;
             let bytes = cs.get(cid).await?;
             let old_index = deserialize(&bytes)?;
             old_index.watermark.get(&source_ledger_alias).unwrap_or(0)

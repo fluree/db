@@ -2674,7 +2674,7 @@ async fn sparql_query_generic_requires_from_clause_even_with_no_header() {
 }
 
 #[tokio::test]
-async fn soft_drop_blocks_recreate() {
+async fn soft_drop_frees_the_name_and_keeps_the_ledger_restorable() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state.clone());
 
@@ -2708,10 +2708,15 @@ async fn soft_drop_blocks_recreate() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let (status, dropped) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dropped["name_released"], true);
+    assert_eq!(dropped["data"], "retained");
+    let instance = dropped["instance"].as_str().expect("instance").to_string();
 
-    // Create again should conflict (must hard-drop to reuse alias)
+    // The name is free at once.
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2722,7 +2727,73 @@ async fn soft_drop_blocks_recreate() {
         )
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The dropped ledger waits in the registry...
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/dropped")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, listed) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["dropped"][0]["instance"], instance.as_str());
+    assert_eq!(listed["dropped"][0]["name"], "test");
+    assert_eq!(listed["dropped"][0]["state"], "dropped");
+
+    // ...but cannot come back while the name is taken.
+    let restore_body = serde_json::json!({ "instance": instance });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/dropped/restore")
+                .header("content-type", "application/json")
+                .body(Body::from(restore_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Purging it frees its data.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/dropped/purge")
+                .header("content-type", "application/json")
+                .body(Body::from(restore_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, purged) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(purged["status"], "purged");
+    assert_eq!(purged["data"], "deleted");
+
+    // A malformed instance id is the caller's mistake.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/dropped/restore")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"instance": "nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

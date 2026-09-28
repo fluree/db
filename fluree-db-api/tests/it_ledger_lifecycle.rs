@@ -132,6 +132,34 @@ async fn duplicate_ledger_creation() {
     );
 }
 
+/// A name holds one ledger: creating another root branch under a live name is
+/// refused. Branches of the ledger come from `create_branch`.
+#[tokio::test]
+async fn create_ledger_refuses_name_held_on_another_branch() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let trunk = fluree.create_ledger("held:trunk").await.unwrap();
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": 1}]
+    });
+    fluree.insert(trunk, &txn).await.unwrap();
+
+    let err = fluree
+        .create_ledger("held:main")
+        .await
+        .expect_err("a second root branch under a live name must be refused");
+    assert!(
+        matches!(&err, fluree_db_api::ApiError::LedgerExists(name) if name == "held"),
+        "expected LedgerExists naming held, got: {err}"
+    );
+    assert!(!fluree.ledger_exists("held:main").await.unwrap());
+
+    fluree
+        .create_branch("held", "main", Some("trunk"), None)
+        .await
+        .expect("a branch of the ledger is still created with create_branch");
+}
+
 // =============================================================================
 // General DB functionality (from it_db.rs)
 // =============================================================================
@@ -226,33 +254,31 @@ async fn ledger_exists_on_file_storage() {
         "a malformed id must be an Err, so callers cannot mistake it for absence",
     );
 
-    // A soft drop keeps the RECORD but not the ledger: `exists` is a
-    // query-path question, and on the query path a retracted record reads
-    // identically to not-found. Tombstoning backends (the raft nameservice)
-    // keep serving the record so admin tooling can read the flag; answering
-    // `true` here is what let a dropped ledger keep loading and serving
-    // queries on those backends.
-    fluree
+    // A soft drop frees the name at once: the ledger is gone from the
+    // nameservice, and its data waits in the dropped-ledger registry.
+    let report = fluree
         .drop_ledger("x", fluree_db_api::DropMode::Soft)
         .await
         .unwrap();
+    assert!(report.name_released);
     assert!(
         !fluree.ledger_exists("x:main").await.unwrap(),
-        "a retracted ledger must read as absent on the query path",
+        "a dropped ledger must read as absent",
     );
-
-    // ...but it is a SOFT drop: the record itself survives, carrying the
-    // flag, which is what distinguishes it from a hard drop.
-    let record = fluree
+    assert!(fluree
         .nameservice()
         .lookup("x:main")
         .await
         .unwrap()
-        .expect("a soft drop keeps the nameservice record");
-    assert!(
-        record.retracted,
-        "the surviving record must be marked retracted",
+        .is_none());
+    let dropped = fluree.list_dropped().await.unwrap();
+    assert_eq!(
+        dropped.len(),
+        1,
+        "a soft drop keeps the ledger in the registry"
     );
+    assert_eq!(dropped[0].name, "x");
+    assert_eq!(Some(&dropped[0].instance), report.instance.as_ref());
 }
 
 /// Integration test for basic query functionality

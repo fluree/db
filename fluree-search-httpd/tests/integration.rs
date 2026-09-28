@@ -125,7 +125,10 @@ mod http_tests {
                 None => return Ok(Bm25Manifest::new(graph_source_id)),
             };
 
-            let cs = fluree_db_core::content_store_for(self.storage.clone(), graph_source_id);
+            let cs = fluree_db_core::content_store_for(
+                self.storage.clone(),
+                &fluree_db_core::StorageNamespace::parse_legacy(graph_source_id).unwrap(),
+            );
             let bytes = cs
                 .get(index_cid)
                 .await
@@ -159,7 +162,10 @@ mod http_tests {
                     message: format!("No snapshot found for {graph_source_id} at t={index_t}"),
                 })?;
 
-            let cs = fluree_db_core::content_store_for(self.storage.clone(), graph_source_id);
+            let cs = fluree_db_core::content_store_for(
+                self.storage.clone(),
+                &fluree_db_core::StorageNamespace::parse_legacy(graph_source_id).unwrap(),
+            );
             let bytes = cs
                 .get(&entry.snapshot_id)
                 .await

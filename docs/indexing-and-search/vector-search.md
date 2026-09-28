@@ -558,6 +558,8 @@ if check.is_stale {
 }
 ```
 
+An index whose source ledger was dropped and replaced by another ledger of the same name is suspended until it is recreated; see [When the Source Ledger Is Dropped](bm25.md#when-the-source-ledger-is-dropped).
+
 #### Drop Index
 
 ```rust

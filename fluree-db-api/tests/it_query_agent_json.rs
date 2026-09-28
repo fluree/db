@@ -17,7 +17,7 @@ fn ctx() -> JsonValue {
 
 async fn seed_data() -> (MemoryFluree, MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/agent-json:test");
+    let ledger0 = genesis_ledger(&fluree, "it/agent-json:test").await;
 
     let tx = json!({
         "@context": ctx(),

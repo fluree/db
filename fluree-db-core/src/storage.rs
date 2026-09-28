@@ -128,7 +128,7 @@ mod wal;
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
 
-use crate::address_path::{storage_ledger_id, SHARED_NAMESPACE};
+use crate::address_path::StorageNamespace;
 use crate::error::Result;
 use async_trait::async_trait;
 use sha2::Digest;
@@ -431,7 +431,7 @@ pub trait ContentAddressedWrite: StorageWrite {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> Result<ContentWriteResult>;
@@ -440,11 +440,11 @@ pub trait ContentAddressedWrite: StorageWrite {
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         let hash_hex = sha256_hex(bytes);
-        self.content_write_bytes_with_hash(kind, ledger_id, &hash_hex, bytes)
+        self.content_write_bytes_with_hash(kind, namespace, &hash_hex, bytes)
             .await
     }
 }
@@ -591,12 +591,12 @@ impl ContentAddressedWrite for Arc<dyn Storage> {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         self.as_ref()
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+            .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
             .await
     }
 }
@@ -820,16 +820,14 @@ impl ContentStore for Arc<dyn ContentStore> {
 /// `S: Storage` can obtain a `ContentStore` without rewriting storage
 /// implementations.
 ///
-/// The adapter is constructed with a ledger scope (`ledger_id`) and a
-/// storage method name (e.g., `"file"`, `"memory"`, `"s3"`), which together
-/// determine the layout rule for mapping CIDs to legacy address strings.
+/// The adapter is constructed with a [`StorageNamespace`] and a storage
+/// method name (e.g., `"file"`, `"memory"`, `"s3"`), which together determine
+/// the layout rule for mapping CIDs to address strings.
 #[derive(Debug, Clone)]
 pub struct StorageContentStore<S: Storage> {
     storage: S,
-    ledger_id: String,
+    namespace: StorageNamespace,
     method: String,
-    /// `(name/branch, name/@shared)`, derived once rather than per address.
-    prefixes: (String, String),
 }
 
 impl<S: Storage> StorageContentStore<S> {
@@ -838,16 +836,13 @@ impl<S: Storage> StorageContentStore<S> {
     /// # Arguments
     ///
     /// * `storage` - The underlying legacy storage implementation
-    /// * `ledger_id` - Ledger identifier (e.g., `"mydb:main"`)
+    /// * `namespace` - Where the branch's artifacts live
     /// * `method` - Storage method name for address generation (e.g., `"file"`, `"memory"`)
-    pub fn new(storage: S, ledger_id: impl Into<String>, method: impl Into<String>) -> Self {
-        let ledger_id = ledger_id.into();
-        let prefixes = storage_path_prefixes(&ledger_id);
+    pub fn new(storage: S, namespace: StorageNamespace, method: impl Into<String>) -> Self {
         Self {
             storage,
-            ledger_id,
+            namespace,
             method: method.into(),
-            prefixes,
         }
     }
 
@@ -856,22 +851,25 @@ impl<S: Storage> StorageContentStore<S> {
         let kind = id.content_kind().ok_or_else(|| {
             crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
         })?;
-        let (prefix, shared) = &self.prefixes;
-        let path = content_path_from_prefixes(kind, prefix, shared, &id.digest_hex());
-        Ok(format!("fluree:{}://{path}", self.method))
+        Ok(content_address(
+            &self.method,
+            kind,
+            &self.namespace,
+            &id.digest_hex(),
+        ))
     }
 
     /// For dict blobs, return the pre-global-dicts address where dicts lived
     /// under the per-branch namespace (`mydb/main/index/objects/dicts/{sha}.dict`).
     /// Returns `None` for non-dict CIDs.
     fn legacy_dict_address(&self, id: &ContentId) -> Option<String> {
-        legacy_dict_address(&self.method, &self.ledger_id, id)
+        legacy_dict_address(&self.method, &self.namespace, id)
     }
 
     /// Index roots were stored with a `.json` extension before the switch to `.fir6`.
     /// Returns `None` for non-IndexRoot CIDs.
     fn legacy_index_root_address(&self, id: &ContentId) -> Option<String> {
-        legacy_index_root_address(&self.method, &self.ledger_id, id)
+        legacy_index_root_address(&self.method, &self.namespace, id)
     }
 }
 
@@ -879,11 +877,15 @@ impl<S: Storage> StorageContentStore<S> {
 /// namespace (`mydb/main/index/objects/dicts/{sha}.dict`).
 ///
 /// Returns `None` for non-dict CIDs.
-pub fn legacy_dict_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
+pub fn legacy_dict_address(
+    method: &str,
+    namespace: &StorageNamespace,
+    id: &ContentId,
+) -> Option<String> {
     if id.codec() != crate::CODEC_FLUREE_DICT_BLOB {
         return None;
     }
-    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let prefix = namespace.branch_prefix();
     let hex = id.digest_hex();
     Some(format!(
         "fluree:{method}://{prefix}/index/objects/dicts/{hex}.dict"
@@ -893,11 +895,15 @@ pub fn legacy_dict_address(method: &str, ledger_id: &str, id: &ContentId) -> Opt
 /// The index-root address from before the `.json` to `.fir6` rename.
 ///
 /// Returns `None` for non-`IndexRoot` CIDs.
-fn legacy_index_root_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
+fn legacy_index_root_address(
+    method: &str,
+    namespace: &StorageNamespace,
+    id: &ContentId,
+) -> Option<String> {
     if id.codec() != crate::CODEC_FLUREE_INDEX_ROOT {
         return None;
     }
-    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let prefix = namespace.branch_prefix();
     let hex = id.digest_hex();
     Some(format!("fluree:{method}://{prefix}/index/roots/{hex}.json"))
 }
@@ -914,13 +920,17 @@ fn legacy_index_root_address(method: &str, ledger_id: &str, id: &ContentId) -> O
 /// Returns an empty vector when the CID's codec is unrecognised. Callers that
 /// delete must treat that as "cannot locate this blob" and decline to act, not
 /// as "this blob occupies no addresses".
-pub fn candidate_addresses(method: &str, ledger_id: &str, id: &ContentId) -> Vec<String> {
+pub fn candidate_addresses(
+    method: &str,
+    namespace: &StorageNamespace,
+    id: &ContentId,
+) -> Vec<String> {
     let mut addresses = Vec::new();
     if let Some(kind) = id.content_kind() {
-        addresses.push(content_address(method, kind, ledger_id, &id.digest_hex()));
+        addresses.push(content_address(method, kind, namespace, &id.digest_hex()));
     }
-    addresses.extend(legacy_dict_address(method, ledger_id, id));
-    addresses.extend(legacy_index_root_address(method, ledger_id, id));
+    addresses.extend(legacy_dict_address(method, namespace, id));
+    addresses.extend(legacy_index_root_address(method, namespace, id));
     addresses
 }
 
@@ -972,7 +982,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         let id = ContentId::new(kind, bytes);
         let hex_digest = id.digest_hex();
         self.storage
-            .content_write_bytes_with_hash(kind, &self.ledger_id, &hex_digest, bytes)
+            .content_write_bytes_with_hash(kind, &self.namespace, &hex_digest, bytes)
             .await?;
         Ok(id)
     }
@@ -993,7 +1003,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // land on the same answer either way; a path that ingests index blobs
         // by CID would silently start fsyncing them.
         self.storage
-            .content_write_bytes_with_hash(kind, &self.ledger_id, &id.digest_hex(), bytes)
+            .content_write_bytes_with_hash(kind, &self.namespace, &id.digest_hex(), bytes)
             .await?;
         Ok(())
     }
@@ -1004,7 +1014,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // `.fir6` rename, the only copy sits at a legacy address, and
         // releasing just the canonical one silently reclaims nothing.
         let mut deleted = Ok(());
-        for address in candidate_addresses(&self.method, &self.ledger_id, id) {
+        for address in candidate_addresses(&self.method, &self.namespace, id) {
             match self.storage.delete(&address).await {
                 Ok(()) | Err(crate::error::Error::NotFound(_)) => {}
                 Err(e) => {
@@ -1032,7 +1042,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         let mut addresses = Vec::with_capacity(ids.len() * 2);
         let mut owner: Vec<usize> = Vec::with_capacity(ids.len() * 2);
         for (i, id) in ids.iter().enumerate() {
-            for address in candidate_addresses(&self.method, &self.ledger_id, id) {
+            for address in candidate_addresses(&self.method, &self.namespace, id) {
                 addresses.push(address);
                 owner.push(i);
             }
@@ -1128,10 +1138,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 /// existing address via `parse_fluree_address().method`.
 pub fn bridge_content_store<S: Storage>(
     storage: S,
-    ledger_id: &str,
+    namespace: &StorageNamespace,
     method: &str,
 ) -> StorageContentStore<S> {
-    StorageContentStore::new(storage, ledger_id, method)
+    StorageContentStore::new(storage, namespace.clone(), method)
 }
 
 /// Construct a `ContentStore` from a `Storage` backend using its declared method.
@@ -1140,12 +1150,14 @@ pub fn bridge_content_store<S: Storage>(
 /// from the storage's [`StorageMethod::storage_method()`] implementation, so
 /// callers never need to supply a method string manually.
 ///
-/// The `namespace_id` is typically a ledger ID (e.g., `"mydb:main"`) or a
-/// graph source ID (e.g., `"my-search:main"`) — it determines the CAS
-/// namespace prefix for physical key layout.
-pub fn content_store_for<S: Storage>(storage: S, namespace_id: &str) -> StorageContentStore<S> {
+/// The `namespace` is a ledger branch's (from its nameservice record) or a
+/// graph source's — it determines the physical key layout.
+pub fn content_store_for<S: Storage>(
+    storage: S,
+    namespace: &StorageNamespace,
+) -> StorageContentStore<S> {
     let method = storage.storage_method().to_string();
-    StorageContentStore::new(storage, namespace_id, method)
+    StorageContentStore::new(storage, namespace.clone(), method)
 }
 
 // ============================================================================
@@ -1211,13 +1223,13 @@ impl RoutedBackend {
         Self { default, mounts }
     }
 
-    /// Select the backend owning `namespace_id` (a ledger ID or name).
-    fn backend_for(&self, namespace_id: &str) -> &StorageBackend {
+    /// Select the backend owning `namespace`, by its storage root.
+    fn backend_for(&self, namespace: &StorageNamespace) -> &StorageBackend {
+        let root = namespace.root().as_str();
         self.mounts
             .iter()
             .find(|(prefix, _)| {
-                namespace_id
-                    .strip_prefix(prefix.as_str())
+                root.strip_prefix(prefix.as_str())
                     .is_some_and(|rest| rest.starts_with('/'))
             })
             .map_or(&self.default, |(_, backend)| backend)
@@ -1237,21 +1249,20 @@ impl Debug for RoutedBackend {
 }
 
 impl StorageBackend {
-    /// Create an `Arc<dyn ContentStore>` scoped to the given namespace
-    /// (typically a ledger ID).
+    /// Create an `Arc<dyn ContentStore>` scoped to the given namespace.
     ///
     /// For `Managed` backends, this constructs a [`StorageContentStore`] that
     /// maps CIDs to physical addresses under the namespace. For `Permanent`
     /// backends, the inner store is returned directly. For `Routed` backends,
     /// the namespace's owning backend (mount or default) is selected first.
-    pub fn content_store(&self, namespace_id: &str) -> Arc<dyn ContentStore> {
+    pub fn content_store(&self, namespace: &StorageNamespace) -> Arc<dyn ContentStore> {
         match self {
             StorageBackend::Managed(storage) => {
-                Arc::new(content_store_for(storage.clone(), namespace_id))
+                Arc::new(content_store_for(storage.clone(), namespace))
             }
             StorageBackend::Permanent(store) => Arc::clone(store),
             StorageBackend::Routed(routed) => {
-                routed.backend_for(namespace_id).content_store(namespace_id)
+                routed.backend_for(namespace).content_store(namespace)
             }
         }
     }
@@ -1482,26 +1493,6 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
-/// Convert a ledger ID to a path prefix (`"mydb:main"` -> `"mydb/main"`).
-pub fn ledger_id_prefix_for_path(ledger_id: &str) -> String {
-    storage_path_prefixes(ledger_id).0
-}
-
-/// `(name/branch, name/@shared)` for a ledger id a storage seam received.
-///
-/// An id that does not parse cannot have been created, so it cannot own
-/// content; its paths keep the pre-validation shape so a read of it misses
-/// rather than landing in another ledger's namespace.
-fn storage_path_prefixes(ledger_id: &str) -> (String, String) {
-    match storage_ledger_id(ledger_id, "a storage path") {
-        Ok(id) => (id.path_prefix(), id.shared_prefix()),
-        Err(_) => (
-            ledger_id.replace(':', "/"),
-            format!("{ledger_id}/{SHARED_NAMESPACE}").replace(':', "/"),
-        ),
-    }
-}
-
 /// Leading path segment under which graph-source artifacts (snapshots and
 /// mappings) are stored. Unlike every other content kind, these addresses do
 /// NOT begin with the owning id — they begin with this literal segment and
@@ -1513,14 +1504,19 @@ pub const GRAPH_SOURCES_PATH_SEGMENT: &str = "graph-sources";
 /// Build a storage path for content-addressed data.
 ///
 /// This determines the directory structure for different content types:
-/// - Commits: `{ledger_id}/commit/{hash}.fcv2`
-/// - Index roots: `{ledger_id}/index/roots/{hash}.fir6`
-/// - Graph sources: `graph-sources/{graph_source_id}/snapshots/{hash}.gssnap`
-///   (note: keyed by graph_source_id, not a ledger id)
+/// - Commits: `{root}/{branch}/commit/{hash}.fcv2`
+/// - Index roots: `{root}/{branch}/index/roots/{hash}.fir6`
+/// - Dictionaries: `{root}/@shared/dicts/{hash}.{ext}`
+/// - Graph sources: `graph-sources/{name}/{branch}/snapshots/{hash}.gssnap`
+///   (graph-source namespaces only)
 /// - etc.
-pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> String {
-    let (prefix, shared) = storage_path_prefixes(ledger_id);
-    content_path_from_prefixes(kind, &prefix, &shared, hash_hex)
+pub fn content_path(kind: ContentKind, namespace: &StorageNamespace, hash_hex: &str) -> String {
+    content_path_from_prefixes(
+        kind,
+        namespace.branch_prefix(),
+        namespace.shared_prefix(),
+        hash_hex,
+    )
 }
 
 fn content_path_from_prefixes(
@@ -1568,14 +1564,19 @@ fn content_path_from_prefixes(
 ///
 /// * `method` - Storage method identifier (e.g., "file", "s3", "memory")
 /// * `kind` - The type of content being stored
-/// * `ledger_id` - Ledger ID (e.g., "mydb:main")
+/// * `namespace` - Where the branch's artifacts live
 /// * `hash_hex` - Content hash as hex string
 ///
 /// # Returns
 ///
 /// A Fluree address like `fluree:file://mydb/main/commit/{hash}.fcv2`
-pub fn content_address(method: &str, kind: ContentKind, ledger_id: &str, hash_hex: &str) -> String {
-    let path = content_path(kind, ledger_id, hash_hex);
+pub fn content_address(
+    method: &str,
+    kind: ContentKind,
+    namespace: &StorageNamespace,
+    hash_hex: &str,
+) -> String {
+    let path = content_path(kind, namespace, hash_hex);
     format!("fluree:{method}://{path}")
 }
 
@@ -1813,7 +1814,9 @@ mod tests {
     use crate::content_kind::DictKind;
     use crate::storage::memory::MemoryStorage;
 
-    const LEDGER: &str = "mydb:main";
+    fn ledger() -> StorageNamespace {
+        StorageNamespace::parse_legacy("mydb:main").unwrap()
+    }
 
     /// Releasing a blob must take its cached copy with it. A cache entry that
     /// outlives its blob reads back as a live object, so a caller deciding
@@ -1823,7 +1826,7 @@ mod tests {
     #[tokio::test]
     async fn releasing_a_blob_evicts_its_cached_copy() {
         let storage = MemoryStorage::new();
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(storage.clone(), &ledger());
         let bytes = b"root bytes";
         let id = store.put(ContentKind::IndexRoot, bytes).await.unwrap();
 
@@ -1861,18 +1864,18 @@ mod tests {
             },
             b"dict bytes",
         );
-        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &id)
+        let legacy = legacy_dict_address(storage.storage_method(), &ledger(), &id)
             .expect("dict CIDs have a legacy address");
         storage.write_bytes(&legacy, b"dict bytes").await.unwrap();
 
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(storage.clone(), &ledger());
         assert_eq!(
             store.get(&id).await.unwrap(),
             b"dict bytes",
             "reads fall back to the legacy dict address"
         );
         assert!(
-            candidate_addresses(storage.storage_method(), LEDGER, &id).contains(&legacy),
+            candidate_addresses(storage.storage_method(), &ledger(), &id).contains(&legacy),
             "the address reads fall back to must be listed as a candidate"
         );
     }
@@ -1883,18 +1886,18 @@ mod tests {
     async fn candidate_addresses_cover_the_legacy_index_root_fallback() {
         let storage = MemoryStorage::new();
         let id = ContentId::new(ContentKind::IndexRoot, b"root bytes");
-        let legacy = legacy_index_root_address(storage.storage_method(), LEDGER, &id)
+        let legacy = legacy_index_root_address(storage.storage_method(), &ledger(), &id)
             .expect("index-root CIDs have a legacy address");
         storage.write_bytes(&legacy, b"root bytes").await.unwrap();
 
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(storage.clone(), &ledger());
         assert_eq!(
             store.get(&id).await.unwrap(),
             b"root bytes",
             "reads fall back to the legacy index-root address"
         );
         assert!(
-            candidate_addresses(storage.storage_method(), LEDGER, &id).contains(&legacy),
+            candidate_addresses(storage.storage_method(), &ledger(), &id).contains(&legacy),
             "the address reads fall back to must be listed as a candidate"
         );
     }
@@ -1912,11 +1915,11 @@ mod tests {
             },
             b"legacy dict",
         );
-        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &id)
+        let legacy = legacy_dict_address(storage.storage_method(), &ledger(), &id)
             .expect("dict CIDs have a legacy address");
         storage.write_bytes(&legacy, b"legacy dict").await.unwrap();
 
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(storage.clone(), &ledger());
         store.release(&id).await.expect("release succeeds");
 
         assert!(
@@ -1937,7 +1940,7 @@ mod tests {
         let canonical = content_address(
             storage.storage_method(),
             ContentKind::IndexLeaf,
-            LEDGER,
+            &ledger(),
             &canonical_id.digest_hex(),
         );
         storage
@@ -1951,13 +1954,13 @@ mod tests {
             },
             b"legacy dict",
         );
-        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &legacy_id)
+        let legacy = legacy_dict_address(storage.storage_method(), &ledger(), &legacy_id)
             .expect("dict CIDs have a legacy address");
         storage.write_bytes(&legacy, b"legacy dict").await.unwrap();
 
         let absent_id = ContentId::new(ContentKind::IndexLeaf, b"never written");
 
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(storage.clone(), &ledger());
         let failures = store
             .release_many(&[canonical_id.clone(), legacy_id.clone(), absent_id])
             .await;
@@ -1977,12 +1980,17 @@ mod tests {
     #[test]
     fn candidate_addresses_lead_with_the_current_layout() {
         let id = ContentId::new(ContentKind::IndexLeaf, b"leaf");
-        let addresses = candidate_addresses("memory", LEDGER, &id);
+        let addresses = candidate_addresses("memory", &ledger(), &id);
         assert_eq!(
             addresses.first().map(String::as_str),
             Some(
-                content_address("memory", ContentKind::IndexLeaf, LEDGER, &id.digest_hex())
-                    .as_str()
+                content_address(
+                    "memory",
+                    ContentKind::IndexLeaf,
+                    &ledger(),
+                    &id.digest_hex()
+                )
+                .as_str()
             )
         );
     }

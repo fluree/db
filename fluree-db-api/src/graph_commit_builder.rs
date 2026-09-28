@@ -267,7 +267,10 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
         };
 
         // 4. Fetch commit blob from content-addressed storage
-        let content_store = self.graph.fluree.content_store(&self.graph.ledger_id);
+        let content_store = self
+            .graph
+            .fluree
+            .content_store(&snapshot.storage_namespace());
         let blob = content_store.get(&commit_id).await.map_err(|e| {
             if matches!(e, fluree_db_core::error::Error::NotFound(_)) {
                 ApiError::NotFound(format!("Commit {commit_id} not found"))

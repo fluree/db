@@ -826,6 +826,8 @@ impl FlureeServerBuilder {
                     ));
                 let event_bus = Arc::clone(&integration.event_bus);
                 let rotation_fluree = Arc::clone(&state_inner.fluree);
+                let housekeeping_fluree = Arc::clone(&state_inner.fluree);
+                let orphan_sweep_interval = state_inner.config.orphan_sweep_interval();
                 let rotation_holder = routes::rotation_holder(&state_inner);
                 let leader_tasks = move || {
                     let nameservice: std::sync::Arc<
@@ -837,6 +839,11 @@ impl FlureeServerBuilder {
                         indexer_config.clone(),
                     );
                     let worker = worker.with_event_bus(Arc::clone(&event_bus));
+                    // This worker owns catch-up, so its ticks also finish
+                    // lifecycle operations a crashed leader left.
+                    handle.set_housekeeping(
+                        housekeeping_fluree.lifecycle_housekeeping(orphan_sweep_interval),
+                    );
                     // The handle owns the worker's ShutdownTrigger:
                     // dropping it fires the shutdown oneshot and `run()`
                     // exits on its FIRST select — silently, before its

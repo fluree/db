@@ -16,7 +16,7 @@ use serde_json::json;
 
 /// Seed a small dataset and return the ledger state.
 async fn seed_people(fluree: &support::MemoryFluree, ledger_id: &str) -> support::MemoryLedger {
-    let ledger0 = support::genesis_ledger(fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {
             "ex": "http://example.org/ns/",
@@ -202,7 +202,7 @@ async fn ac2a_insert_waterfall() {
     let (store, _guard) = span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "ac2a:main");
+    let ledger0 = support::genesis_ledger(&fluree, "ac2a:main").await;
 
     let insert = json!({
         "@context": {
@@ -462,7 +462,7 @@ async fn ac3_deferred_fields_recorded() {
     let (store, _guard) = span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "ac3:main");
+    let ledger0 = support::genesis_ledger(&fluree, "ac3:main").await;
 
     let insert = json!({
         "@context": {
@@ -507,7 +507,7 @@ async fn ac3_deferred_fields_recorded() {
     let (store, _guard) = span_capture::init_test_tracing();
 
     let ledger = fluree
-        .insert(support::genesis_ledger(&fluree, "ac3b:main"), &insert)
+        .insert(support::genesis_ledger(&fluree, "ac3b:main").await, &insert)
         .await
         .unwrap()
         .ledger;
@@ -548,7 +548,7 @@ async fn ac4_commit_subspan_hierarchy() {
     let (store, _guard) = span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "ac4:main");
+    let ledger0 = support::genesis_ledger(&fluree, "ac4:main").await;
 
     let insert = json!({
         "@context": {
@@ -671,7 +671,7 @@ async fn api_transaction_hierarchy_has_stage_and_commit_at_top() {
     let (store, _guard) = span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "ac6-te:main");
+    let ledger0 = support::genesis_ledger(&fluree, "ac6-te:main").await;
 
     let insert = json!({
         "@context": {
@@ -711,7 +711,7 @@ async fn query_spans_not_in_transaction_path() {
     let (store, _guard) = span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "ac7-neg:main");
+    let ledger0 = support::genesis_ledger(&fluree, "ac7-neg:main").await;
 
     // Only do an insert (no query)
     let insert = json!({
@@ -817,7 +817,7 @@ async fn all_spans_properly_closed() {
     let (store, _guard) = span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "ac8:main");
+    let ledger0 = support::genesis_ledger(&fluree, "ac8:main").await;
 
     let insert = json!({
         "@context": {
@@ -860,7 +860,7 @@ async fn annotation_hydration_emits_inject_annotations_span() {
     // would fail it on a non-annotation workload — the API layer is
     // span-clean at INFO).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "tracing-annotations:main");
+    let ledger0 = support::genesis_ledger(&fluree, "tracing-annotations:main").await;
     let ledger = fluree
         .insert(
             ledger0,
@@ -930,7 +930,7 @@ async fn annotation_cascade_emits_cascade_reifies_bundle_span() {
     // `cascade_reifies_bundle` span tagged with the cascade row
     // count. On non-annotation ledgers the gate skips it.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "tracing-cascade:main");
+    let ledger0 = support::genesis_ledger(&fluree, "tracing-cascade:main").await;
     let after_insert = fluree
         .insert(
             ledger0,
@@ -1015,7 +1015,7 @@ async fn ac9_cyclic_bgp_operator_spans() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let insert = json!({
                 "@context": {"ex": "http://example.org/ns/"},
                 "@graph": [
@@ -1232,7 +1232,7 @@ async fn ac10_index_install_spans() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let insert = json!({
                 "@context": {"ex": "http://example.org/ns/"},
                 "@id": "ex:alice",

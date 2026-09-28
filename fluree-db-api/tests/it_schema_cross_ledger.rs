@@ -28,7 +28,7 @@ fn config_iri(ledger_id: &str) -> String {
 /// Seed model ledger M with a subclass axiom, optionally inside a
 /// named graph.
 async fn seed_model(fluree: &fluree_db_api::Fluree, model_id: &str, graph_iri: Option<&str>) {
-    let model = genesis_ledger(fluree, model_id);
+    let model = genesis_ledger(fluree, model_id).await;
     let axiom = "ex:Manager rdfs:subClassOf ex:Employee .";
     let body = match graph_iri {
         Some(iri) => format!("GRAPH <{iri}> {{ {axiom} }}"),
@@ -59,7 +59,7 @@ async fn seed_data(
     graph_selector: &str,
     extra_reasoning_config: &str,
 ) {
-    let data = genesis_ledger(fluree, data_id);
+    let data = genesis_ledger(fluree, data_id).await;
     let cfg = config_iri(data_id);
     let cfg_trig = format!(
         r"
@@ -219,7 +219,7 @@ async fn dataset_query_pulls_schema_from_model_ledger() {
     seed_model(&fluree, model_id, Some(ontology_iri)).await;
     seed_data(&fluree, data_id, model_id, &format!("<{ontology_iri}>"), "").await;
 
-    let other = genesis_ledger(&fluree, other_id);
+    let other = genesis_ledger(&fluree, other_id).await;
     fluree
         .insert(
             other,
@@ -274,7 +274,7 @@ async fn dataset_follow_owl_imports_fails_closed() {
         ";\n                                 f:followOwlImports  true ",
     )
     .await;
-    let other = genesis_ledger(&fluree, other_id);
+    let other = genesis_ledger(&fluree, other_id).await;
     fluree
         .insert(
             other,

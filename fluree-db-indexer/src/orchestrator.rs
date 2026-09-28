@@ -47,7 +47,7 @@ use crate::{publish_index_result, IndexResult};
 #[cfg(feature = "embedded-orchestrator")]
 use fluree_db_core::Storage;
 use fluree_db_core::StorageBackend;
-use fluree_db_core::{LedgerId, LedgerName};
+use fluree_db_core::{LedgerId, LedgerName, StorageNamespace};
 use fluree_db_nameservice::{
     IndexingNameService, LedgerEventBus, NameServiceEvent, NsRecord, SubscriptionScope,
 };
@@ -837,12 +837,13 @@ impl GcPassContext {
     async fn run(
         &self,
         ledger_id: &LedgerId,
+        namespace: &StorageNamespace,
         root_id: &fluree_db_core::ContentId,
         gc: &GcGuard,
         in_flight: InFlightBuild,
     ) -> Result<crate::gc::CleanGarbageResult> {
         let cache_dir = self.config.artifact_cache_dir();
-        let store = self.backend.content_store(ledger_id);
+        let store = self.backend.content_store(namespace);
         let config = crate::gc::CleanGarbageConfig {
             max_old_indexes: Some(self.config.gc_max_old_indexes),
             min_time_garbage_mins: Some(self.config.gc_min_time_mins),
@@ -973,6 +974,29 @@ impl std::fmt::Debug for TriggerHandle {
     }
 }
 
+/// Work that the node owning catch-up runs on every catch-up tick, besides
+/// indexing and collection: see [`IndexerHandle::set_housekeeping`].
+///
+/// Exactly one worker per nameservice owns catch-up (the Raft leader's;
+/// never a peer's), so this runs once per deployment, every
+/// [`IndexerConfig::catchup_interval`] and once at start-up. Nothing runs it
+/// while that interval is zero.
+#[async_trait::async_trait]
+pub trait Housekeeping: Send + Sync {
+    async fn tick(&self);
+}
+
+/// The housekeeping a worker's catch-up tick runs, shared with its handle so
+/// it can be installed once the worker is running.
+type HousekeepingSlot = Arc<std::sync::RwLock<Option<Arc<dyn Housekeeping>>>>;
+
+async fn run_housekeeping(slot: &HousekeepingSlot) {
+    let housekeeping = slot.read().ok().and_then(|h| h.clone());
+    if let Some(housekeeping) = housekeeping {
+        housekeeping.tick().await;
+    }
+}
+
 /// Handle for triggering background indexing
 ///
 /// Provides APIs for:
@@ -992,6 +1016,7 @@ pub struct IndexerHandle {
     /// maintenance run from outside the worker reads through the same cache
     /// rather than a directory of its own.
     artifact_cache_dir: Arc<Path>,
+    housekeeping: HousekeepingSlot,
     /// Holding this Arc bumps the shutdown trigger's strong count;
     /// dropping the last clone fires the worker's `shutdown_rx`.
     _shutdown: Arc<ShutdownTrigger>,
@@ -1284,6 +1309,14 @@ impl TriggerHandle {
 }
 
 impl IndexerHandle {
+    /// Run `housekeeping` on this worker's catch-up ticks, replacing any
+    /// installed before. A worker that does not own catch-up never runs it.
+    pub fn set_housekeeping(&self, housekeeping: Arc<dyn Housekeeping>) {
+        if let Ok(mut slot) = self.housekeeping.write() {
+            *slot = Some(housekeeping);
+        }
+    }
+
     /// Trigger indexing for a ledger with completion tracking. See
     /// [`TriggerHandle::trigger`].
     pub async fn trigger(&self, ledger_id: &LedgerId, min_t: i64) -> IndexCompletion {
@@ -1436,6 +1469,8 @@ pub struct BackgroundIndexerWorker {
     /// Branch listing the collector's sibling check reads; see
     /// [`BranchDirectory`].
     branch_directory: Arc<BranchDirectory>,
+    /// Shared with the handle; run on each catch-up tick.
+    housekeeping: HousekeepingSlot,
 }
 
 /// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
@@ -1492,6 +1527,7 @@ impl BackgroundIndexerWorker {
         let (shutdown, shutdown_rx) = ShutdownTrigger::pair();
         let maintenance: MaintenanceHolds = Arc::default();
         let gc_locks: GcLocks = Arc::default();
+        let housekeeping: HousekeepingSlot = Arc::default();
 
         let trigger = TriggerHandle {
             states: Arc::clone(&states),
@@ -1503,6 +1539,7 @@ impl BackgroundIndexerWorker {
         let handle = IndexerHandle {
             trigger: trigger.clone(),
             artifact_cache_dir: Arc::from(config.artifact_cache_dir()),
+            housekeeping: Arc::clone(&housekeeping),
             _shutdown: shutdown,
         };
 
@@ -1520,6 +1557,7 @@ impl BackgroundIndexerWorker {
             maintenance,
             gc_locks,
             branch_directory: Arc::default(),
+            housekeeping,
         };
 
         (worker, handle)
@@ -1615,13 +1653,14 @@ impl BackgroundIndexerWorker {
                 semaphore: Arc::clone(&self.gc_semaphore),
                 locks: Arc::clone(&self.gc_locks),
             };
+            let housekeeping = Arc::clone(&self.housekeeping);
             Some(AbortOnDrop(tokio::spawn(async move {
                 catch_up_sweep(&trigger, nameservice.as_ref()).await;
                 if interval.is_zero() {
                     debug!("indexer catch-up re-sweep disabled");
                     return;
                 }
-                run_catchup_sweeps(trigger, nameservice, interval, gc_tick).await;
+                run_catchup_sweeps(trigger, nameservice, interval, gc_tick, housekeeping).await;
             })))
         } else {
             debug!("indexer catch-up sweeps disabled; another worker owns catch-up");
@@ -2279,6 +2318,7 @@ impl BackgroundIndexerWorker {
                         let gc_ctx = self.gc_context();
                         let gc_root_id = index_result.root_id.clone();
                         let gc_ledger_id = index_result.ledger_id.clone();
+                        let gc_namespace = record.storage_namespace();
                         let gc_index_t = index_result.index_t;
                         tokio::spawn(async move {
                             // Hold the permit and the per-ledger lock for the
@@ -2288,6 +2328,7 @@ impl BackgroundIndexerWorker {
                             if let Err(e) = gc_ctx
                                 .run(
                                     &gc_ledger_id,
+                                    &gc_namespace,
                                     &gc_root_id,
                                     &gc_guard,
                                     InFlightBuild::WaitOut,
@@ -2537,12 +2578,14 @@ fn stalled_ledgers(
 ///
 /// The same tick runs a collector pass over every ledger whose chain may
 /// exceed retention (see [`GcTick`]), so a ledger that stops publishing does
-/// not keep the versions its last burst left inside the age guard.
+/// not keep the versions its last burst left inside the age guard, and then
+/// any [`Housekeeping`] installed on the handle.
 async fn run_catchup_sweeps(
     handle: TriggerHandle,
     nameservice: Arc<dyn IndexingNameService>,
     interval: Duration,
     gc: GcTick,
+    housekeeping: HousekeepingSlot,
 ) {
     let mut ticker = tokio::time::interval(interval);
     // `Skip` rather than the default `Burst`: if a sweep overruns the period,
@@ -2562,6 +2605,7 @@ async fn run_catchup_sweeps(
         }
         Err(e) => warn!(error = %e, "start-up collector pass: all_records() failed"),
     }
+    run_housekeeping(&housekeeping).await;
 
     let mut last_seen: HashMap<LedgerId, i64> = HashMap::new();
     loop {
@@ -2581,6 +2625,7 @@ async fn run_catchup_sweeps(
         }
 
         gc.collect_idle(&records).await;
+        run_housekeeping(&housekeeping).await;
 
         last_seen = records
             .iter()
@@ -2637,7 +2682,13 @@ impl GcTick {
             passes += 1;
             match self
                 .ctx
-                .run(&record.ledger_id, root_id, &guard, InFlightBuild::GiveUp)
+                .run(
+                    &record.ledger_id,
+                    &record.storage_namespace(),
+                    root_id,
+                    &guard,
+                    InFlightBuild::GiveUp,
+                )
                 .await
             {
                 Ok(result) => cleaned += result.indexes_cleaned,
@@ -2871,7 +2922,12 @@ where
             // go to the device before the pointer that names them.
             let publish_result = match cs.sync().await {
                 Ok(()) => nameservice
-                    .publish_index(&ledger_addr, result.index_t, &result.root_id)
+                    .publish_index_fenced(
+                        &ledger_addr,
+                        result.fence,
+                        result.index_t,
+                        &result.root_id,
+                    )
                     .await
                     .map_err(|e| e.to_string()),
                 Err(e) => Err(format!("flush index artifacts: {e}")),
@@ -2987,7 +3043,7 @@ where
         )))
     })?;
     nameservice
-        .publish_index(&ledger_addr, result.index_t, &result.root_id)
+        .publish_index_fenced(&ledger_addr, result.fence, result.index_t, &result.root_id)
         .await
         .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
 
@@ -3002,6 +3058,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_nameservice::testing::CurrentFence;
 
     fn id(s: &str) -> LedgerId {
         LedgerId::parse(s).unwrap()
@@ -3014,7 +3071,7 @@ mod tests {
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeValue, MemoryStorage, Sid,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{CommitPublisher, NameServiceLookup};
+    use fluree_db_nameservice::NameServiceLookup;
     use fluree_db_novelty::Commit;
     use std::collections::HashMap;
 
@@ -3119,7 +3176,11 @@ mod tests {
 
         // Write via content_write_bytes (CID = SHA-256 of full blob)
         storage
-            .content_write_bytes(ContentKind::Commit, "test:main", &blob)
+            .content_write_bytes(
+                ContentKind::Commit,
+                &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+                &blob,
+            )
             .await
             .unwrap();
 
@@ -3164,6 +3225,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let orchestrator = IndexerOrchestrator::new(
@@ -3198,6 +3262,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -3241,6 +3308,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid1 = store_commit(&storage, &commit1).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid1).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -3299,6 +3369,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -3508,7 +3581,6 @@ mod tests {
         use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
         use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
         use fluree_db_core::{ContentStore, StorageWrite};
-        use fluree_db_nameservice::IndexPublisher;
 
         const LEDGER: &str = "idle:main";
         let storage = MemoryStorage::new();
@@ -3580,7 +3652,10 @@ mod tests {
             semaphore: Arc::new(Semaphore::new(1)),
             locks: Arc::default(),
         };
-        let store = fluree_db_core::storage::content_store_for(storage.clone(), LEDGER);
+        let store = fluree_db_core::storage::content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+        );
 
         tick.ctx.maintenance.lock().unwrap().insert(id(LEDGER));
         tick.collect_idle(std::slice::from_ref(&record)).await;
@@ -3611,7 +3686,6 @@ mod tests {
         use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
         use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
         use fluree_db_core::{ContentStore, DictKind, StorageWrite};
-        use fluree_db_nameservice::IndexPublisher;
 
         const MAIN: &str = "db:main";
         const DEV: &str = "db:dev";
@@ -3684,11 +3758,20 @@ mod tests {
 
         let gc = try_hold_gc(&locks, &name("db")).expect("free lock");
         let result = ctx
-            .run(&id(MAIN), &cid3, &gc, InFlightBuild::GiveUp)
+            .run(
+                &id(MAIN),
+                &StorageNamespace::legacy(&id(MAIN)),
+                &cid3,
+                &gc,
+                InFlightBuild::GiveUp,
+            )
             .await
             .unwrap();
 
-        let store = fluree_db_core::storage::content_store_for(storage.clone(), MAIN);
+        let store = fluree_db_core::storage::content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(MAIN).unwrap(),
+        );
         assert_eq!(result.indexes_cleaned, 1, "t=1 goes");
         assert_eq!(result.shared_deferred, 1);
         assert!(
@@ -3718,6 +3801,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -3761,6 +3847,9 @@ mod tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let config = IndexerConfig::small()
@@ -4864,6 +4953,42 @@ mod tests {
         );
     }
 
+    /// Housekeeping runs on the ticks of the worker that owns catch-up, and
+    /// never on one that does not: that is what keeps it to one node.
+    #[tokio::test]
+    async fn catchup_ticks_run_the_installed_housekeeping() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Count(AtomicUsize);
+        #[async_trait::async_trait]
+        impl Housekeeping for Count {
+            async fn tick(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        async fn ticks(owns_catchup: bool) -> usize {
+            let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+            let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+            let config = IndexerConfig::default()
+                .with_catchup_interval(Duration::from_millis(10))
+                .with_catchup_sweeps(owns_catchup);
+            let (worker, handle) = BackgroundIndexerWorker::new(backend, ns, config);
+            let count = Arc::new(Count(AtomicUsize::new(0)));
+            let run_task = tokio::spawn(worker.run());
+            handle.set_housekeeping(count.clone());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            run_task.abort();
+            count.0.load(Ordering::SeqCst)
+        }
+
+        assert!(
+            ticks(true).await >= 2,
+            "the catch-up owner runs it each tick"
+        );
+        assert_eq!(ticks(false).await, 0, "no other worker runs it");
+    }
+
     #[tokio::test]
     async fn trigger_if_idle_does_not_reset_the_retry_backoff() {
         let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
@@ -5008,7 +5133,7 @@ mod embedded_tests {
     };
     use fluree_db_ledger::LedgerState;
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::CommitPublisher;
+    use fluree_db_nameservice::testing::CurrentFence;
     use fluree_db_novelty::{Commit, Novelty};
     use std::collections::HashMap;
 
@@ -5125,7 +5250,11 @@ mod embedded_tests {
 
         // Write via content_write_bytes (CID = SHA-256 of full blob)
         storage
-            .content_write_bytes(ContentKind::Commit, "test:main", &blob)
+            .content_write_bytes(
+                ContentKind::Commit,
+                &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+                &blob,
+            )
             .await
             .unwrap();
 
@@ -5203,6 +5332,9 @@ mod embedded_tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         // Create a LedgerState with enough novelty to trigger threshold
@@ -5256,6 +5388,9 @@ mod embedded_tests {
             ns_split_mode: None,
         };
         let cid = store_commit(&storage, &commit).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
 
         let db = LedgerSnapshot::genesis("test:main");

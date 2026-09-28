@@ -221,7 +221,8 @@ async fn timing_wal_vs_sync() {
                 .expect("build");
             fluree.create_ledger(LEDGER).await.expect("create");
             let handle = fluree.ledger_cached(LEDGER).await.expect("cache");
-            let store = fluree.content_store(handle.id());
+            let store =
+                fluree.content_store(&fluree_db_core::StorageNamespace::legacy(handle.id()));
             let mut samples = Vec::with_capacity(SAMPLES);
             for n in 0..WARM + SAMPLES {
                 let body = json!({

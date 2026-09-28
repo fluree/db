@@ -126,6 +126,32 @@ pub const SCHEMA_VERSION: i64 = 2;
 pub const STATUS_READY: &str = "ready";
 pub const STATUS_RETRACTED: &str = "retracted";
 
+// ── Lifecycle items ─────────────────────────────────────────────────────────
+// A name binding lives at `pk = <name>` (no `:`, so it cannot collide with a
+// branch record's `name:branch` pk); a dropped-ledger entry at
+// `pk = @<instance>` (`@` is reserved in names). Neither shares a partition
+// with a branch record, so their sort keys never enter a head read's range.
+pub const SK_BINDING: &str = "binding";
+pub const SK_DROPPED: &str = "dropped";
+/// Partition key of the item recording the nameservice format, in its
+/// `schema` attribute: `@` keeps it apart from every name, and `format` is
+/// no instance id.
+pub const PK_FORMAT: &str = "@format";
+/// GSI1 kinds for listing bindings and dropped ledgers.
+pub const KIND_BINDING: &str = "binding";
+pub const KIND_DROPPED: &str = "dropped_ledger";
+/// Version counter on a binding or registry item; survives a delete, whose
+/// item stays as a tombstone without its value attribute.
+pub const ATTR_V: &str = "v";
+/// The binding, as JSON. Absent on a tombstone.
+pub const ATTR_BINDING: &str = "binding";
+/// The dropped-ledger entry, as JSON. Absent on a tombstone.
+pub const ATTR_ENTRY: &str = "entry";
+/// A branch record's fence (16 hex digits), on every item of the record.
+pub const ATTR_FENCE: &str = "fence";
+/// Set on every item of a branch record by a drop.
+pub const ATTR_FROZEN: &str = "frozen";
+
 // ── GSI1 ────────────────────────────────────────────────────────────────────
 pub const GSI1_NAME: &str = "gsi1-kind";
 

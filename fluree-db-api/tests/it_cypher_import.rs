@@ -16,7 +16,7 @@ use support::{genesis_ledger, graphdb_from_ledger};
 #[tokio::test]
 async fn bare_id_jsonld_insert_reads_from_cypher() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher-import:bare-id");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-import:bare-id").await;
     let doc = json!({"@graph": [
         {"@id": "User/1", "@type": "User", "id": 1, "name": "a"},
         {"@id": "User/2", "@type": "User", "id": 2, "name": "b"},
@@ -66,7 +66,7 @@ fn pokec_shaped_conversion_mints_key_derived_ids() {
 #[tokio::test]
 async fn pokec_shaped_round_trips_to_cypher() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher-import:pokec");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-import:pokec").await;
     let objs = cypher_to_jsonld(POKEC_SHAPED, &CypherImportOptions::default()).expect("convert");
     let l = fluree
         .insert(ledger0, &json!({"@graph": objs}))
@@ -108,7 +108,7 @@ MATCH (a:Person {id: 10}), (b:Person {id: 20})
 CREATE (a)-[k:KNOWS {since: 1999, weight: 0.5}]->(b);
 "#;
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher-import:edge-props");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher-import:edge-props").await;
     let objs = cypher_to_jsonld(script, &CypherImportOptions::default()).expect("convert");
     let l = fluree
         .insert(ledger0, &json!({"@graph": objs}))

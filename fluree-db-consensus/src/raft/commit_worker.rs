@@ -7,7 +7,7 @@
 //! the rendezvous-hash owner resolves to; each polls its branch's
 //! queue front, restages the commit locally, writes the commit blob
 //! to shared CAS, and publishes the head advance through
-//! [`CommitPublisher::publish_commit`] — which proposes
+//! [`CommitPublisher::publish_commit_fenced`] — which proposes
 //! [`Command::ApplyHead`](crate::raft::state_machine::Command::ApplyHead).
 //! The entry pops and the head advances on that apply.
 //!
@@ -48,7 +48,7 @@ use fluree_db_api::{
     StagedRebase, StagedRevert,
 };
 use fluree_db_core::task::panic_message;
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, StorageNamespace};
 use fluree_db_ledger::IndexConfig;
 use fluree_db_nameservice::{CommitPublisher, NameServiceError};
 use futures::FutureExt;
@@ -92,7 +92,7 @@ const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 /// — so a deterministic poison (e.g. [`PoisonReason::BodyMalformed`])
 /// would otherwise bounce forever and head-of-line-block the
 /// branch. Implementations dispatch by local-leader status, mirroring
-/// how [`CommitPublisher::publish_commit`] routes `ApplyHead` via
+/// how [`CommitPublisher::publish_commit_fenced`] routes `ApplyHead` via
 /// `RaftNameService::publish_commit_via_leader` on a follower.
 #[async_trait]
 pub trait QueuePoisonPublisher: Send + Sync {
@@ -178,7 +178,7 @@ pub struct StagingContext {
 ///
 /// Drains a single branch's queue: peeks the front, stages the
 /// commit, writes the commit blob, publishes the head advance through
-/// [`CommitPublisher::publish_commit`], and retires the entry. One
+/// [`CommitPublisher::publish_commit_fenced`], and retires the entry. One
 /// worker runs per active [`RefKey`] on whichever node the rendezvous
 /// owner resolves to; cross-branch concurrency is the supervisor's
 /// responsibility.
@@ -199,6 +199,23 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Where this branch's artifacts live, from its ledger's binding in
+    /// the replicated state.
+    async fn storage_namespace(&self) -> Result<StorageNamespace, WorkerError> {
+        let state = self.shared_state.read().await;
+        crate::raft::nameservice::storage_namespace_in(&state, &self.ref_key)
+            .map_err(|e| WorkerError::Transient(format!("no storage root for the branch: {e}")))
+    }
+
+    /// The fence this branch's writes present, from the replicated state.
+    async fn branch_fence(&self) -> Option<fluree_db_nameservice::Fence> {
+        let state = self.shared_state.read().await;
+        state
+            .fences
+            .get(&self.ref_key)
+            .map(|f| fluree_db_nameservice::Fence::from_u64(f.fence))
+    }
+
     fn new(
         ref_key: RefKey,
         shared_state: SharedState,
@@ -505,8 +522,10 @@ impl Worker {
     /// the worker's retry loop. `ContentStore::release` is
     /// idempotent on non-existent CIDs.
     async fn release_orphaned_commit_blob(&self, commit_id: &ContentId) {
-        let full_ledger_id = self.ref_key.ledger_id();
-        let content_store = self.staging.fluree.content_store(&full_ledger_id);
+        let Ok(namespace) = self.storage_namespace().await else {
+            return;
+        };
+        let content_store = self.staging.fluree.content_store(&namespace);
         if let Err(err) = content_store.release(commit_id).await {
             warn!(
                 commit_id = %commit_id,
@@ -524,12 +543,12 @@ impl Worker {
     /// the operation being staged.
     async fn persist_staged_blobs(
         &self,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         commit_cid: &ContentId,
         staged: &fluree_db_transact::StagedCommit,
         op: &str,
     ) -> Result<(), WorkerError> {
-        let content_store = self.staging.fluree.content_store(ledger_id);
+        let content_store = self.staging.fluree.content_store(namespace);
         for (cid, bytes) in &staged.referenced_bytes {
             content_store
                 .put_with_id(cid, bytes)
@@ -561,11 +580,10 @@ impl Worker {
     }
 
     async fn load_envelope(&self, entry: &QueueEntry) -> Result<QueuedRequest, WorkerError> {
-        let ledger_id = self.ref_key.ledger_id();
         let bytes = self
             .staging
             .fluree
-            .content_store(&ledger_id)
+            .content_store(&self.storage_namespace().await?)
             .get(&entry.request_cid)
             .await
             .map_err(|e| WorkerError::Transient(format!("CAS read of request_cid failed: {e}")))?;
@@ -741,8 +759,13 @@ impl Worker {
         // produced.
         let tally = staged_commit.tally.clone();
 
-        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "transact")
-            .await?;
+        self.persist_staged_blobs(
+            &self.storage_namespace().await?,
+            &commit_cid,
+            &staged_commit,
+            "transact",
+        )
+        .await?;
 
         // Derive post-commit state but do NOT call finalize_commit
         // here — local install runs after the publish confirms the
@@ -789,6 +812,7 @@ impl Worker {
         let ledger_name = self.ref_key.ledger_name.clone();
         let branch = self.ref_key.branch.clone();
         let StagedRevert {
+            branch_namespace,
             reverted_commits,
             conflict_count,
             strategy: applied_strategy,
@@ -831,8 +855,7 @@ impl Worker {
         })?;
         let commit_t = staged_commit.commit.t;
 
-        let ledger_id = self.ref_key.ledger_id();
-        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "revert")
+        self.persist_staged_blobs(&branch_namespace, &commit_cid, &staged_commit, "revert")
             .await?;
 
         let (_receipt, new_state) = staged_commit
@@ -883,7 +906,10 @@ impl Worker {
             merged_commit_cids,
         } = push;
         let ledger_id = self.ref_key.ledger_id();
-        let content_store = self.staging.fluree.content_store(&ledger_id);
+        let content_store = self
+            .staging
+            .fluree
+            .content_store(&self.storage_namespace().await?);
         // Read each commit's bytes back from CAS by CID. The
         // transactor wrote them before enqueueing, so a definitive
         // `NotFound` means the blob has been GC'd (or never landed)
@@ -971,7 +997,7 @@ impl Worker {
         let ledger_name = self.ref_key.ledger_name.clone();
         let StagedMerge {
             target,
-            target_id,
+            target_namespace,
             fast_forward,
             conflict_count,
             commits_copied,
@@ -1021,7 +1047,7 @@ impl Worker {
                     message: "build_merge_general produced staged commit without commit.id".into(),
                 })
             })?;
-            self.persist_staged_blobs(&target_id, &commit_cid, &staged, "merge")
+            self.persist_staged_blobs(&target_namespace, &commit_cid, &staged, "merge")
                 .await?;
             let (_receipt, new_state) = staged
                 .finalize_state()
@@ -1059,7 +1085,7 @@ impl Worker {
         let ledger_name = self.ref_key.ledger_name.clone();
         let branch = self.ref_key.branch.clone();
         let StagedRebase {
-            branch_id,
+            branch_namespace,
             source_head_id,
             source_head_t,
             fast_forward,
@@ -1098,7 +1124,7 @@ impl Worker {
             }
         };
 
-        let content_store = self.staging.fluree.content_store(&branch_id);
+        let content_store = self.staging.fluree.content_store(&branch_namespace);
         for replay in &pending_replays {
             content_store
                 .put_with_id(&replay.commit_id, &replay.commit_bytes)
@@ -1134,10 +1160,11 @@ impl Worker {
         commit_t: i64,
     ) -> Result<(), WorkerError> {
         let full_ledger_id = self.ref_key.ledger_id();
+        let fence = self.branch_fence().await;
         match self
             .publishing
             .commits
-            .publish_commit(&full_ledger_id, commit_t, &commit_id)
+            .publish_commit_fenced(&full_ledger_id, fence, commit_t, &commit_id)
             .await
         {
             Ok(()) => Ok(()),

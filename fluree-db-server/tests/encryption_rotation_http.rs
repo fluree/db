@@ -152,19 +152,27 @@ async fn rotation_runs_and_verifies_over_http() {
     assert_eq!(body["state"], json!("running"));
     assert!(body["holder"].as_str().is_some_and(|h| !h.is_empty()));
 
+    // The sweep records `completed` before its task exits, so a status read
+    // between the two sees it completed and still active here.
     let mut progress = Value::Null;
+    let mut active_here = Value::Null;
     for _ in 0..200 {
         let (status, body) = call(&state, "GET", "/v1/fluree/encryption/rotate/status", None).await;
         assert_eq!(status, StatusCode::OK);
         progress = body["progress"].clone();
-        if progress["state"] == json!("completed") {
-            assert_eq!(body["active_here"], json!(false));
+        active_here = body["active_here"].clone();
+        if progress["state"] == json!("completed") && active_here == json!(false) {
             assert_eq!(body["stalled"], json!(false));
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(progress["state"], json!("completed"), "{progress}");
+    assert_eq!(
+        active_here,
+        json!(false),
+        "the finished sweep is no longer active"
+    );
     assert!(progress["rewritten"].as_u64().unwrap() > 0);
     assert_eq!(progress["failed"], json!(0));
     assert_eq!(progress["completion"]["remaining_on_retired"], json!(0));

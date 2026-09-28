@@ -12,7 +12,7 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
 async fn seed_three_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -81,7 +81,7 @@ async fn simple_where_select_limit_with_context_returns_compacted_iri() {
 async fn class_queries_type_and_all_types() {
     // Scenario: misc-queries-test/class-queries (subset: rdf:type queries)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "misc/class-queries:main");
+    let ledger0 = genesis_ledger(&fluree, "misc/class-queries:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -136,7 +136,7 @@ async fn class_queries_type_and_all_types() {
 async fn result_formatting_expansion_variants() {
     // Scenario: misc-queries-test/result-formatting (current query section)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "misc/result-formatting:main");
+    let ledger0 = genesis_ledger(&fluree, "misc/result-formatting:main").await;
 
     let insert = json!({
         "@context": {"id":"@id","ex":"http://example.org/ns/"},
@@ -304,7 +304,7 @@ async fn result_formatting_expansion_variants() {
 async fn s_p_o_full_db_queries_parity() {
     // Scenario: misc-queries-test/s+p+o-full-db-queries (partial coverage: skip commit metadata scan)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "misc/s-p-o-full-db:main");
+    let ledger0 = genesis_ledger(&fluree, "misc/s-p-o-full-db:main").await;
     let ctx = json!([context_ex_schema(), {"rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}]);
 
     let insert = json!({
@@ -414,7 +414,7 @@ async fn s_p_o_full_db_queries_parity() {
 async fn commit_db_metadata_spo_queries_parity() {
     // Scenario: misc-queries-test/s+p+o-full-db-queries (commit/db metadata portion)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "misc/commit-metadata:main");
+    let ledger0 = genesis_ledger(&fluree, "misc/commit-metadata:main").await;
     let ctx = context_ex_schema();
 
     let tx1 = json!({
@@ -542,7 +542,7 @@ async fn illegal_reference_queries_error_on_var_predicate_with_literals() {
 async fn type_handling_parity() {
     // Scenario: misc-queries-test/type-handling
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "misc/type-handling:main");
+    let ledger0 = genesis_ledger(&fluree, "misc/type-handling:main").await;
 
     let ctx = json!({
         "id": "@id",
@@ -658,7 +658,7 @@ async fn type_handling_parity() {
         "rdf:type": "@type"
     });
 
-    let ledger1b = genesis_ledger(&fluree, "misc/type-handling-alias:main");
+    let ledger1b = genesis_ledger(&fluree, "misc/type-handling-alias:main").await;
     let db1b = fluree
         .insert(
             ledger1b,
@@ -751,7 +751,7 @@ async fn load_with_new_connection_placeholder() {
 async fn repeated_transaction_results_parity() {
     // Scenario: misc-queries-test/repeated-transaction-results
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "misc/repeated-tx-results:main");
+    let ledger0 = genesis_ledger(&fluree, "misc/repeated-tx-results:main").await;
 
     let ctx = json!({"ex": "http://example.org/ns/"});
     let tx = json!({
@@ -782,7 +782,7 @@ async fn repeated_transaction_results_parity() {
 async fn base_context_parity() {
     // Scenario: misc-queries-test/base-context
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "misc/base-context:main");
+    let ledger0 = genesis_ledger(&fluree, "misc/base-context:main").await;
 
     let insert = json!({
         "@context": {"@base": "https://flur.ee/", "ex": "http://example.com/"},
@@ -845,7 +845,7 @@ async fn base_context_parity() {
 async fn untyped_value_matching_parity() {
     // Scenario: misc-queries-test/untyped-value-matching-test
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "misc/untyped-value-matching:main");
+    let ledger0 = genesis_ledger(&fluree, "misc/untyped-value-matching:main").await;
 
     let ctx = json!({"ex": "http://example.org/ns/"});
     let tx1 = json!({
@@ -924,7 +924,7 @@ async fn indexed_untyped_value_matching_parity() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let ctx = json!({"ex": "http://example.org/ns/"});
 
             let tx1 = json!({
@@ -995,7 +995,7 @@ async fn index_range_scans() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/index-range:main";
 
-    let db0 = genesis_ledger(&fluree, ledger_id);
+    let db0 = genesis_ledger(&fluree, ledger_id).await;
 
     let insert_txn = json!({
         "@context": context_ex_schema(),
@@ -1184,7 +1184,7 @@ async fn index_range_scans() {
 // =============================================================================
 
 async fn seed_union_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -1336,7 +1336,7 @@ async fn projection_expression_error_leaves_var_unbound() {
     // surface test `sparql_projection_expression_error_leaves_var_unbound`;
     // both surfaces share the Extend (§18.5) execution path.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "exprerr-jsonld:main");
+    let ledger0 = genesis_ledger(&fluree, "exprerr-jsonld:main").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
         "@graph": [

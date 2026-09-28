@@ -22,7 +22,7 @@ fn test_index_cfg() -> IndexConfig {
 #[tokio::test]
 async fn inline_unique_property_rejects_duplicate() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/inline-constraints/duplicate:main");
+    let ledger = genesis_ledger(&fluree, "test/inline-constraints/duplicate:main").await;
 
     // Seed alice with email.
     let seed = json!({
@@ -64,7 +64,7 @@ async fn inline_unique_property_does_not_persist() {
     // without it must accept a duplicate value — the inline list
     // was transient.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/inline-constraints/transient:main");
+    let ledger = genesis_ledger(&fluree, "test/inline-constraints/transient:main").await;
 
     // Tx 1: seed alice under the inline-unique constraint.
     let opts = TxnOpts {
@@ -105,7 +105,7 @@ async fn inline_unique_property_does_not_persist() {
 #[tokio::test]
 async fn inline_unique_property_accepts_unique_values() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/inline-constraints/distinct:main");
+    let ledger = genesis_ledger(&fluree, "test/inline-constraints/distinct:main").await;
 
     let seed = json!({
         "@context": {"ex": "http://example.org/ns/"},
@@ -144,7 +144,7 @@ async fn inline_property_unknown_to_ledger_fails_loudly() {
     // disable enforcement; the strict path used here rejects
     // them up front so typos can't quietly weaken governance.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/inline-constraints/unknown:main");
+    let ledger = genesis_ledger(&fluree, "test/inline-constraints/unknown:main").await;
 
     let opts = TxnOpts {
         unique_properties: Some(vec!["http://never-seen.org/ns/whatever".to_string()]),
@@ -180,7 +180,7 @@ async fn seed_email_in_second_graph(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     fluree
         .stage_owned(ledger)
         .upsert_turtle(

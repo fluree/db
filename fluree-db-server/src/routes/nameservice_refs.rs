@@ -25,7 +25,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use fluree_db_nameservice::{CasResult, NameServiceError, RefKind, RefValue};
+use fluree_db_api::ApiError;
+use fluree_db_nameservice::{CasResult, RefKind, RefValue};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -139,8 +140,15 @@ async fn push_ref_inner(
         ServerError::internal("Write operations require a read-write nameservice")
     })?;
 
+    // Remote writers carry no fence yet, so the push presents the branch's
+    // current one: `expected` alone guards it against a concurrent writer.
+    let fence = ns
+        .lookup(alias)
+        .await
+        .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
+        .and_then(|record| record.fence);
     let result = ns
-        .compare_and_set_ref(alias, kind, body.expected.as_ref(), &body.new)
+        .compare_and_set_ref_fenced(alias, fence, kind, body.expected.as_ref(), &body.new)
         .await
         .map_err(|e| ServerError::internal(format!("CAS operation failed: {e}")))?;
 
@@ -166,8 +174,10 @@ async fn push_ref_inner(
 
 /// POST /fluree/nameservice/refs/:alias/init
 ///
-/// Initialize a ledger on the nameservice (create-if-absent).
-/// Returns `{ "created": true }` if new, `{ "created": false }` if already existed.
+/// Initialize a ledger on the nameservice (create-if-absent), as `/create`
+/// does. Returns `{ "created": true }` if new, `{ "created": false }` if the
+/// branch already existed. A branch of a ledger that already holds the name
+/// is not created here: it conflicts, and `/branch` creates it.
 pub async fn init_ledger(
     State(state): State<Arc<AppState>>,
     Path(alias): Path<String>,
@@ -179,14 +189,21 @@ pub async fn init_ledger(
         return Err(ServerError::not_found("Ledger not found"));
     }
 
-    let ns = state.fluree.nameservice_mode().publisher().ok_or_else(|| {
-        ServerError::internal("Write operations require a read-write nameservice")
-    })?;
-
-    match ns.init(&alias).await {
-        Ok(()) => Ok(Json(InitResponse { created: true })),
-        Err(NameServiceError::LedgerAlreadyExists(_)) => Ok(Json(InitResponse { created: false })),
-        Err(e) => Err(ServerError::internal(format!("Init failed: {e}"))),
+    match state.fluree.create_ledger(&alias).await {
+        Ok(_) => Ok(Json(InitResponse { created: true })),
+        Err(ApiError::LedgerExists(name)) => {
+            let existing = state
+                .fluree
+                .nameservice()
+                .lookup(&alias)
+                .await
+                .map_err(|e| ServerError::internal(format!("Init failed: {e}")))?;
+            match existing {
+                Some(_) => Ok(Json(InitResponse { created: false })),
+                None => Err(ServerError::Api(ApiError::LedgerExists(name))),
+            }
+        }
+        Err(e) => Err(ServerError::Api(e)),
     }
 }
 

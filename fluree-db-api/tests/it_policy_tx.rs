@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 /// Helper to seed test data with users.
 async fn seed_users(fluree: &support::MemoryFluree, ledger_id: &str) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let txn = json!({
         "@context": {
@@ -290,7 +290,7 @@ async fn modify_policy_denies_other_property() {
 async fn view_only_policy_blocks_modify() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "view_only_blocks");
+    let ledger0 = genesis_ledger(&fluree, "view_only_blocks").await;
 
     // Insert some data
     let txn = json!({
@@ -379,7 +379,7 @@ async fn view_only_policy_blocks_modify() {
 async fn modify_query_always_false_denies() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "modify_always_false");
+    let ledger0 = genesis_ledger(&fluree, "modify_always_false").await;
 
     // Insert some data
     let txn = json!({
@@ -480,7 +480,7 @@ async fn modify_query_always_false_denies() {
 async fn where_read_respects_view_policy() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "where_view_policy");
+    let ledger0 = genesis_ledger(&fluree, "where_view_policy").await;
 
     // Seed two users with a hidden salary and a visible name.
     let seed = json!({
@@ -621,7 +621,7 @@ async fn where_read_respects_view_policy() {
 async fn turtle_insert_enforces_modify_policy() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "policy/turtle-modify:main");
+    let ledger0 = genesis_ledger(&fluree, "policy/turtle-modify:main").await;
 
     // Seed ex:secret so the property exists in the namespace table; the policy
     // must encode the same SID the write produces.
@@ -709,7 +709,7 @@ async fn turtle_insert_enforces_modify_policy() {
 async fn identity_with_policy_class_selects_class_policies() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "identity_with_policy_class");
+    let ledger0 = genesis_ledger(&fluree, "identity_with_policy_class").await;
 
     // Store class-typed policies IN the ledger (class selection, not inline):
     // a view policy on ex:Lead and a modify property-whitelist.
@@ -876,7 +876,7 @@ async fn identity_with_policy_class_selects_class_policies() {
 async fn onclass_modify_allows_never_used_property() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "onclass_novel_property");
+    let ledger0 = genesis_ledger(&fluree, "onclass_novel_property").await;
 
     let seed = json!({
         "@context": {"ex": "http://example.org/ns/"},
@@ -941,7 +941,7 @@ async fn onclass_modify_allows_never_used_property() {
 async fn onclass_modify_denies_exclusive_property_on_non_instance() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "onclass_exclusive_leak");
+    let ledger0 = genesis_ledger(&fluree, "onclass_exclusive_leak").await;
 
     // ex:salary is used ONLY by Lead instances → stats mark it exclusive.
     let seed = json!({

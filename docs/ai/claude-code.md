@@ -42,7 +42,7 @@ Support is per-command, not global:
 
 ## Destructive operations — confirm with the user first
 
-- `fluree drop --force` is a **hard** delete (storage removed, not recoverable), and `fluree branch drop` has **no confirmation flag at all** — on a leaf branch it permanently deletes storage and cascades into retracted ancestors. `main` has no special protection. Name the exact target and get explicit user confirmation before running either.
+- `fluree drop` keeps the data (restorable with `fluree dropped restore`), but frees the name at once and refuses writers that loaded the ledger. `fluree drop --hard --force` and `fluree dropped purge --force` delete storage permanently. `fluree branch drop` has **no confirmation flag at all** — on a leaf branch it permanently deletes storage and cascades into retracted ancestors. `main` has no special protection. Name the exact target and get explicit user confirmation before running any of them.
 - Never drop and recreate a ledger underneath a running server — the server keeps stale index pointers and fails *partially* (some queries work, others 404 on leaf files). Stop the server first.
 
 ## Resource limits on shared machines

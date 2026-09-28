@@ -245,7 +245,7 @@ pub trait ContentAddressedWrite: StorageWrite {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> Result<ContentWriteResult>;
@@ -255,17 +255,18 @@ pub trait ContentAddressedWrite: StorageWrite {
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         let hash = sha256_hex(bytes);
-        self.content_write_bytes_with_hash(kind, ledger_id, &hash, bytes).await
+        self.content_write_bytes_with_hash(kind, namespace, &hash, bytes).await
     }
 }
 ```
 
 **Design notes:**
 - `ContentKind` indicates whether data is a commit or index, enabling routing to different storage tiers
+- `StorageNamespace` says where a branch's artifacts live: its ledger's storage root plus the branch (`{root}/{branch}/…`, and `{root}/@shared/…` for dictionaries). Take it from the branch's nameservice record (`NsRecord::storage_namespace`) or loaded state (`LedgerState::storage_namespace`), never from a ledger id
 - The default `content_write_bytes` implementation handles hash computation, so most backends only need to implement `content_write_bytes_with_hash`
 - Content-addressed storage enables deduplication and integrity verification
 
@@ -447,12 +448,12 @@ impl ContentAddressedWrite for MyStorage {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
-        // Build address from kind + alias + hash
-        let address = build_content_address(kind, ledger_id, content_hash_hex);
+        // Build address from kind + namespace + hash
+        let address = content_address("mystore", kind, namespace, content_hash_hex);
         self.write_bytes(&address, bytes).await?;
         Ok(ContentWriteResult {
             address,
@@ -566,7 +567,7 @@ Use the nameservice helpers, not the flat `StorageBackend::content_store(...)`:
 
 Both helpers return the flat namespace store unchanged for non-branched ledgers, so adding them to non-branch code paths costs at most a single nameservice lookup.
 
-A flat `backend.content_store(ledger_id)` on the commit-chain walk path will 404 the moment the walker steps past the fork point and tries to read an ancestor commit from the wrong namespace.
+A flat `backend.content_store(&record.storage_namespace())` on the commit-chain walk path will 404 the moment the walker steps past the fork point and tries to read an ancestor commit from the wrong namespace.
 
 ## Type Erasure with AnyStorage
 

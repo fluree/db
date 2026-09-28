@@ -487,6 +487,16 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_INDEXER_CATCHUP_INTERVAL_SECS", default_value_t = server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS)]
     pub indexer_catchup_interval_secs: u64,
 
+    /// How often to sweep storage for instance folders no ledger or dropped
+    /// ledger references (seconds); `0`, the default, never does
+    ///
+    /// Runs on the indexer's catch-up tick, on the one node that owns it, so
+    /// at most once per `--indexer-catchup-interval-secs` and never on a peer.
+    /// Each sweep lists the whole store, which on a large object store is slow
+    /// and billed per request. `fluree dropped sweep` runs one on demand.
+    #[arg(long, env = "FLUREE_ORPHAN_SWEEP_INTERVAL_SECS", default_value_t = 0)]
+    pub orphan_sweep_interval_secs: u64,
+
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 50% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
@@ -911,6 +921,7 @@ impl Default for ServerConfig {
             gc_min_time_mins: None,
             gc_hard_max_old_indexes: None,
             indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
+            orphan_sweep_interval_secs: 0,
             cache_max_mb: None,
             disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
@@ -996,6 +1007,12 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// `--orphan-sweep-interval-secs`, `None` when off.
+    pub fn orphan_sweep_interval(&self) -> Option<std::time::Duration> {
+        (self.orphan_sweep_interval_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.orphan_sweep_interval_secs))
+    }
+
     /// Create config from CLI args
     pub fn from_args() -> Self {
         Self::parse()

@@ -151,6 +151,21 @@ pub struct LedgerView {
 }
 
 impl LedgerView {
+    /// The fence this view's writes present; see
+    /// [`LedgerState::fence`](fluree_db_ledger::LedgerState::fence).
+    pub fn fence(&self) -> Option<fluree_db_nameservice::Fence> {
+        self.ns_record.as_ref().and_then(|r| r.fence)
+    }
+
+    /// Where this branch's artifacts live; see
+    /// [`LedgerState::storage_namespace`](fluree_db_ledger::LedgerState::storage_namespace).
+    pub fn storage_namespace(&self) -> fluree_db_core::StorageNamespace {
+        match &self.ns_record {
+            Some(record) => record.storage_namespace(),
+            None => fluree_db_core::StorageNamespace::legacy(&self.snapshot.ledger_id),
+        }
+    }
+
     /// Build a view from ledger state.
     ///
     /// Note: `binary_store` is set to `None` here — callers that have a

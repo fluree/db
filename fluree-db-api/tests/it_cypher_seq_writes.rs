@@ -44,7 +44,7 @@ async fn merge_chain_creates_nodes_and_edge_once() {
     // statement — the second and third guards must observe the first's
     // creations within the same commit.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:chain");
+    let l = genesis_ledger(&fluree, "it/cyseq:chain").await;
 
     let stmt = r#"MERGE (a:Person {name: "Alice"}) MERGE (b:City {name: "Paris"}) MERGE (a)-[:LIVES_IN]->(b)"#;
     let r1 = fluree.transact_cypher(l, stmt).await.expect("first run");
@@ -96,7 +96,7 @@ async fn merge_chain_reuses_existing_nodes() {
     // Alice pre-exists: the chain must bind her, create only the city and
     // the edge.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:partial");
+    let l = genesis_ledger(&fluree, "it/cyseq:partial").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (a:Person {name: "Alice", age: 30})"#)
         .await
@@ -134,7 +134,7 @@ async fn unwind_batch_relationship_upsert() {
     // The canonical loading idiom: per-row endpoint upsert + relationship
     // MERGE. Shared endpoints across rows must create once.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:batch");
+    let l = genesis_ledger(&fluree, "it/cyseq:batch").await;
 
     let stmt = r#"UNWIND $rows AS row
         MERGE (a:Person {id: row.src})
@@ -185,7 +185,7 @@ async fn match_merge_node_creates_once_per_distinct_key() {
     // MATCH. The driver creates once per distinct absent key and binds every
     // row — Cypher's actual semantics.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:match-merge");
+    let l = genesis_ledger(&fluree, "it/cyseq:match-merge").await;
     let l = fluree
         .transact_cypher_with_params(
             l,
@@ -239,7 +239,7 @@ async fn create_bound_vars_thread_into_merge() {
     // CREATE-bound variables thread as skolem Sids: each created Item must
     // connect to ITS row's category (pins VALUES-row ↔ solution order).
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:create-thread");
+    let l = genesis_ledger(&fluree, "it/cyseq:create-thread").await;
 
     let r = fluree
         .transact_cypher_with_params(
@@ -285,7 +285,7 @@ async fn create_bound_vars_thread_into_merge() {
 #[tokio::test]
 async fn on_create_and_on_match_fire_per_branch_in_chain() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:branches");
+    let l = genesis_ledger(&fluree, "it/cyseq:branches").await;
 
     let stmt = r#"MERGE (a:P {id: 1}) ON CREATE SET a.created = true ON MATCH SET a.matched = true
                   MERGE (b:P {id: 2}) ON CREATE SET b.created = true ON MATCH SET b.matched = true"#;
@@ -332,7 +332,7 @@ async fn in_batch_duplicate_key_first_creates_later_matches() {
     // second matches the just-created node (+ON MATCH) — sequential per-row
     // semantics inside one vectorized statement.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:dupkey");
+    let l = genesis_ledger(&fluree, "it/cyseq:dupkey").await;
 
     let r = fluree
         .transact_cypher_with_params(
@@ -384,7 +384,7 @@ async fn in_batch_duplicate_key_first_creates_later_matches() {
 #[tokio::test]
 async fn interleaved_set_applies_to_all_rows() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:set");
+    let l = genesis_ledger(&fluree, "it/cyseq:set").await;
 
     let r = fluree
         .transact_cypher(
@@ -420,7 +420,7 @@ async fn trailing_return_answers_from_final_row_table() {
     // table — including the MATCHED (not created) branch, which the
     // created-entity-only reconstruction could never answer.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:return");
+    let l = genesis_ledger(&fluree, "it/cyseq:return").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (a:Person {name: "Alice", age: 42})"#)
         .await
@@ -452,7 +452,7 @@ async fn trailing_return_answers_from_final_row_table() {
 #[tokio::test]
 async fn zero_matching_rows_is_a_clean_no_op() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:zero-rows");
+    let l = genesis_ledger(&fluree, "it/cyseq:zero-rows").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (a:Person {name: "Alice"})"#)
         .await
@@ -478,7 +478,7 @@ async fn zero_matching_rows_is_a_clean_no_op() {
 #[tokio::test]
 async fn anonymous_read_prefix_preserves_row_multiplicity() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:anonymous-prefix");
+    let l = genesis_ledger(&fluree, "it/cyseq:anonymous-prefix").await;
     let l = fluree
         .transact_cypher(l, r#"UNWIND [1, 2, 3] AS id CREATE (:Person {id: id})"#)
         .await
@@ -507,7 +507,7 @@ async fn anonymous_read_prefix_preserves_row_multiplicity() {
 #[tokio::test]
 async fn with_star_preserves_visible_scope_before_sequential_write() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:with-star");
+    let l = genesis_ledger(&fluree, "it/cyseq:with-star").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -543,7 +543,7 @@ async fn with_star_preserves_visible_scope_before_sequential_write() {
 #[tokio::test]
 async fn computed_on_match_values_observe_prior_duplicate_updates() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:computed-on-match");
+    let l = genesis_ledger(&fluree, "it/cyseq:computed-on-match").await;
     let l = fluree
         .transact_cypher(l, r#"CREATE (:Counter {id: "counter", count: 0})"#)
         .await
@@ -584,7 +584,7 @@ async fn computed_on_match_values_observe_prior_duplicate_updates() {
 #[tokio::test]
 async fn computed_on_create_values_can_read_the_created_binding() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:computed-on-create");
+    let l = genesis_ledger(&fluree, "it/cyseq:computed-on-create").await;
 
     let r = fluree
         .transact_cypher(
@@ -610,7 +610,7 @@ async fn computed_on_create_values_can_read_the_created_binding() {
 #[tokio::test]
 async fn path_bindings_round_trip_through_sequential_rows() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:path-row");
+    let l = genesis_ledger(&fluree, "it/cyseq:path-row").await;
     let l = fluree
         .transact_cypher(
             l,
@@ -640,7 +640,7 @@ async fn failing_clause_commits_nothing() {
     // All-or-nothing: the third clause is rejected (multi-hop MERGE), so the
     // first two clauses' staging must not surface anywhere.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:atomic");
+    let l = genesis_ledger(&fluree, "it/cyseq:atomic").await;
     let t0 = l.t();
 
     let err = fluree
@@ -664,7 +664,7 @@ async fn failing_clause_commits_nothing() {
 #[tokio::test]
 async fn delete_in_chain_rejected_clearly() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:delete-chain");
+    let l = genesis_ledger(&fluree, "it/cyseq:delete-chain").await;
 
     let err = fluree
         .transact_cypher(l, r#"MERGE (a:P {id: 1}) MATCH (b:Old) DELETE b"#)
@@ -681,7 +681,7 @@ async fn bolt_transaction_pipelines_sequential_statements() {
     // Explicit-transaction path: a multi-clause statement against the
     // private state, read-your-writes inside the transaction, atomic COMMIT.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:bolt");
+    let l = genesis_ledger(&fluree, "it/cyseq:bolt").await;
     // Committing publishes the nameservice record, so the cached-handle
     // machinery behind `begin_cypher_transaction` can resolve the ledger.
     let l = fluree
@@ -754,7 +754,7 @@ async fn commit_result_carries_fuel_and_indexing_signals() {
     // a fuel tally accumulated across every statement, plus the indexing
     // signals a transactor needs to trigger background reindexing.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:tracked");
+    let l = genesis_ledger(&fluree, "it/cyseq:tracked").await;
     let _ = fluree
         .transact_cypher(l, r#"CREATE (s:Seed {name: "s"})"#)
         .await
@@ -855,7 +855,7 @@ async fn all_reads_commit_on_uncommitted_ledger_is_a_no_op() {
 async fn commit_without_tracking_reports_no_tally() {
     // Opting out of tracking leaves the tally empty — no accidental overhead.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = genesis_ledger(&fluree, "it/cyseq:untracked");
+    let l = genesis_ledger(&fluree, "it/cyseq:untracked").await;
     let _ = fluree
         .transact_cypher(l, r#"CREATE (s:Seed {name: "s"})"#)
         .await

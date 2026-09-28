@@ -36,7 +36,7 @@ use serde_json::json;
 async fn owl2rl_same_as_symmetry() {
     // Test: owl:sameAs(a, b) => owl:sameAs(b, a)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/same-as-sym");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/same-as-sym").await;
 
     let data = json!({
         "@context": {
@@ -78,7 +78,7 @@ async fn owl2rl_same_as_symmetry() {
 async fn owl2rl_same_as_transitivity() {
     // Test: sameAs(a,b) ∧ sameAs(b,c) => sameAs(a,c)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/same-as-trans");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/same-as-trans").await;
 
     let data = json!({
         "@context": {
@@ -134,7 +134,7 @@ async fn owl2rl_same_as_transitivity() {
 async fn owl2rl_symmetric_property() {
     // Test: SymmetricProperty(P) ∧ P(x,y) => P(y,x)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-symp");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-symp").await;
 
     // Define livesWith as symmetric and assert person-a livesWith person-b
     let data = json!({
@@ -174,7 +174,7 @@ async fn owl2rl_symmetric_property() {
 async fn owl2rl_transitive_property() {
     // Test: TransitiveProperty(P) ∧ P(x,y) ∧ P(y,z) => P(x,z)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-trp");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-trp").await;
 
     let data = json!({
         "@context": {
@@ -215,7 +215,7 @@ async fn owl2rl_transitive_property() {
 async fn owl2rl_inverse_of() {
     // Test: inverseOf(P1, P2) ∧ P1(x,y) => P2(y,x)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-inv");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-inv").await;
 
     let data = json!({
         "@context": {
@@ -263,7 +263,7 @@ async fn owl2rl_inverse_of() {
 async fn owl2rl_domain_rule() {
     // Test: domain(P, C) ∧ P(x, y) => type(x, C)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-dom");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-dom").await;
 
     let data = json!({
         "@context": {
@@ -308,7 +308,7 @@ async fn owl2rl_domain_rule() {
 async fn owl2rl_range_rule() {
     // Test: range(P, C) ∧ P(x, y) => type(y, C) [when y is Ref]
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-rng");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-rng").await;
 
     let data = json!({
         "@context": {
@@ -353,7 +353,7 @@ async fn owl2rl_range_rule() {
 async fn owl2rl_functional_property() {
     // Test: FunctionalProperty(P) ∧ P(x, y1) ∧ P(x, y2) => sameAs(y1, y2)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-fp");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-fp").await;
 
     // First, declare the property as functional
     let schema = json!({
@@ -405,7 +405,7 @@ async fn owl2rl_functional_property() {
 async fn owl2rl_inverse_functional_property() {
     // Test: InverseFunctionalProperty(P) ∧ P(x1, y) ∧ P(x2, y) => sameAs(x1, x2)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-ifp");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-ifp").await;
 
     let data = json!({
         "@context": {
@@ -448,7 +448,7 @@ async fn owl2rl_inverse_functional_property() {
 async fn owl2rl_sub_property_of() {
     // Test: subPropertyOf(P1, P2) ∧ P1(x, y) => P2(x, y)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-spo1");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-spo1").await;
 
     let data = json!({
         "@context": {
@@ -487,7 +487,7 @@ async fn owl2rl_sub_property_of() {
 async fn owl2rl_property_chain_axiom() {
     // Test: propertyChainAxiom(P, [P1, P2]) ∧ P1(x, y) ∧ P2(y, z) => P(x, z)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-spo2");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-spo2").await;
 
     // Use explicit RDF list encoding since @list isn't properly supported
     let data = json!({
@@ -534,7 +534,7 @@ async fn owl2rl_property_chain_axiom() {
 async fn owl2rl_has_key() {
     // Test: hasKey(C, [P]) ∧ type(x, C) ∧ type(y, C) ∧ P(x, v) ∧ P(y, v) => sameAs(x, y)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-key");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/prp-key").await;
 
     // Use explicit RDF list encoding since @list isn't properly supported
     let data = json!({
@@ -591,7 +591,7 @@ async fn owl2rl_has_key() {
 async fn owl2rl_subclass_of() {
     // Test: type(x, C1) ∧ subClassOf(C1, C2) => type(x, C2)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cax-sco");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cax-sco").await;
 
     let data = json!({
         "@context": {
@@ -634,7 +634,7 @@ async fn owl2rl_subclass_of() {
 async fn owl2rl_equivalent_class() {
     // Test: type(x, C1) ∧ equivalentClass(C1, C2) => type(x, C2)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cax-eqc");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cax-eqc").await;
 
     let data = json!({
         "@context": {
@@ -678,7 +678,7 @@ async fn owl2rl_has_value_forward() {
     // Test: type(x, C) where C equivalentClass restriction with hasValue => P(x, v)
     // Note: This tests the "backward" entailment: class membership => property value
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-hv-forward");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-hv-forward").await;
 
     // Insert restriction definition with explicit @id for the blank node
     let schema = json!({
@@ -728,7 +728,7 @@ async fn owl2rl_has_value_backward() {
     // Test: P(x, v) where restriction hasValue(P, v) => type(x, C)
     // This tests the "forward" entailment: property value => class membership
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-hv-backward");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-hv-backward").await;
 
     // Insert schema with explicit @id for restriction
     let schema = json!({
@@ -781,7 +781,7 @@ async fn owl2rl_has_value_backward() {
 async fn owl2rl_some_values_from() {
     // Test: someValuesFrom restriction classification
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-svf");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-svf").await;
 
     // Insert schema with explicit @id for restriction
     let schema = json!({
@@ -840,7 +840,7 @@ async fn owl2rl_some_values_from() {
 async fn owl2rl_all_values_from() {
     // Test: allValuesFrom restriction inference
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-avf");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-avf").await;
 
     // Insert schema with explicit @id for restriction
     let schema = json!({
@@ -891,7 +891,7 @@ async fn owl2rl_all_values_from() {
 async fn owl2rl_max_cardinality() {
     // Test: maxCardinality=1 restriction produces sameAs
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-maxc");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-maxc").await;
 
     // Insert schema with explicit @id for restriction
     let schema = json!({
@@ -944,7 +944,7 @@ async fn owl2rl_max_cardinality() {
 async fn owl2rl_intersection_of() {
     // Test: intersectionOf rule (cls-int1, cls-int2)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-int");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-int").await;
 
     // Insert schema with explicit @id for class definition
     // Use rdf:first/rdf:rest for RDF list encoding
@@ -1007,7 +1007,7 @@ async fn owl2rl_intersection_of() {
 async fn owl2rl_union_of() {
     // Test: unionOf rule (cls-uni)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-uni");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-uni").await;
 
     // Insert schema with explicit @id for class definition using RDF list
     let schema = json!({
@@ -1068,7 +1068,7 @@ async fn owl2rl_union_of() {
 async fn owl2rl_one_of() {
     // Test: oneOf rule (cls-oo)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-oo");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/cls-oo").await;
 
     // Insert schema with explicit @id for class definition using RDF list
     let schema = json!({
@@ -1117,7 +1117,7 @@ async fn owl2rl_one_of() {
 async fn owl2rl_disabled_shows_no_derived_facts() {
     // Test that without reasoning enabled, derived facts are not visible
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/disabled");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/disabled").await;
 
     let data = json!({
         "@context": {
@@ -1160,7 +1160,7 @@ async fn owl2rl_sparql_pragma_reasoning() {
     // "reasoning" field. Symmetry is owl2rl-only (not covered by auto-RDFS),
     // so the derived edge is only visible when the pragma takes effect.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "owl2rl/sparql-pragma");
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/sparql-pragma").await;
 
     let data = json!({
         "@context": {

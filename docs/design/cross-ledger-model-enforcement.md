@@ -141,7 +141,8 @@ The helper performs, in order:
    `ctx.memo` and the global cache.
 7. **Caching.** On cache hit the materialized artifact is returned
    directly. On miss the artifact is inserted under the key
-   `(ArtifactKind, canonical_model_ledger_id, graph_iri, resolved_t)`.
+   `(ArtifactKind, canonical_model_ledger_id, graph_iri, resolved_t)`,
+   together with the model ledger's instance.
 
 A `ResolvedGraph` is term-neutral and t-fixed:
 
@@ -312,6 +313,9 @@ resolved_t)`. `ArtifactKind` is part of the key so a memoized
 same `(M, graph, t)`. New commits to M produce new keys without
 explicit invalidation; unreferenced entries age out under the
 cache's eviction policy. There is no "watermark-on-write" channel.
+The global cache also keys on M's instance: a ledger dropped and
+created again under M's name starts its `t` over, and must not be
+served the dropped ledger's artifacts.
 
 The cache value is the term-neutral `ResolvedGraph` (IRIs, not Sids).
 Per-data-ledger interning is not part of the cache key — the cache

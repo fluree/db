@@ -3382,7 +3382,7 @@ impl crate::Fluree {
         // awaits the handle just before writing the commit blob, so durability
         // is preserved but serial latency is eliminated on fast paths.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
-            let content_store = self.content_store(ledger.ledger_id());
+            let content_store = self.content_store(&ledger.storage_namespace());
             commit_opts.with_raw_txn_spawned(content_store, txn_json_for_commit)
         } else {
             commit_opts
@@ -3444,6 +3444,15 @@ impl crate::Fluree {
         index_config: &IndexConfig,
         commit_opts: CommitOpts,
     ) -> Result<(CommitReceipt, LedgerState)> {
+        // A commit publishes to the ledger's record and never creates one:
+        // a state that has none belongs to a ledger that was never created.
+        if view.base().ns_record.is_none() {
+            return Err(ApiError::NotFound(format!(
+                "Ledger not found: {}; create it with create_ledger before committing",
+                view.base().ledger_id()
+            )));
+        }
+
         // Resolve head temporal metadata if it wasn't observed at load time
         // (index == head, no novelty walk): the event-time monotonicity
         // guard and sticky dual-stamp decision in `build_commit` need it.
@@ -3451,9 +3460,11 @@ impl crate::Fluree {
         // branch-aware store because a branched ledger's head commit may
         // live in an ancestor's namespace.
         if view.base().head_temporal.is_none() && view.base().head_commit_id.is_some() {
-            let ledger_id = view.db().ledger_id.clone();
             let store = self
-                .content_store_for_record_or_id(view.base().ns_record.as_ref(), &ledger_id)
+                .content_store_for_record_or_id(
+                    view.base().ns_record.as_ref(),
+                    &view.base().storage_namespace(),
+                )
                 .await?;
             view.base_mut()
                 .ensure_head_temporal(store.as_ref())
@@ -3461,7 +3472,7 @@ impl crate::Fluree {
                 .map_err(fluree_db_transact::TransactError::from)?;
         }
 
-        let content_store = self.content_store(view.db().ledger_id.as_str());
+        let content_store = self.content_store(&view.base().storage_namespace());
         let publisher = self.publisher()?;
         let (receipt, ledger) = commit_txn(
             view,
@@ -3568,7 +3579,7 @@ impl crate::Fluree {
 
         // Spawn raw_txn upload in parallel with staging when opted in.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
-            let content_store = self.content_store(ledger.ledger_id());
+            let content_store = self.content_store(&ledger.storage_namespace());
             commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
             commit_opts
@@ -3600,7 +3611,7 @@ impl crate::Fluree {
 
         // Spawn raw_txn upload in parallel with staging when opted in.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
-            let content_store = self.content_store(ledger.ledger_id());
+            let content_store = self.content_store(&ledger.storage_namespace());
             commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
             commit_opts
@@ -3642,7 +3653,7 @@ impl crate::Fluree {
 
         // Spawn raw_txn upload in parallel with staging when opted in.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
-            let content_store = self.content_store(ledger.ledger_id());
+            let content_store = self.content_store(&ledger.storage_namespace());
             commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
             commit_opts
@@ -3746,7 +3757,7 @@ impl crate::Fluree {
 
         // Spawn raw Turtle upload in parallel with staging when opted in.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
-            let content_store = self.content_store(ledger.ledger_id());
+            let content_store = self.content_store(&ledger.storage_namespace());
             commit_opts.with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
         } else {
             commit_opts
@@ -4183,7 +4194,7 @@ impl crate::Fluree {
         // upload (spawned in parallel with staging), txn_signature for audit.
         // Spawn happens here — after credential verification succeeds — so a
         // failed verification never uploads.
-        let content_store = self.content_store(ledger.ledger_id());
+        let content_store = self.content_store(&ledger.storage_namespace());
         let commit_opts = CommitOpts::default()
             .identity(verified.did.clone())
             .with_raw_txn_spawned(content_store, raw_credential)

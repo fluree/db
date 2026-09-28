@@ -821,7 +821,12 @@ ex:bob a ex:User ;
     let indexer_config = fluree_db_indexer::IndexerConfig::default();
 
     let index_result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store("test/v3-rebuild:main"),
+        fluree.content_store(
+            &fluree
+                .storage_namespace("test/v3-rebuild:main")
+                .await
+                .unwrap(),
+        ),
         "test/v3-rebuild:main",
         &ns_record,
         indexer_config,
@@ -847,8 +852,9 @@ ex:bob a ex:User ;
     fluree
         .publisher()
         .unwrap()
-        .publish_index(
+        .publish_index_fenced(
             "test/v3-rebuild:main",
+            crate::support::fence_of(&fluree, "test/v3-rebuild:main").await,
             index_result.index_t,
             &index_result.root_id,
         )
@@ -993,7 +999,7 @@ ex:bob a ex:User ;
     let rebuild_config = fluree_db_indexer::IndexerConfig::default();
 
     let rebuild_result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store("test/v3-incr:main"),
+        fluree.content_store(&fluree.storage_namespace("test/v3-incr:main").await.unwrap()),
         "test/v3-incr:main",
         &ns_record,
         rebuild_config,
@@ -1004,8 +1010,9 @@ ex:bob a ex:User ;
     fluree
         .publisher()
         .unwrap()
-        .publish_index(
+        .publish_index_fenced(
             "test/v3-incr:main",
+            crate::support::fence_of(&fluree, "test/v3-incr:main").await,
             rebuild_result.index_t,
             &rebuild_result.root_id,
         )
@@ -1067,7 +1074,7 @@ ex:bob a ex:User ;
     );
 
     let index_result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store("test/v3-incr:main"),
+        fluree.content_store(&fluree.storage_namespace("test/v3-incr:main").await.unwrap()),
         fluree.nameservice(),
         "test/v3-incr:main",
         indexer_config,
@@ -1094,8 +1101,9 @@ ex:bob a ex:User ;
     fluree
         .publisher()
         .unwrap()
-        .publish_index(
+        .publish_index_fenced(
             "test/v3-incr:main",
+            crate::support::fence_of(&fluree, "test/v3-incr:main").await,
             index_result.index_t,
             &index_result.root_id,
         )
@@ -1267,7 +1275,12 @@ ex:remove a ex:User ;
     let indexer_config = fluree_db_indexer::IndexerConfig::default();
 
     let index_result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store("test/v3-retract:main"),
+        fluree.content_store(
+            &fluree
+                .storage_namespace("test/v3-retract:main")
+                .await
+                .unwrap(),
+        ),
         "test/v3-retract:main",
         &ns_record,
         indexer_config,
@@ -1279,8 +1292,9 @@ ex:remove a ex:User ;
     fluree
         .publisher()
         .unwrap()
-        .publish_index(
+        .publish_index_fenced(
             "test/v3-retract:main",
+            crate::support::fence_of(&fluree, "test/v3-retract:main").await,
             index_result.index_t,
             &index_result.root_id,
         )

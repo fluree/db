@@ -48,7 +48,7 @@ fn entity_c() -> String {
 /// rest link a disjoint pool. Every edge carries a wide `ns:snap` payload so
 /// an unconstrained star scan materializes real weight.
 async fn seed(fluree: &fluree_db_api::Fluree) {
-    let ledger0 = genesis_ledger(fluree, LEDGER_ID);
+    let ledger0 = genesis_ledger(fluree, LEDGER_ID).await;
     let mut graph = Vec::with_capacity(N);
     for i in 0..N {
         let (a, b) = match i {
@@ -97,7 +97,7 @@ fn sorted(mut rows: Vec<JsonValue>) -> Vec<JsonValue> {
 /// The report's two-endpoint shape, including an edge with only its first
 /// endpoint in the set so dropping the second constraint cannot pass.
 async fn seed_endpoint_report(fluree: &fluree_db_api::Fluree, n: usize, indexed: bool) {
-    let ledger = genesis_ledger(fluree, LEDGER_ID);
+    let ledger = genesis_ledger(fluree, LEDGER_ID).await;
     let graph: Vec<_> = (0..n)
         .map(|i| {
             let (a, b) = match i {
@@ -492,7 +492,7 @@ async fn property_join_probe_lanes_stay_in_a_sane_fuel_envelope() {
     // A hub entity on `ns:entity1` with many edges, so the object-anchored
     // star expands real volume through the property join rather than the
     // two rows the shared fixture's hub carries.
-    let ledger0 = genesis_ledger(&fluree, HUB_LEDGER);
+    let ledger0 = genesis_ledger(&fluree, HUB_LEDGER).await;
     let hub = entity_a();
     let mut graph = Vec::with_capacity(HUB_EDGES);
     for i in 0..HUB_EDGES {

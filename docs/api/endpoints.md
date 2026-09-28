@@ -187,7 +187,9 @@ graph targets.
 - `403 Forbidden` - Not authorized for this ledger
 - `404 Not Found` - Ledger not found
 - `409 Conflict` - Optimistic-concurrency conflict that survived the server's
-  bounded reconcile-and-retry (rare; safe to retry the request)
+  bounded reconcile-and-retry (rare; safe to retry the request), or the ledger
+  was dropped, restored or replaced since the server loaded it
+  (`err:db/Fenced`; a retry runs against the current ledger)
 - `413 Payload Too Large` - Transaction exceeds size limit
 - `500 Internal Server Error` - Server error
 
@@ -839,11 +841,16 @@ Authorization: Bearer <token>   (admin token when configured)
 
 - `201 Created`: ledger restored
 - `400 Bad Request`: malformed archive (bad preamble/frame, missing manifest, or a manifest head CID not present in the archive)
-- `409 Conflict`: a ledger with that name already exists
+- `409 Conflict`: a ledger with that name already exists, on any branch
 - `401 Unauthorized`: missing or invalid admin token
 
 On any mid-stream failure the partially-created ledger is rolled back, so a
-failed import never leaves a live, half-ingested ledger behind.
+failed import never leaves a live, half-ingested ledger behind. The rollback
+removes only the ledger the import created, and the import can be retried
+under the same name. If the server stops mid-import,
+[periodic maintenance](../operations/configuration.md#periodic-maintenance)
+rolls the ledger back once its claim on the name has gone ten minutes
+without renewal.
 
 **Example:**
 
@@ -1169,15 +1176,18 @@ as `/commit` above.
 
 ### POST /nameservice/refs/{alias}/init
 
-Create a ledger entry in the nameservice if it does not already exist.
-Idempotent.
+Create a ledger if it does not already exist, as [`/create`](#post-create)
+does. Idempotent.
 
 **Response:**
 
 ```json
-{ "created": true }   // new ledger entry was registered
-{ "created": false }  // already existed; no change
+{ "created": true }   // new ledger was created
+{ "created": false }  // this branch already existed; no change
 ```
+
+**Status Codes:**
+- `409 Conflict` - The alias names a branch that does not exist of a ledger that already holds the name. Create the branch with [`/branch`](#post-branch).
 
 ### GET /nameservice/snapshot
 
@@ -1922,6 +1932,7 @@ A flat array of ledgers and graph sources. Retracted entries are omitted.
 | `type` | `Ledger`, or the graph-source family: `BM25`, `Vector`, `Geo`, `R2RML`, `Iceberg` |
 | `t` | Commit `t` for a ledger; the index watermark for a graph source |
 | `dependencies` | Source ledger aliases a graph source derives from. Omitted for ledgers. |
+| `suspended` | `true` for a BM25 or vector index whose source ledger was dropped and another created under its name: its `t` is not comparable with the new ledger's, and a sync is refused until the index is recreated. Omitted otherwise. |
 
 `dependencies` is what lets a client pair a graph source against its source's `t` from this one response — the staleness check behind `fluree bm25 list`. A dependency alias may omit the branch, in which case `main` is implied.
 
@@ -1957,6 +1968,10 @@ POST /create
 |-------|------|----------|-------------|
 | `ledger` | string | Yes | Ledger ID (e.g., "mydb" or "mydb:main") |
 
+A name holds one ledger. The branch in `ledger` becomes the new ledger's root
+branch; further branches come from [`POST /branch`](#post-branch). Creating
+`mydb:dev` while `mydb` exists on any branch returns `409`.
+
 **Response:**
 
 ```json
@@ -1977,7 +1992,7 @@ POST /create
 - `201 Created` - Ledger created successfully
 - `400 Bad Request` - Invalid request body
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
-- `409 Conflict` - Ledger already exists
+- `409 Conflict` - A ledger already holds the name, or a drop of the name is still in progress
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -2024,18 +2039,19 @@ POST /drop
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `ledger` | string | Yes | Ledger name (e.g., `"mydb"`). Any branch-qualified form (including `"mydb:main"`) is **rejected** with a `400` — use the [`POST /drop-branch`](#post-drop-branch) endpoint (or call `drop_branch` in the Rust API) to drop a single branch. |
-| `hard` | boolean | No | If `true`, delete managed storage artifacts and purge the nameservice records. Default: `false` (soft drop). |
-
-**Scope:**
-
-`/drop` operates on the **whole ledger** — every branch under the ledger name, including any retracted-but-not-purged branches. Branches are dropped leaf-first so that if the operation aborts mid-way the surviving state stays consistent (orphan parents, never dangling children). The cross-branch `@shared/dicts/` namespace is cleaned up at the very end.
+| `hard` | boolean | No | If `true`, delete the ledger's data. Default: `false` (soft drop). |
 
 **Drop Modes:**
 
-- **Soft drop** (`hard: false`, default): Marks every branch as retracted in the nameservice and preserves storage artifacts. Aliases remain reserved; normal create/load paths treat the ledger as unavailable.
-- **Hard drop** (`hard: true`): Deletes managed storage artifacts for every branch and purges the nameservice records so the name can be reused. **This is irreversible for deleted artifacts.**
+Either way, the name is free as soon as the drop returns: a new ledger can be
+created under it, and it gets storage of its own.
 
-If no ledger is found by name, the server tries the same name as a graph source on branch `main`. Graph source hard-drop cleanup is best effort; graph-source fallback responses omit `branches_dropped` and `files_deleted`.
+- **Soft drop** (`hard: false`, default): The dropped ledger keeps its data in the dropped-ledger registry, where it can be [restored](#post-droppedrestore) under its name or [purged](#post-droppedpurge). List it with [`GET /dropped`](#get-dropped).
+- **Hard drop** (`hard: true`): Deletes the ledger's data. **This is irreversible.** If deletion is interrupted, the ledger stays in the registry as `purging` and the response reports `"data": "deleting"`; purging it finishes the job.
+
+Dropping a name whose create or import has not finished rolls that create back in either mode: nothing is kept to restore, the data it wrote is deleted, and a create still running stops. A drop that meets a restore of the same name answers `409` with `err:db/LifecycleConflict`.
+
+If no ledger is found by name, the server tries the same name as a graph source on branch `main`. Graph source hard-drop cleanup is best effort; graph-source fallback responses omit `branches_dropped`, `files_deleted`, `instance`, `name_released` and `data`.
 
 **Response:**
 
@@ -2043,40 +2059,41 @@ If no ledger is found by name, the server tries the same name as a graph source 
 {
   "ledger_id": "mydb",
   "status": "dropped",
-  "files_deleted": 73,
-  "branches_dropped": ["mydb:feature-x", "mydb:dev", "mydb:main"]
+  "instance": "01JB8ZK4X5Y6Z7A8B9C0D1E2F3",
+  "name_released": true,
+  "data": "retained"
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `ledger_id` | string | Ledger name (or graph source ID if the graph-source fallback handled the request) |
-| `status` | string | Aggregate status across branches. One of: `"dropped"`, `"already_retracted"`, `"not_found"` |
-| `files_deleted` | integer | Number of managed storage artifacts deleted (sum across branches + `@shared/dicts/` cleanup); omitted when zero |
-| `branches_dropped` | string[] | Per-branch `ledger_id`s that were dropped, in leaf-first order; omitted when empty |
+| `status` | string | One of: `"dropped"`, `"not_found"`, or `"already_retracted"` for a graph source already dropped |
+| `instance` | string | The dropped ledger's instance id, by which it is restored or purged |
+| `name_released` | boolean | Whether the name is free for a new ledger |
+| `data` | string | `"retained"` (soft drop), `"deleted"`, or `"deleting"` (a purge must be retried to finish) |
+| `files_deleted` | integer | Number of storage artifacts deleted; omitted when zero |
+| `branches_dropped` | string[] | Per-branch `ledger_id`s whose data was deleted, in leaf-first order; omitted when empty |
 | `warnings` | string[] | Non-fatal cleanup warnings; omitted when empty |
 
 **Status Codes:**
 - `200 OK` - Drop successful (or already dropped/not found)
 - `400 Bad Request` - Invalid request body, or any branch-qualified ledger id was supplied
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
-- `500 Internal Server Error` - Branch enumeration failed, or another unrecoverable error
+- `500 Internal Server Error` - An unrecoverable error; retrying the drop resumes it
 
 **Drop Sequence:**
 
 1. Parses input. `"mydb"` is the canonical form; any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) returns a `400`.
-2. Enumerates every NsRecord under the ledger name (including retracted ones).
-3. Sorts branches leaf-first via the `source_branch` parent pointers.
-4. Cancels and waits for pending background indexing on each branch.
-5. For each branch (leaf-first): deletes managed storage artifacts (hard mode) and retracts (soft) or removes the NS record (hard). Hard mode uses the parent-aware drop path so child counts on surviving parents stay accurate even under partial failure.
-6. Hard mode only: wipes the cross-branch `{ledger_name}/@shared/dicts/` namespace.
-7. Disconnects every branch from the ledger cache.
+2. Cancels and waits for pending background indexing on each branch.
+3. Marks the ledger as dropping. From here it reads as absent, no branch can be created, and creating the name returns `409` until the drop finishes.
+4. Freezes every branch against writes, records the ledger in the dropped-ledger registry, removes its branch records, and frees the name. A write from anyone who loaded the ledger before the drop fails with `409`.
+5. Hard mode only: deletes the ledger's storage, every branch and its shared dictionaries, then removes the registry entry.
+6. Disconnects every branch from the ledger cache.
 
 **Idempotency:**
 
-Safe to call multiple times:
-- Returns `"already_retracted"` when every branch was already retracted (hard mode still proceeds with cleanup for these).
-- Returns `"not_found"` without touching storage when no nameservice record exists for the ledger name. Truly orphaned artifacts with no nameservice pointer are **not** swept by `/drop`; that's a separate admin concern.
+Safe to call multiple times. A drop interrupted at any step resumes when the ledger is dropped again, keeping the mode it started with. `"not_found"` is returned without touching storage when nothing holds the name.
 
 **Examples:**
 
@@ -2086,7 +2103,7 @@ curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb"}'
 
-# Hard drop (delete every branch's artifacts + @shared/dicts - IRREVERSIBLE)
+# Hard drop (delete the ledger's data - IRREVERSIBLE)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "hard": true}'
@@ -2096,12 +2113,141 @@ curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer eyJ..." \
   -d '{"ledger": "mydb", "hard": true}'
-
-# Backwards-compatible form (accepted with a warning; prefer the bare name)
-curl -X POST http://localhost:8090/v1/fluree/drop \
-  -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb:main"}'
 ```
+
+### GET /dropped
+
+List dropped ledgers held in the registry, most recently dropped first.
+
+**URL:**
+```
+GET /dropped
+```
+
+**Authentication:** Admin-protected, like [`POST /drop`](#post-drop).
+
+**Response:**
+
+```json
+{
+  "dropped": [
+    {
+      "instance": "01JB8ZK4X5Y6Z7A8B9C0D1E2F3",
+      "name": "mydb",
+      "dropped_at": 1790467200000,
+      "state": "dropped",
+      "branches": ["main", "dev"]
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `instance` | string | Restore or purge the ledger by this id |
+| `name` | string | The name it was dropped under |
+| `dropped_at` | integer | Milliseconds since the Unix epoch |
+| `state` | string | `"dropped"`; `"restoring"` or `"purging"` when that operation was interrupted and must be retried |
+| `branches` | string[] | Its branches when it was dropped, not counting branches dropped before it |
+
+### POST /dropped/restore
+
+Restore a soft-dropped ledger under the name it was dropped under, with the
+data it had. A branch that was dropped before its ledger comes back dropped.
+A writer that loaded the ledger before it was dropped stays refused: its
+commits fail with `409`, as they do against a ledger that reuses the name.
+
+**URL:**
+```
+POST /dropped/restore
+```
+
+**Authentication:** Admin-protected.
+
+**Request Body:**
+
+```json
+{ "instance": "01JB8ZK4X5Y6Z7A8B9C0D1E2F3" }
+```
+
+**Response:** the restored ledger, in the shape of a [`GET /dropped`](#get-dropped) entry.
+
+**Status Codes:**
+- `200 OK` - Restored
+- `400 Bad Request` - `instance` is not a valid instance id
+- `404 Not Found` - No dropped ledger has this instance id
+- `409 Conflict` - Another ledger now holds the name; the dropped ledger stays in the registry. Restoring under a different name is not supported yet.
+
+### POST /dropped/purge
+
+Delete a dropped ledger's data and remove it from the registry. Resumes a
+purge, or a hard drop, whose deletion was interrupted.
+
+**URL:**
+```
+POST /dropped/purge
+```
+
+**Authentication:** Admin-protected.
+
+**Request Body:**
+
+```json
+{ "instance": "01JB8ZK4X5Y6Z7A8B9C0D1E2F3" }
+```
+
+**Response:** as for [`POST /drop`](#post-drop), with `status` `"purged"`.
+`"data": "deleting"` means some deletions failed; purge again to finish.
+
+**Status Codes:**
+- `200 OK` - Purged
+- `400 Bad Request` - `instance` is not a valid instance id
+- `404 Not Found` - No dropped ledger has this instance id
+
+### POST /dropped/sweep
+
+Delete the storage folders that no ledger and no dropped ledger owns. These
+hold files written by a writer that was still running when its ledger was
+purged, and the data of a create that never finished. Live and dropped
+ledgers are never touched, nor is data stored under a ledger's name by
+versions before instance folders.
+
+Lists the whole store. A peer forwards the request to the transaction server,
+whose nameservice knows every ledger.
+
+**URL:**
+```
+POST /dropped/sweep
+```
+
+**Authentication:** Admin-protected.
+
+**Request Body (optional):**
+
+```json
+{ "dry_run": true }
+```
+
+`dry_run` reports what would be deleted and deletes nothing. It defaults to
+`false`.
+
+**Response:**
+
+```json
+{
+  "dry_run": false,
+  "orphans": [
+    { "root": "oldledger/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3", "files": 1 }
+  ],
+  "files_deleted": 1
+}
+```
+
+`warnings` is present when some deletions failed; sweep again to retry them.
+
+**Status Codes:**
+- `200 OK` - Swept (or, on a dry run, reported)
+- `400 Bad Request` - Invalid body
 
 ### GET /context/{ledger...}
 
@@ -2359,7 +2505,7 @@ POST /drop-branch
 **Behavior:**
 
 - **Cannot drop `main`**: Returns 400 Bad Request.
-- **Leaf branch** (no children): Fully drops — deletes storage artifacts, purges NsRecord, decrements parent's child count. If the parent was previously retracted and its child count reaches 0, the parent is cascade-dropped too.
+- **Leaf branch** (no children): Fully drops — deletes storage artifacts, purges NsRecord, and unlists the branch, which takes it off its parent's child count. If the parent was previously retracted and its child count reaches 0, the parent is cascade-dropped too.
 - **Branch with children** (`branches > 0`): Retracted (hidden from listings, rejects new transactions) but storage is preserved for children. When the last child is eventually dropped, the retracted parent is cascade-purged automatically.
 
 **Status codes:**
@@ -2992,8 +3138,8 @@ Server-Sent Events (SSE) stream of nameservice changes for ledgers and graph sou
 
 | Event | Description |
 |-------|-------------|
-| `ns-record` | A ledger or graph source was published/updated |
-| `ns-retracted` | A ledger or graph source was deleted |
+| `ns-record` | A ledger or graph source was created, restored or updated. A ledger's record carries its `instance` |
+| `ns-retracted` | A ledger or graph source was dropped. A ledger's retraction carries the `instance` it belonged to when known |
 
 **Authentication:** Configurable via `--events-auth-mode none|optional|required`. See [Query peers and replication](../operations/query-peers.md) for full details including auth configuration, event payloads, and peer subscription setup.
 

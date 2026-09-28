@@ -16,7 +16,7 @@ fn geo_context() -> JsonValue {
 }
 
 async fn seed_cities(fluree: &MemoryFluree, alias: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, alias);
+    let ledger0 = genesis_ledger(fluree, alias).await;
     let ctx = geo_context();
 
     // Insert cities with geo:wktLiteral POINT locations
@@ -213,7 +213,7 @@ async fn geof_distance_in_bind_calculates_distances() {
 async fn geof_distance_with_literal_wkt_points() {
     // Test geof:distance with literal WKT POINT strings (not from database)
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "geo:literal");
+    let ledger0 = genesis_ledger(&fluree, "geo:literal").await;
 
     // Insert minimal data just to have a ledger to query against
     let insert = json!({
@@ -254,7 +254,7 @@ async fn non_point_wkt_stored_as_string() {
     // Test that non-POINT WKT geometries (like LINESTRING) are stored as strings
     // and can be queried back
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "geo:nonpoint");
+    let ledger0 = genesis_ledger(&fluree, "geo:nonpoint").await;
     let ctx = geo_context();
 
     // Insert a LINESTRING (not a POINT)

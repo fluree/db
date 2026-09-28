@@ -15,6 +15,8 @@ use fluree_sse::{SSE_KIND_GRAPH_SOURCE, SSE_KIND_LEDGER};
 #[derive(Debug, Clone)]
 pub struct LedgerState {
     pub ledger_id: String,
+    /// The ledger the heads belong to; heads of another are not comparable.
+    pub instance: Option<String>,
     pub commit_t: i64,
     pub index_t: i64,
     pub commit_head_id: Option<String>,
@@ -64,8 +66,11 @@ impl PeerState {
 
         let changed = match ledgers.get(&record.ledger_id) {
             Some(existing) => {
-                // Check if watermarks advanced
-                record.commit_t > existing.commit_t || record.index_t > existing.index_t
+                // A ledger created under the name since replaces the state,
+                // at whatever t it starts; otherwise the watermarks advanced.
+                record.instance != existing.instance
+                    || record.commit_t > existing.commit_t
+                    || record.index_t > existing.index_t
             }
             None => true, // New ledger
         };
@@ -75,6 +80,7 @@ impl PeerState {
                 record.ledger_id.clone(),
                 LedgerState {
                     ledger_id: record.ledger_id.clone(),
+                    instance: record.instance.clone(),
                     commit_t: record.commit_t,
                     index_t: record.index_t,
                     commit_head_id: record.commit_head_id.clone(),
@@ -121,10 +127,24 @@ impl PeerState {
     }
 
     /// Handle retraction (remove from state)
-    pub async fn handle_retracted(&self, kind: &str, resource_id: &str) {
+    ///
+    /// Given the `instance` a retracted branch belonged to, the state of
+    /// another ledger under the name is kept, and `false` returned: the
+    /// retraction is older than that ledger.
+    pub async fn handle_retracted(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        instance: Option<&str>,
+    ) -> bool {
         match kind {
             SSE_KIND_LEDGER => {
-                self.ledgers.write().await.remove(resource_id);
+                let mut ledgers = self.ledgers.write().await;
+                let held = ledgers.get(resource_id).and_then(|l| l.instance.as_deref());
+                if matches!((instance, held), (Some(a), Some(b)) if a != b) {
+                    return false;
+                }
+                ledgers.remove(resource_id);
             }
             SSE_KIND_GRAPH_SOURCE => {
                 self.graph_sources.write().await.remove(resource_id);
@@ -133,6 +153,7 @@ impl PeerState {
                 tracing::warn!(kind, resource_id, "Unknown retraction kind");
             }
         }
+        true
     }
 
     /// Mark snapshot complete
@@ -254,6 +275,7 @@ mod tests {
             index_head_id: Some(format!("index-cid:{index_t}")),
             index_t,
             retracted: false,
+            instance: None,
         }
     }
 
@@ -332,7 +354,35 @@ mod tests {
         assert!(state.get_ledger("books:main").await.is_some());
 
         // Retract it
-        state.handle_retracted("ledger", "books:main").await;
+        assert!(state.handle_retracted("ledger", "books:main", None).await);
+        assert!(state.get_ledger("books:main").await.is_none());
+    }
+
+    /// A ledger created under the name since replaces the state at its
+    /// lower t, and a late retraction of the old one leaves it.
+    #[tokio::test]
+    async fn a_ledger_created_under_the_name_replaces_the_old_one() {
+        let state = PeerState::new();
+        let mut old = make_ledger_record("books:main", 50, 40);
+        old.instance = Some("01JB8ZK4X5Y6Z7A8B9C0D1E2F3".to_string());
+        state.handle_ledger_record(&old).await;
+
+        let mut new = make_ledger_record("books:main", 2, 0);
+        new.instance = Some("01JC2QW7X5Y6Z7A8B9C0D1E2F3".to_string());
+        assert!(state.handle_ledger_record(&new).await);
+        assert_eq!(state.get_ledger("books:main").await.unwrap().commit_t, 2);
+
+        assert!(
+            !state
+                .handle_retracted("ledger", "books:main", old.instance.as_deref())
+                .await
+        );
+        assert!(state.get_ledger("books:main").await.is_some());
+        assert!(
+            state
+                .handle_retracted("ledger", "books:main", new.instance.as_deref())
+                .await
+        );
         assert!(state.get_ledger("books:main").await.is_none());
     }
 

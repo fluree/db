@@ -106,6 +106,16 @@ struct AppState {
     max_timeout_ms: u64,
 }
 
+/// The nameservice at `path`, moved to the current format first when it was
+/// written before name bindings, as the server moves it on start.
+fn open_nameservice(path: impl Into<PathBuf>) -> FileNameService {
+    let nameservice = FileNameService::new(path);
+    if let Err(e) = nameservice.migrate_blocking() {
+        tracing::warn!(error = %e, "could not migrate the nameservice");
+    }
+    nameservice
+}
+
 /// Index loader implementation using file-based storage and nameservice.
 ///
 /// This loader uses:
@@ -121,7 +131,7 @@ impl FileIndexLoader {
     fn new(storage_root: impl Into<PathBuf>, nameservice_path: impl Into<PathBuf>) -> Self {
         Self {
             storage: FileStorage::new(storage_root),
-            nameservice: FileNameService::new(nameservice_path),
+            nameservice: open_nameservice(nameservice_path),
         }
     }
 
@@ -147,7 +157,8 @@ impl FileIndexLoader {
             None => return Ok(Bm25Manifest::new(graph_source_id)),
         };
 
-        let cs = fluree_db_core::content_store_for(self.storage.clone(), graph_source_id);
+        let cs =
+            fluree_db_core::content_store_for(self.storage.clone(), &record.storage_namespace());
         let bytes = cs
             .get(index_cid)
             .await
@@ -179,7 +190,11 @@ impl IndexLoader for FileIndexLoader {
             })?;
 
         // Load index bytes via content store
-        let cs = fluree_db_core::content_store_for(self.storage.clone(), graph_source_id);
+        let namespace = fluree_db_core::StorageNamespace::parse_graph_source(graph_source_id)
+            .map_err(|e| ServiceError::Internal {
+                message: format!("Invalid graph source id {graph_source_id}: {e}"),
+            })?;
+        let cs = fluree_db_core::content_store_for(self.storage.clone(), &namespace);
         let bytes = cs
             .get(&entry.snapshot_id)
             .await
@@ -232,7 +247,7 @@ impl FileVectorIndexLoader {
     fn new(storage_root: impl Into<PathBuf>, nameservice_path: impl Into<PathBuf>) -> Self {
         Self {
             storage: FileStorage::new(storage_root),
-            nameservice: FileNameService::new(nameservice_path),
+            nameservice: open_nameservice(nameservice_path),
         }
     }
 }
@@ -254,11 +269,12 @@ impl VectorIndexLoader for FileVectorIndexLoader {
             address: graph_source_id.to_string(),
         })?;
 
+        let namespace = record.storage_namespace();
         let index_cid = record.index_id.ok_or_else(|| ServiceError::Internal {
             message: format!("No index CID for vector graph source: {graph_source_id}"),
         })?;
 
-        let cs = fluree_db_core::content_store_for(self.storage.clone(), graph_source_id);
+        let cs = fluree_db_core::content_store_for(self.storage.clone(), &namespace);
         let bytes = cs
             .get(&index_cid)
             .await

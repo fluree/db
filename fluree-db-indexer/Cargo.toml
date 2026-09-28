@@ -53,6 +53,7 @@ libc = "0.2"
 rayon.workspace = true
 
 [dev-dependencies]
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false, features = ["conformance"] }
 # For HLL tests (proper hash distribution)
 xxhash-rust.workspace = true
 tempfile = "3"

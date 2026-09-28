@@ -79,8 +79,12 @@ impl PeerSyncTask {
                 RemoteEvent::LedgerUpdated(record) => {
                     self.handle_ledger_updated(&record).await;
                 }
-                RemoteEvent::LedgerRetracted { ledger_id } => {
-                    self.handle_ledger_retracted(&ledger_id).await;
+                RemoteEvent::LedgerRetracted {
+                    ledger_id,
+                    instance,
+                } => {
+                    self.handle_ledger_retracted(&ledger_id, instance.as_ref())
+                        .await;
                 }
                 RemoteEvent::GraphSourceUpdated(record) => {
                     let graph_source_id = record.graph_source_id.clone();
@@ -138,10 +142,21 @@ impl PeerSyncTask {
             return;
         };
 
-        // 1. Ensure ledger exists locally (idempotent)
-        match ns.init(&record.ledger_id).await {
-            Ok(()) => {}
-            Err(NameServiceError::LedgerAlreadyExists(_)) => {}
+        // 1. Ensure ledger exists locally (idempotent), bound to the
+        // origin's instance and root so the copy reads from the origin's
+        // storage.
+        let ensured = fluree_db_nameservice::lifecycle::mirror_record(ns, record)
+            .await
+            .map(Some);
+        // The fence the local copy's writes present.
+        let fence = match ensured {
+            Ok(fence) => fence,
+            Err(NameServiceError::LedgerAlreadyExists(_)) => ns
+                .lookup(&record.ledger_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.fence),
             Err(e) => {
                 tracing::warn!(
                     alias = %record.ledger_id,
@@ -150,7 +165,7 @@ impl PeerSyncTask {
                 );
                 return;
             }
-        }
+        };
 
         // 2. Fast-forward commit head (if record has a commit)
         if record.commit_head_id.is_some() {
@@ -159,7 +174,7 @@ impl PeerSyncTask {
                 t: record.commit_t,
             };
             match ns
-                .fast_forward_commit(&record.ledger_id, &commit_head, 3)
+                .fast_forward_commit_fenced(&record.ledger_id, fence, &commit_head, 3)
                 .await
             {
                 Ok(CasResult::Updated) => {}
@@ -187,8 +202,9 @@ impl PeerSyncTask {
                         }
                     }
                     let force_result = ns
-                        .compare_and_set_ref(
+                        .compare_and_set_ref_fenced(
                             &record.ledger_id,
+                            fence,
                             RefKind::CommitHead,
                             actual.as_ref(),
                             &commit_head,
@@ -243,8 +259,9 @@ impl PeerSyncTask {
                 .ok()
                 .flatten();
             let index_result = ns
-                .compare_and_set_ref(
+                .compare_and_set_ref_fenced(
                     &record.ledger_id,
+                    fence,
                     RefKind::IndexHead,
                     current.as_ref(),
                     &index_head,
@@ -289,6 +306,7 @@ impl PeerSyncTask {
                     .index_head_id
                     .as_ref()
                     .map(std::string::ToString::to_string),
+                record.instance(),
             )
             .await;
 
@@ -302,16 +320,23 @@ impl PeerSyncTask {
         }
     }
 
-    /// Retract ledger locally and clear its in-memory watermarks. Cache
-    /// eviction follows from the retraction event the notifying
-    /// nameservice emits.
-    async fn handle_ledger_retracted(&self, ledger_id: &fluree_db_api::LedgerId) {
-        // 1. Retract via Publisher::retract()
+    /// Remove the local copy of a branch the origin dropped and clear its
+    /// in-memory watermarks. Cache eviction follows from the retraction
+    /// event the notifying nameservice emits. Given the `instance` the
+    /// branch belonged to, a copy of a later ledger under the name is left.
+    async fn handle_ledger_retracted(
+        &self,
+        ledger_id: &fluree_db_api::LedgerId,
+        instance: Option<&fluree_db_core::InstanceId>,
+    ) {
+        // 1. Remove the copy mirror_record made
         let Some(ns) = self.fluree.nameservice_mode().publisher() else {
             tracing::error!("PeerSyncTask requires a read-write nameservice");
             return;
         };
-        if let Err(e) = ns.retract(ledger_id).await {
+        if let Err(e) =
+            fluree_db_nameservice::lifecycle::unmirror_record(ns, ledger_id, instance).await
+        {
             tracing::warn!(
                 ledger_id = %ledger_id,
                 error = %e,
@@ -320,7 +345,10 @@ impl PeerSyncTask {
         }
 
         // 2. Clear in-memory watermarks
-        self.peer_state.remove_ledger(ledger_id).await;
+        if !self.peer_state.remove_ledger(ledger_id, instance).await {
+            tracing::debug!(ledger_id = %ledger_id, "Ignoring the retraction of an earlier ledger under the name");
+            return;
+        }
 
         tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
     }

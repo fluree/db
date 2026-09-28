@@ -22,7 +22,7 @@ fn ctx() -> JsonValue {
 
 async fn seed_alice_engineer(ledger_id: &str) -> (MemoryFluree, MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let txn = json!({
         "@context": ctx(),
         "@id": "ex:alice",
@@ -178,7 +178,7 @@ fn lower_update(ledger: &LedgerState, sparql: &str) -> Txn {
 async fn sparql_insert_data_with_anonymous_annotation_round_trips() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-ann-update/insert-anon";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let update = r#"
         PREFIX ex: <http://example.org/>
@@ -218,7 +218,7 @@ async fn sparql_insert_data_with_anonymous_annotation_round_trips() {
 async fn sparql_insert_data_with_named_blank_reifier_round_trips() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-ann-update/insert-named-blank";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let update = r#"
         PREFIX ex: <http://example.org/>
@@ -262,7 +262,7 @@ async fn sparql_same_id_reifying_two_edges_in_one_txn_is_rejected() {
     // and object slots diverge, so the net bundle is multi-target. The
     // net-bundle decode catches it; a plain count would not.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/multi-target-one-txn");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/multi-target-one-txn").await;
     let update = r#"
         PREFIX ex: <http://example.org/>
         INSERT DATA {
@@ -291,7 +291,7 @@ async fn sparql_reattaching_id_to_different_edge_across_txns_is_rejected() {
     // current txn alone sees a single subject assert and passes. The
     // net-bundle check folds the prior state in and rejects.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/repoint-across-txn");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/repoint-across-txn").await;
 
     let attach = r#"
         PREFIX ex: <http://example.org/>
@@ -332,7 +332,7 @@ async fn sparql_reasserting_same_annotation_across_txns_is_idempotent() {
     // the *identical* attachment must not look like a duplicate slot. RDF
     // set-semantics means the net bundle is unchanged, so it must pass.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/reassert-idempotent");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/reassert-idempotent").await;
     let update = r#"
         PREFIX ex: <http://example.org/>
         INSERT DATA { ex:alice ex:worksFor ex:acme ~ ex:ann1 {| ex:role "Engineer" |} . }
@@ -358,7 +358,7 @@ async fn sparql_reasserting_same_annotation_across_txns_is_idempotent() {
 async fn sparql_insert_data_with_named_iri_reifier_round_trips() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-ann-update/insert-named-iri";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let update = r#"
         PREFIX ex: <http://example.org/>
@@ -442,7 +442,7 @@ async fn sparql_delete_data_blank_reifier_is_rejected() {
     // SPARQL §3.1.3: blank nodes are not allowed in DELETE DATA.
     let ledger0 = {
         let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/delete-blank-rej")
+        genesis_ledger(&fluree, "it/sparql-ann-update/delete-blank-rej").await
     };
     let update = r#"
         PREFIX ex: <http://example.org/>
@@ -471,7 +471,7 @@ async fn sparql_delete_data_blank_reifier_is_rejected() {
 async fn sparql_insert_data_anonymous_in_delete_data_is_rejected() {
     let ledger0 = {
         let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/anon-in-delete-data")
+        genesis_ledger(&fluree, "it/sparql-ann-update/anon-in-delete-data").await
     };
     let update = r#"
         PREFIX ex: <http://example.org/>
@@ -500,7 +500,7 @@ async fn sparql_reifies_hidden_in_annotation_block_body_is_rejected() {
     // system-controlled predicate past the top-level check.
     let ledger0 = {
         let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/reifies-bypass")
+        genesis_ledger(&fluree, "it/sparql-ann-update/reifies-bypass").await
     };
     let update = r"
         PREFIX ex: <http://example.org/>
@@ -537,7 +537,7 @@ async fn sparql_with_scoped_annotation_template_is_rejected() {
     // separately by the quad-pattern expansion.
     let ledger0 = {
         let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/with-scoped-rej")
+        genesis_ledger(&fluree, "it/sparql-ann-update/with-scoped-rej").await
     };
     let update = r#"
         PREFIX ex: <http://example.org/>
@@ -566,7 +566,7 @@ async fn sparql_with_scoped_annotation_template_is_rejected() {
 async fn sparql_user_authored_reifies_in_insert_data_is_rejected() {
     let ledger0 = {
         let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/user-reifies")
+        genesis_ledger(&fluree, "it/sparql-ann-update/user-reifies").await
     };
     let update = r"
         PREFIX ex: <http://example.org/>
@@ -703,7 +703,7 @@ async fn sparql_select_star_does_not_leak_anonymous_reifier() {
 async fn sparql_modify_insert_template_with_annotation_round_trips() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-ann-update/modify-insert";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed a base subject so WHERE binds something.
     let seed = r#"
@@ -790,7 +790,7 @@ async fn sparql_annotation_query_returns_zero_for_unmatched_metadata() {
 async fn sparql_annotation_on_plain_string_literal_returns_source() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-ann-lit/plain";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let txn = json!({
         "@context": ctx(),
         "@id": "ex:alice",
@@ -827,7 +827,7 @@ async fn sparql_annotation_on_plain_string_literal_returns_source() {
 async fn sparql_annotation_on_lang_tagged_literal_returns_source() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-ann-lit/lang";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let txn = json!({
         "@context": ctx(),
         "@id": "ex:alice",
@@ -874,7 +874,7 @@ async fn sparql_annotation_on_lang_tagged_literal_returns_source() {
 async fn sparql_annotation_lang_tag_blocks_wrong_language_match() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-ann-lit/lang-no-cross";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let txn = json!({
         "@context": ctx(),
         "@id": "ex:alice",
@@ -966,7 +966,7 @@ async fn sparql_update_quoted_triple_with_annotation_tail_does_not_panic() {
     // `UnsupportedFeature` error before that helper is called.
     let ledger0 = {
         let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/quoted-triple-tail")
+        genesis_ledger(&fluree, "it/sparql-ann-update/quoted-triple-tail").await
     };
     let update = r"
         PREFIX ex: <http://example.org/>
@@ -1072,7 +1072,7 @@ async fn sparql_update_langstring_annotation_hydrates_via_jsonld() {
     // {| |} read-back reads the same flakes so it can't catch this;
     // JSON-LD hydration is the path that breaks.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/langstring-hydrate");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/langstring-hydrate").await;
 
     let update = r#"
         PREFIX ex: <http://example.org/>
@@ -1213,7 +1213,7 @@ async fn sparql_delete_template_anonymous_annotation_block_is_rejected() {
     // a clear message pointing at the named-reifier form.
     let ledger0 = {
         let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/delete-template-anon")
+        genesis_ledger(&fluree, "it/sparql-ann-update/delete-template-anon").await
     };
     let update = r"
         PREFIX ex: <http://example.org/>
@@ -1338,7 +1338,7 @@ async fn sparql_object_position_reified_triple_matches_jsonld_annotation() {
     // AnnotationTarget machinery instead of erroring or matching a
     // literal.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann/object-position-reified");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann/object-position-reified").await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [
@@ -1402,7 +1402,7 @@ async fn sparql_multiple_annotation_units_join_same_jsonld_annotation() {
     // same edge — both bind the single stored reifier, so the row
     // count stays 1 and ?a = ?b.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann/multi-unit");
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann/multi-unit").await;
     let txn = json!({
         "@context": ctx(),
         "@id": "ex:alice",

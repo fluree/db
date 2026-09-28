@@ -14,7 +14,7 @@ use serde_json::json;
 /// maker1 has two models, maker2 one. `ex:tag` gives maker1 a group whose
 /// members are an IRI and a string, for the mixed case.
 async fn seed(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -166,7 +166,7 @@ async fn seed_single_prefix(
     prefix: &str,
     local: &str,
 ) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"p": prefix},
         "@graph": [{"@id": format!("p:{local}"), "p:tag": "shared"}]

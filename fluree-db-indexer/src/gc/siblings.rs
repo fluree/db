@@ -22,10 +22,7 @@ pub fn siblings_of(records: &[NsRecord], ledger_id: &LedgerId) -> Vec<BranchInde
     records
         .iter()
         .filter(|r| r.ledger_id.name() == ledger_id.name() && r.ledger_id != *ledger_id)
-        .map(|r| BranchIndexHead {
-            ledger_id: r.ledger_id.clone(),
-            index_head_id: r.index_head_id.clone(),
-        })
+        .map(BranchIndexHead::of)
         .collect()
 }
 
@@ -57,7 +54,7 @@ pub async fn shared_refs_of_branches(
         let Some(head) = branch.index_head_id.as_ref() else {
             continue;
         };
-        let store = backend.content_store(&branch.ledger_id);
+        let store = backend.content_store(&branch.namespace);
         let mut walk = PrevIndexChainWalk::new(store.as_ref(), head, artifact_cache_dir);
         while let Some(entry) = walk.next_entry().await? {
             refs.extend(
@@ -93,10 +90,7 @@ pub async fn current_sibling_heads(
     let mut heads = Vec::with_capacity(siblings.len());
     for id in siblings {
         if let Some(record) = nameservice.lookup(id).await? {
-            heads.push(BranchIndexHead {
-                ledger_id: record.ledger_id,
-                index_head_id: record.index_head_id,
-            });
+            heads.push(BranchIndexHead::of(&record));
         }
     }
     Ok(heads)
@@ -195,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn current_sibling_heads_reads_each_sibling_from_the_nameservice() {
         use fluree_db_nameservice::memory::MemoryNameService;
-        use fluree_db_nameservice::{IndexPublisher, LedgerLifecycle};
+        use fluree_db_nameservice::testing::CurrentFence;
 
         let ns = MemoryNameService::new();
         let head = ContentId::new(ContentKind::IndexRoot, b"dev head");
@@ -203,7 +197,13 @@ mod tests {
             ns.create_ledger(id).unwrap();
         }
         ns.publish_index("db:dev", 7, &head).await.unwrap();
-        ns.retract("db:old").await.unwrap();
+        fluree_db_nameservice::lifecycle::begin_drop_branch(
+            &ns,
+            &fluree_db_core::LedgerName::parse("db").unwrap(),
+            "old",
+        )
+        .await
+        .unwrap();
 
         let candidates: Vec<LedgerId> = [
             "db:dev",
@@ -288,6 +288,7 @@ mod tests {
             &backend,
             &[BranchIndexHead {
                 ledger_id: id("db:dev"),
+                namespace: fluree_db_core::StorageNamespace::legacy(&id("db:dev")),
                 index_head_id: Some(dev_t3),
             }],
             None,

@@ -228,6 +228,7 @@ impl DeltaCreateConfig {
                 media_type: Some(media_type),
             }),
             model: self.model.clone(),
+            model_instance: None,
             default_allow: self.default_allow,
         }
     }
@@ -277,7 +278,8 @@ impl crate::Fluree {
         let graph_source_id = config.graph_source_id();
         info!(graph_source_id = %graph_source_id, "Creating Delta graph source");
         config.validate()?;
-        let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
+        let (model_instance, model_warnings) =
+            self.validate_source_model(config.model.as_deref()).await?;
 
         let registered = self
             .register_r2rml_mapping(
@@ -288,7 +290,8 @@ impl crate::Fluree {
             )
             .await?;
         let (triples_map_count, table_names, mapping_validated) = registered.summary();
-        let gs_config = config.to_gs_config(&registered.address);
+        let mut gs_config = config.to_gs_config(&registered.address);
+        gs_config.model_instance = model_instance;
 
         // An unresolvable secret is a registration error, not a table warning.
         let io = gs_config
@@ -661,10 +664,15 @@ pub(crate) fn mapping_source(record: &GraphSourceRecord) -> Option<MappingSource
         .and_then(|c| c.mapping)
 }
 
-pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Option<bool>) {
-    DeltaGsConfig::from_json(&record.config)
-        .ok()
-        .map_or((None, None), |c| (c.model, c.default_allow))
+pub(crate) fn policy_config(record: &GraphSourceRecord) -> super::r2rml::SourcePolicy {
+    DeltaGsConfig::from_json(&record.config).ok().map_or_else(
+        super::r2rml::SourcePolicy::default,
+        |c| super::r2rml::SourcePolicy {
+            model: c.model,
+            model_instance: c.model_instance,
+            default_allow: c.default_allow,
+        },
+    )
 }
 
 #[cfg(test)]

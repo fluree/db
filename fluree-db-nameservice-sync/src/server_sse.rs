@@ -50,6 +50,9 @@ struct NsRecordEnvelope {
 struct NsRetractedEnvelope {
     kind: String,
     resource_id: String,
+    /// Sent by servers that name the ledger a retracted branch belonged to.
+    #[serde(default)]
+    instance: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -67,6 +70,8 @@ struct LedgerSseRecord {
     source_branch: Option<String>,
     #[serde(default)]
     branches: u32,
+    #[serde(default)]
+    storage_root: Option<fluree_db_core::StorageRoot>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -116,7 +121,14 @@ fn parse_ns_retracted(data: &str) -> Result<Option<RemoteEvent>, ServerSseParseE
     };
 
     match payload.kind.as_str() {
-        SSE_KIND_LEDGER => Ok(Some(RemoteEvent::LedgerRetracted { ledger_id: id })),
+        SSE_KIND_LEDGER => Ok(Some(RemoteEvent::LedgerRetracted {
+            ledger_id: id,
+            // One this peer cannot read is treated as absent, which only
+            // loses the check it enables.
+            instance: payload
+                .instance
+                .and_then(|i| fluree_db_core::InstanceId::parse(&i).ok()),
+        })),
         SSE_KIND_GRAPH_SOURCE => Ok(Some(RemoteEvent::GraphSourceRetracted {
             graph_source_id: id,
         })),
@@ -153,6 +165,9 @@ fn ledger_sse_to_ns_record(ledger_id: LedgerId, record: LedgerSseRecord) -> NsRe
         retracted: record.retracted,
         source_branch: record.source_branch,
         branches: record.branches,
+        storage_root: record.storage_root,
+        fence: None,
+        frozen: false,
     }
 }
 
@@ -342,9 +357,39 @@ mod tests {
         };
 
         match parse_server_sse_event(&event).unwrap() {
-            Some(RemoteEvent::LedgerRetracted { ledger_id }) => assert_eq!(ledger_id, "mydb:main"),
+            Some(RemoteEvent::LedgerRetracted {
+                ledger_id,
+                instance,
+            }) => {
+                assert_eq!(ledger_id, "mydb:main");
+                assert_eq!(instance, None, "a server that sends none");
+            }
             other => panic!("expected LedgerRetracted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_retraction_names_the_ledger_it_belonged_to() {
+        let retraction = |instance: &str| SseEvent {
+            event_type: Some("ns-retracted".to_string()),
+            data: format!(
+                r#"{{"action": "ns-retracted", "kind": "ledger", "resource_id": "mydb:main",
+                    "instance": "{instance}", "emitted_at": "2025-01-01T00:00:00Z"}}"#
+            ),
+            id: None,
+        };
+        let instance = fluree_db_core::InstanceId::parse("01JB8ZK4X5Y6Z7A8B9C0D1E2F3").unwrap();
+        match parse_server_sse_event(&retraction(instance.as_str())).unwrap() {
+            Some(RemoteEvent::LedgerRetracted { instance: got, .. }) => {
+                assert_eq!(got, Some(instance));
+            }
+            other => panic!("expected LedgerRetracted, got {other:?}"),
+        }
+        // An instance this peer cannot read still retracts, unchecked.
+        assert!(matches!(
+            parse_server_sse_event(&retraction("not-an-instance")).unwrap(),
+            Some(RemoteEvent::LedgerRetracted { instance: None, .. })
+        ));
     }
 
     #[test]

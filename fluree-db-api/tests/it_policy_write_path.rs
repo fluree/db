@@ -38,7 +38,7 @@ fn test_index_config() -> IndexConfig {
 #[tokio::test]
 async fn no_config_no_inputs_yields_root() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "policy/write-root:main");
+    let ledger = genesis_ledger(&fluree, "policy/write-root:main").await;
 
     let ctx = build_transact_policy_context(
         &fluree,
@@ -65,7 +65,7 @@ async fn config_policy_class_defaults_enforced_on_writes() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "policy/write-config-defaults:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed data (registers ex: namespace) plus the write policy itself in
     // the default graph: deny modifying ex:ssn, typed ex:WritePolicy.
@@ -170,7 +170,7 @@ async fn config_policy_source_named_graph_enforced_on_writes() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "policy/write-named-graph-source:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed data in the default graph (no policy rules there).
     let r1 = fluree
@@ -283,7 +283,7 @@ async fn config_invalid_policy_source_fails_closed_on_writes() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "policy/write-invalid-source:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let r1 = fluree
         .insert(
@@ -354,7 +354,7 @@ async fn cross_ledger_policy_source_enforced_on_writes() {
 
     // --- model ledger M: modify-deny on ex:ssn in a named policy graph
     let model_id = "policy/write-xledger/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/m-policies";
     fluree
         .stage_owned(model)
@@ -380,7 +380,7 @@ async fn cross_ledger_policy_source_enforced_on_writes() {
 
     // --- data ledger D: data + cross-ledger config, no policy IRIs in D
     let data_id = "policy/write-xledger/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,
@@ -476,7 +476,7 @@ async fn cross_ledger_plus_identity_fails_closed_on_writes() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "policy/write-xledger-id/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/m-policies";
     fluree
         .stage_owned(model)
@@ -496,7 +496,7 @@ async fn cross_ledger_plus_identity_fails_closed_on_writes() {
         .expect("seed M");
 
     let data_id = "policy/write-xledger-id/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let config_iri = config_graph_iri(data_id);
     let r1 = fluree
         .stage_owned(data)
@@ -554,7 +554,7 @@ async fn cross_ledger_identity_with_config_policy_class_enforced_on_writes() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "policy/write-xledger-idclass/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/m-policies";
     fluree
         .stage_owned(model)
@@ -579,7 +579,7 @@ async fn cross_ledger_identity_with_config_policy_class_enforced_on_writes() {
         .expect("seed M policy graph");
 
     let data_id = "policy/write-xledger-idclass/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     // The identity must exist as a subject in D for ?$identity binding.
     let r1 = fluree
         .insert(
@@ -692,7 +692,7 @@ async fn cross_ledger_identity_binding_drives_fquery_modify_rule() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "policy/write-xledger-fquery/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/m-policies";
     // Full IRIs inside f:query — it executes against D, where prefixed
     // names from M's turtle context wouldn't expand.
@@ -721,7 +721,7 @@ async fn cross_ledger_identity_binding_drives_fquery_modify_rule() {
         .expect("seed M owner-only f:query rule");
 
     let data_id = "policy/write-xledger-fquery/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,

@@ -23,7 +23,7 @@ async fn seed_movie_graph() -> (MemoryFluree, MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:movie";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Minimal “movie -> book -> author” shape to exercise expansion + depth.
     let tx = json!({
@@ -116,7 +116,7 @@ fn normalize_object_arrays(value: &mut JsonValue) {
 async fn seed_simple_subject_crawl() -> (MemoryFluree, MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:ssc";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let tx = json!({
         "@context": ctx(),
@@ -463,7 +463,7 @@ async fn jsonld_query_with_faux_compact_iri_ids() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:faux-compact";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // ── Part 1: undefined prefix is rejected ──
     let tx_bad = json!({
@@ -528,7 +528,7 @@ async fn jsonld_opts_strict_compact_iri_false_allows_undefined_prefix() {
     // even when `foaf` is not defined in @context.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:strict-opt-out";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Insert with strict guard disabled
     let tx = json!({
@@ -567,7 +567,7 @@ async fn jsonld_opts_strict_compact_iri_true_explicit() {
     // behavior — undefined prefixes are still rejected.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:strict-opt-in";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let tx = json!({
         "@context": ctx(),
@@ -588,7 +588,7 @@ async fn jsonld_single_object_insert_opts_does_not_leak_as_data() {
     // is never stored as data.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:opts-no-leak-single-object";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Single-object insert (no @graph) with top-level opts
     let tx = json!({
@@ -638,7 +638,7 @@ async fn jsonld_path_alias_honors_strict_opt_out() {
     //   - opts.strictCompactIri=false: ACCEPT (pass through)
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:path-alias-opt-out";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed minimal data
     let seed = json!({
@@ -691,7 +691,7 @@ async fn jsonld_typed_literal_datatype_honors_strict_opt_out() {
     // opts.strictCompactIri when the prefix isn't in @context.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:typed-literal-opt-out";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Strict (default): undefined datatype prefix rejected
     let tx_strict = json!({
@@ -733,7 +733,7 @@ async fn jsonld_txn_meta_datatype_honors_strict_opt_out() {
     // opts.strictCompactIri.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:txn-meta-datatype-opt-out";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Strict (default): undefined datatype prefix in txn-meta → reject
     let tx_strict = json!({
@@ -890,7 +890,7 @@ async fn jsonld_expansion_nested_subselect_includes_id() {
 async fn jsonld_list_order_preservation_context_container() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:list-container";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let tx = json!({
         "@context": {
@@ -933,7 +933,7 @@ async fn jsonld_list_order_preservation_context_container() {
 async fn jsonld_list_order_preservation_explicit_list() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-basic:list-explicit";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let tx = json!({
         "@context": {

@@ -28,14 +28,14 @@ use serde_json::{json, Value as JsonValue};
 async fn apply_index<S: Storage + Clone + 'static>(
     ledger: &mut LedgerState,
     root_id: &fluree_db_core::ContentId,
-    ledger_id: &str,
+    namespace: &fluree_db_core::StorageNamespace,
     storage: &S,
     cache_dir: &std::path::Path,
 ) {
     let root_address = fluree_db_core::storage::content_address(
         storage.storage_method(),
         fluree_db_core::ContentKind::IndexRoot,
-        ledger_id,
+        namespace,
         &root_id.digest_hex(),
     );
     let bytes = storage
@@ -45,7 +45,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
 
     let cs = std::sync::Arc::new(fluree_db_core::content_store_for(
         storage.clone(),
-        ledger_id,
+        namespace,
     ));
     let store = BinaryIndexStore::load_from_root_bytes(cs, &bytes, cache_dir, None)
         .await
@@ -178,7 +178,7 @@ async fn class_property_datatype_decrements_after_delete_non_last_instance() {
     local
         .run_until(async move {
             let ledger_id = "it/stats-classprop-delete:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -215,7 +215,7 @@ async fn class_property_datatype_decrements_after_delete_non_last_instance() {
                 unreachable!("helper only returns Completed")
             };
             let root1 = root_id.expect("expected root_id after first index");
-            let loaded1 = load_ledger_snapshot(&storage, &root1, ledger_id)
+            let loaded1 = load_ledger_snapshot(&storage, &root1, &fluree.storage_namespace(ledger_id).await.unwrap())
                 .await
                 .expect("load snapshot 1");
 
@@ -252,7 +252,7 @@ async fn class_property_datatype_decrements_after_delete_non_last_instance() {
                 unreachable!("helper only returns Completed")
             };
             let root2 = root_id.expect("expected root_id after incremental refresh");
-            let loaded2 = load_ledger_snapshot(&storage, &root2, ledger_id)
+            let loaded2 = load_ledger_snapshot(&storage, &root2, &fluree.storage_namespace(ledger_id).await.unwrap())
                 .await
                 .expect("load snapshot 2");
 
@@ -305,7 +305,7 @@ async fn class_property_reattributed_after_retype() {
     local
         .run_until(async move {
             let ledger_id = "it/stats-classprop-retype:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -342,9 +342,13 @@ async fn class_property_reattributed_after_retype() {
                 unreachable!("helper only returns Completed")
             };
             let root1 = root_id.expect("expected root_id after first index");
-            let loaded1 = load_ledger_snapshot(&storage, &root1, ledger_id)
-                .await
-                .expect("load snapshot 1");
+            let loaded1 = load_ledger_snapshot(
+                &storage,
+                &root1,
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 1");
 
             assert_eq!(
                 class_prop_datatype_total(
@@ -379,9 +383,13 @@ async fn class_property_reattributed_after_retype() {
                 unreachable!("helper only returns Completed")
             };
             let root2 = root_id.expect("expected root_id after incremental refresh");
-            let loaded2 = load_ledger_snapshot(&storage, &root2, ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root2,
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
 
             // Class instance counts (already correct).
             assert_eq!(
@@ -478,7 +486,7 @@ async fn ref_class_reattributed_after_subject_retype() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-subject-retype:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -510,9 +518,13 @@ async fn ref_class_reattributed_after_subject_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
-                .await
-                .expect("load snapshot 1");
+            let loaded1 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root1"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 1");
             assert_eq!(
                 ref_class_total(
                     &loaded1,
@@ -546,9 +558,13 @@ async fn ref_class_reattributed_after_subject_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -595,7 +611,7 @@ async fn ref_class_reattributed_after_object_retype() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-object-retype:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -627,9 +643,13 @@ async fn ref_class_reattributed_after_object_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
-                .await
-                .expect("load snapshot 1");
+            let loaded1 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root1"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 1");
             assert_eq!(
                 ref_class_total(
                     &loaded1,
@@ -663,9 +683,13 @@ async fn ref_class_reattributed_after_object_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -713,7 +737,7 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-both-retype:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -771,9 +795,13 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -834,7 +862,7 @@ async fn ref_class_attributed_when_object_typed_later() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-object-typed-later:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -867,9 +895,13 @@ async fn ref_class_attributed_when_object_typed_later() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
-                .await
-                .expect("load snapshot 1");
+            let loaded1 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root1"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 1");
             assert_eq!(
                 ref_class_total(
                     &loaded1,
@@ -903,9 +935,13 @@ async fn ref_class_attributed_when_object_typed_later() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -943,7 +979,7 @@ async fn ref_class_attributed_when_subject_typed_later() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-subject-typed-later:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -996,9 +1032,13 @@ async fn ref_class_attributed_when_subject_typed_later() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -1036,7 +1076,7 @@ async fn ref_class_attributed_when_both_endpoints_typed_later() {
     local
         .run_until(async move {
             let ledger_id = "it/ref-both-typed-later:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -1088,9 +1128,13 @@ async fn ref_class_attributed_when_both_endpoints_typed_later() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
             assert_eq!(
                 ref_class_total(
                     &loaded2,
@@ -1129,7 +1173,7 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
     local
         .run_until(async move {
             let ledger_id = "it/large-retype-gate:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
@@ -1188,9 +1232,13 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
-            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
-                .await
-                .expect("load snapshot 2");
+            let loaded2 = load_ledger_snapshot(
+                &storage,
+                &root_id.expect("root2"),
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load snapshot 2");
 
             // Rebuild must produce correct current-state stats.
             assert_eq!(
@@ -1249,7 +1297,7 @@ async fn property_and_class_statistics_persist_in_db_root() {
     local
         .run_until(async move {
             let ledger_id ="it/indexing-stats:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1291,7 +1339,7 @@ async fn property_and_class_statistics_persist_in_db_root() {
             assert!(index_t >= commit_t);
             let root_cid = root_id.expect("expected root_id after indexing");
 
-            let loaded = load_ledger_snapshot(&fluree.backend().admin_storage_cloned().expect("test uses managed backend"), &root_cid, ledger_id)
+            let loaded = load_ledger_snapshot(&fluree.backend().admin_storage_cloned().expect("test uses managed backend"), &root_cid, &fluree.storage_namespace(ledger_id).await.unwrap())
             .await
             .expect("load_ledger_snapshot(root_cid)");
 
@@ -1336,7 +1384,7 @@ async fn class_statistics_decrement_after_delete_refresh() {
     local
         .run_until(async move {
             let ledger_id = "it/indexing-stats-retracts:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1394,7 +1442,7 @@ async fn class_statistics_decrement_after_delete_refresh() {
                     .admin_storage_cloned()
                     .expect("test uses managed backend"),
                 &root_cid,
-                ledger_id,
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
             )
             .await
             .expect("load_ledger_snapshot(root_cid)");
@@ -1421,7 +1469,7 @@ async fn statistics_work_with_memory_storage_when_indexed() {
     local
         .run_until(async move {
             let ledger_id = "it/indexing-stats-memory:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1459,7 +1507,7 @@ async fn statistics_work_with_memory_storage_when_indexed() {
                     .admin_storage_cloned()
                     .expect("test uses managed backend"),
                 &root_cid,
-                ledger_id,
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
             )
             .await
             .expect("load_ledger_snapshot(root_cid)");
@@ -1514,7 +1562,7 @@ async fn ledger_info_api_returns_expected_structure() {
     local
         .run_until(async move {
             let ledger_id ="test/ledger-info:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1782,7 +1830,7 @@ async fn ledger_info_api_with_context_compacts_stats_iris() {
     local
         .run_until(async move {
             let ledger_id ="test/ledger-info-ctx:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -1940,7 +1988,7 @@ async fn ledger_info_property_datatypes_option_merges_novelty() {
     local
         .run_until(async move {
             let ledger_id ="test/ledger-info-datatypes:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2056,7 +2104,7 @@ async fn ledger_info_realtime_edges_merge_novelty_ref_counts() {
     local
         .run_until(async move {
             let ledger_id = "test/ledger-info-edges:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2168,7 +2216,7 @@ async fn ledger_info_stats_update_across_novelty_then_second_index_refresh() {
     local
         .run_until(async move {
             let ledger_id = "test/ledger-info-stats-refresh:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2420,7 +2468,7 @@ async fn ndv_cardinality_estimates_are_accurate() {
     local
         .run_until(async move {
             let ledger_id = "test/ndv-accuracy:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2471,7 +2519,7 @@ async fn ndv_cardinality_estimates_are_accurate() {
                     .admin_storage_cloned()
                     .expect("test uses managed backend"),
                 &root_cid,
-                ledger_id,
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
             )
             .await
             .expect("load_ledger_snapshot(root_cid)");
@@ -2670,9 +2718,13 @@ async fn flat_property_ndv_survives_incremental_over_sketchless_base() {
                 unreachable!("helper only returns Completed")
             };
             let delta_root = root_id.expect("delta root id");
-            let delta_loaded = load_ledger_snapshot(&storage, &delta_root, ledger_id)
-                .await
-                .expect("load delta root");
+            let delta_loaded = load_ledger_snapshot(
+                &storage,
+                &delta_root,
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
+            )
+            .await
+            .expect("load delta root");
             assert!(
                 delta_loaded.t > base_view.snapshot.t,
                 "the write must publish a newer root"
@@ -2710,7 +2762,7 @@ async fn selectivity_calculation_is_correct() {
     local
         .run_until(async move {
             let ledger_id = "test/selectivity:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2814,7 +2866,7 @@ async fn multi_class_entities_tracked_correctly() {
     local
         .run_until(async move {
             let ledger_id = "test/multi-class:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -2930,7 +2982,7 @@ async fn class_property_type_distribution_tracked() {
     local
         .run_until(async move {
             let ledger_id = "test/type-distribution:main";
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -3055,7 +3107,7 @@ async fn large_dataset_statistics_accuracy() {
     local
         .run_until(async move {
             let ledger_id = "test/large-dataset:main";
-            let mut ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let mut ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 1_000_000_000,
@@ -3110,7 +3162,7 @@ async fn large_dataset_statistics_accuracy() {
                 apply_index(
                     &mut ledger,
                     &root_cid,
-                    ledger_id,
+                    &fluree.storage_namespace(ledger_id).await.unwrap(),
                     &fluree
                         .backend()
                         .admin_storage_cloned()
@@ -3133,7 +3185,7 @@ async fn large_dataset_statistics_accuracy() {
                     .admin_storage_cloned()
                     .expect("test uses managed backend"),
                 &root_cid,
-                ledger_id,
+                &fluree.storage_namespace(ledger_id).await.unwrap(),
             )
             .await
             .expect("load_ledger_snapshot(root_cid)");

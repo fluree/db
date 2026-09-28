@@ -8,32 +8,35 @@
 //!
 //! # File Layout
 //!
-//! Uses the ns@v2 format compatible with legacy implementations:
-//! - `{prefix}/ns@v2/{ledger-name}/{branch}.json` - Main record (commit info)
-//! - `{prefix}/ns@v2/{ledger-name}/{branch}.index.json` - Index record (separate for indexer)
+//! Uses the ns@v3 format compatible with legacy implementations:
+//! - `{prefix}/ns@v3/{ledger-name}/{branch}.json` - Main record (commit info)
+//! - `{prefix}/ns@v3/{ledger-name}/{branch}.index.json` - Index record (separate for indexer)
 //!
 //! # Concurrency
 //!
 //! Uses ETag-based compare-and-swap (CAS) operations for atomic updates.
 //! Under contention, operations will retry with exponential backoff.
 
+use crate::binding::{
+    BranchRecordStore, DroppedLedger, Fence, FenceOutcome, LedgerRegistry, NameBinding,
+    RegistryCas, Versioned,
+};
+use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
-    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
-    NS_VERSION,
+    merge_heads, ns_context, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
 };
 use crate::{
-    deserialize_json, parse_default_context_value, serialize_json, AdminPublisher, BranchLifecycle,
-    CasResult, CommitPublisher, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue,
-    GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher,
-    LedgerHeads, LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord,
-    RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
-    StatusPublisher, StatusValue,
+    deserialize_json, serialize_json, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
+    ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
+    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads,
+    NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup,
+    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
 use fluree_db_core::{
-    CasAction, CasOutcome, ContentId, Error as CoreError, LedgerId, StorageCas, StorageList,
-    StorageRead, StorageWrite,
+    CasAction, CasOutcome, ContentId, Error as CoreError, InstanceId, LedgerId, StorageCas,
+    StorageList, StorageRead, StorageWrite,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -66,7 +69,7 @@ impl<S: Debug> Debug for StorageNameService<S> {
 }
 
 // =============================================================================
-// Graph Source File Structures (ns@v2 format)
+// Graph Source File Structures (ns@v3 format)
 // =============================================================================
 
 /// JSON structure for graph source main config file
@@ -130,6 +133,31 @@ struct GraphSourceIndexRef {
 
 // Methods that do not depend on storage trait bounds.
 impl<S> StorageNameService<S> {
+    /// The key of `relative` under the versioned nameservice root.
+    fn ns_root_key(&self, relative: &str) -> String {
+        if self.prefix.is_empty() {
+            format!("{NS_VERSION}/{relative}")
+        } else {
+            format!("{}/{NS_VERSION}/{relative}", self.prefix)
+        }
+    }
+
+    fn binding_key(&self, name: &str) -> String {
+        self.ns_root_key(&format!("{name}/@binding.json"))
+    }
+
+    fn dropped_key(&self, instance: &InstanceId) -> String {
+        self.ns_root_key(&format!("@dropped/{instance}.json"))
+    }
+
+    /// Whether `key` is a binding or registry file rather than a record.
+    /// `@` is reserved in names and branches, so no record path has a
+    /// segment starting with it.
+    fn is_registry_key(&self, key: &str) -> bool {
+        key.strip_prefix(&self.ns_root_key(""))
+            .is_some_and(|rest| rest.split('/').any(|segment| segment.starts_with('@')))
+    }
+
     /// Create a new `NsFileV2` for initial creation.
     ///
     /// This is pure data construction and is intentionally available without
@@ -162,6 +190,8 @@ impl<S> StorageNameService<S> {
             source_branch: None,
             branch_point: None,
             branches: 0,
+            fence: None,
+            extra: Default::default(),
         }
     }
 }
@@ -349,6 +379,9 @@ where
             return Ok(None);
         }
         let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        if main.is_deleted() {
+            return Ok(None);
+        }
         let index_file: Option<NsIndexFileV2> =
             self.read_json(&self.index_key(ledger_name, branch)).await?;
         Ok(Some(merge_heads(&main, index_file.as_ref())))
@@ -387,7 +420,7 @@ where
             }
         };
 
-        // A graph-source record shares the `ns@v2/{name}/{branch}.json` key space
+        // A graph-source record shares the `ns@v3/{name}/{branch}.json` key space
         // with ledger records but uses a different schema (no `f:ledger`). Report
         // it as "not a ledger" (Ok(None)) so single-alias resolution yields a
         // clean not-found and callers fall back to graph-source resolution —
@@ -411,50 +444,7 @@ where
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
 
-        // Convert to NsRecord, parsing persisted CID strings
-        let mut record = NsRecord {
-            ledger_id: LedgerId::from_parts(&main.ledger.id, &main.branch)?,
-            name: main.ledger.id.clone(),
-            branch: main.branch,
-            commit_head_id: main
-                .commit_cid
-                .as_deref()
-                .and_then(|s| s.parse::<ContentId>().ok()),
-            config_id: main
-                .config_cid
-                .as_deref()
-                .and_then(|s| s.parse::<ContentId>().ok()),
-            commit_t: main.t,
-            index_head_id: main
-                .index
-                .as_ref()
-                .and_then(|i| i.cid.as_deref())
-                .and_then(|s| s.parse::<ContentId>().ok()),
-            index_t: main.index.as_ref().map(|i| i.t).unwrap_or(0),
-            default_context: main
-                .default_context_cid
-                .as_deref()
-                .and_then(parse_default_context_value),
-            retracted: main.status == "retracted",
-            source_branch: main
-                .source_branch
-                .or_else(|| main.branch_point.map(|bp| bp.source)),
-            branches: main.branches,
-        };
-
-        // Merge index file if it has equal or higher t (READ-TIME merge rule)
-        if let Some(index_data) = index_file {
-            if index_data.index.t >= record.index_t {
-                record.index_head_id = index_data
-                    .index
-                    .cid
-                    .as_deref()
-                    .and_then(|s| s.parse::<ContentId>().ok());
-                record.index_t = index_data.index.t;
-            }
-        }
-
-        Ok(Some(record))
+        main.into_record(index_file)
     }
 
     /// Perform an atomic read-modify-write on a JSON value.
@@ -487,31 +477,64 @@ where
             CasOutcome::Written | CasOutcome::Aborted(()) => Ok(()),
         }
     }
+}
 
-    /// Atomic read-modify-write that returns an outcome decided by the closure.
-    ///
-    /// Unlike `cas_update`, this lets the closure signal "I decided not to update" as
-    /// a non-error condition, carrying an application-level result out.
-    async fn cas_update_with_outcome<T, F>(
+impl<S> StorageNameService<S>
+where
+    S: StorageCas + Debug + Send + Sync,
+{
+    /// [`cas_update`](Self::cas_update) for a write presenting a fence:
+    /// refused with [`NameServiceError::Fenced`] unless `admits` passes the
+    /// current value.
+    async fn cas_update_fenced<T, A, F>(
         &self,
+        ledger_id: &str,
         key: &str,
+        admits: A,
+        update_fn: F,
+    ) -> Result<()>
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+        A: Fn(Option<&T>) -> bool + Send + Sync,
+        F: Fn(Option<T>) -> Option<T> + Send + Sync,
+    {
+        self.cas_update_with_outcome_fenced(ledger_id, key, admits, |current| {
+            match update_fn(current) {
+                Some(value) => CasUpdateDecision::Apply(value),
+                None => CasUpdateDecision::Skip(CasResult::Updated),
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Atomic read-modify-write for a write presenting a fence, returning an
+    /// outcome the closure decides; see
+    /// [`cas_update_fenced`](Self::cas_update_fenced).
+    async fn cas_update_with_outcome_fenced<T, A, F>(
+        &self,
+        ledger_id: &str,
+        key: &str,
+        admits: A,
         update_fn: F,
     ) -> Result<CasUpdateOutcome>
     where
         T: Serialize + for<'de> Deserialize<'de>,
+        A: Fn(Option<&T>) -> bool + Send + Sync,
         F: Fn(Option<T>) -> CasUpdateDecision<T> + Send + Sync,
     {
         let outcome = self
             .storage
             .compare_and_swap(key, |current_bytes| {
                 let current: Option<T> = current_bytes.map(deserialize_json).transpose()?;
-
+                if !admits(current.as_ref()) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
                 match update_fn(current) {
                     CasUpdateDecision::Apply(value) => {
-                        let bytes = serialize_json(&value)?;
-                        Ok(CasAction::Write(bytes))
+                        Ok(CasAction::Write(serialize_json(&value)?))
                     }
-                    CasUpdateDecision::Skip(result) => Ok(CasAction::Abort(result)),
+                    CasUpdateDecision::Skip(result) => Ok(CasAction::Abort(Ok(result))),
                 }
             })
             .await
@@ -519,7 +542,8 @@ where
 
         match outcome {
             CasOutcome::Written => Ok(CasUpdateOutcome::Updated),
-            CasOutcome::Aborted(result) => Ok(CasUpdateOutcome::Skipped(result)),
+            CasOutcome::Aborted(Ok(result)) => Ok(CasUpdateOutcome::Skipped(result)),
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
         }
     }
 }
@@ -550,7 +574,7 @@ where
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         // A graph-source record is not a ledger (#1369). `load_record` reports it
         // as Ok(None) so the caller can fall back to the graph-source path.
-        self.load_record(&ledger_name, &branch).await
+        crate::lookup_resolved(self, &ledger_name, self.load_record(&ledger_name, &branch)).await
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
@@ -572,30 +596,189 @@ where
         let mut records = Vec::new();
 
         for key in keys {
-            if !key.ends_with(".json") {
+            if !key.ends_with(".json") || self.is_registry_key(&key) {
                 continue;
             }
 
             // Keys under `{ledger_name}/` also include nested ledgers
             // (`{ledger_name}/sub/main.json`); the record says which it is.
             if let Ok(Some(record)) = self.read_record_at(&key).await {
-                if record.name == ledger_name && !record.retracted {
+                if record.name == ledger_name {
                     records.push(record);
                 }
             }
         }
 
+        let mut records = crate::read_all_resolved(self, records).await?;
+        records.retain(|r| !r.retracted);
         Ok(records)
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
+        let records = BranchRecordStore::all_raw_records(self).await?;
+        crate::read_all_resolved(self, records).await
+    }
+}
+
+impl<S> StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    /// Bring a store written before name bindings to the current format,
+    /// once: see [`crate::migration`]. Returns what it bound, or `None` when
+    /// the store was already current. Safe to repeat, to resume, and to run
+    /// from several processes at once.
+    pub async fn migrate(&self) -> Result<Option<crate::lifecycle::MigrationReport>> {
+        use crate::migration::{
+            FormatMarker, LegacyFiles, FORMAT_MARKER, LEGACY_NS_VERSION, RETIRED_FILE,
+        };
+
+        let marker_key = self.ns_root_key(FORMAT_MARKER);
+        match self.storage.read_bytes(&marker_key).await {
+            Ok(bytes) => {
+                let marker = FormatMarker::parse(&bytes)?;
+                if let Some((then, now)) = self.legacy_changes(&marker).await? {
+                    tracing::warn!(
+                        then,
+                        now,
+                        "the nameservice files under {LEGACY_NS_VERSION}/ changed after the \
+                         migration to {NS_VERSION}/ ({then} then, {now} now): an older Fluree \
+                         binary is still using this store, most likely creating a ledger \
+                         there, which this binary does not see"
+                    );
+                }
+                return Ok(None);
+            }
+            Err(CoreError::NotFound(_)) => {}
+            Err(e) => {
+                return Err(NameServiceError::storage(format!(
+                    "reading the format marker: {e}"
+                )))
+            }
+        }
+
+        let (legacy_root, relatives) = self.legacy_files().await?;
+        for relative in &relatives {
+            let key = format!("{legacy_root}{relative}");
+            let bytes = match self.storage.read_bytes(&key).await {
+                Ok(bytes) => bytes,
+                Err(CoreError::NotFound(_)) => continue,
+                Err(e) => {
+                    return Err(NameServiceError::storage(format!("reading {key}: {e}")));
+                }
+            };
+            // Retired by an interrupted attempt, which copied it first.
+            if bytes == RETIRED_FILE {
+                continue;
+            }
+            self.storage
+                .insert(&self.ns_root_key(relative), &bytes)
+                .await
+                .map_err(|e| NameServiceError::storage(format!("copying {key}: {e}")))?;
+        }
+
+        let report = crate::lifecycle::migrate_legacy(self).await?;
+        self.retire_legacy(&legacy_root, &relatives).await?;
+        let marker =
+            serde_json::to_vec_pretty(&FormatMarker::current(Some(LegacyFiles::of(&relatives))))?;
+        self.storage
+            .insert(&marker_key, &marker)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("writing the format marker: {e}")))?;
+        if !report.is_empty() {
+            tracing::info!(
+                bound = report.bound.len(),
+                dropped = report.dropped.len(),
+                "nameservice migrated from {LEGACY_NS_VERSION} to {NS_VERSION}"
+            );
+        }
+        Ok(Some(report))
+    }
+
+    /// The directory `dir` under this nameservice's prefix, with a trailing
+    /// `/`.
+    fn prefixed_dir(&self, dir: &str) -> String {
+        if self.prefix.is_empty() {
+            format!("{dir}/")
+        } else {
+            format!("{}/{dir}/", self.prefix)
+        }
+    }
+
+    /// Keep each file under `legacy_root` in the backup directory, then
+    /// replace it with [`RETIRED_FILE`](crate::migration::RETIRED_FILE); see
+    /// [`crate::migration`]. Every file is kept before any is replaced, and a
+    /// kept file is never overwritten, so an interrupted attempt resumes
+    /// without losing an original.
+    async fn retire_legacy(&self, legacy_root: &str, relatives: &[String]) -> Result<()> {
+        use crate::migration::{LEGACY_BACKUP, RETIRED_FILE};
+        let backup_root = self.prefixed_dir(LEGACY_BACKUP);
+        for relative in relatives {
+            let key = format!("{legacy_root}{relative}");
+            let bytes = match self.storage.read_bytes(&key).await {
+                Ok(bytes) => bytes,
+                Err(CoreError::NotFound(_)) => continue,
+                Err(e) => return Err(NameServiceError::storage(format!("reading {key}: {e}"))),
+            };
+            if bytes == RETIRED_FILE {
+                continue;
+            }
+            self.storage
+                .insert(&format!("{backup_root}{relative}"), &bytes)
+                .await
+                .map_err(|e| NameServiceError::storage(format!("keeping {key}: {e}")))?;
+        }
+        for relative in relatives {
+            let key = format!("{legacy_root}{relative}");
+            self.storage
+                .write_bytes(&key, RETIRED_FILE)
+                .await
+                .map_err(|e| NameServiceError::storage(format!("retiring {key}: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// The root of the address version from before name bindings, and the
+    /// files under it, relative to it, except lock and staging files.
+    async fn legacy_files(&self) -> Result<(String, Vec<String>)> {
+        use crate::migration::LEGACY_NS_VERSION;
+        let legacy_root = self.prefixed_dir(LEGACY_NS_VERSION);
+        let keys = StorageList::list_prefix(&self.storage, &legacy_root)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("listing {legacy_root}: {e}")))?;
+        let relatives = keys
+            .iter()
+            .filter_map(|key| key.strip_prefix(&legacy_root))
+            .filter(|relative| !relative.ends_with(".lock") && !relative.ends_with(".tmp"))
+            .map(str::to_string)
+            .collect();
+        Ok((legacy_root, relatives))
+    }
+
+    /// How many legacy files there were at the migration and are now, when
+    /// a binary from before name bindings has since added or removed one.
+    /// A rewrite of an existing file goes unnoticed: listing reports no
+    /// modification time. `None` for a marker that recorded no files.
+    async fn legacy_changes(
+        &self,
+        marker: &crate::migration::FormatMarker,
+    ) -> Result<Option<(usize, usize)>> {
+        let Some(then) = &marker.legacy else {
+            return Ok(None);
+        };
+        let (_, relatives) = self.legacy_files().await?;
+        let now = crate::migration::LegacyFiles::of(&relatives);
+        Ok((now != *then).then_some((then.count, now.count)))
+    }
+
+    async fn list_raw_records(&self) -> Result<Vec<NsRecord>> {
         let prefix = if self.prefix.is_empty() {
             NS_VERSION.to_string()
         } else {
             format!("{}/{}", self.prefix, NS_VERSION)
         };
 
-        // List all files under ns@v2
+        // List all files under ns@v3
         let keys = StorageList::list_prefix(&self.storage, &prefix)
             .await
             .map_err(|e| NameServiceError::storage(format!("Failed to list records: {e}")))?;
@@ -603,7 +786,7 @@ where
         let mut records = Vec::new();
 
         for key in keys {
-            if !key.ends_with(".json") {
+            if !key.ends_with(".json") || self.is_registry_key(&key) {
                 continue;
             }
 
@@ -615,8 +798,154 @@ where
                 records.push(record);
             }
         }
-
         Ok(records)
+    }
+}
+
+#[async_trait]
+impl<S> LedgerRegistry for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
+        ns_cas::read_versioned(&self.storage, &self.binding_key(name)).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&NameBinding>,
+    ) -> Result<RegistryCas<NameBinding>> {
+        ns_cas::cas_versioned(&self.storage, &self.binding_key(name), expected, new).await
+    }
+
+    async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
+        let root = self.ns_root_key("");
+        let keys = StorageList::list_prefix(&self.storage, &root)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("Failed to list bindings: {e}")))?;
+        let mut found = Vec::new();
+        for key in keys {
+            let Some(name) = key
+                .strip_prefix(&root)
+                .and_then(|rest| rest.strip_suffix("/@binding.json"))
+            else {
+                continue;
+            };
+            if let Some(binding) = self.get_binding(name).await? {
+                found.push((name.to_string(), binding));
+            }
+        }
+        Ok(found)
+    }
+
+    async fn get_dropped(&self, instance: &InstanceId) -> Result<Option<Versioned<DroppedLedger>>> {
+        ns_cas::read_versioned(&self.storage, &self.dropped_key(instance)).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &InstanceId,
+        expected: Option<u64>,
+        new: Option<&DroppedLedger>,
+    ) -> Result<RegistryCas<DroppedLedger>> {
+        ns_cas::cas_versioned(&self.storage, &self.dropped_key(instance), expected, new).await
+    }
+
+    async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
+        let dir = self.ns_root_key("@dropped/");
+        let keys = StorageList::list_prefix(&self.storage, &dir)
+            .await
+            .map_err(|e| {
+                NameServiceError::storage(format!("Failed to list dropped ledgers: {e}"))
+            })?;
+        let mut found = Vec::new();
+        for key in keys {
+            let Some(instance) = key
+                .strip_prefix(&dir)
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .and_then(|stem| InstanceId::parse(stem).ok())
+            else {
+                continue;
+            };
+            if let Some(dropped) = self.get_dropped(&instance).await? {
+                found.push(dropped);
+            }
+        }
+        Ok(found)
+    }
+}
+
+#[async_trait]
+impl<S> BranchRecordStore for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        self.list_raw_records().await
+    }
+
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
+        ns_cas::raw_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+        )
+        .await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        let (main, index) = (
+            self.ns_key(&record.name, &record.branch),
+            self.index_key(&record.name, &record.branch),
+        );
+        ns_cas::insert_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            record,
+        )
+        .await
+    }
+
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
+        ns_cas::adopt_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            fence,
+        )
+        .await
+    }
+
+    async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
+        ns_cas::freeze_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            fence,
+        )
+        .await
+    }
+
+    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        ns_cas::delete_record(&self.storage, &self.ns_key(&name, &branch), fence).await
     }
 }
 
@@ -625,235 +954,36 @@ impl<S> BranchLifecycle for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn create_branch(
+    async fn reset_head_fenced(
         &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(ContentId, i64)>,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        snapshot: crate::NsRecordSnapshot,
     ) -> Result<()> {
-        let key = self.ns_key(ledger_name, new_branch);
-        let normalized_id = format_ledger_id(ledger_name, new_branch);
-
-        // Read the source branch to validate it exists (and to get commit info
-        // when `at_commit` is None).
-        let source_record = self
-            .load_record(ledger_name, source_branch)
-            .await?
-            .ok_or_else(|| {
-                NameServiceError::not_found(format!("source branch {ledger_name}:{source_branch}"))
-            })?;
-
-        let (commit_head_id, commit_t) = match at_commit {
-            Some((id, t)) => (Some(id), t),
-            None => (source_record.commit_head_id.clone(), source_record.commit_t),
-        };
-
-        let file = NsFileV2 {
-            context: ns_context(),
-            id: normalized_id.clone(),
-            record_type: vec!["f:LedgerSource".to_string()],
-            ledger: LedgerRef {
-                id: ledger_name.to_string(),
-            },
-            branch: new_branch.to_string(),
-            commit_cid: commit_head_id
-                .as_ref()
-                .map(std::string::ToString::to_string),
-            config_cid: None,
-            t: commit_t,
-            index: None,
-            status: "ready".to_string(),
-            default_context_cid: None,
-            status_v: Some(1),
-            status_meta: None,
-            config_v: Some(0),
-            config_meta: None,
-            source_branch: Some(source_branch.to_string()),
-            branch_point: Some(BranchPointRef {
-                source: source_branch.to_string(),
-                commit_cid: None,
-                t: 0,
-            }),
-            branches: 0,
-        };
-        let bytes = serde_json::to_vec_pretty(&file)
-            .map_err(|e| NameServiceError::storage(e.to_string()))?;
-
-        let created = self.storage.insert(&key, &bytes).await?;
-        if !created {
-            return Err(NameServiceError::ledger_already_exists(&normalized_id));
-        }
-
-        // Increment source branch's child count
-        let source_key = self.ns_key(ledger_name, source_branch);
-        self.cas_update::<NsFileV2, _>(&source_key, |existing| {
-            let mut file = existing?;
-            file.branches += 1;
-            Some(file)
-        })
-        .await?;
-
-        Ok(())
-    }
-
-    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-
-        // Read the record to find the parent before purging
-        let record = self
-            .load_record(&ledger_name, &branch)
-            .await?
-            .ok_or_else(|| NameServiceError::not_found(ledger_id))?;
-
-        // Refuse a branch that still has children — the same lineage
-        // guard the raft state machine enforces. The authoritative
-        // drop policy in the api layer defers (retracts) a branch
-        // with children rather than reaching this primitive, so this
-        // only fires on a direct out-of-order call, failing loud
-        // instead of stranding a child with a dangling `source_branch`.
-        if record.branches > 0 {
-            return Err(NameServiceError::storage(format!(
-                "drop_branch refused: {ledger_id} still has {} child branch(es)",
-                record.branches
-            )));
-        }
-
-        let parent_source = record.source_branch.clone();
-
-        // Remove the NS files
-        let main_key = self.ns_key(&ledger_name, &branch);
-        let index_key = self.index_key(&ledger_name, &branch);
-        let _ = self.storage.delete(&main_key).await;
-        let _ = self.storage.delete(&index_key).await;
-
-        // Decrement parent's child count if this branch had a parent
-        match parent_source {
-            Some(source) => {
-                let parent_key = self.ns_key(&ledger_name, &source);
-                self.cas_update::<NsFileV2, _>(&parent_key, move |existing| {
-                    let mut file = existing?;
-                    file.branches = file.branches.saturating_sub(1);
-                    Some(file)
-                })
-                .await?;
-                // Re-read the parent to get the updated count
-                let parent_record = self.load_record(&ledger_name, &source).await?;
-                Ok(parent_record.map(|r| r.branches))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn reset_head(&self, ledger_id: &str, snapshot: crate::NsRecordSnapshot) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
 
         let outcome = self
             .storage
             .compare_and_swap(&key, |bytes| {
-                let Some(data) = bytes else {
-                    return Ok(CasAction::Abort(()));
+                let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+                let Some(mut file) = current.filter(|f| !f.is_deleted()) else {
+                    return Ok(CasAction::Abort(fence.is_some()));
                 };
-                let mut file: NsFileV2 = deserialize_json(data)?;
+                if !file.admits(fence) {
+                    return Ok(CasAction::Abort(true));
+                }
                 file.apply_snapshot(&snapshot);
                 let new_bytes = serialize_json(&file)?;
                 Ok(CasAction::Write(new_bytes))
             })
             .await?;
 
-        if matches!(outcome, CasOutcome::Aborted(())) {
-            return Err(NameServiceError::not_found(ledger_id));
+        match outcome {
+            CasOutcome::Written => Ok(()),
+            CasOutcome::Aborted(true) => Err(NameServiceError::fenced(ledger_id)),
+            CasOutcome::Aborted(false) => Err(NameServiceError::not_found(ledger_id)),
         }
-
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl<S> LedgerLifecycle for StorageNameService<S>
-where
-    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
-{
-    async fn init(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let key = self.ns_key(&ledger_name, &branch);
-        let normalized_address = format_ledger_id(&ledger_name, &branch);
-
-        // Create minimal record with no commits
-        let file = NsFileV2 {
-            context: ns_context(),
-            id: normalized_address.clone(),
-            record_type: vec!["f:LedgerSource".to_string()],
-            ledger: LedgerRef {
-                id: ledger_name.clone(),
-            },
-            branch: branch.clone(),
-            commit_cid: None,
-            config_cid: None,
-            t: 0,
-            index: None,
-            status: "ready".to_string(),
-            default_context_cid: None,
-            // v2 extension fields
-            status_v: Some(1),
-            status_meta: None,
-            config_v: Some(0),
-            config_meta: None,
-            source_branch: None,
-            branch_point: None,
-            branches: 0,
-        };
-
-        let bytes = serde_json::to_vec_pretty(&file)?;
-
-        // Use insert for atomic create-if-not-exists
-        match self.storage.insert(&key, &bytes).await {
-            Ok(true) => Ok(()), // Successfully created
-            Ok(false) => {
-                // Record exists — check if it's retracted (dropped) and allow re-creation
-                match self.storage.read_bytes(&key).await {
-                    Ok(existing_bytes) => {
-                        let existing: NsFileV2 = serde_json::from_slice(&existing_bytes)?;
-                        if existing.status == "retracted" {
-                            // Overwrite the retracted record with a fresh one
-                            self.storage.write_bytes(&key, &bytes).await.map_err(|e| {
-                                NameServiceError::storage(format!(
-                                    "Failed to re-create ledger {normalized_address}: {e}"
-                                ))
-                            })?;
-                            // Clean up stale index sidecar
-                            let idx_key = self.index_key(&ledger_name, &branch);
-                            let _ = self.storage.delete(&idx_key).await;
-                            return Ok(());
-                        }
-                        Err(NameServiceError::ledger_already_exists(normalized_address))
-                    }
-                    Err(_) => Err(NameServiceError::ledger_already_exists(normalized_address)),
-                }
-            }
-            Err(e) => Err(NameServiceError::storage(format!(
-                "Failed to create ledger {normalized_address}: {e}"
-            ))),
-        }
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let key = self.ns_key(&ledger_name, &branch);
-
-        self.cas_update::<NsFileV2, _>(&key, |existing| {
-            let mut file = existing?;
-            if file.status == "retracted" {
-                return None; // Already retracted
-            }
-            file.status = "retracted".to_string();
-            // Advance status_v when retracting
-            let current_v = file.status_v.unwrap_or(1);
-            file.status_v = Some(current_v + 1);
-            Some(file)
-        })
-        .await
     }
 }
 
@@ -862,9 +992,10 @@ impl<S> CommitPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn publish_commit(
+    async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
@@ -875,8 +1006,11 @@ where
         let branch_clone = branch.clone();
         let cid_str = commit_id.to_string();
 
-        self.cas_update::<NsFileV2, _>(&key, move |existing| {
-            match existing {
+        self.cas_update_fenced::<NsFileV2, _, _>(
+            ledger_id,
+            &key,
+            |current| main_admits(current, fence),
+            move |existing| match existing.filter(|f| !f.is_deleted()) {
                 Some(mut file) => {
                     // Only update if strictly newer
                     if commit_t > file.t {
@@ -896,8 +1030,8 @@ where
                         commit_t,
                     ))
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -912,9 +1046,10 @@ impl<S> IndexPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn publish_index(
+    async fn publish_index_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -923,22 +1058,30 @@ where
 
         let cid_str = index_id.to_string();
 
-        self.cas_update::<NsIndexFileV2, _>(&key, move |existing| {
-            // Only update if strictly newer
-            if let Some(ref file) = existing {
-                if index_t <= file.index.t {
-                    return None;
+        self.cas_update_fenced::<NsIndexFileV2, _, _>(
+            ledger_id,
+            &key,
+            |current| index_admits(current, fence),
+            move |existing| {
+                // Only update if strictly newer
+                if let Some(ref file) = existing {
+                    if index_t <= file.index.t {
+                        return None;
+                    }
                 }
-            }
 
-            Some(NsIndexFileV2 {
-                context: ns_context(),
-                index: IndexRef {
-                    cid: Some(cid_str.clone()),
-                    t: index_t,
-                },
-            })
-        })
+                Some(NsIndexFileV2 {
+                    context: ns_context(),
+                    index: IndexRef {
+                        cid: Some(cid_str.clone()),
+                        t: index_t,
+                    },
+                    fence,
+                    frozen: false,
+                    extra: Default::default(),
+                })
+            },
+        )
         .await
     }
 }
@@ -948,9 +1091,10 @@ impl<S> AdminPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn publish_index_allow_equal(
+    async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -958,24 +1102,32 @@ where
         let index_key = self.index_key(&ledger_name, &branch);
         let cid_str = index_id.to_string();
 
-        self.cas_update::<NsIndexFileV2, _>(&index_key, |existing| {
-            let should_update = match &existing {
-                Some(file) => index_t >= file.index.t, // Allow equal
-                None => true,
-            };
+        self.cas_update_fenced::<NsIndexFileV2, _, _>(
+            ledger_id,
+            &index_key,
+            |current| index_admits(current, fence),
+            |existing| {
+                let should_update = match &existing {
+                    Some(file) => index_t >= file.index.t, // Allow equal
+                    None => true,
+                };
 
-            if should_update {
-                Some(NsIndexFileV2 {
-                    context: ns_context(),
-                    index: IndexRef {
-                        cid: Some(cid_str.clone()),
-                        t: index_t,
-                    },
-                })
-            } else {
-                None
-            }
-        })
+                if should_update {
+                    Some(NsIndexFileV2 {
+                        context: ns_context(),
+                        index: IndexRef {
+                            cid: Some(cid_str.clone()),
+                            t: index_t,
+                        },
+                        fence,
+                        frozen: false,
+                        extra: Default::default(),
+                    })
+                } else {
+                    None
+                }
+            },
+        )
         .await
 
         // Note: StorageNameService has no event_tx (no Publication support),
@@ -996,7 +1148,7 @@ where
             RefKind::CommitHead => {
                 let key = self.ns_key(&ledger_name, &branch);
                 let file: Option<NsFileV2> = self.read_json(&key).await?;
-                Ok(file.map(|f| RefValue {
+                Ok(file.filter(|f| !f.is_deleted()).map(|f| RefValue {
                     id: f
                         .commit_cid
                         .as_deref()
@@ -1010,7 +1162,11 @@ where
                 let main_key = self.ns_key(&ledger_name, &branch);
                 let index_key = self.index_key(&ledger_name, &branch);
 
-                let main_file: Option<NsFileV2> = self.read_json(&main_key).await?;
+                // A deleted record has no heads, whatever its index file says.
+                let main_file: Option<NsFileV2> = self
+                    .read_json::<NsFileV2>(&main_key)
+                    .await?
+                    .filter(|f| !f.is_deleted());
                 let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
 
                 let main_index = main_file.as_ref().and_then(|f| {
@@ -1057,9 +1213,10 @@ impl<S> RefPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn compare_and_set_ref(
+    async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -1076,65 +1233,71 @@ where
                 let expect_exists = expected.is_some();
 
                 let outcome = self
-                    .cas_update_with_outcome::<NsFileV2, _>(&key, move |existing| {
-                        let current_ref = existing.as_ref().map(|f| RefValue {
-                            id: f
-                                .commit_cid
-                                .as_deref()
-                                .and_then(|s| s.parse::<ContentId>().ok()),
-                            t: f.t,
-                        });
+                    .cas_update_with_outcome_fenced::<NsFileV2, _, _>(
+                        ledger_id,
+                        &key,
+                        |current| main_admits(current, fence),
+                        move |existing| {
+                            let current_ref = existing.as_ref().map(|f| RefValue {
+                                id: f
+                                    .commit_cid
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<ContentId>().ok()),
+                                t: f.t,
+                            });
 
-                        // Compare expected with current
-                        match (expect_exists, &current_ref) {
-                            (false, None) => {
-                                // Create new record
-                                return CasUpdateDecision::Apply(
-                                    StorageNameService::<S>::new_main_file(
-                                        &ledger_name,
-                                        &branch,
-                                        new_cid_str.as_deref(),
-                                        new_t,
-                                    ),
-                                );
-                            }
-                            (false, Some(actual)) => {
-                                return CasUpdateDecision::Skip(CasResult::Conflict {
-                                    actual: Some(actual.clone()),
-                                });
-                            }
-                            (true, None) => {
-                                return CasUpdateDecision::Skip(CasResult::Conflict {
-                                    actual: None,
-                                });
-                            }
-                            (true, Some(actual)) => {
-                                // Compare by content id
-                                let identity_matches = match (&expected_id, &actual.id) {
-                                    (Some(a), Some(b)) => a == b,
-                                    (None, None) => true,
-                                    _ => false,
-                                };
-                                if !identity_matches {
+                            // Compare expected with current
+                            match (expect_exists, &current_ref) {
+                                (false, None) => {
+                                    // Create new record
+                                    return CasUpdateDecision::Apply(
+                                        StorageNameService::<S>::new_main_file(
+                                            &ledger_name,
+                                            &branch,
+                                            new_cid_str.as_deref(),
+                                            new_t,
+                                        ),
+                                    );
+                                }
+                                (false, Some(actual)) => {
                                     return CasUpdateDecision::Skip(CasResult::Conflict {
                                         actual: Some(actual.clone()),
                                     });
                                 }
-                                // Identity matches — check monotonic guard (strict for CommitHead)
-                                if new_t <= actual.t {
+                                (true, None) => {
                                     return CasUpdateDecision::Skip(CasResult::Conflict {
-                                        actual: Some(actual.clone()),
+                                        actual: None,
                                     });
                                 }
+                                (true, Some(actual)) => {
+                                    // Compare by content id
+                                    let identity_matches = match (&expected_id, &actual.id) {
+                                        (Some(a), Some(b)) => a == b,
+                                        (None, None) => true,
+                                        _ => false,
+                                    };
+                                    if !identity_matches {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: Some(actual.clone()),
+                                        });
+                                    }
+                                    // Identity matches — check monotonic guard (strict for CommitHead)
+                                    if new_t <= actual.t {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: Some(actual.clone()),
+                                        });
+                                    }
+                                }
                             }
-                        }
 
-                        // Apply the update
-                        let mut file = existing.unwrap();
-                        file.commit_cid = new_cid.as_ref().map(std::string::ToString::to_string);
-                        file.t = new_t;
-                        CasUpdateDecision::Apply(file)
-                    })
+                            // Apply the update
+                            let mut file = existing.unwrap();
+                            file.commit_cid =
+                                new_cid.as_ref().map(std::string::ToString::to_string);
+                            file.t = new_t;
+                            CasUpdateDecision::Apply(file)
+                        },
+                    )
                     .await?;
 
                 match outcome {
@@ -1150,81 +1313,96 @@ where
                 let expect_exists = expected.is_some();
 
                 let outcome = self
-                    .cas_update_with_outcome::<NsIndexFileV2, _>(&key, move |existing| {
-                        let current_ref = existing.as_ref().map(|f| RefValue {
-                            id: f
-                                .index
-                                .cid
-                                .as_deref()
-                                .and_then(|s| s.parse::<ContentId>().ok()),
-                            t: f.index.t,
-                        });
+                    .cas_update_with_outcome_fenced::<NsIndexFileV2, _, _>(
+                        ledger_id,
+                        &key,
+                        |current| index_admits(current, fence),
+                        move |existing| {
+                            let current_ref = existing.as_ref().map(|f| RefValue {
+                                id: f
+                                    .index
+                                    .cid
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<ContentId>().ok()),
+                                t: f.index.t,
+                            });
 
-                        match (expect_exists, &current_ref) {
-                            (false, None) => {
-                                // Create new index record
-                                return CasUpdateDecision::Apply(NsIndexFileV2 {
-                                    context: ns_context(),
-                                    index: IndexRef {
-                                        cid: new_cid.as_ref().map(std::string::ToString::to_string),
-                                        t: new_t,
-                                    },
-                                });
-                            }
-                            (false, Some(actual)) => {
-                                return CasUpdateDecision::Skip(CasResult::Conflict {
-                                    actual: Some(actual.clone()),
-                                });
-                            }
-                            (true, None) => {
-                                // The separate index file doesn't exist yet.
-                                // get_ref returns Some(RefValue { id: None, t: 0 })
-                                // for a freshly created ledger (from the main file
-                                // fallback). Allow if the caller expected that empty
-                                // state; otherwise conflict.
-                                let expected_is_empty = expected_id.is_none();
-                                if !expected_is_empty {
-                                    return CasUpdateDecision::Skip(CasResult::Conflict {
-                                        actual: None,
+                            match (expect_exists, &current_ref) {
+                                (false, None) => {
+                                    // Create new index record
+                                    return CasUpdateDecision::Apply(NsIndexFileV2 {
+                                        context: ns_context(),
+                                        index: IndexRef {
+                                            cid: new_cid
+                                                .as_ref()
+                                                .map(std::string::ToString::to_string),
+                                            t: new_t,
+                                        },
+                                        fence,
+                                        frozen: false,
+                                        extra: Default::default(),
                                     });
                                 }
-                                // Treat as create — fall through to apply
-                                return CasUpdateDecision::Apply(NsIndexFileV2 {
-                                    context: ns_context(),
-                                    index: IndexRef {
-                                        cid: new_cid.as_ref().map(std::string::ToString::to_string),
-                                        t: new_t,
-                                    },
-                                });
-                            }
-                            (true, Some(actual)) => {
-                                // Compare by content id
-                                let identity_matches = match (&expected_id, &actual.id) {
-                                    (Some(a), Some(b)) => a == b,
-                                    (None, None) => true,
-                                    _ => false,
-                                };
-                                if !identity_matches {
+                                (false, Some(actual)) => {
                                     return CasUpdateDecision::Skip(CasResult::Conflict {
                                         actual: Some(actual.clone()),
                                     });
                                 }
-                                // Non-strict for IndexHead: new.t >= current.t
-                                if new_t < actual.t {
-                                    return CasUpdateDecision::Skip(CasResult::Conflict {
-                                        actual: Some(actual.clone()),
+                                (true, None) => {
+                                    // The separate index file doesn't exist yet.
+                                    // get_ref returns Some(RefValue { id: None, t: 0 })
+                                    // for a freshly created ledger (from the main file
+                                    // fallback). Allow if the caller expected that empty
+                                    // state; otherwise conflict.
+                                    let expected_is_empty = expected_id.is_none();
+                                    if !expected_is_empty {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: None,
+                                        });
+                                    }
+                                    // Treat as create — fall through to apply
+                                    return CasUpdateDecision::Apply(NsIndexFileV2 {
+                                        context: ns_context(),
+                                        index: IndexRef {
+                                            cid: new_cid
+                                                .as_ref()
+                                                .map(std::string::ToString::to_string),
+                                            t: new_t,
+                                        },
+                                        fence,
+                                        frozen: false,
+                                        extra: Default::default(),
                                     });
                                 }
+                                (true, Some(actual)) => {
+                                    // Compare by content id
+                                    let identity_matches = match (&expected_id, &actual.id) {
+                                        (Some(a), Some(b)) => a == b,
+                                        (None, None) => true,
+                                        _ => false,
+                                    };
+                                    if !identity_matches {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: Some(actual.clone()),
+                                        });
+                                    }
+                                    // Non-strict for IndexHead: new.t >= current.t
+                                    if new_t < actual.t {
+                                        return CasUpdateDecision::Skip(CasResult::Conflict {
+                                            actual: Some(actual.clone()),
+                                        });
+                                    }
+                                }
                             }
-                        }
 
-                        let mut file = existing.unwrap();
-                        file.index = IndexRef {
-                            cid: new_cid.as_ref().map(std::string::ToString::to_string),
-                            t: new_t,
-                        };
-                        CasUpdateDecision::Apply(file)
-                    })
+                            let mut file = existing.unwrap();
+                            file.index = IndexRef {
+                                cid: new_cid.as_ref().map(std::string::ToString::to_string),
+                                t: new_t,
+                            };
+                            CasUpdateDecision::Apply(file)
+                        },
+                    )
                     .await?;
 
                 match outcome {
@@ -1347,6 +1525,14 @@ where
         })
         .await
     }
+
+    async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
+        let main: Option<GraphSourceNsFileV2> = self.read_json(&self.ns_key(name, branch)).await?;
+        if main.is_some_and(|m| m.status == "retracted") {
+            StorageWrite::delete(&self.storage, &self.index_key(name, branch)).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1390,7 +1576,8 @@ where
             }
         } else {
             // It's a ledger record
-            match self.load_record(&name, &branch).await? {
+            let record = self.load_record(&name, &branch).await?;
+            match crate::read_resolved(self, record).await? {
                 Some(record) => Ok(NsLookupResult::Ledger(record)),
                 None => Ok(NsLookupResult::NotFound),
             }
@@ -1404,7 +1591,7 @@ where
             format!("{}/{}", self.prefix, NS_VERSION)
         };
 
-        // List all files under ns@v2
+        // List all files under ns@v3
         let keys = StorageList::list_prefix(&self.storage, &prefix)
             .await
             .map_err(|e| NameServiceError::storage(format!("Failed to list records: {e}")))?;
@@ -1422,7 +1609,7 @@ where
             }
 
             // Parse name and branch from key
-            // Key format: {prefix}/ns@v2/{name}/{branch}.json
+            // Key format: {prefix}/ns@v3/{name}/{branch}.json
             let path_part = if self.prefix.is_empty() {
                 key.strip_prefix(&format!("{NS_VERSION}/"))
             } else {
@@ -1505,6 +1692,9 @@ where
         };
 
         let file: NsFileV2 = serde_json::from_slice(&data)?;
+        if file.is_deleted() {
+            return Ok(None);
+        }
 
         Ok(Some(file.to_status_value()))
     }
@@ -1515,9 +1705,10 @@ impl<S> StatusPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn push_status(
+    async fn push_status_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
@@ -1530,35 +1721,40 @@ where
         let outcome = self
             .storage
             .compare_and_swap(&key, |current_bytes| {
-                let Some(bytes) = current_bytes else {
-                    return Ok(CasAction::Abort(StatusCasResult::Conflict { actual: None }));
+                let current_file: Option<NsFileV2> =
+                    current_bytes.map(deserialize_json).transpose()?;
+                if !main_admits(current_file.as_ref(), fence) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
+                let Some(mut file) = current_file else {
+                    return Ok(CasAction::Abort(Ok(StatusCasResult::Conflict {
+                        actual: None,
+                    })));
                 };
-
-                let mut file: NsFileV2 = deserialize_json(bytes)?;
 
                 let current = file.to_status_value();
 
                 // Compare expected with current
                 match &expected {
                     None => {
-                        return Ok(CasAction::Abort(StatusCasResult::Conflict {
+                        return Ok(CasAction::Abort(Ok(StatusCasResult::Conflict {
                             actual: Some(current),
-                        }));
+                        })));
                     }
                     Some(exp) => {
                         if exp.v != current.v || exp.payload != current.payload {
-                            return Ok(CasAction::Abort(StatusCasResult::Conflict {
+                            return Ok(CasAction::Abort(Ok(StatusCasResult::Conflict {
                                 actual: Some(current),
-                            }));
+                            })));
                         }
                     }
                 }
 
                 // Monotonic guard: new.v > current.v
                 if new.v <= current.v {
-                    return Ok(CasAction::Abort(StatusCasResult::Conflict {
+                    return Ok(CasAction::Abort(Ok(StatusCasResult::Conflict {
                         actual: Some(current),
-                    }));
+                    })));
                 }
 
                 // Apply update
@@ -1578,7 +1774,8 @@ where
 
         match outcome {
             CasOutcome::Written => Ok(StatusCasResult::Updated),
-            CasOutcome::Aborted(result) => Ok(result),
+            CasOutcome::Aborted(Ok(result)) => Ok(result),
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
         }
     }
 }
@@ -1603,6 +1800,9 @@ where
         };
 
         let file: NsFileV2 = serde_json::from_slice(&data)?;
+        if file.is_deleted() {
+            return Ok(None);
+        }
 
         Ok(Some(file.to_config_value()))
     }
@@ -1613,9 +1813,10 @@ impl<S> ConfigPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn push_config(
+    async fn push_config_fenced(
         &self,
         ledger_id: &str,
+        fence: Option<Fence>,
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
@@ -1628,35 +1829,40 @@ where
         let outcome = self
             .storage
             .compare_and_swap(&key, |current_bytes| {
-                let Some(bytes) = current_bytes else {
-                    return Ok(CasAction::Abort(ConfigCasResult::Conflict { actual: None }));
+                let current_file: Option<NsFileV2> =
+                    current_bytes.map(deserialize_json).transpose()?;
+                if !main_admits(current_file.as_ref(), fence) {
+                    return Ok(CasAction::Abort(Err(FenceRefused)));
+                }
+                let Some(mut file) = current_file else {
+                    return Ok(CasAction::Abort(Ok(ConfigCasResult::Conflict {
+                        actual: None,
+                    })));
                 };
-
-                let mut file: NsFileV2 = deserialize_json(bytes)?;
 
                 let current = file.to_config_value();
 
                 // Compare expected with current
                 match &expected {
                     None => {
-                        return Ok(CasAction::Abort(ConfigCasResult::Conflict {
+                        return Ok(CasAction::Abort(Ok(ConfigCasResult::Conflict {
                             actual: Some(current),
-                        }));
+                        })));
                     }
                     Some(exp) => {
                         if exp.v != current.v || exp.payload != current.payload {
-                            return Ok(CasAction::Abort(ConfigCasResult::Conflict {
+                            return Ok(CasAction::Abort(Ok(ConfigCasResult::Conflict {
                                 actual: Some(current),
-                            }));
+                            })));
                         }
                     }
                 }
 
                 // Monotonic guard: new.v > current.v
                 if new.v <= current.v {
-                    return Ok(CasAction::Abort(ConfigCasResult::Conflict {
+                    return Ok(CasAction::Abort(Ok(ConfigCasResult::Conflict {
                         actual: Some(current),
-                    }));
+                    })));
                 }
 
                 // Apply update
@@ -1690,18 +1896,32 @@ where
 
         match outcome {
             CasOutcome::Written => Ok(ConfigCasResult::Updated),
-            CasOutcome::Aborted(result) => Ok(result),
+            CasOutcome::Aborted(Ok(result)) => Ok(result),
+            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    mod lifecycle_conformance {
+        crate::lifecycle_conformance_tests!((
+            super::StorageNameService::new(super::MemoryCasStorage::new(), "test"),
+            ()
+        ));
+    }
+
     use super::*;
+    use crate::testing::CurrentFence;
     use crate::{CasResult, ConfigPayload, RefPublisher, RefValue, StatusPayload};
     use fluree_db_core::StorageExtError;
 
-    async fn publish_commit(ns: &impl RefPublisher, ledger_id: &str, t: i64, cid: &ContentId) {
+    async fn publish_commit(
+        ns: &(impl RefPublisher + NameServiceLookup),
+        ledger_id: &str,
+        t: i64,
+        cid: &ContentId,
+    ) {
         let new = RefValue {
             id: Some(cid.clone()),
             t,
@@ -1722,7 +1942,7 @@ mod tests {
         // Create a mock storage for testing key generation
         // We can't easily test the full StorageNameService without a real storage impl
         let prefix = "ledgers";
-        let expected = format!("{prefix}/ns@v2/mydb/main.json");
+        let expected = format!("{prefix}/ns@v3/mydb/main.json");
         assert_eq!(
             expected,
             format!("{}/{}/{}/{}.json", prefix, NS_VERSION, "mydb", "main")
@@ -1732,13 +1952,13 @@ mod tests {
     #[test]
     fn test_ns_key_without_prefix() {
         let expected = format!("{}/{}/{}.json", NS_VERSION, "mydb", "main");
-        assert_eq!(expected, "ns@v2/mydb/main.json");
+        assert_eq!(expected, "ns@v3/mydb/main.json");
     }
 
     #[test]
     fn test_index_key() {
         let expected = format!("{}/{}/{}.index.json", NS_VERSION, "mydb", "main");
-        assert_eq!(expected, "ns@v2/mydb/main.index.json");
+        assert_eq!(expected, "ns@v3/mydb/main.index.json");
     }
 
     #[test]
@@ -1826,7 +2046,7 @@ mod tests {
         async fn content_write_bytes_with_hash(
             &self,
             _kind: fluree_db_core::ContentKind,
-            _ledger_id: &str,
+            _namespace: &fluree_db_core::StorageNamespace,
             content_hash_hex: &str,
             bytes: &[u8],
         ) -> fluree_db_core::Result<fluree_db_core::ContentWriteResult> {
@@ -1910,6 +2130,115 @@ mod tests {
         StorageNameService::new(MemoryCasStorage::new(), "test")
     }
 
+    #[tokio::test]
+    async fn migrate_moves_a_legacy_store_to_the_current_address() {
+        let ns = make_storage_ns();
+        let mut record = NsRecord::new(LedgerId::parse("mydb:main").unwrap());
+        record.commit_t = 2;
+        record.commit_head_id = Some(ContentId::new(fluree_db_core::ContentKind::Commit, b"c"));
+        let legacy_key = "test/ns@v2/mydb/main.json";
+        ns.storage
+            .write_bytes(
+                legacy_key,
+                &serde_json::to_vec(&NsFileV2::for_record(&record)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let report = ns.migrate().await.unwrap().expect("migrated");
+        assert_eq!(report.bound, vec!["mydb".to_string()]);
+        let migrated = ns.lookup("mydb:main").await.unwrap().expect("bound");
+        assert!(migrated.fence.is_some());
+        assert_eq!(migrated.commit_t, 2);
+        assert_eq!(
+            ns.storage.read_bytes(legacy_key).await.unwrap(),
+            crate::migration::RETIRED_FILE
+        );
+        assert_eq!(
+            ns.storage
+                .read_bytes("test/ns@v2.bak/mydb/main.json")
+                .await
+                .unwrap(),
+            serde_json::to_vec(&NsFileV2::for_record(&record)).unwrap()
+        );
+        assert!(ns.migrate().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_store_in_a_newer_format_is_refused() {
+        let ns = make_storage_ns();
+        ns.storage
+            .write_bytes(
+                "test/ns@v3/@format.json",
+                br#"{"version": 4, "migrated_at": 0}"#,
+            )
+            .await
+            .unwrap();
+        let err = ns.migrate().await.unwrap_err();
+        assert!(err.to_string().contains("newer"), "{err}");
+    }
+
+    /// A ledger an older binary creates or drops under `ns@v2/` after the
+    /// migration changes the files there, which startup notices. A commit
+    /// it publishes to an existing ledger rewrites a file in place, which
+    /// listing cannot see.
+    #[tokio::test]
+    async fn legacy_files_added_after_the_migration_are_noticed() {
+        let ns = make_storage_ns();
+        let record = NsRecord::new(LedgerId::parse("mydb:main").unwrap());
+        let bytes = serde_json::to_vec(&NsFileV2::for_record(&record)).unwrap();
+        ns.storage
+            .write_bytes("test/ns@v2/mydb/main.json", &bytes)
+            .await
+            .unwrap();
+        ns.migrate().await.unwrap().expect("migrated");
+        let marker = crate::migration::FormatMarker::parse(
+            &ns.storage
+                .read_bytes("test/ns@v3/@format.json")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ns.legacy_changes(&marker).await.unwrap(), None);
+
+        ns.storage
+            .write_bytes("test/ns@v2/mydb/main.json", &bytes)
+            .await
+            .unwrap();
+        assert_eq!(ns.legacy_changes(&marker).await.unwrap(), None);
+
+        ns.storage
+            .write_bytes("test/ns@v2/other/main.json", &bytes)
+            .await
+            .unwrap();
+        assert_eq!(ns.legacy_changes(&marker).await.unwrap(), Some((1, 2)));
+    }
+
+    /// See the file backend's test of the same name.
+    #[tokio::test]
+    async fn a_binding_in_an_unknown_state_is_refused() {
+        let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
+        let key = "test/ns@v3/mydb/@binding.json";
+        let text = String::from_utf8(ns.storage.read_bytes(key).await.unwrap()).unwrap();
+        assert!(text.contains(r#""state": "active""#), "{text}");
+        ns.storage
+            .write_bytes(
+                key,
+                text.replace(r#""state": "active""#, r#""state": "archived""#)
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        assert!(ns.lookup("mydb:main").await.is_err());
+        assert!(
+            crate::lifecycle::create_ledger(&ns, &LedgerId::parse("mydb:main").unwrap())
+                .await
+                .is_err()
+        );
+    }
+
     /// Wrapper that simulates a concurrent modification on the first
     /// `compare_and_swap` call. The closure runs but writes are silently
     /// discarded on the first attempt, forcing a retry. This tests that
@@ -1968,14 +2297,14 @@ mod tests {
         async fn content_write_bytes_with_hash(
             &self,
             kind: fluree_db_core::ContentKind,
-            ledger_id: &str,
+            namespace: &fluree_db_core::StorageNamespace,
             content_hash_hex: &str,
             bytes: &[u8],
         ) -> fluree_db_core::Result<fluree_db_core::ContentWriteResult> {
             fluree_db_core::ContentAddressedWrite::content_write_bytes_with_hash(
                 &self.inner,
                 kind,
-                ledger_id,
+                namespace,
                 content_hash_hex,
                 bytes,
             )
@@ -2065,6 +2394,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_status_push_retries_on_etag_mismatch() {
         let ns = make_flaky_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let expected = ns.get_status("mydb:main").await.unwrap().unwrap();
@@ -2084,6 +2414,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_config_push_retries_on_etag_mismatch() {
         let ns = make_flaky_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let expected = ns.get_config("mydb:main").await.unwrap().unwrap();
@@ -2120,6 +2451,7 @@ mod tests {
             "mydb:feature.index",
             "mydb:main.json",
         ] {
+            crate::testing::create(&ns, id).await.unwrap();
             publish_commit(&ns, id, 1, &dummy_cid(id)).await;
         }
 
@@ -2165,6 +2497,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_get_ref_after_publish() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 5, &dummy_cid("commit-1")).await;
 
         let commit = ns
@@ -2184,8 +2517,12 @@ mod tests {
             t: 1,
         };
 
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
+
+        let unborn = ns.get_ref("mydb:main", RefKind::CommitHead).await.unwrap();
+
         let result = ns
-            .compare_and_set_ref("mydb:main", RefKind::CommitHead, None, &new_ref)
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, unborn.as_ref(), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);
@@ -2202,6 +2539,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_conflict_already_exists() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let new_ref = RefValue {
@@ -2224,6 +2562,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_id_mismatch() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let expected = RefValue {
@@ -2247,6 +2586,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_success() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let expected = RefValue {
@@ -2275,6 +2615,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_commit_strict_monotonic() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 5, &dummy_cid("commit-1")).await;
 
         let expected = RefValue {
@@ -2299,6 +2640,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_cas_index_allows_equal_t() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         ns.publish_index("mydb:main", 5, &dummy_cid("index-1"))
             .await
             .unwrap();
@@ -2321,6 +2663,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_fast_forward_commit() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 1, &dummy_cid("commit-1")).await;
 
         let new_ref = RefValue {
@@ -2344,6 +2687,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_fast_forward_rejected_stale() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 10, &dummy_cid("commit-1")).await;
 
         let new_ref = RefValue {
@@ -2365,6 +2709,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_ref_get_index_after_publish() {
         let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 5, &dummy_cid("commit-1")).await;
         ns.publish_index("mydb:main", 3, &dummy_cid("index-1"))
             .await
@@ -2384,6 +2729,7 @@ mod tests {
         let ns = make_storage_ns();
         assert_eq!(ns.heads("mydb:main").await.unwrap(), None);
 
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         publish_commit(&ns, "mydb:main", 5, &dummy_cid("commit-1")).await;
         let heads = ns.heads("mydb:main").await.unwrap().unwrap();
         assert_eq!(heads.commit.t, 5);
@@ -2410,13 +2756,14 @@ mod tests {
             id: Some(dummy_cid("commit-2")),
             t: 2,
         };
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
         let result = ns
             .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
             CasResult::Conflict { actual } => {
-                assert_eq!(actual, None);
+                assert!(actual.as_ref().is_none_or(|a| a.id.is_none()), "{actual:?}");
             }
             _ => panic!("expected conflict when ref doesn't exist"),
         }
@@ -2426,32 +2773,8 @@ mod tests {
     // StatusPublisher tests
     // =========================================================================
 
-    #[tokio::test]
-    async fn test_storage_retract_bumps_status_v() {
-        use crate::StatusLookup;
-
-        let ns = make_storage_ns();
-        ns.init("mydb:main").await.unwrap();
-
-        // Get initial status (v=1, state="ready")
-        let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
-        assert_eq!(initial.v, 1);
-        assert_eq!(initial.payload.state, "ready");
-
-        // Retract the ledger
-        ns.retract("mydb:main").await.unwrap();
-
-        // Verify status_v was incremented and state changed to "retracted"
-        let after_retract = ns.get_status("mydb:main").await.unwrap().unwrap();
-        assert_eq!(
-            after_retract.v, 2,
-            "status_v should be incremented on retract"
-        );
-        assert_eq!(after_retract.payload.state, "retracted");
-    }
-
     /// Regression (#1369): a graph-source record shares the
-    /// `ns@v2/{name}/{branch}.json` key space with ledger records but uses a
+    /// `ns@v3/{name}/{branch}.json` key space with ledger records but uses a
     /// different schema (no `f:ledger`). `lookup` must report it as a clean
     /// not-found (`Ok(None)`) instead of failing to deserialize `NsFileV2`
     /// ("missing field `f:ledger`"), so single-alias query/`use` resolution can
@@ -2460,6 +2783,7 @@ mod tests {
     async fn test_storage_ns_lookup_skips_graph_source_record() {
         let ns = make_storage_ns();
 
+        crate::testing::create(&ns, "realdb:main").await.unwrap();
         publish_commit(&ns, "realdb:main", 1, &dummy_cid("commit-1")).await;
         ns.publish_graph_source(
             "gs",
@@ -2490,32 +2814,5 @@ mod tests {
             ns.lookup_any("realdb:main").await.unwrap(),
             NsLookupResult::Ledger(_)
         ));
-    }
-
-    #[tokio::test]
-    async fn drop_branch_refuses_parent_with_children() {
-        let ns = make_storage_ns();
-        ns.init("mydb:main").await.unwrap();
-        ns.create_branch("mydb", "feature", "main", None)
-            .await
-            .unwrap();
-
-        // `main` has a child — the drop must refuse and leave both
-        // records intact rather than strand `feature` with a
-        // dangling `source_branch`.
-        let err = ns
-            .drop_branch("mydb:main")
-            .await
-            .expect_err("dropping a parent with children must fail");
-        assert!(
-            err.to_string().contains("child branch"),
-            "expected child-branch refusal, got: {err}"
-        );
-        assert!(ns.lookup("mydb:main").await.unwrap().is_some());
-        assert!(ns.lookup("mydb:feature").await.unwrap().is_some());
-
-        // Leaf-first drop succeeds.
-        ns.drop_branch("mydb:feature").await.unwrap();
-        ns.drop_branch("mydb:main").await.unwrap();
     }
 }

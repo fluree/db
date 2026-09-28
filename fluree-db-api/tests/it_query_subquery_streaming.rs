@@ -34,7 +34,7 @@ fn query(flat: bool) -> String {
 async fn seed(n: usize) -> Fluree {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, LEDGER);
+    let ledger = genesis_ledger(&fluree, LEDGER).await;
     let mut graph = Vec::new();
     for p in 0..n {
         graph.push(json!({"@id":format!("ex:p{p}"), "@type":"ex:Type"}));

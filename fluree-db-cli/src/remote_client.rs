@@ -1918,6 +1918,48 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// List dropped ledgers. Calls `GET {base_url}/dropped`.
+    pub async fn list_dropped(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("dropped");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Restore or purge a dropped ledger. Calls
+    /// `POST {base_url}/dropped/{restore|purge}` with `{"instance": "<id>"}`.
+    pub async fn dropped_action(
+        &self,
+        action: &str,
+        instance: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("dropped/{action}"));
+        let body = serde_json::json!({ "instance": instance });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Sweep storage for instance folders nothing references. Calls
+    /// `POST {base_url}/dropped/sweep` with `{"dry_run": bool}`.
+    pub async fn sweep_orphans(
+        &self,
+        dry_run: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("dropped/sweep");
+        let body = serde_json::json!({ "dry_run": dry_run });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
     // =========================================================================
     // RDF export
     // =========================================================================

@@ -25,7 +25,7 @@ async fn data_ledger_tx_rejected_by_cross_ledger_shape() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-shapes/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     let shapes_graph_iri = "http://example.org/governance/shapes";
     let m_trig = format!(
@@ -55,7 +55,7 @@ async fn data_ledger_tx_rejected_by_cross_ledger_shape() {
         .expect("seed M shapes");
 
     let data_id = "test/cross-ledger-shapes/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let config_iri = config_graph_iri(data_id);
     let r1 = fluree
@@ -113,7 +113,7 @@ async fn data_ledger_tx_passes_when_cross_ledger_shape_satisfied() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-shapes/valid-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     let shapes_graph_iri = "http://example.org/governance/shapes";
     fluree
@@ -142,7 +142,7 @@ async fn data_ledger_tx_passes_when_cross_ledger_shape_satisfied() {
         .expect("seed M shapes");
 
     let data_id = "test/cross-ledger-shapes/valid-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let config_iri = config_graph_iri(data_id);
     let r1 = fluree
@@ -194,7 +194,7 @@ async fn cross_ledger_sh_class_value_set_resolved_against_model_ledger() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-shapes/vocab-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     let shapes_graph_iri = "http://example.org/governance/shapes";
     fluree
@@ -224,7 +224,7 @@ async fn cross_ledger_sh_class_value_set_resolved_against_model_ledger() {
         .expect("seed M shapes + controlled vocabulary");
 
     let data_id = "test/cross-ledger-shapes/vocab-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let config_iri = config_graph_iri(data_id);
     let r1 = fluree
@@ -299,7 +299,7 @@ async fn cross_ledger_schema_feeds_shacl_subclass_targeting() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-schema/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let ontology_graph_iri = "http://example.org/governance/ontology";
     let m_trig = format!(
         r"
@@ -319,7 +319,7 @@ async fn cross_ledger_schema_feeds_shacl_subclass_targeting() {
         .expect("seed M ontology");
 
     let data_id = "test/cross-ledger-schema/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     // D: local Employee shape + config pointing the schema source at M.
     let config_iri = config_graph_iri(data_id);
@@ -400,7 +400,7 @@ async fn seed_cross_ledger_person_shape(
     data_id: &str,
     extra_shacl_config: &str,
 ) -> fluree_db_api::LedgerState {
-    let model = genesis_ledger(fluree, model_id);
+    let model = genesis_ledger(fluree, model_id).await;
     let shapes_graph_iri = "http://example.org/governance/shapes";
     fluree
         .stage_owned(model)
@@ -427,7 +427,7 @@ async fn seed_cross_ledger_person_shape(
         .await
         .expect("seed M shapes");
 
-    let data = genesis_ledger(fluree, data_id);
+    let data = genesis_ledger(fluree, data_id).await;
     let config_iri = config_graph_iri(data_id);
     let r = fluree
         .stage_owned(data)
@@ -572,7 +572,7 @@ async fn sh_sparql_constraint_enforced_across_ledgers() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-shapes/sparql-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let shapes_graph_iri = "http://example.org/governance/shapes";
     fluree
         .stage_owned(model)
@@ -598,7 +598,7 @@ async fn sh_sparql_constraint_enforced_across_ledgers() {
         .expect("seed M sh:sparql shape");
 
     let data_id = "test/cross-ledger-shapes/sparql-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let config_iri = config_graph_iri(data_id);
     let r = fluree
         .stage_owned(data)
@@ -663,7 +663,7 @@ async fn sh_sparql_over_unknown_vocabulary_is_inert() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-shapes/unknown-vocab-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let shapes_graph_iri = "http://example.org/governance/shapes";
     fluree
         .stage_owned(model)
@@ -689,7 +689,7 @@ async fn sh_sparql_over_unknown_vocabulary_is_inert() {
         .expect("seed M shape over unknown vocabulary");
 
     let data_id = "test/cross-ledger-shapes/unknown-vocab-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let config_iri = config_graph_iri(data_id);
     let r = fluree
         .stage_owned(data)

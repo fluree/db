@@ -3448,20 +3448,16 @@ GRAPH <urn:fluree:{ledger_id}#txn-meta> {{
         "expected the same refusal every other write surface emits, got: {msg}"
     );
 
-    // A refused import leaves a *registered but empty* ledger — pre-existing
-    // behavior shared by every import refusal (the `f:reifies` firewall does
-    // the same), not something this guard introduces. What matters is that the
-    // chunk is aborted whole: t stays 0, so not one flake of the forged block
-    // reached storage.
-    let ledger = fluree
-        .ledger(ledger_id)
-        .await
-        .expect("create registers the ledger even when the import is refused");
-    assert_eq!(
-        ledger.t(),
-        0,
-        "a refused chunk must commit nothing at all, not even its default-graph triples"
+    // A refused import publishes nothing: the ledger never becomes visible
+    // and the name is free again.
+    assert!(
+        !fluree.ledger_exists(ledger_id).await.unwrap(),
+        "a refused import must not leave a ledger behind"
     );
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("a refused import releases the name");
 }
 
 /// The variant the issue never tested. `#config` has the identical defect —
@@ -3610,7 +3606,7 @@ GRAPH <urn:fluree:{ledger_id}#txn-meta> {{
     // Drop the index ref, reproducing a commits-only replica.
     let index_ref = db_dir
         .path()
-        .join("ns@v2")
+        .join("ns@v3")
         .join("test/unindexed-forgery")
         .join("main.index.json");
     if index_ref.exists() {
@@ -3693,7 +3689,7 @@ GRAPH <#txn-meta> {
     // where the forgery filter runs.
     let index_ref = db_dir
         .path()
-        .join("ns@v2")
+        .join("ns@v3")
         .join("test/sentinel-survives")
         .join("main.index.json");
     if index_ref.exists() {

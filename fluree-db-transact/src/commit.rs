@@ -969,8 +969,9 @@ where
             t: new_t,
         };
         let publish_result = nameservice
-            .compare_and_set_ref(
+            .compare_and_set_ref_fenced(
                 ledger_id_for_publish.as_str(),
+                base.fence(),
                 RefKind::CommitHead,
                 expected_head_ref.as_ref(),
                 &new_head_ref,
@@ -1417,28 +1418,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl BranchLifecycle for LosePublishRaceNameService {
-        async fn create_branch(
-            &self,
-            ledger_name: &str,
-            new_branch: &str,
-            source_branch: &str,
-            at_commit: Option<(fluree_db_core::ContentId, i64)>,
-        ) -> fluree_db_nameservice::Result<()> {
-            self.inner
-                .create_branch(ledger_name, new_branch, source_branch, at_commit)
-                .await
-        }
-
-        async fn drop_branch(&self, ledger_id: &str) -> fluree_db_nameservice::Result<Option<u32>> {
-            self.inner.drop_branch(ledger_id).await
-        }
-
-        async fn reset_head(
+        async fn reset_head_fenced(
             &self,
             ledger_id: &str,
+            fence: Option<fluree_db_nameservice::Fence>,
             snapshot: NsRecordSnapshot,
         ) -> fluree_db_nameservice::Result<()> {
-            self.inner.reset_head(ledger_id, snapshot).await
+            self.inner
+                .reset_head_fenced(ledger_id, fence, snapshot)
+                .await
         }
     }
 
@@ -1475,9 +1463,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RefPublisher for LosePublishRaceNameService {
-        async fn compare_and_set_ref(
+        async fn compare_and_set_ref_fenced(
             &self,
             ledger_id: &str,
+            fence: Option<fluree_db_nameservice::Fence>,
             kind: RefKind,
             _expected: Option<&RefValue>,
             new: &RefValue,
@@ -1491,7 +1480,7 @@ mod tests {
                 }),
                 RefKind::IndexHead => {
                     self.inner
-                        .compare_and_set_ref(ledger_id, kind, None, new)
+                        .compare_and_set_ref_fenced(ledger_id, fence, kind, None, new)
                         .await
                 }
             }
@@ -1499,26 +1488,16 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl fluree_db_nameservice::LedgerLifecycle for LosePublishRaceNameService {
-        async fn init(&self, ledger_id: &str) -> fluree_db_nameservice::Result<()> {
-            self.inner.init(ledger_id).await
-        }
-
-        async fn retract(&self, ledger_id: &str) -> fluree_db_nameservice::Result<()> {
-            self.inner.retract(ledger_id).await
-        }
-    }
-
-    #[async_trait::async_trait]
     impl fluree_db_nameservice::CommitPublisher for LosePublishRaceNameService {
-        async fn publish_commit(
+        async fn publish_commit_fenced(
             &self,
             ledger_id: &str,
+            fence: Option<fluree_db_nameservice::Fence>,
             commit_t: i64,
             commit_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
             self.inner
-                .publish_commit(ledger_id, commit_t, commit_id)
+                .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
                 .await
         }
 
@@ -1529,13 +1508,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl fluree_db_nameservice::IndexPublisher for LosePublishRaceNameService {
-        async fn publish_index(
+        async fn publish_index_fenced(
             &self,
             ledger_id: &str,
+            fence: Option<fluree_db_nameservice::Fence>,
             index_t: i64,
             index_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
-            self.inner.publish_index(ledger_id, index_t, index_id).await
+            self.inner
+                .publish_index_fenced(ledger_id, fence, index_t, index_id)
+                .await
         }
     }
 
@@ -1547,6 +1529,8 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
 
         // Stage an insert
         let txn = Txn::insert().with_insert(TripleTemplate::new(
@@ -1565,7 +1549,10 @@ mod tests {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let (receipt, new_state) = commit(
             view,
             ns_registry,
@@ -1594,6 +1581,8 @@ mod tests {
 
         let nameservice = MemoryNameService::new();
 
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
+
         // Stage an empty transaction (no inserts)
         let txn = Txn::insert();
         let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
@@ -1606,7 +1595,10 @@ mod tests {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let result = commit(
             view,
             ns_registry,
@@ -1628,11 +1620,16 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
 
         // First commit
         let txn1 = Txn::insert().with_insert(TripleTemplate::new(
@@ -1699,6 +1696,8 @@ mod tests {
 
         let nameservice = MemoryNameService::new();
 
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
+
         // Create a transaction with a large string value
         let big_value = "x".repeat(1000);
         let txn = Txn::insert().with_insert(TripleTemplate::new(
@@ -1718,7 +1717,10 @@ mod tests {
             reindex_max_bytes: 100, // Smaller than the big flake
         };
 
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let result = commit(
             view,
             ns_registry,
@@ -1748,6 +1750,7 @@ mod tests {
             inner: MemoryNameService::new(),
             winner_commit_id: winner_commit_id.clone(),
         };
+        let ledger = crate::test_support::created(&nameservice.inner, ledger).await;
 
         let txn = Txn::insert().with_insert(TripleTemplate::new(
             TemplateTerm::Sid(Sid::new(1, "ex:alice")),
@@ -1764,7 +1767,10 @@ mod tests {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
         let result = commit(
             view,
             ns_registry,
@@ -1805,15 +1811,22 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let txn = Txn::insert();
         let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let (view, ns_registry) = stage(ledger, txn, ns_registry, StageOptions::default())
             .await
             .unwrap();
 
-        let cs = content_store_for(storage.clone(), "test:main");
-        let upload_cs: Arc<dyn ContentStore> =
-            Arc::new(content_store_for(storage.clone(), "test:main"));
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
+        let upload_cs: Arc<dyn ContentStore> = Arc::new(content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        ));
         let raw_txn = serde_json::json!({ "raw": "payload" });
         let raw_txn_bytes = serde_json::to_vec(&raw_txn).expect("serialize raw txn");
         let expected_cid = ContentId::new(ContentKind::Txn, &raw_txn_bytes);

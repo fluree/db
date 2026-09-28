@@ -253,6 +253,11 @@ with two adjustments, because D has nowhere to hold identity records:
 matters for `f:query` rules — and those cannot run against a virtual source
 anyway. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
 
+The source records which ledger its model was when it was registered. If
+that ledger is dropped and another created under its name, queries against
+the source fail with `409` (`err:db/GraphSourceSuspended`) instead of
+applying the new ledger's policies.
+
 One merge subtlety: an identity counts as a request policy input,
 so under the default `f:overrideControl` (`f:OverrideAll`) the
 request's options take precedence and the config's
@@ -652,8 +657,8 @@ clients can branch on the specific failure.
 
 There is no explicit invalidation channel. The cache key includes
 the model ledger's `resolved_t` (its commit head at the time of
-capture), so new commits to M produce new cache keys
-automatically. The next request after M advances captures the
+capture) and its instance, so new commits to M, and a new ledger
+under M's name, produce new cache keys automatically. The next request after M advances captures the
 new head; older entries age out under the cache's LRU/TinyLFU
 policy.
 
@@ -666,6 +671,14 @@ If M is dropped while D references it, the next request against
 D that needs governance from M fails closed with
 `ModelLedgerMissing`. D isn't proactively notified — the
 failure surface is the next request.
+
+`f:ledger` names a ledger, not one incarnation of it. If another
+ledger is later created under M's name, its artifacts govern D
+from the next request, so creating a ledger under a model
+ledger's name is as privileged as writing to the model ledger.
+A [virtual graph source](#virtual-graph-sources-iceberg--sql) is
+the exception: it records the model ledger it was registered
+with.
 
 ## Related
 

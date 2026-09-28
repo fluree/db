@@ -3,8 +3,8 @@
 //! Note: The `transaction-functions` section (hash/datetime) is covered with bind support.
 
 use crate::support;
-use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, Novelty};
-use fluree_db_core::{load_commit_by_id, FlakeValue, LedgerSnapshot};
+use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState};
+use fluree_db_core::{load_commit_by_id, FlakeValue};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::{json, Value as JsonValue};
 
@@ -28,8 +28,10 @@ fn ctx_ex() -> JsonValue {
 async fn seed_users(ledger_id: &str) -> (fluree_db_api::Fluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -73,7 +75,7 @@ async fn query_names(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) -> Ve
 
 #[tokio::test]
 async fn update_delete_subject_ex_alice_removes_only_alice() {
-    let (fluree, db) = seed_users("it/transact-update:delete-subject").await;
+    let (fluree, db) = seed_users("it/transact-update-delete-subject:main").await;
 
     let out = fluree
         .update(
@@ -92,7 +94,7 @@ async fn update_delete_subject_ex_alice_removes_only_alice() {
 
 #[tokio::test]
 async fn update_delete_bob_age_only() {
-    let (fluree, db) = seed_users("it/transact-update:delete-bob-age").await;
+    let (fluree, db) = seed_users("it/transact-update-delete-bob-age:main").await;
 
     let out = fluree
         .update(
@@ -121,7 +123,7 @@ async fn update_delete_bob_age_only() {
 
 #[tokio::test]
 async fn update_delete_all_subjects_with_email_predicate() {
-    let (fluree, db) = seed_users("it/transact-update:delete-has-email").await;
+    let (fluree, db) = seed_users("it/transact-update-delete-has-email:main").await;
 
     let out = fluree
         .update(
@@ -140,7 +142,7 @@ async fn update_delete_all_subjects_with_email_predicate() {
 
 #[tokio::test]
 async fn update_delete_all_subjects_where_age_equals_30() {
-    let (fluree, db) = seed_users("it/transact-update:delete-age-30").await;
+    let (fluree, db) = seed_users("it/transact-update-delete-age-30:main").await;
 
     let out = fluree
         .update(
@@ -162,7 +164,7 @@ async fn update_delete_all_subjects_where_age_equals_30() {
 
 #[tokio::test]
 async fn update_bob_age_when_match() {
-    let (fluree, db) = seed_users("it/transact-update:update-bob-when-match").await;
+    let (fluree, db) = seed_users("it/transact-update-update-bob-when-match:main").await;
 
     let out = fluree
         .update(
@@ -252,7 +254,7 @@ async fn update_where_bound_typed_string_delete_and_insert_use_same_datatype_sid
         .await
         .unwrap();
 
-    let content_store = fluree.content_store(ledger_id);
+    let content_store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
     let commit = load_commit_by_id(&content_store, &result.receipt.commit_id)
         .await
         .expect("load update commit");
@@ -287,7 +289,7 @@ async fn update_delete_blank_node_rejected() {
     // test_50/51/52, delete-insert-03..09): blank nodes are not allowed in
     // delete templates. A blank node denotes a fresh node — the retraction
     // would skolemize a brand-new SID and silently match nothing.
-    let (fluree, db) = seed_users("it/transact-update:delete-bnode").await;
+    let (fluree, db) = seed_users("it/transact-update-delete-bnode:main").await;
 
     // Explicit blank-node @id.
     let err = fluree
@@ -328,7 +330,7 @@ async fn update_delete_blank_node_rejected() {
 
 #[tokio::test]
 async fn update_no_match_is_noop_success_and_does_not_bump_t() {
-    let (fluree, db) = seed_users("it/transact-update:no-match-noop").await;
+    let (fluree, db) = seed_users("it/transact-update-no-match-noop:main").await;
     let t_before = db.t();
 
     let out = fluree
@@ -364,7 +366,7 @@ async fn update_no_match_is_noop_success_and_does_not_bump_t() {
 
 #[tokio::test]
 async fn update_replace_jane_age() {
-    let (fluree, db) = seed_users("it/transact-update:update-jane").await;
+    let (fluree, db) = seed_users("it/transact-update-update-jane:main").await;
 
     let out = fluree
         .update(
@@ -398,8 +400,10 @@ async fn update_replace_jane_age() {
 #[tokio::test]
 async fn update_where_bind_hash_functions() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:hash-functions");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-hash-functions:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -459,8 +463,10 @@ async fn update_where_bind_hash_functions() {
 #[tokio::test]
 async fn update_where_bind_datetime_functions() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:datetime-functions");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-datetime-functions:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -605,8 +611,10 @@ async fn update_where_bind_datetime_functions() {
 #[tokio::test]
 async fn update_where_bind_numeric_and_math_functions() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:numeric-functions");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-numeric-functions:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -715,8 +723,10 @@ async fn update_where_bind_numeric_and_math_functions() {
 #[tokio::test]
 async fn update_where_bind_string_functions() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:string-functions");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-string-functions:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -808,8 +818,10 @@ async fn update_where_bind_string_functions() {
 #[tokio::test]
 async fn update_where_bind_functional_forms() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:functional-forms");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-functional-forms:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -891,8 +903,10 @@ async fn update_where_bind_functional_forms() {
 #[tokio::test]
 async fn update_where_bind_rdf_term_functions() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:rdf-term-functions");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-rdf-term-functions:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -991,8 +1005,10 @@ async fn update_where_bind_rdf_term_functions() {
 async fn update_where_bind_error_handling_unknown_function() {
     let fluree = FlureeBuilder::memory().build_memory();
 
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-handling-parse");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-handling-parse:main")
+        .await
+        .expect("create ledger");
     let ledger_for_update = fluree
         .update(
             ledger0,
@@ -1035,8 +1051,10 @@ async fn update_where_bind_error_handling_unknown_function() {
         );
     }
 
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-handling-query");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-handling-query:main")
+        .await
+        .expect("create ledger");
     let ledger_for_query = fluree
         .update(
             ledger0,
@@ -1085,8 +1103,10 @@ async fn update_where_bind_error_handling_runtime_type_mismatch() {
     // (abs ?text) where ?text is a string returns Ok(None) → ?err is unbound,
     // and the insert simply omits the ex:error predicate.
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-runtime");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-runtime:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1132,8 +1152,10 @@ async fn update_where_bind_error_handling_invalid_iri() {
     // the transact layer rejects raw IRIs that can't be resolved to a SID
     // for flake generation.
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-invalid-iri");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-invalid-iri:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1182,8 +1204,10 @@ async fn update_where_bind_error_handling_invalid_iri() {
 #[tokio::test]
 async fn update_where_bind_error_handling_invalid_datatype_iri() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-invalid-dt-iri");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-invalid-dt-iri:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1231,8 +1255,10 @@ async fn update_where_bind_error_handling_invalid_iri_type() {
     // (iri 42) with a numeric arg returns Ok(None) → ?err is unbound,
     // and the insert simply omits the ex:error predicate.
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-iri-type");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-iri-type:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1278,8 +1304,10 @@ async fn update_where_bind_error_handling_strdt_non_string() {
     // (str-dt 42 "xsd:string") with a numeric first arg returns Ok(None) → ?err is unbound,
     // and the insert simply omits the ex:error predicate.
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-strdt-non-string");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-strdt-non-string:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1324,8 +1352,10 @@ async fn update_where_bind_error_handling_bnode_arity() {
     // Per W3C spec, BNODE accepts 0 or 1 arguments. (bnode ?text) with a
     // string label now produces a deterministic blank node rather than an error.
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-bnode-arity");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-bnode-arity:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1371,8 +1401,10 @@ async fn update_where_bind_error_handling_strlang_non_string() {
     // (str-lang 42 "en") with a numeric first arg returns Ok(None) → ?err is unbound,
     // and the insert simply omits the ex:error predicate.
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-strlang-non-string");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-strlang-non-string:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1415,8 +1447,10 @@ async fn update_where_bind_error_handling_strlang_non_string() {
 #[tokio::test]
 async fn update_where_bind_error_handling_iri_arity() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-iri-arity");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-iri-arity:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1461,8 +1495,10 @@ async fn update_where_bind_error_handling_iri_arity() {
 #[tokio::test]
 async fn update_where_bind_error_handling_strdt_arity() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-strdt-arity");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-strdt-arity:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1508,8 +1544,10 @@ async fn update_where_bind_error_handling_strdt_arity() {
 #[tokio::test]
 async fn update_where_bind_error_handling_strlang_arity() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-strlang-arity");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-strlang-arity:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1555,8 +1593,10 @@ async fn update_where_bind_error_handling_strlang_arity() {
 #[tokio::test]
 async fn update_where_bind_error_handling_in_requires_list() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-in-list");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-error-in-list:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1623,8 +1663,10 @@ fn ctx_full() -> JsonValue {
 #[tokio::test]
 async fn update_values_wildcard_delete_retracts_all_triples() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:values-wildcard-delete");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-values-wildcard-delete:main")
+        .await
+        .expect("create ledger");
 
     // Seed entity using urn: IRI format and fsys properties (matching production).
     let seeded = fluree
@@ -1701,8 +1743,10 @@ async fn update_values_wildcard_delete_retracts_all_triples() {
 #[tokio::test]
 async fn update_values_wildcard_delete_minimal_context_works() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:values-wildcard-delete-minimal");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-values-wildcard-delete-minimal:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1777,8 +1821,10 @@ async fn update_values_wildcard_delete_minimal_context_works() {
 #[tokio::test]
 async fn update_hardcoded_id_wildcard_delete_retracts_all_triples() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:hardcoded-wildcard-delete");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-hardcoded-wildcard-delete:main")
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -1849,8 +1895,10 @@ async fn update_hardcoded_id_wildcard_delete_retracts_all_triples() {
 #[tokio::test]
 async fn update_values_wildcard_delete_across_two_transactions() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:values-wildcard-delete-2txn");
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger("it/transact-update-values-wildcard-delete-2txn:main")
+        .await
+        .expect("create ledger");
 
     // First transaction: core properties
     let txn1 = fluree
@@ -1946,13 +1994,15 @@ async fn update_values_wildcard_delete_index_plus_novelty() {
     use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/transact-update:wildcard-delete-indexed";
+    let ledger_id = "it/transact-update-wildcard-delete-indexed:main";
     let index_cfg = IndexConfig {
         reindex_min_bytes: 100_000,
         reindex_max_bytes: 1_000_000_000,
     };
-    let ledger0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(ledger0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
@@ -2080,13 +2130,15 @@ async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
     use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/transact-update:wildcard-delete-dup-index-novelty";
+    let ledger_id = "it/transact-update-wildcard-delete-dup-index-novelty:main";
     let index_cfg = IndexConfig {
         reindex_min_bytes: 100_000,
         reindex_max_bytes: 1_000_000_000,
     };
-    let ledger0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(ledger0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
@@ -2213,13 +2265,15 @@ async fn update_values_wildcard_delete_after_updates_and_indexing() {
     use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/transact-update:wildcard-delete-updates-indexed";
+    let ledger_id = "it/transact-update-wildcard-delete-updates-indexed:main";
     let index_cfg = IndexConfig {
         reindex_min_bytes: 100_000,
         reindex_max_bytes: 1_000_000_000,
     };
-    let ledger0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(ledger0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
@@ -3160,7 +3214,7 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
 async fn tracked_update_matching_nothing_is_a_noop() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/tracked-noop-update:main";
-    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    let ledger = support::genesis_ledger(&fluree, ledger_id).await;
     let seeded = fluree
         .insert(
             ledger,
@@ -3192,7 +3246,7 @@ async fn tracked_update_matching_nothing_is_a_noop() {
 async fn no_match_update_naming_a_new_graph_commits_its_registration() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/noop-update-new-graph:main";
-    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    let ledger = support::genesis_ledger(&fluree, ledger_id).await;
     let seeded = fluree
         .insert(
             ledger,

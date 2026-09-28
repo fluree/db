@@ -76,6 +76,8 @@ dashmap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+# The lifecycle conformance suite, run against a single-node raft.
+fluree-db-nameservice = { path = "../fluree-db-nameservice", features = ["conformance"] }
 tempfile = "3.19"
 
 [lints]

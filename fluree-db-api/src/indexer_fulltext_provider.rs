@@ -88,7 +88,7 @@ impl ApiFulltextConfigProvider {
                     .map_err(|e| format!("build_branched_store: {e}"))?;
                     Arc::new(branched) as Arc<dyn fluree_db_core::ContentStore>
                 } else {
-                    self.backend.content_store(&record.ledger_id)
+                    self.backend.content_store(&record.storage_namespace())
                 };
                 let cfg_iri = config_graph_iri(ledger_id);
                 let probe = first_t_where_graph_registered(cs.as_ref(), head_id, &cfg_iri)

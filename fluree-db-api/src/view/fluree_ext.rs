@@ -250,7 +250,7 @@ impl Fluree {
                 let cs = self
                     .content_store_for_record_or_id(
                         snapshot.ns_record.as_ref(),
-                        &snapshot.snapshot.ledger_id,
+                        &snapshot.storage_namespace(),
                     )
                     .await?;
                 let bytes = cs
@@ -633,8 +633,11 @@ impl Fluree {
     ) -> Option<fluree_db_core::ledger_config::ResolvedConfig> {
         #[cfg(feature = "iceberg")]
         {
-            let (model, default_allow) = crate::graph_source::r2rml::policy_config_of(record);
-            crate::graph_source::r2rml::source_resolved_config(model.as_deref(), default_allow)
+            let policy = crate::graph_source::r2rml::policy_config_of(record);
+            crate::graph_source::r2rml::source_resolved_config(
+                policy.model.as_deref(),
+                policy.default_allow,
+            )
         }
         #[cfg(not(feature = "iceberg"))]
         {
@@ -643,8 +646,9 @@ impl Fluree {
         }
     }
 
-    /// Validate a graph source's `--model` reference at registration and
-    /// return user-facing warnings about it.
+    /// Validate a graph source's `--model` reference at registration, and
+    /// return the model ledger's instance, for the source to record, with
+    /// user-facing warnings about it.
     ///
     /// The model must be an existing native ledger (a typo would otherwise
     /// surface only as a 502 on every governed query). Policies in it that use
@@ -655,9 +659,12 @@ impl Fluree {
     /// feature-gated, so the method is gated the same way — a wasm32
     /// `--no-default-features` build would otherwise lint it as dead.
     #[cfg(any(feature = "iceberg", feature = "sql"))]
-    pub(crate) async fn validate_source_model(&self, model: Option<&str>) -> Result<Vec<String>> {
+    pub(crate) async fn validate_source_model(
+        &self,
+        model: Option<&str>,
+    ) -> Result<(Option<String>, Vec<String>)> {
         let Some(model) = model else {
-            return Ok(Vec::new());
+            return Ok((None, Vec::new()));
         };
         let id = fluree_db_core::LedgerId::parse(model)?;
         let ns = self.nameservice();
@@ -672,8 +679,8 @@ impl Fluree {
                  holding the policies and class hierarchy"
             )));
         }
-        match ns.lookup(&id).await {
-            Ok(Some(record)) if !record.retracted => {}
+        let instance = match ns.lookup(&id).await {
+            Ok(Some(record)) if !record.retracted => record.instance().map(|i| i.to_string()),
             Ok(_) => {
                 return Err(ApiError::config(format!(
                     "model ledger '{model}' not found; create it first (`fluree create`) \
@@ -681,7 +688,7 @@ impl Fluree {
                 )));
             }
             Err(e) => return Err(ApiError::internal(e.to_string())),
-        }
+        };
 
         let probe = serde_json::json!({
             "from": id,
@@ -703,7 +710,7 @@ impl Fluree {
             .collect();
         warnings.sort();
         warnings.dedup();
-        Ok(warnings)
+        Ok((instance, warnings))
     }
 
     pub async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {
@@ -769,6 +776,8 @@ impl Fluree {
         // The default graph routes to the virtual provider and uses its model
         // configuration. Shared graph selection removes both when selecting an
         // empty system graph, for fragments and explicit dataset selectors alike.
+        #[cfg(feature = "iceberg")]
+        self.check_source_model(&record).await?;
         db.resolved_config = Self::graph_source_model_config(&record);
         db.graph_source_id = Some(gs_id.to_string().into());
         db.graph_source_time = graph_source_time;

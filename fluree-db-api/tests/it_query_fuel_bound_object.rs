@@ -43,7 +43,7 @@ fn ctx() -> JsonValue {
 /// Seed N widgets (`ns:Widget`), each owned by one of 5 owner entities, then
 /// rebuild the binary index so the data lives in persisted base leaflets.
 async fn seed(fluree: &fluree_db_api::Fluree) {
-    let ledger0 = genesis_ledger(fluree, LEDGER_ID);
+    let ledger0 = genesis_ledger(fluree, LEDGER_ID).await;
 
     let mut graph = Vec::with_capacity(N + 5);
     for i in 0..5 {
@@ -211,7 +211,7 @@ async fn untyped_string_on_langstring_predicate_stays_lenient_and_short_circuits
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "fuel-langstring:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let mut graph = vec![
         json!({ "@id": "ns:plain", "ns:label": "shared" }),

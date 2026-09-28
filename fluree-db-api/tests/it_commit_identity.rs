@@ -33,7 +33,7 @@ fn ctx_test() -> JsonValue {
 /// Two commits. Returns the ledger plus the t=1 commit id, which every
 /// spelling below names.
 async fn seed(fluree: &MemoryFluree, ledger_id: &str) -> (MemoryLedger, fluree_db_core::ContentId) {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let tx1 = json!({
         "@context": ctx_test(),

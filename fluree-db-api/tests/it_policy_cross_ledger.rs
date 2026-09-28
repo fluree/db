@@ -28,7 +28,7 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
 
     // --- model ledger M: holds a deny-on-class policy in a named graph
     let model_id = "test/cross-ledger-e2e/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     let policy_graph_iri = "http://example.org/m-policies";
     let m_trig = format!(
@@ -55,7 +55,7 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
 
     // --- data ledger D: holds user data plus a cross-ledger config
     let data_id = "test/cross-ledger-e2e/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     // First write the actual user data into D's default graph.
     let r1 = fluree
@@ -180,7 +180,7 @@ async fn custom_class_policy_enforced_when_data_ledger_includes_class() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-filter/custom-included/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/custom-policies";
 
     // Policy typed as ex:OrgPolicy (NOT f:AccessPolicy).
@@ -206,7 +206,7 @@ async fn custom_class_policy_enforced_when_data_ledger_includes_class() {
         .expect("seed M custom-typed policy");
 
     let data_id = "test/cross-ledger-filter/custom-included/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,
@@ -283,7 +283,7 @@ async fn custom_class_policy_skipped_when_data_ledger_omits_class() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-filter/custom-omitted/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/custom-policies";
 
     // Identical M setup to the previous test — custom-typed policy.
@@ -309,7 +309,7 @@ async fn custom_class_policy_skipped_when_data_ledger_omits_class() {
         .expect("seed M custom-typed policy");
 
     let data_id = "test/cross-ledger-filter/custom-omitted/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,
@@ -394,7 +394,7 @@ async fn empty_cross_ledger_restrictions_fail_closed_under_default_deny() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-filter/empty-deny/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/empty-policies";
 
     // M holds a custom-typed (ex:OrgPolicy) rule — nothing typed
@@ -421,7 +421,7 @@ async fn empty_cross_ledger_restrictions_fail_closed_under_default_deny() {
         .expect("seed M custom-typed policy");
 
     let data_id = "test/cross-ledger-filter/empty-deny/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,
@@ -506,7 +506,7 @@ async fn empty_cross_ledger_restrictions_under_default_allow_are_root() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-filter/empty-allow/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/empty-allow-policies";
 
     // Custom-typed rule only: the default {f:AccessPolicy} filter selects none.
@@ -532,7 +532,7 @@ async fn empty_cross_ledger_restrictions_under_default_allow_are_root() {
         .expect("seed M custom-typed policy");
 
     let data_id = "test/cross-ledger-filter/empty-allow/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,
@@ -614,7 +614,7 @@ async fn empty_cross_ledger_restrictions_under_default_allow_keep_fast_paths() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-filter/empty-allow-indexed/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/empty-allow-indexed-policies";
     fluree
         .stage_owned(model)
@@ -638,7 +638,7 @@ async fn empty_cross_ledger_restrictions_under_default_allow_keep_fast_paths() {
         .expect("seed M custom-typed policy");
 
     let data_id = "test/cross-ledger-filter/empty-allow-indexed/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let config_iri = config_graph_iri(data_id);
     let data = fluree
         .stage_owned(data)
@@ -757,7 +757,7 @@ async fn baseline_access_policy_class_enforced() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-filter/baseline/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/access-policies";
 
     fluree
@@ -782,7 +782,7 @@ async fn baseline_access_policy_class_enforced() {
         .expect("seed M baseline policy");
 
     let data_id = "test/cross-ledger-filter/baseline/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,
@@ -857,7 +857,7 @@ async fn omitted_policy_class_defaults_to_access_policy_only() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-filter/default-class/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/mixed-policies";
 
     // M holds two policies: one canonical, one custom-typed. Both
@@ -892,7 +892,7 @@ async fn omitted_policy_class_defaults_to_access_policy_only() {
         .expect("seed M with mixed policy classes");
 
     let data_id = "test/cross-ledger-filter/default-class/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,
@@ -995,7 +995,7 @@ async fn identity_with_policy_class_engages_cross_ledger_rules() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-e2e/id-bind-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/id-bind-policies";
     // Full IRIs inside f:query — it executes against D.
     let owner_query =
@@ -1023,7 +1023,7 @@ async fn identity_with_policy_class_engages_cross_ledger_rules() {
         .expect("seed M owner-only view rule");
 
     let data_id = "test/cross-ledger-e2e/id-bind-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,
@@ -1109,7 +1109,7 @@ async fn cross_ledger_plus_identity_mode_fails_closed() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger-e2e/id-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/id-policies";
     fluree
         .stage_owned(model)
@@ -1129,7 +1129,7 @@ async fn cross_ledger_plus_identity_mode_fails_closed() {
         .expect("seed M");
 
     let data_id = "test/cross-ledger-e2e/id-data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let config_iri = config_graph_iri(data_id);
     fluree
@@ -1186,7 +1186,7 @@ async fn multiple_targeted_query_rules_any_allow_grants_across_materializations(
     let model_id = "test/cross-ledger-e2e/multi-query-model:main";
     let mut model = fluree
         .insert(
-            genesis_ledger(&fluree, model_id),
+            genesis_ledger(&fluree, model_id).await,
             &json!({"@context": ctx, "@graph": [
                 {"@id": "ex:one-hop", "@type": "f:AccessPolicy", "f:action": {"@id": "f:view"},
                  "f:onClass": [{"@id": "ex:Line"}],
@@ -1203,7 +1203,7 @@ async fn multiple_targeted_query_rules_any_allow_grants_across_materializations(
     let data_id = "test/cross-ledger-e2e/multi-query-data:main";
     let data = fluree
         .insert(
-            genesis_ledger(&fluree, data_id),
+            genesis_ledger(&fluree, data_id).await,
             &json!({"@context": ctx, "@graph": [
                 {"@id": "ex:acme", "@type": "ex:Supplier"},
                 {"@id": "ex:acme-rome", "@type": "ex:SupplierRecord", "ex:canonical": {"@id": "ex:acme"}},
@@ -1279,4 +1279,116 @@ async fn multiple_targeted_query_rules_any_allow_grants_across_materializations(
             "round {round}: one-hop rule must grant acme-rome"
         );
     }
+}
+
+/// A model ledger dropped and created again under its name is another
+/// ledger, whose `t` starts over. The policies D reads are the new
+/// ledger's, never the dropped one's cached at the same `t`.
+#[tokio::test]
+async fn recreated_model_ledger_policies_replace_the_dropped_ones() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-recreate/model:main";
+    let data_id = "test/cross-ledger-recreate/data:main";
+    let policy_graph_iri = "http://example.org/m-policies";
+    let seed_model = |allow: bool| {
+        format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:users
+                    rdf:type    f:AccessPolicy ;
+                    f:action    f:view ;
+                    f:onClass   ex:User ;
+                    f:allow     {allow} .
+            }}
+        "
+        )
+    };
+
+    let model = genesis_ledger(&fluree, model_id).await;
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&seed_model(false))
+        .execute()
+        .await
+        .expect("seed M deny");
+
+    let data = genesis_ledger(&fluree, data_id).await;
+    let data = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice"
+            }),
+        )
+        .await
+        .expect("seed D")
+        .ledger;
+    let config_iri = config_graph_iri(data_id);
+    fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow false .
+                <urn:cfg:policy> f:policyClass f:AccessPolicy .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config");
+
+    let users = || async {
+        let wrapped = fluree
+            .db_with_policy(data_id, &GovernanceOptions::default())
+            .await
+            .expect("db_with_policy");
+        fluree
+            .query(
+                &wrapped,
+                &json!({"@context": {"ex": "http://example.org/ns/"}, "select": "?u",
+                        "where": {"@id": "?u", "@type": "ex:User"}}),
+            )
+            .await
+            .expect("query")
+            .to_jsonld(&wrapped.snapshot)
+            .expect("jsonld")
+    };
+    assert_eq!(users().await, json!([]), "M denies users");
+
+    fluree
+        .drop_ledger(
+            "test/cross-ledger-recreate/model",
+            fluree_db_api::DropMode::Soft,
+        )
+        .await
+        .expect("drop M");
+    let model = genesis_ledger(&fluree, model_id).await;
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&seed_model(true))
+        .execute()
+        .await
+        .expect("seed the new M allow");
+
+    assert_eq!(
+        users().await,
+        json!(["ex:alice"]),
+        "the new M, at the dropped M's t, allows users"
+    );
 }

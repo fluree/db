@@ -112,7 +112,7 @@ async fn indexed_ledger_with_novelty(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
 ) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let _ = fluree
         .insert(ledger0, &seed())
         .await

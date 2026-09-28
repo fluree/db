@@ -189,24 +189,39 @@ pub fn cid_and_ledger_from_address(address: &str) -> Option<(ContentId, String)>
 
     // Reconstruct ledger ID from the alias segments `parts[alias_start..alias_end]`
     // (the segments before the kind directory, after any leading prefix).
-    let ledger_id = if branch_in_path {
+    let (name_end, branch) = if branch_in_path {
         if alias_end < alias_start + 2 {
             return None;
         }
-        let branch = parts[alias_end - 1];
-        let name = parts[alias_start..alias_end - 1].join("/");
-        format_ledger_id(&name, branch)
+        (alias_end - 1, parts[alias_end - 1])
     } else {
-        if alias_end < alias_start + 1 {
-            return None;
-        }
-        let name = parts[alias_start..alias_end].join("/");
-        format_ledger_id(&name, fluree_db_core::DEFAULT_BRANCH)
+        (alias_end, fluree_db_core::DEFAULT_BRANCH)
     };
+    let name = ledger_name_of_root(&parts[alias_start..name_end])?;
+    let ledger_id = format_ledger_id(&name, branch);
 
     // Build CID from codec + hex digest
     let cid = ContentId::from_hex_digest(codec, hash_hex)?;
     Some((cid, ledger_id))
+}
+
+/// The ledger name a storage root's segments belong to: the segments
+/// themselves for a name root, or those before the `@{instance}` segment of
+/// an instance root. `@` is reserved in ledger names, so a segment starting
+/// with it is an instance or nothing; anything else is not a root.
+fn ledger_name_of_root(segments: &[&str]) -> Option<String> {
+    let (last, name) = segments.split_last()?;
+    let name = match last.strip_prefix('@') {
+        Some(instance) => {
+            fluree_db_core::InstanceId::parse(instance).ok()?;
+            name
+        }
+        None => segments,
+    };
+    if name.is_empty() || name.iter().any(|s| s.starts_with('@')) {
+        return None;
+    }
+    Some(name.join("/"))
 }
 
 /// Internal result type for fetch operations
@@ -661,7 +676,7 @@ impl ContentAddressedWrite for ProxyStorage {
     async fn content_write_bytes_with_hash(
         &self,
         _kind: ContentKind,
-        _ledger_alias: &str,
+        _namespace: &fluree_db_core::StorageNamespace,
         _content_hash_hex: &str,
         _bytes: &[u8],
     ) -> Result<ContentWriteResult> {
@@ -673,7 +688,7 @@ impl ContentAddressedWrite for ProxyStorage {
     async fn content_write_bytes(
         &self,
         _kind: ContentKind,
-        _ledger_alias: &str,
+        _namespace: &fluree_db_core::StorageNamespace,
         _bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         Err(CoreError::storage(
@@ -738,7 +753,7 @@ mod tests {
         let address = fluree_db_core::content_address(
             "file",
             ContentKind::Txn,
-            "mydb:main",
+            &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
             &id.digest_hex(),
         );
 
@@ -776,7 +791,7 @@ mod tests {
         let address = fluree_db_core::content_address(
             "file",
             ContentKind::Txn,
-            "mydb:main",
+            &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
             &id.digest_hex(),
         );
 
@@ -806,7 +821,7 @@ mod tests {
         let address = fluree_db_core::content_address(
             "file",
             ContentKind::Txn,
-            "mydb:main",
+            &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
             &id.digest_hex(),
         );
 
@@ -873,7 +888,12 @@ mod tests {
     /// `cid_and_ledger_from_address` recovers the correct CID and ledger.
     fn assert_roundtrip(kind: ContentKind, alias: &str, data: &[u8]) {
         let id = ContentId::new(kind, data);
-        let address = fluree_db_core::content_address("file", kind, alias, &id.digest_hex());
+        let address = fluree_db_core::content_address(
+            "file",
+            kind,
+            &fluree_db_core::StorageNamespace::parse_legacy(alias).unwrap(),
+            &id.digest_hex(),
+        );
         let (cid, ledger) = cid_and_ledger_from_address(&address).expect("should parse address");
         assert_eq!(cid, id, "CID mismatch for {address}");
         assert_eq!(ledger, alias, "ledger mismatch for {address}");
@@ -1002,8 +1022,12 @@ mod tests {
         ];
         for kind in recoverable {
             let id = ContentId::new(kind, b"x");
-            let address =
-                fluree_db_core::content_address("file", kind, "mydb:main", &id.digest_hex());
+            let address = fluree_db_core::content_address(
+                "file",
+                kind,
+                &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                &id.digest_hex(),
+            );
             let (cid, ledger) = cid_and_ledger_from_address(&address)
                 .unwrap_or_else(|| panic!("no round-trip for {kind:?} at {address}"));
             assert_eq!(cid, id, "CID mismatch for {kind:?}");
@@ -1020,11 +1044,74 @@ mod tests {
             ContentKind::AnnotationReverseLeaf,
         ] {
             let id = ContentId::new(kind, b"x");
-            let address =
-                fluree_db_core::content_address("file", kind, "mydb:main", &id.digest_hex());
+            let address = fluree_db_core::content_address(
+                "file",
+                kind,
+                &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                &id.digest_hex(),
+            );
             assert!(
                 cid_and_ledger_from_address(&address).is_none(),
                 "{kind:?} unexpectedly parsed — update this test AND the parser"
+            );
+        }
+    }
+
+    /// An instance root maps back to its ledger by name: the server resolves
+    /// and authorizes that ledger, so a wrong parse would be a policy hole.
+    #[test]
+    fn instance_root_addresses_map_to_their_ledger() {
+        use fluree_db_core::{DictKind, InstanceId, LedgerName, StorageRoot};
+
+        let instance = "01JB8ZK4X5Y6Z7A8B9C0D1E2F3";
+        let root = StorageRoot::for_instance(
+            &LedgerName::parse("acme/inventory").unwrap(),
+            &InstanceId::parse(instance).unwrap(),
+        );
+        for kind in [
+            ContentKind::Commit,
+            ContentKind::Txn,
+            ContentKind::IndexRoot,
+            ContentKind::GarbageRecord,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            ContentKind::IndexBranch,
+            ContentKind::IndexLeaf,
+            ContentKind::LedgerConfig,
+            ContentKind::StatsSketch,
+            ContentKind::SpatialIndex,
+            ContentKind::HistorySidecar,
+        ] {
+            let id = ContentId::new(kind, b"x");
+            let address = fluree_db_core::content_address(
+                "file",
+                kind,
+                &root.namespace("dev"),
+                &id.digest_hex(),
+            );
+            let (cid, ledger) = cid_and_ledger_from_address(&address)
+                .unwrap_or_else(|| panic!("no round-trip for {kind:?} at {address}"));
+            assert_eq!(cid, id, "CID mismatch for {kind:?}");
+            let expected = match kind {
+                ContentKind::DictBlob { .. } => "acme/inventory:main",
+                _ => "acme/inventory:dev",
+            };
+            assert_eq!(ledger, expected, "ledger mismatch for {address}");
+        }
+
+        // `@` is reserved in names, so any other `@` segment is no root.
+        let hash = ContentId::new(ContentKind::Commit, b"x").digest_hex();
+        for path in [
+            "acme/@nope/main".to_string(),
+            format!("@{instance}/main"),
+            format!("acme/@{instance}/@{instance}/main"),
+            format!("acme/@{instance}/x/main"),
+        ] {
+            let address = format!("fluree:file://{path}/commit/{hash}.fcv2");
+            assert!(
+                cid_and_ledger_from_address(&address).is_none(),
+                "{address} must not parse"
             );
         }
     }
@@ -1035,7 +1122,7 @@ mod tests {
         let address = fluree_db_core::content_address(
             "s3",
             ContentKind::Commit,
-            "prod:main",
+            &fluree_db_core::StorageNamespace::parse_legacy("prod:main").unwrap(),
             &id.digest_hex(),
         );
         let (cid, ledger) = cid_and_ledger_from_address(&address).expect("should parse s3 address");
