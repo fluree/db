@@ -336,28 +336,11 @@ bindings (4.2 and earlier) keeps its data at the name itself — `mydb/main/…`
 ### Upgrading from a release before name bindings
 
 Releases 4.2 and earlier keep the nameservice under `ns@v2/`. The first start of
-this release copies it to `ns@v3/`, binds each ledger to its name where its
-data already is, and moves each ledger those releases soft-dropped into the
-list of dropped ledgers ([`fluree dropped list`](../cli/dropped.md)). No ledger
-data is moved or rewritten, and `ns@v2/` is left as it was.
-
-- **Rolling back:** an older release reads only `ns@v2/`, so it sees the
-  ledgers as they were at the upgrade; writes made since are not visible to it.
-- **Mixed versions:** upgrade every process that shares the store together,
-  CLIs included, and don't run an older release against it afterwards. An
-  older release writes to `ns@v2/`, which this release ignores: a commit it
-  makes is invisible here, and from that commit on the two releases'
-  histories of the ledger diverge. This release logs a warning at start when
-  it finds such writes. On a local filesystem it notices any file under
-  `ns@v2/` changed since the upgrade. On an object store it notices only a
-  ledger or branch created or deleted there, because a listing does not say
-  when an object last changed; a commit to an existing ledger goes
-  unnoticed.
-- **Newer formats:** a release refuses to start against a store in a newer
-  format than it understands.
-
-For DynamoDB, see [the DynamoDB guide](dynamodb-guide.md#upgrading-from-a-release-before-name-bindings);
-for Raft clusters, [Raft clusters](raft-clusters.md#rolling-upgrades).
+this release copies it to `ns@v3/` and binds each ledger to its name where its
+data already is; no ledger data is moved, and `ns@v2/` is left as it was. Every
+process that shares the store must be upgraded together: a 4.2 process still
+writing to `ns@v2/` afterwards is invisible to this release. See
+[Upgrading from 4.2 and earlier](upgrading-from-4.2.md).
 
 ### File Formats
 

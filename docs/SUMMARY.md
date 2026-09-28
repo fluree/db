@@ -255,6 +255,7 @@
 - [Operations](operations/README.md)
   - [Scaling and resilience architecture](operations/scaling-and-resilience.md)
   - [Configuration](operations/configuration.md)
+  - [Upgrading from 4.2 and earlier](operations/upgrading-from-4.2.md)
   - [Running with Docker](operations/docker.md)
   - [Storage modes (memory/file/AWS/IPFS)](operations/storage.md)
   - [Serverless storage choices](operations/serverless-storage.md)

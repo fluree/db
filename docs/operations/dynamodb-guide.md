@@ -600,14 +600,13 @@ Hard drops and branch-drop cascade cleanup require `dynamodb:DeleteItem`. Backen
 Releases before name bindings (4.2 and earlier) keep no bindings or fences. The
 first start of this release binds every ledger in the table to its name, gives
 each branch record a fence, and moves each ledger those releases soft-dropped
-into the list of dropped ledgers, where it can be restored or purged. It then
-writes the `@format` item, so later starts skip the step. Ledger data is not
-moved or rewritten.
+into the list of dropped ledgers. It then writes the `@format` item, so later
+starts skip the step. Ledger data is not moved or rewritten.
 
-Older releases write without checking fences and know nothing of bindings, so
-upgrade every node before starting any: stop all nodes, upgrade them, then
-start them. Do not run an older release against the table afterwards. A release
-refuses to start against a table in a newer format than it understands.
+The upgrade writes in place, so take a backup first, and upgrade every process
+that writes the table together, or deny the old ones write access with IAM. See
+[Upgrading from 4.2 and earlier](upgrading-from-4.2.md), including
+[deployments that cannot stop at once](upgrading-from-4.2.md#deployments-that-cannot-stop-at-once).
 
 ## Production Considerations
 
