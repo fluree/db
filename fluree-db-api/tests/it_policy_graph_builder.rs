@@ -685,3 +685,144 @@ async fn verified_identity_from_execution_options_gates_config_override() {
          request's default-allow and its own deny stands"
     );
 }
+
+// =========================================================================
+// The materialized snapshot: `graph().load()` rather than `graph().query()`
+// =========================================================================
+
+/// `Graph::load` materializes a view before any query is attached, so it applies
+/// the ledger's configured policy defaults and nothing query-specific. A bare read
+/// of a governed ledger must therefore match the lazy form, which is how
+/// `docs/getting-started/rust-api.md` presents the two.
+#[tokio::test]
+async fn snapshot_load_applies_configured_policy_defaults() {
+    const LEDGER: &str = "repro/gqb-snapshot-config:main";
+    let fluree = setup_configured(LEDGER).await;
+
+    let lazy = via_graph(&fluree, LEDGER, &by_name()).await;
+    assert_eq!(
+        rows(&lazy),
+        0,
+        "precondition: the lazy form enforces: {lazy}"
+    );
+
+    let snapshot = fluree
+        .graph(LEDGER)
+        .load()
+        .await
+        .expect("load")
+        .query()
+        .jsonld(&by_name())
+        .execute_formatted()
+        .await
+        .expect("snapshot query");
+    assert_eq!(
+        rows(&snapshot),
+        0,
+        "a materialized snapshot must carry the ledger's configured defaults: \
+         {snapshot}"
+    );
+
+    // Control: the configured deny targets ex:name only, so the snapshot is not
+    // simply refusing everything.
+    let readable = fluree
+        .graph(LEDGER)
+        .load()
+        .await
+        .expect("load")
+        .query()
+        .jsonld(&by_ssn())
+        .execute_formatted()
+        .await
+        .expect("snapshot control");
+    assert_eq!(rows(&readable), 5, "{readable}");
+}
+
+/// An unconfigured ledger is unchanged by the wrap above: `wrap_policy_defaults`
+/// returns such a view untouched, so the snapshot stays on the plain-query path.
+#[tokio::test]
+async fn snapshot_load_leaves_an_unconfigured_ledger_unrestricted() {
+    const LEDGER: &str = "repro/gqb-snapshot-open:main";
+    let fluree = setup(LEDGER).await;
+
+    let snapshot = fluree
+        .graph(LEDGER)
+        .load()
+        .await
+        .expect("load")
+        .query()
+        .jsonld(&by_name())
+        .execute_formatted()
+        .await
+        .expect("snapshot query");
+    assert_eq!(rows(&snapshot), 5, "{snapshot}");
+}
+
+// =========================================================================
+// Status codes for a malformed policy option
+// =========================================================================
+
+/// A malformed `opts` block is a caller error on every terminal, and the same
+/// error through the `from`-driven builder has always been a 400. `load_view`
+/// reports policy parsing as well as load failures now, so the tracked terminal
+/// cannot map everything it returns to 404.
+#[tokio::test]
+async fn a_malformed_policy_option_is_a_400_on_every_terminal() {
+    const LEDGER: &str = "repro/gqb-bad-opts:main";
+    let fluree = setup(LEDGER).await;
+    let bad = with_opts(by_name(), json!({ "policy-values": "x" }));
+
+    let formatted = fluree
+        .graph(LEDGER)
+        .query()
+        .jsonld(&bad)
+        .execute_formatted()
+        .await
+        .expect_err("malformed opts must fail");
+    assert_eq!(formatted.status_code(), 400, "{formatted}");
+
+    let raw = fluree
+        .graph(LEDGER)
+        .query()
+        .jsonld(&bad)
+        .execute()
+        .await
+        .expect_err("malformed opts must fail");
+    assert_eq!(raw.status_code(), 400, "{raw}");
+
+    let tracked = fluree
+        .graph(LEDGER)
+        .query()
+        .jsonld(&bad)
+        .execute_tracked()
+        .await
+        .expect_err("malformed opts must fail");
+    assert_eq!(tracked.status, 400, "{}", tracked.error);
+
+    // Parity with the builder that already answered 400.
+    let mut from_q = bad.clone();
+    from_q["from"] = json!(LEDGER);
+    let via_from = fluree
+        .query_from()
+        .jsonld(&from_q)
+        .execute_formatted()
+        .await
+        .expect_err("malformed opts must fail");
+    assert_eq!(via_from.status_code(), 400, "{via_from}");
+}
+
+/// The tracked terminal now reports the error's own status, so a genuinely
+/// missing ledger must still be a 404 rather than collateral from that change.
+#[tokio::test]
+async fn a_missing_ledger_is_still_a_404_on_the_tracked_terminal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let q = by_name();
+    let tracked = fluree
+        .graph("repro/gqb-no-such-ledger:main")
+        .query()
+        .jsonld(&q)
+        .execute_tracked()
+        .await
+        .expect_err("missing ledger must fail");
+    assert_eq!(tracked.status, 404, "{}", tracked.error);
+}

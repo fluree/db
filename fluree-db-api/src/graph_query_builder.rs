@@ -146,8 +146,10 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
     async fn wrap_request_policy(&self, view: GraphDb) -> Result<GraphDb> {
         let mut opts = match self.core.input.as_ref() {
             Some(crate::view::QueryInput::JsonLd(json)) => {
+                // A malformed `opts` block is the caller's mistake, so a 400.
+                // `ApiError::query` would report it as an internal 500.
                 crate::GovernanceOptions::from_json(json)
-                    .map_err(|e| ApiError::query(e.to_string()))?
+                    .map_err(|e| ApiError::invalid_query(e.to_string()))?
             }
             _ => crate::GovernanceOptions::default(),
         };
@@ -328,7 +330,9 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         let db = self
             .load_view()
             .await
-            .map_err(|e| TrackedErrorResponse::new(404, e.to_string(), None))?;
+            // Not a blanket 404: `load_view` now also reports a malformed `opts`
+            // block, which is a 400, and a load can fail for other reasons too.
+            .map_err(|e| TrackedErrorResponse::new(e.status_code(), e.to_string(), None))?;
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
