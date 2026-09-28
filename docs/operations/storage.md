@@ -343,10 +343,16 @@ data is moved or rewritten, and `ns@v2/` is left as it was.
 
 - **Rolling back:** an older release reads only `ns@v2/`, so it sees the
   ledgers as they were at the upgrade; writes made since are not visible to it.
-- **Mixed versions:** don't run an older release against the store after the
-  upgrade, for example an older CLI beside a newer server. It writes to
-  `ns@v2/`, which this release ignores; this release logs a warning at start
-  when it finds such writes.
+- **Mixed versions:** upgrade every process that shares the store together,
+  CLIs included, and don't run an older release against it afterwards. An
+  older release writes to `ns@v2/`, which this release ignores: a commit it
+  makes is invisible here, and from that commit on the two releases'
+  histories of the ledger diverge. This release logs a warning at start when
+  it finds such writes. On a local filesystem it notices any file under
+  `ns@v2/` changed since the upgrade. On an object store it notices only a
+  ledger or branch created or deleted there, because a listing does not say
+  when an object last changed; a commit to an existing ledger goes
+  unnoticed.
 - **Newer formats:** a release refuses to start against a store in a newer
   format than it understands.
 

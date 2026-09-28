@@ -201,7 +201,7 @@ impl FileNameService {
         }
 
         let report = crate::lifecycle::migrate_legacy(self).await?;
-        let marker = serde_json::to_vec_pretty(&FormatMarker::current())?;
+        let marker = serde_json::to_vec_pretty(&FormatMarker::current(None))?;
         self.storage
             .insert(
                 &format!("fluree:file://{NS_VERSION}/{FORMAT_MARKER}"),
@@ -666,22 +666,26 @@ fn walk_files(root: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
-/// Warn when a binary from before name bindings has written to `ns@v2/`
-/// since the migration: this binary does not see those writes.
-fn warn_about_legacy_writes(base: &Path, marker: &FormatMarker) {
+/// How many files under `ns@v2/` changed after the migration, which a
+/// binary from before name bindings wrote: this binary does not see them.
+fn legacy_writes(base: &Path, marker: &FormatMarker) -> usize {
     let legacy = base.join(LEGACY_NS_VERSION);
     let Ok(files) = walk_files(&legacy) else {
-        return;
+        return 0;
     };
     let since = std::time::UNIX_EPOCH + std::time::Duration::from_millis(marker.migrated_at as u64);
-    let written = files
+    files
         .iter()
         .filter(|relative| {
             std::fs::metadata(legacy.join(relative))
                 .and_then(|m| m.modified())
                 .is_ok_and(|modified| modified > since)
         })
-        .count();
+        .count()
+}
+
+fn warn_about_legacy_writes(base: &Path, marker: &FormatMarker) {
+    let written = legacy_writes(base, marker);
     if written > 0 {
         tracing::warn!(
             written,
@@ -2049,6 +2053,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("newer"), "{err}");
+    }
+
+    /// A file an older binary writes under `ns@v2/` after the migration is
+    /// counted, so startup can warn that this binary does not see it.
+    #[tokio::test]
+    async fn legacy_writes_after_the_migration_are_counted() {
+        let temp = TempDir::new().unwrap();
+        let legacy = temp.path().join(LEGACY_NS_VERSION).join("mydb");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let record = NsRecord::new(LedgerId::parse("mydb:main").unwrap());
+        std::fs::write(
+            legacy.join("main.json"),
+            serde_json::to_vec(&NsFileV2::for_record(&record)).unwrap(),
+        )
+        .unwrap();
+        let ns = FileNameService::new(temp.path());
+        ns.migrate().await.unwrap().expect("migrated");
+        let marker = read_format_marker(&temp.path().join(NS_VERSION).join(FORMAT_MARKER)).unwrap();
+        let marker = marker.expect("marker");
+        assert_eq!(legacy_writes(temp.path(), &marker), 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(legacy.join("dev.json"), b"{}").unwrap();
+        assert_eq!(legacy_writes(temp.path(), &marker), 1);
+    }
+
+    /// A binding in a state this binary does not know, written by a newer
+    /// one, is refused rather than read as a free name: nothing resolves
+    /// under it, and no create can claim the name.
+    #[tokio::test]
+    async fn a_binding_in_an_unknown_state_is_refused() {
+        let (temp, ns) = setup().await;
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
+        let path = temp.path().join(NS_VERSION).join("mydb/@binding.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""state": "active""#), "{text}");
+        std::fs::write(
+            &path,
+            text.replace(r#""state": "active""#, r#""state": "archived""#),
+        )
+        .unwrap();
+
+        assert!(ns.lookup("mydb:main").await.is_err());
+        assert!(
+            crate::lifecycle::create_ledger(&ns, &LedgerId::parse("mydb:main").unwrap())
+                .await
+                .is_err()
+        );
     }
 
     /// Create a test ContentId from a label string (deterministic, reproducible).

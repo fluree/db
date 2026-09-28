@@ -27,15 +27,40 @@ pub(crate) struct FormatMarker {
     pub version: u32,
     /// Milliseconds since the Unix epoch.
     pub migrated_at: i64,
+    /// The files under [`LEGACY_NS_VERSION`] when the migration copied them,
+    /// on a backend that cannot tell when a file last changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy: Option<LegacyFiles>,
+}
+
+/// Which files an address version held: enough to tell that one was added
+/// or removed since, though not that one was rewritten.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LegacyFiles {
+    pub count: usize,
+    /// SHA-256 of the sorted relative paths, one per line.
+    pub digest: String,
+}
+
+impl LegacyFiles {
+    pub fn of(relative_paths: &[String]) -> Self {
+        let mut sorted: Vec<&str> = relative_paths.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        Self {
+            count: sorted.len(),
+            digest: fluree_db_core::sha256_hex(sorted.join("\n").as_bytes()),
+        }
+    }
 }
 
 impl FormatMarker {
-    pub fn current() -> Self {
+    pub fn current(legacy: Option<LegacyFiles>) -> Self {
         Self {
             version: FORMAT_VERSION,
             migrated_at: fluree_db_core::clock::SystemTime::now()
                 .duration_since(fluree_db_core::clock::SystemTime::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as i64),
+            legacy,
         }
     }
 

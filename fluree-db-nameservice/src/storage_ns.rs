@@ -629,12 +629,22 @@ where
     /// the store was already current. Safe to repeat, to resume, and to run
     /// from several processes at once.
     pub async fn migrate(&self) -> Result<Option<crate::lifecycle::MigrationReport>> {
-        use crate::migration::{FormatMarker, FORMAT_MARKER, LEGACY_NS_VERSION};
+        use crate::migration::{FormatMarker, LegacyFiles, FORMAT_MARKER, LEGACY_NS_VERSION};
 
         let marker_key = self.ns_root_key(FORMAT_MARKER);
         match self.storage.read_bytes(&marker_key).await {
             Ok(bytes) => {
-                FormatMarker::parse(&bytes)?;
+                let marker = FormatMarker::parse(&bytes)?;
+                if let Some((then, now)) = self.legacy_changes(&marker).await? {
+                    tracing::warn!(
+                        then,
+                        now,
+                        "the nameservice files under {LEGACY_NS_VERSION}/ changed after the \
+                         migration to {NS_VERSION}/ ({then} then, {now} now), most likely \
+                         because an older Fluree binary created or dropped a ledger there; \
+                         this binary does not see those changes"
+                    );
+                }
                 return Ok(None);
             }
             Err(CoreError::NotFound(_)) => {}
@@ -645,21 +655,9 @@ where
             }
         }
 
-        let legacy_root = if self.prefix.is_empty() {
-            format!("{LEGACY_NS_VERSION}/")
-        } else {
-            format!("{}/{LEGACY_NS_VERSION}/", self.prefix)
-        };
-        let keys = StorageList::list_prefix(&self.storage, &legacy_root)
-            .await
-            .map_err(|e| NameServiceError::storage(format!("listing {legacy_root}: {e}")))?;
-        for key in keys {
-            let Some(relative) = key.strip_prefix(&legacy_root) else {
-                continue;
-            };
-            if relative.ends_with(".lock") || relative.ends_with(".tmp") {
-                continue;
-            }
+        let (legacy_root, relatives) = self.legacy_files().await?;
+        for relative in &relatives {
+            let key = format!("{legacy_root}{relative}");
             let bytes = match self.storage.read_bytes(&key).await {
                 Ok(bytes) => bytes,
                 Err(CoreError::NotFound(_)) => continue,
@@ -674,7 +672,8 @@ where
         }
 
         let report = crate::lifecycle::migrate_legacy(self).await?;
-        let marker = serde_json::to_vec_pretty(&FormatMarker::current())?;
+        let marker =
+            serde_json::to_vec_pretty(&FormatMarker::current(Some(LegacyFiles::of(&relatives))))?;
         self.storage
             .insert(&marker_key, &marker)
             .await
@@ -687,6 +686,43 @@ where
             );
         }
         Ok(Some(report))
+    }
+
+    /// The root of the address version from before name bindings, and the
+    /// files under it, relative to it, except lock and staging files.
+    async fn legacy_files(&self) -> Result<(String, Vec<String>)> {
+        use crate::migration::LEGACY_NS_VERSION;
+        let legacy_root = if self.prefix.is_empty() {
+            format!("{LEGACY_NS_VERSION}/")
+        } else {
+            format!("{}/{LEGACY_NS_VERSION}/", self.prefix)
+        };
+        let keys = StorageList::list_prefix(&self.storage, &legacy_root)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("listing {legacy_root}: {e}")))?;
+        let relatives = keys
+            .iter()
+            .filter_map(|key| key.strip_prefix(&legacy_root))
+            .filter(|relative| !relative.ends_with(".lock") && !relative.ends_with(".tmp"))
+            .map(str::to_string)
+            .collect();
+        Ok((legacy_root, relatives))
+    }
+
+    /// How many legacy files there were at the migration and are now, when
+    /// a binary from before name bindings has since added or removed one.
+    /// A rewrite of an existing file goes unnoticed: listing reports no
+    /// modification time. `None` for a marker that recorded no files.
+    async fn legacy_changes(
+        &self,
+        marker: &crate::migration::FormatMarker,
+    ) -> Result<Option<(usize, usize)>> {
+        let Some(then) = &marker.legacy else {
+            return Ok(None);
+        };
+        let (_, relatives) = self.legacy_files().await?;
+        let now = crate::migration::LegacyFiles::of(&relatives);
+        Ok((now != *then).then_some((then.count, now.count)))
     }
 
     async fn list_raw_records(&self) -> Result<Vec<NsRecord>> {
@@ -2070,6 +2106,81 @@ mod tests {
         assert_eq!(migrated.commit_t, 2);
         assert!(ns.storage.read_bytes(legacy_key).await.is_ok());
         assert!(ns.migrate().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_store_in_a_newer_format_is_refused() {
+        let ns = make_storage_ns();
+        ns.storage
+            .write_bytes(
+                "test/ns@v3/@format.json",
+                br#"{"version": 4, "migrated_at": 0}"#,
+            )
+            .await
+            .unwrap();
+        let err = ns.migrate().await.unwrap_err();
+        assert!(err.to_string().contains("newer"), "{err}");
+    }
+
+    /// A ledger an older binary creates or drops under `ns@v2/` after the
+    /// migration changes the files there, which startup notices. A commit
+    /// it publishes to an existing ledger rewrites a file in place, which
+    /// listing cannot see.
+    #[tokio::test]
+    async fn legacy_files_added_after_the_migration_are_noticed() {
+        let ns = make_storage_ns();
+        let record = NsRecord::new(LedgerId::parse("mydb:main").unwrap());
+        let bytes = serde_json::to_vec(&NsFileV2::for_record(&record)).unwrap();
+        ns.storage
+            .write_bytes("test/ns@v2/mydb/main.json", &bytes)
+            .await
+            .unwrap();
+        ns.migrate().await.unwrap().expect("migrated");
+        let marker = crate::migration::FormatMarker::parse(
+            &ns.storage
+                .read_bytes("test/ns@v3/@format.json")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ns.legacy_changes(&marker).await.unwrap(), None);
+
+        ns.storage
+            .write_bytes("test/ns@v2/mydb/main.json", &bytes)
+            .await
+            .unwrap();
+        assert_eq!(ns.legacy_changes(&marker).await.unwrap(), None);
+
+        ns.storage
+            .write_bytes("test/ns@v2/other/main.json", &bytes)
+            .await
+            .unwrap();
+        assert_eq!(ns.legacy_changes(&marker).await.unwrap(), Some((1, 2)));
+    }
+
+    /// See the file backend's test of the same name.
+    #[tokio::test]
+    async fn a_binding_in_an_unknown_state_is_refused() {
+        let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
+        let key = "test/ns@v3/mydb/@binding.json";
+        let text = String::from_utf8(ns.storage.read_bytes(key).await.unwrap()).unwrap();
+        assert!(text.contains(r#""state": "active""#), "{text}");
+        ns.storage
+            .write_bytes(
+                key,
+                text.replace(r#""state": "active""#, r#""state": "archived""#)
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        assert!(ns.lookup("mydb:main").await.is_err());
+        assert!(
+            crate::lifecycle::create_ledger(&ns, &LedgerId::parse("mydb:main").unwrap())
+                .await
+                .is_err()
+        );
     }
 
     /// Wrapper that simulates a concurrent modification on the first
