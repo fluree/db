@@ -2155,20 +2155,11 @@ fn term_to_ntriples(binding: &serde_json::Value) -> String {
     }
 }
 
-/// Escape a literal lexical form per N-Triples, matching the enumerator's
-/// `escape_literal` so the two sides render byte-identically.
+/// Escape a literal lexical form per N-Triples with the same escaper as the
+/// enumerator's `escape_literal`, so the two sides render byte-identically.
 fn escape_nt_literal(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
+    fluree_graph_ir::syntax::push_string(&mut out, value);
     out
 }
 

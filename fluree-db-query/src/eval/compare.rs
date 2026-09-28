@@ -379,7 +379,7 @@ impl CompareOp {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<Option<ComparableValue>> {
-        check_min_arity(args, 1, &self.to_string())?;
+        check_min_arity(args, 1, self.symbol())?;
 
         if let Some(b) = fast_eq_ne_for_iri_bindings(*self, args, row, ctx)? {
             return Ok(Some(ComparableValue::Bool(b)));

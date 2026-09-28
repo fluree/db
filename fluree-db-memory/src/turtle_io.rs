@@ -450,21 +450,12 @@ pub fn normalize_unicode_quotes(s: &str) -> String {
 
 /// Escape special characters for Turtle string literals.
 ///
-/// First normalizes Unicode smart quotes to ASCII equivalents, then escapes:
-/// `\` → `\\`, `"` → `\"`, newline → `\n`, tab → `\t`, carriage return → `\r`.
+/// First normalizes Unicode smart quotes to ASCII equivalents, then escapes
+/// in canonical N-Triples form (see [`fluree_graph_ir::syntax::escape_string`]).
 pub fn escape_turtle_string(s: &str) -> String {
     let normalized = normalize_unicode_quotes(s);
     let mut out = String::with_capacity(normalized.len());
-    for ch in normalized.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
+    fluree_graph_ir::syntax::push_string(&mut out, &normalized);
     out
 }
 

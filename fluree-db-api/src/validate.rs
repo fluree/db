@@ -273,31 +273,19 @@ fn turtle_term(iri_or_bnode: &str) -> String {
     }
 }
 
-/// Render an IRI as a Turtle IRIREF, `\uXXXX`-escaping the characters the Turtle
-/// grammar forbids inside `<…>` (controls, space, and ``<>"{}|^`\``). The parser
-/// unescapes these back to the original codepoint, so the IRI round-trips —
-/// unlike percent-encoding, which would change the IRI's identity.
+/// Render an IRI as a Turtle IRIREF; characters the grammar forbids inside
+/// `<…>` are `\uXXXX`-escaped, which the parser reads back as the same IRI.
 fn turtle_iri(iri: &str) -> String {
-    use std::fmt::Write;
     let mut out = String::with_capacity(iri.len() + 2);
-    out.push('<');
-    for c in iri.chars() {
-        match c {
-            '\u{00}'..='\u{20}' | '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' => {
-                let _ = write!(out, "\\u{:04X}", c as u32);
-            }
-            _ => out.push(c),
-        }
-    }
-    out.push('>');
+    fluree_graph_ir::syntax::push_iri_ref(&mut out, iri);
     out
 }
 
 /// Render an IRI as `sh:Name` when it lives in the SHACL namespace.
 fn turtle_sh_term(iri: &str) -> String {
     match iri.strip_prefix("http://www.w3.org/ns/shacl#") {
-        Some(local) => format!("sh:{local}"),
-        None => turtle_term(iri),
+        Some(local) if fluree_graph_ir::syntax::is_pn_local(local) => format!("sh:{local}"),
+        _ => turtle_term(iri),
     }
 }
 
@@ -309,7 +297,13 @@ fn turtle_value_term(value: &JsonValue) -> String {
                 return turtle_term(iri);
             }
             if let Some(lex) = obj.get("@value").and_then(|v| v.as_str()) {
-                if let Some(lang) = obj.get("@language").and_then(|v| v.as_str()) {
+                // A tag has no escape form; an invalid one would end the
+                // literal and forge triples, so the report drops it.
+                if let Some(lang) = obj
+                    .get("@language")
+                    .and_then(|v| v.as_str())
+                    .filter(|lang| fluree_graph_ir::syntax::is_lang_tag(lang))
+                {
                     return format!("{}@{lang}", turtle_string(lex));
                 }
                 if let Some(dt) = obj.get("@type").and_then(|v| v.as_str()) {
@@ -330,16 +324,7 @@ fn turtle_value_term(value: &JsonValue) -> String {
 fn turtle_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
+    fluree_graph_ir::syntax::push_string(&mut out, s);
     out.push('"');
     out
 }
@@ -518,16 +503,7 @@ async fn validate_view_inner(
             // `sh:class` value-sets living alongside M's shapes: probe M's
             // shapes graph after a local membership miss, translating D-term
             // Sids through the snapshot namespace map.
-            cross_membership = Some(fluree_db_shacl::CrossLedgerMembership {
-                model_db: GraphDbRef::new(
-                    &model.model_db.snapshot,
-                    model.model_g_id,
-                    model.model_db.overlay.as_ref(),
-                    model.model_db.t,
-                ),
-                data_ns_map: snapshot.namespaces(),
-                same_term_space: false,
-            });
+            cross_membership = Some(model.membership(snapshot.namespaces()));
         } else {
             let shapes_g_ids = crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot)?;
             for g_id in &shapes_g_ids {

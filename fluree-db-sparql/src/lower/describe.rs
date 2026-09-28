@@ -151,6 +151,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         })
     }
 

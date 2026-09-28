@@ -271,7 +271,10 @@ pub(crate) fn classify_reified_object(map: &Map<String, Value>) -> Result<Reifie
         let datatype = ty.map(String::from);
         let language = match map.get("@language") {
             None => None,
-            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::String(s)) => {
+                super::jsonld::check_lang_tag(s)?;
+                Some(s.clone())
+            }
             Some(other) => {
                 return Err(TransactError::Parse(format!(
                     "@language must be a string, got {other}"

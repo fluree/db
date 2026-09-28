@@ -1,6 +1,9 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_limit_stops_work.rs"]
+mod it_limit_stops_work;
+
 #[path = "it_novelty_subject_iri_formats.rs"]
 mod it_novelty_subject_iri_formats;
 

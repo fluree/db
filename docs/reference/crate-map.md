@@ -439,9 +439,10 @@ Behind the `ipfs` feature on `fluree-db-api`.
 **Purpose:** Storage encryption
 
 **Responsibilities:**
-- AES-256-GCM encryption/decryption
-- Key management
-- Encrypted storage layer
+- AES-256-GCM encryption/decryption and the `FLU\0` envelope
+- Key management: single keys and rotation key sets (`MultiKeyProvider`)
+- Encrypted storage layer (`EncryptedStorage`), including the `EncryptionAdmin`
+  surface key rotation drives (`key_id_at`, `reencrypt`)
 
 **Dependencies:**
 - fluree-db-core

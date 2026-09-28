@@ -538,10 +538,10 @@ async fn where_read_respects_view_policy() {
     };
 
     // --- Attack under the restricted identity: salary is view-denied, so the
-    // WHERE matches nothing → no flakes → an empty transaction. The flag is
-    // never written. (Before the fix the WHERE matched both users and committed
-    // ex:exposed.) The attack errors and does not advance the ledger, so the
-    // control below runs on a clone of the pre-attack state. ---
+    // WHERE matches nothing → no flakes → a no-op update that commits nothing.
+    // The flag is never written. (Before the fix the WHERE matched both users
+    // and committed ex:exposed.) The attack does not advance the ledger, so
+    // the control below runs on a clone of the pre-attack state. ---
     let policy_ctx = policy_builder::build_policy_context_from_opts(
         &ledger.snapshot,
         ledger.novelty.as_ref(),
@@ -563,11 +563,12 @@ async fn where_read_respects_view_policy() {
     let attack_result = fluree
         .transact_tracked_with_policy(ledger.clone(), input, CommitOpts::default(), &index_cfg)
         .await;
-    let err = attack_result.expect_err("salary-probe WHERE must be fully view-filtered (empty tx)");
-    assert!(
-        err.error.contains("Empty transaction") || err.error.contains("no flakes"),
-        "expected an empty transaction (WHERE matched nothing under view policy), got: {}",
-        err.error
+    let (attack_result, _tally) = attack_result
+        .unwrap_or_else(|e| panic!("a no-match update is a no-op, not an error: {}", e.error));
+    assert_eq!(
+        (attack_result.receipt.t, attack_result.receipt.flake_count),
+        (ledger.t(), 0),
+        "salary-probe WHERE must be fully view-filtered: nothing may be committed"
     );
 
     // --- Control: probe a VIEWABLE property; the WHERE must still match both

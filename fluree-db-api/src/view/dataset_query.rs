@@ -454,25 +454,12 @@ impl Fluree {
         }
 
         // Format with tracking
-        let result_json = match primary.policy() {
-            Some(policy) => query_result
-                .format_async_with_policy_tracked(
-                    primary.as_graph_db_ref(),
-                    &format_config,
-                    policy,
-                    &tracker,
-                )
-                .await
-                .map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
-                })?,
-            None => query_result
-                .format_async_tracked(primary.as_graph_db_ref(), &format_config, &tracker)
-                .await
-                .map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
-                })?,
-        };
+        let result_json = query_result
+            .format_async_for_view_tracked(primary, &format_config, &tracker)
+            .await
+            .map_err(|e| {
+                crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
+            })?;
 
         Ok(crate::query::TrackedQueryResponse::success(
             result_json,
@@ -581,25 +568,12 @@ impl Fluree {
             format_config = crate::format::FormatterConfig::jsonld();
         }
 
-        let result_json = match primary.policy() {
-            Some(policy) => query_result
-                .format_async_with_policy_tracked(
-                    primary.as_graph_db_ref(),
-                    &format_config,
-                    policy,
-                    &tracker,
-                )
-                .await
-                .map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
-                })?,
-            None => query_result
-                .format_async_tracked(primary.as_graph_db_ref(), &format_config, &tracker)
-                .await
-                .map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
-                })?,
-        };
+        let result_json = query_result
+            .format_async_for_view_tracked(primary, &format_config, &tracker)
+            .await
+            .map_err(|e| {
+                crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
+            })?;
 
         Ok(crate::query::TrackedQueryResponse::success(
             result_json,

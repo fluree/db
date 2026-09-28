@@ -1377,6 +1377,39 @@ fn upsert_turtle() {
 }
 
 #[test]
+fn sync_without_graph_targets_the_default_graph() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "syncdefault"])
+        .assert()
+        .success();
+    let v1 = "@prefix ex: <http://example.org/> .\nex:alice ex:name \"Alice\" .";
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdefault", "-e", v1])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Synced the default graph in 'syncdefault:main': +1 asserted, -0 retracted",
+        ));
+
+    let v2 = "@prefix ex: <http://example.org/> .\nex:bob ex:name \"Bob\" .";
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdefault", "-e", v2])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+1 asserted, -1 retracted"));
+
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdefault", "-e", v2])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The default graph in 'syncdefault:main' already matches the payload",
+        ));
+}
+
+#[test]
 fn sync_graph_commits_only_the_delta() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();

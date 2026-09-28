@@ -536,7 +536,7 @@ impl R2rmlScanOperator {
             return Ok(None);
         }
         match &self.consumed_filter {
-            Some(prepared) => filter_batch(&batch, prepared, &self.schema, ctx),
+            Some(prepared) => filter_batch(batch, prepared, ctx),
             None => Ok(Some(batch)),
         }
     }

@@ -5,45 +5,12 @@
 //! can be checked against branch commits to detect overlapping changes.
 
 use crate::{trace_first_parent_commits_by_id, Result};
-use fluree_db_core::{ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid};
+use fluree_db_core::{
+    load_commit_by_id, ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid,
+};
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::HashMap;
-
-/// Walk the first-parent lineage from `head_id` back to `stop_at_t` and
-/// collect all (subject, predicate, graph) tuples modified in those commits.
-///
-/// This produces the "source delta" — the set of data points changed on
-/// the source branch since the branch point. During rebase, branch commits
-/// whose flakes overlap with this set are flagged as conflicts.
-///
-/// # Arguments
-///
-/// * `store` - Content store for loading commits by CID
-/// * `head_id` - CID of the source branch's current HEAD commit
-/// * `stop_at_t` - Stop when `commit.t <= stop_at_t` (the branch point t)
-pub async fn compute_delta_keys<C: ContentStore + Clone + 'static>(
-    store: C,
-    head_id: ContentId,
-    stop_at_t: i64,
-) -> Result<FxHashSet<ConflictKey>> {
-    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
-    futures::pin_mut!(stream);
-
-    let mut keys = FxHashSet::default();
-
-    while let Some(commit) = stream.try_next().await? {
-        for flake in &commit.flakes {
-            keys.insert(ConflictKey::new(
-                flake.s.clone(),
-                flake.p.clone(),
-                flake.g.clone(),
-            ));
-        }
-    }
-
-    Ok(keys)
-}
+use std::collections::{BTreeSet, HashMap};
 
 /// Full identity of a fact — every [`Flake`] component except `t` and `op`.
 ///
@@ -117,28 +84,61 @@ impl NetChangeAccumulator {
     }
 }
 
-/// Like [`compute_delta_keys`], but additionally nets the range's flakes
-/// into the aggregate change set the range applies (see
-/// [`NetChangeAccumulator`] for the netting contract).
+/// The (subject, predicate, graph) tuples these commits changed, oldest
+/// commit first.
+///
+/// Branch clocks are not comparable, so a range that crosses a merge cannot
+/// be cut by `t`. Callers that compare two branches name the commits
+/// instead.
+pub async fn delta_keys_of<C: ContentStore + ?Sized>(
+    store: &C,
+    cids: &[ContentId],
+) -> Result<FxHashSet<ConflictKey>> {
+    let mut keys = FxHashSet::default();
+    for cid in cids {
+        let commit = load_commit_by_id(store, cid).await?;
+        keys.extend(
+            commit
+                .flakes
+                .iter()
+                .map(|flake| ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())),
+        );
+    }
+    Ok(keys)
+}
+
+/// Walk the first-parent lineage from `head_id` back to `stop_at_t`,
+/// collecting the (subject, predicate, graph) tuples those commits changed
+/// and netting their flakes into the aggregate change set the range applies
+/// (see [`NetChangeAccumulator`] for the netting contract).
 ///
 /// One walk serves every output, so callers that need conflict keys *and*
 /// the change set (merge preview) replay the source chain once instead of
 /// twice. The third element is the union of the range's namespace deltas,
 /// earliest commit winning on a code collision: the codes a consumer needs
 /// to make the change set's terms encodable before the range is committed.
+/// The fourth is every named graph the range's commits list, by IRI: the
+/// graphs a consumer must route before staging the change set elsewhere.
 pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
     store: C,
     head_id: ContentId,
     stop_at_t: i64,
-) -> Result<(FxHashSet<ConflictKey>, Vec<Flake>, HashMap<u16, String>)> {
+) -> Result<(
+    FxHashSet<ConflictKey>,
+    Vec<Flake>,
+    HashMap<u16, String>,
+    BTreeSet<String>,
+)> {
     let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut keys = FxHashSet::default();
     let mut acc = NetChangeAccumulator::default();
     let mut namespace_delta: HashMap<u16, String> = HashMap::new();
+    let mut graph_iris: BTreeSet<String> = BTreeSet::new();
 
     while let Some(commit) = stream.try_next().await? {
+        graph_iris.extend(commit.graph_delta.into_values());
         // Commits stream newest-first, so a plain insert leaves the oldest
         // commit's prefix in place for a colliding code.
         for (code, prefix) in commit.namespace_delta {
@@ -157,7 +157,7 @@ pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
         }
     }
 
-    Ok((keys, acc.finish(), namespace_delta))
+    Ok((keys, acc.finish(), namespace_delta, graph_iris))
 }
 
 #[cfg(test)]

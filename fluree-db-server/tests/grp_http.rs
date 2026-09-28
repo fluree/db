@@ -2,8 +2,12 @@
 mod admin_auth_layering;
 #[path = "cross_ledger_http_integration.rs"]
 mod cross_ledger_http_integration;
+#[path = "encryption_rotation_http.rs"]
+mod encryption_rotation_http;
 #[path = "export_omission_headers.rs"]
 mod export_omission_headers;
+#[path = "graph_store_http.rs"]
+mod graph_store_http;
 // GraphQL is behind a feature flag (async-graphql is a heavy dependency), so
 // this module only compiles when it is on.
 #[cfg(feature = "graphql")]

@@ -1088,7 +1088,9 @@ mod construct_license_output_gate {
         JsonLd     => Canonicalizes, // format_results → construct::format → Graph::canonicalize
         SparqlJson => Canonicalizes, // coerced to the same construct::format path (#1274)
         SparqlXml  => Rejects,       // sparql_xml::format: SELECT/ASK only
-        RdfXml     => Canonicalizes, // rdf_xml::format → Graph::canonicalize
+        RdfXml     => Canonicalizes, // graph_text::format → Graph::canonicalize
+        Turtle     => Canonicalizes, // graph_text::format → Graph::canonicalize
+        NTriples   => Canonicalizes, // graph_text::format → Graph::canonicalize
         TypedJson  => Canonicalizes, // coerced to construct::format
         Tsv        => Rejects,       // delimited::reject_non_tabular
         Csv        => Rejects,       // delimited::reject_non_tabular
@@ -1153,5 +1155,150 @@ mod construct_license_output_gate {
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// Turtle / N-Triples / RDF/XML output
+// ============================================================================
+
+mod graph_text_output {
+    use super::{context_people, seed_people};
+    use crate::support;
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+    use fluree_db_api::{LedgerState, QueryResult};
+    use serde_json::json;
+
+    fn render(result: &QueryResult, ledger: &LedgerState, config: FormatterConfig) -> String {
+        format_results_string(result, &result.context, &ledger.snapshot, &config)
+            .expect("graph text output")
+    }
+
+    fn sorted_lines(nt: &str) -> Vec<&str> {
+        let mut lines: Vec<&str> = nt.lines().collect();
+        lines.sort_unstable();
+        lines
+    }
+
+    /// SPARQL and JSON-LD share the CONSTRUCT IR: the same template over the
+    /// same WHERE serializes to the same triples, and Turtle takes its
+    /// prefixes from either surface's declarations.
+    #[tokio::test]
+    async fn sparql_and_jsonld_construct_serialize_alike() {
+        let (fluree, ledger) = seed_people().await;
+        let sparql = support::query_sparql(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/>
+             PREFIX person: <http://example.org/Person#>
+             CONSTRUCT { ?s ex:label ?name ; ex:fav ?n }
+             WHERE { ?s person:fullName ?name ; person:favNums ?n }",
+        )
+        .await
+        .expect("SPARQL construct");
+        let jsonld = support::query_jsonld(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": context_people(),
+                "where": [{"@id": "?s", "person:fullName": "?name", "person:favNums": "?n"}],
+                "construct": [{"@id": "?s", "ex:label": "?name", "ex:fav": "?n"}]
+            }),
+        )
+        .await
+        .expect("JSON-LD construct");
+
+        let nt_sparql = render(&sparql, &ledger, FormatterConfig::ntriples());
+        let nt_jsonld = render(&jsonld, &ledger, FormatterConfig::ntriples());
+        assert_eq!(sorted_lines(&nt_sparql), sorted_lines(&nt_jsonld));
+        assert!(
+            nt_sparql
+                .contains("<http://example.org/jdoe> <http://example.org/label> \"Jane Doe\" .\n"),
+            "{nt_sparql}"
+        );
+        // 4 + 1 + 7 favNums, one label per subject.
+        assert_eq!(nt_sparql.lines().count(), 12 + 3, "{nt_sparql}");
+
+        for result in [&sparql, &jsonld] {
+            let ttl = render(result, &ledger, FormatterConfig::turtle());
+            assert!(ttl.contains("@prefix ex: <http://example.org/> ."), "{ttl}");
+            assert!(ttl.contains("ex:jdoe ex:fav 3, 7, 42, 99 ;"), "{ttl}");
+        }
+    }
+
+    /// A template literal keeps its language tag or datatype.
+    #[tokio::test]
+    async fn template_literals_keep_tag_and_datatype() {
+        let (fluree, ledger) = seed_people().await;
+        let result = support::query_sparql(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             CONSTRUCT { ?s ex:greeting \"salut\"@fr ; ex:rank \"5\"^^xsd:long ; ex:plain \"x\" }
+             WHERE { ?s ex:name ?name }",
+        )
+        .await
+        .expect("construct");
+        let nt = render(&result, &ledger, FormatterConfig::ntriples());
+        let s = "<http://example.org/fran>";
+        for line in [
+            format!("{s} <http://example.org/greeting> \"salut\"@fr ."),
+            format!(
+                "{s} <http://example.org/rank> \"5\"^^<http://www.w3.org/2001/XMLSchema#long> ."
+            ),
+            format!("{s} <http://example.org/plain> \"x\" ."),
+        ] {
+            assert!(nt.lines().any(|l| l == line), "missing {line}\nin:\n{nt}");
+        }
+    }
+
+    /// A stored blank node is a blank node in every text format, under the
+    /// label writes resolve back to it.
+    #[tokio::test]
+    async fn stored_blank_nodes_stay_blank() {
+        let (fluree, ledger) = seed_people().await;
+        let ledger = fluree
+            .insert_turtle(
+                ledger,
+                "@prefix ex: <http://example.org/> .\nex:svc ex:param [ ex:name \"q\" ] .\n",
+            )
+            .await
+            .expect("insert")
+            .ledger;
+        let result = support::query_sparql(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ex:svc ex:param ?p . ?p ex:name ?n }
+             WHERE { ex:svc ex:param ?p . ?p ex:name ?n }",
+        )
+        .await
+        .expect("construct");
+
+        let nt = render(&result, &ledger, FormatterConfig::ntriples());
+        assert!(!nt.contains("<_:"), "{nt}");
+        let label = nt
+            .split_whitespace()
+            .find(|t| t.starts_with("_:"))
+            .unwrap_or_else(|| panic!("no blank node in:\n{nt}"));
+        assert!(
+            nt.contains(&format!(
+                "<http://example.org/svc> <http://example.org/param> {label} ."
+            )),
+            "{nt}"
+        );
+        assert!(
+            nt.contains(&format!("{label} <http://example.org/name> \"q\" .")),
+            "{nt}"
+        );
+
+        let ttl = render(&result, &ledger, FormatterConfig::turtle());
+        assert!(ttl.contains(&format!("ex:param {label}")), "{ttl}");
+
+        let xml = render(&result, &ledger, FormatterConfig::rdf_xml());
+        let id = label.trim_start_matches("_:");
+        assert!(xml.contains(&format!(r#"rdf:nodeID="{id}""#)), "{xml}");
+        assert!(!xml.contains(r#"rdf:about="_:"#), "{xml}");
     }
 }

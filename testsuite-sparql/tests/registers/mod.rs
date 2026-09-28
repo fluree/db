@@ -182,23 +182,26 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // docs/audit/burn-down/ROADMAP.md §6.1 (absolute count omitted — it went
     // stale after the wave-2 register prune; the subgroup counts below are live)
     //
-    // W-1 algebra cluster (3): join-combo-2 = GRAPH ?g default-graph
-    // enumeration (PR-G1); nested-opt-1/2 = correlated-OPTIONAL independence
+    // W-1 algebra cluster (2): join-combo-2 = GRAPH ?g default-graph
+    // enumeration (PR-G1); nested-opt-1 = correlated-OPTIONAL independence
     // (PR-W1-OPT). filter-nested-2 (nested-group FILTER scope) and join-scope-1
     // (sub-SELECT merge of an OPTIONAL-produced correlation var) are fixed
-    // (PR-W1 Families A/B).
+    // (PR-W1 Families A/B). nested-opt-2 passes since #1734 (an unmatched
+    // OPTIONAL leaves its variables Unbound, not Poisoned), but partly by
+    // coincidence: its first OPTIONAL shares no variable with the required
+    // pattern, and the planner still evaluates it AFTER the second — an
+    // unsound reorder of left joins that this data happens not to expose.
     //
-    // nested-opt-1/2 are about WHERE the right operand is evaluated, not how it
+    // nested-opt-1 is about WHERE the right operand is evaluated, not how it
     // merges: §18.2.4 evaluates it independently and unifies afterwards, while
     // every OptionalBuilder here seeds it from the required row. nested-opt-1
     // wants `{ :x3 :q ?w . OPTIONAL { :x2 :p ?v } }` to bind ?v=2 on its own and
     // so match nothing against ?v=1 (1 solution); correlating substitutes ?v=1,
     // the inner OPTIONAL finds nothing and passes ?w=3/4 through, and we answer
-    // 2. #1713's unbound-merge fix does not move either one — verified, output
+    // 2. #1713's unbound-merge fix does not move it — verified, output
     // byte-identical before and after.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-2",
     // PR-BASE: relative-IRI/BASE resolution in query output (2)
     // list-2..4: the SPARQL parser now desugars `( ... )` patterns to
     // rdf:first/rest/nil triples, but Fluree's Turtle ingest emits
@@ -542,7 +545,9 @@ pub const SPARQL11_PROTOCOL: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/protocol/manifest#update_post_form",
 ];
 
-// Requires a running SPARQL server to introspect (audit §4.4).
+// Requires a running SPARQL server to introspect (audit §4.4). The server
+// serves the description; `fluree-db-server/tests/sparql_service_description.rs`
+// covers what these check (RDF returned, a matching `sd:endpoint`).
 pub const SPARQL11_SERVICE_DESCRIPTION: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/service-description/manifest#conforms-to-schema",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/service-description/manifest#has-endpoint-triple",

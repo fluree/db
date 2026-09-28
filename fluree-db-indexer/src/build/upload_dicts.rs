@@ -1648,6 +1648,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for DiscardingContentStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+
         async fn has(&self, _id: &ContentId) -> fluree_db_core::error::Result<bool> {
             Ok(false)
         }

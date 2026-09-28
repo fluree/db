@@ -10,14 +10,14 @@
 //! **Partial-binding correctness:** When any key var is Unbound or Poisoned in an
 //! outer row, the hash probe is not valid (SPARQL substitution leaves unbound vars
 //! free in the inner query). These rows fall back to per-row correlated evaluation
-//! via the same `SeedOperator` + `build_where_operators_seeded` pattern used by
-//! `ExistsOperator`.
+//! via [`any_solution`], as `ExistsOperator` does.
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
-use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
+use crate::exists::any_solution;
+use crate::group_aggregate::CompositeGroupKey;
 use crate::ir::Pattern;
 use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -81,19 +81,6 @@ impl SemijoinOperator {
         }
     }
 
-    /// Extract a composite key from a batch row at the given key column indices.
-    fn extract_key(&self, batch: &Batch, row_idx: usize) -> CompositeGroupKey {
-        let keys = self
-            .key_col_indices
-            .iter()
-            .map(|&ci| {
-                let (store, gv) = EqualityNorm::parts(&self.norm);
-                binding_to_group_key_normalized(batch.get_by_col(row_idx, ci), store, gv)
-            })
-            .collect();
-        CompositeGroupKey(keys)
-    }
-
     /// Check if all key vars are bound (not Unbound or Poisoned) in a row.
     fn all_keys_bound(&self, batch: &Batch, row_idx: usize) -> bool {
         self.key_col_indices.iter().all(|&ci| {
@@ -104,34 +91,39 @@ impl SemijoinOperator {
         })
     }
 
-    /// Per-row correlated evaluation fallback for rows with unbound key vars.
-    /// Uses the same SeedOperator pattern as ExistsOperator::has_match.
-    async fn per_row_has_match(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        input_batch: &Batch,
-        row_idx: usize,
-    ) -> Result<bool> {
-        let seed = SeedOperator::from_batch_row(input_batch, row_idx);
-        let mut inner_op = build_where_operators_seeded(
-            Some(Box::new(seed)),
-            &self.inner_patterns,
-            self.stats.clone(),
-            None,
-            &self.planning,
-        )?;
-
-        inner_op.open(ctx).await?;
-        let has_result = loop {
-            match inner_op.next_batch(ctx).await? {
-                Some(batch) if !batch.is_empty() => break true,
-                Some(_) => continue,
-                None => break false,
-            }
-        };
-        inner_op.close();
-        Ok(has_result)
+    /// Per-row keep flags: a hash probe when every key var is bound,
+    /// otherwise a per-row correlated evaluation.
+    async fn keep_mask(&self, ctx: &ExecutionContext<'_>, batch: &Batch) -> Result<Vec<bool>> {
+        let mut keep = Vec::with_capacity(batch.len());
+        for row_idx in 0..batch.len() {
+            let has_match = if self.all_keys_bound(batch, row_idx) {
+                let key = row_key(batch, row_idx, &self.key_col_indices, &self.norm);
+                self.key_set.contains(&key)
+            } else {
+                let seed = SeedOperator::from_batch_row(batch, row_idx);
+                any_solution(
+                    Box::new(seed),
+                    &self.inner_patterns,
+                    self.stats.clone(),
+                    &self.planning,
+                    ctx,
+                )
+                .await?
+            };
+            keep.push(if self.negated { !has_match } else { has_match });
+        }
+        Ok(keep)
     }
+}
+
+/// Composite key over the columns `cols` of one row.
+fn row_key(
+    batch: &Batch,
+    row_idx: usize,
+    cols: &[usize],
+    norm: &Option<EqualityNorm>,
+) -> CompositeGroupKey {
+    CompositeGroupKey::normalized(cols.iter().map(|&ci| batch.get_by_col(row_idx, ci)), norm)
 }
 
 #[async_trait]
@@ -154,14 +146,13 @@ impl Operator for SemijoinOperator {
         }
 
         // Build phase: execute inner patterns once, collect distinct key tuples.
-        let key_var_slice: Vec<VarId> = self.key_vars.clone();
         #[allow(clippy::box_default)]
         let seed: BoxedOperator = Box::new(EmptyOperator::new());
         let mut inner_op = build_where_operators_seeded(
             Some(seed),
             &self.inner_patterns,
             self.stats.clone(),
-            Some(&key_var_slice),
+            Some(&self.key_vars),
             &self.planning,
         )?;
 
@@ -182,16 +173,9 @@ impl Operator for SemijoinOperator {
         while let Some(batch) = inner_op.next_batch(ctx).await? {
             ctx.check_cancelled()?;
             for row_idx in 0..batch.len() {
-                let key = inner_key_col_indices
-                    .iter()
-                    .map(|&ci| {
-                        let (store, gv) = EqualityNorm::parts(&self.norm);
-                        binding_to_group_key_normalized(batch.get_by_col(row_idx, ci), store, gv)
-                    })
-                    .collect();
-                self.key_set.insert(CompositeGroupKey(key));
+                let key = row_key(&batch, row_idx, &inner_key_col_indices, &self.norm);
+                self.key_set.insert(key);
             }
-            ctx.check_cancelled()?;
         }
         inner_op.close();
 
@@ -227,44 +211,10 @@ impl Operator for SemijoinOperator {
                 }
             };
 
-            let mut keep_rows: Vec<bool> = Vec::with_capacity(input_batch.len());
-
-            for row_idx in 0..input_batch.len() {
-                let has_match = if self.all_keys_bound(&input_batch, row_idx) {
-                    // Fast path: all key vars bound → probe hash set.
-                    let key = self.extract_key(&input_batch, row_idx);
-                    self.key_set.contains(&key)
-                } else {
-                    // Slow path: partial/no binding → per-row correlated evaluation.
-                    self.per_row_has_match(ctx, &input_batch, row_idx).await?
-                };
-
-                let keep = if self.negated { !has_match } else { has_match };
-                keep_rows.push(keep);
+            let keep = self.keep_mask(ctx, &input_batch).await?;
+            if let Some(kept) = input_batch.filter_rows(&keep) {
+                return Ok(Some(kept));
             }
-
-            let kept_count = keep_rows.iter().filter(|&&k| k).count();
-            if kept_count == 0 {
-                continue;
-            }
-            if kept_count == input_batch.len() {
-                return Ok(Some(input_batch));
-            }
-
-            // Build filtered batch with only kept rows.
-            let mut columns: Vec<Vec<Binding>> = (0..self.schema.len())
-                .map(|_| Vec::with_capacity(kept_count))
-                .collect();
-            for (row_idx, keep) in keep_rows.iter().enumerate() {
-                if *keep {
-                    for (col_idx, var) in self.schema.iter().enumerate() {
-                        if let Some(col) = input_batch.column(*var) {
-                            columns[col_idx].push(col[row_idx].clone());
-                        }
-                    }
-                }
-            }
-            return Ok(Some(Batch::new(self.schema.clone(), columns)?));
         }
     }
 
@@ -282,20 +232,11 @@ impl Operator for SemijoinOperator {
         loop {
             match self.child.next_batch(ctx).await? {
                 Some(batch) if !batch.is_empty() => {
-                    for row_idx in 0..batch.len() {
-                        let has_match = if self.all_keys_bound(&batch, row_idx) {
-                            let key = self.extract_key(&batch, row_idx);
-                            self.key_set.contains(&key)
-                        } else {
-                            self.per_row_has_match(ctx, &batch, row_idx).await?
-                        };
-                        let keep = if self.negated { !has_match } else { has_match };
-                        if keep {
-                            count = count.checked_add(1).ok_or_else(|| {
-                                QueryError::execution("COUNT(*) overflow in semijoin drain_count")
-                            })?;
-                        }
-                    }
+                    let keep = self.keep_mask(ctx, &batch).await?;
+                    let kept = keep.iter().filter(|&&k| k).count() as u64;
+                    count = count.checked_add(kept).ok_or_else(|| {
+                        QueryError::execution("COUNT(*) overflow in semijoin drain_count")
+                    })?;
                 }
                 Some(_) => continue,
                 None => break,

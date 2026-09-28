@@ -114,7 +114,8 @@ pub enum DiagCode {
     #[serde(rename = "F004")]
     UnsupportedMultipleUsing,
 
-    /// GRAPH restrictions in SPARQL Update templates
+    /// GRAPH restrictions in SPARQL Update templates. No longer emitted: kept
+    /// so the serialized `F005` code is not reused for something else.
     #[serde(rename = "F005")]
     UnsupportedGraphInUpdate,
 
