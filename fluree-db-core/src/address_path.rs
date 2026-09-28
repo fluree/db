@@ -21,16 +21,19 @@ pub const SHARED_NAMESPACE: &str = "@shared";
 ///
 /// Debug builds panic on a non-canonical id so tests catch the path that
 /// skipped edge normalization; release builds apply the default branch.
+/// A persisted legacy id ([`LedgerId::from_persisted_parts`]) maps to the
+/// paths its ledger was written under.
 pub(crate) fn storage_ledger_id(
     ledger_id: &str,
     seam: &str,
 ) -> Result<LedgerId, LedgerIdParseError> {
     debug_assert!(
-        LedgerId::expect_canonical(ledger_id, seam).is_ok(),
+        LedgerId::expect_canonical(ledger_id, seam).is_ok()
+            || (ledger_id.contains(':') && LedgerId::parse_persisted(ledger_id).is_ok()),
         "{}",
         LedgerId::expect_canonical(ledger_id, seam).unwrap_err()
     );
-    LedgerId::parse(ledger_id)
+    LedgerId::parse(ledger_id).or_else(|e| LedgerId::parse_persisted(ledger_id).map_err(|_| e))
 }
 
 /// Convert a ledger ID `name[:branch]` into a portable path prefix `name/branch`.

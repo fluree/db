@@ -1489,9 +1489,9 @@ pub fn ledger_id_prefix_for_path(ledger_id: &str) -> String {
 
 /// `(name/branch, name/@shared)` for a ledger id a storage seam received.
 ///
-/// An id that does not parse cannot have been created, so it cannot own
-/// content; its paths keep the pre-validation shape so a read of it misses
-/// rather than landing in another ledger's namespace.
+/// An id that neither the current nor the persisted grammar accepts is never
+/// listed or addressed; its paths keep the pre-validation shape so a read of
+/// it misses rather than landing in another ledger's namespace.
 fn storage_path_prefixes(ledger_id: &str) -> (String, String) {
     match storage_ledger_id(ledger_id, "a storage path") {
         Ok(id) => (id.path_prefix(), id.shared_prefix()),

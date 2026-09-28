@@ -145,6 +145,7 @@ pub struct NsRecord {
     ///
     /// This is the primary cache key and the fully-qualified identifier.
     /// Always equal to `name:branch`.
+    #[serde(deserialize_with = "LedgerId::deserialize_persisted")]
     pub ledger_id: LedgerId,
 
     /// Ledger name without branch suffix (e.g., "mydb")
@@ -340,6 +341,7 @@ impl GraphSourceType {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSourceRecord {
     /// Canonical identifier for this graph source (e.g., "my-search:main")
+    #[serde(deserialize_with = "LedgerId::deserialize_persisted")]
     pub graph_source_id: LedgerId,
 
     /// Base name of the graph source (e.g., "my-search")

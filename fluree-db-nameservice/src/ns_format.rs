@@ -9,7 +9,7 @@ use crate::{
     is_zero, parse_default_context_value, ConfigPayload, ConfigValue, LedgerHeads, RefValue,
     StatusPayload, StatusValue,
 };
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, LedgerId};
 use serde::{Deserialize, Serialize};
 
 /// ns@v2 format version path segment.
@@ -252,6 +252,23 @@ pub(crate) fn is_ledger_main_record(bytes: &[u8]) -> bool {
 /// Keys that may be sidecars rather than main records.
 pub(crate) fn has_sidecar_suffix(key: &str) -> bool {
     key.ends_with(".index.json") || key.ends_with(".snapshots.json")
+}
+
+/// A stored ledger record's identity, or `None` (logged) when even
+/// [`LedgerId::from_persisted_parts`] refuses it. Such a name (`/x`, `x/`,
+/// `a/../b`) has a storage path that can alias another ledger's: listing it
+/// would let GC or key rotation act on that ledger's files, and failing
+/// would take down every listing on the node.
+pub(crate) fn persisted_ledger_id(name: &str, branch: &str, record: &str) -> Option<LedgerId> {
+    LedgerId::from_persisted_parts(name, branch)
+        .inspect_err(|e| {
+            tracing::warn!(
+                record,
+                error = %e,
+                "Skipping nameservice record whose id is invalid; rename or remove it"
+            );
+        })
+        .ok()
 }
 
 #[cfg(test)]

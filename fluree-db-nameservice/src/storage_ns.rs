@@ -292,7 +292,7 @@ where
 
         // Convert to GraphSourceRecord. The file is authoritative for
         // identity; a different name/branch at this path is another source.
-        let graph_source_id = LedgerId::from_parts(&main.name, &main.branch)?;
+        let graph_source_id = LedgerId::from_persisted_parts(&main.name, &main.branch)?;
         if graph_source_id.name() != name || graph_source_id.branch() != branch {
             return Ok(None);
         }
@@ -407,13 +407,18 @@ where
         }
 
         let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let Some(ledger_id) =
+            crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, main_key)
+        else {
+            return Ok(None);
+        };
 
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
 
         // Convert to NsRecord, parsing persisted CID strings
         let mut record = NsRecord {
-            ledger_id: LedgerId::from_parts(&main.ledger.id, &main.branch)?,
+            ledger_id,
             name: main.ledger.id.clone(),
             branch: main.branch,
             commit_head_id: main
@@ -610,7 +615,8 @@ where
             // A read failure must not silently shrink the result: callers
             // that decide what to delete treat a missing branch as one with
             // nothing to protect. `Ok(None)` is a legitimate skip
-            // (graph-source record, or a branch dropped since the listing).
+            // (graph-source record, a branch dropped since the listing, or an
+            // id whose path could alias another ledger's).
             if let Some(record) = self.read_record_at(&key).await? {
                 records.push(record);
             }
@@ -2160,6 +2166,50 @@ mod tests {
         // Same path, different identity: not this ledger.
         assert!(ns.lookup("mydb/release:v1.0").await.unwrap().is_none());
         assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
+    }
+
+    /// Ids an older release could store but the current grammar rejects
+    /// never fail the listing: `@`/`#` stay listed so GC and drop still see
+    /// them, and a name whose path can alias another ledger's is skipped.
+    #[tokio::test]
+    async fn legacy_ids_do_not_fail_the_listing() {
+        let ns = make_storage_ns();
+        for id in [
+            "plain:main",
+            "repQ2026:main",
+            "mydb:featureQ1",
+            "unsafeQ:main",
+        ] {
+            publish_commit(&ns, id, 1, &dummy_cid(id)).await;
+        }
+        for (from, to, (placeholder, legacy)) in [
+            ("repQ2026/main", "rep@2026/main", ("repQ2026", "rep@2026")),
+            (
+                "mydb/featureQ1",
+                "mydb/feature#1",
+                ("featureQ1", "feature#1"),
+            ),
+            ("unsafeQ/main", "unsafeQ/main", ("unsafeQ", "/unsafe")),
+        ] {
+            let from = format!("test/{NS_VERSION}/{from}.json");
+            let bytes = ns.storage.read_bytes(&from).await.unwrap();
+            let json = String::from_utf8(bytes)
+                .unwrap()
+                .replace(placeholder, legacy);
+            ns.storage.delete(&from).await.unwrap();
+            let to = format!("test/{NS_VERSION}/{to}.json");
+            ns.storage.write_bytes(&to, json.as_bytes()).await.unwrap();
+        }
+
+        let mut all: Vec<String> = ns
+            .all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.ledger_id.to_string())
+            .collect();
+        all.sort();
+        assert_eq!(all, ["mydb:feature#1", "plain:main", "rep@2026:main"]);
     }
 
     #[tokio::test]

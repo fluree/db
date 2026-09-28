@@ -275,7 +275,17 @@ fn record_from_state(
     if !ledger.branches.iter().any(|b| b == branch) {
         return None;
     }
-    let mut record = NsRecord::new(LedgerId::from_parts(ledger_name, branch).ok()?);
+    let id = LedgerId::from_persisted_parts(ledger_name, branch)
+        .inspect_err(|e| {
+            tracing::warn!(
+                ledger_name,
+                branch,
+                error = %e,
+                "Skipping nameservice record whose id is invalid; rename or remove it"
+            );
+        })
+        .ok()?;
+    let mut record = NsRecord::new(id);
     let ref_key = RefKey::new(ledger_name, branch);
     if let Some(entry) = state.refs.get(&ref_key) {
         record.commit_head_id = Some(entry.head.clone());

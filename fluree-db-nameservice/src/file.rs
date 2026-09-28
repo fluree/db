@@ -350,13 +350,18 @@ impl FileNameService {
         }
 
         let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let Some(ledger_id) =
+            crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, &main_address)
+        else {
+            return Ok(None);
+        };
 
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json_from_address(&index_address).await?;
 
         // Convert to NsRecord
         let mut record = NsRecord {
-            ledger_id: LedgerId::from_parts(&main.ledger.id, &main.branch)?,
+            ledger_id,
             name: main.ledger.id.clone(),
             branch: main.branch,
             commit_head_id: main
@@ -501,7 +506,7 @@ impl FileNameService {
 
         // Convert to GraphSourceRecord. The file is authoritative for
         // identity; a different name/branch at this path is another source.
-        let graph_source_id = LedgerId::from_parts(&main.name, &main.branch)?;
+        let graph_source_id = LedgerId::from_persisted_parts(&main.name, &main.branch)?;
         if graph_source_id.name() != name || graph_source_id.branch() != branch {
             return Ok(None);
         }
@@ -572,7 +577,8 @@ impl crate::NameServiceLookup for FileNameService {
             if relative.parent().is_none_or(|p| p.as_os_str().is_empty()) {
                 continue;
             }
-            // Graph-source records are skipped by `read_record_at` (Ok(None)).
+            // Graph-source records, and ids whose path could alias another
+            // ledger's, are skipped by `read_record_at` (Ok(None)).
             // A read failure must not silently shrink the result: callers
             // that decide what to delete treat a missing branch as one with
             // nothing to protect.
@@ -1908,6 +1914,51 @@ mod tests {
         // Same path, different identity: not this ledger.
         assert!(ns.lookup("mydb/release:v1.0").await.unwrap().is_none());
         assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
+    }
+
+    /// Ids an older release could store but the current grammar rejects
+    /// never fail the listing: `@`/`#` stay listed so GC and drop still see
+    /// them, and a name whose path can alias another ledger's is skipped.
+    #[tokio::test]
+    async fn legacy_ids_do_not_fail_the_listing() {
+        let (temp, ns) = setup().await;
+        for id in [
+            "plain:main",
+            "repQ2026:main",
+            "mydb:featureQ1",
+            "unsafeQ:main",
+        ] {
+            ns.publish_commit(id, 1, &test_cid(id)).await.unwrap();
+        }
+        let ns_dir = temp.path().join(NS_VERSION);
+        for (from, to, (placeholder, legacy)) in [
+            ("repQ2026/main", "rep@2026/main", ("repQ2026", "rep@2026")),
+            (
+                "mydb/featureQ1",
+                "mydb/feature#1",
+                ("featureQ1", "feature#1"),
+            ),
+            ("unsafeQ/main", "unsafeQ/main", ("unsafeQ", "/unsafe")),
+        ] {
+            let from = ns_dir.join(format!("{from}.json"));
+            let json = std::fs::read_to_string(&from)
+                .unwrap()
+                .replace(placeholder, legacy);
+            std::fs::remove_file(&from).unwrap();
+            let to = ns_dir.join(format!("{to}.json"));
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::write(to, json).unwrap();
+        }
+
+        let mut all: Vec<String> = ns
+            .all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.ledger_id.to_string())
+            .collect();
+        all.sort();
+        assert_eq!(all, ["mydb:feature#1", "plain:main", "rep@2026:main"]);
     }
 
     #[tokio::test]

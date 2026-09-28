@@ -57,6 +57,16 @@ pub struct DynamoDbNameService {
     table_name: String,
 }
 
+/// An item whose id even the persisted grammar refuses is skipped: its
+/// storage path can alias another ledger's (see `LedgerId::from_persisted_parts`).
+fn skipped_record(pk: &str, e: &fluree_db_core::LedgerIdParseError) {
+    tracing::warn!(
+        pk,
+        error = %e,
+        "Skipping nameservice record whose id is invalid; rename or remove it"
+    );
+}
+
 impl std::fmt::Debug for DynamoDbNameService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynamoDbNameService")
@@ -300,8 +310,9 @@ impl DynamoDbNameService {
 
         // Identity from the name/branch attributes; `pk` only when an item
         // predates them.
-        let ledger_id = LedgerId::from_parts(&name, &branch)
-            .or_else(|_| LedgerId::parse(pk))
+        let ledger_id = LedgerId::from_persisted_parts(&name, &branch)
+            .or_else(|_| LedgerId::parse_persisted(pk))
+            .inspect_err(|e| skipped_record(pk, e))
             .ok()?;
         Some(NsRecord {
             name: ledger_id.name().to_string(),
@@ -378,8 +389,9 @@ impl DynamoDbNameService {
             .unwrap_or(0);
 
         // Identity from the name/branch attributes, as for ledger records.
-        let graph_source_id = LedgerId::from_parts(&name, &branch)
-            .or_else(|_| LedgerId::parse(pk))
+        let graph_source_id = LedgerId::from_persisted_parts(&name, &branch)
+            .or_else(|_| LedgerId::parse_persisted(pk))
+            .inspect_err(|e| skipped_record(pk, e))
             .ok()?;
         Some(GraphSourceRecord {
             name: graph_source_id.name().to_string(),
