@@ -13,10 +13,11 @@ other ledger file is moved or rewritten.
 
 **The one rule:** every process that reads or writes a store must run the same
 release. Stop them all, upgrade them all, then start them. An older release
-still running against an upgraded store does damage that differs by backend
-(see [Why every process at once](#why-every-process-at-once)). Where stopping
-everything at once is hard, as with AWS Lambda, you can make the older release
-unable to write instead (see [Deployments that cannot stop at once](#deployments-that-cannot-stop-at-once)).
+left running against an upgraded store is stopped from writing where this
+release can arrange it: on file and object stores the upgrade itself makes the
+old release fail, and on DynamoDB you can deny it write access with IAM (see
+[Why every process at once](#why-every-process-at-once) and
+[Deployments that cannot stop at once](#deployments-that-cannot-stop-at-once)).
 
 ## What changes
 
@@ -79,6 +80,9 @@ On every backend the upgrade:
 - gives every branch record a fence, the token a writer must present;
 - moves each ledger whose branches 4.2 had all retracted into the list of
   dropped ledgers, freeing its name;
+- on file and object stores, retires the old nameservice: each file under
+  `ns@v2/` is kept under `ns@v2.bak/` and replaced with a note that 4.2 cannot
+  read;
 - records that the store is upgraded, so later starts skip all of this.
 
 It is safe to run from several processes at once and to interrupt: the ids it
@@ -88,7 +92,7 @@ small store.
 
 | Backend | Where the upgraded metadata lives | The marker | Log line |
 |---|---|---|---|
-| File | copied from `ns@v2/` to `ns@v3/`; `ns@v2/` is left as it was | `ns@v3/@format.json` | `nameservice migrated from ns@v2 to ns@v3` |
+| File | copied from `ns@v2/` to `ns@v3/`; `ns@v2/` retired, its files kept under `ns@v2.bak/` | `ns@v3/@format.json` | `nameservice migrated from ns@v2 to ns@v3` |
 | S3 and other object stores | the same, under the configured prefix | `ns@v3/@format.json` | the same |
 | DynamoDB | in place: a `fence` on each item, and new binding and dropped-ledger items in the same table ([layout](dynamodb-guide.md)) | the `@format` item | `nameservice migrated to format 3` |
 | Raft | in the replicated state, by the first leader elected on this release | the state itself | `bound the ledgers created before name bindings` |
@@ -105,37 +109,41 @@ dropped list, and is logged only when there was something to do.
    can be upgraded on its own schedule; a 4.2 CLI's `fluree drop --remote`
    still asks for a hard drop, as it always did.
 2. **Take a backup you can roll back to.**
-   - File and object stores: nothing to do. The upgrade leaves `ns@v2/` as
-     it was; see [Rolling back](#rolling-back) for what a rollback keeps.
+   - File and object stores: nothing to do. The upgrade keeps the files it
+     retires under `ns@v2.bak/`; see [Rolling back](#rolling-back).
    - DynamoDB: take an on-demand backup or enable point-in-time recovery. The
      upgrade writes in place, and a backup is the only way back.
    - Raft: copy each node's `--raft-storage-path`.
 3. **Check your scripts** for `fluree drop` (now soft; add `--hard --force` to
    delete) and for creating separate ledgers as branches of one name.
-4. **Upgrade query peers together with the servers they follow.** A 4.2 peer
-   works out a ledger's files from its name, so it cannot read a ledger created
-   after the upgrade, and it ignores a ledger recreated under a name it already
-   holds because the new ledger's `t` starts again from 0. A peer on this
-   release cannot follow a 4.2 server either: it refuses records that do not
-   say where the ledger's files are, and a 4.2 server's never do.
+4. **Query peers.** A peer in shared storage mode opens its server's store, and
+   upgrades it if it starts first, so it is one of the processes above. A peer
+   in proxy storage mode keeps no store of its own: it can be upgraded before
+   its server, but not after. A 4.2 peer works out a ledger's files from its
+   name, so it cannot read a ledger created after the upgrade, and it ignores a
+   ledger recreated under a name it already holds, because the new ledger's `t`
+   starts again from 0.
 
 ## Why every process at once
 
 The risk differs by backend.
 
 **File and object stores.** A 4.2 process reads and writes only `ns@v2/`, and
-this release reads only `ns@v3/`. From the upgrade on they keep separate
-books: a commit made by the 4.2 process is invisible to this release, and each
-side's history of the ledger continues from its own last commit, so the two
-diverge. The usual way this happens is a 4.2 CLI on the same store as an
-upgraded server, for example a CLI installed from Homebrew beside a server in a
-container.
+this release reads only `ns@v3/`. Were `ns@v2/` left in place, the two would
+keep separate books: a commit made by the 4.2 process would be invisible to
+this release, and each side's history of the ledger would continue from its
+own last commit. The usual way this happens is a 4.2 CLI on the same store as
+an upgraded server, for example a CLI installed from Homebrew beside a server
+in a container.
 
-This release warns at start when `ns@v2/` has changed since the upgrade. On a
-local filesystem it notices any change. On an object store it notices only a
-ledger or branch created or deleted there, because a listing does not say when
-an object last changed; a commit to an existing ledger goes unnoticed. The
-warning comes after the fact and stops nothing.
+So the upgrade retires `ns@v2/`. A 4.2 process then fails on every read and
+write of an existing ledger, instead of writing where this release never
+looks: its commands report a serialization error, or that the ledger is not
+found. It can still create a
+ledger under a name `ns@v2/` never held, which this release does not see. This
+release warns at start when that has happened: on a local filesystem it
+notices any file under `ns@v2/` changed since the upgrade, and on an object
+store any file added or removed there.
 
 **DynamoDB.** 4.2 and this release read and write the same items, so a commit
 made by a 4.2 process is visible to this release and history does not split.
@@ -237,8 +245,9 @@ would put the old code back on an upgraded table. Fix a failed update forward
 instead.
 
 The same approach works for any DynamoDB deployment whose old and new
-processes can run under different IAM identities. For file and object stores
-there is no equivalent; stop every process.
+processes can run under different IAM identities. On file and object stores
+the upgrade itself stops a 4.2 process from writing to existing ledgers;
+stopping every process first still spares their users failed requests.
 
 ## After you upgrade
 
@@ -246,16 +255,18 @@ there is no equivalent; stop every process.
 - `fluree dropped list` shows the ledgers 4.2 had soft-dropped, now
   restorable or purgeable, and `fluree list` shows the rest as before.
 - Watch for a warning that files under `ns@v2/` changed after the migration:
-  a process on the old release is still writing.
+  a process on the old release is still running, and has created a ledger
+  this release does not see.
 
 ## Rolling back
 
-- **File and object stores:** a 4.2 release reads `ns@v2/`, which the upgrade
-  left as it was, so it sees the ledgers as they were at the upgrade. Commits
-  made since are not in `ns@v2/`, and ledgers created since live in folders 4.2
-  cannot read. Upgrading again afterwards does not pick up what 4.2 wrote in
-  between: the store is already marked upgraded, and `ns@v2/` is not read
-  again.
+- **File and object stores:** stop every process, then put the files under
+  `ns@v2.bak/` back in place of `ns@v2/`. A 4.2 release then sees the ledgers
+  as they were at the upgrade. Commits made since are not in them, and ledgers
+  created since live in folders 4.2 cannot read. To upgrade again later, delete
+  `ns@v3/` first, so the upgrade starts from what 4.2 wrote; what this release
+  wrote before the rollback is then lost, and the orphan sweep deletes the
+  folders of ledgers it created.
 - **DynamoDB:** restore the backup taken before the upgrade. Running 4.2
   against the upgraded table is not supported.
 - **Raft:** see [Rolling upgrades](raft-clusters.md#rolling-upgrades); a

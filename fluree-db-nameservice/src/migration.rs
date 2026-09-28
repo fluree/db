@@ -5,8 +5,16 @@
 //! `ns@v2/`; this format lives under `ns@v3/`, which they never see, so they
 //! cannot rewrite a record and strip the fields they do not know. The
 //! migration copies `ns@v2/` across once, binds its ledgers
-//! ([`migrate_legacy`](crate::lifecycle::migrate_legacy)), and leaves a
-//! marker. `ns@v2/` is left as it was, for a rollback.
+//! ([`migrate_legacy`](crate::lifecycle::migrate_legacy)), retires `ns@v2/`,
+//! and leaves a marker.
+//!
+//! Retiring keeps each `ns@v2/` file under [`LEGACY_BACKUP`], for a
+//! rollback, and replaces it with [`RETIRED_FILE`]. That is not JSON, so a
+//! binary from before name bindings still running against the store fails
+//! on every read and write of an existing ledger, rather than committing to
+//! `ns@v2/` where this format never sees it. Such a binary can still create
+//! a ledger there, under a name `ns@v2/` did not hold; startup warns about
+//! that.
 
 use crate::{NameServiceError, Result};
 use serde::{Deserialize, Serialize};
@@ -16,6 +24,14 @@ pub const FORMAT_VERSION: u32 = 3;
 
 /// The address version of binaries from before name bindings.
 pub(crate) const LEGACY_NS_VERSION: &str = "ns@v2";
+
+/// Where the migration keeps the `ns@v2/` files it retires.
+pub(crate) const LEGACY_BACKUP: &str = "ns@v2.bak";
+
+/// What each `ns@v2/` file holds once retired.
+pub(crate) const RETIRED_FILE: &[u8] =
+    b"This nameservice was upgraded to name bindings and now lives \
+under ns@v3/. Fluree 4.2 and earlier cannot use it. The file that was here is under ns@v2.bak/.\n";
 
 /// The marker a finished migration leaves at the root of the current address
 /// version. `@` keeps it out of every record listing.

@@ -28,7 +28,9 @@ use crate::binding::{
     RegistryCas, Versioned,
 };
 use crate::lifecycle::MigrationReport;
-use crate::migration::{FormatMarker, FORMAT_MARKER, LEGACY_NS_VERSION};
+use crate::migration::{
+    FormatMarker, FORMAT_MARKER, LEGACY_BACKUP, LEGACY_NS_VERSION, RETIRED_FILE,
+};
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
     merge_heads, ns_context, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
@@ -190,10 +192,15 @@ impl FileNameService {
         }
 
         let legacy = base.join(LEGACY_NS_VERSION);
-        for relative in walk_files(&legacy)? {
-            let bytes = tokio::fs::read(legacy.join(&relative))
+        let relatives = walk_files(&legacy)?;
+        for relative in &relatives {
+            let bytes = tokio::fs::read(legacy.join(relative))
                 .await
                 .map_err(|e| NameServiceError::storage(format!("reading {relative}: {e}")))?;
+            // Retired by an interrupted attempt, which copied it first.
+            if bytes == RETIRED_FILE {
+                continue;
+            }
             self.storage
                 .insert(&format!("fluree:file://{NS_VERSION}/{relative}"), &bytes)
                 .await
@@ -201,6 +208,7 @@ impl FileNameService {
         }
 
         let report = crate::lifecycle::migrate_legacy(self).await?;
+        self.retire_legacy(&relatives).await?;
         let marker = serde_json::to_vec_pretty(&FormatMarker::current(None))?;
         self.storage
             .insert(
@@ -217,6 +225,43 @@ impl FileNameService {
             );
         }
         Ok(Some(report))
+    }
+
+    /// Keep each `ns@v2/` file under `ns@v2.bak/`, then replace it with
+    /// [`RETIRED_FILE`]; see [`crate::migration`]. Every file is kept before
+    /// any is replaced, and a kept file is never overwritten, so an
+    /// interrupted attempt resumes without losing an original.
+    async fn retire_legacy(&self, relatives: &[String]) -> Result<()> {
+        use fluree_db_core::StorageWrite;
+        let legacy = self.storage.base_path().join(LEGACY_NS_VERSION);
+        for relative in relatives {
+            let bytes = match tokio::fs::read(legacy.join(relative)).await {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(NameServiceError::storage(format!(
+                        "reading {relative}: {e}"
+                    )))
+                }
+            };
+            if bytes == RETIRED_FILE {
+                continue;
+            }
+            self.storage
+                .insert(&format!("fluree:file://{LEGACY_BACKUP}/{relative}"), &bytes)
+                .await
+                .map_err(|e| NameServiceError::storage(format!("keeping {relative}: {e}")))?;
+        }
+        for relative in relatives {
+            self.storage
+                .write_bytes(
+                    &format!("fluree:file://{LEGACY_NS_VERSION}/{relative}"),
+                    RETIRED_FILE,
+                )
+                .await
+                .map_err(|e| NameServiceError::storage(format!("retiring {relative}: {e}")))?;
+        }
+        Ok(())
     }
 
     /// [`migrate`](Self::migrate) for synchronous startup, which may be on an
@@ -673,7 +718,10 @@ fn legacy_writes(base: &Path, marker: &FormatMarker) -> usize {
     let Ok(files) = walk_files(&legacy) else {
         return 0;
     };
-    let since = std::time::UNIX_EPOCH + std::time::Duration::from_millis(marker.migrated_at as u64);
+    // The end of the millisecond `migrated_at` truncates: the migration's
+    // own retiring of these files happens before it.
+    let since =
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(marker.migrated_at as u64 + 1);
     files
         .iter()
         .filter(|relative| {
@@ -690,8 +738,8 @@ fn warn_about_legacy_writes(base: &Path, marker: &FormatMarker) {
         tracing::warn!(
             written,
             "{written} nameservice files under {LEGACY_NS_VERSION}/ changed after the migration \
-             to {NS_VERSION}/, most likely by an older Fluree binary; this binary does not \
-             see those changes"
+             to {NS_VERSION}/: an older Fluree binary is still using this store, most likely \
+             creating a ledger there, which this binary does not see"
         );
     }
 }
@@ -1977,14 +2025,39 @@ mod tests {
         assert!(ns.lookup("gone:main").await.unwrap().is_none());
         assert_eq!(ns.list_dropped().await.unwrap().len(), 1);
 
-        // The old address is left for a rollback, and the marker makes the
-        // migration run once.
+        // The old address is retired, its files kept for a rollback, and
+        // the marker makes the migration run once.
         assert_eq!(
             std::fs::read(temp.path().join("ns@v2/mydb/main.json")).unwrap(),
+            RETIRED_FILE
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("ns@v2.bak/mydb/main.json")).unwrap(),
             legacy_bytes
         );
+        assert!(serde_json::from_slice::<NsFileV2>(RETIRED_FILE).is_err());
         assert!(temp.path().join("ns@v3/@format.json").exists());
         assert!(ns.migrate().await.unwrap().is_none());
+    }
+
+    /// A migration interrupted after retiring `ns@v2/` resumes without
+    /// copying a retired file over the current format or over the kept
+    /// original.
+    #[tokio::test]
+    async fn an_interrupted_retirement_resumes() {
+        let temp = TempDir::new().unwrap();
+        write_legacy_record(temp.path(), &legacy_record("mydb:main", 3, false));
+        let legacy_bytes = std::fs::read(temp.path().join("ns@v2/mydb/main.json")).unwrap();
+        let ns = FileNameService::new(temp.path());
+        ns.migrate().await.unwrap().expect("migrated");
+        std::fs::remove_file(temp.path().join("ns@v3/@format.json")).unwrap();
+
+        ns.migrate().await.unwrap().expect("resumed");
+        assert_eq!(
+            std::fs::read(temp.path().join("ns@v2.bak/mydb/main.json")).unwrap(),
+            legacy_bytes
+        );
+        assert_eq!(ns.lookup("mydb:main").await.unwrap().unwrap().commit_t, 3);
     }
 
     #[tokio::test]

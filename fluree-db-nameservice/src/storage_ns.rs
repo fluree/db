@@ -629,7 +629,9 @@ where
     /// the store was already current. Safe to repeat, to resume, and to run
     /// from several processes at once.
     pub async fn migrate(&self) -> Result<Option<crate::lifecycle::MigrationReport>> {
-        use crate::migration::{FormatMarker, LegacyFiles, FORMAT_MARKER, LEGACY_NS_VERSION};
+        use crate::migration::{
+            FormatMarker, LegacyFiles, FORMAT_MARKER, LEGACY_NS_VERSION, RETIRED_FILE,
+        };
 
         let marker_key = self.ns_root_key(FORMAT_MARKER);
         match self.storage.read_bytes(&marker_key).await {
@@ -640,9 +642,9 @@ where
                         then,
                         now,
                         "the nameservice files under {LEGACY_NS_VERSION}/ changed after the \
-                         migration to {NS_VERSION}/ ({then} then, {now} now), most likely \
-                         because an older Fluree binary created or dropped a ledger there; \
-                         this binary does not see those changes"
+                         migration to {NS_VERSION}/ ({then} then, {now} now): an older Fluree \
+                         binary is still using this store, most likely creating a ledger \
+                         there, which this binary does not see"
                     );
                 }
                 return Ok(None);
@@ -665,6 +667,10 @@ where
                     return Err(NameServiceError::storage(format!("reading {key}: {e}")));
                 }
             };
+            // Retired by an interrupted attempt, which copied it first.
+            if bytes == RETIRED_FILE {
+                continue;
+            }
             self.storage
                 .insert(&self.ns_root_key(relative), &bytes)
                 .await
@@ -672,6 +678,7 @@ where
         }
 
         let report = crate::lifecycle::migrate_legacy(self).await?;
+        self.retire_legacy(&legacy_root, &relatives).await?;
         let marker =
             serde_json::to_vec_pretty(&FormatMarker::current(Some(LegacyFiles::of(&relatives))))?;
         self.storage
@@ -688,15 +695,54 @@ where
         Ok(Some(report))
     }
 
+    /// The directory `dir` under this nameservice's prefix, with a trailing
+    /// `/`.
+    fn prefixed_dir(&self, dir: &str) -> String {
+        if self.prefix.is_empty() {
+            format!("{dir}/")
+        } else {
+            format!("{}/{dir}/", self.prefix)
+        }
+    }
+
+    /// Keep each file under `legacy_root` in the backup directory, then
+    /// replace it with [`RETIRED_FILE`](crate::migration::RETIRED_FILE); see
+    /// [`crate::migration`]. Every file is kept before any is replaced, and a
+    /// kept file is never overwritten, so an interrupted attempt resumes
+    /// without losing an original.
+    async fn retire_legacy(&self, legacy_root: &str, relatives: &[String]) -> Result<()> {
+        use crate::migration::{LEGACY_BACKUP, RETIRED_FILE};
+        let backup_root = self.prefixed_dir(LEGACY_BACKUP);
+        for relative in relatives {
+            let key = format!("{legacy_root}{relative}");
+            let bytes = match self.storage.read_bytes(&key).await {
+                Ok(bytes) => bytes,
+                Err(CoreError::NotFound(_)) => continue,
+                Err(e) => return Err(NameServiceError::storage(format!("reading {key}: {e}"))),
+            };
+            if bytes == RETIRED_FILE {
+                continue;
+            }
+            self.storage
+                .insert(&format!("{backup_root}{relative}"), &bytes)
+                .await
+                .map_err(|e| NameServiceError::storage(format!("keeping {key}: {e}")))?;
+        }
+        for relative in relatives {
+            let key = format!("{legacy_root}{relative}");
+            self.storage
+                .write_bytes(&key, RETIRED_FILE)
+                .await
+                .map_err(|e| NameServiceError::storage(format!("retiring {key}: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// The root of the address version from before name bindings, and the
     /// files under it, relative to it, except lock and staging files.
     async fn legacy_files(&self) -> Result<(String, Vec<String>)> {
         use crate::migration::LEGACY_NS_VERSION;
-        let legacy_root = if self.prefix.is_empty() {
-            format!("{LEGACY_NS_VERSION}/")
-        } else {
-            format!("{}/{LEGACY_NS_VERSION}/", self.prefix)
-        };
+        let legacy_root = self.prefixed_dir(LEGACY_NS_VERSION);
         let keys = StorageList::list_prefix(&self.storage, &legacy_root)
             .await
             .map_err(|e| NameServiceError::storage(format!("listing {legacy_root}: {e}")))?;
@@ -2104,7 +2150,17 @@ mod tests {
         let migrated = ns.lookup("mydb:main").await.unwrap().expect("bound");
         assert!(migrated.fence.is_some());
         assert_eq!(migrated.commit_t, 2);
-        assert!(ns.storage.read_bytes(legacy_key).await.is_ok());
+        assert_eq!(
+            ns.storage.read_bytes(legacy_key).await.unwrap(),
+            crate::migration::RETIRED_FILE
+        );
+        assert_eq!(
+            ns.storage
+                .read_bytes("test/ns@v2.bak/mydb/main.json")
+                .await
+                .unwrap(),
+            serde_json::to_vec(&NsFileV2::for_record(&record)).unwrap()
+        );
         assert!(ns.migrate().await.unwrap().is_none());
     }
 

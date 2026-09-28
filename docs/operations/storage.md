@@ -337,9 +337,10 @@ bindings (4.2 and earlier) keeps its data at the name itself — `mydb/main/…`
 
 Releases 4.2 and earlier keep the nameservice under `ns@v2/`. The first start of
 this release copies it to `ns@v3/` and binds each ledger to its name where its
-data already is; no ledger data is moved, and `ns@v2/` is left as it was. Every
-process that shares the store must be upgraded together: a 4.2 process still
-writing to `ns@v2/` afterwards is invisible to this release. See
+data already is; no ledger data is moved. It then retires `ns@v2/`, keeping its
+files under `ns@v2.bak/`, so a 4.2 process still running against the store
+fails rather than writing where this release never looks. Every process that
+shares the store must be upgraded together. See
 [Upgrading from 4.2 and earlier](upgrading-from-4.2.md).
 
 ### File Formats

@@ -98,9 +98,13 @@ async fn a_store_from_before_name_bindings_opens_migrated() {
 
     assert_eq!(names(&fluree, "gonedb").await, ["Dave"]);
 
-    // 4.2.1's address is left as it was, for a rollback.
+    // 4.2.1's address is retired, and its files kept for a rollback.
+    assert!(serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(tmp.path().join("ns@v2/legacydb/main.json")).unwrap()
+    )
+    .is_err());
     assert_eq!(
-        std::fs::read(tmp.path().join("ns@v2/legacydb/main.json")).unwrap(),
+        std::fs::read(tmp.path().join("ns@v2.bak/legacydb/main.json")).unwrap(),
         legacy_record
     );
 
