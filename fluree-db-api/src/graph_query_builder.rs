@@ -139,10 +139,16 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
     /// leave an unconfigured ledger untouched.
     ///
     /// SPARQL has nowhere to carry an `opts` block, so only configured defaults
-    /// can govern it. The verified identity does not arrive in the body either:
-    /// it rides the builder's execution options from the auth layer, and without
-    /// it an `f:IdentityRestricted` override control refuses a request the config
-    /// would permit.
+    /// can govern a SPARQL request through this builder. That is a limit of the
+    /// builder, not of the product: over HTTP a SPARQL request selects policy
+    /// with the `fluree-identity`, `fluree-policy`, `fluree-policy-class`,
+    /// `fluree-policy-values` and `fluree-default-allow` headers, but those
+    /// resolve into a view through `db_with_policy` and never reach this builder.
+    ///
+    /// The verified identity does not arrive in the body either: it rides the
+    /// builder's execution options from the auth layer, and without it an
+    /// `f:IdentityRestricted` override control refuses a request the config would
+    /// permit.
     async fn wrap_request_policy(&self, view: GraphDb) -> Result<GraphDb> {
         let mut opts = match self.core.input.as_ref() {
             Some(crate::view::QueryInput::JsonLd(json)) => {
