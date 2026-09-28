@@ -445,7 +445,9 @@ pub async fn rollback_branch_create<S: LifecycleStore + ?Sized>(
 /// `store`: bind its name to the record's instance and root, list its
 /// branch, and insert it. A root at the name itself, from before name
 /// bindings, takes the instance the migration derives from the name
-/// ([`legacy_instance`]). A binding to another instance is replaced: the
+/// ([`legacy_instance`]). A record with no root comes from a nameservice
+/// from before name bindings, which keeps every ledger at its name; a later
+/// one always sends the root. A binding to another instance is replaced: the
 /// origin has dropped that ledger and created this one under the name.
 ///
 /// The record keeps its fence when it carries one; otherwise a local one is
@@ -456,13 +458,11 @@ pub async fn mirror_record<S: LifecycleStore + ?Sized>(
     store: &S,
     record: &NsRecord,
 ) -> Result<Fence> {
-    let Some(root) = record.storage_root.clone() else {
-        return Err(NameServiceError::invalid_id(format!(
-            "{} has no storage root to mirror",
-            record.ledger_id
-        )));
-    };
     let name = record.ledger_id.ledger_name();
+    let root = record
+        .storage_root
+        .clone()
+        .unwrap_or_else(|| StorageRoot::legacy(&name));
     // A ledger from before name bindings keeps its root at the name; the
     // origin's migration gave it the instance derived from the name.
     let instance = root.instance().unwrap_or_else(|| legacy_instance(&name));

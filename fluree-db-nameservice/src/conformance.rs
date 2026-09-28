@@ -884,12 +884,14 @@ pub async fn mirror_binds_the_origin_instance<S: LifecycleStore + crate::NameSer
         .unwrap();
     assert!(store.lookup("mydb:main").await.unwrap().is_none());
 
+    // A nameservice from before name bindings sends no root: its ledgers
+    // are at their names.
     let mut legacy = NsRecord::new(id("old:main"));
     legacy.storage_root = None;
-    assert!(matches!(
-        lifecycle::mirror_record(store, &legacy).await.unwrap_err(),
-        NameServiceError::InvalidId(_)
-    ));
+    lifecycle::mirror_record(store, &legacy).await.unwrap();
+    let copy = store.lookup("old:main").await.unwrap().unwrap();
+    assert_eq!(copy.storage_root, Some(StorageRoot::legacy(&name("old"))));
+    assert_eq!(copy.instance(), Some(lifecycle::legacy_instance("old")));
 }
 
 fn assert_fenced<T: std::fmt::Debug>(result: crate::Result<T>, write: &str) {
