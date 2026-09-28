@@ -154,6 +154,9 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             _ => crate::GovernanceOptions::default(),
         };
         opts.server_identity = self.core.execution.server_identity.clone();
+        // `has_any_policy_inputs`, not the narrower `selects_policy_set`: the
+        // latter ignores a `default-allow: false` that arrives on its own, and
+        // such a request must not take the unrestricted path.
         if opts.has_any_policy_inputs() {
             self.graph.fluree.wrap_policy(view, &opts).await
         } else {
