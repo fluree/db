@@ -30,6 +30,8 @@ By default the data is kept. The dropped ledger moves to a list of dropped ledge
 
 `--hard` deletes the data now: commits, indexes, dictionaries and the cross-branch `@shared/` namespace. Equivalent to `POST /drop` with `"hard": true`.
 
+Dropping a name whose create or import has not finished rolls it back, with or without `--hard`: there is nothing to restore, the data it wrote is deleted, and an import still running stops.
+
 The command first tries to drop the name as a ledger. If no ledger holds the name, it tries to drop it as a graph source, so `fluree drop` works uniformly for both ledgers and graph sources like Iceberg mappings. Graph sources cannot be restored; a soft drop retracts the graph source and keeps its files, and `--hard` deletes them. Graph source cleanup is implementation-specific, and warnings are printed when it is partial.
 
 To remove a single branch (not the whole ledger), use `fluree branch drop`.

@@ -14,7 +14,7 @@
 //!
 //! With an interval set, it also runs the orphan sweep.
 
-use crate::admin::{DropMode, DropReport, DropStatus};
+use crate::admin::{DropMode, DropStatus};
 use crate::Fluree;
 use fluree_db_core::{InstanceId, LedgerName};
 use fluree_db_indexer::Housekeeping;
@@ -225,26 +225,16 @@ async fn resume(fluree: &Fluree, op: &Unfinished, version: u64) {
     }
 }
 
-/// Free the name a stopped create holds, then delete what it wrote. Only an
-/// instance root is deleted whole; a create always makes one.
+/// Free the name a stopped create holds, then delete what it wrote.
 async fn rollback_create(fluree: &Fluree, name: &str, version: u64) -> crate::Result<()> {
-    let Some(binding) = lifecycle::rollback_create(fluree.publisher()?, name, version).await?
-    else {
+    let name = LedgerName::parse(name)?;
+    let Some(report) = fluree.roll_back_create(&name, version).await? else {
         return Ok(());
     };
-    let mut report = DropReport::default();
-    if let (Some(storage), Some(_)) = (fluree.admin_storage(), binding.root.instance()) {
-        crate::admin::purge_instance_root(storage, &binding.root, &[], &mut report).await;
-    }
     for warning in &report.warnings {
         warn!(ledger = %name, %warning, "a rolled-back create's data left behind");
     }
-    info!(
-        ledger = %name,
-        instance = %binding.instance,
-        files_deleted = report.artifacts_deleted,
-        "rolled back a create whose claim on the name stopped being renewed"
-    );
+    info!(ledger = %name, "the create's claim on the name had stopped being renewed");
     Ok(())
 }
 

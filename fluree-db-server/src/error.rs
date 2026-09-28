@@ -175,6 +175,7 @@ impl ServerError {
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
             // Not retryable, unlike the conflicts below: the writer must reload.
             ServerError::Api(e) if e.is_fenced() => errors::FENCED,
+            ServerError::Api(e) if e.is_lifecycle_conflict() => errors::LIFECYCLE_CONFLICT,
             // Optimistic-concurrency conflicts: a distinct, retryable class so
             // clients can branch on `@type` (and the 409 status below).
             ServerError::Api(ApiError::Transact(
@@ -283,6 +284,7 @@ impl ServerError {
 
             // 409 - Conflict
             ServerError::Api(e) if e.is_fenced() => StatusCode::CONFLICT,
+            ServerError::Api(e) if e.is_lifecycle_conflict() => StatusCode::CONFLICT,
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
             // Optimistic-concurrency / namespace-allocation conflicts are
             // retryable: 409 lets clients distinguish "retry" from a 400 "bad

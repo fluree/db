@@ -241,6 +241,19 @@ if none does).
 }
 ```
 
+**`err:db/LifecycleConflict`** — a create, drop, restore or purge that another
+one got to first: the name is being created, dropped or restored, or the
+dropped ledger is being restored or purged. Retrying once that operation
+finishes may succeed.
+
+```json
+{
+  "error": "Conflict: 'mydb' is being restored; retry the drop once it finishes",
+  "status": 409,
+  "@type": "err:db/LifecycleConflict"
+}
+```
+
 **`err:db/GraphSourceSuspended`** — a sync of a BM25 or vector index whose
 source ledger was dropped and replaced by another ledger of the same name.
 Retrying does not help: restore the dropped ledger, or drop the index and

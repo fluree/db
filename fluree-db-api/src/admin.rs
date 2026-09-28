@@ -21,7 +21,8 @@ use fluree_db_indexer::{
 };
 use fluree_db_nameservice::lifecycle::{self, BranchDrop};
 use fluree_db_nameservice::{
-    DroppedLedger, DroppedState, GraphSourceType, NameBinding, NameServiceError, NsRecord,
+    BindingState, DroppedLedger, DroppedState, GraphSourceType, NameBinding, NameServiceError,
+    NsRecord,
 };
 use fluree_db_transact::GraphSel;
 use std::collections::HashSet;
@@ -754,6 +755,16 @@ impl crate::Fluree {
         let ledger_name = parse_whole_ledger_input(ledger_id, WholeLedgerOperation::Drop)?;
         info!(ledger_name = %ledger_name, mode = ?mode, "Dropping whole ledger");
         match self.publisher()?.get_binding(&ledger_name).await? {
+            // Nothing a drop could keep: the create is rolled back instead.
+            Some(binding) if binding.value.state == BindingState::Creating => {
+                match self.roll_back_create(&ledger_name, binding.version).await? {
+                    Some(report) => Ok(report),
+                    // It finished or was rolled back meanwhile.
+                    None => Err(ApiError::from(NameServiceError::conflict(format!(
+                        "the create of '{ledger_name}' finished while it was being dropped; retry"
+                    )))),
+                }
+            }
             Some(binding) => {
                 self.drop_bound_ledger(&ledger_name, binding.value, mode, false)
                     .await
@@ -767,6 +778,49 @@ impl crate::Fluree {
                 })
             }
         }
+    }
+
+    /// Roll back the create holding `name` in the binding seen at `version`:
+    /// free the name, delete the records, then the data the create wrote. A
+    /// creator still running finds its claim gone and stops. `None` when the
+    /// binding has moved on since it was seen.
+    pub(crate) async fn roll_back_create(
+        &self,
+        name: &LedgerName,
+        version: u64,
+    ) -> Result<Option<DropReport>> {
+        let Some(binding) =
+            lifecycle::rollback_create(self.publisher()?, name.as_str(), version).await?
+        else {
+            return Ok(None);
+        };
+        let mut report = DropReport {
+            ledger_id: name.to_string(),
+            status: DropStatus::Dropped,
+            instance: Some(binding.instance.clone()),
+            name_released: true,
+            ..Default::default()
+        };
+        // A create always has an instance root; a root at the name is never
+        // deleted whole.
+        let deleted = match (self.admin_storage(), binding.root.instance()) {
+            (Some(storage), Some(_)) => {
+                purge_instance_root(storage, &binding.root, &[], &mut report).await
+            }
+            _ => false,
+        };
+        report.data = Some(if deleted && report.warnings.is_empty() {
+            DroppedData::Deleted
+        } else {
+            DroppedData::Deleting
+        });
+        info!(
+            ledger_name = %name,
+            instance = %binding.instance,
+            artifacts_deleted = report.artifacts_deleted,
+            "Rolled back an unfinished create"
+        );
+        Ok(Some(report))
     }
 
     /// Drop a ledger created under a name binding: the name is free at once,
@@ -786,6 +840,20 @@ impl crate::Fluree {
             ..Default::default()
         };
 
+        // A resumed drop acts only while the drop it saw is still under way:
+        // one that finished meanwhile may have handed the name to a new
+        // ledger, whose indexing must not be cancelled.
+        let store = self.publisher()?;
+        if resume {
+            let still = store.get_binding(ledger_name).await?.is_some_and(|b| {
+                b.value.instance == binding.instance
+                    && matches!(b.value.state, BindingState::Dropping { .. })
+            });
+            if !still {
+                return Ok(report);
+            }
+        }
+
         // Stop indexing before the records go, so a build cannot publish
         // into a ledger mid-drop.
         let branch_ids: Vec<LedgerId> = binding
@@ -800,7 +868,6 @@ impl crate::Fluree {
             }
         }
 
-        let store = self.publisher()?;
         let dropped = if resume {
             lifecycle::resume_drop_ledger(store, ledger_name).await?
         } else {

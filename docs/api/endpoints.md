@@ -2048,6 +2048,8 @@ created under it, and it gets storage of its own.
 - **Soft drop** (`hard: false`, default): The dropped ledger keeps its data in the dropped-ledger registry, where it can be [restored](#post-droppedrestore) under its name or [purged](#post-droppedpurge). List it with [`GET /dropped`](#get-dropped).
 - **Hard drop** (`hard: true`): Deletes the ledger's data. **This is irreversible.** If deletion is interrupted, the ledger stays in the registry as `purging` and the response reports `"data": "deleting"`; purging it finishes the job.
 
+Dropping a name whose create or import has not finished rolls that create back in either mode: nothing is kept to restore, the data it wrote is deleted, and a create still running stops. A drop that meets a restore of the same name answers `409` with `err:db/LifecycleConflict`.
+
 If no ledger is found by name, the server tries the same name as a graph source on branch `main`. Graph source hard-drop cleanup is best effort; graph-source fallback responses omit `branches_dropped`, `files_deleted`, `instance`, `name_released` and `data`.
 
 **Response:**

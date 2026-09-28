@@ -2044,19 +2044,10 @@ impl Fluree {
         restored
     }
 
-    /// Undo a restore that failed: delete what it wrote, then release its
-    /// claim on the name, so the restore can be retried.
+    /// Undo a restore that failed: release its claim on the name, so the
+    /// restore can be retried, then delete what it wrote, which nothing
+    /// references once the claim is gone.
     async fn discard_restored(&self, pending: &PendingLedger) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let (_, warnings) = self
-                .drop_artifacts(&pending.record.ledger_id, &pending.record)
-                .await;
-            let (_, shared_warnings) = self.drop_shared_artifacts(&pending.root).await;
-            for warning in warnings.iter().chain(&shared_warnings) {
-                tracing::warn!(ledger = %pending.record.ledger_id, %warning, "partially-restored data left behind");
-            }
-        }
         let abandoned = match self.publisher() {
             Ok(store) => fluree_db_nameservice::lifecycle::abandon(store, pending)
                 .await
@@ -2069,6 +2060,14 @@ impl Fluree {
                 error = %e,
                 "failed to release a failed restore's claim on the name"
             );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(storage) = self.admin_storage() {
+            let mut report = crate::admin::DropReport::default();
+            crate::admin::purge_instance_root(storage, &pending.root, &[], &mut report).await;
+            for warning in &report.warnings {
+                tracing::warn!(ledger = %pending.record.ledger_id, %warning, "partially-restored data left behind");
+            }
         }
     }
 

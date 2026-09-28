@@ -88,6 +88,10 @@ pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
 /// restored or replaced; reloading the ledger is the only way forward
 pub const FENCED: &str = "err:db/Fenced";
 
+/// A create, drop, restore or purge refused because another holds the name
+/// or the dropped ledger; retrying once that finishes may succeed
+pub const LIFECYCLE_CONFLICT: &str = "err:db/LifecycleConflict";
+
 /// Empty transaction (no flakes)
 pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 

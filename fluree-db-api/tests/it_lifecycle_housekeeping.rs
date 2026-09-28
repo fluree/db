@@ -236,6 +236,42 @@ async fn a_stopped_create_is_rolled_back() {
         .expect("the name is free");
 }
 
+/// Dropping a ledger whose create has not finished rolls the create back:
+/// nothing is kept to restore, the name is free, and the data is gone.
+#[tokio::test]
+async fn dropping_an_unfinished_create_rolls_it_back() {
+    let (_tmp, fluree) = fluree_with(&[]).await;
+    let pending = lifecycle::begin_create(
+        fluree.publisher().unwrap(),
+        &LedgerId::parse("importing:main").unwrap(),
+    )
+    .await
+    .unwrap();
+    let root = pending.root.to_string();
+    let storage = fluree.admin_storage().unwrap();
+    storage
+        .write_bytes(&format!("fluree:file://{root}/main/commit/x.fcv2"), b"x")
+        .await
+        .unwrap();
+
+    let report = fluree
+        .drop_ledger("importing", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    assert_eq!(report.status, fluree_db_api::DropStatus::Dropped);
+    assert!(report.name_released);
+    assert_eq!(report.data, Some(fluree_db_api::DroppedData::Deleted));
+    assert!(fluree.list_dropped().await.unwrap().is_empty());
+    assert_eq!(files_under(&fluree, &root).await, 0);
+    assert!(lifecycle::activate(fluree.publisher().unwrap(), &pending)
+        .await
+        .is_err());
+    fluree
+        .create_ledger("importing:main")
+        .await
+        .expect("the name is free");
+}
+
 /// A create whose claim is renewed between ticks, as a running import's is,
 /// is left alone, and so is a stopped one until its claim has been still for
 /// the configured time.
