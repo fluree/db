@@ -75,13 +75,13 @@ cargo build
 # Optimized build
 cargo build --release
 
-# Server binary at: target/release/fluree-db-server
+# Server binary at: target/release/fluree-server
 ```
 
 ### Build Server Only
 
 ```bash
-cargo build --release --bin fluree-db-server
+cargo build --release --bin fluree-server
 ```
 
 ## Run Development Server
@@ -89,8 +89,8 @@ cargo build --release --bin fluree-db-server
 ### Quick Start
 
 ```bash
-# Run with default settings (memory storage)
-cargo run --bin fluree-db-server
+# Run with default settings (file storage in ./.fluree/storage)
+cargo run --bin fluree-server
 ```
 
 Server starts on http://localhost:8090
@@ -98,9 +98,8 @@ Server starts on http://localhost:8090
 ### With Custom Settings
 
 ```bash
-cargo run --bin fluree-db-server -- \
-  --storage file \
-  --data-dir ./dev-data \
+cargo run --bin fluree-server -- \
+  --storage-path ./dev-data \
   --log-level debug
 ```
 
@@ -109,7 +108,7 @@ cargo run --bin fluree-db-server -- \
 Auto-rebuild and restart on changes:
 
 ```bash
-cargo watch -x 'run --bin fluree-db-server'
+cargo watch -x 'run --bin fluree-server'
 ```
 
 ## Run Tests
@@ -179,13 +178,13 @@ cargo nextest run
       "request": "launch",
       "name": "Debug server",
       "cargo": {
-        "args": ["build", "--bin=fluree-db-server"],
+        "args": ["build", "--bin=fluree-server"],
         "filter": {
-          "name": "fluree-db-server",
+          "name": "fluree-server",
           "kind": "bin"
         }
       },
-      "args": ["--storage", "memory", "--log-level", "debug"],
+      "args": ["--log-level", "debug"],
       "cwd": "${workspaceFolder}"
     }
   ]
@@ -262,8 +261,7 @@ cargo build --all-features
 ### Run Server Locally
 
 ```bash
-cargo run --bin fluree-db-server -- \
-  --storage memory \
+cargo run --bin fluree-server -- \
   --log-level debug
 ```
 
@@ -284,11 +282,11 @@ curl -X POST http://localhost:8090/v1/fluree/query -d '{...}'
 cargo build
 
 # Run with lldb
-rust-lldb target/debug/fluree-db-server
+rust-lldb target/debug/fluree-server
 
 # Set breakpoint
 (lldb) b fluree_db_query::execute::execute_query
-(lldb) run --storage memory
+(lldb) run --storage-path ./dev-data
 
 # Debug commands
 (lldb) continue
@@ -315,13 +313,13 @@ tracing::debug!(?value, "Processing query");
 Enable debug logs:
 
 ```bash
-RUST_LOG=debug cargo run --bin fluree-db-server
+RUST_LOG=debug cargo run --bin fluree-server
 ```
 
 Or trace specific module:
 
 ```bash
-RUST_LOG=fluree_db_query=trace cargo run --bin fluree-db-server
+RUST_LOG=fluree_db_query=trace cargo run --bin fluree-server
 ```
 
 ## Performance Profiling
@@ -353,7 +351,7 @@ cargo install flamegraph
 CARGO_PROFILE_RELEASE_STRIP=false \
 CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
 RUSTFLAGS="-C force-frame-pointers=yes" \
-  cargo flamegraph --bin fluree-db-server
+  cargo flamegraph --bin fluree-server
 
 # Open flamegraph.svg in browser
 ```
@@ -367,7 +365,7 @@ window: `perf record -g --call-graph fp -F 997 -p <pid> -- sleep <secs>`, then
 ```bash
 # Record
 cargo build --release
-perf record -g target/release/fluree-db-server
+perf record -g target/release/fluree-server
 
 # Report
 perf report

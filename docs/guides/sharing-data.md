@@ -62,12 +62,13 @@ fluree token keygen
 Start the server trusting that issuer on the surfaces you intend to serve:
 
 ```bash
-fluree-server \
+# --data-auth-*: query serving with enforced auth
+# --storage-proxy-*: block serving (peer/replication tier)
+fluree server run \
   --storage-path /var/lib/fluree \
-  # query serving with enforced auth:
+  -- \
   --data-auth-mode required \
   --data-auth-trusted-issuer did:key:z6Mk... \
-  # block serving (peer/replication tier):
   --storage-proxy-enabled \
   --storage-proxy-trusted-issuer did:key:z6Mk...
 ```
@@ -190,7 +191,7 @@ S3** instead of proxying bytes through your server — same access model,
 near-zero serving cost:
 
 ```bash
-fluree-server ... \
+fluree server run ... -- \
   --storage-vend-enabled \
   --storage-vend-role-arn arn:aws:iam::123456789012:role/fluree-vend
 ```
