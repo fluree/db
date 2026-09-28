@@ -500,7 +500,6 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
     }
 }
 
-/// Translate an apply-path `(Command, Response)` pair into the
 /// A state-machine ledger identity as an event id. The state machine only
 /// holds ids that passed validation on the way in; one that no longer parses
 /// is logged and its event dropped rather than broadcast under a key no
@@ -517,6 +516,7 @@ fn parsed_event_ledger_id(ledger_id: &str) -> Option<fluree_db_core::LedgerId> {
         .ok()
 }
 
+/// Translate an apply-path `(Command, Response)` pair into the
 /// matching [`NameServiceEvent`]. Returns `None` for pairs that
 /// don't advance head state — desyncs, no-ops, idempotency hits.
 fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {

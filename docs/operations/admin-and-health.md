@@ -79,6 +79,7 @@ Diagnostic endpoint for debugging Bearer tokens.
 - If no token is present, returns `token_present=false`.
 - If a token is present, attempts to **cryptographically verify** it using the same verification logic as authenticated endpoints (embedded-JWK Ed25519 and JWKS/OIDC when enabled/configured).
 - On verification failure, returns `verified=false` and includes an `error` string. Some unverified decoded fields may be included for debugging.
+- A verified token's `scopes` list the ledger IDs it grants, as authorization reads them: `mydb` shows as `mydb:main`, and an entry that is not a valid ledger ID is left out.
 
 ```bash
 curl http://localhost:8090/v1/fluree/whoami \

@@ -18,7 +18,7 @@ fluree branch create <NAME> [OPTIONS]
 
 | Argument | Description |
 |----------|-------------|
-| `<NAME>` | Name for the new branch (e.g., "dev", "feature-x") |
+| `<NAME>` | Name for the new branch (e.g., "dev", "feature-x"). Cannot contain `/`, `:`, `@` or `#`; see [naming rules](../concepts/ledgers-and-nameservice.md#naming-rules) |
 
 **Options:**
 
