@@ -12,7 +12,7 @@ pub(crate) use bearer::extract_bearer_token;
 pub use bearer::{EventsPrincipal, MaybeBearer};
 pub use credential::{CredentialPayload, ExtractedCredential, MaybeCredential};
 pub use credential_policy::CredentialPolicy;
-pub(crate) use data_bearer::verify_data_principal;
+pub(crate) use data_bearer::{parse_scopes, verify_data_principal};
 pub use data_bearer::{DataPrincipal, MaybeDataBearer};
 pub use headers::{negotiate_graph_format, FlureeHeaders, GraphFormat};
 pub use storage_proxy::{StorageProxyBearer, StorageProxyPrincipal};
