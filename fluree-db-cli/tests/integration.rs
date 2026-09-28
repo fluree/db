@@ -2526,54 +2526,6 @@ fn export_without_annotations_is_unchanged() {
         .stdout(predicate::str::contains("~").not());
 }
 
-/// An annotation written inside a named graph is not represented in the
-/// output today: the forward lookup export uses is blind to named graphs,
-/// though the rows are in the ledger and SPARQL reads them. Export must say
-/// so — suppressing the `f:reifies*` rows and then emitting no marker is
-/// exactly the silent truncation this work exists to remove.
-#[test]
-fn export_reports_annotations_it_could_not_resolve() {
-    let tmp = TempDir::new().unwrap();
-    fluree_cmd(&tmp).arg("init").assert().success();
-    let src = tmp.path().join("gann-src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("a.trig"),
-        "@prefix ex: <http://example.org/> .\n\
-         GRAPH <http://example.org/g1> { \
-             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
-    )
-    .unwrap();
-    fluree_cmd(&tmp)
-        .args(["create", "gann", "--from"])
-        .arg(&src)
-        .assert()
-        .success();
-
-    fluree_cmd(&tmp)
-        .args(["export", "gann", "--format", "trig", "--all-graphs"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains(
-            "1 edge annotations could not be resolved",
-        ))
-        .stderr(predicate::str::contains("--raw-reifies"));
-
-    // And the named remedy works: the bundle comes out verbatim.
-    fluree_cmd(&tmp)
-        .args([
-            "export",
-            "gann",
-            "--format",
-            "trig",
-            "--all-graphs",
-            "--raw-reifies",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("reifiesSubject"));
-}
-
 /// Two exports of the same ledger must produce the same bytes.
 ///
 /// They did not. Untranslated rows reach the writers through
@@ -2707,51 +2659,6 @@ fn an_untranslated_annotation_exports_with_its_marker() {
         .assert()
         .success()
         .stdout(predicate::str::contains("<http://example.org/src>"));
-}
-
-/// The counter still fires when an annotation genuinely cannot be resolved.
-///
-/// Paired with the test above on purpose. "No warning" is satisfied by a
-/// counter that has stopped working, so a `MustNotFire` assertion alone
-/// cannot distinguish "nothing was dropped" from "the accounting is dead".
-///
-/// The fixture is an annotation inside a named graph, which the base-index
-/// seal scan cannot key on this branch.
-///
-/// **This canary has a known expiry**, recorded here so the next person does
-/// not mistake its retirement for a regression: the stacked seal fix makes
-/// named-graph annotations resolve, at which point this stops firing and
-/// must be replaced rather than deleted. The replacement wanted is a bundle
-/// the decoder rejects outright — a `GraphMismatch` or a malformed bundle —
-/// which is a corruption state rather than a defect, and which no supported
-/// write surface can produce, since every write path rejects hand-written
-/// `f:reifies*`.
-#[test]
-fn the_unresolved_counter_still_fires_when_it_should() {
-    let tmp = TempDir::new().unwrap();
-    fluree_cmd(&tmp).arg("init").assert().success();
-    let src = tmp.path().join("mf-src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("a.trig"),
-        "@prefix ex: <http://example.org/> .\n\
-         GRAPH <http://example.org/g1> { \
-             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
-    )
-    .unwrap();
-    fluree_cmd(&tmp)
-        .args(["create", "mf", "--from"])
-        .arg(&src)
-        .assert()
-        .success();
-
-    fluree_cmd(&tmp)
-        .args(["export", "mf", "--format", "trig", "--all-graphs"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains(
-            "1 edge annotations could not be resolved",
-        ));
 }
 
 /// Every object shape keeps its annotation, including the big-numeric ones.
@@ -2901,6 +2808,190 @@ fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
         .success()
         .stdout(predicate::str::contains("~ <http://example.org/c1>"))
         .stdout(predicate::str::contains("<http://example.org/knows>"));
+}
+
+/// An annotation written inside a named graph exports like any other.
+///
+/// It did not, until #1882: the seal scan reads bundles out of the base
+/// index, and the base-index reader does not put a graph on the rows it
+/// decodes — the graph rides on the query's `g_id`, not the row. The
+/// decoder cross-checks `f:reifiesGraph` against the flake-level graph and
+/// read the disagreement as a forged bundle, so every named-graph
+/// annotation was dropped on the floor with no marker emitted. This is the
+/// user-facing shape of that fix, and the reason #1859's last gap closed.
+#[test]
+fn a_named_graph_annotation_exports_with_its_marker() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("gann-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.trig"),
+        "@prefix ex: <http://example.org/> .\n\
+         GRAPH <http://example.org/g1> { \
+             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "gann", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "gann", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        // The marker, inline on the edge it annotates.
+        .stdout(predicate::str::contains("ex:p ex:y ~ ex:cG"))
+        // And the reifier's own description, so the annotation is usable.
+        .stdout(predicate::str::contains("ex:src ex:d"))
+        // Nothing was dropped, so nothing is reported.
+        .stderr(predicate::str::contains("could not be resolved").not());
+
+    // `--raw-reifies` still emits the bundle verbatim for pinned consumers.
+    fluree_cmd(&tmp)
+        .args([
+            "export",
+            "gann",
+            "--format",
+            "trig",
+            "--all-graphs",
+            "--raw-reifies",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reifiesSubject"));
+}
+
+/// `fluree index` must seal the annotation arena on the first pass.
+///
+/// It did not: the attachment-events provider reads from a running
+/// `LedgerManager`, a one-shot CLI process has none, so `index` resolved no
+/// coverage and sealed nothing — while root assembly set the sticky
+/// `had_annotation_arena` bit regardless, permanently blocking the
+/// bootstrap that would have recovered it. `reindex` already had a fallback
+/// for this; `index` now makes the same call (#1882).
+///
+/// What this asserts is that the annotation survives `insert` + `index`
+/// round-trip. It does *not* assert which annotation source answered —
+/// after the named-graph fix above, the arena and the base-index scan
+/// produce identical output, so the remaining difference between sealed and
+/// unsealed is speed, which is measured rather than asserted here.
+#[test]
+fn insert_then_index_keeps_annotations_readable() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "iann"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "iann",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:knows ex:b ~ ex:c1 {| ex:conf 0.5 |} .\n",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index", "iann"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "iann", "--format", "turtle"])
+        .assert()
+        .success()
+        // Full IRIs, not CURIEs: an inline `insert -e` does not persist the
+        // `@prefix` the way `create --from` does.
+        .stdout(predicate::str::contains(
+            "<http://example.org/knows> <http://example.org/b> \
+             ~ <http://example.org/c1>",
+        ))
+        .stdout(predicate::str::contains("<http://example.org/conf>"))
+        .stderr(predicate::str::contains("could not be resolved").not());
+}
+
+/// The remote reindex API does not carry the flag, so asking for it against
+/// a remote is refused rather than silently ignored — a repair that reports
+/// success without repairing anything is the worst of the three outcomes.
+#[test]
+fn rebuild_annotations_is_refused_against_a_remote() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "reindex",
+            "rb3",
+            "--rebuild-annotations",
+            "--force",
+            "--remote",
+            "origin",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("local-only repair"));
+}
+
+/// And with the acknowledgement it runs. `--force` is this CLI's existing
+/// confirmation idiom, the same flag `fluree drop` requires.
+#[test]
+fn rebuild_annotations_proceeds_once_acknowledged() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "rb2"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "rb2",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:knows ex:b ~ ex:c1 {| ex:conf 0.5 |} .\n",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["reindex", "rb2", "--rebuild-annotations", "--force"])
+        .assert()
+        .success();
+
+    // The ledger is still readable and the annotation survived.
+    fluree_cmd(&tmp)
+        .args(["export", "rb2", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/knows> <http://example.org/b> \
+             ~ <http://example.org/c1>",
+        ));
+}
+
+/// `--rebuild-annotations` discards unrecoverable history in one case the
+/// code cannot detect, so it refuses rather than warning after the fact —
+/// and refuses rather than prompting, because the people who need it are
+/// recovering a stuck ledger from a script.
+///
+/// The refusal has to name the *condition of safe use*, not only the hazard:
+/// a user who knows their arena was never sealed is the whole population this
+/// flag exists for.
+#[test]
+fn rebuild_annotations_refuses_without_the_confirmation_flag() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "rb"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["reindex", "rb", "--rebuild-annotations"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("retraction history is discarded"))
+        .stderr(predicate::str::contains(
+            "Safe when the arena was never sealed",
+        ))
+        .stderr(predicate::str::contains("--force"));
 }
 
 // ============================================================================

@@ -3858,6 +3858,45 @@ impl Fluree {
         ))
     }
 
+    /// Resolve attachment-event coverage for `ledger_id` from its loaded
+    /// ledger state, the way [`Fluree::reindex`] does.
+    ///
+    /// Exposed for callers that drive the indexer themselves rather than
+    /// going through `reindex` — chiefly `fluree index`. The provider
+    /// returned by [`Fluree::attachment_events_provider`] reads from a
+    /// running `LedgerManager`, so in a one-shot process it resolves
+    /// nothing; without a second chance the indexer receives no coverage,
+    /// seals no arena, and root assembly sets the sticky
+    /// `had_annotation_arena` bit regardless — which then blocks the
+    /// bootstrap that would have recovered it, permanently. That
+    /// asymmetry is why `reindex`-first seals and `index`-first does not.
+    ///
+    /// Returns `None` when the ledger state cannot be loaded; callers
+    /// should treat that as "no coverage resolved" and leave the arena
+    /// unsealed rather than guessing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn attachment_coverage_from_state(
+        &self,
+        ledger_id: &str,
+    ) -> Option<fluree_db_indexer::AttachmentEventCoverage> {
+        let state = match self.ledger(ledger_id).await {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    ledger_id,
+                    "attachment coverage: no loadable ledger state; \
+                     annotation arena will not be sealed this pass"
+                );
+                return None;
+            }
+        };
+        // `false`: `fluree index` resolves coverage for a ledger that has not
+        // been indexed yet, which needs no override. Rebuilding past the
+        // sticky bit is `reindex --rebuild-annotations`, and is acknowledged.
+        crate::indexer_attachment_provider::attachment_events_from_state(&state, false).await
+    }
+
     /// Per-instance cache for cross-ledger governance artifacts.
     ///
     /// Exposed so the resolver in `cross_ledger::resolver` can plug

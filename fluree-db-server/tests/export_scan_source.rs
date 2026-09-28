@@ -1,16 +1,18 @@
-//! The one omission counter that needs its own process.
+//! The third annotation source, which needs its own process to reach.
 //!
-//! `x-fluree-export-annotations-unresolved` goes non-zero when the export
-//! resolves annotations through the **base-index scan**, which is blind to
-//! annotations written inside a named graph. Selecting that source means
-//! setting `FLUREE_EXPORT_ANNOTATION_SCAN`, which is process-global while
-//! these assertions are per-test — so this is a standalone `[[test]]` target
-//! rather than a `grp_http` member, for the same reason `telemetry_test` is.
+//! Export can answer annotations from a sealed arena, from the novelty
+//! overlay, or from the **base-index scan**. Selecting the scan means setting
+//! `FLUREE_EXPORT_ANNOTATION_SCAN`, which is process-global while these
+//! assertions are per-test — so this is a standalone `[[test]]` target rather
+//! than a `grp_http` member, for the same reason `telemetry_test` is.
 //!
-//! This is also the only coverage the kill switch has, and it shows what the
-//! switch is for: the sources do *not* agree, and they disagree exactly on
-//! named-graph annotations. `export_omission_headers` holds the other half —
-//! the same fixture resolving cleanly through the arena and the overlay.
+//! The scan used to be the odd one out: it read named-graph bundles fine but
+//! the decoder rejected them, because the base-index reader does not put a
+//! graph on the rows it decodes and `EdgeKey::from_reifies_facts` read the
+//! resulting disagreement as a forged bundle (#1882). All three sources now
+//! agree, which is what the kill switch exists to let you check, and this is
+//! the wire-level guard on that. `export_omission_headers` holds the arena
+//! and overlay halves.
 
 use axum::body::Body;
 use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
@@ -143,7 +145,7 @@ fn header(headers: &http::HeaderMap, name: &str) -> Option<String> {
 }
 
 #[tokio::test]
-async fn the_base_index_scan_reports_the_annotation_it_cannot_see() {
+async fn the_base_index_scan_resolves_a_named_graph_annotation() {
     std::env::set_var("FLUREE_EXPORT_ANNOTATION_SCAN", "1");
 
     let (_tmp, state) = test_state().await;
@@ -167,18 +169,21 @@ async fn the_base_index_scan_reports_the_annotation_it_cannot_see() {
          reporting on an export that produced nothing: {body}"
     );
     assert!(
-        !body.contains("~ <http://example.org/cG>"),
-        "this is the source that cannot emit the marker: {body}"
+        body.contains("~ <http://example.org/cG>"),
+        "the scan must emit the marker, as the other two sources do: {body}"
+    );
+    assert!(
+        body.contains("<http://example.org/src> <http://example.org/d>"),
+        "and the reifier's own description must be in scope: {body}"
     );
     assert_eq!(
-        header(&headers, UNRESOLVED).as_deref(),
-        Some("1"),
-        "the annotation the scan could not see must be reported; headers: {headers:?}"
+        header(&headers, UNRESOLVED),
+        None,
+        "nothing is dropped, so nothing to report; headers: {headers:?}"
     );
 
-    // `raw_reifies` is the remedy the header's docs name. Over HTTP it is a
-    // request field; with it the bundle comes out verbatim, so there is
-    // nothing dropped left to report.
+    // `raw_reifies` still emits the bundle verbatim for consumers pinned to
+    // pre-4.2 bytes, and still reports nothing.
     let (status, headers, body) = export(
         &app,
         "scan:main",
