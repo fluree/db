@@ -244,12 +244,6 @@ pub enum FenceOutcome {
     Frozen,
 }
 
-fn unsupported<T>(what: &str) -> Result<T> {
-    Err(NameServiceError::storage(format!(
-        "{what} is not supported by this nameservice backend"
-    )))
-}
-
 /// Storage for name bindings and the dropped-ledger registry.
 ///
 /// Each method reads or compare-and-swaps one item, which every backend can
@@ -263,44 +257,28 @@ fn unsupported<T>(what: &str) -> Result<T> {
 /// reused the name.
 #[async_trait]
 pub trait LedgerRegistry: Debug + Send + Sync {
-    async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
-        let _ = name;
-        unsupported("reading name bindings")
-    }
+    async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>>;
 
     async fn cas_binding(
         &self,
         name: &str,
         expected: Option<u64>,
         new: Option<&NameBinding>,
-    ) -> Result<RegistryCas<NameBinding>> {
-        let _ = (name, expected, new);
-        unsupported("writing name bindings")
-    }
+    ) -> Result<RegistryCas<NameBinding>>;
 
     /// Every binding, with its name.
-    async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
-        unsupported("listing name bindings")
-    }
+    async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>>;
 
-    async fn get_dropped(&self, instance: &InstanceId) -> Result<Option<Versioned<DroppedLedger>>> {
-        let _ = instance;
-        unsupported("reading the dropped-ledger registry")
-    }
+    async fn get_dropped(&self, instance: &InstanceId) -> Result<Option<Versioned<DroppedLedger>>>;
 
     async fn cas_dropped(
         &self,
         instance: &InstanceId,
         expected: Option<u64>,
         new: Option<&DroppedLedger>,
-    ) -> Result<RegistryCas<DroppedLedger>> {
-        let _ = (instance, expected, new);
-        unsupported("writing the dropped-ledger registry")
-    }
+    ) -> Result<RegistryCas<DroppedLedger>>;
 
-    async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
-        unsupported("listing the dropped-ledger registry")
-    }
+    async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>>;
 }
 
 /// Branch-record writes the lifecycle protocols make. Every write that
@@ -309,44 +287,27 @@ pub trait LedgerRegistry: Debug + Send + Sync {
 #[async_trait]
 pub trait BranchRecordStore: Debug + Send + Sync {
     /// The record at `ledger_id` as stored, live or not.
-    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        let _ = ledger_id;
-        unsupported("reading raw branch records")
-    }
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>>;
 
     /// Every record as stored, live or not, under any binding or none.
-    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
-        unsupported("listing raw branch records")
-    }
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>>;
 
     /// Insert `record`, which carries its fence, if no record exists at its
     /// key. Returns `None` when inserted, or the record already there.
-    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
-        let _ = record;
-        unsupported("inserting branch records")
-    }
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>>;
 
     /// Give a record from before fencing its first fence. Returns
     /// [`FenceOutcome::Applied`] when the record carries `fence` afterwards,
     /// including when it already did, and [`FenceOutcome::Mismatch`] when it
     /// carries another.
-    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let _ = (ledger_id, fence);
-        unsupported("fencing branch records")
-    }
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome>;
 
     /// Mark the record frozen, if it carries `fence`.
-    async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let _ = (ledger_id, fence);
-        unsupported("freezing branch records")
-    }
+    async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome>;
 
     /// Delete the record and everything stored with it, if it carries
     /// `fence`.
-    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let _ = (ledger_id, fence);
-        unsupported("deleting branch records")
-    }
+    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome>;
 
     /// Add `delta` to the record's child-branch count, if it carries `fence`.
     /// A frozen record gains no children: a positive `delta` returns
@@ -357,10 +318,7 @@ pub trait BranchRecordStore: Debug + Send + Sync {
         ledger_id: &str,
         fence: Fence,
         delta: i32,
-    ) -> Result<FenceOutcome> {
-        let _ = (ledger_id, fence, delta);
-        unsupported("adjusting branch child counts")
-    }
+    ) -> Result<FenceOutcome>;
 }
 
 /// The live form of a branch record under `binding`, or `None` when the

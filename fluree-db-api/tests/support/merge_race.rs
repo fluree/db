@@ -316,8 +316,20 @@ impl fluree_db_nameservice::BranchRecordStore for PausingNameService {
         self.inner.raw_record(ledger_id).await
     }
 
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        self.inner.all_raw_records().await
+    }
+
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
         self.inner.insert_record(record).await
+    }
+
+    async fn adopt_record(
+        &self,
+        ledger_id: &str,
+        fence: fluree_db_nameservice::Fence,
+    ) -> Result<fluree_db_nameservice::FenceOutcome> {
+        self.inner.adopt_record(ledger_id, fence).await
     }
 
     async fn freeze_record(
