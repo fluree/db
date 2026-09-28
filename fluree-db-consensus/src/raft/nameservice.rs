@@ -1632,7 +1632,6 @@ fn fence_outcome_from_response(response: SmResponse) -> Result<FenceOutcome> {
         | SmResponse::BranchDeleted { .. } => Ok(FenceOutcome::Applied),
         SmResponse::FenceMissing => Ok(FenceOutcome::Missing),
         SmResponse::FenceMismatch => Ok(FenceOutcome::Mismatch),
-        SmResponse::FenceFrozen => Ok(FenceOutcome::Frozen),
         other => Err(NameServiceError::storage(format!(
             "unexpected fenced-branch response: {other:?}"
         ))),
@@ -1784,20 +1783,6 @@ impl BranchRecordStore for RaftNameService {
             key: ref_key_of(ledger_id)?,
             fence: fence.as_u64(),
             applied_at_millis: crate::raft::current_millis(),
-        };
-        fence_outcome_from_response(self.submit_lifecycle(cmd).await?)
-    }
-
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: Fence,
-        delta: i32,
-    ) -> Result<FenceOutcome> {
-        let cmd = SmCommand::AdjustChildren {
-            key: ref_key_of(ledger_id)?,
-            fence: fence.as_u64(),
-            delta,
         };
         fence_outcome_from_response(self.submit_lifecycle(cmd).await?)
     }

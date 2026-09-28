@@ -875,16 +875,6 @@ impl BranchRecordStore for FileNameService {
         let (main, _) = Self::record_keys(ledger_id)?;
         ns_cas::delete_record(&self.storage, &main, fence).await
     }
-
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: Fence,
-        delta: i32,
-    ) -> Result<FenceOutcome> {
-        let (main, _) = Self::record_keys(ledger_id)?;
-        ns_cas::adjust_children(&self.storage, &main, fence, delta).await
-    }
 }
 
 #[async_trait]

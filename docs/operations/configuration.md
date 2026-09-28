@@ -483,7 +483,8 @@ reindex_min_bytes = 100            # ≈ every commit — soft trigger
 The indexer's catch-up tick queues ledgers whose indexing has stalled, collects old index versions, and finishes lifecycle operations a crash interrupted:
 
 - a drop, restore or purge that has not moved since the previous tick is resumed, and completes as if it had not been interrupted;
-- a create, import or archive restore that stopped is rolled back: its name is freed and what it wrote is deleted. One that is still running renews its claim on the name every minute, so a create is rolled back only once its claim has gone unrenewed for ten minutes, counted from when this node first saw it. A worker of that create still writing when it is rolled back can leave files behind; only the orphan sweep reclaims them.
+- a create, import or archive restore that stopped is rolled back: its name is freed and what it wrote is deleted. One that is still running renews its claim on the name every minute, so a create is rolled back only once its claim has gone unrenewed for ten minutes, counted from when this node first saw it. A worker of that create still writing when it is rolled back can leave files behind; only the orphan sweep reclaims them;
+- a branch create that stopped before confirming the branch is rolled back ten minutes after this node first saw it, which frees a dropped branch it was created from.
 
 Only the node that owns catch-up runs the tick: never a peer, and under Raft only the leader. It runs only where background indexing is enabled.
 

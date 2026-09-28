@@ -10,7 +10,8 @@
 //! A create is rolled back instead, and only once its claim on the name has
 //! not moved for [`ABANDONED_CREATE_AFTER`]: an import holds its create open
 //! for as long as it runs, renewing the claim every minute. The rollback frees
-//! the name and deletes whatever the create wrote.
+//! the name and deletes whatever the create wrote. A branch create that has
+//! not confirmed its listing for as long is rolled back the same way.
 //!
 //! With an interval set, it also runs the orphan sweep.
 
@@ -36,6 +37,11 @@ enum Unfinished {
         branch: String,
         fence: Fence,
     },
+    BranchCreate {
+        name: String,
+        branch: String,
+        fence: Fence,
+    },
 }
 
 /// How long a create's claim on its name must stay unchanged before the
@@ -50,6 +56,7 @@ pub struct HousekeepingOptions {
     /// after housekeeping starts; `None` never runs it.
     pub orphan_sweep_interval: Option<Duration>,
     /// Roll back a create whose claim on its name has stayed unchanged this
+    /// long, and a branch create that has left its listing unconfirmed this
     /// long, timed by this process.
     pub abandoned_create_after: Duration,
 }
@@ -106,7 +113,7 @@ impl Housekeeping for LifecycleHousekeeping {
                     if seen.since == now {
                         continue;
                     }
-                    if matches!(op, Unfinished::Create(_))
+                    if matches!(op, Unfinished::Create(_) | Unfinished::BranchCreate { .. })
                         && seen.since.elapsed() < self.options.abandoned_create_after
                     {
                         continue;
@@ -163,14 +170,27 @@ async fn observe(fluree: &Fluree) -> crate::Result<HashMap<Unfinished, u64>> {
             BindingState::Restoring => {}
             BindingState::Active => {
                 let ledger = LedgerName::parse(&name)?;
+                // The listing's fence names the attempt, and nothing moves
+                // while it is stuck: it is timed from when it was first seen.
+                for listing in binding.value.branches.iter().filter(|b| b.creating) {
+                    observed.insert(
+                        Unfinished::BranchCreate {
+                            name: name.clone(),
+                            branch: listing.branch.clone(),
+                            fence: listing.fence,
+                        },
+                        0,
+                    );
+                }
                 for listing in binding.value.branches.iter().filter(|b| b.dropped) {
                     // A dropped branch with children keeps its data until they
                     // go. One without was stopped before its storage was
                     // deleted.
-                    let childless = store
-                        .raw_record(&ledger.with_branch(&listing.branch)?)
-                        .await?
-                        .is_some_and(|r| r.fence == Some(listing.fence) && r.branches == 0);
+                    let childless = binding.value.children_of(&listing.branch).next().is_none()
+                        && store
+                            .raw_record(&ledger.with_branch(&listing.branch)?)
+                            .await?
+                            .is_some_and(|r| r.fence == Some(listing.fence));
                     if childless {
                         observed.insert(
                             Unfinished::BranchDrop {
@@ -216,6 +236,11 @@ async fn resume(fluree: &Fluree, op: &Unfinished, version: u64) {
             branch,
             fence,
         } => resume_branch_drop(fluree, name, branch, *fence).await,
+        Unfinished::BranchCreate {
+            name,
+            branch,
+            fence,
+        } => rollback_branch_create(fluree, name, branch, *fence).await,
     };
     match outcome {
         Ok(()) => {}
@@ -283,10 +308,25 @@ async fn resume_branch_drop(
     Ok(())
 }
 
+/// Unlist a branch whose create stopped before confirming it, then delete
+/// its record. A create writes no data of its own before it confirms.
+async fn rollback_branch_create(
+    fluree: &Fluree,
+    name: &str,
+    branch: &str,
+    fence: Fence,
+) -> crate::Result<()> {
+    let name = LedgerName::parse(name)?;
+    if lifecycle::rollback_branch_create(fluree.publisher()?, &name, branch, fence).await? {
+        info!(ledger = %name, %branch, "rolled back a branch create that did not finish");
+    }
+    Ok(())
+}
+
 impl Fluree {
     /// Housekeeping for [`IndexerHandle::set_housekeeping`](fluree_db_indexer::IndexerHandle::set_housekeeping):
     /// finishes the drops, restores and purges a crash interrupted, rolls
-    /// back creates that stopped, and, given an interval, runs
+    /// back creates and branch creates that stopped, and, given an interval, runs
     /// [`sweep_orphan_instances`](Self::sweep_orphan_instances) at most that
     /// often, the first time one interval after it starts.
     ///

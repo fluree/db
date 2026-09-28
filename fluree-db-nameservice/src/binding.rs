@@ -128,6 +128,15 @@ fn without_keys_of<T: Serialize>(mut extra: ExtraFields, state: &T) -> ExtraFiel
 pub struct BranchFence {
     pub branch: String,
     pub fence: Fence,
+    /// The branch it was created from, whose data its history reaches into.
+    /// A branch keeps its data while any listing names it here, which the
+    /// binding decides in the same write that lists or unlists a child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// A create listed the branch and has not confirmed it. It reads as
+    /// absent; a create that never confirms is rolled back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub creating: bool,
     /// The branch has been dropped: it reads as absent and its record is
     /// frozen. It stays listed while child branches keep its data, or until
     /// its storage is deleted, so its name cannot be reused before then.
@@ -142,8 +151,19 @@ impl BranchFence {
         Self {
             branch: branch.into(),
             fence,
+            source: None,
+            creating: false,
             dropped: false,
             extra: ExtraFields::new(),
+        }
+    }
+
+    /// A listing for `record`, a branch created from its `source_branch`,
+    /// under `fence`.
+    pub fn for_record(record: &NsRecord, fence: Fence) -> Self {
+        Self {
+            source: record.source_branch.clone(),
+            ..Self::new(&record.branch, fence)
         }
     }
 }
@@ -199,6 +219,23 @@ impl NameBinding {
 
     pub fn is_active(&self) -> bool {
         self.state == BindingState::Active
+    }
+
+    /// Whether readers see `branch`: the ledger is active and the branch is
+    /// listed, neither dropped nor still being created.
+    pub fn shows(&self, branch: &str) -> bool {
+        self.is_active()
+            && self
+                .listing(branch)
+                .is_some_and(|l| !l.dropped && !l.creating)
+    }
+
+    /// The listings created from `branch`, including those dropped or still
+    /// being created: each keeps `branch`'s data.
+    pub fn children_of<'a>(&'a self, branch: &'a str) -> impl Iterator<Item = &'a BranchFence> {
+        self.branches
+            .iter()
+            .filter(move |b| b.source.as_deref() == Some(branch))
     }
 }
 
@@ -317,8 +354,6 @@ pub enum FenceOutcome {
     Missing,
     /// The record carries a different fence (or none).
     Mismatch,
-    /// The record is frozen and refuses the change.
-    Frozen,
 }
 
 /// Storage for name bindings and the dropped-ledger registry.
@@ -385,17 +420,6 @@ pub trait BranchRecordStore: Debug + Send + Sync {
     /// Delete the record and everything stored with it, if it carries
     /// `fence`.
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome>;
-
-    /// Add `delta` to the record's child-branch count, if it carries `fence`.
-    /// A frozen record gains no children: a positive `delta` returns
-    /// [`FenceOutcome::Frozen`], so a branch being dropped cannot acquire a
-    /// child after its drop has read the count.
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: Fence,
-        delta: i32,
-    ) -> Result<FenceOutcome>;
 }
 
 /// The live form of a branch record under `binding`, or `None` when the
@@ -406,12 +430,16 @@ pub trait BranchRecordStore: Debug + Send + Sync {
 /// still listed reads as retracted.
 pub fn resolve_record(binding: Option<&NameBinding>, mut record: NsRecord) -> Option<NsRecord> {
     let binding = binding.filter(|b| b.is_active())?;
-    let listing = binding.listing(&record.branch)?;
+    let listing = binding.listing(&record.branch).filter(|l| !l.creating)?;
     if record.fence != Some(listing.fence) {
         return None;
     }
     record.storage_root = Some(binding.root.clone());
     record.retracted |= listing.dropped;
+    record.branches = binding
+        .children_of(&record.branch)
+        .filter(|c| !c.creating)
+        .count() as u32;
     Some(record)
 }
 

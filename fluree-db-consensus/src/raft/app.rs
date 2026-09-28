@@ -621,16 +621,12 @@ fn state_binding(state: &NameServiceState, name: &str) -> Option<NameBinding> {
         .ok()
 }
 
-/// Whether `binding` shows `branch` to readers.
-fn shows(binding: &NameBinding, branch: &str) -> bool {
-    binding.is_active() && binding.listing(branch).is_some_and(|l| !l.dropped)
-}
-
 /// [`NameServiceEvent::LedgerCreated`] for each branch a command made
 /// visible. A binding written active announces every branch it shows that
 /// has a record: the state holds no copy of the binding it replaced, so
-/// branches it already showed are announced again. A record registered
-/// under a binding that already shows its branch, as a new branch's is,
+/// branches it already showed are announced again; a new branch is
+/// announced by the write that confirms its create. A record registered
+/// under a binding that already shows its branch, as a mirrored copy's is,
 /// announces that branch.
 fn created_events(
     cmd: &Command,
@@ -658,7 +654,7 @@ fn created_events(
             binding
                 .branches
                 .iter()
-                .filter(|l| shows(&binding, &l.branch))
+                .filter(|l| binding.shows(&l.branch))
                 .filter(|l| {
                     state
                         .fences
@@ -671,7 +667,7 @@ fn created_events(
         (Command::InsertBranchRecord(record), Response::BranchRecordInserted) => {
             let key = &record.key;
             state_binding(state, &key.ledger_name)
-                .filter(|b| shows(b, &key.branch))
+                .filter(|b| b.shows(&key.branch))
                 .filter(|b| b.fence_of(&key.branch).map(Fence::as_u64) == record.fence)
                 .and_then(|b| created(&b, &key.ledger_name, &key.branch))
                 .into_iter()

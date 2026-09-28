@@ -589,18 +589,6 @@ impl crate::BranchRecordStore for CompositeNameService {
         }
         self.local.delete_record(ledger_id, fence).await
     }
-
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: crate::Fence,
-        delta: i32,
-    ) -> Result<crate::FenceOutcome> {
-        if let Some(err) = self.reject_mounted_write(ledger_id) {
-            return Err(err);
-        }
-        self.local.adjust_children(ledger_id, fence, delta).await
-    }
 }
 
 #[cfg(test)]

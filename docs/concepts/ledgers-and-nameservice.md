@@ -551,10 +551,12 @@ is the root on most ledgers, but the refusal is structural: a ledger created
 as `mydb:trunk` has `trunk` as its root, and `drop_branch("mydb", "trunk")`
 will be refused. Conversely, a non-root branch named `"main"` is droppable.
 
-Branches use **reference counting** (`branches` field on `NsRecord`) to track child branches. This enables safe deletion:
+A ledger's name binding lists each of its branches with the branch it was created from. A branch's child count (the `branches` field on its `NsRecord`) is the number of branches listed from it, and it decides what a drop does:
 
-- **Leaf branch** (no children, `branches == 0`): Fully dropped — storage artifacts are deleted, the NsRecord is purged, and the parent's child count is decremented. If the parent was previously retracted and its count reaches 0, it is cascade-dropped.
+- **Leaf branch** (no children, `branches == 0`): Fully dropped — storage artifacts are deleted, the NsRecord is purged, and the branch is unlisted, which takes it off its parent's count. If the parent was previously retracted and its count reaches 0, it is cascade-dropped.
 - **Branch with children** (`branches > 0`): Retracted (hidden from listings, transactions rejected) but storage is preserved so children can still read parent data via `BranchedContentStore` fallback. When the last child is dropped and the count reaches 0, the retracted branch is automatically cascade-purged.
+
+A branch create lists the branch before it writes the branch's record, and confirms the listing after. A create that stops in between leaves a branch that reads as absent: creating the branch again takes it over, and [periodic maintenance](../operations/configuration.md#periodic-maintenance) rolls it back. Until then it holds its source's data, as a child would.
 
 **Rust API:**
 ```rust

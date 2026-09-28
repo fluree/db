@@ -865,16 +865,6 @@ where
         let (name, branch) = split_ledger_id(ledger_id)?;
         ns_cas::delete_record(&self.storage, &self.ns_key(&name, &branch), fence).await
     }
-
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: Fence,
-        delta: i32,
-    ) -> Result<FenceOutcome> {
-        let (name, branch) = split_ledger_id(ledger_id)?;
-        ns_cas::adjust_children(&self.storage, &self.ns_key(&name, &branch), fence, delta).await
-    }
 }
 
 #[async_trait]

@@ -275,6 +275,14 @@ async fn active_binding<S: LifecycleStore + ?Sized>(
 
 /// Create `new_branch` from `source_branch`, starting at `at_commit` or at
 /// the source's current head. Returns the new branch's record.
+///
+/// The branch is listed as being created, naming its source, then its
+/// record inserted, then the listing confirmed. Listing it in the same write
+/// that checks the source is live means a source dropped since cannot gain
+/// the child, and a source keeps its data while any listing names it. A
+/// create that stops before confirming reads as absent; creating the branch
+/// again takes it over, and the maintenance scan rolls it back
+/// ([`rollback_branch_create`]).
 pub async fn create_branch<S: LifecycleStore + ?Sized>(
     store: &S,
     name: &LedgerName,
@@ -285,6 +293,7 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
     let new_id = name.with_branch(new_branch)?;
     let source_id = name.with_branch(source_branch)?;
 
+    let mut listed = None;
     for _ in 0..MAX_ATTEMPTS {
         let Versioned {
             value: binding,
@@ -292,7 +301,7 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
         } = active_binding(store, name).await?;
         let source_fence = binding
             .listing(source_branch)
-            .filter(|b| !b.dropped)
+            .filter(|_| binding.shows(source_branch))
             .ok_or_else(|| NameServiceError::not_found(source_id.to_string()))?
             .fence;
         let source = store
@@ -301,45 +310,133 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
             .filter(|r| r.fence == Some(source_fence))
             .ok_or_else(|| NameServiceError::not_found(source_id.to_string()))?;
 
-        // A listed branch whose record is missing is a create that did not
-        // finish; its listing is replaced with a fresh fence, which turns any
-        // record it later inserts into garbage.
-        if let Some(listed) = binding.fence_of(new_branch) {
+        // A confirmed listing whose record is missing is a create from before
+        // creates were confirmed that did not finish; one being created is a
+        // create under way or stopped. Either is replaced with a fresh fence,
+        // which turns any record it later inserts into garbage.
+        if let Some(existing) = binding.listing(new_branch).filter(|l| !l.creating) {
             let has_record = store
                 .raw_record(&new_id)
                 .await?
-                .is_some_and(|r| r.fence == Some(listed));
+                .is_some_and(|r| r.fence == Some(existing.fence));
             if has_record {
                 return Err(NameServiceError::ledger_already_exists(new_id.to_string()));
             }
         }
 
-        let fence = Fence::generate();
+        let listing = BranchFence {
+            source: Some(source_branch.to_string()),
+            creating: true,
+            ..BranchFence::new(new_branch, Fence::generate())
+        };
         let mut next = binding.clone();
         next.branches.retain(|b| b.branch != new_branch);
-        next.branches.push(BranchFence::new(new_branch, fence));
-        match store.cas_binding(name, Some(version), Some(&next)).await? {
-            RegistryCas::Updated { .. } => {}
-            RegistryCas::Conflict { .. } => continue,
+        next.branches.push(listing.clone());
+        if let RegistryCas::Updated { .. } =
+            store.cas_binding(name, Some(version), Some(&next)).await?
+        {
+            listed = Some((listing.fence, source, binding.root));
+            break;
         }
+    }
+    let (fence, source, root) = listed.ok_or_else(|| contended(name))?;
 
-        // The parent's count goes up before the child exists: a crash in
-        // between leaves the parent undroppable rather than droppable under
-        // a live child. A parent frozen since it was read refuses.
-        if store.adjust_children(&source_id, source_fence, 1).await? != FenceOutcome::Applied {
-            return Err(NameServiceError::not_found(source_id.to_string()));
+    let mut record = NsRecord::new(new_id.clone());
+    record.fence = Some(fence);
+    record.source_branch = Some(source_branch.to_string());
+    (record.commit_head_id, record.commit_t) = match at_commit {
+        Some((id, t)) => (Some(id), t),
+        None => (source.commit_head_id.clone(), source.commit_t),
+    };
+    let confirmed = match insert_fenced(store, &record).await {
+        Ok(()) => confirm_branch(store, name, new_branch, fence).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = confirmed {
+        if let Err(undo) = rollback_branch_create(store, name, new_branch, fence).await {
+            tracing::warn!(ledger_id = %new_id, error = %undo, "could not roll back a failed branch create");
         }
+        return Err(e);
+    }
+    record.storage_root = Some(root);
+    Ok(record)
+}
 
-        let mut record = NsRecord::new(new_id.clone());
-        record.fence = Some(fence);
-        record.source_branch = Some(source_branch.to_string());
-        (record.commit_head_id, record.commit_t) = match at_commit {
-            Some((id, t)) => (Some(id), t),
-            None => (source.commit_head_id.clone(), source.commit_t),
+/// Confirm the listing a create of `branch` under `fence` made, once its
+/// record is in. Fails when the listing is gone or replaced: the create was
+/// rolled back or taken over, and its record is garbage.
+async fn confirm_branch<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    branch: &str,
+    fence: Fence,
+) -> Result<()> {
+    for _ in 0..MAX_ATTEMPTS {
+        let current = store.get_binding(name).await?;
+        let Some(Versioned {
+            value: binding,
+            version,
+        }) = current.filter(|v| v.value.is_active() && v.value.fence_of(branch) == Some(fence))
+        else {
+            return Err(NameServiceError::conflict(format!(
+                "the create of '{name}:{branch}' was rolled back or taken over before it finished"
+            )));
         };
-        insert_fenced(store, &record).await?;
-        record.storage_root = Some(binding.root.clone());
-        return Ok(record);
+        let mut next = binding;
+        for b in &mut next.branches {
+            if b.branch == branch {
+                if !b.creating {
+                    return Ok(());
+                }
+                b.creating = false;
+            }
+        }
+        if let RegistryCas::Updated { .. } =
+            store.cas_binding(name, Some(version), Some(&next)).await?
+        {
+            return Ok(());
+        }
+    }
+    Err(contended(name))
+}
+
+/// Roll back a create of `branch` under `fence` that did not confirm its
+/// listing: unlist the branch, then delete its record. Unlisting first means
+/// a creator that was only paused fails to confirm and stops. A record left
+/// under a fence no longer listed is deleted too: it is garbage. Returns
+/// `false`, changing nothing, when the create was confirmed.
+pub async fn rollback_branch_create<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    branch: &str,
+    fence: Fence,
+) -> Result<bool> {
+    let id = name.with_branch(branch)?;
+    for _ in 0..MAX_ATTEMPTS {
+        let current = store.get_binding(name).await?;
+        let creating = match current
+            .as_ref()
+            .and_then(|v| v.value.listing(branch))
+            .filter(|l| l.fence == fence)
+        {
+            Some(l) if !l.creating => return Ok(false),
+            listed => listed.is_some(),
+        };
+        // Only an active ledger's listings change here; a drop copies no
+        // branch still being created, and deletes the record itself.
+        if let Some(Versioned { value, version }) =
+            current.filter(|v| creating && v.value.is_active())
+        {
+            let mut next = value;
+            next.branches.retain(|b| b.branch != branch);
+            if let RegistryCas::Conflict { .. } =
+                store.cas_binding(name, Some(version), Some(&next)).await?
+            {
+                continue;
+            }
+        }
+        store.delete_record(id.as_ref(), fence).await?;
+        return Ok(true);
     }
     Err(contended(name))
 }
@@ -405,7 +502,7 @@ pub async fn mirror_record<S: LifecycleStore + ?Sized>(
         next.branches.retain(|b| b.branch != record.branch);
         next.branches.push(BranchFence {
             dropped: record.retracted,
-            ..BranchFence::new(&record.branch, branch_fence)
+            ..BranchFence::for_record(record, branch_fence)
         });
         if let RegistryCas::Updated { .. } = store.cas_binding(&name, expected, Some(&next)).await?
         {
@@ -523,12 +620,16 @@ async fn drop_branch_from<S: LifecycleStore + ?Sized>(
                 "'{branch}' is the root branch of '{name}'; drop the ledger instead"
             )));
         }
-        let listing = binding.listing(branch).ok_or_else(not_found)?.clone();
+        let listing = binding
+            .listing(branch)
+            .filter(|l| !l.creating)
+            .ok_or_else(not_found)?
+            .clone();
         if resume.is_some_and(|fence| !listing.dropped || listing.fence != fence) {
             return Ok(None);
         }
         if listing.dropped {
-            marked = Some((binding.root, listing.fence, true));
+            marked = Some((binding, listing.fence, true));
             break;
         }
         let mut next = binding;
@@ -538,33 +639,35 @@ async fn drop_branch_from<S: LifecycleStore + ?Sized>(
         if let RegistryCas::Updated { .. } =
             store.cas_binding(name, Some(version), Some(&next)).await?
         {
-            marked = Some((next.root, listing.fence, false));
+            marked = Some((next, listing.fence, false));
             break;
         }
     }
-    let (root, fence, already) = marked.ok_or_else(|| contended(name))?;
+    // Once the branch is marked dropped no create lists a child of it, so
+    // the children this binding lists can only go.
+    let (binding, fence, already) = marked.ok_or_else(|| contended(name))?;
 
     if store.freeze_record(&id, fence).await? != FenceOutcome::Applied {
         return Err(not_found());
     }
-    // Read after freezing: from here the count can only fall.
+    if binding.children_of(branch).next().is_some() {
+        return Ok(Some(BranchDrop::Deferred { already }));
+    }
     let mut record = store
         .raw_record(&id)
         .await?
         .filter(|r| r.fence == Some(fence))
         .ok_or_else(not_found)?;
-    if record.branches > 0 {
-        return Ok(Some(BranchDrop::Deferred { already }));
-    }
-    record.storage_root = Some(root);
+    record.storage_root = Some(binding.root);
     Ok(Some(BranchDrop::Purge(Box::new(record))))
 }
 
 /// Forget a dropped branch once its storage is gone: take it out of the
-/// binding, delete its record, and take it off its parent's child count.
+/// binding, then delete its record.
 ///
 /// Returns the parent's record when the parent is itself a dropped branch
-/// that this left with no children, for the caller to purge in turn.
+/// that no listing names as its source any more, for the caller to purge in
+/// turn.
 pub async fn finish_drop_branch<S: LifecycleStore + ?Sized>(
     store: &S,
     name: &LedgerName,
@@ -573,60 +676,49 @@ pub async fn finish_drop_branch<S: LifecycleStore + ?Sized>(
     let fence = record.fence.ok_or_else(|| {
         NameServiceError::storage(format!("{} carries no fence", record.ledger_id))
     })?;
-    let mut parent_fence = None;
-    let mut unlisted = false;
+    let mut unlisted = None;
     for _ in 0..MAX_ATTEMPTS {
         let Versioned {
             value: binding,
             version,
         } = active_binding(store, name).await?;
-        // An earlier attempt got further. If it stopped before the parent's
-        // count, the count stays high, which only keeps the parent's data
-        // longer.
+        // An earlier attempt got as far as unlisting it.
         if binding.fence_of(&record.branch) != Some(fence) {
-            return Ok(None);
+            unlisted = Some(binding);
+            break;
         }
-        parent_fence = record
-            .source_branch
-            .as_deref()
-            .and_then(|p| binding.fence_of(p));
         let mut next = binding;
         next.branches.retain(|b| b.branch != record.branch);
         if let RegistryCas::Updated { .. } =
             store.cas_binding(name, Some(version), Some(&next)).await?
         {
-            unlisted = true;
+            unlisted = Some(next);
             break;
         }
     }
-    if !unlisted {
-        return Err(contended(name));
-    }
+    let binding = unlisted.ok_or_else(|| contended(name))?;
     store.delete_record(&record.ledger_id, fence).await?;
 
-    let (Some(parent), Some(parent_fence)) = (record.source_branch.as_deref(), parent_fence) else {
+    // A dropped parent gains no children, so once none is listed it stays so.
+    let Some(parent) = record.source_branch.as_deref() else {
         return Ok(None);
     };
-    let parent_id = name.with_branch(parent)?;
-    if store.adjust_children(&parent_id, parent_fence, -1).await? != FenceOutcome::Applied {
-        return Ok(None);
-    }
-    let Ok(binding) = active_binding(store, name).await else {
-        return Ok(None);
-    };
-    if !binding
-        .value
+    let Some(parent_fence) = binding
         .listing(parent)
-        .is_some_and(|b| b.dropped && b.fence == parent_fence)
-    {
+        .filter(|b| b.dropped)
+        .map(|b| b.fence)
+    else {
+        return Ok(None);
+    };
+    if binding.children_of(parent).next().is_some() {
         return Ok(None);
     }
     Ok(store
-        .raw_record(&parent_id)
+        .raw_record(&name.with_branch(parent)?)
         .await?
-        .filter(|r| r.fence == Some(parent_fence) && r.branches == 0)
+        .filter(|r| r.fence == Some(parent_fence))
         .map(|mut r| {
-            r.storage_root = Some(binding.value.root);
+            r.storage_root = Some(binding.root);
             r
         }))
 }
@@ -721,9 +813,11 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
         unreachable!("claimed binding is dropping");
     };
 
-    // 2. Freeze every listed branch, and copy its record.
+    // 2. Freeze every listed branch, and copy its record. A branch still
+    // being created is not copied: its creator was not told it succeeded,
+    // and fails to confirm it. Step 4 deletes its record.
     let mut records = Vec::with_capacity(binding.branches.len());
-    for b in &binding.branches {
+    for b in binding.branches.iter().filter(|b| !b.creating) {
         let id = name.with_branch(&b.branch)?;
         if store.freeze_record(&id, b.fence).await? == FenceOutcome::Applied {
             if let Some(mut record) = store
@@ -843,7 +937,7 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
                 .iter()
                 .map(|r| BranchFence {
                     dropped: r.retracted,
-                    ..BranchFence::new(&r.branch, Fence::generate())
+                    ..BranchFence::for_record(r, Fence::generate())
                 })
                 .collect();
             let restoring = DroppedLedger {
@@ -1130,7 +1224,7 @@ async fn bind_legacy<S: LifecycleStore + ?Sized>(
         }
         branches.push(BranchFence {
             dropped: record.retracted,
-            ..BranchFence::new(&record.branch, fence)
+            ..BranchFence::for_record(record, fence)
         });
     }
     branches.sort_by(|a, b| a.branch.cmp(&b.branch));

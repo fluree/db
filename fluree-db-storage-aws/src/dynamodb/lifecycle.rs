@@ -775,46 +775,4 @@ impl BranchRecordStore for DynamoDbNameService {
             Err(e) => Err(storage_err("DeleteItem", e)),
         }
     }
-
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: Fence,
-        delta: i32,
-    ) -> Result<FenceOutcome> {
-        let pk = Self::normalize(ledger_id)?;
-        if self.meta_fence(&pk).await?.is_none() {
-            return Ok(FenceOutcome::Missing);
-        }
-        let mut values = vec![
-            (":zero", AttributeValue::N("0".to_string())),
-            (":delta", AttributeValue::N(delta.to_string())),
-        ];
-        let not_frozen = (delta > 0).then(|| {
-            values.push((":frozen", AttributeValue::Bool(true)));
-            "attribute_not_exists(#frozen) OR #frozen <> :frozen"
-        });
-        let applied = self
-            .update_item_conditioned(
-                &pk,
-                SK_META,
-                fence,
-                not_frozen,
-                "SET #branches = if_not_exists(#branches, :zero) + :delta",
-                &values,
-            )
-            .await?;
-        if applied {
-            return Ok(FenceOutcome::Applied);
-        }
-        let frozen = not_frozen.is_some()
-            && self.get_item(&pk, SK_META).await?.is_some_and(|meta| {
-                meta.get(ATTR_FROZEN).and_then(|v| v.as_bool().ok()) == Some(&true)
-            });
-        Ok(if frozen {
-            FenceOutcome::Frozen
-        } else {
-            FenceOutcome::Mismatch
-        })
-    }
 }

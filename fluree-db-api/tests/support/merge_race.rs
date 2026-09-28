@@ -347,13 +347,4 @@ impl fluree_db_nameservice::BranchRecordStore for PausingNameService {
     ) -> Result<fluree_db_nameservice::FenceOutcome> {
         self.inner.delete_record(ledger_id, fence).await
     }
-
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: fluree_db_nameservice::Fence,
-        delta: i32,
-    ) -> Result<fluree_db_nameservice::FenceOutcome> {
-        self.inner.adjust_children(ledger_id, fence, delta).await
-    }
 }

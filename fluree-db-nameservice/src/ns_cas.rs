@@ -370,26 +370,6 @@ where
     .await
 }
 
-/// Add `delta` to the record's child-branch count, if it carries `fence`.
-pub(crate) async fn adjust_children<S>(
-    storage: &S,
-    main_key: &str,
-    fence: Fence,
-    delta: i32,
-) -> Result<FenceOutcome>
-where
-    S: StorageCas + ?Sized,
-{
-    update_fenced(storage, main_key, fence, |file| {
-        if delta > 0 && file.status == STATUS_FROZEN {
-            return Err(FenceOutcome::Frozen);
-        }
-        file.branches = file.branches.saturating_add_signed(delta);
-        Ok(())
-    })
-    .await
-}
-
 /// Whether a write presenting `fence` may change the main file `current`,
 /// its bytes as read: a live record [`admits`](NsFileV2::admits) it, and a
 /// missing or deleted one takes nothing, since publication never creates a

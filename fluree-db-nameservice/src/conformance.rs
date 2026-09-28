@@ -4,10 +4,15 @@
 //! [`lifecycle_conformance_tests!`](crate::lifecycle_conformance_tests) in a
 //! backend's test module to run them all against it.
 
-use crate::binding::{BindingState, DroppedState, Fence, FenceOutcome};
+use crate::binding::{
+    BindingState, BranchRecordStore, DroppedLedger, DroppedState, Fence, FenceOutcome,
+    LedgerRegistry, NameBinding, RegistryCas, Versioned,
+};
 use crate::lifecycle::{self, BranchDrop, LifecycleStore};
-use crate::{NameServiceError, NsRecord};
-use fluree_db_core::{LedgerId, LedgerName, StorageRoot};
+use crate::{NameServiceError, NsRecord, Result};
+use async_trait::async_trait;
+use fluree_db_core::{InstanceId, LedgerId, LedgerName, StorageRoot};
+use futures::future::BoxFuture;
 
 fn id(s: &str) -> LedgerId {
     LedgerId::parse(s).unwrap()
@@ -22,6 +27,108 @@ fn assert_exists(err: NameServiceError) {
         matches!(err, NameServiceError::LedgerAlreadyExists(_)),
         "expected LedgerAlreadyExists, got {err}"
     );
+}
+
+fn assert_conflict(err: NameServiceError) {
+    assert!(
+        matches!(err, NameServiceError::Conflict(_)),
+        "expected Conflict, got {err}"
+    );
+}
+
+/// The child count readers see on `ledger_id`'s record.
+async fn children<S: crate::NameServiceLookup>(store: &S, ledger_id: &str) -> u32 {
+    store.lookup(ledger_id).await.unwrap().unwrap().branches
+}
+
+/// `inner`, which runs `interlude` against it once, just before the first
+/// record insert: an operation paused there while someone else acts.
+struct PausedBeforeInsert<'a, S> {
+    inner: &'a S,
+    interlude: parking_lot::Mutex<Option<BoxFuture<'a, ()>>>,
+}
+
+impl<'a, S> PausedBeforeInsert<'a, S> {
+    fn new(inner: &'a S, interlude: impl std::future::Future<Output = ()> + Send + 'a) -> Self {
+        Self {
+            inner,
+            interlude: parking_lot::Mutex::new(Some(Box::pin(interlude))),
+        }
+    }
+}
+
+impl<S> std::fmt::Debug for PausedBeforeInsert<'_, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PausedBeforeInsert")
+    }
+}
+
+#[async_trait]
+impl<S: LifecycleStore> LedgerRegistry for PausedBeforeInsert<'_, S> {
+    async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
+        self.inner.get_binding(name).await
+    }
+
+    async fn cas_binding(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        new: Option<&NameBinding>,
+    ) -> Result<RegistryCas<NameBinding>> {
+        self.inner.cas_binding(name, expected, new).await
+    }
+
+    async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
+        self.inner.list_bindings().await
+    }
+
+    async fn get_dropped(&self, instance: &InstanceId) -> Result<Option<Versioned<DroppedLedger>>> {
+        self.inner.get_dropped(instance).await
+    }
+
+    async fn cas_dropped(
+        &self,
+        instance: &InstanceId,
+        expected: Option<u64>,
+        new: Option<&DroppedLedger>,
+    ) -> Result<RegistryCas<DroppedLedger>> {
+        self.inner.cas_dropped(instance, expected, new).await
+    }
+
+    async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
+        self.inner.list_dropped().await
+    }
+}
+
+#[async_trait]
+impl<S: LifecycleStore> BranchRecordStore for PausedBeforeInsert<'_, S> {
+    async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        self.inner.raw_record(ledger_id).await
+    }
+
+    async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+        self.inner.all_raw_records().await
+    }
+
+    async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+        let interlude = self.interlude.lock().take();
+        if let Some(interlude) = interlude {
+            interlude.await;
+        }
+        self.inner.insert_record(record).await
+    }
+
+    async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        self.inner.adopt_record(ledger_id, fence).await
+    }
+
+    async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        self.inner.freeze_record(ledger_id, fence).await
+    }
+
+    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        self.inner.delete_record(ledger_id, fence).await
+    }
 }
 
 /// A create claims the name under a fresh instance root, and a second create
@@ -199,25 +306,22 @@ pub async fn soft_dropped_ledger_can_be_purged<S: LifecycleStore>(store: &S) {
 
 /// Branches are listed in the binding with their own fence, and count
 /// against their parent.
-pub async fn create_branch_lists_and_counts<S: LifecycleStore>(store: &S) {
+pub async fn create_branch_lists_and_counts<S: LifecycleStore + crate::NameServiceLookup>(
+    store: &S,
+) {
     let main = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
     let dev = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
         .await
         .unwrap();
     let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
     assert_eq!(dev.fence, binding.fence_of("dev"));
+    let listing = binding.listing("dev").unwrap();
+    assert_eq!(listing.source.as_deref(), Some("main"));
+    assert!(!listing.creating);
     assert_ne!(dev.fence, main.fence);
     assert_eq!(dev.source_branch.as_deref(), Some("main"));
     assert_eq!(dev.storage_root, main.storage_root);
-    assert_eq!(
-        store
-            .raw_record("mydb:main")
-            .await
-            .unwrap()
-            .unwrap()
-            .branches,
-        1
-    );
+    assert_eq!(children(store, "mydb:main").await, 1);
 
     assert_exists(
         lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
@@ -232,8 +336,9 @@ pub async fn create_branch_lists_and_counts<S: LifecycleStore>(store: &S) {
     ));
 }
 
-/// A branch listed in the binding with no record is a create that did not
-/// finish, and creating the branch again takes it over.
+/// A confirmed branch listed with no record is a create from before creates
+/// were confirmed that did not finish, and creating the branch again takes
+/// it over.
 pub async fn unfinished_branch_create_is_taken_over<S: LifecycleStore>(store: &S) {
     lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
     let dev = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
@@ -338,7 +443,6 @@ pub async fn fenced_record_writes_check_the_fence<S: LifecycleStore>(store: &S) 
     for outcome in [
         store.freeze_record("mydb:main", stale).await.unwrap(),
         store.delete_record("mydb:main", stale).await.unwrap(),
-        store.adjust_children("mydb:main", stale, 1).await.unwrap(),
     ] {
         assert_eq!(outcome, FenceOutcome::Mismatch);
     }
@@ -440,21 +544,12 @@ pub async fn leaf_branch_drop_frees_the_branch<S: LifecycleStore + crate::NameSe
     assert!(parent.is_none(), "main is not dropped");
     assert!(store.raw_record("mydb:dev").await.unwrap().is_none());
     assert!(store.lookup("mydb:dev").await.unwrap().is_none());
-    let main = store.raw_record("mydb:main").await.unwrap().unwrap();
-    assert_eq!(main.branches, 0);
-    // Finishing again is a no-op, and does not count the child off twice.
+    assert_eq!(children(store, "mydb:main").await, 0);
+    // Finishing again is a no-op.
     lifecycle::finish_drop_branch(store, &name("mydb"), &record)
         .await
         .unwrap();
-    assert_eq!(
-        store
-            .raw_record("mydb:main")
-            .await
-            .unwrap()
-            .unwrap()
-            .branches,
-        0
-    );
+    assert_eq!(children(store, "mydb:main").await, 0);
 
     let again = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
         .await
@@ -511,41 +606,199 @@ pub async fn branch_with_children_drop_is_deferred<S: LifecycleStore + crate::Na
     let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
     let listed: Vec<&str> = binding.branches.iter().map(|b| b.branch.as_str()).collect();
     assert_eq!(listed, vec!["main"]);
-    assert_eq!(
-        store
-            .raw_record("mydb:main")
-            .await
-            .unwrap()
-            .unwrap()
-            .branches,
-        0
-    );
+    assert_eq!(children(store, "mydb:main").await, 0);
 }
 
-/// A frozen record refuses a new child, so a branch being dropped cannot
-/// gain one after its drop read the count, but still counts children off.
-pub async fn frozen_record_refuses_new_children<S: LifecycleStore>(store: &S) {
-    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
-    let fence = created.fence.unwrap();
-    store.adjust_children("mydb:main", fence, 1).await.unwrap();
-    store.freeze_record("mydb:main", fence).await.unwrap();
-    assert_eq!(
-        store.adjust_children("mydb:main", fence, 1).await.unwrap(),
-        FenceOutcome::Frozen
-    );
-    assert_eq!(
-        store.adjust_children("mydb:main", fence, -1).await.unwrap(),
-        FenceOutcome::Applied
-    );
-    assert_eq!(
-        store
-            .raw_record("mydb:main")
+/// A branch whose create has not confirmed it reads as absent, and cannot be
+/// dropped or branched from, but keeps its source's data until it is rolled
+/// back.
+pub async fn a_branch_being_created_reads_as_absent<
+    S: LifecycleStore + crate::NameServiceLookup,
+>(
+    store: &S,
+) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    // A create of fx from dev that stopped after inserting its record.
+    let current = store.get_binding("mydb").await.unwrap().unwrap();
+    let fence = Fence::generate();
+    let mut next = current.value.clone();
+    next.branches.push(crate::BranchFence {
+        source: Some("dev".into()),
+        creating: true,
+        ..crate::BranchFence::new("fx", fence)
+    });
+    store
+        .cas_binding("mydb", Some(current.version), Some(&next))
+        .await
+        .unwrap();
+    let mut record = NsRecord::new(id("mydb:fx"));
+    record.fence = Some(fence);
+    record.source_branch = Some("dev".into());
+    assert!(store.insert_record(&record).await.unwrap().is_none());
+
+    assert!(store.lookup("mydb:fx").await.unwrap().is_none());
+    assert_eq!(store.list_branches("mydb").await.unwrap().len(), 2);
+    assert_eq!(children(store, "mydb:dev").await, 0);
+    assert!(matches!(
+        lifecycle::begin_drop_branch(store, &name("mydb"), "fx")
+            .await
+            .unwrap_err(),
+        NameServiceError::NotFound(_)
+    ));
+    assert!(matches!(
+        lifecycle::create_branch(store, &name("mydb"), "fy", "fx", None)
+            .await
+            .unwrap_err(),
+        NameServiceError::NotFound(_)
+    ));
+
+    assert!(matches!(
+        lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+            .await
+            .unwrap(),
+        BranchDrop::Deferred { already: false }
+    ));
+    assert!(
+        lifecycle::rollback_branch_create(store, &name("mydb"), "fx", fence)
             .await
             .unwrap()
-            .unwrap()
-            .branches,
-        0
     );
+    assert!(store.raw_record("mydb:fx").await.unwrap().is_none());
+    let dev_fence = store
+        .get_binding("mydb")
+        .await
+        .unwrap()
+        .unwrap()
+        .value
+        .fence_of("dev")
+        .unwrap();
+    assert!(matches!(
+        lifecycle::resume_drop_branch(store, &name("mydb"), "dev", dev_fence)
+            .await
+            .unwrap(),
+        Some(BranchDrop::Purge(_))
+    ));
+}
+
+/// A branch create paused before inserting its record, and taken over
+/// meanwhile, fails; its source counts the branch once, and frees once the
+/// branch goes.
+pub async fn a_taken_over_branch_create_counts_once<
+    S: LifecycleStore + crate::NameServiceLookup,
+>(
+    store: &S,
+) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    let paused = PausedBeforeInsert::new(store, async {
+        lifecycle::create_branch(store, &name("mydb"), "fx", "dev", None)
+            .await
+            .unwrap();
+    });
+    assert_conflict(
+        lifecycle::create_branch(&paused, &name("mydb"), "fx", "dev", None)
+            .await
+            .unwrap_err(),
+    );
+    assert!(store.lookup("mydb:fx").await.unwrap().is_some());
+    assert_eq!(children(store, "mydb:dev").await, 1);
+
+    assert!(matches!(
+        lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+            .await
+            .unwrap(),
+        BranchDrop::Deferred { .. }
+    ));
+    let BranchDrop::Purge(fx) = lifecycle::begin_drop_branch(store, &name("mydb"), "fx")
+        .await
+        .unwrap()
+    else {
+        panic!("fx is a leaf");
+    };
+    let parent = lifecycle::finish_drop_branch(store, &name("mydb"), &fx)
+        .await
+        .unwrap();
+    assert_eq!(parent.map(|r| r.branch).as_deref(), Some("dev"));
+}
+
+/// A branch create paused before inserting its record, and rolled back
+/// meanwhile, fails and leaves nothing behind.
+pub async fn a_rolled_back_branch_create_fails<S: LifecycleStore + crate::NameServiceLookup>(
+    store: &S,
+) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let paused = PausedBeforeInsert::new(store, async {
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        let listing = binding.listing("dev").unwrap();
+        assert!(listing.creating);
+        assert!(
+            lifecycle::rollback_branch_create(store, &name("mydb"), "dev", listing.fence)
+                .await
+                .unwrap()
+        );
+    });
+    assert_conflict(
+        lifecycle::create_branch(&paused, &name("mydb"), "dev", "main", None)
+            .await
+            .unwrap_err(),
+    );
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    assert!(binding.listing("dev").is_none());
+    assert!(store.raw_record("mydb:dev").await.unwrap().is_none());
+    lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+}
+
+/// A branch drop that stopped after unlisting the branch still frees the
+/// branch's dropped source.
+pub async fn a_parent_frees_after_its_last_childs_drop_stopped<
+    S: LifecycleStore + crate::NameServiceLookup,
+>(
+    store: &S,
+) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "fx", "dev", None)
+        .await
+        .unwrap();
+    lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap();
+    let BranchDrop::Purge(fx) = lifecycle::begin_drop_branch(store, &name("mydb"), "fx")
+        .await
+        .unwrap()
+    else {
+        panic!("fx is a leaf");
+    };
+    // fx's finish stopped once it had unlisted fx.
+    let current = store.get_binding("mydb").await.unwrap().unwrap();
+    let mut next = current.value.clone();
+    next.branches.retain(|b| b.branch != "fx");
+    store
+        .cas_binding("mydb", Some(current.version), Some(&next))
+        .await
+        .unwrap();
+
+    let dev_fence = next.fence_of("dev").unwrap();
+    assert!(matches!(
+        lifecycle::resume_drop_branch(store, &name("mydb"), "dev", dev_fence)
+            .await
+            .unwrap(),
+        Some(BranchDrop::Purge(_))
+    ));
+    let parent = lifecycle::finish_drop_branch(store, &name("mydb"), &fx)
+        .await
+        .unwrap();
+    assert_eq!(parent.map(|r| r.branch).as_deref(), Some("dev"));
+    assert!(store.raw_record("mydb:fx").await.unwrap().is_none());
 }
 
 /// A branch dropped before its ledger comes back dropped when the ledger is
@@ -1403,7 +1656,10 @@ where
     listings_skip_registry_state(&make().await).await;
     leaf_branch_drop_frees_the_branch(&make().await).await;
     branch_with_children_drop_is_deferred(&make().await).await;
-    frozen_record_refuses_new_children(&make().await).await;
+    a_branch_being_created_reads_as_absent(&make().await).await;
+    a_taken_over_branch_create_counts_once(&make().await).await;
+    a_rolled_back_branch_create_fails(&make().await).await;
+    a_parent_frees_after_its_last_childs_drop_stopped(&make().await).await;
     restore_keeps_dropped_branches_dropped(&make().await).await;
     mirror_binds_the_origin_instance(&make().await).await;
     writes_present_the_branch_fence(&make().await).await;
@@ -1449,7 +1705,10 @@ macro_rules! lifecycle_conformance_tests {
             listings_skip_registry_state,
             leaf_branch_drop_frees_the_branch,
             branch_with_children_drop_is_deferred,
-            frozen_record_refuses_new_children,
+            a_branch_being_created_reads_as_absent,
+            a_taken_over_branch_create_counts_once,
+            a_rolled_back_branch_create_fails,
+            a_parent_frees_after_its_last_childs_drop_stopped,
             restore_keeps_dropped_branches_dropped,
             mirror_binds_the_origin_instance,
             writes_present_the_branch_fence,

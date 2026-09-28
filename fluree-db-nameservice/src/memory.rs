@@ -311,24 +311,6 @@ impl BranchRecordStore for MemoryNameService {
         self.config_values.write().remove(&key);
         Ok(FenceOutcome::Applied)
     }
-
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: Fence,
-        delta: i32,
-    ) -> Result<FenceOutcome> {
-        let key = LedgerId::parse(ledger_id)?;
-        Ok(match self.records.write().get_mut(&key) {
-            None => FenceOutcome::Missing,
-            Some(record) if record.fence != Some(fence) => FenceOutcome::Mismatch,
-            Some(record) if record.frozen && delta > 0 => FenceOutcome::Frozen,
-            Some(record) => {
-                record.branches = record.branches.saturating_add_signed(delta);
-                FenceOutcome::Applied
-            }
-        })
-    }
 }
 
 #[async_trait]

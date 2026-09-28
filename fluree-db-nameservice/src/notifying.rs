@@ -73,11 +73,6 @@ impl<N: crate::LedgerRegistry> NotifyingNameService<N> {
     }
 }
 
-/// Whether `binding` shows `branch` to readers.
-fn shows(binding: &crate::NameBinding, branch: &str) -> bool {
-    binding.is_active() && binding.listing(branch).is_some_and(|l| !l.dropped)
-}
-
 impl<N: Clone> Clone for NotifyingNameService<N> {
     fn clone(&self) -> Self {
         Self {
@@ -475,8 +470,9 @@ where
     }
 
     /// Announces each branch the new binding shows that the one it replaced
-    /// did not. When the replaced binding cannot be read as it was, every
-    /// branch shown is announced.
+    /// did not, as the write confirming a branch's create does. When the
+    /// replaced binding cannot be read as it was, every branch shown is
+    /// announced.
     async fn cas_binding(
         &self,
         name: &str,
@@ -497,12 +493,12 @@ where
         let result = self.inner.cas_binding(name, expected, new).await?;
         if let (crate::RegistryCas::Updated { .. }, Some(binding)) = (&result, new) {
             for listing in &binding.branches {
-                if !shows(binding, &listing.branch) {
+                if !binding.shows(&listing.branch) {
                     continue;
                 }
                 let shown_before = before.as_ref().is_some_and(|b| {
                     b.instance == binding.instance
-                        && shows(b, &listing.branch)
+                        && b.shows(&listing.branch)
                         && b.fence_of(&listing.branch) == Some(listing.fence)
                 });
                 if shown_before {
@@ -558,12 +554,12 @@ where
     }
 
     /// Announces the branch when its binding already shows it, as when a
-    /// branch is created under a live ledger.
+    /// mirrored copy of a branch is inserted.
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
         let existing = self.inner.insert_record(record).await?;
         if existing.is_none() {
             if let Some(binding) = self.listing_binding(&record.ledger_id, record.fence).await {
-                if shows(&binding, &record.branch) {
+                if binding.shows(&record.branch) {
                     self.event_bus.notify(NameServiceEvent::LedgerCreated {
                         ledger_id: record.ledger_id.clone(),
                         instance: binding.instance,
@@ -610,15 +606,6 @@ where
             });
         }
         Ok(outcome)
-    }
-
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: crate::Fence,
-        delta: i32,
-    ) -> Result<crate::FenceOutcome> {
-        self.inner.adjust_children(ledger_id, fence, delta).await
     }
 }
 

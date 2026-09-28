@@ -1,6 +1,6 @@
 //! Lifecycle housekeeping: finishing the drops, restores and purges a crash
-//! interrupted, rolling back creates that stopped, and the scheduled orphan
-//! sweep.
+//! interrupted, rolling back creates and branch creates that stopped, and the
+//! scheduled orphan sweep.
 //!
 //! Each test leaves the nameservice exactly as a crash at one step would,
 //! then drives the housekeeping's ticks directly. An operation is resumed on
@@ -182,6 +182,54 @@ async fn a_branch_drop_stopped_before_deleting_is_finished() {
         .unwrap()
         .unwrap();
     assert!(binding.value.listing("dev").is_none(), "unlisted");
+    assert_eq!(files_under(&fluree, &dev_root).await, 0);
+    assert!(fluree.db("branched:main").await.unwrap().t > 0);
+}
+
+/// A branch create that stopped before confirming its listing is rolled
+/// back, and the dropped branch it was created from, which it held, is then
+/// purged.
+#[tokio::test]
+async fn a_stopped_branch_create_is_rolled_back() {
+    let (_tmp, fluree) = fluree_with(&["branched:main"]).await;
+    fluree
+        .create_branch("branched", "dev", None, None)
+        .await
+        .unwrap();
+    let dev_root = fluree
+        .storage_namespace("branched:dev")
+        .await
+        .unwrap()
+        .branch_prefix()
+        .to_string();
+    let store = fluree.publisher().unwrap();
+    let current = store.get_binding("branched").await.unwrap().unwrap();
+    let mut next = current.value.clone();
+    next.branches.push(BranchFence {
+        source: Some("dev".into()),
+        creating: true,
+        ..BranchFence::new("fx", Fence::generate())
+    });
+    store
+        .cas_binding("branched", Some(current.version), Some(&next))
+        .await
+        .unwrap();
+    let report = fluree.drop_branch("branched", "dev").await.unwrap();
+    assert!(report.deferred, "fx is listed from dev");
+
+    let housekeeping = rolling_back_at_once(&fluree);
+    housekeeping.tick().await;
+    let listed = |b: &NameBinding, branch: &str| b.listing(branch).is_some();
+    let binding = store.get_binding("branched").await.unwrap().unwrap().value;
+    assert!(listed(&binding, "fx"), "the first tick only looks");
+    // Roll back fx; see dev with no children; finish dev's drop.
+    for _ in 0..3 {
+        housekeeping.tick().await;
+    }
+
+    let binding = store.get_binding("branched").await.unwrap().unwrap().value;
+    assert!(!listed(&binding, "fx"));
+    assert!(!listed(&binding, "dev"));
     assert_eq!(files_under(&fluree, &dev_root).await, 0);
     assert!(fluree.db("branched:main").await.unwrap().t > 0);
 }

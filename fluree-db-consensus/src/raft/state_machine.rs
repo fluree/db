@@ -840,8 +840,6 @@ pub enum Command {
         fence: u64,
         applied_at_millis: u64,
     },
-    /// Add `delta` to a branch's child count if it carries `fence`.
-    AdjustChildren { key: RefKey, fence: u64, delta: i32 },
     /// `command`, a write to one branch, by a writer holding `fence`:
     /// applied only while the branch carries that fence and is not
     /// frozen. The same write unwrapped is an unfenced write, which a
@@ -1457,8 +1455,7 @@ pub enum Response {
     FenceMismatch,
     /// A fenced branch command applied.
     FenceApplied,
-    /// [`Command::AdjustChildren`] refused to add a child to a frozen
-    /// branch.
+    /// A [`Command::Fenced`] write found its branch frozen.
     FenceFrozen,
     /// [`Command::FreezeBranch`] froze the branch.
     BranchFrozen {
@@ -1702,7 +1699,6 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             fence,
             applied_at_millis,
         } => delete_branch(state, key, fence, applied_at_millis),
-        Command::AdjustChildren { key, fence, delta } => adjust_children(state, key, fence, delta),
         Command::AdoptBranch { key, fence } => adopt_branch(state, key, fence),
         Command::ResetGraphSourceIndex { name, branch } => {
             match state
@@ -1896,21 +1892,6 @@ fn adopt_branch(state: &mut NameServiceState, key: RefKey, fence: u64) -> Respon
             Response::FenceApplied
         }
     }
-}
-
-fn adjust_children(state: &mut NameServiceState, key: RefKey, fence: u64, delta: i32) -> Response {
-    if let Some(refused) = check_fence(state, &key, fence) {
-        return refused;
-    }
-    if delta > 0 && state.fences.get(&key).is_some_and(|f| f.frozen) {
-        return Response::FenceFrozen;
-    }
-    if let Some(entry) = state.refs.get_mut(&key) {
-        entry.branches = entry.branches.saturating_add_signed(delta);
-    } else if let Some(f) = state.fences.get_mut(&key) {
-        f.children = f.children.saturating_add_signed(delta);
-    }
-    Response::FenceApplied
 }
 
 /// Apply [`Command::SetWorkerEligibility`]. Validate the voter is

@@ -1550,15 +1550,6 @@ where
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         (**self).delete_record(ledger_id, fence).await
     }
-
-    async fn adjust_children(
-        &self,
-        ledger_id: &str,
-        fence: Fence,
-        delta: i32,
-    ) -> Result<FenceOutcome> {
-        (**self).adjust_children(ledger_id, fence, delta).await
-    }
 }
 
 #[async_trait]

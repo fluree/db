@@ -2504,7 +2504,7 @@ POST /drop-branch
 **Behavior:**
 
 - **Cannot drop `main`**: Returns 400 Bad Request.
-- **Leaf branch** (no children): Fully drops — deletes storage artifacts, purges NsRecord, decrements parent's child count. If the parent was previously retracted and its child count reaches 0, the parent is cascade-dropped too.
+- **Leaf branch** (no children): Fully drops — deletes storage artifacts, purges NsRecord, and unlists the branch, which takes it off its parent's child count. If the parent was previously retracted and its child count reaches 0, the parent is cascade-dropped too.
 - **Branch with children** (`branches > 0`): Retracted (hidden from listings, rejects new transactions) but storage is preserved for children. When the last child is eventually dropped, the retracted parent is cascade-purged automatically.
 
 **Status codes:**
