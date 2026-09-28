@@ -1349,6 +1349,37 @@ pub async fn a_dropped_branch_reads_as_absent<S: crate::NameServicePublisher>(st
     assert!(store.get_config("mydb:main").await.unwrap().is_none());
 }
 
+/// Fields a later version wrote into a binding survive this version's
+/// rewrites of it.
+pub async fn unknown_binding_fields_survive_rewrites<S: LifecycleStore>(store: &S) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let current = store.get_binding("mydb").await.unwrap().unwrap();
+    let mut later = current.value.clone();
+    later
+        .extra
+        .insert("future".to_string(), serde_json::json!({"x": 1}));
+    later.branches[0]
+        .extra
+        .insert("future".to_string(), serde_json::json!(2));
+    store
+        .cas_binding("mydb", Some(current.version), Some(&later))
+        .await
+        .unwrap();
+
+    lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    assert_eq!(
+        binding.extra.get("future"),
+        Some(&serde_json::json!({"x": 1}))
+    );
+    assert_eq!(
+        binding.listing("main").unwrap().extra.get("future"),
+        Some(&serde_json::json!(2))
+    );
+}
+
 pub async fn run_all<S, F, Fut>(mut make: F)
 where
     S: crate::NameServicePublisher,
@@ -1390,6 +1421,7 @@ where
     drop_replaces_a_finished_restores_entry(&make().await).await;
     a_create_under_way_is_not_dropped(&make().await).await;
     a_dropped_branch_reads_as_absent(&make().await).await;
+    unknown_binding_fields_survive_rewrites(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1435,6 +1467,7 @@ macro_rules! lifecycle_conformance_tests {
             drop_replaces_a_finished_restores_entry,
             a_create_under_way_is_not_dropped,
             a_dropped_branch_reads_as_absent,
+            unknown_binding_fields_survive_rewrites,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

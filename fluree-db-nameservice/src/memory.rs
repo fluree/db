@@ -132,6 +132,7 @@ impl MemoryNameService {
         let mut binding = match &current {
             Some(existing) => existing.value.clone(),
             None => crate::NameBinding {
+                extra: crate::binding::ExtraFields::new(),
                 instance: crate::lifecycle::legacy_instance(&name),
                 root: fluree_db_core::StorageRoot::legacy(&id.ledger_name()),
                 root_branch: id.branch().to_string(),

@@ -2251,6 +2251,7 @@ mod tests {
             ));
         }
         let binding = NameBinding {
+            extra: fluree_db_nameservice::ExtraFields::new(),
             instance: fluree_db_nameservice::lifecycle::legacy_instance(ledger_name),
             root: fluree_db_core::StorageRoot::legacy(
                 &fluree_db_core::LedgerName::parse(ledger_name).unwrap(),

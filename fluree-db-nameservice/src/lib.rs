@@ -43,7 +43,8 @@ pub mod tracking_file;
 pub use binding::{
     check_write_fence, fence_admits, lookup_resolved, new_instance_id, read_all_resolved,
     read_resolved, resolve_record, BindingState, BranchFence, BranchRecordStore, DroppedLedger,
-    DroppedState, Fence, FenceOutcome, LedgerRegistry, NameBinding, RegistryCas, Versioned,
+    DroppedState, ExtraFields, Fence, FenceOutcome, LedgerRegistry, NameBinding, RegistryCas,
+    Versioned,
 };
 pub use branched_store::{
     branched_content_store_for_id, branched_content_store_for_record,

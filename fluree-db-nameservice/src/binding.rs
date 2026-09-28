@@ -109,6 +109,20 @@ pub enum BindingState {
     Restoring,
 }
 
+/// Fields a later version wrote into a binding or registry entry. This one
+/// keeps them and writes them back, so rewriting the item does not lose
+/// them.
+pub type ExtraFields = serde_json::Map<String, serde_json::Value>;
+
+/// `extra` without the keys `state`, a flattened tagged enum, writes: serde
+/// hands a flattened map every key, including those the enum read.
+fn without_keys_of<T: Serialize>(mut extra: ExtraFields, state: &T) -> ExtraFields {
+    if let Ok(serde_json::Value::Object(owned)) = serde_json::to_value(state) {
+        extra.retain(|k, _| !owned.contains_key(k));
+    }
+    extra
+}
+
 /// One branch listed in a binding, with the fence its record must carry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchFence {
@@ -119,6 +133,8 @@ pub struct BranchFence {
     /// its storage is deleted, so its name cannot be reused before then.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dropped: bool,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
 }
 
 impl BranchFence {
@@ -127,12 +143,14 @@ impl BranchFence {
             branch: branch.into(),
             fence,
             dropped: false,
+            extra: ExtraFields::new(),
         }
     }
 }
 
 /// The authoritative claim on a ledger name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "NameBindingFields")]
 pub struct NameBinding {
     pub instance: InstanceId,
     pub root: StorageRoot,
@@ -140,6 +158,33 @@ pub struct NameBinding {
     #[serde(flatten)]
     pub state: BindingState,
     pub branches: Vec<BranchFence>,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+#[derive(Deserialize)]
+struct NameBindingFields {
+    instance: InstanceId,
+    root: StorageRoot,
+    root_branch: String,
+    #[serde(flatten)]
+    state: BindingState,
+    branches: Vec<BranchFence>,
+    #[serde(flatten)]
+    extra: ExtraFields,
+}
+
+impl From<NameBindingFields> for NameBinding {
+    fn from(f: NameBindingFields) -> Self {
+        Self {
+            extra: without_keys_of(f.extra, &f.state),
+            instance: f.instance,
+            root: f.root,
+            root_branch: f.root_branch,
+            state: f.state,
+            branches: f.branches,
+        }
+    }
 }
 
 impl NameBinding {
@@ -172,6 +217,7 @@ pub enum DroppedState {
 
 /// A dropped ledger: everything needed to restore or purge it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "DroppedLedgerFields")]
 pub struct DroppedLedger {
     pub instance: InstanceId,
     #[serde(flatten)]
@@ -185,6 +231,37 @@ pub struct DroppedLedger {
     /// marked retracted is a branch dropped before its ledger, which a
     /// restore brings back still dropped.
     pub branches: Vec<NsRecord>,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+#[derive(Deserialize)]
+struct DroppedLedgerFields {
+    instance: InstanceId,
+    #[serde(flatten)]
+    state: DroppedState,
+    dropped_at: i64,
+    name: String,
+    root: StorageRoot,
+    root_branch: String,
+    branches: Vec<NsRecord>,
+    #[serde(flatten)]
+    extra: ExtraFields,
+}
+
+impl From<DroppedLedgerFields> for DroppedLedger {
+    fn from(f: DroppedLedgerFields) -> Self {
+        Self {
+            extra: without_keys_of(f.extra, &f.state),
+            instance: f.instance,
+            state: f.state,
+            dropped_at: f.dropped_at,
+            name: f.name,
+            root: f.root,
+            root_branch: f.root_branch,
+            branches: f.branches,
+        }
+    }
 }
 
 /// Whether a write presenting `presented` may change a record carrying
@@ -388,10 +465,51 @@ pub async fn read_all_resolved<S: LedgerRegistry + ?Sized>(
 mod tests {
     use super::*;
     use fluree_db_core::LedgerName;
+    use serde_json::json;
+
+    /// Fields a later version wrote come back unchanged and only once,
+    /// beside the flattened state they share the object with.
+    #[test]
+    fn unknown_fields_round_trip() {
+        let binding = json!({
+            "instance": "01JB8ZK4X5Y6Z7A8B9C0D1E2F3",
+            "root": "mydb/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3",
+            "root_branch": "main",
+            "state": "dropping",
+            "hard": true,
+            "branches": [{"branch": "main", "fence": "00000000000000ff", "later": [1]}],
+            "future": {"x": 1}
+        });
+        let parsed: NameBinding = serde_json::from_value(binding.clone()).unwrap();
+        assert_eq!(parsed.state, BindingState::Dropping { hard: true });
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), binding);
+        // A `Value` keeps one of two equal keys; the text shows both.
+        let text = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(text.matches("\"state\"").count(), 1, "{text}");
+        assert_eq!(text.matches("\"hard\"").count(), 1, "{text}");
+
+        let entry = json!({
+            "instance": "01JB8ZK4X5Y6Z7A8B9C0D1E2F3",
+            "state": "restoring",
+            "fences": [{"branch": "main", "fence": "00000000000000ff"}],
+            "dropped_at": 1,
+            "name": "mydb",
+            "root": "mydb/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3",
+            "root_branch": "main",
+            "branches": [],
+            "future": true
+        });
+        let parsed: DroppedLedger = serde_json::from_value(entry.clone()).unwrap();
+        assert!(matches!(parsed.state, DroppedState::Restoring { .. }));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), entry);
+        let text = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(text.matches("\"fences\"").count(), 1, "{text}");
+    }
 
     fn binding(state: BindingState, fence: Fence) -> NameBinding {
         let instance = new_instance_id();
         NameBinding {
+            extra: crate::binding::ExtraFields::new(),
             root: StorageRoot::for_instance(&LedgerName::parse("mydb").unwrap(), &instance),
             instance,
             root_branch: "main".into(),
@@ -458,6 +576,7 @@ mod tests {
             },
         ] {
             let entry = DroppedLedger {
+                extra: crate::binding::ExtraFields::new(),
                 root: StorageRoot::for_instance(&LedgerName::parse("mydb").unwrap(), &instance),
                 instance: instance.clone(),
                 state,

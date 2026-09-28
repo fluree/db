@@ -111,6 +111,7 @@ pub async fn begin_create<S: LifecycleStore + ?Sized>(
     let fence = Fence::generate();
     let root = StorageRoot::for_instance(&name, &instance);
     let binding = NameBinding {
+        extra: crate::binding::ExtraFields::new(),
         instance: instance.clone(),
         root: root.clone(),
         root_branch: id.branch().to_string(),
@@ -384,6 +385,7 @@ pub async fn mirror_record<S: LifecycleStore + ?Sized>(
             other => (
                 other.map(|v| v.version),
                 NameBinding {
+                    extra: crate::binding::ExtraFields::new(),
                     instance: instance.clone(),
                     root: root.clone(),
                     root_branch: fluree_db_core::DEFAULT_BRANCH.to_string(),
@@ -743,6 +745,7 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
     // restore, and resuming it would bring the ledger back, so it is
     // replaced.
     let entry = DroppedLedger {
+        extra: crate::binding::ExtraFields::new(),
         instance: binding.instance.clone(),
         state: if hard {
             DroppedState::Purging
@@ -867,6 +870,7 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
 
     // 2. Claim the name.
     let binding = NameBinding {
+        extra: crate::binding::ExtraFields::new(),
         instance: instance.clone(),
         root: entry.root.clone(),
         root_branch: entry.root_branch.clone(),
@@ -1132,6 +1136,7 @@ async fn bind_legacy<S: LifecycleStore + ?Sized>(
     branches.sort_by(|a, b| a.branch.cmp(&b.branch));
 
     let binding = NameBinding {
+        extra: crate::binding::ExtraFields::new(),
         instance: legacy_instance(name),
         root: StorageRoot::legacy(name),
         root_branch: legacy_root_branch(records),
@@ -1173,6 +1178,7 @@ async fn register_legacy_drop<S: LifecycleStore + ?Sized>(
 ) -> Result<()> {
     let instance = legacy_instance(name);
     let entry = DroppedLedger {
+        extra: crate::binding::ExtraFields::new(),
         instance: instance.clone(),
         state: DroppedState::Dropped,
         dropped_at: now_ms(),
