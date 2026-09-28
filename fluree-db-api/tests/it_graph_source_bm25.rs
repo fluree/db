@@ -2054,6 +2054,10 @@ async fn bm25_suspends_when_its_ledger_is_replaced() {
         .insert(ledger, &doc("ex:doc3", "original 3"))
         .await
         .unwrap();
+    let check = fluree.check_bm25_staleness(&gs).await.unwrap();
+    assert!(!check.suspended);
+    assert!(check.is_stale);
+    assert_eq!(check.lag, 1);
     fluree
         .sync_bm25_index(&gs)
         .await
@@ -2079,6 +2083,12 @@ async fn bm25_suspends_when_its_ledger_is_replaced() {
     }
     let idx = fluree.load_bm25_index(&gs).await.unwrap();
     assert_eq!(hits(&idx, "replacement"), 0, "nothing synced from it");
+    // Staleness reports the suspension rather than comparing against the
+    // replacement's head, which is behind the index.
+    let check = fluree.check_bm25_staleness(&gs).await.unwrap();
+    assert!(check.suspended);
+    assert!(!check.is_stale);
+    assert_eq!(check.lag, 0);
 
     // Recreated over the replacement, it indexes the replacement alone.
     fluree.drop_full_text_index(&gs).await.unwrap();
@@ -2089,6 +2099,7 @@ async fn bm25_suspends_when_its_ledger_is_replaced() {
     let idx = fluree.load_bm25_index(&gs).await.unwrap();
     assert_eq!(hits(&idx, "replacement"), 1);
     assert_eq!(hits(&idx, "original"), 0);
+    assert!(!fluree.check_bm25_staleness(&gs).await.unwrap().suspended);
     fluree
         .sync_bm25_index(&gs)
         .await

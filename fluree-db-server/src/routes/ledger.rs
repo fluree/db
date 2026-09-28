@@ -786,6 +786,11 @@ pub struct ListEntry {
     /// the staleness check behind `fluree bm25 list` — from this one response.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
+    /// A BM25 or vector index whose source ledger was dropped and another
+    /// created under its name: `t` is not comparable with the new ledger's,
+    /// and a sync is refused until the index is recreated.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub suspended: bool,
 }
 
 /// List all ledgers and graph sources
@@ -825,8 +830,24 @@ pub async fn list_ledgers(
             entry_type: "Ledger".to_string(),
             t: r.commit_t,
             dependencies: Vec::new(),
+            suspended: false,
         });
     }
+
+    // A dependency alias may omit the branch, which means `main`.
+    let by_alias: std::collections::HashMap<String, &fluree_db_nameservice::NsRecord> =
+        ledger_records
+            .iter()
+            .filter(|r| !r.retracted)
+            .map(|r| (format!("{}:{}", r.name, r.branch), r))
+            .collect();
+    let source_of = |gs: &fluree_db_nameservice::GraphSourceRecord| {
+        let alias = gs.dependencies.first()?;
+        by_alias
+            .get(alias)
+            .or_else(|| by_alias.get(&format!("{alias}:main")))
+            .copied()
+    };
 
     for gs in &gs_records {
         if gs.retracted || !readable(&gs.graph_source_id) {
@@ -838,6 +859,8 @@ pub async fn list_ledgers(
             entry_type: fluree_db_api::ledger_info::graph_source_type_label(&gs.source_type),
             t: gs.index_t,
             dependencies: gs.dependencies.clone(),
+            suspended: source_of(gs)
+                .is_some_and(|source| fluree_db_api::index_is_suspended(gs, source)),
         });
     }
 

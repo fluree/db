@@ -14,7 +14,9 @@ use crate::graph_source::result::{
     VectorCreateResult, VectorDropResult, VectorStalenessCheck, VectorSyncResult,
 };
 #[cfg(feature = "vector")]
-use crate::graph_source::source_instance::{check_source_instance, instance_of, SOURCE_INSTANCE};
+use crate::graph_source::source_instance::{
+    check_source_instance, instance_of, is_suspended, SOURCE_INSTANCE,
+};
 #[cfg(feature = "vector")]
 use crate::Result;
 #[cfg(feature = "vector")]
@@ -370,10 +372,14 @@ impl crate::Fluree {
 
         // Check minimum head across all dependencies
         let mut ledger_t: Option<i64> = None;
+        let mut suspended = false;
         for dep in &record.dependencies {
             let ledger_record = self.nameservice().lookup(dep).await?.ok_or_else(|| {
                 crate::ApiError::NotFound(format!("Source ledger not found: {dep}"))
             })?;
+            if *dep == source_ledger {
+                suspended = is_suspended(&record, dep, &ledger_record.storage_root())?;
+            }
             ledger_t = Some(match ledger_t {
                 Some(cur) => cur.min(ledger_record.commit_t),
                 None => ledger_record.commit_t,
@@ -381,9 +387,10 @@ impl crate::Fluree {
         }
         let ledger_t = ledger_t.unwrap_or(0);
 
+        // Another ledger's head says nothing about how far behind this index is.
         let index_t = record.index_t;
-        let is_stale = index_t < ledger_t;
-        let lag = ledger_t - index_t;
+        let is_stale = !suspended && index_t < ledger_t;
+        let lag = if suspended { 0 } else { ledger_t - index_t };
 
         Ok(VectorStalenessCheck {
             graph_source_id: graph_source_id.to_string(),
@@ -392,6 +399,7 @@ impl crate::Fluree {
             ledger_t,
             is_stale,
             lag,
+            suspended,
         })
     }
 }

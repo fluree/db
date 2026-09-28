@@ -128,13 +128,19 @@ struct IndexRow {
     /// `None` when the source ledger could not be resolved — it may have been
     /// dropped out from under the index.
     ledger_t: Option<i64>,
+    /// The source ledger was dropped and another created under its name:
+    /// `ledger_t` is the new ledger's, and a sync is refused.
+    suspended: bool,
 }
 
 impl IndexRow {
     /// An index is stale once its source has committed past the watermark.
+    /// A suspended one is not: syncing it is refused.
     fn is_stale(&self) -> bool {
-        self.ledger_t
-            .is_some_and(|ledger_t| self.index_t < ledger_t)
+        !self.suspended
+            && self
+                .ledger_t
+                .is_some_and(|ledger_t| self.index_t < ledger_t)
     }
 
     fn alias(&self) -> String {
@@ -186,11 +192,15 @@ async fn local_index_rows(dirs: &FlureeDir) -> CliResult<Vec<IndexRow>> {
     let ledgers = fluree.nameservice().all_records().await?;
     let sources = fluree.nameservice().all_graph_source_records().await?;
 
-    // Source-ledger alias -> current commit t (skip retracted).
-    let commit_t: HashMap<String, i64> = ledgers
+    // Source-ledger alias -> its record (skip retracted).
+    let by_alias: HashMap<String, &fluree_db_api::NsRecord> = ledgers
         .iter()
         .filter(|r| !r.retracted)
-        .map(|r| (format!("{}:{}", r.name, r.branch), r.commit_t))
+        .map(|r| (format!("{}:{}", r.name, r.branch), r))
+        .collect();
+    let commit_t: HashMap<String, i64> = by_alias
+        .iter()
+        .map(|(alias, r)| (alias.clone(), r.commit_t))
         .collect();
 
     let rows = sources
@@ -198,10 +208,14 @@ async fn local_index_rows(dirs: &FlureeDir) -> CliResult<Vec<IndexRow>> {
         .filter(|r| r.is_bm25() && !r.retracted)
         .map(|gs| {
             let source = gs.dependencies.first().cloned().unwrap_or_default();
+            let record = by_alias
+                .get(&source)
+                .or_else(|| by_alias.get(&format!("{source}:main")));
             IndexRow {
                 name: gs.name.clone(),
                 branch: gs.branch.clone(),
                 ledger_t: resolve_source_t(&commit_t, &source),
+                suspended: record.is_some_and(|r| fluree_db_api::index_is_suspended(gs, r)),
                 source,
                 index_t: gs.index_t,
             }
@@ -291,6 +305,10 @@ fn remote_index_rows(entries: &serde_json::Value) -> Vec<IndexRow> {
                     .unwrap_or("main")
                     .to_string(),
                 ledger_t: resolve_source_t(&commit_t, &source),
+                suspended: e
+                    .get("suspended")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 source,
                 index_t: t_of(e).unwrap_or_default(),
             }
@@ -342,7 +360,14 @@ fn render_index_rows(rows: &[IndexRow], stale_only: bool) {
             row.source.clone(),
             index_t,
             ledger_t,
-            if row.is_stale() { "YES" } else { "no" }.to_string(),
+            if row.suspended {
+                "suspended"
+            } else if row.is_stale() {
+                "YES"
+            } else {
+                "no"
+            }
+            .to_string(),
         ]);
     }
     println!("{table}");
@@ -711,6 +736,18 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ledger_t, None);
         assert!(!rows[0].is_stale(), "unknown staleness is not staleness");
+    }
+
+    /// A suspended index's source is another ledger now: its `t` says
+    /// nothing, and a sync would be refused, so the index is not stale.
+    #[test]
+    fn remote_rows_report_a_suspended_index_as_not_stale() {
+        let mut payload = ledgers_payload();
+        payload[2]["suspended"] = json!(true);
+
+        let row = &remote_index_rows(&payload)[0];
+        assert!(row.suspended);
+        assert!(!row.is_stale());
     }
 
     #[test]

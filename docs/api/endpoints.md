@@ -1932,6 +1932,7 @@ A flat array of ledgers and graph sources. Retracted entries are omitted.
 | `type` | `Ledger`, or the graph-source family: `BM25`, `Vector`, `Geo`, `R2RML`, `Iceberg` |
 | `t` | Commit `t` for a ledger; the index watermark for a graph source |
 | `dependencies` | Source ledger aliases a graph source derives from. Omitted for ledgers. |
+| `suspended` | `true` for a BM25 or vector index whose source ledger was dropped and another created under its name: its `t` is not comparable with the new ledger's, and a sync is refused until the index is recreated. Omitted otherwise. |
 
 `dependencies` is what lets a client pair a graph source against its source's `t` from this one response — the staleness check behind `fluree bm25 list`. A dependency alias may omit the branch, in which case `main` is implied.
 

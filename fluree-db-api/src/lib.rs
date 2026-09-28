@@ -184,8 +184,8 @@ pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, Resol
 pub use graph_query_builder::{GraphQueryBuilder, GraphSnapshotQueryBuilder};
 pub use graph_snapshot::GraphSnapshot;
 pub use graph_source::{
-    Bm25CreateConfig, Bm25CreateResult, Bm25DropResult, Bm25StalenessCheck, Bm25SyncResult,
-    FlureeIndexProvider, SnapshotSelection,
+    index_is_suspended, Bm25CreateConfig, Bm25CreateResult, Bm25DropResult, Bm25StalenessCheck,
+    Bm25SyncResult, FlureeIndexProvider, SnapshotSelection,
 };
 pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
 #[cfg(not(target_arch = "wasm32"))]

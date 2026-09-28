@@ -1075,9 +1075,14 @@ async fn vector_suspends_when_its_ledger_is_replaced() {
         let err = sync.expect_err("the replacement is not the ledger indexed");
         assert!(matches!(err, ApiError::GraphSourceSuspended(_)), "{err}");
     }
+    let check = fluree.check_vector_staleness(&gs).await.unwrap();
+    assert!(check.suspended);
+    assert!(!check.is_stale);
+    assert_eq!(check.lag, 0);
 
     fluree.drop_vector_index(&gs).await.unwrap();
     fluree.create_vector_index(config()).await.unwrap();
+    assert!(!fluree.check_vector_staleness(&gs).await.unwrap().suspended);
     assert_eq!(fluree.load_vector_index(&gs).await.unwrap().len(), 1);
     fluree
         .sync_vector_index(&gs)
