@@ -1,11 +1,11 @@
-//! Binary scan operator — eagerly materializes `ColumnBatch` rows into `Binding` values.
+//! Binary scan operator — turns `ColumnBatch` rows into `Binding` values.
 //!
 //! - Uses `BinaryCursor` (leaflet-at-a-time columnar batches)
 //! - Uses `o_type` for value dispatch
-//! - Eagerly materializes all values (no EncodedLit/EncodedSid)
-//!
-//! The eager approach trades some allocation for simplicity. Deferred decoding
-//! can be added in a follow-up when perf requires it.
+//! - Emits encoded bindings (`EncodedSid`/`EncodedPid`/`EncodedLit`) when the
+//!   persisted index is authoritative; decodes eagerly under a novelty overlay,
+//!   for `eager_materialization` contexts, and when one variable fills two
+//!   positions (`?x ?x ?o`, `?s ?x ?x`).
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -937,6 +937,39 @@ impl Operator for GroupAggregateOperator {
             }
         }
 
+        // A join can count matches before expanding them into output rows when
+        // all group keys come from its driving side. Other aggregates and
+        // DISTINCT retain ordinary row consumption.
+        if self.emit_iter.is_none()
+            && !self.group_key_indices.is_empty()
+            && !self.agg_specs.is_empty()
+            && self
+                .agg_specs
+                .iter()
+                .all(|spec| matches!(spec.function, AggregateFn::CountAll))
+        {
+            let group_vars = &self.in_schema[..self.group_key_indices.len()];
+            if let Some(groups) = self.child.drain_grouped_count(ctx, group_vars).await? {
+                let states = groups
+                    .into_iter()
+                    .map(|group| {
+                        i64::try_from(group.count).map_err(|_| {
+                            QueryError::execution("grouped COUNT(*) exceeds i64::MAX")
+                        })?;
+                        Ok(GroupState {
+                            key_bindings: group.keys,
+                            agg_states: self
+                                .agg_specs
+                                .iter()
+                                .map(|_| AggState::Count { n: group.count })
+                                .collect(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.emit_iter = Some(GroupEmitIter::Vec(states.into_iter()));
+            }
+        }
+
         // If we haven't consumed all input yet, do so now (streaming aggregation)
         if self.emit_iter.is_none() {
             let span = tracing::debug_span!(
