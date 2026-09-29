@@ -1611,6 +1611,55 @@ mod annotations_and_graphs {
         );
     }
 
+    /// A dataset written as TriG reads back into a fresh ledger unchanged: its
+    /// named graphs, the annotations in each, and the annotation bodies.
+    #[tokio::test]
+    async fn trig_dataset_round_trips_through_upsert() {
+        const SEED: &str = "@prefix ex: <http://example.org/> .\n\
+            ex:a ex:p ex:b ~ ex:r0 {| ex:source ex:hr |} .\n\
+            GRAPH ex:g1 { ex:c ex:p ex:d ~ ex:r1 {| ex:source ex:crm |} . ex:c ex:name \"C\" . }\n\
+            GRAPH ex:g2 { ex:e ex:p ex:f ~ ex:r2 . }\n";
+        const COPY: &str = "CONSTRUCT { ?s ?p ?o ~ ?r . GRAPH ?g { ?gs ?gp ?go ~ ?gr } }
+            WHERE {
+              { { ?s ?p ?o } UNION { ?r rdf:reifies <<( ?s ?p ?o )>> } }
+              UNION
+              { GRAPH ?g { { ?gs ?gp ?go } UNION { ?gr rdf:reifies <<( ?gs ?gp ?go )>> } } }
+            }";
+        async fn upsert(fluree: &fluree_db_api::Fluree, id: &str, trig: &str) -> LedgerState {
+            let ledger = support::genesis_ledger_for_fluree(fluree, id);
+            fluree
+                .stage_owned(ledger)
+                .upsert_turtle(trig)
+                .execute()
+                .await
+                .unwrap_or_else(|e| panic!("upsert failed: {e}\n{trig}"))
+                .ledger
+        }
+
+        let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+        let source = upsert(&fluree, "it/construct:trig-source", SEED).await;
+        let result = sparql(&fluree, &source, COPY).await;
+        let trig = render(&result, &source, FormatterConfig::trig());
+        let nq = render(&result, &source, FormatterConfig::nquads());
+        for line in [
+            format!("<{EX}r0> {REIFIES} <<( <{EX}a> <{EX}p> <{EX}b> )>> ."),
+            format!("<{EX}r0> <{EX}source> <{EX}hr> ."),
+            format!("<{EX}r1> {REIFIES} <<( <{EX}c> <{EX}p> <{EX}d> )>> <{EX}g1> ."),
+            format!("<{EX}r1> <{EX}source> <{EX}crm> <{EX}g1> ."),
+            format!("<{EX}r2> {REIFIES} <<( <{EX}e> <{EX}p> <{EX}f> )>> <{EX}g2> ."),
+        ] {
+            assert!(nq.lines().any(|l| l == line), "missing {line}\n{nq}");
+        }
+
+        let copy = upsert(&fluree, "it/construct:trig-copy", &trig).await;
+        let copied = render(
+            &sparql(&fluree, &copy, COPY).await,
+            &copy,
+            FormatterConfig::nquads(),
+        );
+        assert_eq!(sorted_lines(&copied), sorted_lines(&nq), "{trig}");
+    }
+
     /// The JSON-LD twin of a `GRAPH` block: `["graph", <iri>, node-map, ...]`,
     /// the `where` clause's form.
     #[tokio::test]
