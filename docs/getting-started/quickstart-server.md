@@ -85,6 +85,15 @@ You should see output like:
 INFO fluree_db_cli::commands::server: Starting Fluree server (foreground) version="…" addr=0.0.0.0:8090 storage="file"
 ```
 
+### Memory Storage (Throwaway)
+
+To try the server without creating a project, keep the data in memory. Nothing is written to the
+current directory, and the data is gone when the server stops:
+
+```bash
+fluree server run --memory
+```
+
 ### File Storage (Persistent)
 
 For persistent storage, specify a storage path:
@@ -180,10 +189,10 @@ See the [API Reference](../api/endpoints.md) for complete endpoint documentation
 - Data survives restarts
 - Best for single-server deployments
 
-**Memory** (via `--connection-config`; see [Storage Modes](../operations/storage.md#memory-storage)):
+**Memory** (`--memory`; see [Storage Modes](../operations/storage.md#memory-storage)):
 - Fast, in-process storage
 - Data lost on restart
-- Best for development and testing
+- Best for development, testing, and CI
 
 ### Configuration
 

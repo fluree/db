@@ -466,6 +466,12 @@ impl FlureeServer {
                  tokens there too"
             );
         }
+        if let Some(displaced) = &self.state.config.memory_displaced {
+            tracing::warn!(
+                "memory storage replaces the configured {displaced}; everything written \
+                 is lost when the server stops"
+            );
+        }
         #[cfg(not(feature = "bolt"))]
         if self.state.config.bolt_listen_addr.is_some() {
             tracing::warn!(
@@ -630,7 +636,8 @@ pub struct FlureeServerBuilder {
 }
 
 impl FlureeServerBuilder {
-    /// Create a new builder with default config (memory storage)
+    /// Create a new builder with default config (file storage in
+    /// `.fluree/storage`)
     pub fn new() -> Self {
         Self::for_config(ServerConfig::default())
     }
@@ -649,7 +656,9 @@ impl FlureeServerBuilder {
 
     /// Create a builder configured for memory storage
     pub fn memory() -> Self {
-        Self::new()
+        let mut builder = Self::new();
+        builder.config.memory = true;
+        builder
     }
 
     /// Create a builder configured for file storage
@@ -1019,6 +1028,13 @@ impl Default for FlureeServerBuilder {
 mod tests {
     use super::*;
     use fluree_db_nameservice::GraphSourceType;
+
+    #[test]
+    fn memory_builder_selects_memory_storage() {
+        let storage = |b: FlureeServerBuilder| b.config.storage_type_str();
+        assert_eq!(storage(FlureeServerBuilder::memory()), "memory");
+        assert_eq!(storage(FlureeServerBuilder::new()), "file");
+    }
 
     fn auto_sync_config(server_role: ServerRole) -> ServerConfig {
         ServerConfig {
