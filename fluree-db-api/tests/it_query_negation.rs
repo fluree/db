@@ -118,6 +118,52 @@ async fn minus_after_values_undef_binds_shared_variable() {
 }
 
 #[tokio::test]
+async fn jsonld_minus_after_values_undef_binds_shared_variable() {
+    use fluree_db_api::{QueryInput, ReindexOptions};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "minus-values-undef-jsonld:main";
+    seed_minus_regression_people(&fluree, ledger_id).await;
+    let p = |i: usize| json!({"@type": "@id", "@value": format!("ex:p{i}")});
+    let values = json!(["values", ["?p", [p(0), p(1), p(1), null]]]);
+    for indexed in [false, true] {
+        if indexed {
+            fluree
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .unwrap();
+        }
+        let view = fluree.db(ledger_id).await.unwrap();
+        for (negation, expected) in [
+            ("minus", &[1, 1, 1, 2, 4, 5, 7, 8, 10, 11][..]),
+            ("not-exists", &[1, 1, 1, 2, 4, 5, 7, 8, 10, 11]),
+            ("exists", &[0, 0, 3, 6, 9]),
+        ] {
+            let q = json!({
+                "@context": ctx_ex(),
+                "select": "?p",
+                "where": [
+                    values,
+                    {"@id": "?p", "@type": "ex:Person"},
+                    [negation, {"@id": "?p", "ex:worksFor": "?org"}]
+                ]
+            });
+            let rows = fluree
+                .query(&view, QueryInput::JsonLd(&q))
+                .await
+                .unwrap()
+                .to_jsonld(&view.snapshot)
+                .unwrap();
+            let expected: Vec<_> = expected.iter().map(|i| format!("ex:p{i}")).collect();
+            assert_eq!(
+                normalize_rows(&rows),
+                normalize_rows(&json!(expected)),
+                "{negation}, indexed: {indexed}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn minus_at_historical_time_after_reindex() {
     use fluree_db_api::ReindexOptions;
     let fluree = FlureeBuilder::memory().build_memory();
