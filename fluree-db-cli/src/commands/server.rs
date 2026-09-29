@@ -688,6 +688,26 @@ async fn run_restart(
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<()> {
+    // Resolved and refused before anything stops, as `start` does, so
+    // `FLUREE_MEMORY_STORAGE` and `-- --memory` are caught too. Checked on
+    // this command's own arguments: the replayed ones always name a storage
+    // path, which would quietly outrank the environment.
+    let resolved = build_server_config(
+        config_override,
+        listen_addr,
+        storage_path.clone(),
+        connection_config.clone(),
+        false,
+        log_level.clone(),
+        bolt_listen_addr,
+        bolt_default_db.clone(),
+        profile.clone(),
+        extra_args,
+    )?;
+    if resolved.memory {
+        return Err(memory_needs_foreground());
+    }
+
     let dirs = config::require_fluree_dir(config_override)?;
     let data_dir = dirs.data_dir();
 

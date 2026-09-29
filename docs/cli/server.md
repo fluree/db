@@ -58,8 +58,8 @@ fluree server run --memory
 `--memory` keeps every ledger in memory: the server needs no `.fluree/` directory, writes nothing
 to the directory it runs in (not even `server.meta.json`), and loses all data when it exits. It
 cannot be combined with `--storage-path` or `--connection-config`, and it replaces a storage path
-set by `FLUREE_STORAGE_PATH`, a profile, or the config file. `FLUREE_MEMORY_STORAGE=true` does the
-same as the flag. With no `server.meta.json`, CLI auto-routing does not see a memory server (and,
+set by `FLUREE_STORAGE_PATH`, a profile, or the config file, logging a warning at startup when it
+does. `FLUREE_MEMORY_STORAGE=true` does the same as the flag. With no `server.meta.json`, CLI auto-routing does not see a memory server (and,
 like any foreground server, it has no PID file for `status` or `stop`); use its HTTP API directly.
 It suits tests and CI; see
 [Throwaway server for tests and CI](../operations/running-fluree.md#throwaway-server-for-tests-and-ci).

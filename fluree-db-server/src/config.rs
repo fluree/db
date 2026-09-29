@@ -436,6 +436,11 @@ pub struct ServerConfig {
     )]
     pub memory: bool,
 
+    /// The configured storage `--memory` took the place of, recorded while
+    /// settling it against other sources so startup can warn. Not an option.
+    #[arg(skip)]
+    pub memory_displaced: Option<String>,
+
     /// Enable CORS (Cross-Origin Resource Sharing). On by default;
     /// `--cors-enabled=false` turns it off.
     #[arg(
@@ -937,6 +942,7 @@ impl Default for ServerConfig {
             storage_path: None,
             connection_config: None,
             memory: false,
+            memory_displaced: None,
             iceberg_local_roots: None,
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
             indexing_enabled: server_defaults::DEFAULT_INDEXING_ENABLED,
@@ -1035,16 +1041,6 @@ impl ServerConfig {
     /// Create config from CLI args
     pub fn from_args() -> Self {
         Self::parse()
-    }
-
-    /// Check if using file storage (vs memory)
-    pub fn is_file_storage(&self) -> bool {
-        self.storage_path.is_some() && self.connection_config.is_none()
-    }
-
-    /// Check if using a connection config file (S3, DynamoDB, etc.)
-    pub fn has_connection_config(&self) -> bool {
-        self.connection_config.is_some()
     }
 
     /// The storage the server builds from this config, for logs and
@@ -1210,6 +1206,15 @@ impl ServerConfig {
                     .to_string(),
             );
         }
+        // A peer reads the transaction server's storage, which a store local
+        // to this process can never be.
+        if self.memory && self.server_role == ServerRole::Peer {
+            return Err(
+                "--memory is not available on a query peer (server_role=peer): a peer \
+                 reads the transaction server's storage"
+                    .to_string(),
+            );
+        }
 
         // Warn if both connection_config and storage_path are set
         if self.connection_config.is_some() && self.storage_path.is_some() {
@@ -1243,6 +1248,11 @@ impl ServerConfig {
                 return Err(
                     "raft.enabled=true is incompatible with storage-access-mode=proxy".to_string(),
                 );
+            }
+            // The log outlives the process; the ledger data it points at
+            // would not.
+            if self.memory {
+                return Err("raft.enabled=true is incompatible with --memory".to_string());
             }
             // The raft log + snapshot tree (raft_storage_path) and
             // the ledger content store (storage_path) both manage
@@ -1470,6 +1480,15 @@ mod raft_validation_tests {
     }
 
     #[test]
+    fn rejects_raft_with_memory_storage() {
+        let mut cfg = raft_enabled_base();
+        cfg.raft_storage_path = Some(PathBuf::from("/srv/raft"));
+        cfg.memory = true;
+        let err = cfg.validate().expect_err("the log would outlive the data");
+        assert!(err.contains("--memory"), "unexpected error message: {err}");
+    }
+
+    #[test]
     fn accepts_raft_without_local_storage_path() {
         // Connection-config-driven deployments don't set
         // `storage_path` at all — the disjoint check should noop.
@@ -1618,6 +1637,19 @@ mod storage_selection_tests {
         };
         let err = config.validate().expect_err("contradictory storage");
         assert!(err.contains("--memory"), "{err}");
+    }
+
+    #[test]
+    fn memory_on_a_query_peer_does_not_validate() {
+        let config = ServerConfig {
+            memory: true,
+            server_role: ServerRole::Peer,
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("a peer cannot share a memory store");
+        assert!(err.contains("query peer"), "{err}");
     }
 }
 

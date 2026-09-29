@@ -466,6 +466,12 @@ impl FlureeServer {
                  tokens there too"
             );
         }
+        if let Some(displaced) = &self.state.config.memory_displaced {
+            tracing::warn!(
+                "memory storage replaces the configured {displaced}; everything written \
+                 is lost when the server stops"
+            );
+        }
         #[cfg(not(feature = "bolt"))]
         if self.state.config.bolt_listen_addr.is_some() {
             tracing::warn!(

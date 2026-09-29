@@ -1038,7 +1038,9 @@ pub fn load_and_merge_config(
 /// `--memory` and a storage path or connection config choose the same thing,
 /// so the higher-precedence source wins. Memory comes only from a flag or
 /// `FLUREE_MEMORY_STORAGE`; when both sides are flags they are left for
-/// [`ServerConfig::validate`] to reject.
+/// [`ServerConfig::validate`] to reject. What memory displaces is recorded in
+/// [`ServerConfig::memory_displaced`]: this runs before logging starts, so the
+/// server warns about it at startup instead.
 fn settle_memory_storage(config: &mut ServerConfig, matches: &ArgMatches) {
     use clap::parser::ValueSource;
 
@@ -1052,8 +1054,22 @@ fn settle_memory_storage(config: &mut ServerConfig, matches: &ArgMatches) {
         (true, true) => {}
         (false, true) => config.memory = false,
         (_, false) => {
-            config.storage_path = None;
-            config.connection_config = None;
+            let displaced: Vec<String> = [
+                config
+                    .storage_path
+                    .take()
+                    .map(|p| format!("storage path {}", p.display())),
+                config
+                    .connection_config
+                    .take()
+                    .map(|p| format!("connection config {}", p.display())),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !displaced.is_empty() {
+                config.memory_displaced = Some(displaced.join(" and "));
+            }
         }
     }
 }
@@ -1222,8 +1238,14 @@ mod tests {
             c.memory && c.storage_path.is_none() && c.connection_config.is_none()
         };
 
-        // The flag beats the file and the environment.
-        assert!(memory_only(&settle(&with_storage, &["--memory"], &[])));
+        // The flag beats the file and the environment, and records what it
+        // displaced so startup can warn.
+        let over_file = settle(&with_storage, &["--memory"], &[]);
+        assert!(memory_only(&over_file));
+        assert_eq!(
+            over_file.memory_displaced.as_deref(),
+            Some("storage path /from/file and connection config /from/file.jsonld")
+        );
         assert!(memory_only(&settle(
             &empty,
             &["--memory"],
@@ -1241,6 +1263,8 @@ mod tests {
             &[],
             &[(MEMORY_ENV, "true"), (PATH_ENV, "/from/env")]
         )));
+        // Nothing configured, nothing displaced.
+        assert_eq!(settle(&empty, &["--memory"], &[]).memory_displaced, None);
         // A storage path flag beats memory from the environment.
         let flagged = settle(
             &empty,
@@ -1248,6 +1272,7 @@ mod tests {
             &[(MEMORY_ENV, "true")],
         );
         assert!(!flagged.memory);
+        assert_eq!(flagged.memory_displaced, None);
         assert_eq!(flagged.storage_path, Some(PathBuf::from("/from/flag")));
         // Two flags are left in place for `validate` to reject.
         let both = settle(&empty, &["--memory", "--storage-path", "/from/flag"], &[]);

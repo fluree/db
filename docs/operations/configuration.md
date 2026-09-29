@@ -273,7 +273,12 @@ files. `fluree server start` does not run in memory mode. There is no config fil
 `--memory` cannot be combined with `--storage-path` or `--connection-config`. It replaces a
 storage path or connection config set in the environment, a profile, or the config file.
 `FLUREE_MEMORY_STORAGE=true` does the same, except that a `--storage-path` or
-`--connection-config` flag beats it.
+`--connection-config` flag beats it. When memory storage replaces a configured storage path or
+connection config, the server logs a warning at startup naming what it replaced, since that
+data is not being read and nothing written is kept.
+
+A query peer (`--server-role peer`) and a Raft node refuse `--memory`: a peer reads the
+transaction server's storage, and a Raft log outlives the process that holds the data it refers to.
 
 ### Connection Configuration (S3, DynamoDB, etc.)
 

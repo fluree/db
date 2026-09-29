@@ -248,3 +248,77 @@ fn start_and_restart_refuse_memory() {
     }
     assert_empty(dir.path());
 }
+
+/// `restart` refuses memory mode, from `-- --memory` or the environment,
+/// before it stops anything: a running daemon is still serving afterwards.
+#[tokio::test]
+async fn restart_refuses_memory_without_stopping_the_daemon() {
+    let dir = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let fluree = |args: &[&str], memory_env: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fluree"));
+        cmd.args(args)
+            .current_dir(dir.path())
+            .env("HOME", outside.path())
+            .env("TMPDIR", outside.path())
+            .stdin(Stdio::null());
+        for (var, _) in std::env::vars_os() {
+            let name = var.to_string_lossy();
+            if name.starts_with("FLUREE_") || name.starts_with("XDG_") {
+                cmd.env_remove(&var);
+            }
+        }
+        if memory_env {
+            cmd.env("FLUREE_MEMORY_STORAGE", "true");
+        }
+        cmd
+    };
+    /// Stops the daemon however the test ends.
+    struct Daemon<F: Fn(&[&str], bool) -> Command>(F);
+    impl<F: Fn(&[&str], bool) -> Command> Drop for Daemon<F> {
+        fn drop(&mut self) {
+            let _ = (self.0)(&["server", "stop"], false).output();
+        }
+    }
+
+    assert!(fluree(&["init"], false).status().unwrap().success());
+    let addr = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap()
+    };
+    let started = fluree(
+        &["server", "start", "--listen-addr", &addr.to_string()],
+        false,
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .unwrap();
+    assert!(started.success());
+    let _daemon = Daemon(fluree);
+    let health = format!("http://{addr}/health");
+    let healthy = || async {
+        reqwest::get(&health)
+            .await
+            .is_ok_and(|r| r.status().is_success())
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !healthy().await {
+        assert!(Instant::now() < deadline, "daemon never became healthy");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for (args, memory_env) in [
+        (&["server", "restart", "--", "--memory"][..], false),
+        (&["server", "restart"][..], true),
+    ] {
+        let out = (_daemon.0)(args, memory_env).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("fluree server run --memory"),
+            "{args:?}: {stderr}"
+        );
+        assert!(healthy().await, "{args:?} stopped the daemon");
+    }
+}
