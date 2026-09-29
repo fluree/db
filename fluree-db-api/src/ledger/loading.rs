@@ -189,6 +189,7 @@ impl Fluree {
     /// # Errors
     ///
     /// - [`ApiError::LedgerExists`] if the branch already exists
+    /// - [`ApiError::InvalidBranch`] if the source branch has no commits
     /// - [`ApiError::NotFound`] if the source branch does not exist, or if
     ///   `source_commit` resolves to a commit not reachable from source HEAD
     pub async fn create_branch(
@@ -221,7 +222,10 @@ impl Fluree {
 
         // Verify the source branch has a commit head before creating.
         let source_head = source_record.commit_head_id.clone().ok_or_else(|| {
-            ApiError::internal(format!("Source branch {source_id} has no commit head"))
+            ApiError::InvalidBranch(format!(
+                "Cannot branch from '{source_id}': it has no commits yet. \
+                 Transact to it first."
+            ))
         })?;
 
         // If the caller specified a historical commit, resolve it and verify

@@ -2212,7 +2212,7 @@ POST /branch
 
 **Status Codes:**
 - `201 Created` - Branch created successfully
-- `400 Bad Request` - Invalid request body (including malformed `at` value)
+- `400 Bad Request` - Invalid request body (including malformed `at` value), or the source branch has no commits yet
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
 - `404 Not Found` - Source branch does not exist, or `at` commit is not reachable from source HEAD
 - `409 Conflict` - Branch already exists
@@ -2716,6 +2716,7 @@ When `include_conflict_details=true`, `conflicts.details[]` contains one entry f
 - `400 Bad Request` — Source has no branch point (e.g., main), `source == target`, unknown strategy, unsupported preview strategy, `include_conflict_details=true` with `include_conflicts=false`, `strategy=abort` with `include_conflicts=false`, or `changes_after_subject` without `include_changes=true`
 - `401 Unauthorized` — Bearer token required
 - `404 Not Found` — Ledger or branch does not exist (or bearer cannot read it)
+- `409 Conflict` — The source's namespace allocations conflict with the target's (`@type` `err:db/CommitConflict`)
 
 **Examples:**
 
