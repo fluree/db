@@ -584,3 +584,78 @@ async fn connection_construct_turtle_is_406() {
     let (status, _, _) = post_connection_sparql(&state, &construct, Some("text/turtle")).await;
     assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
 }
+
+/// A template with a `GRAPH` block produces a dataset: TriG, N-Quads and
+/// JSON-LD carry it, and an `Accept` that admits only triples formats is a 406.
+#[tokio::test]
+async fn construct_graph_template_negotiates_dataset_formats() {
+    let (_tmp, state) = server_state().await;
+    let ledger = "test/construct-dataset:main";
+    seed(&state, ledger).await;
+    let construct = "PREFIX schema: <http://schema.org/> \
+                     CONSTRUCT { GRAPH <http://ex.org/names> { ?s schema:name ?n } } \
+                     WHERE { ?s schema:name ?n }";
+
+    let (status, content_type, body) =
+        post_sparql(&state, ledger, construct, Some("application/n-quads")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(content_type, "application/n-quads; charset=utf-8");
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        "<http://ex.org/alice> <http://schema.org/name> \"Alice\" <http://ex.org/names> .\n"
+    );
+
+    let (status, content_type, body) =
+        post_sparql(&state, ledger, construct, Some("application/trig")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(content_type, "application/trig; charset=utf-8");
+    assert!(
+        String::from_utf8_lossy(&body).contains("GRAPH <http://ex.org/names> {"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Among the Accept ranges, only the dataset formats are candidates.
+    let (status, content_type, _) = post_sparql(
+        &state,
+        ledger,
+        construct,
+        Some("text/turtle, application/n-quads;q=0.5"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("application/n-quads"),
+        "{content_type}"
+    );
+
+    let (status, content_type, body) = post_sparql(&state, ledger, construct, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("application/ld+json"),
+        "{content_type}"
+    );
+    let doc: JsonValue = serde_json::from_slice(&body).unwrap();
+    assert!(
+        doc["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["@id"] == "http://ex.org/names" && n["@graph"].is_array()),
+        "{doc}"
+    );
+
+    for accept in [
+        "text/turtle",
+        "application/n-triples",
+        "application/rdf+xml",
+    ] {
+        let (status, _, body) = post_sparql(&state, ledger, construct, Some(accept)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_ACCEPTABLE,
+            "{accept}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}

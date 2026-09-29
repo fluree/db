@@ -11,7 +11,7 @@ pub async fn run(
 ) -> CliResult<()> {
     let alias = context::resolve_ledger(ledger, dirs)?;
     let fluree = context::build_fluree(dirs)?;
-    let ledger_id = context::to_ledger_id(&alias);
+    let ledger_id = context::to_ledger_id(&alias)?;
 
     let report = fluree.verify_ledger(&ledger_id, limit).await.map_err(|e| {
         if e.is_not_found() {

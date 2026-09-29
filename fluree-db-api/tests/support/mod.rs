@@ -370,7 +370,9 @@ pub async fn trigger_index_and_wait_outcome(
     ledger_id: &str,
     t: i64,
 ) -> fluree_db_api::IndexOutcome {
-    let completion = handle.trigger(ledger_id, t).await;
+    let completion = handle
+        .trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), t)
+        .await;
     match completion.wait().await {
         ok @ fluree_db_api::IndexOutcome::Completed { .. } => ok,
         fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -431,7 +433,10 @@ pub fn start_background_indexer_with_attachments(
 
     #[async_trait]
     impl AttachmentEventsProvider for TestProvider {
-        async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {
+        async fn attachment_events(
+            &self,
+            ledger_id: &fluree_db_api::LedgerId,
+        ) -> Option<AttachmentEventCoverage> {
             use fluree_db_api::ledger_manager::RunningCoverage;
             let result = self
                 .manager
@@ -861,7 +866,12 @@ pub async fn run_collector_and_fork_drop_scenario(
                 )
                 .await
                 .expect("insert");
-            let completion = handle.trigger(&ledger_id, result.receipt.t).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
+                    result.receipt.t,
+                )
+                .await;
             match tokio::time::timeout(Duration::from_secs(120), completion.wait())
                 .await
                 .expect("build timed out: a release window must not wedge the worker")
@@ -875,7 +885,11 @@ pub async fn run_collector_and_fork_drop_scenario(
     // Every dictionary blob `ledger_id`'s whole chain references is present.
     let assert_dicts_present = |ledger_id: String, stage: &'static str| async move {
         // Let a pass the last publish spawned finish before looking.
-        drop(handle.hold_gc(ledger_name).await);
+        drop(
+            handle
+                .hold_gc(&fluree_db_api::LedgerName::parse(ledger_name).unwrap())
+                .await,
+        );
         let head = fluree
             .nameservice()
             .lookup(&ledger_id)
@@ -886,7 +900,7 @@ pub async fn run_collector_and_fork_drop_scenario(
         let refs = shared_refs_of_branches(
             fluree.backend(),
             &[BranchIndexHead {
-                ledger_id: ledger_id.clone(),
+                ledger_id: fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
                 index_head_id: head,
             }],
             None,

@@ -592,6 +592,110 @@ async fn create_branch_at_historical_t() {
 }
 
 #[tokio::test]
+async fn create_branch_from_empty_ledger_is_bad_request() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "empty:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "empty", "branch": "dev"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got: {json}");
+    assert_eq!(json["@type"], "err:api/BadRequest", "{json}");
+    assert!(
+        json.to_string().contains("no commits yet"),
+        "expected the empty-source message, got: {json}"
+    );
+}
+
+/// Merge-preview returns the API error typed; merge reaches the HTTP layer
+/// through the committer, flattened to a bare status. Both answer alike.
+#[tokio::test]
+async fn merging_a_root_branch_is_bad_request_on_both_routes() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "root:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/root?source=main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let merge = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/merge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "root", "source": "main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    for resp in [preview, merge] {
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "got: {json}");
+        assert_eq!(json["@type"], "err:api/BadRequest", "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("no source branch")),
+            "expected the root-branch message, got: {json}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn merge_preview_include_changes() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state.clone());

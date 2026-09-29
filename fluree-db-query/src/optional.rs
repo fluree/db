@@ -3109,7 +3109,7 @@ mod tests {
         );
         op.set_row_budget(10);
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let first = op.pull_coalesced_required(&ctx).await.unwrap().unwrap();
@@ -3385,7 +3385,7 @@ mod tests {
 
         let map_provider = MapProvider(Arc::clone(&mapping));
         let table_provider = TableProvider;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let mut ctx = ExecutionContext::new(&snapshot, &vars);
         ctx = ctx.with_r2rml_providers(&map_provider, &table_provider);
@@ -3612,7 +3612,7 @@ mod tests {
 
         let map_provider = MapProvider(Arc::clone(&mapping));
         let table_provider = TableProvider;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let mut ctx = ExecutionContext::new(&snapshot, &vars);
         ctx = ctx.with_r2rml_providers(&map_provider, &table_provider);
@@ -3711,7 +3711,7 @@ mod tests {
         use fluree_db_core::FlakeValue;
         use fluree_db_core::LedgerSnapshot;
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -3945,7 +3945,7 @@ mod tests {
             CountingCoalesceBuilder::new(&rs, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let mut op =
             OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -3987,7 +3987,7 @@ mod tests {
         let builder = CountingCoalesceBuilder::new(&rs, Arc::clone(&calls));
         let mut op =
             OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

@@ -219,12 +219,15 @@ async fn notify_single_commit_uses_incremental_path() {
     assert!(t_after_first >= 1);
 
     // Cache the ledger in the manager (simulates a prior request)
-    let _handle = manager.get_or_load(ledger_id).await.expect("load");
+    let _handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load");
 
     // Verify it's cached and current
     let result = manager
         .notify(NsNotify {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
             record: None,
         })
         .await
@@ -241,7 +244,7 @@ async fn notify_single_commit_uses_incremental_path() {
     // Notify — should use CommitCatchUp (gap=1), NOT reload
     let result = manager
         .notify(NsNotify {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
             record: None,
         })
         .await
@@ -253,7 +256,10 @@ async fn notify_single_commit_uses_incremental_path() {
     );
 
     // Verify the cached state now reflects the new commit
-    let handle = manager.get_or_load(ledger_id).await.expect("re-load");
+    let handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("re-load");
     let state = handle.snapshot().await;
     assert_eq!(
         state.t,
@@ -275,7 +281,10 @@ async fn notify_small_gap_uses_incremental_path() {
     let t_initial = ledger1.t();
 
     // Cache the ledger
-    let _handle = manager.get_or_load(ledger_id).await.expect("load");
+    let _handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load");
 
     // Transact 3 more commits
     let ledger2 = insert_data(&fluree, ledger1, "item2").await;
@@ -285,7 +294,7 @@ async fn notify_small_gap_uses_incremental_path() {
     // Notify — should catch up 3 commits incrementally
     let result = manager
         .notify(NsNotify {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
             record: None,
         })
         .await
@@ -297,7 +306,10 @@ async fn notify_small_gap_uses_incremental_path() {
     );
 
     // Verify final t
-    let handle = manager.get_or_load(ledger_id).await.expect("re-load");
+    let handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("re-load");
     let state = handle.snapshot().await;
     assert_eq!(state.t, t_initial + 3);
 }
@@ -313,7 +325,10 @@ async fn notify_large_gap_falls_back_to_reload() {
     let mut ledger = insert_data(&fluree, ledger0, "item0").await;
 
     // Cache the ledger
-    let _handle = manager.get_or_load(ledger_id).await.expect("load");
+    let _handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load");
 
     // Transact 6 more commits (exceeds MAX_INCREMENTAL_COMMITS = 5)
     for i in 1..=6 {
@@ -323,7 +338,7 @@ async fn notify_large_gap_falls_back_to_reload() {
     // Notify — gap is 6, should fall back to full reload
     let result = manager
         .notify(NsNotify {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
             record: None,
         })
         .await
@@ -388,7 +403,10 @@ async fn notify_index_only_trims_novelty() {
             let commit_t = ledger1.ledger.t();
 
             // Cache the ledger (has novelty, no index yet)
-            let handle = manager.get_or_load(ledger_id).await.expect("load");
+            let handle = manager
+                .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+                .await
+                .expect("load");
             let state_before = handle.snapshot().await;
             // snapshot.t is the index_t (from the LedgerSnapshot)
             assert_eq!(
@@ -404,7 +422,7 @@ async fn notify_index_only_trims_novelty() {
             // Notify — commit_t unchanged, index advanced → IndexOnly plan
             let result = manager
                 .notify(NsNotify {
-                    ledger_id: ledger_id.to_string(),
+                    ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
                     record: None,
                 })
                 .await
@@ -417,7 +435,10 @@ async fn notify_index_only_trims_novelty() {
             );
 
             // Verify the cached state now has the index
-            let handle = manager.get_or_load(ledger_id).await.expect("re-load");
+            let handle = manager
+                .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+                .await
+                .expect("re-load");
             let state_after = handle.snapshot().await;
             assert_eq!(
                 state_after.snapshot.t, commit_t,
@@ -463,7 +484,10 @@ async fn notify_branch_catch_up_resolves_pre_fork_parent() {
     //    will compare against when dev advances.
     let dev_ledger = fluree.ledger(dev_id).await.expect("open dev");
     let local_t_before = dev_ledger.t();
-    let _handle = manager.get_or_load(dev_id).await.expect("cache dev");
+    let _handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(dev_id).unwrap())
+        .await
+        .expect("cache dev");
 
     // 4. Transact on dev — this commit's `previous` points at the t=1
     //    commit that lives under main's namespace, not dev's.
@@ -476,7 +500,7 @@ async fn notify_branch_catch_up_resolves_pre_fork_parent() {
     //    to main's namespace and resolves it.
     let result = manager
         .notify(NsNotify {
-            ledger_id: dev_id.to_string(),
+            ledger_id: fluree_db_api::LedgerId::parse(dev_id).unwrap(),
             record: None,
         })
         .await
@@ -487,7 +511,10 @@ async fn notify_branch_catch_up_resolves_pre_fork_parent() {
         "expected CommitsApplied {{ count: 1 }} via branch-aware catch-up, got: {result:?}"
     );
 
-    let handle = manager.get_or_load(dev_id).await.expect("re-load dev");
+    let handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(dev_id).unwrap())
+        .await
+        .expect("re-load dev");
     let state = handle.snapshot().await;
     assert_eq!(
         state.t,
@@ -544,7 +571,10 @@ async fn notify_branch_refresh_after_incremental_index_on_branch() {
                 .create_branch(ledger_name, "dev", None, None)
                 .await
                 .expect("create_branch");
-            let handle = manager.get_or_load(dev_id).await.expect("cache dev");
+            let handle = manager
+                .get_or_load(&fluree_db_api::LedgerId::parse(dev_id).unwrap())
+                .await
+                .expect("cache dev");
             assert_eq!(handle.snapshot().await.ledger_id(), Some(dev_id));
 
             // 3. Write on dev, then let the indexer index the branch itself.
@@ -586,7 +616,7 @@ async fn notify_branch_refresh_after_incremental_index_on_branch() {
             //    LedgerIdMismatch on the branch's first own index.
             let result = manager
                 .notify(NsNotify {
-                    ledger_id: dev_id.to_string(),
+                    ledger_id: fluree_db_api::LedgerId::parse(dev_id).unwrap(),
                     record: None,
                 })
                 .await
@@ -597,7 +627,7 @@ async fn notify_branch_refresh_after_incremental_index_on_branch() {
             );
 
             let state = manager
-                .get_or_load(dev_id)
+                .get_or_load(&fluree_db_api::LedgerId::parse(dev_id).unwrap())
                 .await
                 .expect("re-load dev")
                 .snapshot()
@@ -623,7 +653,7 @@ async fn notify_returns_not_loaded_for_uncached_ledger() {
 
     let result = manager
         .notify(NsNotify {
-            ledger_id: "nonexistent:main".to_string(),
+            ledger_id: fluree_db_api::LedgerId::parse("nonexistent:main").unwrap(),
             record: None,
         })
         .await

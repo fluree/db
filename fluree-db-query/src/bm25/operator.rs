@@ -722,7 +722,7 @@ mod tests {
     }
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        let mut snapshot = LedgerSnapshot::genesis("test/main");
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
         // Ensure example IRIs used by BM25 tests are encodable to SIDs.
         snapshot
             .insert_namespace_code(100, "http://example.org/".to_string())

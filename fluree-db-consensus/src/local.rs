@@ -98,6 +98,8 @@ impl Committer for LocalCommitter {
             governance,
         } = request;
 
+        let ledger_id = fluree_db_core::LedgerId::expect_canonical(&ledger_id, "LocalTransactor")
+            .map_err(|e| execution_failure(e.into()))?;
         let ledger_handle = self
             .ledger_manager()?
             .get_or_load(&ledger_id)

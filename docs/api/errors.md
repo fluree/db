@@ -87,6 +87,7 @@ The request is malformed or contains invalid data.
 - Invalid SPARQL syntax
 - Invalid IRI format
 - Type mismatch
+- Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
 
 **Error typing:**
 
@@ -211,6 +212,7 @@ The request conflicts with current server state.
 **Common Causes:**
 - Concurrent modification conflict
 - Ledger already exists
+- Branch conflict (`err:db/CommitConflict`), such as a merge or rebase with `strategy=abort` meeting conflicting changes, or another maintenance operation holding the ledger (retry when it completes)
 - Resource state conflict
 
 **Example:**

@@ -157,7 +157,7 @@ pub async fn resolve_graph_ref(
 
     let key: (ArtifactKind, String, String, i64) = (
         kind,
-        canonical_ledger_id.clone(),
+        canonical_ledger_id.clone().to_string(),
         graph_iri.to_string(),
         resolved_t,
     );
@@ -310,6 +310,10 @@ async fn materialize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn id(s: &str) -> fluree_db_core::LedgerId {
+        fluree_db_core::LedgerId::parse(s).unwrap()
+    }
     use crate::cross_ledger::ResolveCtx;
     use crate::FlureeBuilder;
     use fluree_db_core::ledger_config::GraphSourceRef;
@@ -337,7 +341,8 @@ mod tests {
     #[tokio::test]
     async fn missing_ledger_field_is_a_call_site_bug() {
         let fluree = FlureeBuilder::memory().build_memory();
-        let mut ctx = ResolveCtx::new("d:main", &fluree);
+        let data_id = id("d:main");
+        let mut ctx = ResolveCtx::new(&data_id, &fluree);
 
         let err = resolve_graph_ref(
             &local_ref("http://example.org/policy"),
@@ -358,7 +363,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_model_ledger_returns_model_ledger_missing() {
         let fluree = FlureeBuilder::memory().build_memory();
-        let mut ctx = ResolveCtx::new("d:main", &fluree);
+        let data_id = id("d:main");
+        let mut ctx = ResolveCtx::new(&data_id, &fluree);
 
         let err = resolve_graph_ref(
             &cross_ref("nope:main", "http://example.org/policy"),
@@ -382,7 +388,8 @@ mod tests {
         // the "no fallback to nearest-available" retention guard
         // the design doc requires, so resolve_graph_ref must reject.
         let fluree = FlureeBuilder::memory().build_memory();
-        let mut ctx = ResolveCtx::new("d:main", &fluree);
+        let data_id = id("d:main");
+        let mut ctx = ResolveCtx::new(&data_id, &fluree);
 
         let mut pinned = cross_ref("m:main", "http://example.org/policy");
         pinned.at_t = Some(5);
@@ -402,7 +409,8 @@ mod tests {
     #[tokio::test]
     async fn trust_policy_field_is_rejected_until_phase_4() {
         let fluree = FlureeBuilder::memory().build_memory();
-        let mut ctx = ResolveCtx::new("d:main", &fluree);
+        let data_id = id("d:main");
+        let mut ctx = ResolveCtx::new(&data_id, &fluree);
 
         let mut ref_with_trust = cross_ref("m:main", "http://example.org/policy");
         ref_with_trust.trust_policy = Some(fluree_db_core::ledger_config::TrustPolicy {
@@ -424,7 +432,8 @@ mod tests {
     #[tokio::test]
     async fn rollback_guard_field_is_rejected_until_phase_4() {
         let fluree = FlureeBuilder::memory().build_memory();
-        let mut ctx = ResolveCtx::new("d:main", &fluree);
+        let data_id = id("d:main");
+        let mut ctx = ResolveCtx::new(&data_id, &fluree);
 
         let mut ref_with_guard = cross_ref("m:main", "http://example.org/policy");
         ref_with_guard.rollback_guard =

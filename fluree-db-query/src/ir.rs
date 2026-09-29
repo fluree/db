@@ -59,6 +59,6 @@ pub use projection::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec,
     Projection, Root,
 };
-pub use query::{ConstructTemplate, Query, QueryOutput, Restriction};
+pub use query::{ConstructTemplate, Query, QueryOutput, Restriction, TemplateReification};
 pub use reasoning::{ReasoningConfig, ReasoningModes};
 pub use triple::{Ref, Term, TriplePattern};

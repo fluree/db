@@ -26,6 +26,7 @@ use crate::{Fluree, IndexConfig, LedgerHandle};
 use base64::Engine as _;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentId;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{
     range_with_overlay, ContentAddressedWrite, ContentKind, Flake, GraphId, IndexType, Sid,
     TXN_META_GRAPH_ID,
@@ -258,7 +259,7 @@ pub struct PushedHead {
 /// left is the single ref advance.
 pub struct StagedPush {
     /// Target ledger id (`"<name>:<branch>"`).
-    pub ledger: String,
+    pub ledger: LedgerId,
     /// Number of commits accepted in this push.
     pub accepted: usize,
     /// Branch's pre-push head snapshot. The local apply path passes
@@ -337,6 +338,7 @@ impl Fluree {
         if request.commits.is_empty() {
             return Err(ApiError::http(400, "missing required field 'commits'"));
         }
+        let ledger_id = &LedgerId::parse(ledger_id)?;
 
         // 0) Lock ledger state for write (serialize with transactions).
         let guard = self
@@ -644,7 +646,7 @@ impl Fluree {
         };
 
         Ok(StagedPush {
-            ledger: ledger_id.to_string(),
+            ledger: ledger_id.clone(),
             accepted,
             rollback_snapshot,
             pre_push_head: current_ref,
@@ -714,7 +716,7 @@ impl Fluree {
         }
 
         Ok(PushCommitsResponse {
-            ledger,
+            ledger: ledger.to_string(),
             accepted,
             head: PushedHead {
                 t: new_head_t,
@@ -2026,8 +2028,7 @@ impl Fluree {
         // callers may pass a bare `name` (the CLI does), which `create_ledger`
         // would register as `name:main` while raw-id storage writes would land
         // in the wrong namespace.
-        let new_ledger_id = fluree_db_core::ledger_id::normalize_ledger_id(new_ledger_id)
-            .unwrap_or_else(|_| new_ledger_id.to_string());
+        let new_ledger_id = LedgerId::parse(new_ledger_id)?.to_string();
         let new_ledger_id = new_ledger_id.as_str();
 
         // Create the empty target first. `create_ledger` errors if the name is
@@ -2402,6 +2403,7 @@ impl Fluree {
         if commits.is_empty() {
             return Err(ApiError::http(400, "no commits to import"));
         }
+        let ledger_id = &LedgerId::parse(ledger_id)?;
 
         let mut guard = self
             .lock_ledger(ledger_id)

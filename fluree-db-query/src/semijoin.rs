@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn projected_keys_preserve_bound_constraints_and_handle_empty_keys() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let mut op = semijoin(vec![triple()]);
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn projected_key_cache_is_bounded_and_keeps_existing_masks() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let mut op = semijoin(vec![triple()]);
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn compound_inner_patterns_keep_seeded_evaluation() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let rows = batch(vec![vec![
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn projected_lookup_honors_memory_budget_and_cancellation() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let cancellation = QueryCancellation::new();
         cancellation.set_memory_limit(1);
@@ -573,7 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn base_lookup_charges_only_distinct_keys_and_enforces_budget() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let expected_bytes = 2 * key_entry_bytes(2);
         for budget in [expected_bytes, expected_bytes - 1] {

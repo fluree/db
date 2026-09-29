@@ -23,12 +23,14 @@ These options are available on `run`, `start`, and `restart`:
 | `--storage-path <PATH>` | Storage path override (local file storage) |
 | `--connection-config <FILE>` | JSON-LD connection config for S3, DynamoDB, etc. |
 | `--log-level <LEVEL>` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
+| `--bolt-listen-addr <ADDR>` | Bolt protocol listen address (e.g., `0.0.0.0:7687`); unset = Bolt disabled |
+| `--bolt-default-db <LEDGER>` | Default ledger for Bolt sessions that select no database |
 | `--profile <NAME>` | Configuration profile to activate |
 | `-- <ARGS>...` | Additional server flags (passed through to server config) |
 
 `--storage-path` and `--connection-config` are mutually exclusive. Use `--storage-path` for local file storage or `--connection-config` for remote backends (S3, DynamoDB, split storage). See [Configuration](../operations/configuration.md#connection-configuration-s3-dynamodb-etc) for details.
 
-When no flags are provided, the server discovers its configuration using the same search as the CLI: it walks up from the current working directory looking for a `.fluree/config.toml` (or `config.jsonld`), then falls back to the global Fluree config directory (`$FLUREE_HOME`, or the platform config directory — see [Configuration](../operations/configuration.md)). Server settings live under the `[server]` section. The CLI's `--config` flag is also honored.
+When no flags are provided, the server discovers its configuration using the same search as the CLI: it walks up from the current working directory looking for a `.fluree/config.toml` (or `config.jsonld`). Unlike read-only CLI commands, `run` and `start` do not fall back to the global Fluree directory: with no `.fluree/` found they exit with an error (run `fluree init` first, or pass `--config`). Server settings live under the `[server]` section. The CLI's `--config` flag is also honored.
 
 ## run
 

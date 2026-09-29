@@ -202,8 +202,10 @@ A `CONSTRUCT` or `DESCRIBE` result is an RDF graph rather than a table of soluti
 | Turtle | `text/turtle` | `FormatterConfig::turtle()` |
 | N-Triples | `application/n-triples` | `FormatterConfig::ntriples()` |
 | RDF/XML | `application/rdf+xml` | `FormatterConfig::rdf_xml()` |
+| TriG | `application/trig` | `FormatterConfig::trig()` |
+| N-Quads | `application/n-quads` | `FormatterConfig::nquads()` |
 
-Turtle, N-Triples and RDF/XML are strings: use `execute_formatted_string()` or `format_results_string()`. Every format sorts the graph and removes duplicate triples.
+All but JSON-LD are strings: use `execute_formatted_string()` or `format_results_string()`. Every format sorts each graph and removes duplicate triples.
 
 ```sparql
 PREFIX ex: <http://example.org/ns/>
@@ -220,7 +222,11 @@ ex:alice ex:label "Alice" .
 ex:bob ex:label "Bob" .
 ```
 
-N-Triples writes one triple per line with full IRIs. Both use the canonical N-Triples escapes for strings, and escape characters an IRI may not contain as `\uXXXX`, which reads back as the same IRI. Blank nodes keep their stored labels (`_:fdb-…`), so the output can be written back to the same nodes. RDF 1.2 edge annotations are not included in any graph format yet.
+N-Triples writes one triple per line with full IRIs. Both use the canonical N-Triples escapes for strings, and escape characters an IRI may not contain as `\uXXXX`, which reads back as the same IRI. Blank nodes keep their stored labels (`_:fdb-…`), so the output can be written back to the same nodes.
+
+**Named graphs.** A CONSTRUCT template with `GRAPH` blocks produces a dataset (see [CONSTRUCT](construct.md#named-graphs-in-the-template)). TriG writes the default graph as top-level Turtle and each named graph as a `GRAPH <name> { ... }` block; N-Quads adds the graph name as a fourth term; JSON-LD adds a `{"@id": <name>, "@graph": [...]}` node per named graph. Turtle, N-Triples and RDF/XML cannot express named graphs and refuse such a result (over HTTP, a `406`). Without named graphs, TriG and N-Quads output are plain Turtle and N-Triples.
+
+**Edge annotations.** A reifier attached to a result triple (see [CONSTRUCT](construct.md#edge-annotations-in-the-template)) is written as `o ~ r` after the object in Turtle and TriG, as an `r rdf:reifies <<( s p o )>>` line in N-Triples and N-Quads, as `"@annotation": {"@id": r}` on the value in JSON-LD, and as the RDF 1.2 `rdf:annotation` (or `rdf:annotationNodeID`) attribute on the property element in RDF/XML.
 
 ## Array Normalization
 
@@ -400,7 +406,7 @@ Available format constructors:
 - `FormatterConfig::sparql_json()` — SPARQL 1.1 JSON Results (default for SPARQL queries)
 - `FormatterConfig::typed_json()` — Typed JSON with explicit datatypes on every value
 - `FormatterConfig::agent_json()` — Agent JSON envelope for LLM/agent consumers
-- `FormatterConfig::turtle()` / `ntriples()` / `rdf_xml()` — graph text formats for CONSTRUCT/DESCRIBE (see [Graph Formats](#graph-formats-construct--describe))
+- `FormatterConfig::turtle()` / `ntriples()` / `rdf_xml()` / `trig()` / `nquads()` — graph text formats for CONSTRUCT/DESCRIBE (see [Graph Formats](#graph-formats-construct--describe))
 
 Builder methods:
 - `.with_normalize_arrays()` — Force array wrapping for all graph crawl properties
@@ -455,7 +461,7 @@ fluree query --format typed-json --normalize-arrays '{"select": {"ex:alice": ["*
 - **Typed JSON** adds a constant-factor overhead per literal value (the `@value`/`@type` wrapper). Query execution is unaffected — only the formatting phase is slower.
 - **normalize_arrays** adds zero overhead when disabled (default). When enabled, it skips the `len() == 1` check — no additional allocations beyond the array wrapper.
 - **TSV/CSV** bypass JSON construction entirely for maximum throughput
-- **Turtle, N-Triples and RDF/XML** write the constructed graph straight into one output string, with no JSON DOM; decoded IRIs are shared across the triples that repeat them. They allocate far less than CONSTRUCT's JSON-LD, which builds a `serde_json::Value` DOM
+- **Turtle, N-Triples, RDF/XML, TriG and N-Quads** write the constructed graph straight into one output string, with no JSON DOM; decoded IRIs are shared across the triples that repeat them. They allocate far less than CONSTRUCT's JSON-LD, which builds a `serde_json::Value` DOM
 - **Graph output is not streamed or paged.** Every graph format builds the whole constructed graph, then the whole document, before the first byte is sent, so memory grows with the result. For a large graph, bound the CONSTRUCT with `LIMIT` / `OFFSET`, or export the ledger.
 
 ## Best Practices
