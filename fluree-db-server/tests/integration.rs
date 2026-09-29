@@ -563,6 +563,9 @@ async fn create_branch_at_time() {
     for (at, expect) in [
         ("time:2019-01-01T00:00:00Z", "no data as of"),
         ("time:2021-13-45T00:00:00Z", "Invalid ISO-8601 timestamp"),
+        ("t:0", "must be >= 1"),
+        ("0", "must be >= 1"),
+        ("-3", "must be >= 1"),
         ("snapshot:7", "@snapshot:"),
         ("time:", "Missing value after 'time:'"),
     ] {

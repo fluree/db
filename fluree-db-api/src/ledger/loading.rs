@@ -200,8 +200,8 @@ impl Fluree {
     /// - [`ApiError::LedgerExists`] if the branch already exists
     /// - [`ApiError::InvalidBranch`] if the source branch has no commits, or
     ///   `at` is a malformed timestamp, a time before the source's first
-    ///   commit, or an `AtSnapshot` (a graph-source table snapshot, never a
-    ///   commit on a ledger)
+    ///   commit, a transaction number below 1, or an `AtSnapshot` (a
+    ///   graph-source table snapshot, never a commit on a ledger)
     /// - [`ApiError::NotFound`] if the source branch does not exist, or if
     ///   `at` resolves to a commit not reachable from source HEAD
     pub async fn create_branch(
@@ -450,18 +450,20 @@ async fn branch_point_commit(view: LedgerView, source_id: &str, at: TimeSpec) ->
         };
         return view.resolve_commit(commit_ref).await;
     }
+    let as_branch_error = |e| match e {
+        ApiError::Query(QueryError::InvalidQuery(msg)) => {
+            ApiError::InvalidBranch(format!("Cannot branch from '{source_id}': {msg}"))
+        }
+        other => other,
+    };
     let state = view.to_ledger_state();
     let t = time_resolve::resolve_time_spec(&state, &at)
         .await
-        .map_err(|e| match e {
-            ApiError::Query(QueryError::InvalidQuery(msg)) => {
-                ApiError::InvalidBranch(format!("Cannot branch from '{source_id}': {msg}"))
-            }
-            other => other,
-        })?;
+        .map_err(as_branch_error)?;
     LedgerView::from_state(&state)
         .resolve_commit(CommitRef::T(t))
         .await
+        .map_err(as_branch_error)
 }
 
 /// Verify `target` is on the source branch's line of commits, and return

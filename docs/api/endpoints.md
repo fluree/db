@@ -2249,7 +2249,7 @@ POST /branch
 
 **Status Codes:**
 - `201 Created` - Branch created successfully
-- `400 Bad Request` - Invalid request body (including malformed `at` value), the source branch has no commits yet, or `at` names no commit on it: a time before its first commit, a malformed timestamp, or `snapshot:<id>` (a graph-source table snapshot)
+- `400 Bad Request` - Invalid request body (including malformed `at` value), the source branch has no commits yet, or `at` names no commit on it: a time before its first commit, a malformed timestamp, a transaction number below 1, or `snapshot:<id>` (a graph-source table snapshot)
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
 - `404 Not Found` - Source branch does not exist, or `at` commit is not reachable from source HEAD
 - `409 Conflict` - Branch already exists

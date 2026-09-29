@@ -1244,7 +1244,7 @@ The CLI's pretty-printer (`print_branch_created` in
 
 | Status | When |
 |--------|------|
-| `400` | Invalid branch name (per `validate_branch_name`); malformed JSON body; malformed `at`; the source branch has no commits yet (`ApiError::InvalidBranch`); `at` names no commit on the source (a time before its first commit, a malformed timestamp, `snapshot:<id>`). |
+| `400` | Invalid branch name (per `validate_branch_name`); malformed JSON body; malformed `at`; the source branch has no commits yet (`ApiError::InvalidBranch`); `at` names no commit on the source (a time before its first commit, a malformed timestamp, a transaction number below 1, `snapshot:<id>`). |
 | `401` / `403` | Admin token required and absent/invalid (see admin-auth middleware). |
 | `404` | Source branch does not exist, or `at` names a commit that is not on the source's line. |
 | `409` | A branch with this name already exists (`ApiError::LedgerExists` → 409). |

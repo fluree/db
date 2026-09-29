@@ -33,7 +33,7 @@ fluree branch create <NAME> [OPTIONS]
 
 Creates a new branch for a ledger. By default the branch starts at the source branch's current HEAD, and is fully isolated — subsequent transactions on either branch are invisible to the other.
 
-Pass `--at` to branch from an earlier point on the source branch instead of its HEAD. The new branch starts at the commit that `fluree query --at` with the same value reads on the source: `--at time:2026-01-01T00:00:00Z` gives you the data as of that instant, resolved exactly as a query at that time resolves it. A time before the source's first commit, a malformed timestamp, and `snapshot:<id>` (which names a graph source's table snapshot, not a commit) are rejected.
+Pass `--at` to branch from an earlier point on the source branch instead of its HEAD. The new branch starts at the commit that `fluree query --at` with the same value reads on the source: `--at time:2026-01-01T00:00:00Z` gives you the data as of that instant, resolved exactly as a query at that time resolves it. A time before the source's first commit, a malformed timestamp, a transaction number below 1, and `snapshot:<id>` (which names a graph source's table snapshot, not a commit) are rejected.
 
 The commit must be on the source branch's line of commits, which runs through its fork point into the branch it came from. A commit that reached the branch through a merge is refused: the branch never replays it, because what the merge contributed is folded into the merge commit. Branch at the merge commit instead, or on the branch that made the commit. The new branch starts with no index and replays from genesis on first query.
 

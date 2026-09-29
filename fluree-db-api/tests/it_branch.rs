@@ -635,7 +635,7 @@ async fn create_branch_at_recorded_uses_the_recorded_axis() {
 
 /// Every point that names no commit on the source is a 400, and creates
 /// nothing: a time before the first commit on either axis, a malformed
-/// timestamp, and a table snapshot id.
+/// timestamp, a transaction number below 1, and a table snapshot id.
 #[tokio::test]
 async fn create_branch_at_a_point_with_no_commit_is_a_bad_request() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -654,6 +654,9 @@ async fn create_branch_at_a_point_with_no_commit_is_a_bad_request() {
             TimeSpec::at_time("2021-13-45T00:00:00Z"),
             "Invalid ISO-8601 timestamp",
         ),
+        (TimeSpec::parse_at("t:0").unwrap(), "must be >= 1"),
+        (TimeSpec::parse_at("0").unwrap(), "must be >= 1"),
+        (TimeSpec::parse_at("-3").unwrap(), "must be >= 1"),
         (TimeSpec::AtSnapshot(7), "@snapshot:"),
     ] {
         let label = format!("{at:?}");
