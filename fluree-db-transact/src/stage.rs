@@ -2721,16 +2721,29 @@ async fn stream_where_into_accumulator(
             .or_else(|| binary_store.as_ref().and_then(|s| s.graph_id_for_iri(iri)))
     };
 
+    // A WHERE default graph named by `USING`, `WITH` or JSON-LD `from`/`graph`:
+    // this ledger's own address names its default graph (the within-ledger
+    // `FROM` convention, D-3), a registered IRI names that graph, and anything
+    // else names a graph that does not exist here, so `None`.
+    let resolve_where_default_graph = |iri: &str| -> Option<GraphId> {
+        let names_this_ledger = fluree_db_core::LedgerRef::parse(iri).is_ok_and(|r| {
+            r.at.is_none() && r.fragment.is_none() && r.id == ledger.snapshot.ledger_id
+        });
+        if names_this_ledger {
+            return Some(0);
+        }
+        resolve_graph_id(iri)
+    };
+    let where_default_g_ids: Vec<Option<GraphId>> = desired_where_default_graph_iris
+        .iter()
+        .map(|iri| resolve_where_default_graph(iri))
+        .collect();
+
     // Base GraphDbRef is used to provide snapshot/overlay/time; dataset controls active graphs.
-    // For multi-default-graph datasets we use g_id=0 as the base reference.
-    let base_db = if desired_where_default_graph_iris.len() <= 1 {
-        let base_g_id: GraphId = desired_where_default_graph_iris
-            .first()
-            .and_then(|iri| resolve_graph_id(iri))
-            .unwrap_or(0);
-        ledger.as_graph_db_ref(base_g_id)
-    } else {
-        ledger.as_graph_db_ref(0)
+    // A single resolved default graph is the base; otherwise g_id=0 is the base reference.
+    let base_db = match where_default_g_ids.as_slice() {
+        [Some(g_id)] => ledger.as_graph_db_ref(*g_id),
+        _ => ledger.as_graph_db_ref(0),
     };
 
     // View-policy enforcement for the WHERE read. The transaction WHERE is a
@@ -2784,19 +2797,23 @@ async fn stream_where_into_accumulator(
         w.using_default_graph_iris.is_empty() && !w.using_named_graph_iris.is_empty()
     });
 
+    // With no `USING`/`WITH`/`from`, the WHERE reads the ledger's default graph.
+    // Otherwise each named graph that exists joins the default-graph union and
+    // one that does not contributes nothing (SPARQL 1.1 Update §3.1.3, Query
+    // §13.2), so a lone unknown IRI leaves the default graph EMPTY. Falling back
+    // to g_id 0 instead made `DELETE { ?s ?p ?o } USING <typo> WHERE { ?s ?p ?o }`
+    // delete the ledger's whole default graph.
     let mut runtime_dataset = if where_default_is_empty {
         fluree_db_query::DataSet::new()
-    } else if desired_where_default_graph_iris.len() <= 1 {
+    } else if desired_where_default_graph_iris.is_empty() {
         fluree_db_query::DataSet::new().with_default_graph(make_graph_ref(base_db.g_id))
     } else {
-        let mut ds = fluree_db_query::DataSet::new();
-        for iri in &desired_where_default_graph_iris {
-            let Some(g_id) = resolve_graph_id(iri) else {
-                continue;
-            };
-            ds = ds.with_default_graph(make_graph_ref(g_id));
-        }
-        ds
+        where_default_g_ids
+            .iter()
+            .flatten()
+            .fold(fluree_db_query::DataSet::new(), |ds, &g_id| {
+                ds.with_default_graph(make_graph_ref(g_id))
+            })
     };
 
     // Prefer snapshot GraphRegistry, but also include binary-store graph entries as a fallback.

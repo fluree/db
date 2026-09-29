@@ -3216,6 +3216,196 @@ async fn test_using_named_only_where_default_graph_is_empty() {
     assert_eq!(count_in_default(&fluree, &ledger).await, 0);
 }
 
+const UNKNOWN_CASE_G1: &str = "http://example.org/g1";
+const UNKNOWN_CASE_NEWG: &str = "http://example.org/newg";
+
+/// Default graph `ex:a ex:v "d1" . ex:b ex:v "d2"`; `<g1>` holds `ex:c ex:v "g1"`.
+fn unknown_graph_seed() -> String {
+    format!(
+        r#"PREFIX ex: <http://example.org/>
+           INSERT DATA {{
+               ex:a ex:v "d1" . ex:b ex:v "d2" .
+               GRAPH <{UNKNOWN_CASE_G1}> {{ ex:c ex:v "g1" }}
+           }}"#
+    )
+}
+
+/// Triples in the default graph, `<g1>` and `<newg>`.
+async fn unknown_graph_counts(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> [usize; 3] {
+    [
+        count_in_default(fluree, ledger).await,
+        count_in_graph(fluree, ledger, UNKNOWN_CASE_G1).await,
+        count_in_graph(fluree, ledger, UNKNOWN_CASE_NEWG).await,
+    ]
+}
+
+/// SPARQL 1.1 Update §3.1.3 with Query §13.2: a lone `USING <g>` or `WITH <g>`
+/// naming a graph this ledger does not have gives the WHERE an EMPTY default
+/// graph. It fell back to g_id 0, so the WHERE read, and a DELETE emptied, the
+/// ledger's real default graph. Controls: two unknown `USING` graphs (already
+/// an empty union), a registered `USING` graph, and the ledger's own id, which
+/// names its default graph (the within-ledger `FROM` convention, D-3). Each
+/// case runs on its own indexed ledger, so the WHERE reads through the binary
+/// index.
+#[tokio::test]
+async fn test_using_or_with_an_unknown_graph_reads_an_empty_default_graph() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ex = "PREFIX ex: <http://example.org/> ";
+            let (g1, newg) = (UNKNOWN_CASE_G1, UNKNOWN_CASE_NEWG);
+            // (case, update, expected (default, g1, newg) triples after it).
+            // `LEDGER` stands for the case's own ledger id.
+            let cases = [
+                (
+                    "USING an unknown graph",
+                    format!(
+                        "{ex}DELETE {{ ?s ex:v ?o }} USING <http://example.org/typo> \
+                         WHERE {{ ?s ex:v ?o }}"
+                    ),
+                    [2, 1, 0],
+                ),
+                (
+                    "WITH an unknown graph",
+                    format!("{ex}WITH <{newg}> INSERT {{ ?s ex:copy ?o }} WHERE {{ ?s ex:v ?o }}"),
+                    [2, 1, 0],
+                ),
+                (
+                    "control: USING two unknown graphs",
+                    format!(
+                        "{ex}DELETE {{ ?s ex:v ?o }} USING <http://example.org/t1> \
+                         USING <http://example.org/t2> WHERE {{ ?s ex:v ?o }}"
+                    ),
+                    [2, 1, 0],
+                ),
+                (
+                    "control: USING a registered graph",
+                    format!(
+                        "{ex}DELETE {{ GRAPH <{g1}> {{ ?s ex:v ?o }} }} USING <{g1}> \
+                         WHERE {{ ?s ex:v ?o }}"
+                    ),
+                    [2, 0, 0],
+                ),
+                (
+                    "control: USING this ledger's id (D-3)",
+                    format!("{ex}DELETE {{ ?s ex:v ?o }} USING <LEDGER> WHERE {{ ?s ex:v ?o }}"),
+                    [0, 1, 0],
+                ),
+            ];
+
+            let mut failures = Vec::new();
+            for (i, (case, update, expected)) in cases.into_iter().enumerate() {
+                let ledger_id = format!("it/using-unknown-graph-{i}:main");
+                let seeded = run_sparql_update(
+                    &fluree,
+                    genesis_ledger(&fluree, &ledger_id),
+                    &unknown_graph_seed(),
+                )
+                .await;
+                trigger_index_and_wait(&handle, &ledger_id, seeded.receipt.t).await;
+                let ledger = fluree
+                    .ledger(&ledger_id)
+                    .await
+                    .expect("load indexed ledger");
+                let update = update.replace("LEDGER", &ledger_id);
+                let ledger = run_sparql_update(&fluree, ledger, &update).await.ledger;
+                let got = unknown_graph_counts(&fluree, &ledger).await;
+                if got != expected {
+                    failures.push(format!(
+                        "{case}: (default, g1, newg) = {got:?}, expected {expected:?}"
+                    ));
+                }
+            }
+            assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+        })
+        .await;
+}
+
+/// JSON-LD twin: `from` (the `USING` equivalent) or a top-level `graph` (the
+/// `WITH` equivalent) naming a graph this ledger does not have gives the WHERE
+/// an empty default graph. A registered `from` graph and this ledger's own
+/// address still resolve.
+#[tokio::test]
+async fn test_jsonld_update_from_an_unknown_graph_reads_an_empty_default_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (g1, newg) = (UNKNOWN_CASE_G1, UNKNOWN_CASE_NEWG);
+    let v = json!({"@id": "?s", "ex:v": "?o"});
+    let copy = json!({"@id": "?s", "ex:copy": "?o"});
+    // (case, update, expected (default, g1, newg) triples after it).
+    // `LEDGER` stands for the case's own ledger id.
+    let cases = [
+        (
+            "from an unknown graph",
+            json!({"from": "http://example.org/typo2", "where": v, "delete": v}),
+            [2, 1, 0],
+        ),
+        (
+            "graph an unknown graph",
+            json!({"graph": newg, "where": v, "insert": copy}),
+            [2, 1, 0],
+        ),
+        (
+            "control: from two unknown graphs",
+            json!({"from": ["http://example.org/t1", "http://example.org/t2"], "where": v, "delete": v}),
+            [2, 1, 0],
+        ),
+        (
+            "control: from a registered graph",
+            json!({"from": g1, "graph": g1, "where": v, "delete": v}),
+            [2, 0, 0],
+        ),
+        (
+            "control: from this ledger's address (D-3)",
+            json!({"from": "urn:fluree:LEDGER", "where": v, "delete": v}),
+            [0, 1, 0],
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (i, (case, update, expected)) in cases.into_iter().enumerate() {
+        let ledger_id = format!("it/jsonld-from-unknown-graph-{i}:main");
+        let ledger = run_sparql_update(
+            &fluree,
+            genesis_ledger(&fluree, &ledger_id),
+            &unknown_graph_seed(),
+        )
+        .await
+        .ledger;
+        let mut update: serde_json::Value =
+            serde_json::from_str(&update.to_string().replace("LEDGER", &ledger_id))
+                .expect("update json");
+        update["@context"] = json!({"ex": "http://example.org/"});
+        let ledger = match fluree.update(ledger, &update).await {
+            Ok(result) => result.ledger,
+            Err(e) => {
+                failures.push(format!("{case}: update failed: {e}"));
+                continue;
+            }
+        };
+        let got = unknown_graph_counts(&fluree, &ledger).await;
+        if got != expected {
+            failures.push(format!(
+                "{case}: (default, g1, newg) = {got:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 /// Builder↔SPARQL parity for the two transfer verbs the builder previously
 /// lacked: `Txn::move_graph` ≡ `MOVE <from> TO <to>` (source retracted) and
 /// `Txn::add_graph` ≡ `ADD <from> TO <to>` (destination contents kept).
