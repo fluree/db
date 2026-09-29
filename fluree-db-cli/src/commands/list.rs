@@ -109,9 +109,9 @@ pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> C
             };
             table.add_row(vec![
                 marker.to_string(),
-                t.local_alias.clone(),
+                t.local_alias.to_string(),
                 t.remote.clone(),
-                t.remote_alias.clone(),
+                t.remote_alias.to_string(),
             ]);
         }
 

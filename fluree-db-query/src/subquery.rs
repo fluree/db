@@ -1018,7 +1018,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{LedgerSnapshot, Sid};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let lit = |n| Binding::lit(FlakeValue::Long(n), Sid::xsd_integer());
@@ -1117,7 +1117,7 @@ mod tests {
     async fn identity_scope_streams_and_close_discards_pending_input() {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::LedgerSnapshot;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let mut op = SubqueryOperator::new(
@@ -1162,7 +1162,7 @@ mod tests {
         use crate::seed::BatchSeedOperator;
         use crate::var_registry::VarRegistry;
         use fluree_db_core::LedgerSnapshot;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         for parents in [0, 1, 3] {
@@ -1191,7 +1191,7 @@ mod tests {
         use crate::seed::BatchSeedOperator;
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot, Sid};
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let lit = |i| Binding::lit(FlakeValue::Long(i), Sid::xsd_integer());
@@ -1245,7 +1245,7 @@ mod tests {
     async fn materialization_and_stream_buffers_enforce_memory_budget() {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{LedgerSnapshot, QueryCancellation};
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         for identity in [false, true] {
             let cancel = QueryCancellation::new();
@@ -1283,7 +1283,7 @@ mod tests {
     async fn output_batch_growth_is_charged_against_budget() {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{LedgerSnapshot, QueryCancellation};
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let rows = SUBQUERY_BATCH_SIZE;
         // Admits the retained inner batch plus a partial output window, but
@@ -1319,7 +1319,7 @@ mod tests {
     async fn closing_or_cancelling_releases_only_owned_memory() {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{LedgerSnapshot, QueryCancellation};
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         for identity in [false, true] {
             let cancellation = QueryCancellation::new();

@@ -331,7 +331,12 @@ async fn orchestrator_first_reindex_no_config_completes_quickly() {
     let started = Instant::now();
     let outcome = local
         .run_until(async move {
-            let completion = handle.trigger(ledger_id, N as i64).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    N as i64,
+                )
+                .await;
             completion.wait().await
         })
         .await;

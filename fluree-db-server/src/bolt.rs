@@ -78,16 +78,17 @@ impl SessionAuth {
             .is_some_and(|p| now_unix() > p.expires_unix)
     }
 
+    /// A `db` that is not a ledger id is authorized for nothing.
     fn can_read(&self, ledger_id: &str) -> bool {
         self.principal
             .as_ref()
-            .is_none_or(|p| p.can_read(ledger_id))
+            .is_none_or(|p| crate::error::scope_id(ledger_id).is_ok_and(|id| p.can_read(&id)))
     }
 
     fn can_write(&self, ledger_id: &str) -> bool {
         self.principal
             .as_ref()
-            .is_none_or(|p| p.can_write(ledger_id))
+            .is_none_or(|p| crate::error::scope_id(ledger_id).is_ok_and(|id| p.can_write(&id)))
     }
 
     /// Reuse the login-time verified policy selection; statements cannot supply

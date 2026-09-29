@@ -65,7 +65,12 @@ async fn indexing_disabled_transaction_exposes_indexing_status_hints() {
     );
     local
         .run_until(async move {
-            let completion = handle.trigger(ledger_id, result.receipt.t).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    result.receipt.t,
+                )
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -136,7 +141,12 @@ async fn manual_indexing_disabled_mode_then_trigger_updates_nameservice_and_load
             );
             assert_eq!(record.commit_t, 10);
 
-            let completion = handle.trigger(ledger_id, record.commit_t).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    record.commit_t,
+                )
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -245,8 +255,12 @@ async fn indexing_coalesces_multiple_commits_and_latest_root_is_queryable() {
             let t2 = r2.receipt.t;
             assert!(t2 >= t1, "expected monotonic t");
 
-            let c1 = handle.trigger(ledger_id, t1).await;
-            let c2 = handle.trigger(ledger_id, t2).await;
+            let c1 = handle
+                .trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), t1)
+                .await;
+            let c2 = handle
+                .trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), t2)
+                .await;
 
             let (index_t2, _root_id2) = match c2.wait().await {
                 fluree_db_api::IndexOutcome::Completed {
@@ -342,7 +356,12 @@ async fn file_based_indexing_then_new_connection_loads_and_queries() {
                 ledger = r.ledger;
             }
 
-            let completion = handle.trigger(ledger_id, ledger.t()).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    ledger.t(),
+                )
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -1117,7 +1136,12 @@ async fn expansion_select_works_after_indexing() {
                 .await
                 .expect("ns lookup")
                 .expect("ns record");
-            let completion = handle.trigger(ledger_id, record.commit_t).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    record.commit_t,
+                )
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -1244,7 +1268,12 @@ async fn construct_works_after_indexing() {
                 .await
                 .expect("ns lookup")
                 .expect("ns record");
-            let completion = handle.trigger(ledger_id, record.commit_t).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    record.commit_t,
+                )
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -1336,7 +1365,12 @@ async fn new_namespace_after_indexing_is_queryable() {
             // Trigger indexing and wait — index root will contain namespace codes
             // for the built-in namespaces plus "http://example.org/" but NOT
             // "http://newprefix.org/".
-            let completion = handle.trigger(ledger_id, r1.receipt.t).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    r1.receipt.t,
+                )
+                .await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),

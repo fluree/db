@@ -569,6 +569,9 @@ Modes:
 - `optional`: Accept tokens but don't require them
 - `required`: Require valid Bearer token
 
+Events auth is independent of [data auth](#data-api-authentication): requiring tokens on
+the data API does not require them here.
+
 Supports both Ed25519 (embedded JWK) and OIDC/JWKS (RS256) tokens when the `oidc` feature is enabled and `--jwks-issuer` is configured. For OIDC tokens, issuer trust is implicit — only tokens signed by keys from configured JWKS endpoints will verify. For Ed25519 tokens, the issuer must appear in `--events-auth-trusted-issuer`.
 
 ```bash
@@ -611,6 +614,12 @@ Bearer token scopes:
 - **Write**: `fluree.ledger.write.all=true` or `fluree.ledger.write.ledgers=[...]`
 
 Back-compat: `fluree.storage.*` claims imply **read** scope for data endpoints.
+
+Data auth does not cover `/v1/fluree/events`, which has its own
+[`--events-auth-mode`](#events-endpoint-authentication). With data auth `required` and
+events auth `none`, `/v1/fluree/events?all=true` lists every ledger and its nameservice
+record to anyone, and the server logs a warning at startup. Set both; query peers then
+need an events token (`--peer-events-token`).
 
 Applications may select request policies using a credential with
 `"fluree.policy": "request"`, or issue a fixed signed `fluree.policy`
@@ -743,6 +752,25 @@ fluree server run -- \
   --mcp-enabled \
   --mcp-auth-trusted-issuer did:key:z6Mk...
 ```
+
+Whether `/mcp` requires a token follows the data API. With `--data-auth-mode none` (the
+default) and no MCP issuer configured (`--mcp-auth-trusted-issuer`, or the
+`--events-auth-trusted-issuer` fallback), `/mcp` is as open as the query API: no token is
+needed, any token sent is ignored, and every ledger is readable, governed by each ledger's
+policy defaults. Configuring an MCP issuer requires tokens regardless of data auth. With
+data auth `optional` or `required`, tokens are always required and the server will not
+start without an MCP issuer. Under `optional` that makes `/mcp` stricter than the query
+API: an anonymous `/query` is served, an anonymous `/mcp` call is a `401`.
+
+Issuer trust admits a token; its ledger claims decide what it can reach. Both MCP tools
+authorize the requested ledger against `fluree.ledger.read.all` /
+`fluree.ledger.read.ledgers` (falling back to `fluree.storage.*`), the same claims the data
+API uses — see [Authentication](../security/authentication.md). A token with neither claim
+reaches no ledger; issue `"fluree.ledger.read.all": true` for an agent that should read
+everything.
+
+For a walkthrough from a local tryout to a scoped production setup, see
+[Connect an agent over MCP](../ai/mcp-server.md).
 
 ## Peer Mode Configuration
 
@@ -1007,6 +1035,8 @@ fluree server run \
 | `FLUREE_MCP_QUERY_TIMEOUT_MS`           | MCP `sparql_query` execution timeout            | `300000`                                                                |
 | `FLUREE_STORAGE_ACCESS_MODE`            | Peer storage mode                               | `shared`                                                                |
 | `FLUREE_STORAGE_PROXY_ENABLED`          | Enable storage proxy                            | `false`                                                                 |
+
+`FLUREE_CORS_ENABLED` and `FLUREE_INDEXING_ENABLED` accept `true`/`false`, `1`/`0`, `yes`/`no` and `on`/`off`, in any case. The `--cors-enabled` and `--indexing-enabled` flags take the same values after `=` (`--indexing-enabled=off`); the bare flag means `true`.
 
 ## Command-Line Reference
 

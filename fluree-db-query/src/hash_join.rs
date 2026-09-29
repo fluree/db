@@ -998,7 +998,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x"); // join var (bound object)
         let driver = vars.get_or_insert("?driver");
@@ -1076,7 +1076,7 @@ mod tests {
             FlakeValue, LedgerSnapshot, QueryCancellation, QueryCancellationReason,
         };
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x");
         let driver = vars.get_or_insert("?driver");
@@ -1122,7 +1122,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot, QueryCancellation};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x");
         let driver = vars.get_or_insert("?driver");
@@ -1179,7 +1179,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot, QueryCancellation};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x");
         let driver = vars.get_or_insert("?driver");

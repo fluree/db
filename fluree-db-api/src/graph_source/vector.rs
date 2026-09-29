@@ -309,6 +309,7 @@ impl crate::Fluree {
     /// Vector indexes are head-only and do not support time-travel queries.
     pub async fn load_vector_index(&self, graph_source_id: &str) -> Result<Arc<VectorIndex>> {
         use fluree_db_query::vector::usearch::deserialize;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         // Look up graph source record
         let record = self
@@ -341,6 +342,7 @@ impl crate::Fluree {
         &self,
         graph_source_id: &str,
     ) -> Result<VectorStalenessCheck> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         // Look up graph source record
         let record = self
             .nameservice()
@@ -402,6 +404,7 @@ impl crate::Fluree {
         use fluree_db_query::bm25::{CompiledPropertyDeps, PropertyDeps};
         use fluree_db_query::vector::usearch::deserialize;
         use futures::StreamExt;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(graph_source_id = %graph_source_id, "Starting vector index sync");
 
@@ -645,6 +648,7 @@ impl crate::Fluree {
     /// Rebuilds the entire index from scratch by re-running the indexing query.
     pub async fn resync_vector_index(&self, graph_source_id: &str) -> Result<VectorSyncResult> {
         use fluree_db_query::vector::usearch::deserialize;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(graph_source_id = %graph_source_id, "Starting full vector index resync");
 
@@ -799,6 +803,7 @@ impl crate::Fluree {
     /// This marks the graph source as retracted in the nameservice but does not
     /// immediately delete snapshot files (they may be needed for time-travel).
     pub async fn drop_vector_index(&self, graph_source_id: &str) -> Result<VectorDropResult> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         info!(graph_source_id = %graph_source_id, "Dropping vector index");
 
         // Look up graph source record

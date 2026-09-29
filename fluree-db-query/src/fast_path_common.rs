@@ -4322,7 +4322,7 @@ mod tests {
         use fluree_db_policy::{PolicyContext, PolicySet, PolicyWrapper, PropertyPolicyEntry};
         use std::collections::HashMap;
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ssn = Sid::new(100, "ssn"); // covered by the view policy
         let name = Sid::new(100, "name"); // uncovered

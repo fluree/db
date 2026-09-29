@@ -3077,7 +3077,7 @@ mod tests {
     async fn collect_stream_bails_on_cancelled_query() {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{LedgerSnapshot, QueryCancellation};
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let cancellation = QueryCancellation::new();
         cancellation.cancel();
@@ -3094,7 +3094,7 @@ mod tests {
     async fn collect_scan_capped_bails_on_cancelled_query() {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{LedgerSnapshot, QueryCancellation};
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let cancellation = QueryCancellation::new();
         cancellation.cancel();
@@ -3119,7 +3119,7 @@ mod tests {
         use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let cancellation = QueryCancellation::new();
         let polls = Arc::new(AtomicUsize::new(0));
@@ -3214,7 +3214,7 @@ mod tests {
                 object_map: ObjectMap::column("STORE_KEY"),
             });
         let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let provider = StoreProvider;
 
@@ -3309,7 +3309,7 @@ mod tests {
                 object_map: ObjectMap::column("STORE_KEY"),
             });
         let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let provider = ManyRowsProvider;
 
@@ -3377,7 +3377,7 @@ mod tests {
         use fluree_db_core::{LedgerSnapshot, QueryCancellation};
         use fluree_db_r2rml::mapping::TriplesMap;
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let cancel = QueryCancellation::new();
         cancel.set_memory_limit(1); // 1-byte ceiling.
@@ -3452,7 +3452,7 @@ mod tests {
         let parent_batch =
             two_col_i64_batch(("a_area", vec![Some(10)]), ("z_zone", vec![Some(99)]));
 
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let lookup = Arc::new(
@@ -3511,7 +3511,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let lookup =
@@ -4201,7 +4201,7 @@ mod tests {
             R2rmlPattern::new_bound_subject("gs:main", "http://ex/store/1", Some(VarId(2)))
                 .with_predicate_var(VarId(1));
 
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
         let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
@@ -4243,7 +4243,7 @@ mod tests {
         let pattern =
             R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
 
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
         let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
@@ -4299,7 +4299,7 @@ mod tests {
                 object_map: ObjectMap::column("STORE_KEY"),
             });
         let batch = single_col_batch("STORE_KEY", vec![Some(7)]);
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
         let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
@@ -4529,7 +4529,7 @@ mod tests {
         let pattern =
             R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
 
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
         let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
@@ -4629,7 +4629,7 @@ mod tests {
         let customers = TriplesMap::new("#Customer", "customers")
             .with_subject_template("http://ex/customer/{ID}");
         let mapping = Arc::new(CompiledR2rmlMapping::new(vec![orders, customers]));
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
 
         // Returns (parent "customers" scans, child "orders" scans).
@@ -4770,7 +4770,7 @@ mod tests {
         #[test]
         fn parent_lookup_survives_operator_rebuild() {
             let mapping = mapping();
-            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
             let vars = VarRegistry::new();
             let provider = CountingProvider::default();
             {
@@ -4805,7 +4805,7 @@ mod tests {
         fn parent_memo_survives_with_graph_ref_rebuild() {
             use crate::dataset::GraphRef;
             let mapping = mapping();
-            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
             let vars = VarRegistry::new();
             let no_overlay = fluree_db_core::NoOverlay;
             let graph = GraphRef::new(&snapshot, 0, &no_overlay, snapshot.t, "test/main");
@@ -4837,7 +4837,7 @@ mod tests {
         #[test]
         fn parent_memo_isolated_by_graph_source() {
             let mapping = mapping();
-            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
             let vars = VarRegistry::new();
             let provider = CountingProvider::default();
             {
@@ -4871,7 +4871,7 @@ mod tests {
             let mapping = Arc::new(CompiledR2rmlMapping::new(vec![orders]));
 
             fn orders_scans(topk: bool, mapping: &Arc<CompiledR2rmlMapping>) -> usize {
-                let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+                let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
                 let vars = VarRegistry::new();
                 let provider = CountingProvider::default();
                 {

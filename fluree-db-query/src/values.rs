@@ -490,7 +490,7 @@ mod tests {
         use fluree_db_core::LedgerSnapshot;
 
         let vars = VarRegistry::new();
-        let snapshot = LedgerSnapshot::genesis("values-test/main");
+        let snapshot = LedgerSnapshot::genesis("values-test:main");
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
         let child_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
