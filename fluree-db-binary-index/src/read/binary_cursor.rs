@@ -478,12 +478,13 @@ impl BinaryCursor {
                                 let history = leaf
                                     .handle
                                     .load_sidecar_segment(self.current_leaflet_idx - 1)?;
-                                if !history.is_empty() {
-                                    if let Some(replayed) =
-                                        replay_leaflet(&batch, &history, self.to_t, self.order)
-                                    {
-                                        batch = replayed;
-                                    }
+                                // An encoded sidecar segment can contain no
+                                // events. Base assertions newer than `to_t`
+                                // still need to be undone in that case.
+                                if let Some(replayed) =
+                                    replay_leaflet(&batch, &history, self.to_t, self.order)
+                                {
+                                    batch = replayed;
                                 }
                             } else if needs_leaflet_replay {
                                 // No sidecar but base rows have t > to_t: filter them out.

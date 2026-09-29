@@ -93,6 +93,19 @@ impl DistinctOperator {
 
 #[async_trait]
 impl Operator for DistinctOperator {
+    // The trait object has no Default; replace it with a closed wrapper's stub.
+    #[allow(clippy::box_default)]
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        if self.state != OperatorState::Created {
+            return None;
+        }
+        self.state = OperatorState::Closed;
+        Some(std::mem::replace(
+            &mut self.child,
+            Box::new(crate::seed::EmptyOperator::new()),
+        ))
+    }
+
     /// Item 11 (F-AUD-7): DECLINE forwarding — DISTINCT may collapse arbitrarily
     /// many input rows into one, so producing `k` distinct rows can require
     /// unboundedly many input rows. Explicit (was a silent trait-default no-op) so

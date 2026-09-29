@@ -1324,7 +1324,7 @@ curl -X POST http://localhost:8090/v1/fluree/update \
 
 1. **Use PREFIX Declarations**: Makes queries readable
 2. **Automatic Pattern Optimization**: The query planner automatically reorders patterns for efficient execution using statistics-driven cardinality estimates
-3. **Flexible FILTER Placement**: Filters can be placed anywhere in the WHERE clause — the query engine automatically applies each filter as soon as all its required variables are bound
+3. **Flexible FILTER Placement**: Filters, including `FILTER EXISTS` and `FILTER NOT EXISTS`, can be placed anywhere in their group — the query engine applies each one to the whole group, as soon as every variable it reads has its final value. A variable that an `OPTIONAL` or an `UNDEF` in `VALUES` leaves unbound on some rows waits for any later pattern that fills it in
 4. **Limit Results**: Use LIMIT for large result sets
 5. **Avoid Cartesian Products**: Structure queries to avoid large joins
 

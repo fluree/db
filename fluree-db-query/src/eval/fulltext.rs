@@ -318,11 +318,11 @@ fn get_or_build_delta(
     p_id: u32,
     lang_id: u16,
 ) -> Option<Arc<NoveltyFulltextDelta>> {
+    if !crate::fast_path_common::overlay_has_novelty(ctx) {
+        return None;
+    }
     let overlay = ctx.overlay?;
     let epoch = overlay.epoch();
-    if epoch == 0 {
-        return None; // No novelty
-    }
     let binary_store = ctx.binary_store.as_ref()?;
 
     // Resolve target predicate Sid for overlay filtering

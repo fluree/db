@@ -8,8 +8,8 @@
 //! later window geometrically back to the lane's cap, so a lane that keeps
 //! pulling pays for only a few extra flushes.
 
-/// Narrowest first window: per-flush setup isn't worth paying for fewer rows,
-/// even under `LIMIT 1`.
+/// Minimum first window for probes whose setup should be amortized. Lanes
+/// bounded by their input subjects can start smaller with `ramped_from`.
 pub(crate) const MIN_FLUSH: usize = 1024;
 /// Growth between consecutive windows.
 pub(crate) const FLUSH_GROWTH: usize = 8;
@@ -35,6 +35,15 @@ impl FlushSchedule {
         }
     }
 
+    /// Start at the requested size for lanes whose probes are bounded by
+    /// their input subjects, then grow geometrically if more rows are needed.
+    pub(crate) fn ramped_from(initial: usize, cap: usize) -> Self {
+        Self {
+            size: initial.max(1).min(cap),
+            cap,
+        }
+    }
+
     /// First window sized to a `LIMIT` row budget (see
     /// [`Operator::set_row_budget`](crate::operator::Operator::set_row_budget)).
     pub(crate) fn budgeted(budget: usize, cap: usize) -> Self {
@@ -51,6 +60,23 @@ impl FlushSchedule {
     /// Widen the next window; call after each flush.
     pub(crate) fn advance(&mut self) {
         self.size = self.size.saturating_mul(FLUSH_GROWTH).min(self.cap);
+    }
+
+    /// Size the next window for a row budget from the yield so far: `seen`
+    /// inputs produced `yielded` of the `wanted` rows. The window covers the
+    /// remaining rows at that rate twice over, never past the geometric step,
+    /// which also applies until something has matched. A fixed step alone can
+    /// overshoot the rows still needed nearly eightfold on a selective input.
+    pub(crate) fn advance_toward(&mut self, wanted: usize, seen: usize, yielded: usize) {
+        let step = self.size.saturating_mul(FLUSH_GROWTH).min(self.cap);
+        self.size = match wanted.checked_sub(yielded) {
+            Some(remaining) if remaining > 0 && yielded > 0 => remaining
+                .saturating_mul(seen)
+                .div_ceil(yielded)
+                .saturating_mul(2)
+                .clamp(1, step),
+            _ => step,
+        };
     }
 }
 
@@ -86,6 +112,44 @@ mod tests {
         assert_eq!(FlushSchedule::budgeted(10, 100_000).size(), MIN_FLUSH);
         assert_eq!(FlushSchedule::budgeted(5000, 100_000).size(), 5000);
         assert_eq!(FlushSchedule::budgeted(usize::MAX, 100_000).size(), 100_000);
+    }
+
+    #[test]
+    fn subject_windows_start_at_the_goal_and_keep_growing() {
+        assert_eq!(
+            sizes(FlushSchedule::ramped_from(10, 100_000), 6),
+            [10, 80, 640, 5120, 40_960, 100_000]
+        );
+        assert_eq!(FlushSchedule::ramped_from(0, 100_000).size(), 1);
+        assert_eq!(
+            FlushSchedule::ramped_from(usize::MAX, 100_000).size(),
+            100_000
+        );
+    }
+
+    #[test]
+    fn a_known_yield_sizes_the_window_to_the_rows_still_wanted() {
+        let mut schedule = FlushSchedule::ramped_from(5120, 100_000);
+        // 6 of 10 rows from 5,850 inputs: 4 more need ~3,900, doubled.
+        schedule.advance_toward(10, 5850, 6);
+        assert_eq!(schedule.size(), 7800);
+
+        // The estimate never exceeds the geometric step.
+        let mut schedule = FlushSchedule::ramped_from(10, 100_000);
+        schedule.advance_toward(1000, 10, 1);
+        assert_eq!(schedule.size(), 80);
+    }
+
+    #[test]
+    fn an_unknown_or_met_yield_takes_the_geometric_step() {
+        for (wanted, yielded) in [(10, 0), (10, 10), (10, 12)] {
+            let mut schedule = FlushSchedule::ramped_from(10, 100_000);
+            schedule.advance_toward(wanted, 90, yielded);
+            assert_eq!(schedule.size(), 80, "wanted {wanted}, yielded {yielded}");
+        }
+        let mut schedule = FlushSchedule::ramped_from(10, 100_000);
+        schedule.advance_toward(usize::MAX, usize::MAX, 1);
+        assert_eq!(schedule.size(), 80);
     }
 
     #[test]

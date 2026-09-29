@@ -28,6 +28,115 @@ async fn test_state() -> (TempDir, Arc<AppState>) {
     (tmp, state)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn http_queries_use_fast_paths_after_background_index_publication() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: true,
+        storage_path: Some(tmp.path().to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("server state"));
+    let app = build_router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ledger":"index-adoption"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let handle = state
+        .fluree
+        .ledger_cached("index-adoption:main")
+        .await
+        .unwrap();
+
+    let mut turtle = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..2000 {
+        use std::fmt::Write as _;
+        writeln!(turtle, "ex:p{i} a ex:Person ; ex:name \"Person {i}\" .").unwrap();
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert/index-adoption:main")
+                .header("content-type", "text/turtle")
+                .body(Body::from(turtle))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "insert: {body}");
+
+    // Keep the original handle: reloading or explicit reindexing would mask
+    // the distinction between a drained overlay and a never-written overlay.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if handle.snapshot().await.snapshot.t == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background index installed on the original handle");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/index-adoption:main")
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/sparql-results+json")
+                .header("fluree-track-fuel", "true")
+                .body(Body::from(
+                    "SELECT ?p WHERE { ?p a <http://example.org/Person> } LIMIT 10",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    assert_eq!(
+        body["result"]["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let fuel = body["fuel"].as_f64().expect("tracked fuel");
+    // One index batch costs ~3 fuel. Eagerly decoding all 2,000 subjects
+    // despite LIMIT 10 used ~23 fuel on this same cached state.
+    assert!(fuel < 4.0, "cached indexed query used {fuel} fuel");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/fluree/info/index-adoption:main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "info: {body}");
+    assert_eq!(body["ledger"]["commit-t"], 1);
+    assert_eq!(body["ledger"]["index-t"], 1);
+}
+
 // Regression for #1369: querying a registered Iceberg/R2RML graph source by
 // alias (SPARQL `POST /query/<alias>`, the `execute_sparql_ledger` path) must
 // route to the graph-source engine, not load it as a ledger (which deserialized

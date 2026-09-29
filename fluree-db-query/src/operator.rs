@@ -6,13 +6,22 @@
 pub(crate) mod flush;
 pub mod inline;
 
-use crate::binding::Batch;
+use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use std::sync::Arc;
+
+/// One nonempty group returned by a grouped count drain.
+#[derive(Debug)]
+pub struct CountGroup {
+    /// Representative bindings in the requested group-variable order.
+    pub keys: Vec<Binding>,
+    /// Number of remaining output rows in this group.
+    pub count: u64,
+}
 
 /// Query execution operator
 ///
@@ -69,6 +78,15 @@ pub trait Operator: Send + Sync {
         false
     }
 
+    /// Extract the input of a DISTINCT wrapper during planning, before `open()`.
+    /// The caller must prove that its consumer cannot observe input duplicates.
+    /// A successful extraction leaves the wrapper closed; discard it immediately.
+    /// Only DISTINCT implements this: do not forward through other operators,
+    /// since a LIMIT, projection or subquery can make deduplication significant.
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        None
+    }
+
     /// Consume all remaining output rows to exhaustion and return the total count.
     ///
     /// # Contract
@@ -84,6 +102,19 @@ pub trait Operator: Send + Sync {
     /// Operators that implement this avoid materializing output batches, reducing
     /// allocation and cloning overhead when the downstream consumer only needs a count.
     async fn drain_count(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Count remaining rows by `group_vars`, using ordinary GROUP BY equality.
+    /// A successful drain exhausts this operator and returns each nonempty group
+    /// exactly once. Empty input returns an empty vector. Returning `None` must
+    /// leave the input untouched so the consumer can aggregate ordinary rows.
+    /// Do not forward through row-changing operators such as DISTINCT or LIMIT.
+    async fn drain_grouped_count(
+        &mut self,
+        _ctx: &ExecutionContext<'_>,
+        _group_vars: &[VarId],
+    ) -> Result<Option<Vec<CountGroup>>> {
         Ok(None)
     }
 
