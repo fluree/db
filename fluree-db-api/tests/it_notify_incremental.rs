@@ -76,6 +76,10 @@ async fn published_index_matches_fresh_query_on_cached_handle() {
             "indexing must preserve the mutation counter"
         );
         assert_cached_queries_match_fresh(&fluree, &cached).await;
+        assert!(
+            !scan_translates_overlay(&fluree, &cached).await,
+            "a drained overlay has nothing for a scan to translate"
+        );
 
         if expected_t == 1 {
             // A subsequent write must still use the overlay correctly. In
@@ -97,8 +101,29 @@ async fn published_index_matches_fresh_query_on_cached_handle() {
             let cached = handle.snapshot().await.to_ledger_state();
             assert!(!cached.novelty.is_empty());
             assert_cached_queries_match_fresh(&fluree, &cached).await;
+            assert!(scan_translates_overlay(&fluree, &cached).await);
         }
     }
+}
+
+/// Whether a plain scan of `state` translates its overlay into index ops.
+async fn scan_translates_overlay(
+    fluree: &fluree_db_api::Fluree,
+    state: &fluree_db_api::LedgerState,
+) -> bool {
+    let (spans, _guard) = support::span_capture::init_test_tracing();
+    // Other tests in this binary hit the same callsite. Recompute its interest
+    // now that this subscriber is installed, or it can stay pinned to "never".
+    tracing::callsite::rebuild_interest_cache();
+    fluree_db_api::GraphDb::from_ledger_state(state)
+        .query(fluree)
+        .sparql(
+            "PREFIX ex: <http://example.org/> SELECT ?p ?name WHERE { ?p ex:name ?name } LIMIT 5",
+        )
+        .execute()
+        .await
+        .expect("scan query");
+    spans.has_span("overlay_translate")
 }
 
 async fn assert_cached_queries_match_fresh(

@@ -2535,7 +2535,13 @@ impl Operator for BinaryScanOperator {
         // subject per left row — memoizing per-scope products would grow the
         // map by one entry per probed subject for the whole execution, with no
         // eviction, to save ~a microsecond on a duplicate probe.
-        if ctx.overlay.is_some() {
+        //
+        // A drained overlay (a cached handle after an index install) has
+        // nothing to merge. This asks the overlay itself rather than
+        // `overlay_has_novelty`, which also trusts a zero epoch: this block is
+        // the scan's only overlay merge, so a wrong answer here drops rows
+        // instead of declining a fast path.
+        if ctx.overlay.is_some_and(|o| !o.is_effectively_empty()) {
             let epoch = ctx.overlay().epoch();
             // A bound subject (or, failing that, a bound predicate) turns the
             // translation from a whole-novelty walk into a seek. Without it the
