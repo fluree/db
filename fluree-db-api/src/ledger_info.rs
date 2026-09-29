@@ -2839,7 +2839,7 @@ mod tests {
         let mut novelty = fluree_db_novelty::Novelty::new(1);
         novelty.t = 2;
         let mut ledger = LedgerState::new(snapshot, novelty);
-        ledger.ns_record = Some(NsRecord::new("info-watermarks", "main"));
+        ledger.ns_record = Some(NsRecord::new("info-watermarks:main"));
 
         let block = build_ledger_block(&ledger, &IndexStats::default());
         assert_eq!(block.t, Some(2));
