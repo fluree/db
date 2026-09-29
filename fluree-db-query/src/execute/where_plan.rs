@@ -28,7 +28,7 @@ use crate::operator::{BoxedOperator, Operator};
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
 use crate::planner::{
     analyze_property_join, is_property_join, must_bind_vars, reorder_patterns_with_seed,
-    BindTargets,
+    BindTargets, SeedVars,
 };
 use crate::property_join::PropertyJoinOperator;
 use crate::property_path::PropertyPathOperator;
@@ -2151,6 +2151,19 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
     }
 }
 
+/// What `seed` hands the group planned on top of it. An operator that cannot see
+/// its rows reports every schema variable as bound on every row.
+fn seed_vars(seed: &dyn Operator) -> SeedVars {
+    let schema: HashSet<VarId> = seed.schema().iter().copied().collect();
+    match seed.bound_in_every_row() {
+        Some(vars) => SeedVars {
+            schema,
+            bound_in_every_row: vars.into_iter().collect(),
+        },
+        None => SeedVars::all_bound(schema),
+    }
+}
+
 /// Build WHERE operators with an optional initial seed operator (back-compat wrapper).
 ///
 /// Treats all WHERE-bound vars as needed and does not provide GROUP BY hints.
@@ -2554,22 +2567,8 @@ pub fn build_where_operators_seeded_with_needed(
     // (triples, compound patterns like UNION/OPTIONAL/MINUS/EXISTS/Subquery)
     // using selectivity-based cost estimation. This subsumes the per-block
     // reorder_patterns_seeded calls that previously handled triple-only blocks.
-    let initial_bound = seed
-        .as_ref()
-        .map(|op| op.schema().iter().copied().collect::<HashSet<_>>())
-        .unwrap_or_default();
-    let seed_bound_in_every_row: HashSet<VarId> = match &seed {
-        Some(op) => op
-            .bound_in_every_row()
-            .map_or_else(|| initial_bound.clone(), |vars| vars.into_iter().collect()),
-        None => HashSet::new(),
-    };
-    let reordered_storage = reorder_patterns_with_seed(
-        patterns,
-        stats.as_deref(),
-        &initial_bound,
-        &seed_bound_in_every_row,
-    );
+    let seed_vars = seed.as_deref().map(|op| seed_vars(op)).unwrap_or_default();
+    let reordered_storage = reorder_patterns_with_seed(patterns, stats.as_deref(), &seed_vars);
     let patterns = &reordered_storage;
 
     // Compute variable stats for emission pruning and join heuristics.
@@ -2610,7 +2609,7 @@ pub fn build_where_operators_seeded_with_needed(
     };
 
     // Variables bound in every row of `operator`, grown as patterns are applied.
-    let mut guaranteed = seed_bound_in_every_row;
+    let mut guaranteed = seed_vars.bound_in_every_row;
     let mut guaranteed_through = 0;
 
     let mut i = 0;

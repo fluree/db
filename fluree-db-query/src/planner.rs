@@ -1763,7 +1763,7 @@ fn left_join_introduced_vars(pattern: &Pattern, out: &mut HashSet<VarId>) {
 fn values_optional_barrier_indices(
     values_vars: &[VarId],
     preceding: &[Pattern],
-    initial_bound_vars: &HashSet<VarId>,
+    seed_bound_in_every_row: &HashSet<VarId>,
 ) -> Vec<usize> {
     let mut blockers = Vec::new();
     if values_vars.is_empty() {
@@ -1771,7 +1771,7 @@ fn values_optional_barrier_indices(
     }
     let wanted: HashSet<VarId> = values_vars.iter().copied().collect();
     // Variables bound REQUIREDLY before the pattern under test.
-    let mut required_before: HashSet<VarId> = initial_bound_vars.clone();
+    let mut required_before: HashSet<VarId> = seed_bound_in_every_row.clone();
     for (i, p) in preceding.iter().enumerate() {
         let mut introduced = HashSet::new();
         left_join_introduced_vars(p, &mut introduced);
@@ -1824,7 +1824,7 @@ fn values_optional_barrier_indices(
 /// preceding binding-producing patterns.
 fn left_join_order_barriers(
     patterns: &[Pattern],
-    initial_bound_vars: &HashSet<VarId>,
+    seed_bound_in_every_row: &HashSet<VarId>,
 ) -> Vec<Vec<usize>> {
     let mut barriers: Vec<Vec<usize>> = vec![Vec::new(); patterns.len()];
     if !patterns.iter().any(|p| matches!(p, Pattern::Optional(_))) {
@@ -1834,7 +1834,7 @@ fn left_join_order_barriers(
         .iter()
         .map(|p| p.referenced_vars().into_iter().collect())
         .collect();
-    let mut certain_before: HashSet<VarId> = initial_bound_vars.clone();
+    let mut certain_before: HashSet<VarId> = seed_bound_in_every_row.clone();
     for (i, earlier) in patterns.iter().enumerate() {
         if !matches!(
             earlier,
@@ -1897,24 +1897,45 @@ pub fn reorder_patterns(
     stats: Option<&StatsView>,
     initial_bound_vars: &HashSet<VarId>,
 ) -> Vec<Pattern> {
-    reorder_patterns_with_seed(patterns, stats, initial_bound_vars, initial_bound_vars)
+    reorder_patterns_with_seed(
+        patterns,
+        stats,
+        &SeedVars::all_bound(initial_bound_vars.clone()),
+    )
 }
 
-/// [`reorder_patterns`] for a group planned on top of a seed whose schema is
-/// `initial_bound_vars`, of which only `seed_bound_in_every_row` are bound on
-/// every row. A FILTER or BIND reading any other seed variable waits for the
-/// group's patterns that can still bind it.
+/// The variables a seed operator hands to the group planned on top of it.
+#[derive(Clone, Debug, Default)]
+pub struct SeedVars {
+    /// Every variable of the seed's schema: available to join on and to cost.
+    pub schema: HashSet<VarId>,
+    /// The ones bound on every row. Any other may be unbound on some rows, and
+    /// a pattern of the group can still bind it, so it settles nothing: not a
+    /// FILTER or BIND reading it, and not a left-join barrier.
+    pub bound_in_every_row: HashSet<VarId>,
+}
+
+impl SeedVars {
+    /// A seed that binds every variable of `schema` on every row.
+    pub fn all_bound(schema: HashSet<VarId>) -> Self {
+        Self {
+            bound_in_every_row: schema.clone(),
+            schema,
+        }
+    }
+}
+
+/// [`reorder_patterns`] for a group planned on top of `seed`.
 pub fn reorder_patterns_with_seed(
     patterns: &[Pattern],
     stats: Option<&StatsView>,
-    initial_bound_vars: &HashSet<VarId>,
-    seed_bound_in_every_row: &HashSet<VarId>,
+    seed: &SeedVars,
 ) -> Vec<Pattern> {
     if patterns.len() <= 1 {
         return patterns.to_vec();
     }
 
-    let mut bound_vars = initial_bound_vars.clone();
+    let mut bound_vars = seed.schema.clone();
 
     // PIPELINE outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
     // producers). A pattern consuming one of these must be placed AFTER the
@@ -1970,14 +1991,15 @@ pub fn reorder_patterns_with_seed(
     let mut seed_anchor_vars: HashSet<VarId> = subquery_output_vars.clone();
     for (i, p) in patterns.iter().enumerate() {
         if let Pattern::Values { vars, .. } = p {
-            if values_optional_barrier_indices(vars, &patterns[..i], initial_bound_vars).is_empty()
+            if values_optional_barrier_indices(vars, &patterns[..i], &seed.bound_in_every_row)
+                .is_empty()
             {
                 seed_anchor_vars.extend(vars.iter().copied());
             }
         }
     }
 
-    let barriers = left_join_order_barriers(patterns, initial_bound_vars);
+    let barriers = left_join_order_barriers(patterns, &seed.bound_in_every_row);
 
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
@@ -2052,7 +2074,7 @@ pub fn reorder_patterns_with_seed(
         // them.
         if let Pattern::Values { vars, .. } = pattern {
             let blockers =
-                values_optional_barrier_indices(vars, &patterns[..i], initial_bound_vars);
+                values_optional_barrier_indices(vars, &patterns[..i], &seed.bound_in_every_row);
             if !blockers.is_empty() {
                 deferred.push(DeferredPattern {
                     orig_index: i,
@@ -2197,7 +2219,7 @@ pub fn reorder_patterns_with_seed(
             }
         }
     }
-    attach_filter_binders(&mut deferred, patterns, seed_bound_in_every_row);
+    attach_filter_binders(&mut deferred, patterns, &seed.bound_in_every_row);
 
     let mut result: Vec<Pattern> = Vec::with_capacity(patterns.len());
     // Original indices already emitted into `result`, for the positional
@@ -3120,6 +3142,60 @@ mod tests {
         ];
         let barriers = left_join_order_barriers(&patterns, &HashSet::new());
         assert_eq!(barriers, vec![vec![], vec![0], vec![1]]);
+    }
+
+    /// A seed variable unbound on some rows settles nothing: the OPTIONAL can
+    /// still introduce `?org` on those rows, so the triple reading it stays
+    /// behind the OPTIONAL. Only a seed binding `?org` on every row frees it.
+    #[test]
+    fn left_join_barrier_ignores_a_seed_var_unbound_on_some_rows() {
+        let (p, y, org) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![optional(p, "worksFor", org), triple(y, "worksFor", org)];
+        let schema: HashSet<VarId> = [p, org].into_iter().collect();
+
+        let partly_bound = SeedVars {
+            schema: schema.clone(),
+            bound_in_every_row: [p].into_iter().collect(),
+        };
+        let reordered = reorder_patterns_with_seed(&patterns, None, &partly_bound);
+        assert!(
+            matches!(reordered.first(), Some(Pattern::Optional(_))),
+            "{reordered:?}"
+        );
+
+        let barriers = left_join_order_barriers(&patterns, &schema);
+        assert_eq!(barriers, vec![Vec::<usize>::new(), vec![]]);
+    }
+
+    /// #1690 under a seed: the trailing VALUES stays behind the OPTIONAL that
+    /// introduces `?f` when the seed leaves `?f` unbound on some rows.
+    #[test]
+    fn values_barrier_ignores_a_seed_var_unbound_on_some_rows() {
+        let (s, n, f) = (VarId(0), VarId(1), VarId(2));
+        let values = Pattern::Values {
+            vars: vec![f],
+            rows: vec![vec![crate::binding::Binding::iri("ex:alice")]],
+        };
+        let patterns = vec![triple(s, "name", n), optional(s, "friend", f), values];
+        let is_values = |p: &Pattern| matches!(p, Pattern::Values { .. });
+        let is_optional = |p: &Pattern| matches!(p, Pattern::Optional(_));
+
+        let partly_bound = SeedVars {
+            schema: [f].into_iter().collect(),
+            bound_in_every_row: HashSet::new(),
+        };
+        let reordered = reorder_patterns_with_seed(&patterns, None, &partly_bound);
+        assert!(
+            reordered.iter().position(is_optional) < reordered.iter().position(is_values),
+            "{reordered:?}"
+        );
+
+        let all_bound = SeedVars::all_bound([f].into_iter().collect());
+        let reordered = reorder_patterns_with_seed(&patterns, None, &all_bound);
+        assert!(
+            reordered.iter().position(is_values) < reordered.iter().position(is_optional),
+            "with `?f` bound on every row the VALUES may seed: {reordered:?}"
+        );
     }
 
     /// #1925: two OPTIONALs sharing `?f` keep their written order, even though

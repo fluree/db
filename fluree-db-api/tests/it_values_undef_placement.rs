@@ -230,6 +230,33 @@ async fn union_branch_seeded_with_an_unbound_var() {
 }
 
 #[tokio::test]
+async fn optional_keeps_its_barrier_over_an_unbound_seed_var() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree, false).await;
+
+    // The outer OPTIONAL matches nothing, so each seed row of the UNION branch
+    // carries `?payer` unbound. In the branch the OPTIONAL introduces `?payer`,
+    // so `?d ex:payer ?payer` must stay behind it; hoisted ahead, every claim
+    // pairs with every `?d` and the OPTIONAL keeps the pair either way.
+    let body = "SELECT ?c ?d WHERE {
+      ?c ex:patientAge ?a .
+      OPTIONAL { ?c ex:none ?payer }
+      { OPTIONAL { ?c ex:payer ?payer } ?d ex:payer ?payer }
+      UNION
+      { ?c ex:none ?z }
+    }";
+    let mut expected: Vec<Vec<Option<String>>> = (0..5)
+        .flat_map(|c| {
+            (0..5)
+                .filter(move |d| d % 2 == c % 2)
+                .map(move |d| vec![claim(c), claim(d)])
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(rows(&fluree, body, &["c", "d"]).await, expected);
+}
+
+#[tokio::test]
 async fn all_undef_values_plans_like_the_query_without_it() {
     let fluree = FlureeBuilder::memory().build_memory();
     seed(&fluree, true).await;
