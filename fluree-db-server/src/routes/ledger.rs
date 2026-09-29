@@ -1038,7 +1038,8 @@ pub struct CreateBranchResponse {
 /// - `source`: Source branch (optional, defaults to "main")
 ///
 /// Returns 201 Created on success, 409 Conflict if branch already exists,
-/// 404 Not Found if source branch does not exist.
+/// 404 Not Found if source branch does not exist, 400 Bad Request if the
+/// source branch has no commits.
 pub async fn create_branch(State(state): State<Arc<AppState>>, request: Request) -> Response {
     if state.config.server_role == ServerRole::Peer {
         return forward_write_request(&state, request).await;
@@ -1916,12 +1917,12 @@ fn parse_commit_ref(s: &str) -> Result<fluree_db_api::CommitRef> {
 /// returned).
 ///
 /// **What this does NOT protect:** the underlying divergence walk. The
-/// `count` field on each side reflects the full unbounded divergence —
-/// computed by walking every commit envelope between HEAD and the common
-/// ancestor — so a request against branches diverged by N commits costs N
+/// `count` field on each side reflects the full unbounded divergence. It is
+/// computed by walking every commit envelope down to the commit the other
+/// side holds, so a request against branches diverged by N commits costs N
 /// envelope reads regardless of the cap. If you need to reject huge
-/// divergences, add an operational guard before invoking the walk
-/// (e.g., refuse when ancestor.t < target.t - SOME_LIMIT).
+/// divergences, add an operational guard before invoking the walk, such as
+/// refusing when either side is more than some number of commits ahead.
 const PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
 
 /// Hard cap on `max_conflict_keys`. 25x the recommended default.
@@ -1929,8 +1930,8 @@ const PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
 /// **What this protects:** the size of `conflicts.keys` in the response.
 ///
 /// **What this does NOT protect:** the conflict computation. When
-/// `include_conflicts=true`, both `compute_delta_keys` walks scan the full
-/// per-side delta regardless of cap. Clients that need a fast preview
+/// `include_conflicts=true`, both delta-key walks scan the full per-side
+/// delta regardless of cap. Clients that need a fast preview
 /// should pass `include_conflicts=false`.
 const PREVIEW_HARD_MAX_CONFLICT_KEYS: usize = 5_000;
 
@@ -1941,8 +1942,8 @@ const PREVIEW_HARD_MAX_CONFLICT_KEYS: usize = 5_000;
 /// may overshoot by its own size).
 ///
 /// **What this does NOT protect:** the change computation. When
-/// `include_changes=true`, the source-side commit chain since the ancestor
-/// is fully replayed (one commit blob load per commit) regardless of cap —
+/// `include_changes=true`, the source-side commits since the divergence are
+/// fully replayed (one commit blob load per commit) regardless of cap —
 /// the same cost the merge itself pays. Each pagination page re-pays it.
 const PREVIEW_HARD_MAX_CHANGES: usize = 5_000;
 

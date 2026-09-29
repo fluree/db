@@ -2212,7 +2212,7 @@ POST /branch
 
 **Status Codes:**
 - `201 Created` - Branch created successfully
-- `400 Bad Request` - Invalid request body (including malformed `at` value)
+- `400 Bad Request` - Invalid request body (including malformed `at` value), or the source branch has no commits yet
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
 - `404 Not Found` - Source branch does not exist, or `at` commit is not reachable from source HEAD
 - `409 Conflict` - Branch already exists
@@ -2514,7 +2514,9 @@ curl -X POST http://localhost:8090/v1/fluree/rebase \
 
 Merge a source branch into a target branch. Admin-protected.
 
-Fast-forward merges copy the source commit chain into the target namespace and advance the target HEAD. When the target has diverged, Fluree performs a general merge: it computes the source and target deltas since their common ancestor, resolves overlapping `(s, p, g)` conflicts according to the requested strategy, and creates a merge commit on the target branch.
+A merge fast-forwards when the target's HEAD is on the source's line of first parents: Fluree copies the source's commits the target lacks into the target namespace and advances the target HEAD. Otherwise it performs a general merge: it folds each side's commits since the two branches diverged, resolves keys both sides changed according to the requested strategy, and creates a merge commit on the target branch.
+
+Each branch numbers its commits from its own fork point, so the two sides are compared by commit identity rather than by `t`. Any branch can be the source, `main` included, as long as `target` names where the changes go.
 
 **URL:**
 ```
@@ -2701,7 +2703,7 @@ Per-commit summaries (`ahead.commits[]` / `behind.commits[]`) are newest-first a
 
 When `include_conflict_details=true`, `conflicts.details[]` contains one entry for each returned conflict key. `source_values` and `target_values` are the current asserted values for that key at each branch HEAD, using the same resolved flake tuple format as `/show`: `[subject, predicate, object, datatype, operation]`, with an optional metadata object as the 6th tuple item. The `resolution` object is an annotation only; preview does not apply the strategy or mutate state.
 
-**The `changes` object** is a git-diff-style rollup of the merge: the source side's `ancestor..source_head` flakes folded per fact (full identity: subject, predicate, object, datatype, graph, language tag, list index), keeping each touched fact's **newest** op. That op is the fact's state at the source head, which is exactly what the merge applies, so a fact created and then deleted within the range shows as a deletion rather than disappearing from the diff. Nothing is inferred about whether the fact existed before the range: a range can re-assert a value the ledger already holds, so a vanishing pair would hide a real deletion. The change set is strategy-independent (the raw source-vs-ancestor delta, before conflict resolution); under a non-default strategy, conflicting keys resolve per `conflicts.details`.
+**The `changes` object** is a git-diff-style rollup of the merge: the source side's `ancestor..source_head` flakes folded per fact (full identity: subject, predicate, object, datatype, graph, language tag, list index), keeping each touched fact's **newest** op. That op is the fact's state at the source head, which is exactly what the merge applies, so a fact created and then deleted within the range shows as a deletion rather than disappearing from the diff. Nothing is inferred about whether the fact existed before the range: a range can re-assert a value the ledger already holds, so a vanishing pair would hide a real deletion. A merge on the source's line that brought the target in contributes only its resolution, so a branch that synced the target in does not report the target's own changes as its own. The change set is strategy-independent (the raw source-vs-ancestor delta, before conflict resolution); under a non-default strategy, conflicting keys resolve per `conflicts.details`.
 
 - `assert_count` / `retract_count` / `subject_count` are exact across the full divergence, never truncated — a UI can render "showing X of Y".
 - `entries[]` groups net changes by subject, subjects ordered by full IRI. Each flake uses the same resolved tuple format as conflict details.
@@ -2714,6 +2716,7 @@ When `include_conflict_details=true`, `conflicts.details[]` contains one entry f
 - `400 Bad Request` — Source has no branch point (e.g., main), `source == target`, unknown strategy, unsupported preview strategy, `include_conflict_details=true` with `include_conflicts=false`, `strategy=abort` with `include_conflicts=false`, or `changes_after_subject` without `include_changes=true`
 - `401 Unauthorized` — Bearer token required
 - `404 Not Found` — Ledger or branch does not exist (or bearer cannot read it)
+- `409 Conflict` — The source's namespace allocations conflict with the target's (`@type` `err:db/CommitConflict`)
 
 **Examples:**
 
@@ -3788,12 +3791,12 @@ Enable admin authentication with CLI flags:
 
 ```bash
 # Production: require trusted tokens
-fluree-server \
+fluree server run -- \
   --admin-auth-mode=required \
   --admin-auth-trusted-issuer=did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK
 
 # Development: no authentication (default)
-fluree-server --admin-auth-mode=none
+fluree server run -- --admin-auth-mode=none
 ```
 
 **Environment Variables:**
