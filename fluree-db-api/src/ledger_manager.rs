@@ -32,9 +32,7 @@ use fluree_db_core::db::{LedgerSnapshot, LedgerSnapshotMetadata};
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::trace_first_parent_commits_by_id;
-use fluree_db_core::{
-    ledger_id::normalize_ledger_id, ContentId, ContentStore, Sid, StorageBackend,
-};
+use fluree_db_core::{ContentId, ContentStore, LedgerId, Sid, StorageBackend};
 use fluree_db_ledger::{LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
 use rustc_hash::FxHashSet;
@@ -188,7 +186,7 @@ struct LedgerHandleInner {
     /// guard.
     state: Arc<RwLock<LedgerState>>,
     /// Ledger ID (e.g., "mydb:main")
-    ledger_id: String,
+    ledger_id: LedgerId,
     /// Last access time (monotonic secs since process start)
     last_access: AtomicU64,
     /// Binary columnar index store (v2 only).
@@ -351,7 +349,7 @@ pub(crate) enum WritePath {
 impl LedgerHandle {
     /// Create a new handle wrapping ledger state
     pub fn new(
-        ledger_id: String,
+        ledger_id: LedgerId,
         state: LedgerState,
         binary_store: Option<Arc<BinaryIndexStore>>,
     ) -> Self {
@@ -539,7 +537,7 @@ impl LedgerHandle {
     ///
     /// This is functionally identical to `new()`, but the naming clarifies
     /// that this handle is NOT cached and each call creates a fresh load.
-    pub fn ephemeral(ledger_id: String, state: LedgerState) -> Self {
+    pub fn ephemeral(ledger_id: LedgerId, state: LedgerState) -> Self {
         Self::new(ledger_id, state, None)
     }
 
@@ -602,7 +600,7 @@ impl LedgerHandle {
     }
 
     /// Get ledger ID
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &LedgerId {
         &self.inner.ledger_id
     }
 
@@ -721,7 +719,8 @@ impl LedgerHandle {
 
         // Build metadata-only LedgerSnapshot from FIR6 root.
         let meta = LedgerSnapshotMetadata {
-            ledger_id: root.ledger_id,
+            ledger_id: LedgerId::parse(&root.ledger_id)
+                .map_err(|e| ApiError::internal(format!("index root ledger id: {e}")))?,
             t: root.index_t,
             base_t: root.base_t,
             namespace_codes: root.namespace_codes.into_iter().collect(),
@@ -861,7 +860,7 @@ pub struct RemoteWatermark {
 /// Server's PeerState implements this; library doesn't depend on server types.
 pub trait FreshnessSource: Send + Sync {
     /// Get remote watermark for a ledger ID
-    fn watermark(&self, ledger_id: &str) -> Option<RemoteWatermark>;
+    fn watermark(&self, ledger_id: &LedgerId) -> Option<RemoteWatermark>;
 }
 
 /// Result of checking if cached state is fresh
@@ -928,8 +927,8 @@ enum LoadState {
 /// next caller re-elects a fresh leader. The leader calls [`Self::disarm`]
 /// once it has published (success or error), making normal completion a no-op.
 struct LoadingLeaderGuard {
-    entries: Arc<RwLock<HashMap<String, LoadState>>>,
-    alias: String,
+    entries: Arc<RwLock<HashMap<LedgerId, LoadState>>>,
+    alias: LedgerId,
     /// Generation of the `Loading` slot this leader inserted. Cleanup removes
     /// the slot only when it still carries this generation (ABA protection).
     generation: u64,
@@ -957,7 +956,7 @@ impl Drop for LoadingLeaderGuard {
             return;
         };
         let entries = Arc::clone(&self.entries);
-        let alias = std::mem::take(&mut self.alias);
+        let alias = self.alias.clone();
         let generation = self.generation;
         rt.spawn(async move {
             let mut entries = entries.write().await;
@@ -990,8 +989,8 @@ impl Drop for LoadingLeaderGuard {
 /// concurrent `disconnect`/shutdown. The leader calls [`Self::disarm`] once it
 /// has published.
 struct ReloadLeaderGuard {
-    entries: Arc<RwLock<HashMap<String, LoadState>>>,
-    alias: String,
+    entries: Arc<RwLock<HashMap<LedgerId, LoadState>>>,
+    alias: LedgerId,
     generation: u64,
     armed: bool,
 }
@@ -1011,7 +1010,7 @@ impl Drop for ReloadLeaderGuard {
             return;
         };
         let entries = Arc::clone(&self.entries);
-        let alias = std::mem::take(&mut self.alias);
+        let alias = self.alias.clone();
         let generation = self.generation;
         rt.spawn(async move {
             let mut entries = entries.write().await;
@@ -1312,7 +1311,7 @@ pub struct LedgerManager {
     ///
     /// `Arc` so a [`LoadingLeaderGuard`] can reclaim an orphaned `Loading`
     /// slot from a detached cleanup task if a load leader future is cancelled.
-    entries: Arc<RwLock<HashMap<String, LoadState>>>,
+    entries: Arc<RwLock<HashMap<LedgerId, LoadState>>>,
     /// Storage backend for ledger loading
     backend: StorageBackend,
     /// Shared cache for index nodes
@@ -1332,7 +1331,7 @@ pub struct LedgerManager {
     /// treats a cached handle behind its alias's watermark as stale.
     /// A `std::sync` lock: both sides are sub-microsecond map
     /// operations with no `.await` inside the critical section.
-    head_watermarks: std::sync::RwLock<HashMap<String, i64>>,
+    head_watermarks: std::sync::RwLock<HashMap<LedgerId, i64>>,
 }
 
 impl LedgerManager {
@@ -1369,12 +1368,12 @@ impl LedgerManager {
     /// at each advance, upholding the invariant that whoever moves
     /// a head keeps this cache coherent. Cache hits behind the
     /// watermark reload; the reload cost stays on the read path.
-    pub fn note_head_advance(&self, ledger_id: &str, commit_t: i64) {
+    pub fn note_head_advance(&self, ledger_id: &LedgerId, commit_t: i64) {
         let mut watermarks = self
             .head_watermarks
             .write()
             .expect("head watermark lock never poisoned: no panics inside critical section");
-        let entry = watermarks.entry(ledger_id.to_string()).or_insert(commit_t);
+        let entry = watermarks.entry(ledger_id.clone()).or_insert(commit_t);
         if *entry < commit_t {
             *entry = commit_t;
         }
@@ -1384,7 +1383,7 @@ impl LedgerManager {
     /// [`Self::note_head_advance`], or `None` if no head-advancing
     /// component has reported one (heads that only move through
     /// this manager's own pipeline never do).
-    pub fn head_watermark(&self, ledger_id: &str) -> Option<i64> {
+    pub fn head_watermark(&self, ledger_id: &LedgerId) -> Option<i64> {
         self.head_watermarks
             .read()
             .expect("head watermark lock never poisoned: no panics inside critical section")
@@ -1435,7 +1434,7 @@ impl LedgerManager {
     /// arena.
     pub async fn try_running_attachment_events(
         &self,
-        ledger_id: &str,
+        ledger_id: &LedgerId,
     ) -> Option<RunningAttachmentEvents> {
         let handle = self.ready_handle(ledger_id).await?;
         let view = handle.snapshot().await;
@@ -1470,10 +1469,9 @@ impl LedgerManager {
     /// needs to seal an authoritative arena for a write-only ingest flow.
     pub async fn transient_attachment_events(
         &self,
-        ledger_id: &str,
+        ledger_id: &LedgerId,
     ) -> Option<RunningAttachmentEvents> {
-        let canonical_alias =
-            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let canonical_alias = ledger_id.clone();
         let state = LedgerState::load(&self.nameservice_mode, &canonical_alias, &self.backend)
             .await
             .ok()?;
@@ -1497,7 +1495,7 @@ impl LedgerManager {
     /// sticky bit says annotations exist (the post-import state),
     /// the provider needs the snapshot + range_provider to scan the
     /// base index for `f:reifies*` flakes itself.
-    pub async fn get_loaded_view(&self, ledger_id: &str) -> Option<LedgerView> {
+    pub async fn get_loaded_view(&self, ledger_id: &LedgerId) -> Option<LedgerView> {
         let handle = self.ready_handle(ledger_id).await?;
         Some(handle.snapshot().await)
     }
@@ -1513,9 +1511,8 @@ impl LedgerManager {
     /// cold load of any ledger — and, because the lock is write-fair,
     /// every `entries.read()` after that. The manager wedges for the
     /// duration of an unrelated write.
-    async fn ready_handle(&self, ledger_id: &str) -> Option<LedgerHandle> {
-        let canonical_alias =
-            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+    async fn ready_handle(&self, ledger_id: &LedgerId) -> Option<LedgerHandle> {
+        let canonical_alias = ledger_id.clone();
         let entries = self.entries.read().await;
         match entries.get(&canonical_alias) {
             Some(LoadState::Ready(handle)) => Some(handle.clone()),
@@ -1529,9 +1526,8 @@ impl LedgerManager {
     /// Used by the owned-state commit path to write a freshly-committed state
     /// back into the cache (read-your-writes) without resurrecting a ledger the
     /// caller hasn't otherwise accessed.
-    pub async fn get_loaded_handle(&self, ledger_id: &str) -> Option<LedgerHandle> {
-        let canonical_alias =
-            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+    pub async fn get_loaded_handle(&self, ledger_id: &LedgerId) -> Option<LedgerHandle> {
+        let canonical_alias = ledger_id.clone();
         let entries = self.entries.read().await;
         match entries.get(&canonical_alias)? {
             LoadState::Ready(handle) | LoadState::Reloading { handle, .. } => Some(handle.clone()),
@@ -1546,11 +1542,10 @@ impl LedgerManager {
     ///
     /// The ledger_id is normalized to canonical form (e.g., "mydb" -> "mydb:main")
     /// before caching to ensure consistent cache keys regardless of input form.
-    pub async fn get_or_load(&self, ledger_id: &str) -> Result<LedgerHandle> {
+    pub async fn get_or_load(&self, ledger_id: &LedgerId) -> Result<LedgerHandle> {
         // Normalize ledger_id to canonical form for consistent cache keys
         // This ensures "mydb" and "mydb:main" use the same cache entry
-        let canonical_alias =
-            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let canonical_alias = ledger_id.clone();
 
         // Fast path: already loaded
         {
@@ -1788,10 +1783,9 @@ impl LedgerManager {
     ///
     /// Note: If loading/reloading is in progress, waiters will receive
     /// cancellation errors. This is acceptable - disconnect is a "force evict."
-    pub async fn disconnect(&self, ledger_id: &str) {
+    pub async fn disconnect(&self, ledger_id: &LedgerId) {
         // Normalize ledger_id to match cache key format
-        let canonical_alias =
-            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let canonical_alias = ledger_id.clone();
 
         let mut entries = self.entries.write().await;
         // Removal will drop any pending oneshot senders, causing waiters to get RecvError
@@ -1834,10 +1828,9 @@ impl LedgerManager {
     /// - Reloading{h, waiters} → add waiter, await completion
     /// - Loading(waiters) → wait for initial load, then return Ok(())
     /// - None → Ok(()) (not loaded, nothing to reload)
-    pub async fn reload(&self, ledger_id: &str) -> Result<()> {
+    pub async fn reload(&self, ledger_id: &LedgerId) -> Result<()> {
         // Normalize ledger_id to match cache key format
-        let canonical_alias =
-            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let canonical_alias = ledger_id.clone();
 
         enum ReloadAction {
             BecomeLeader {
@@ -2075,7 +2068,7 @@ impl LedgerManager {
     ///
     /// Only evicts Ready entries. Never evicts Loading/Reloading entries
     /// (they're transient; eviction would cancel waiters unexpectedly).
-    pub async fn sweep_idle(&self) -> Vec<String> {
+    pub async fn sweep_idle(&self) -> Vec<LedgerId> {
         let now = monotonic_secs();
         let ttl_secs = self.config.idle_ttl.as_secs();
 
@@ -2107,7 +2100,7 @@ impl LedgerManager {
     }
 
     /// Get list of cached ledger IDs (for introspection)
-    pub async fn cached_aliases(&self) -> Vec<String> {
+    pub async fn cached_aliases(&self) -> Vec<LedgerId> {
         let entries = self.entries.read().await;
         entries
             .iter()
@@ -2297,7 +2290,7 @@ impl UpdatePlan {
 /// Input for notify: ledger ID + optional fresh NsRecord
 pub struct NsNotify {
     /// Ledger ID
-    pub ledger_id: String,
+    pub ledger_id: LedgerId,
     /// Fresh nameservice record (if already fetched)
     pub record: Option<NsRecord>,
 }
@@ -2581,7 +2574,7 @@ impl LedgerManager {
     }
 
     /// Returns the cached ledger's current `t`, or `None` if not cached.
-    pub async fn current_t(&self, ledger_id: &str) -> Option<i64> {
+    pub async fn current_t(&self, ledger_id: &LedgerId) -> Option<i64> {
         // Clone the handle out and drop the `entries` read guard BEFORE locking
         // the handle `state` (via state_metrics): never hold `entries` across a
         // `state` lock, so there is no entries↔state acquisition-order pair to
@@ -2606,6 +2599,10 @@ impl LedgerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn id(s: &str) -> LedgerId {
+        LedgerId::parse(s).unwrap()
+    }
 
     #[test]
     fn test_monotonic_secs() {
@@ -2682,7 +2679,7 @@ mod tests {
             LedgerSnapshot::genesis("test/compact:main"),
             Novelty::new(0),
         );
-        let handle = LedgerHandle::new("test/compact:main".to_string(), state, None);
+        let handle = LedgerHandle::new(id("test/compact:main"), state, None);
         let tier_width = 4;
         handle.set_tier_width(tier_width);
         let rg = std::collections::HashMap::new();
@@ -2733,7 +2730,7 @@ mod tests {
             LedgerSnapshot::genesis("test/nocompact:main"),
             Novelty::new(0),
         );
-        let handle = LedgerHandle::new("test/nocompact:main".to_string(), state, None);
+        let handle = LedgerHandle::new(id("test/nocompact:main"), state, None);
         handle.set_tier_width(0);
         let rg = std::collections::HashMap::new();
 
@@ -2788,7 +2785,7 @@ mod tests {
         index_id: Option<ContentId>,
     ) -> NsRecord {
         NsRecord {
-            ledger_id: "test:main".to_string(),
+            ledger_id: id("test:main"),
             name: "test:main".to_string(),
             branch: "main".to_string(),
             commit_head_id: commit_id,
@@ -3028,7 +3025,7 @@ mod tests {
         let snapshot = LedgerSnapshot::genesis("test:main");
         let novelty = Novelty::new(5);
         let state = LedgerState::new(snapshot, novelty);
-        let handle = LedgerHandle::new("test:main".to_string(), state, None);
+        let handle = LedgerHandle::new(id("test:main"), state, None);
 
         let mgr = LedgerManager::new(backend, ns_mode, LedgerManagerConfig::default());
 
@@ -3039,21 +3036,21 @@ mod tests {
         assert!(!mgr.cached_handle_is_stale(&handle).await);
 
         // A watermark at the cached `t` is still fresh.
-        mgr.note_head_advance("test:main", 5);
+        mgr.note_head_advance(&id("test:main"), 5);
         assert!(!mgr.cached_handle_is_stale(&handle).await);
 
         // A head-advancer reporting past the cached `t` marks it stale.
-        mgr.note_head_advance("test:main", 12);
+        mgr.note_head_advance(&id("test:main"), 12);
         assert!(mgr.cached_handle_is_stale(&handle).await);
 
         // Monotonic: a late, lower report can't roll the watermark back.
-        mgr.note_head_advance("test:main", 3);
+        mgr.note_head_advance(&id("test:main"), 3);
         assert!(mgr.cached_handle_is_stale(&handle).await);
 
         // Disconnect clears the watermark with the entry, so a
         // ledger re-created under the same alias isn't permanently
         // flagged stale by a leftover high watermark.
-        mgr.disconnect("test:main").await;
+        mgr.disconnect(&id("test:main")).await;
         assert!(!mgr.cached_handle_is_stale(&handle).await);
     }
 
@@ -3073,14 +3070,14 @@ mod tests {
         {
             let mut entries = mgr.entries.write().await;
             entries.insert(
-                "ledger_a:main".to_string(),
+                id("ledger_a:main"),
                 LoadState::Loading {
                     generation: 0,
                     waiters: Vec::new(),
                 },
             );
             entries.insert(
-                "ledger_b:main".to_string(),
+                id("ledger_b:main"),
                 LoadState::Loading {
                     generation: 0,
                     waiters: Vec::new(),
@@ -3127,7 +3124,7 @@ mod tests {
             // Verify the flag is set so the guard would skip insertion.
             if !mgr.shutdown.load(Ordering::Acquire) {
                 entries.insert(
-                    "should_not_appear:main".to_string(),
+                    id("should_not_appear:main"),
                     LoadState::Loading {
                         generation: 0,
                         waiters: Vec::new(),
@@ -3152,7 +3149,7 @@ mod tests {
         use fluree_db_ledger::LedgerState;
         use fluree_db_novelty::Novelty;
         let state = LedgerState::new(LedgerSnapshot::genesis(alias), Novelty::new(1));
-        LedgerHandle::new(alias.to_string(), state, None)
+        LedgerHandle::new(id(alias), state, None)
     }
 
     /// The shape of the wedge a writer can cause: a transaction holds
@@ -3169,10 +3166,10 @@ mod tests {
     #[tokio::test]
     async fn snapshot_readers_release_entries_before_taking_state() {
         let mgr = Arc::new(make_test_manager());
-        let handle = ready_handle("busy:main");
+        let handle = ready_handle(&id("busy:main"));
         {
             let mut entries = mgr.entries.write().await;
-            entries.insert("busy:main".to_string(), LoadState::Ready(handle.clone()));
+            entries.insert(id("busy:main"), LoadState::Ready(handle.clone()));
         }
 
         // A transaction in flight on `busy:main`.
@@ -3182,11 +3179,11 @@ mod tests {
         // must park on `state`, not on `entries`.
         let reader_a = {
             let mgr = Arc::clone(&mgr);
-            tokio::spawn(async move { mgr.try_running_attachment_events("busy:main").await })
+            tokio::spawn(async move { mgr.try_running_attachment_events(&id("busy:main")).await })
         };
         let reader_b = {
             let mgr = Arc::clone(&mgr);
-            tokio::spawn(async move { mgr.get_loaded_view("busy:main").await })
+            tokio::spawn(async move { mgr.get_loaded_view(&id("busy:main")).await })
         };
         tokio::task::yield_now().await;
 
@@ -3196,11 +3193,11 @@ mod tests {
         let unrelated = tokio::time::timeout(Duration::from_millis(500), async {
             let mut entries = mgr.entries.write().await;
             entries.insert(
-                "other:main".to_string(),
-                LoadState::Ready(ready_handle("other:main")),
+                id("other:main"),
+                LoadState::Ready(ready_handle(&id("other:main"))),
             );
             drop(entries);
-            mgr.current_t("other:main").await
+            mgr.current_t(&id("other:main")).await
         })
         .await;
         assert!(
@@ -3245,7 +3242,7 @@ mod tests {
         {
             let mut entries = mgr.entries.write().await;
             entries.insert(
-                "x:main".to_string(),
+                id("x:main"),
                 LoadState::Loading {
                     generation: 0,
                     waiters: Vec::new(),
@@ -3256,7 +3253,7 @@ mod tests {
         {
             let _guard = LoadingLeaderGuard {
                 entries: Arc::clone(&mgr.entries),
-                alias: "x:main".to_string(),
+                alias: id("x:main"),
                 generation: 0,
                 armed: true,
             };
@@ -3265,12 +3262,12 @@ mod tests {
         // Cleanup is detached; give it a few scheduler turns to run.
         for _ in 0..20 {
             tokio::task::yield_now().await;
-            if mgr.entries.read().await.get("x:main").is_none() {
+            if mgr.entries.read().await.get(&id("x:main")).is_none() {
                 break;
             }
         }
         assert!(
-            mgr.entries.read().await.get("x:main").is_none(),
+            mgr.entries.read().await.get(&id("x:main")).is_none(),
             "orphaned Loading slot must be reclaimed when the leader future is dropped"
         );
     }
@@ -3284,7 +3281,7 @@ mod tests {
         {
             let mut entries = mgr.entries.write().await;
             entries.insert(
-                "x:main".to_string(),
+                id("x:main"),
                 LoadState::Loading {
                     generation: 0,
                     waiters: vec![tx],
@@ -3294,7 +3291,7 @@ mod tests {
         {
             let _guard = LoadingLeaderGuard {
                 entries: Arc::clone(&mgr.entries),
-                alias: "x:main".to_string(),
+                alias: id("x:main"),
                 generation: 0,
                 armed: true,
             };
@@ -3318,7 +3315,7 @@ mod tests {
         {
             let mut entries = mgr.entries.write().await;
             entries.insert(
-                "x:main".to_string(),
+                id("x:main"),
                 LoadState::Loading {
                     generation: 0,
                     waiters: Vec::new(),
@@ -3328,7 +3325,7 @@ mod tests {
         {
             let mut guard = LoadingLeaderGuard {
                 entries: Arc::clone(&mgr.entries),
-                alias: "x:main".to_string(),
+                alias: id("x:main"),
                 generation: 0,
                 armed: true,
             };
@@ -3338,7 +3335,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(
-            mgr.entries.read().await.get("x:main").is_some(),
+            mgr.entries.read().await.get(&id("x:main")).is_some(),
             "a disarmed guard must not touch the slot"
         );
     }
@@ -3353,7 +3350,7 @@ mod tests {
         {
             let mut entries = mgr.entries.write().await;
             entries.insert(
-                "x:main".to_string(),
+                id("x:main"),
                 LoadState::Loading {
                     generation: 7,
                     waiters: Vec::new(),
@@ -3365,7 +3362,7 @@ mod tests {
         {
             let _guard = LoadingLeaderGuard {
                 entries: Arc::clone(&mgr.entries),
-                alias: "x:main".to_string(),
+                alias: id("x:main"),
                 generation: 3,
                 armed: true,
             };
@@ -3377,7 +3374,7 @@ mod tests {
         let entries = mgr.entries.read().await;
         assert!(
             matches!(
-                entries.get("x:main"),
+                entries.get(&id("x:main")),
                 Some(LoadState::Loading { generation: 7, .. })
             ),
             "stale guard (gen 3) must not remove the new leader's slot (gen 7)"
@@ -3394,7 +3391,7 @@ mod tests {
         use fluree_db_core::db::LedgerSnapshot;
         use fluree_db_novelty::Novelty;
         let state = LedgerState::new(LedgerSnapshot::genesis(alias), Novelty::new(0));
-        LedgerHandle::new(alias.to_string(), state, None)
+        LedgerHandle::new(id(alias), state, None)
     }
 
     /// Regression: a reload-leader future cancelled mid-load must not orphan its
@@ -3406,7 +3403,7 @@ mod tests {
         {
             let mut entries = mgr.entries.write().await;
             entries.insert(
-                "x:main".to_string(),
+                id("x:main"),
                 LoadState::Reloading {
                     generation: 5,
                     handle: handle.clone(),
@@ -3417,7 +3414,7 @@ mod tests {
         {
             let _guard = ReloadLeaderGuard {
                 entries: Arc::clone(&mgr.entries),
-                alias: "x:main".to_string(),
+                alias: id("x:main"),
                 generation: 5,
                 armed: true,
             };
@@ -3425,12 +3422,12 @@ mod tests {
         }
         for _ in 0..20 {
             tokio::task::yield_now().await;
-            if mgr.entries.read().await.get("x:main").is_none() {
+            if mgr.entries.read().await.get(&id("x:main")).is_none() {
                 break;
             }
         }
         assert!(
-            mgr.entries.read().await.get("x:main").is_none(),
+            mgr.entries.read().await.get(&id("x:main")).is_none(),
             "orphaned Reloading slot must be reclaimed when the reload leader is dropped"
         );
     }
@@ -3444,7 +3441,7 @@ mod tests {
         {
             let mut entries = mgr.entries.write().await;
             entries.insert(
-                "x:main".to_string(),
+                id("x:main"),
                 LoadState::Reloading {
                     generation: 9,
                     handle,
@@ -3455,7 +3452,7 @@ mod tests {
         {
             let _guard = ReloadLeaderGuard {
                 entries: Arc::clone(&mgr.entries),
-                alias: "x:main".to_string(),
+                alias: id("x:main"),
                 generation: 4,
                 armed: true,
             };
@@ -3466,7 +3463,7 @@ mod tests {
         let entries = mgr.entries.read().await;
         assert!(
             matches!(
-                entries.get("x:main"),
+                entries.get(&id("x:main")),
                 Some(LoadState::Reloading { generation: 9, .. })
             ),
             "stale reload guard (gen 4) must not remove the newer slot (gen 9)"

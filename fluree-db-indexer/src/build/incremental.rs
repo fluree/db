@@ -736,7 +736,7 @@ pub async fn incremental_index(
         return Ok(IndexResult {
             root_id: base_root_id,
             index_t: novelty.max_t,
-            ledger_id: ledger_id.to_string(),
+            ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
             stats: IndexStats::default(),
             fuel: None,
         });
@@ -4065,7 +4065,7 @@ pub async fn incremental_index(
     Ok(IndexResult {
         root_id,
         index_t: final_root.index_t,
-        ledger_id: ledger_id.to_string(),
+        ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
         stats: IndexStats {
             flake_count: novelty.records.len(),
             leaf_count: total_new_leaves,

@@ -471,10 +471,9 @@ pub enum S2QueryGeom {
 }
 
 impl S2SearchPattern {
-    /// Create a new within pattern
-    pub fn within(subject_var: VarId, query_geom: S2QueryGeom) -> Self {
+    fn new(operation: S2SpatialOp, subject_var: VarId, query_geom: S2QueryGeom) -> Self {
         Self {
-            operation: S2SpatialOp::Within,
+            operation,
             subject_var,
             query_geom,
             predicate: None,
@@ -482,45 +481,26 @@ impl S2SearchPattern {
             limit: None,
             spatial_index_alias: None,
         }
+    }
+
+    /// Create a new within pattern
+    pub fn within(subject_var: VarId, query_geom: S2QueryGeom) -> Self {
+        Self::new(S2SpatialOp::Within, subject_var, query_geom)
     }
 
     /// Create a new contains pattern
     pub fn contains(subject_var: VarId, query_geom: S2QueryGeom) -> Self {
-        Self {
-            operation: S2SpatialOp::Contains,
-            subject_var,
-            query_geom,
-            predicate: None,
-            distance_var: None,
-            limit: None,
-            spatial_index_alias: None,
-        }
+        Self::new(S2SpatialOp::Contains, subject_var, query_geom)
     }
 
     /// Create a new intersects pattern
     pub fn intersects(subject_var: VarId, query_geom: S2QueryGeom) -> Self {
-        Self {
-            operation: S2SpatialOp::Intersects,
-            subject_var,
-            query_geom,
-            predicate: None,
-            distance_var: None,
-            limit: None,
-            spatial_index_alias: None,
-        }
+        Self::new(S2SpatialOp::Intersects, subject_var, query_geom)
     }
 
     /// Create a new nearby pattern
     pub fn nearby(subject_var: VarId, center: S2QueryGeom, radius_meters: f64) -> Self {
-        Self {
-            operation: S2SpatialOp::Nearby { radius_meters },
-            subject_var,
-            query_geom: center,
-            predicate: None,
-            distance_var: None,
-            limit: None,
-            spatial_index_alias: None,
-        }
+        Self::new(S2SpatialOp::Nearby { radius_meters }, subject_var, center)
     }
 
     /// Set the predicate IRI for index routing
@@ -704,16 +684,17 @@ pub struct R2rmlPattern {
 }
 
 impl R2rmlPattern {
-    /// Create a new R2RML pattern with subject and object variables.
-    pub fn new(
-        graph_source_id: impl Into<String>,
-        subject_var: VarId,
+    #[inline]
+    fn with_subject(
+        graph_source_id: String,
+        subject_var: Option<VarId>,
+        subject_constant: Option<String>,
         object_var: Option<VarId>,
     ) -> Self {
         Self {
-            graph_source_id: graph_source_id.into(),
-            subject_var: Some(subject_var),
-            subject_constant: None,
+            graph_source_id,
+            subject_var,
+            subject_constant,
             object_var,
             predicate_var: None,
             type_var: None,
@@ -729,6 +710,15 @@ impl R2rmlPattern {
         }
     }
 
+    /// Create a new R2RML pattern with subject and object variables.
+    pub fn new(
+        graph_source_id: impl Into<String>,
+        subject_var: VarId,
+        object_var: Option<VarId>,
+    ) -> Self {
+        Self::with_subject(graph_source_id.into(), Some(subject_var), None, object_var)
+    }
+
     /// Create a new R2RML pattern with a constant (bound) subject IRI.
     ///
     /// The subject is not a variable; the operator keeps only table rows whose
@@ -738,23 +728,12 @@ impl R2rmlPattern {
         subject_constant: impl Into<String>,
         object_var: Option<VarId>,
     ) -> Self {
-        Self {
-            graph_source_id: graph_source_id.into(),
-            subject_var: None,
-            subject_constant: Some(subject_constant.into()),
+        Self::with_subject(
+            graph_source_id.into(),
+            None,
+            Some(subject_constant.into()),
             object_var,
-            predicate_var: None,
-            type_var: None,
-            triples_map_iri: None,
-            predicate_filter: None,
-            class_filter: None,
-            class_prune_hint: None,
-            star_bindings: Vec::new(),
-            star_constraints: Vec::new(),
-            scan_filters: Vec::new(),
-            consumed_filter: None,
-            object_constant: None,
-        }
+        )
     }
 
     /// Set the predicate filter.
@@ -789,9 +768,8 @@ impl R2rmlPattern {
         self
     }
 
-    /// Variables this pattern produces. R2RML patterns have no input
-    /// variables (only the static graph_source_id and metadata filters), so
-    /// referenced and produced are the same set.
+    /// Variables this pattern binds from the table scan. Filter dependencies
+    /// are included separately by [`Self::referenced_vars`].
     pub fn produced_vars(&self) -> Vec<VarId> {
         let mut vars = Vec::new();
         if let Some(sv) = self.subject_var {

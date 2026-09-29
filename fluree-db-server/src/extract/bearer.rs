@@ -39,15 +39,15 @@ pub struct EventsPrincipal {
     /// fluree.events.all claim
     pub allowed_all: bool,
     /// fluree.events.ledgers claim (HashSet for O(1) lookup)
-    pub allowed_ledgers: HashSet<String>,
+    pub allowed_ledgers: HashSet<fluree_db_api::LedgerId>,
     /// fluree.events.graph_sources claim (HashSet for O(1) lookup)
-    pub allowed_graph_sources: HashSet<String>,
+    pub allowed_graph_sources: HashSet<fluree_db_api::LedgerId>,
 
     // Storage proxy permissions
     /// fluree.storage.all claim
     pub storage_all: bool,
     /// fluree.storage.ledgers claim (HashSet for O(1) lookup)
-    pub storage_ledgers: HashSet<String>,
+    pub storage_ledgers: HashSet<fluree_db_api::LedgerId>,
 }
 
 impl EventsPrincipal {
@@ -57,8 +57,8 @@ impl EventsPrincipal {
     }
 
     /// Check if principal is authorized for a specific ledger alias (storage proxy)
-    pub fn is_storage_authorized_for_ledger(&self, alias: &str) -> bool {
-        self.storage_all || self.storage_ledgers.contains(alias)
+    pub fn is_storage_authorized_for_ledger(&self, id: &fluree_db_api::LedgerId) -> bool {
+        self.storage_all || self.storage_ledgers.contains(id)
     }
 }
 
@@ -230,26 +230,13 @@ fn build_principal(
         identity: payload.resolve_identity(),
         // Events permissions
         allowed_all: payload.events_all.unwrap_or(false),
-        allowed_ledgers: payload
-            .events_ledgers
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
-        allowed_graph_sources: payload
-            .events_graph_sources
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
+        allowed_ledgers: super::data_bearer::parse_scopes(payload.events_ledgers.as_ref()),
+        allowed_graph_sources: super::data_bearer::parse_scopes(
+            payload.events_graph_sources.as_ref(),
+        ),
         // Storage proxy permissions
         storage_all: payload.storage_all.unwrap_or(false),
-        storage_ledgers: payload
-            .storage_ledgers
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
+        storage_ledgers: super::data_bearer::parse_scopes(payload.storage_ledgers.as_ref()),
     }
 }
 
@@ -296,6 +283,10 @@ mod test_helpers {
 mod tests_common {
     use super::*;
     use axum::http::HeaderValue;
+
+    fn id(s: &str) -> fluree_db_api::LedgerId {
+        fluree_db_api::LedgerId::parse(s).unwrap()
+    }
 
     #[test]
     fn test_extract_bearer_token_standard() {
@@ -375,15 +366,15 @@ mod tests_common {
             subject: Some("user@example.com".to_string()),
             identity: Some("user@example.com".to_string()),
             allowed_all: false,
-            allowed_ledgers: vec!["books:main".to_string()].into_iter().collect(),
+            allowed_ledgers: vec![id("books:main")].into_iter().collect(),
             allowed_graph_sources: HashSet::new(),
             storage_all: false,
             storage_ledgers: HashSet::new(),
         };
 
         assert!(!principal.allowed_all);
-        assert!(principal.allowed_ledgers.contains("books:main"));
-        assert!(!principal.allowed_graph_sources.contains("search:main"));
+        assert!(principal.allowed_ledgers.contains(&id("books:main")));
+        assert!(!principal.allowed_graph_sources.contains(&id("search:main")));
     }
 
     #[test]
@@ -396,15 +387,16 @@ mod tests_common {
             allowed_ledgers: HashSet::new(),
             allowed_graph_sources: HashSet::new(),
             storage_all: false,
-            storage_ledgers: vec!["books:main".to_string(), "users:main".to_string()]
-                .into_iter()
-                .collect(),
+            storage_ledgers: crate::extract::data_bearer::parse_scopes(Some(&vec![
+                "books".to_string(),
+                "users:main".to_string(),
+            ])),
         };
 
         assert!(principal.has_storage_permissions());
-        assert!(principal.is_storage_authorized_for_ledger("books:main"));
-        assert!(principal.is_storage_authorized_for_ledger("users:main"));
-        assert!(!principal.is_storage_authorized_for_ledger("other:main"));
+        assert!(principal.is_storage_authorized_for_ledger(&id("books:main")));
+        assert!(principal.is_storage_authorized_for_ledger(&id("users:main")));
+        assert!(!principal.is_storage_authorized_for_ledger(&id("other:main")));
     }
 
     #[test]
@@ -421,8 +413,8 @@ mod tests_common {
         };
 
         assert!(principal.has_storage_permissions());
-        assert!(principal.is_storage_authorized_for_ledger("any:ledger"));
-        assert!(principal.is_storage_authorized_for_ledger("books:main"));
+        assert!(principal.is_storage_authorized_for_ledger(&id("any:ledger")));
+        assert!(principal.is_storage_authorized_for_ledger(&id("books:main")));
     }
 }
 
@@ -434,6 +426,10 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use fluree_db_credential::did_from_pubkey;
+
+    fn id(s: &str) -> fluree_db_api::LedgerId {
+        fluree_db_api::LedgerId::parse(s).unwrap()
+    }
 
     #[test]
     fn test_verify_token_valid_with_trusted_issuer() {
@@ -615,8 +611,8 @@ mod tests {
         let principal = result.0.unwrap();
 
         assert!(!principal.allowed_all);
-        assert!(principal.allowed_ledgers.contains("books:main"));
-        assert!(principal.allowed_ledgers.contains("users:prod"));
+        assert!(principal.allowed_ledgers.contains(&id("books:main")));
+        assert!(principal.allowed_ledgers.contains(&id("users:prod")));
         assert_eq!(principal.allowed_ledgers.len(), 2);
     }
 
@@ -860,8 +856,12 @@ mod tests_oidc {
         let principal = result.0.unwrap();
 
         assert!(!principal.allowed_all);
-        assert!(principal.allowed_ledgers.contains("books:main"));
-        assert!(principal.allowed_ledgers.contains("users:prod"));
+        assert!(principal
+            .allowed_ledgers
+            .contains(&fluree_db_api::LedgerId::parse("books:main").unwrap()));
+        assert!(principal
+            .allowed_ledgers
+            .contains(&fluree_db_api::LedgerId::parse("users:prod").unwrap()));
         assert_eq!(principal.allowed_ledgers.len(), 2);
     }
 

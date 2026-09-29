@@ -160,10 +160,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     let var_id = self.vars.get_or_insert(&format!("_:{label}"));
                     Ok(Ref::Var(var_id))
                 }
-                BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
-                    Ok(Ref::Var(var_id))
-                }
+                BlankNodeValue::Anon => Ok(Ref::Var(self.fresh_blank_node_var())),
             },
             Some(ReifierId::Var(v)) => Ok(self.lower_var_ref(v)),
             None => {
@@ -245,7 +242,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Carries the same constraint-preserving object lowering as the
     /// annotation-block body so reified base-edge object positions
     /// match precisely.
-    fn lower_triple_term(
+    pub(super) fn lower_triple_term(
         &mut self,
         term: &TripleTerm,
         out: &mut Vec<Pattern>,

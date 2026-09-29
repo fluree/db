@@ -33,8 +33,11 @@ async fn run_set(
     auto_pull: bool,
 ) -> CliResult<()> {
     // Normalize local alias to include branch
-    let local_alias = context::to_ledger_id(local);
-    let remote_alias = remote_alias.unwrap_or_else(|| local_alias.clone());
+    let local_alias = context::to_ledger_id(local)?;
+    let remote_alias = match remote_alias {
+        Some(r) => context::to_ledger_id(&r)?,
+        None => local_alias.clone(),
+    };
 
     // Check that the remote exists
     let remote_name = RemoteName::new(remote);
@@ -75,7 +78,7 @@ async fn run_set(
 }
 
 async fn run_remove(store: &TomlSyncConfigStore, local: &str) -> CliResult<()> {
-    let local_alias = context::to_ledger_id(local);
+    let local_alias = context::to_ledger_id(local)?;
 
     // Check if exists
     let existing = store

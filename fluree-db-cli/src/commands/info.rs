@@ -37,7 +37,7 @@ pub async fn run(
                 // Ledger not found — try graph source lookup
                 let alias = context::resolve_ledger(ledger, dirs)?;
                 let fluree = context::build_fluree(dirs)?;
-                let gs_id = context::to_ledger_id(&alias);
+                let gs_id = context::to_ledger_id(&alias)?;
                 if let Some(gs) = fluree.nameservice().lookup_graph_source(&gs_id).await? {
                     if graph.is_some() {
                         return Err(CliError::Usage(
@@ -111,7 +111,7 @@ pub async fn run(
             }
         }
         LedgerMode::Local { fluree, alias } => {
-            let ledger_id = context::to_ledger_id(&alias);
+            let ledger_id = context::to_ledger_id(&alias)?;
 
             // Try ledger first, then graph source
             if let Some(record) = fluree.nameservice().lookup(&ledger_id).await? {

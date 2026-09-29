@@ -24,7 +24,7 @@ use crate::ir::{CompareOp, Expression, Function, Pattern};
 use crate::join::NestedLoopJoinOperator;
 use crate::minus::MinusOperator;
 use crate::operator::inline::InlineOperator;
-use crate::operator::BoxedOperator;
+use crate::operator::{BoxedOperator, Operator};
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
 use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
 use crate::property_join::PropertyJoinOperator;
@@ -1739,6 +1739,14 @@ pub(crate) struct TriplePlanContext<'a> {
     stats: Option<&'a StatsView>,
 }
 
+impl<'a> TriplePlanContext<'a> {
+    fn hash_planner(&self, left: &Option<BoxedOperator>) -> HashJoinPlanner<'a> {
+        HashJoinPlanner::new(self.stats)
+            .with_row_goal(self.planning.row_goal)
+            .with_left_estimate(left.as_ref().and_then(|op| op.estimated_rows()))
+    }
+}
+
 /// Build an operator tree for a sequential scan/join block of triples.
 ///
 /// Applies VALUES first (if any), then iterates triples building scan/join
@@ -1774,8 +1782,7 @@ fn build_sequential_join_block(
     // Seed it from the incoming LEFT operator's estimate (e.g. a subquery producing
     // `WITH DISTINCT friend`) so the first probe is costed against the producer size,
     // not 1 — otherwise a large object predicate falsely trips scan-ratio-too-high.
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
-        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
+    let mut hash_planner = ctx.hash_planner(&operator);
     let mut dead_before_step = 0usize;
     let mut folded = vec![false; triples.len()];
     for (k, tp) in triples.iter().enumerate() {
@@ -3332,21 +3339,24 @@ pub(crate) fn build_scan_or_join(
                 }
             }
 
-            Box::new(
-                NestedLoopJoinOperator::new(
-                    left,
-                    left_schema,
-                    tp.clone(),
-                    bounds,
-                    inline_ops,
-                    EmitMask::ALL,
-                    planning.mode(),
-                )
-                .with_out_schema(downstream_vars)
-                // A shape-eligible-but-rejected hash join attaches its reason; a
-                // non-candidate (subject chain, bounds, etc.) attaches nothing.
-                .with_hash_join_decision(decision),
+            let mut join = NestedLoopJoinOperator::new(
+                left,
+                left_schema,
+                tp.clone(),
+                bounds,
+                inline_ops,
+                EmitMask::ALL,
+                planning.mode(),
             )
+            .with_out_schema(downstream_vars)
+            // A shape-eligible-but-rejected hash join attaches its reason; a
+            // non-candidate (subject chain, bounds, etc.) attaches nothing.
+            .with_hash_join_decision(decision);
+            if let Some(goal) = planning.row_goal {
+                // This only sizes probe windows; it never truncates input.
+                join.set_row_budget(goal);
+            }
+            Box::new(join)
         }
     }
 }
@@ -3517,8 +3527,7 @@ fn build_sequential_triple_chain(
     // friend` subquery's ~producer size) — otherwise the first probe is weighed
     // against 1 and a large object predicate falsely trips scan-ratio-too-high.
     let mut seen_vars: HashSet<VarId> = bound_vars_from_operator(&operator);
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
-        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
+    let mut hash_planner = ctx.hash_planner(&operator);
     let mut dead_before_step = 0usize;
     for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);

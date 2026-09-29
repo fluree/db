@@ -252,7 +252,7 @@ impl crate::Fluree {
         }
 
         Ok(LedgerVerifyReport {
-            ledger_id: record.ledger_id.clone(),
+            ledger_id: record.ledger_id.clone().to_string(),
             head_commit_id: record.commit_head_id.clone(),
             head_t: record.commit_t,
             index_id: record.index_head_id.clone(),

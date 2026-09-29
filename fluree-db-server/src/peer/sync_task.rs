@@ -305,7 +305,7 @@ impl PeerSyncTask {
     /// Retract ledger locally and clear its in-memory watermarks. Cache
     /// eviction follows from the retraction event the notifying
     /// nameservice emits.
-    async fn handle_ledger_retracted(&self, ledger_id: &str) {
+    async fn handle_ledger_retracted(&self, ledger_id: &fluree_db_api::LedgerId) {
         // 1. Retract via Publisher::retract()
         let Some(ns) = self.fluree.nameservice_mode().publisher() else {
             tracing::error!("PeerSyncTask requires a read-write nameservice");

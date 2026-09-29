@@ -559,7 +559,7 @@ pub(crate) async fn encode_and_write_root_v6(
     Ok(IndexResult {
         root_id,
         index_t: root.index_t,
-        ledger_id: inputs.ledger_id,
+        ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(inputs.ledger_id.as_str()),
         stats: IndexStats {
             total_bytes: root_bytes.len(),
             ..result_stats

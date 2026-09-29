@@ -599,8 +599,12 @@ impl Worker {
             .fluree
             .ledger_manager()
             .ok_or_else(|| stage_failure("LedgerManager is not configured on Fluree"))?;
+        let typed_id = self
+            .ref_key
+            .id()
+            .map_err(|e| stage_failure(&format!("invalid ledger id: {e}")))?;
         let ledger_handle = ledger_manager
-            .get_or_load(&ledger_id)
+            .get_or_load(&typed_id)
             .await
             .map_err(|e| stage_failure(&format!("ledger load failed: {e}")))?;
 

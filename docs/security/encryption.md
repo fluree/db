@@ -84,7 +84,7 @@ Set the encryption key via environment variable:
 export FLUREE_ENCRYPTION_KEY=$(openssl rand -base64 32)
 
 # Start the server with JSON-LD config
-./fluree-db-server --config config.jsonld
+fluree server run --connection-config config.jsonld
 ```
 
 ## Configuration

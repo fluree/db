@@ -6,10 +6,22 @@ Fluree supports four storage modes, each optimized for different deployment scen
 
 ### Memory Storage
 
-In-memory storage for development and testing:
+In-memory storage for development and testing. The server has no dedicated flag for it;
+point `--connection-config` at a connection config whose storage node has no backend fields:
+
+```json
+{
+  "@context": {"@vocab": "https://ns.flur.ee/system#"},
+  "@graph": [{
+    "@id": "conn",
+    "@type": "Connection",
+    "indexStorage": {"@id": "mem", "@type": "Storage"}
+  }]
+}
+```
 
 ```bash
-./fluree-db-server --storage memory
+fluree server run --connection-config memory.jsonld
 ```
 
 **Characteristics:**
@@ -31,12 +43,10 @@ In-memory storage for development and testing:
 
 ### File Storage
 
-Local file system storage:
+Local file system storage (the server's default, at `.fluree/storage` when no path is given):
 
 ```bash
-./fluree-db-server \
-  --storage file \
-  --data-dir /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 ```
 
 **Characteristics:**
@@ -59,15 +69,13 @@ Local file system storage:
 
 ### AWS Storage
 
-Distributed storage using S3 and DynamoDB:
+Distributed storage using S3 and DynamoDB. Buckets, DynamoDB table, and region are set in a
+JSON-LD connection config file (requires a server built with the `aws` feature); see the
+[example in Configuration](configuration.md#connection-configuration-s3-dynamodb-etc) and the
+[connection config reference](../reference/connection-config-jsonld.md):
 
 ```bash
-./fluree-db-server \
-  --storage aws \
-  --s3-bucket fluree-prod-data \
-  --s3-region us-east-1 \
-  --dynamodb-table fluree-nameservice \
-  --dynamodb-region us-east-1
+fluree server run --connection-config /etc/fluree/connection.jsonld
 ```
 
 **Characteristics:**
@@ -94,43 +102,18 @@ Indexes are reproducible from commits, so they can use either Standard S3 or S3
 Express One Zone depending on latency and cost requirements. See
 [Serverless Storage Choices](serverless-storage.md) for benchmark-backed guidance.
 
-### IPFS Storage
+### IPFS Storage (experimental, Rust API only)
 
-Decentralized content-addressed storage via a local Kubo node:
+Content-addressed storage in IPFS through a local Kubo node. It is available only to programs
+that embed Fluree through the Rust API (`FlureeBuilder::build_ipfs`, with the `ipfs` feature on
+`fluree-db-api`). The server and CLI cannot use it, and a connection config cannot select it: a
+storage node with `ipfsApiUrl` is rejected.
 
-```json
-{
-  "@context": {"@vocab": "https://ns.flur.ee/system#"},
-  "@graph": [{
-    "@type": "Connection",
-    "indexStorage": {
-      "@type": "Storage",
-      "ipfsApiUrl": "http://127.0.0.1:5001",
-      "ipfsPinOnPut": true
-    }
-  }]
-}
-```
+The builder keeps the nameservice in memory, so blocks persist in IPFS but a restarted process no
+longer knows each ledger's current commit. Use it to publish and fetch content-addressed Fluree
+data, not as durable primary storage.
 
-**Characteristics:**
-- Content-addressed (every blob identified by SHA-256 hash)
-- Immutable, tamper-evident storage
-- Decentralized replication via IPFS network
-- Fluree's native CIDs work directly with IPFS
-
-**Use Cases:**
-- Decentralized / censorship-resistant deployments
-- Content integrity verification
-- Cross-organization data sharing
-- Foundation for IPNS/ENS-based ledger discovery
-
-**Limitations:**
-- Requires a running Kubo node
-- No prefix listing (manifest-based tracking needed)
-- No native deletion (unpin + GC)
-- Higher write latency than local file I/O
-
-See [IPFS Storage Guide](ipfs-storage.md) for complete setup and configuration.
+See the [IPFS Storage Guide](ipfs-storage.md) for setup and details.
 
 ## Storage Architecture
 
@@ -211,7 +194,7 @@ Multiple processes coordinate via AWS.
      └─────────────┘
 ```
 
-Data stored as content-addressed blocks in IPFS via Kubo.
+Data stored as content-addressed blocks in IPFS via Kubo (Rust API only; the nameservice is in memory).
 
 ## Storage Encryption
 
@@ -577,19 +560,18 @@ Required IAM permissions:
 
 ### Decision Matrix
 
-| Requirement | Memory | File | AWS | IPFS |
+| Requirement | Memory | File | AWS | IPFS (Rust API) |
 |-------------|--------|------|-----|------|
-| **Development** | Best | Good | Overkill | Overkill |
-| **Single server** | No | Best | Overkill | Good |
-| **Multi-server** | No | No | Best | Good |
-| **Persistence** | No | Yes | Yes | Yes |
+| **Development** | Best | Good | Overkill | Experimental |
+| **Single server** | No | Best | Overkill | No |
+| **Multi-server** | No | No | Best | No |
+| **Persistence** | No | Yes | Yes | Blocks only; ledger heads are in memory |
 | **Cloud-native** | No | No | Yes | No |
-| **Decentralized** | No | No | No | Best |
-| **Content integrity** | No | No | No | Best |
+| **Decentralized** | No | No | No | Blocks can replicate |
 | **Cost** | Free | Free | Monthly | Free |
 | **Setup complexity** | Trivial | Simple | Complex | Moderate |
 | **Performance** | Fastest | Fast | Good | Good |
-| **Durability** | None | Local | 11 9's | Network-wide |
+| **Durability** | None | Local | 11 9's | Blocks: network-wide; ledger heads: none |
 
 ### Recommendations
 
@@ -612,11 +594,8 @@ Required IAM permissions:
 - Cloud-native architecture
 
 **Use IPFS when:**
-- Decentralized storage required
-- Content integrity verification is critical
-- Cross-organization data sharing
-- Building toward IPNS/ENS-based ledger discovery
-- Censorship resistance is a requirement
+- You embed Fluree through the Rust API and want to publish or fetch content-addressed Fluree
+  data through IPFS, and don't need ledgers to survive a restart
 
 ## Switching Storage Modes
 
@@ -626,10 +605,12 @@ Export from the running system and import into the new one:
 
 ```bash
 # Export from memory
-curl -X POST http://localhost:8090/export?ledger=mydb:main > mydb-export.jsonld
+curl -X POST http://localhost:8090/v1/fluree/export/mydb:main \
+  -H "Content-Type: application/json" \
+  -d '{"format": "jsonld"}' > mydb-export.jsonld
 
 # Stop memory server, start file server
-./fluree-db-server --storage file --data-dir /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 
 # Import to file storage
 curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
@@ -656,8 +637,8 @@ aws dynamodb create-table \
     AttributeName=sk,KeyType=RANGE \
   --billing-mode PAY_PER_REQUEST
 
-# Start AWS-backed server
-./fluree-db-server --storage aws --s3-bucket fluree-prod-data
+# Start AWS-backed server (S3 bucket + DynamoDB table named in the connection config)
+fluree server run --connection-config /etc/fluree/connection.jsonld
 ```
 
 ### AWS to File
@@ -669,7 +650,7 @@ Download from S3:
 aws s3 sync s3://fluree-prod-data/ /var/lib/fluree/
 
 # Start file-backed server
-./fluree-db-server --storage file --data-dir /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 ```
 
 ## Backup and Recovery
@@ -680,7 +661,9 @@ No native backup (data is ephemeral):
 
 ```bash
 # Export ledger
-curl -X POST http://localhost:8090/export?ledger=mydb:main > backup.jsonld
+curl -X POST http://localhost:8090/v1/fluree/export/mydb:main \
+  -H "Content-Type: application/json" \
+  -d '{"format": "jsonld"}' > backup.jsonld
 ```
 
 ### File Storage
