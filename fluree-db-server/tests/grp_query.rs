@@ -13,6 +13,8 @@ mod multi_ledger_query_dispatch;
 mod multi_query_auth_integration;
 #[path = "multi_query_integration.rs"]
 mod multi_query_integration;
+#[path = "query_path_time_pin.rs"]
+mod query_path_time_pin;
 #[path = "sparql_construct_jsonld_accept.rs"]
 mod sparql_construct_jsonld_accept;
 #[path = "sparql_dataset_semantics.rs"]
