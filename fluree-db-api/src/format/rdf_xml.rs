@@ -172,7 +172,7 @@ fn write_predicate_object(
     match reifier {
         Some(Term::Iri(iri)) if iri.starts_with("_:") => {
             out.push_str(r#" rdf:annotationNodeID=""#);
-            escape_attr_into(&iri[2..], out);
+            push_node_id(&iri[2..], out);
             out.push('"');
         }
         Some(Term::Iri(iri)) => {
@@ -182,7 +182,7 @@ fn write_predicate_object(
         }
         Some(Term::BlankNode(id)) => {
             out.push_str(r#" rdf:annotationNodeID=""#);
-            escape_attr_into(id.as_str(), out);
+            push_node_id(id.as_str(), out);
             out.push('"');
         }
         Some(Term::Literal { .. }) => {
@@ -371,6 +371,34 @@ mod tests {
         );
         assert!(xml.contains(r#"rdf:annotationNodeID="r1""#), "{xml}");
         assert!(xml.contains(r#"rdf:annotationNodeID="fdb-9""#), "{xml}");
+
+        // A label that is not an XML name is encoded as it is for
+        // `rdf:nodeID`, so the annotation names the node its description does.
+        let mut legacy = Graph::new();
+        legacy.add(Triple::new(ex("alice"), ex("knows"), ex("bob")));
+        legacy.add(Triple::new(
+            Term::iri("_:old/ledger:1"),
+            ex("source"),
+            ex("hr"),
+        ));
+        legacy.add_reification(
+            ex("alice"),
+            ex("knows"),
+            ex("bob"),
+            Term::iri("_:old/ledger:1"),
+        );
+        legacy.add_reification(ex("alice"), ex("knows"), ex("bob"), Term::blank("1"));
+        legacy.canonicalize();
+        let xml = format_graph(&legacy).unwrap();
+        assert!(
+            xml.contains(r#"rdf:annotationNodeID="x6f6c642f6c65646765723a31""#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<rdf:Description rdf:nodeID="x6f6c642f6c65646765723a31">"#),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"rdf:annotationNodeID="x31""#), "{xml}");
 
         let mut orphan = Graph::new();
         orphan.add_reification(ex("a"), ex("p"), ex("b"), ex("r"));

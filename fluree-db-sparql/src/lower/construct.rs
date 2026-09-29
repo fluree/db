@@ -11,7 +11,7 @@ use crate::ast::{GraphName, SubjectTerm, Term};
 
 use fluree_db_query::ir::triple::{Ref, TriplePattern};
 use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Pattern, Query, QueryOutput, TemplateReification,
+    ConstructTemplate as QueryConstructTemplate, Pattern, Query, QueryOutput,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 
@@ -123,8 +123,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     ));
                 }
                 let triple = out.push_pattern(reified, graph.clone());
-                out.reifications
-                    .push(TemplateReification { triple, reifier: s });
+                out.push_reification(triple, s);
                 continue;
             }
 
@@ -152,10 +151,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     None => Ref::Var(self.fresh_blank_node_var()),
                     other => self.lower_reifier_id(other.as_ref())?,
                 };
-                out.reifications.push(TemplateReification {
-                    triple: edge,
-                    reifier: reifier.clone(),
-                });
+                out.push_reification(edge, reifier.clone());
                 for entry in unit.block.iter().flat_map(|b| &b.entries) {
                     let AnnotationVerb::Simple(pred) = &entry.verb else {
                         return Err(LowerError::not_implemented(
@@ -215,10 +211,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     body,
                 } => {
                     let triple = out.push_pattern(edge.clone(), None);
-                    out.reifications.push(TemplateReification {
-                        triple,
-                        reifier: annotation.clone(),
-                    });
+                    out.push_reification(triple, annotation.clone());
                     self.collect_triples(body, out);
                 }
                 // Filters, Binds, Values, PropertyPaths, Subqueries, IndexSearch, Service, and R2rml don't contribute template triples

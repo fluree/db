@@ -20,7 +20,7 @@ use crate::ir::ReasoningConfig;
 use crate::ir::{AggregateFn, AggregateSpec, InputSemantics};
 use crate::ir::{
     Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
-    Query, QueryOutput, Restriction, Root, TemplateReification,
+    Query, QueryOutput, Restriction, Root,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, PathStep, Pattern,
@@ -1433,7 +1433,7 @@ fn lower_construct_template<E: IriEncoder>(
     // synthetic variable no WHERE clause binds: mint a fresh blank node for
     // it on each row, as SPARQL does for a `[ ]` reifier.
     out.bnode_vars = out
-        .reifications
+        .reifications()
         .iter()
         .filter_map(|r| r.reifier.as_var())
         .filter(|&v| vars.try_name(v).is_some_and(|n| n.starts_with("?__ann")))
@@ -1460,10 +1460,7 @@ fn lower_construct_patterns<E: IriEncoder>(
             } => {
                 let triple =
                     out.push_pattern(lower_triple_pattern(edge, encoder, vars)?, graph.cloned());
-                out.reifications.push(TemplateReification {
-                    triple,
-                    reifier: lower_ref_term(annotation, encoder, vars)?,
-                });
+                out.push_reification(triple, lower_ref_term(annotation, encoder, vars)?);
                 lower_construct_patterns(body, graph, encoder, vars, out)?;
             }
             UnresolvedPattern::Graph { name, patterns } => {

@@ -28,10 +28,14 @@ use crate::var_registry::VarId;
 /// to produce output triples. Uses the same TriplePattern type as WHERE clause
 /// patterns, but variables are resolved against the query result bindings rather
 /// than matched against the database.
+///
+/// `patterns`, `graphs` and `reifications` index into one another, so they
+/// change only through [`push_pattern`](Self::push_pattern) and
+/// [`push_reification`](Self::push_reification).
 #[derive(Debug, Clone)]
 pub struct ConstructTemplate {
     /// Template patterns (resolved TriplePatterns with Sids and VarIds)
-    pub patterns: Vec<TriplePattern>,
+    patterns: Vec<TriplePattern>,
     /// Variables that originated as template blank nodes (`[ ]`, `_:a`, or the
     /// blank cells of a desugared RDF collection `( ... )`).
     ///
@@ -44,11 +48,11 @@ pub struct ConstructTemplate {
     /// The named graph each pattern writes into, parallel to `patterns`
     /// (`None`: the default graph). Empty when no pattern names a graph. A
     /// template that names one produces a dataset, not a single graph.
-    pub graphs: Vec<Option<Ref>>,
+    graphs: Vec<Option<Ref>>,
     /// RDF 1.2 reifier attachments: `reifier` reifies the triple that
     /// `patterns[triple]` instantiates to. A row that leaves either unbound
     /// contributes no attachment.
-    pub reifications: Vec<TemplateReification>,
+    reifications: Vec<TemplateReification>,
 }
 
 /// A reifier attachment in a CONSTRUCT template (see
@@ -89,6 +93,28 @@ impl ConstructTemplate {
         }
         self.patterns.push(pattern);
         self.patterns.len() - 1
+    }
+
+    /// Attach `reifier` to `patterns[triple]`, an index
+    /// [`push_pattern`](Self::push_pattern) returned.
+    pub fn push_reification(&mut self, triple: usize, reifier: Ref) {
+        assert!(
+            triple < self.patterns.len(),
+            "reification of pattern {triple}, but the template has {}",
+            self.patterns.len()
+        );
+        self.reifications
+            .push(TemplateReification { triple, reifier });
+    }
+
+    /// The template patterns.
+    pub fn patterns(&self) -> &[TriplePattern] {
+        &self.patterns
+    }
+
+    /// The reifier attachments, each naming a pattern that exists.
+    pub fn reifications(&self) -> &[TemplateReification] {
+        &self.reifications
     }
 
     /// The graph `patterns[i]` writes into (`None`: the default graph).

@@ -74,10 +74,11 @@ pub fn sparql_service_description(endpoint: &str, config: &FormatterConfig) -> R
     graph.canonicalize();
 
     match config.format {
-        OutputFormat::JsonLd => Ok(serde_json::to_string(&format_jsonld(
-            &graph,
-            &JsonLdFormatConfig::new(),
-        ))?),
+        OutputFormat::JsonLd => {
+            let json = format_jsonld(&graph, &JsonLdFormatConfig::new())
+                .map_err(|e| FormatError::InvalidBinding(e.to_string()))?;
+            Ok(serde_json::to_string(&json)?)
+        }
         OutputFormat::Turtle => {
             let prefixes = PrefixMap::from_context(&serde_json::json!({
                 "sd": SD,

@@ -525,6 +525,38 @@ async fn graph_store_requires_authorization() {
     assert!(body.contains("tool"), "{body}");
 }
 
+/// An unauthenticated read is refused before anything loads the ledger, the
+/// default graph included, which needs no existence check of its own.
+#[tokio::test]
+async fn an_unauthenticated_read_does_not_load_the_ledger() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        data_auth_mode: fluree_db_server::config::DataAuthMode::Required,
+        data_auth_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state.clone());
+    let create = serde_json::json!({ "ledger": LEDGER }).to_string();
+    let (status, body) = send(&app, "POST", "/v1/fluree/create", JSON_LD, &create, None).await;
+    assert_eq!(status, StatusCode::CREATED, "create ledger: {body}");
+
+    let manager = state.fluree.ledger_manager().expect("ledger caching");
+    manager.disconnect(LEDGER).await;
+    for uri in [default_graph(), named(TOOLS)] {
+        let (status, _, body) = send_as(&app, "GET", &uri, None, None, "", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "GET {uri}: {body}");
+        assert!(
+            manager.get_loaded_handle(LEDGER).await.is_none(),
+            "GET {uri} loaded the ledger before authenticating"
+        );
+    }
+}
+
 /// A language tag that is not a `LANGTAG` would end the literal in Turtle or
 /// N-Triples output and forge triples, so writing one is a 400.
 #[tokio::test]

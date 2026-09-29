@@ -256,32 +256,30 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
     let (parts, _) = request.into_parts();
 
     // Existence is asked through the query route, so authentication and read
-    // policy answer first: a graph with no triple the caller may see is
-    // indistinguishable from an absent one. `HEAD` stops here rather than
-    // serializing the graph. A plain `GET` of the default graph needs no probe;
-    // the CONSTRUCT is authorized the same way.
-    if head || matches!(graph, GraphSel::Graph(_)) {
-        let probe = match &graph {
-            GraphSel::Graph(iri) => format!("ASK {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"),
-            GraphSel::Default => "ASK { ?s ?p ?o }".to_string(),
-        };
-        let response = query_as_caller(
-            &state,
-            &ledger,
-            parts.clone(),
-            probe,
-            "application/sparql-results+json",
-        )
-        .await?;
-        if !response.status().is_success() {
-            return Ok(response);
-        }
-        if !ask_answer(response).await? && matches!(graph, GraphSel::Graph(_)) {
-            return Err(missing_graph(&graph));
-        }
-        if head {
-            return Ok(([(header::CONTENT_TYPE, format.media_type())], ()).into_response());
-        }
+    // policy answer before anything else touches the ledger: a graph with no
+    // triple the caller may see is indistinguishable from an absent one, and
+    // the default graph always exists. `HEAD` stops here rather than
+    // serializing the graph.
+    let probe = match &graph {
+        GraphSel::Graph(iri) => format!("ASK {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"),
+        GraphSel::Default => "ASK { ?s ?p ?o }".to_string(),
+    };
+    let response = query_as_caller(
+        &state,
+        &ledger,
+        parts.clone(),
+        probe,
+        "application/sparql-results+json",
+    )
+    .await?;
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+    if matches!(graph, GraphSel::Graph(_)) && !ask_answer(response).await? {
+        return Err(missing_graph(&graph));
+    }
+    if head {
+        return Ok(([(header::CONTENT_TYPE, format.media_type())], ()).into_response());
     }
 
     // Edge annotations come back with their triples, so a GET of an annotated
@@ -290,12 +288,14 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
     // annotation skips it. That flag only ever turns on: if it is still off
     // after the query ran, the snapshot the query read had no annotations;
     // if a commit or refresh turned it on meanwhile, run again with the
-    // lookup. The first check can run before the caller is authenticated, so
-    // a failure only drops the lookup; the query route answers for the ledger.
+    // lookup. A failed check only drops the lookup; the query route answers
+    // for the ledger.
     let annotated = state.fluree.has_annotations(&ledger).await.unwrap_or(false);
     let response =
         construct_graph(&state, &ledger, parts.clone(), &graph, format, annotated).await?;
-    if !annotated && response.status().is_success() && state.fluree.has_annotations(&ledger).await?
+    if !annotated
+        && response.status().is_success()
+        && state.fluree.has_annotations(&ledger).await.unwrap_or(false)
     {
         return construct_graph(&state, &ledger, parts, &graph, format, true).await;
     }
@@ -304,9 +304,9 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
 
 /// `CONSTRUCT` the graph through the query route. With `annotated`, each
 /// annotated edge also brings its reifier (`?s ?p ?o ~ ?r`). The annotations
-/// come from a `UNION` branch rooted at `rdf:reifies`, which costs a lookup
-/// per annotation; an `OPTIONAL` probing every triple is several times
-/// slower inside a named graph.
+/// come from a `UNION` branch rooted at `rdf:reifies`, which adds about a
+/// quarter to the read even when nothing matches; an `OPTIONAL` probing
+/// every triple is several times slower inside a named graph.
 async fn construct_graph(
     state: &Arc<AppState>,
     ledger: &str,

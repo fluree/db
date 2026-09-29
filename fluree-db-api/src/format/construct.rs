@@ -66,7 +66,7 @@ pub fn format(result: &QueryResult, compactor: &IriCompactor) -> Result<JsonValu
     // CONSTRUCT output singleton wrapping isn't semantically important for us.
     // We keep a single consistent policy (currently: always use arrays).
 
-    Ok(format_jsonld_dataset(&dataset, &config))
+    format_jsonld_dataset(&dataset, &config).map_err(|e| FormatError::InvalidBinding(e.to_string()))
 }
 
 /// Instantiate CONSTRUCT template patterns with query bindings.
@@ -101,8 +101,8 @@ pub(super) fn instantiate_construct_graph(
         constant => terms.constant_ref(constant, position).map(Slot::Const),
     };
     // Each pattern's slots, graph, and the reifiers attached to it.
-    let mut patterns = Vec::with_capacity(template.patterns.len());
-    for (i, pattern) in template.patterns.iter().enumerate() {
+    let mut patterns = Vec::with_capacity(template.patterns().len());
+    for (i, pattern) in template.patterns().iter().enumerate() {
         let s = slot_of(&mut terms, &pattern.s, Position::Subject)?;
         let p = slot_of(&mut terms, &pattern.p, Position::Predicate)?;
         let o = match &pattern.o {
@@ -115,7 +115,7 @@ pub(super) fn instantiate_construct_graph(
         };
         patterns.push(([s, p, o], graph, Vec::new()));
     }
-    for r in &template.reifications {
+    for r in template.reifications() {
         let reifier = slot_of(&mut terms, &r.reifier, Position::Subject)?;
         patterns[r.triple].2.push(reifier);
     }

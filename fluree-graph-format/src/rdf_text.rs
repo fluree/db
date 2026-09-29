@@ -151,7 +151,6 @@ fn push_turtle_graph(out: &mut String, graph: &Graph, prefixes: &PrefixMap, inde
     // Reifiers by the triple they reify; the ones whose triple the graph
     // does not hold are written as `r rdf:reifies <<( s p o )>>` at the end.
     let mut reifiers = graph.reifiers_by_triple();
-    let continuation = format!(" ;\n{indent}    ");
     let triples = graph.triples();
     let mut start = 0;
     while start < triples.len() {
@@ -176,11 +175,13 @@ fn push_turtle_graph(out: &mut String, graph: &Graph, prefixes: &PrefixMap, inde
             if predicate == Some(t.predicate()) {
                 out.push_str(", ");
             } else {
-                out.push_str(if predicate.is_some() {
-                    &continuation
+                if predicate.is_some() {
+                    out.push_str(" ;\n");
+                    out.push_str(indent);
+                    out.push_str("    ");
                 } else {
-                    " "
-                });
+                    out.push(' ');
+                }
                 if t.is_rdf_type() {
                     out.push('a');
                 } else {

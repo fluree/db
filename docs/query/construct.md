@@ -217,7 +217,8 @@ In a JSON-LD query, put `@annotation` on the object, as when writing an annotati
 
 Every output format carries the annotations: `o ~ r` in Turtle and TriG,
 `r rdf:reifies <<( s p o )>>` lines in N-Triples and N-Quads, `@annotation` in JSON-LD, and
-the RDF 1.2 `rdf:annotation` attribute in RDF/XML.
+the RDF 1.2 `rdf:annotation` / `rdf:annotationNodeID` attributes in RDF/XML
+([RDF 1.2 XML Syntax §2.20](https://www.w3.org/TR/rdf12-xml/)).
 
 ## Use Cases
 
@@ -361,6 +362,10 @@ details of each.
   template is a basic graph pattern, per SPARQL 1.1).
 - A triple term in a template is accepted only as the object of `rdf:reifies`; nested triple
   terms and property paths inside a template annotation block are rejected.
+- `?r rdf:reifies <<( s p o )>>` in a template also writes `s p o`, the same as the annotation
+  tail `s p o ~ ?r`. Fluree reifies asserted edges only, as every write form does (see
+  [Edge annotations](../concepts/edge-annotations.md)), so a result never carries a reifier
+  without its triple.
 - A SPARQL datalog rule whose head (the template) annotates an edge or writes into a named
   graph is rejected: rules infer default-graph triples only.
 

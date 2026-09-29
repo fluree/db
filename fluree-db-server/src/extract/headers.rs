@@ -158,13 +158,13 @@ fn media_ranges(accept: &str) -> impl Iterator<Item = (f32, &str)> {
 /// The graph format an `Accept` value prefers among `allowed`: the highest-`q`
 /// media range an allowed format satisfies. `*/*` and `application/*` are
 /// JSON-LD, `text/*` is Turtle, and no `Accept` at all is JSON-LD. `None`
-/// when no range matches.
+/// when nothing allowed matches.
 pub fn negotiate_graph_format(
     accept: Option<&str>,
     allowed: &[GraphFormat],
 ) -> Option<GraphFormat> {
     let Some(accept) = accept.filter(|a| !a.trim().is_empty()) else {
-        return Some(GraphFormat::JsonLd);
+        return Some(GraphFormat::JsonLd).filter(|f| allowed.contains(f));
     };
     media_ranges(accept).find_map(|(_, media)| {
         GraphFormat::from_media_type(media)
@@ -745,6 +745,11 @@ mod tests {
         );
         assert_eq!(dataset("text/turtle"), None);
         assert_eq!(dataset("text/*"), None);
+        assert_eq!(
+            negotiate_graph_format(None, &[GraphFormat::Turtle]),
+            None,
+            "the no-Accept default is still subject to `allowed`"
+        );
     }
 
     #[test]
