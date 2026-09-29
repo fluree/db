@@ -1359,10 +1359,35 @@ impl<'a> FlureeR2rmlProvider<'a> {
         }))
     }
 
+    /// The record a per-family dispatch probe ([`Self::sql_source`],
+    /// [`Self::delta_source`]) decides on.
+    ///
+    /// The probes receive a GRAPH IRI as the query wrote it: the SQL lane asks
+    /// about every constant `GRAPH <iri>` that names a dataset member, and a
+    /// ledger's own graphs (`ledger#graph`, `urn:fluree:ledger#txn-meta`) are
+    /// members too. An IRI that does not parse as a graph-source id names no
+    /// source, so it is `Ok(None)` without a lookup. A failed lookup of a
+    /// well-formed id still fails the query, so a nameservice outage cannot
+    /// quietly send a real source down another plan.
+    #[cfg(any(feature = "sql", feature = "delta"))]
+    async fn dispatch_record(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<fluree_db_nameservice::GraphSourceRecord>> {
+        let Ok(id) = fluree_db_core::LedgerId::parse(graph_source_id) else {
+            return Ok(None);
+        };
+        self.fluree
+            .nameservice()
+            .lookup_graph_source(&id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))
+    }
+
     /// The SQL source behind `graph_source_id`, or `None` when it is
-    /// Iceberg-backed. Decided once per query session: the nameservice lookup
-    /// is not free on a storage-backed nameservice, and a query scans a source
-    /// once per triples map it touches.
+    /// Iceberg-backed or not a graph source. Decided once per query session:
+    /// the nameservice lookup is not free on a storage-backed nameservice, and
+    /// a query scans a source once per triples map it touches.
     #[cfg(feature = "sql")]
     async fn sql_source(
         &self,
@@ -1371,13 +1396,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
         if let Some(decision) = self.session.sql_dispatch(graph_source_id) {
             return Ok(decision);
         }
-        let record = self
-            .fluree
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
-            .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
-        let decision = match record {
+        let decision = match self.dispatch_record(graph_source_id).await? {
             Some(r) if r.source_type == GraphSourceType::Sql => Some(Arc::new(
                 super::sql::SqlSource::open(self.fluree, &r).await?,
             )),
@@ -1399,13 +1418,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
         if let Some(decision) = self.session.delta_dispatch(graph_source_id) {
             return Ok(decision);
         }
-        let record = self
-            .fluree
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
-            .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
-        let decision = match record {
+        let decision = match self.dispatch_record(graph_source_id).await? {
             Some(r) if r.source_type == GraphSourceType::Delta => {
                 Some(Arc::new(super::delta::DeltaSource::open(&r)?))
             }
