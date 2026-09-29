@@ -150,7 +150,8 @@ The benchmark workflow has three jobs:
      tests run in the per-PR nextest job. All benchmark binaries are attempted
      even if an earlier one fails.
 2. **Nightly/on-demand compare (`bench.yml` `bench-compare`).** Runs the cheap subset
-   (`query_overlay_matrix` + `query_hot_bsbm`) at `tiny`/`quick` and compares
+   (`query_overlay_matrix`, `query_hot_bsbm`, `query_hot_negation_count`,
+   `query_hot_limit_startup`) at `tiny`/`quick` and compares
    against the committed baseline via the `bench-baseline` bin. **Time and peak
    memory enforce only when the baseline's `host_class` matches the runner's**
    (see [Baselines](#baselines-capture--compare) for why). Today's committed
@@ -164,7 +165,7 @@ The benchmark workflow has three jobs:
    All three benchmark jobs use `ci-cd-large` (8 cores / 32 GB), Rust 1.97.0,
    and `host_class=ci-cd-large-8core`. Keep their runner and host-class settings
    aligned; changing hardware requires a newly captured baseline. They retain
-   the normal release optimization profile. The two selected binaries build in
+   the normal release optimization profile. The selected binaries build in
    one Cargo invocation; benchmark measurements still execute sequentially.
 
 3. **CI-class capture (`bench.yml` `bench-capture`, `workflow_dispatch`).**
