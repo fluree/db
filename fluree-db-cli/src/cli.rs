@@ -2631,6 +2631,11 @@ pub enum ServerAction {
         #[arg(long)]
         connection_config: Option<PathBuf>,
 
+        /// Keep all data in memory: needs no .fluree/ directory, writes
+        /// nothing to the working directory, and loses everything on exit
+        #[arg(long, conflicts_with_all = ["storage_path", "connection_config"])]
+        memory: bool,
+
         /// Log level (trace, debug, info, warn, error)
         #[arg(long)]
         log_level: Option<String>,
@@ -2665,6 +2670,10 @@ pub enum ServerAction {
         /// Path to a JSON-LD connection config file (S3, DynamoDB, etc.)
         #[arg(long)]
         connection_config: Option<PathBuf>,
+
+        /// Accepted only to explain that memory storage is foreground-only
+        #[arg(long, hide = true)]
+        memory: bool,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(long)]
@@ -2714,6 +2723,10 @@ pub enum ServerAction {
         /// Path to a JSON-LD connection config file (S3, DynamoDB, etc.)
         #[arg(long)]
         connection_config: Option<PathBuf>,
+
+        /// Accepted only to explain that memory storage is foreground-only
+        #[arg(long, hide = true)]
+        memory: bool,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(long)]

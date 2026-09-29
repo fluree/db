@@ -1664,7 +1664,7 @@ The default is `true`. Disable only when you are intentionally working with bare
 1. **Always Provide @context**: Makes queries readable and maintainable
 2. **Use Specific Patterns**: More specific patterns are more efficient
 3. **Limit Result Sets**: Use `limit` for large result sets
-4. **Flexible Filter Placement**: Filters can be placed anywhere in `where` clauses - the query engine automatically applies each filter as soon as all its required variables are bound
+4. **Flexible Filter Placement**: Filters, including `exists` and `not-exists`, can be placed anywhere in `where` clauses - the query engine applies each one to the whole clause, as soon as every variable it reads has its final value. A variable that an `optional` or a `null` in `values` leaves unbound on some rows waits for any later pattern that fills it in
 5. **Use Time Specifiers**: Use `@t:` when transaction numbers are known (fastest)
 6. **Graph Source Selection**: Choose appropriate graph sources for query patterns
 
