@@ -26,7 +26,10 @@ use crate::minus::MinusOperator;
 use crate::operator::inline::InlineOperator;
 use crate::operator::{BoxedOperator, Operator};
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
-use crate::planner::{analyze_property_join, is_property_join, reorder_patterns_with_seed};
+use crate::planner::{
+    analyze_property_join, is_property_join, must_bind_vars, reorder_patterns_with_seed,
+    BindTargets,
+};
 use crate::property_join::PropertyJoinOperator;
 use crate::property_path::PropertyPathOperator;
 use crate::range_semijoin::{RangeSemiJoinCondition, RangeSemiJoinOperator};
@@ -898,17 +901,8 @@ pub struct ValuesPattern {
 }
 
 impl ValuesPattern {
-    /// Columns with no UNDEF cell: bound in every row the table emits.
     fn bound_in_every_row(&self) -> impl Iterator<Item = VarId> + '_ {
-        self.vars
-            .iter()
-            .enumerate()
-            .filter(|(col, _)| {
-                self.rows
-                    .iter()
-                    .all(|row| row.get(*col).is_some_and(crate::binding::Binding::is_bound))
-            })
-            .map(|(_, var)| *var)
+        crate::ir::pattern::values_bound_in_every_row(&self.vars, &self.rows)
     }
 
     pub fn new(vars: Vec<VarId>, rows: Vec<Vec<crate::binding::Binding>>) -> Self {
@@ -2157,15 +2151,6 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
     }
 }
 
-/// Variables `pattern` binds in every solution it produces. A BIND's target is
-/// left out: an expression error leaves it unbound.
-fn bound_in_every_solution(pattern: &Pattern) -> HashSet<VarId> {
-    match pattern {
-        Pattern::Bind { .. } => HashSet::new(),
-        other => crate::planner::must_bind_vars(other),
-    }
-}
-
 /// Build WHERE operators with an optional initial seed operator (back-compat wrapper).
 ///
 /// Treats all WHERE-bound vars as needed and does not provide GROUP BY hints.
@@ -2300,14 +2285,8 @@ fn values_cell_as_ref_term(binding: &crate::binding::Binding) -> Option<Term> {
 /// Returns `None` when nothing changed, so callers keep borrowing the original
 /// slice.
 fn drop_undef_values_columns(patterns: &[Pattern]) -> Option<Vec<Pattern>> {
-    use crate::binding::Binding;
+    use crate::ir::pattern::values_column_all_undef;
 
-    let all_undef = |rows: &[Vec<Binding>], col: usize| {
-        !rows.is_empty()
-            && rows
-                .iter()
-                .all(|row| matches!(row.get(col), Some(Binding::Unbound)))
-    };
     let bound_elsewhere = |at: usize, var: VarId| {
         patterns.iter().enumerate().any(|(j, p)| {
             j != at
@@ -2315,7 +2294,7 @@ fn drop_undef_values_columns(patterns: &[Pattern]) -> Option<Vec<Pattern>> {
                     Pattern::Values { vars, rows } => vars
                         .iter()
                         .position(|v| *v == var)
-                        .is_some_and(|col| !all_undef(rows, col)),
+                        .is_some_and(|col| !values_column_all_undef(rows, col)),
                     other => other.produced_vars().contains(&var),
                 }
         })
@@ -2327,7 +2306,7 @@ fn drop_undef_values_columns(patterns: &[Pattern]) -> Option<Vec<Pattern>> {
             continue;
         };
         let dropped: Vec<usize> = (0..vars.len())
-            .filter(|&col| all_undef(rows, col) && bound_elsewhere(at, vars[col]))
+            .filter(|&col| values_column_all_undef(rows, col) && bound_elsewhere(at, vars[col]))
             .collect();
         if dropped.is_empty() {
             continue;
@@ -2640,7 +2619,7 @@ pub fn build_where_operators_seeded_with_needed(
             Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. } => {
                 let start = i;
                 for applied in &patterns[guaranteed_through..start] {
-                    guaranteed.extend(bound_in_every_solution(applied));
+                    guaranteed.extend(must_bind_vars(applied, BindTargets::MayBeUnbound));
                 }
                 guaranteed_through = start;
                 let block = collect_inner_join_block(patterns, start);

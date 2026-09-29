@@ -1365,8 +1365,9 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
         .any(|v| bound_vars.contains(v))
 }
 
-/// Collect the variables that a slice of patterns guarantees to bind.
-fn collect_guaranteed_vars(patterns: &[Pattern]) -> HashSet<VarId> {
+/// Variables some pattern of `patterns` may bind (see [`must_bind_vars`] for
+/// the ones bound on every row).
+fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
     patterns
         .iter()
         .flat_map(super::ir::Pattern::produced_vars)
@@ -1385,14 +1386,13 @@ fn collect_guaranteed_vars(patterns: &[Pattern]) -> HashSet<VarId> {
 /// parent scope and available inside each branch, so only the UNION-specific
 /// variables need the intersection check.
 ///
-/// For Graph and Service all inner variables are guaranteed, so the deferred
-/// pattern is nested unconditionally.
+/// For Graph and Service the deferred pattern is nested unconditionally.
 fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool {
     match compound {
         Pattern::Union(branches) => {
-            let guaranteed_vars = branches
+            let produced_in_every_branch = branches
                 .iter()
-                .map(|b| collect_guaranteed_vars(b))
+                .map(|b| produced_vars_of(b))
                 .reduce(|mut union_vars, branch_vars| {
                     union_vars.retain(|v| branch_vars.contains(v));
                     union_vars
@@ -1401,7 +1401,7 @@ fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool
             if !deferred
                 .required_vars
                 .iter()
-                .any(|v| guaranteed_vars.contains(v))
+                .any(|v| produced_in_every_branch.contains(v))
             {
                 return false;
             }
@@ -1547,13 +1547,23 @@ fn attach_filter_binders(
                 .copied()
                 .filter(|&j| {
                     every_row_vars[j]
-                        .get_or_insert_with(|| must_bind_vars(&patterns[j]))
+                        .get_or_insert_with(|| must_bind_vars(&patterns[j], BindTargets::Bound))
                         .contains(&v)
                 })
                 .collect();
             dp.binders.push(VarBinders { every_row, any });
         }
     }
+}
+
+/// How [`must_bind_vars`] counts the target of a BIND.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindTargets {
+    /// Bound on every row. Subquery correlation needs this: a variable a
+    /// WITH-pipeline BIND produces is the subquery's own, not an input.
+    Bound,
+    /// Unbound on a row whose expression errors, so not bound on every row.
+    MayBeUnbound,
 }
 
 /// Variables `pattern` binds in **every** solution it emits.
@@ -1566,28 +1576,27 @@ fn attach_filter_binders(
 /// genuinely introduces it — the barrier stopped firing and #1690 came back one
 /// UNION away from the shape it was written for.
 ///
-/// **`Bind` is a known may-bind variant this function deliberately counts, so
-/// the contract above is not unconditional.** `Pattern::Bind` binds nothing on
-/// a row whose expression errors — `bind.rs` yields `Binding::Unbound` — and a
-/// BIND-then-OPTIONAL lead can therefore fabricate exactly as a UNION lead
-/// does. It is counted anyway because [`subquery_correlation_vars`] needs it
-/// counted: a variable the subquery produces through a WITH-pipeline binder
-/// must not be read as an external correlation, or the subquery is deferred on
-/// a variable only it can bind. That is the one concept where the two call
-/// sites genuinely want different answers, and it is resolved in the
-/// correlation site's favour — so tightening `Bind` here on the strength of the
-/// stated contract would quietly break subquery correlation. It needs a fix at
-/// both sites or at neither.
+/// **`Bind` is the one may-bind variant, so callers choose ([`BindTargets`]).**
+/// `Pattern::Bind` binds nothing on a row whose expression errors — `bind.rs`
+/// yields `Binding::Unbound`. [`subquery_correlation_vars`] counts it anyway: a
+/// variable the subquery produces through a WITH-pipeline binder must not be
+/// read as an external correlation, or the subquery is deferred on a variable
+/// only it can bind. Join-chain placement does not count it (see
+/// `where_plan::build_where_operators_seeded_with_needed`). The barrier and
+/// binder sites here still count it, so a BIND-then-OPTIONAL lead can fabricate
+/// exactly as a UNION lead does; tightening them changes placement and wants
+/// its own tests.
 ///
 /// Shared with [`subquery_correlation_vars`], which needs the same rule to
 /// decide whether a shared SELECT-list variable is a join key or a correlation
-/// input — it used to state it as an inline `matches!` allow-list. One relation
-/// over one concept, with `Bind` above as the single knowing exception.
-///
-/// Note `collect_guaranteed_vars` is NOT this function despite the name: it is
-/// plain `produced_vars`, with the branch intersection done at its
-/// `try_nest_deferred` call site.
-pub(crate) fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
+/// input — it used to state it as an inline `matches!` allow-list.
+pub(crate) fn must_bind_vars(pattern: &Pattern, bind_targets: BindTargets) -> HashSet<VarId> {
+    let all = |patterns: &[Pattern]| -> HashSet<VarId> {
+        patterns
+            .iter()
+            .flat_map(|p| must_bind_vars(p, bind_targets))
+            .collect()
+    };
     match pattern {
         // A left join binds nothing unconditionally.
         Pattern::Optional(_) => HashSet::new(),
@@ -1598,12 +1607,7 @@ pub(crate) fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
         // A UNION guarantees only what EVERY branch guarantees.
         Pattern::Union(branches) => branches
             .iter()
-            .map(|branch| {
-                branch
-                    .iter()
-                    .flat_map(must_bind_vars)
-                    .collect::<HashSet<_>>()
-            })
+            .map(|branch| all(branch))
             .reduce(|mut acc, branch_vars| {
                 acc.retain(|v| branch_vars.contains(v));
                 acc
@@ -1612,20 +1616,18 @@ pub(crate) fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
         // Containers: whatever their body guarantees. A `GRAPH ?g` that emits a
         // row has always bound `?g`.
         Pattern::Graph { name, patterns } => {
-            let mut vars: HashSet<VarId> = patterns.iter().flat_map(must_bind_vars).collect();
+            let mut vars = all(patterns);
             if let crate::ir::GraphName::Var(v) = name {
                 vars.insert(*v);
             }
             vars
         }
-        Pattern::DefaultGraphSource { patterns } => {
-            patterns.iter().flat_map(must_bind_vars).collect()
-        }
-        Pattern::Service(sp) => sp.patterns.iter().flat_map(must_bind_vars).collect(),
+        Pattern::DefaultGraphSource { patterns } => all(patterns),
+        Pattern::Service(sp) => all(&sp.patterns),
         // A subquery exposes only its SELECT list, and only the members of it
         // its own body binds unconditionally.
         Pattern::Subquery(sq) => {
-            let body: HashSet<VarId> = sq.patterns.iter().flat_map(must_bind_vars).collect();
+            let body = all(&sq.patterns);
             sq.select
                 .iter()
                 .copied()
@@ -1646,7 +1648,7 @@ pub(crate) fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
             if let Ref::Var(v) = annotation {
                 vars.insert(*v);
             }
-            vars.extend(body.iter().flat_map(must_bind_vars));
+            vars.extend(all(body));
             vars
         }
         // A constant table guarantees only the columns with no UNDEF cell. Both
@@ -1664,18 +1666,14 @@ pub(crate) fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
         // and `empty_path_result` are both this). Cypher's WITH-pipeline
         // binders never emit `Unbound`, so this narrowing cannot reach the
         // `self_produced` set [`subquery_correlation_vars`] builds for them.
-        Pattern::Values { vars, rows } => vars
-            .iter()
-            .enumerate()
-            .filter(|(col, _)| {
-                rows.iter().all(|row| {
-                    row.get(*col)
-                        .is_some_and(|cell| !matches!(cell, crate::binding::Binding::Unbound))
-                })
-            })
-            .map(|(_, v)| *v)
-            .collect(),
-        // Triples, property paths, BIND/UNWIND, search adapters: every solution
+        Pattern::Values { vars, rows } => {
+            crate::ir::pattern::values_bound_in_every_row(vars, rows).collect()
+        }
+        Pattern::Bind { var, .. } => match bind_targets {
+            BindTargets::Bound => HashSet::from([*var]),
+            BindTargets::MayBeUnbound => HashSet::new(),
+        },
+        // Triples, property paths, UNWIND, search adapters: every solution
         // they emit carries their produced vars.
         other => other.produced_vars().into_iter().collect(),
     }
@@ -1718,7 +1716,7 @@ fn left_join_introduced_vars(pattern: &Pattern, out: &mut HashSet<VarId>) {
             }
         }
         Pattern::Subquery(sq) => {
-            let body = must_bind_vars(pattern);
+            let body = must_bind_vars(pattern, BindTargets::Bound);
             out.extend(sq.select.iter().copied().filter(|v| !body.contains(v)));
         }
         Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
@@ -1783,7 +1781,7 @@ fn values_optional_barrier_indices(
         {
             blockers.push(i);
         }
-        required_before.extend(must_bind_vars(p));
+        required_before.extend(must_bind_vars(p, BindTargets::Bound));
     }
     blockers
 }
@@ -1855,7 +1853,7 @@ fn left_join_order_barriers(
                 }
             }
         }
-        certain_before.extend(must_bind_vars(earlier));
+        certain_before.extend(must_bind_vars(earlier, BindTargets::Bound));
     }
     barriers
 }
@@ -2969,7 +2967,10 @@ fn subquery_correlation_vars(
     // but was flat (no Graph/Service recursion) and treated UNION as wholly
     // absent rather than intersecting its branches.
     let self_produced: HashSet<VarId> = if sq.limit.is_none() && sq.offset.is_none() {
-        sq.patterns.iter().flat_map(must_bind_vars).collect()
+        sq.patterns
+            .iter()
+            .flat_map(|p| must_bind_vars(p, BindTargets::Bound))
+            .collect()
     } else {
         HashSet::new()
     };
