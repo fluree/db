@@ -85,7 +85,7 @@ this table, so it is the one that rots. Add a row when you add a bench file.
 | `fluree-db-api` | `query_hot_bsbm_bi.rs` | BSBM Business-Intelligence "bowtie" (BI-1 F2): join-ordering tie-break between two equally-selective anchors |
 | `fluree-db-api` | `query_hot_property_path.rs` | Hot-cache SPARQL property paths, one scenario per execution mode of the operator (`*` closure, sequence, `?`, …) |
 | `fluree-db-api` | `query_hot_whole_graph_agg.rs` | Cypher aggregate folds from `fast_whole_graph_agg` (whole-graph + class scalars, histograms) against a linear-cost pipeline baseline |
-| `fluree-db-api` | `query_overlay_matrix.rs` | The same query shapes at three ledger conditions — base / overlay / novelty — so the columnar+novelty merge lane has coverage |
+| `fluree-db-api` | `query_overlay_matrix.rs` | The same query shapes at four ledger conditions — base / overlay / cached / novelty — so the columnar+novelty merge lane and a cached handle's steady state after background indexing have coverage |
 | `fluree-db-api` | `annotation_hydration.rs` | `inject_annotations` hydration cost: index scan vs sealed annotation arena |
 | `fluree-db-api` | `annotation_planner.rs` | Planner direction for `f:reifies*` edge-annotation queries: arena-informed row counts vs HLL-only stats |
 | `fluree-db-query` | `vector_math.rs` | SIMD vs scalar dot/L2/cosine micro-bench |

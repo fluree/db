@@ -1366,12 +1366,13 @@ impl BinaryScanOperator {
         // Late materialization is safe only when the BinaryIndexStore is authoritative
         // for decoding (no novelty overlay with ephemeral IDs).
         //
-        // Note: ExecutionContext always carries an overlay provider; `NoOverlay` has epoch=0.
+        // An indexed cached ledger retains a nonzero overlay epoch even after
+        // all novelty is drained. Test for live overlay rows, not past writes.
         // When `eager_materialization` is set (via `GraphDbRef::eager()`), always resolve
         // bindings eagerly — infrastructure queries (config, policy) need concrete
         // `Binding::Sid`/`Lit`, not `EncodedSid`/`EncodedLit`.
         let late_materialize = ctx.is_some_and(|c| {
-            c.overlay.map(fluree_db_core::OverlayProvider::epoch).unwrap_or(0) == 0 && !c.eager_materialization
+            !crate::fast_path_common::overlay_has_novelty(c) && !c.eager_materialization
         })
             // If a repeated variable forces two components into the same output slot,
             // late-materialization must produce comparable binding representations.
@@ -2534,7 +2535,13 @@ impl Operator for BinaryScanOperator {
         // subject per left row — memoizing per-scope products would grow the
         // map by one entry per probed subject for the whole execution, with no
         // eviction, to save ~a microsecond on a duplicate probe.
-        if ctx.overlay.is_some() {
+        //
+        // A drained overlay (a cached handle after an index install) has
+        // nothing to merge. This asks the overlay itself rather than
+        // `overlay_has_novelty`, which also trusts a zero epoch: this block is
+        // the scan's only overlay merge, so a wrong answer here drops rows
+        // instead of declining a fast path.
+        if ctx.overlay.is_some_and(|o| !o.is_effectively_empty()) {
             let epoch = ctx.overlay().epoch();
             // A bound subject (or, failing that, a bound predicate) turns the
             // translation from a whole-novelty walk into a seek. Without it the
@@ -2849,10 +2856,7 @@ impl Operator for BinaryScanOperator {
             &self.inline_ops,
             &self.pattern,
             store_ref,
-            ctx.overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                == 0,
+            !crate::fast_path_common::overlay_has_novelty(ctx),
         );
         self.encoded_pre_filters = encoded;
         self.inline_ops = pruned;
