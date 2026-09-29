@@ -7,6 +7,7 @@
 
 use crate::{RefValue, Result};
 use async_trait::async_trait;
+use fluree_db_core::{IntoLedgerId, LedgerId};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
@@ -43,7 +44,7 @@ pub struct TrackingRecord {
     pub remote: RemoteName,
 
     /// The ledger ID (e.g., "mydb:main").
-    pub ledger_id: String,
+    pub ledger_id: LedgerId,
 
     /// The remote's commit head (if known).
     pub commit_head: Option<RefValue>,
@@ -60,11 +61,11 @@ pub struct TrackingRecord {
 
 impl TrackingRecord {
     /// Create a new tracking record with sensible defaults.
-    pub fn new(remote: RemoteName, ledger_id: impl Into<String>) -> Self {
+    pub fn new(remote: RemoteName, ledger_id: impl IntoLedgerId) -> Self {
         Self {
             schema_version: 1,
             remote,
-            ledger_id: ledger_id.into(),
+            ledger_id: ledger_id.into_ledger_id(),
             commit_head: None,
             index_head: None,
             retracted: false,
@@ -85,7 +86,7 @@ pub trait RemoteTrackingStore: Debug + Send + Sync {
     async fn get_tracking(
         &self,
         remote: &RemoteName,
-        ledger_id: &str,
+        ledger_id: &LedgerId,
     ) -> Result<Option<TrackingRecord>>;
 
     /// Store (create or update) a tracking record.
@@ -95,13 +96,13 @@ pub trait RemoteTrackingStore: Debug + Send + Sync {
     async fn list_tracking(&self, remote: &RemoteName) -> Result<Vec<TrackingRecord>>;
 
     /// Remove a tracking record.
-    async fn remove_tracking(&self, remote: &RemoteName, ledger_id: &str) -> Result<()>;
+    async fn remove_tracking(&self, remote: &RemoteName, ledger_id: &LedgerId) -> Result<()>;
 }
 
 /// In-memory implementation of [`RemoteTrackingStore`] for testing.
 #[derive(Debug)]
 pub struct MemoryTrackingStore {
-    records: parking_lot::RwLock<std::collections::HashMap<(String, String), TrackingRecord>>,
+    records: parking_lot::RwLock<std::collections::HashMap<(String, LedgerId), TrackingRecord>>,
 }
 
 impl Default for MemoryTrackingStore {
@@ -117,8 +118,8 @@ impl MemoryTrackingStore {
         }
     }
 
-    fn make_key(remote: &RemoteName, ledger_id: &str) -> (String, String) {
-        (remote.0.clone(), ledger_id.to_string())
+    fn make_key(remote: &RemoteName, ledger_id: &LedgerId) -> (String, LedgerId) {
+        (remote.0.clone(), ledger_id.clone())
     }
 }
 
@@ -127,7 +128,7 @@ impl RemoteTrackingStore for MemoryTrackingStore {
     async fn get_tracking(
         &self,
         remote: &RemoteName,
-        ledger_id: &str,
+        ledger_id: &LedgerId,
     ) -> Result<Option<TrackingRecord>> {
         let key = Self::make_key(remote, ledger_id);
         Ok(self.records.read().get(&key).cloned())
@@ -148,7 +149,7 @@ impl RemoteTrackingStore for MemoryTrackingStore {
             .collect())
     }
 
-    async fn remove_tracking(&self, remote: &RemoteName, ledger_id: &str) -> Result<()> {
+    async fn remove_tracking(&self, remote: &RemoteName, ledger_id: &LedgerId) -> Result<()> {
         let key = Self::make_key(remote, ledger_id);
         self.records.write().remove(&key);
         Ok(())
@@ -171,7 +172,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_tracking_empty() {
         let store = MemoryTrackingStore::new();
-        let result = store.get_tracking(&origin(), "mydb:main").await.unwrap();
+        let result = store
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -185,7 +189,7 @@ mod tests {
         store.set_tracking(&record).await.unwrap();
 
         let fetched = store
-            .get_tracking(&origin(), "mydb:main")
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -211,7 +215,7 @@ mod tests {
         store.set_tracking(&record).await.unwrap();
 
         let fetched = store
-            .get_tracking(&origin(), "mydb:main")
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -252,14 +256,17 @@ mod tests {
             .await
             .unwrap();
         assert!(store
-            .get_tracking(&origin(), "mydb:main")
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
             .await
             .unwrap()
             .is_some());
 
-        store.remove_tracking(&origin(), "mydb:main").await.unwrap();
+        store
+            .remove_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
         assert!(store
-            .get_tracking(&origin(), "mydb:main")
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
             .await
             .unwrap()
             .is_none());
@@ -270,7 +277,7 @@ mod tests {
         let store = MemoryTrackingStore::new();
         // Should not error
         store
-            .remove_tracking(&origin(), "nonexistent:main")
+            .remove_tracking(&origin(), &LedgerId::parse("nonexistent:main").unwrap())
             .await
             .unwrap();
     }

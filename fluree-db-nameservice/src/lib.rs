@@ -120,7 +120,7 @@ pub use tracking::{MemoryTrackingStore, RemoteName, RemoteTrackingStore, Trackin
 pub use tracking_file::FileTrackingStore;
 
 use async_trait::async_trait;
-use fluree_db_core::{format_ledger_id, ContentId};
+use fluree_db_core::{format_ledger_id, ContentId, IntoLedgerId, LedgerId};
 use fluree_vocab::ns_types;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -144,8 +144,9 @@ pub struct NsRecord {
     /// Canonical ledger ID with branch (e.g., "mydb:main")
     ///
     /// This is the primary cache key and the fully-qualified identifier.
-    /// Use this for cache lookups and as the canonical form.
-    pub ledger_id: String,
+    /// Always equal to `name:branch`.
+    #[serde(deserialize_with = "LedgerId::deserialize_persisted")]
+    pub ledger_id: LedgerId,
 
     /// Ledger name without branch suffix (e.g., "mydb")
     pub name: String,
@@ -202,15 +203,12 @@ pub(crate) fn is_zero(v: &u32) -> bool {
 
 impl NsRecord {
     /// Create a new NsRecord with minimal required fields
-    pub fn new(name: impl Into<String>, branch: impl Into<String>) -> Self {
-        let name = name.into();
-        let branch = branch.into();
-        let ledger_id = format_ledger_id(&name, &branch);
-
+    pub fn new(ledger_id: impl IntoLedgerId) -> Self {
+        let ledger_id = ledger_id.into_ledger_id();
         Self {
+            name: ledger_id.name().to_string(),
+            branch: ledger_id.branch().to_string(),
             ledger_id,
-            name,
-            branch,
             commit_head_id: None,
             commit_t: 0,
             index_head_id: None,
@@ -343,7 +341,8 @@ impl GraphSourceType {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSourceRecord {
     /// Canonical identifier for this graph source (e.g., "my-search:main")
-    pub graph_source_id: String,
+    #[serde(deserialize_with = "LedgerId::deserialize_persisted")]
+    pub graph_source_id: LedgerId,
 
     /// Base name of the graph source (e.g., "my-search")
     pub name: String,
@@ -381,7 +380,7 @@ impl GraphSourceRecord {
     ) -> Self {
         let name = name.into();
         let branch = branch.into();
-        let graph_source_id = format_ledger_id(&name, &branch);
+        let graph_source_id = format_ledger_id(&name, &branch).as_str().into_ledger_id();
 
         Self {
             graph_source_id,
@@ -843,15 +842,15 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscriptionScope {
     /// Subscribe to events for a specific resource (ledger_id or graph_source_id)
-    ResourceId(String),
+    ResourceId(LedgerId),
     /// Subscribe to all events (all ledgers and graph sources)
     All,
 }
 
 impl SubscriptionScope {
     /// Create a scope for a specific resource ID (ledger_id or graph_source_id)
-    pub fn resource_id(id: impl Into<String>) -> Self {
-        Self::ResourceId(id.into())
+    pub fn resource_id(id: LedgerId) -> Self {
+        Self::ResourceId(id)
     }
 
     /// Create a scope for all events
@@ -860,7 +859,7 @@ impl SubscriptionScope {
     }
 
     /// Check if this scope matches a given event's resource_id
-    pub fn matches(&self, event_resource_id: &str) -> bool {
+    pub fn matches(&self, event_resource_id: &LedgerId) -> bool {
         match self {
             Self::All => true,
             Self::ResourceId(id) => id == event_resource_id,
@@ -877,13 +876,13 @@ impl SubscriptionScope {
 pub enum NameServiceEvent {
     /// A ledger commit head was advanced.
     LedgerCommitPublished {
-        ledger_id: String,
+        ledger_id: LedgerId,
         commit_id: ContentId,
         commit_t: i64,
     },
     /// A ledger index head was advanced.
     LedgerIndexPublished {
-        ledger_id: String,
+        ledger_id: LedgerId,
         index_id: ContentId,
         index_t: i64,
     },
@@ -901,21 +900,21 @@ pub enum NameServiceEvent {
     /// identically to `not-found` for a peer's query path.
     /// Distinguishing the transitions would need separate event
     /// variants threaded through the SSE peer-sync protocol.
-    LedgerRetracted { ledger_id: String },
+    LedgerRetracted { ledger_id: LedgerId },
     /// A graph source config was published/updated.
     GraphSourceConfigPublished {
-        graph_source_id: String,
+        graph_source_id: LedgerId,
         source_type: GraphSourceType,
-        dependencies: Vec<String>,
+        dependencies: Vec<LedgerId>,
     },
     /// A graph source index head pointer was advanced.
     GraphSourceIndexPublished {
-        graph_source_id: String,
+        graph_source_id: LedgerId,
         index_id: ContentId,
         index_t: i64,
     },
     /// A graph source was retracted.
-    GraphSourceRetracted { graph_source_id: String },
+    GraphSourceRetracted { graph_source_id: LedgerId },
 }
 
 /// Subscription handle for receiving ledger updates
@@ -1677,7 +1676,7 @@ mod tests {
 
     #[test]
     fn test_ns_record_new() {
-        let record = NsRecord::new("mydb", "main");
+        let record = NsRecord::new("mydb:main");
         assert_eq!(record.name, "mydb");
         assert_eq!(record.branch, "main");
         assert_eq!(record.ledger_id, "mydb:main");
@@ -1688,7 +1687,7 @@ mod tests {
 
     #[test]
     fn test_ns_record_has_novelty() {
-        let mut record = NsRecord::new("mydb", "main");
+        let mut record = NsRecord::new("mydb:main");
         assert!(!record.has_novelty());
 
         record.commit_t = 10;

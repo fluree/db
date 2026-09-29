@@ -821,7 +821,7 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
     }
 
     Ledger {
-        alias: ledger.snapshot.ledger_id.clone(),
+        alias: ledger.snapshot.ledger_id.clone().to_string(),
         t: Some(ledger.t()),
         commit_t: Some(commit_t),
         index_t: Some(index_t),
@@ -1527,10 +1527,10 @@ pub fn build_virtual_ledger_info(
         // Top-level parity with the native `/info` response (which the server
         // route stamps `ledger_id`/`t` onto for native ledgers). For a virtual
         // dataset the Iceberg snapshot id serves as the version `t`.
-        ledger_id: Some(record.graph_source_id.clone()),
+        ledger_id: Some(record.graph_source_id.clone().to_string()),
         t: Some(meta.snapshot_id),
         ledger: Ledger {
-            alias: record.graph_source_id.clone(),
+            alias: record.graph_source_id.clone().to_string(),
             t: meta.snapshot_id,
             // A virtual dataset has no commit/index chain.
             commit_t: None,
@@ -2848,7 +2848,7 @@ mod tests {
         let commit_cid = ContentId::new(ContentKind::Commit, b"abc");
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"def");
         let record = NsRecord {
-            ledger_id: "mydb:main".to_string(),
+            ledger_id: fluree_db_core::LedgerId::parse("mydb:main").unwrap(),
             name: "mydb:main".to_string(),
             branch: "main".to_string(),
             commit_head_id: Some(commit_cid.clone()),
@@ -2879,7 +2879,7 @@ mod tests {
         use fluree_db_core::{ContentId, ContentKind};
         let commit_cid = ContentId::new(ContentKind::Commit, b"commit-data");
         let record = NsRecord {
-            ledger_id: "mydb:main".to_string(),
+            ledger_id: fluree_db_core::LedgerId::parse("mydb:main").unwrap(),
             name: "mydb:main".to_string(),
             branch: "main".to_string(),
             commit_head_id: Some(commit_cid),
@@ -2902,7 +2902,7 @@ mod tests {
         use fluree_db_core::{ContentId, ContentKind};
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"snapshot-data");
         let record = GraphSourceRecord {
-            graph_source_id: "my-search:main".to_string(),
+            graph_source_id: fluree_db_core::LedgerId::parse("my-search:main").unwrap(),
             name: "my-search".to_string(),
             branch: "main".to_string(),
             source_type: fluree_db_nameservice::GraphSourceType::Bm25,
@@ -3030,7 +3030,7 @@ mod tests {
 
     fn virtual_record(config: &str) -> GraphSourceRecord {
         GraphSourceRecord {
-            graph_source_id: "sales:main".to_string(),
+            graph_source_id: fluree_db_core::LedgerId::parse("sales:main").unwrap(),
             name: "sales".to_string(),
             branch: "main".to_string(),
             source_type: GraphSourceType::Iceberg,

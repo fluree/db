@@ -9,6 +9,7 @@ use super::CrossLedgerError;
 use crate::view::GraphDb;
 use crate::Fluree;
 use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+use fluree_db_core::LedgerId;
 use fluree_db_ledger::LedgerState;
 use fluree_db_policy::PolicyArtifactWire;
 use std::collections::HashMap;
@@ -563,7 +564,7 @@ pub struct WireOrigin {
 ///   cross-subsystem de-dup never trips cycle detection.
 pub struct ResolveCtx<'a> {
     /// Canonical data-ledger id D.
-    pub data_ledger_id: &'a str,
+    pub data_ledger_id: &'a LedgerId,
     /// The Fluree instance hosting D and (per the same-instance
     /// constraint) the referenced model ledger.
     pub fluree: &'a Fluree,
@@ -571,7 +572,7 @@ pub struct ResolveCtx<'a> {
     /// `resolved_t`. Phase 1a is the only producer (M's head at
     /// first reference); pinned `f:atT` is rejected upstream until
     /// Phase 3.
-    pub resolved_ts: HashMap<String, i64>,
+    pub resolved_ts: HashMap<LedgerId, i64>,
     /// Active resolution stack (cycle detection). Keyed on the full
     /// resolution tuple including `ArtifactKind` so a `PolicyRules`
     /// resolve doesn't see a `Shapes` resolution of the same
@@ -590,7 +591,7 @@ pub struct ResolveCtx<'a> {
 
 impl<'a> ResolveCtx<'a> {
     /// Build a fresh resolution context for a request against D.
-    pub fn new(data_ledger_id: &'a str, fluree: &'a Fluree) -> Self {
+    pub fn new(data_ledger_id: &'a LedgerId, fluree: &'a Fluree) -> Self {
         Self {
             data_ledger_id,
             fluree,
@@ -653,9 +654,9 @@ impl<'a> ResolveCtx<'a> {
     /// per-resolution-call state (cycle detection, dedup within a
     /// single dispatch tree) and don't carry across calls.
     pub fn with_resolved_ts(
-        data_ledger_id: &'a str,
+        data_ledger_id: &'a LedgerId,
         fluree: &'a Fluree,
-        resolved_ts: HashMap<String, i64>,
+        resolved_ts: HashMap<LedgerId, i64>,
     ) -> Self {
         Self {
             data_ledger_id,

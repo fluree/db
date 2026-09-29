@@ -988,7 +988,9 @@ async fn an_expired_history_table_drains_in_bounded_passes() {
                 Ok(r) => break r,
                 Err(ApiError::MaterializePartial { detail, .. }) if attempts < 50 => {
                     eprintln!("pass {}: deferred ({detail}); draining novelty", pass + 1);
-                    indexer.wait_for_idle(target).await;
+                    indexer
+                        .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+                        .await;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 Err(e) => panic!("pass {} failed: {e}", pass + 1),
@@ -1031,7 +1033,9 @@ async fn an_expired_history_table_drains_in_bounded_passes() {
         );
         // Let the indexer drain the target before the next pass so the next commit
         // has headroom; the retry loop above covers the case where it has not.
-        indexer.wait_for_idle(target).await;
+        indexer
+            .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+            .await;
     }
 
     // Steady state: the watermark resolves, the window is empty, nothing commits.
@@ -1207,7 +1211,9 @@ async fn an_incremental_backlog_drains_in_bounded_passes() {
                     Ok(r) => break r,
                     Err(ApiError::MaterializePartial { detail, .. }) if attempts < 50 => {
                         eprintln!("pass {pass}: deferred ({detail}); draining novelty");
-                        indexer.wait_for_idle(target).await;
+                        indexer
+                            .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+                            .await;
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
                     Err(e) => panic!("pass {pass} failed: {e}"),
@@ -1228,7 +1234,9 @@ async fn an_incremental_backlog_drains_in_bounded_passes() {
     assert!(!first.incremental, "a first run is a full read");
     assert_eq!(first.rows_read, 600);
     assert_eq!(watermark().await, Some(chain[0]));
-    indexer.wait_for_idle(target).await;
+    indexer
+        .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+        .await;
 
     // The source commits four more times while the job is away.
     for (from, to) in &held {
@@ -1274,7 +1282,9 @@ async fn an_incremental_backlog_drains_in_bounded_passes() {
             None,
             "cursor after pass {pass}"
         );
-        indexer.wait_for_idle(target).await;
+        indexer
+            .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+            .await;
     }
 
     // Steady state: the watermark is at the head, the window is empty, nothing

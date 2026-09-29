@@ -60,6 +60,14 @@ impl<'a> Graph<'a> {
     /// Materialize the snapshot, producing a [`GraphSnapshot`] that can be queried
     /// multiple times without re-loading.
     ///
+    /// The snapshot carries the ledger's configured policy defaults, so a bare
+    /// read of a governed ledger is filtered here exactly as it is through
+    /// [`Graph::query`]. An unconfigured ledger comes back untouched.
+    ///
+    /// A query's own `opts` cannot be applied here: the snapshot is materialized
+    /// before any query is attached, and the same snapshot serves many queries.
+    /// Those still reach only [`Graph::query`] and `query_from`.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -72,6 +80,7 @@ impl<'a> Graph<'a> {
             .fluree
             .load_graph_db_at(&self.ledger_id, self.time_spec.clone())
             .await?;
+        let view = self.fluree.wrap_policy_defaults(view).await?;
         Ok(GraphSnapshot::new(self.fluree, view))
     }
 

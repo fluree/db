@@ -3863,7 +3863,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_drain_counts_only_remaining_rows_and_exhausts() {
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[]));
@@ -3883,7 +3883,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_drain_declines_bind_without_consuming_input() {
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let mut join = count_join(
@@ -3909,7 +3909,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_drain_skips_poisoned_and_invalid_subjects() {
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let batch = Batch::new(
@@ -3930,7 +3930,7 @@ mod tests {
     #[tokio::test]
     async fn count_drain_checks_budgets_and_clears_mode_on_error() {
         use fluree_db_core::{QueryCancellation, QueryCancellationReason};
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         for cancelled in [false, true] {
             let cancellation = QueryCancellation::new();
@@ -3961,7 +3961,7 @@ mod tests {
 
     #[tokio::test]
     async fn grouped_drain_counts_remaining_rows_and_preserves_declined_input() {
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[VarId(0)]));
@@ -4030,7 +4030,7 @@ mod tests {
     #[tokio::test]
     async fn grouped_drain_checks_group_growth_and_cancellation() {
         use fluree_db_core::{QueryCancellation, QueryCancellationReason};
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         for cancelled in [false, true] {
             let cancellation = QueryCancellation::new();
@@ -4273,7 +4273,7 @@ mod tests {
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
 
         // Minimal context (db is unused here; only batch_size matters).
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x"); // VarId(0)
         let v = vars.get_or_insert("?v"); // VarId(1)
@@ -4401,7 +4401,7 @@ mod tests {
             )
         };
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
 
         // Root / no policy on an overlay-free single graph => Clean (the batched
@@ -4666,7 +4666,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let s = vars.get_or_insert("?s"); // VarId(0)
         let x = vars.get_or_insert("?x"); // VarId(1)

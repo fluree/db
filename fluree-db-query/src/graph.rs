@@ -1082,7 +1082,7 @@ mod tests {
 
     #[test]
     fn test_extract_graph_iri_from_binding() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

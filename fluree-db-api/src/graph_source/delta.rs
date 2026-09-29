@@ -412,7 +412,7 @@ impl DeltaSource {
                 ))
             })?;
         Ok(Self {
-            graph_source_id: record.graph_source_id.clone(),
+            graph_source_id: record.graph_source_id.to_string(),
             config,
             snapshots: std::sync::Mutex::new(HashMap::new()),
         })

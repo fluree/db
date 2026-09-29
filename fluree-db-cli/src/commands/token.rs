@@ -103,6 +103,18 @@ fn run_create(
             "no permissions granted; use --all, --events-ledger, --storage-ledger, --read-ledger/--read-all, --write-ledger/--write-all, or --graph-source".into(),
         ));
     }
+    // Verification drops a scope that is not a ledger id, so it would grant
+    // nothing; refuse it now rather than mint a token that silently lacks it.
+    for scope in permissions
+        .events_ledgers
+        .iter()
+        .chain(permissions.storage_ledgers)
+        .chain(permissions.read_ledgers)
+        .chain(permissions.write_ledgers)
+        .chain(permissions.graph_sources)
+    {
+        fluree_db_api::LedgerId::parse(scope).map_err(|e| CliError::Usage(e.to_string()))?;
+    }
 
     // Load private key
     let signing_key = load_private_key(private_key)?;
@@ -816,6 +828,35 @@ mod tests {
 
         let verified = verify_jws(&jws).unwrap();
         assert!(verified.did.starts_with("did:key:z"));
+    }
+
+    #[test]
+    fn a_scope_that_is_not_a_ledger_id_is_refused_at_mint() {
+        let read = ["mydb".to_string(), "mydb@t:5".to_string()];
+        let err = run_create(
+            "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "1h",
+            TokenClaims {
+                subject: None,
+                audiences: &[],
+                identity: None,
+            },
+            TokenPermissions {
+                policy_select: false,
+                all: false,
+                events_ledgers: &[],
+                storage_ledgers: &[],
+                read_all: false,
+                read_ledgers: &read,
+                write_all: false,
+                write_ledgers: &[],
+                graph_sources: &[],
+            },
+            TokenOutputFormat::Token,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("'mydb@t:5'"), "{err}");
     }
 
     #[test]

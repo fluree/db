@@ -292,6 +292,27 @@ async fn limit_stops_the_driver_after_one_chunk() {
     }
 }
 
+/// After its first chunks, a selective star sizes the next from the rows found
+/// per subject so far, instead of growing eightfold past what `LIMIT` needs.
+#[tokio::test]
+async fn a_selective_star_sizes_later_chunks_from_its_yield() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/pj-stream-yield:main";
+    seed_people(&fluree, ledger_id).await;
+    let view = fluree.db(ledger_id).await.expect("view");
+
+    // One person in 100 has a badge, so 30 rows need about 3,000 subjects.
+    // Chunks of 30, 240, 1,920 and then 15,360 would read all 12,000.
+    let sparql = "PREFIX ex: <http://example.org/ns/>\n\
+                  SELECT ?p ?b WHERE { ?p a ex:Person ; ex:badge ?b } LIMIT 30";
+    assert_eq!(rows(&fluree, &view, sparql).await.len(), 30);
+    let (subjects, exhausted) = driver_read(&fluree, &view, sparql).await;
+    assert!(
+        subjects < PEOPLE / 2 && !exhausted,
+        "read {subjects} driver subjects (exhausted: {exhausted})"
+    );
+}
+
 #[tokio::test]
 async fn chunked_rows_match_the_full_drain() {
     let fluree = FlureeBuilder::memory().build_memory();

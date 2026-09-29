@@ -47,6 +47,7 @@ use crate::{
     TransactResultRef,
 };
 use fluree_db_core::ContentId;
+use fluree_db_core::LedgerId;
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, RefKind, RefValue};
 use fluree_db_transact::{CommitOpts, TransactError};
@@ -54,7 +55,7 @@ use fluree_db_transact::{CommitOpts, TransactError};
 /// An open interactive Cypher transaction. Create with
 /// [`Fluree::begin_cypher_transaction`]; drop to roll back.
 pub struct CypherTransaction {
-    ledger_id: String,
+    ledger_id: LedgerId,
     /// `t` of the pinned base — the commit-time precondition.
     base_t: i64,
     /// Head ref of the pinned base (`None` on an empty ledger) — the
@@ -99,7 +100,7 @@ pub struct CypherTxnWriteOutcome {
 }
 
 impl CypherTransaction {
-    pub fn ledger_id(&self) -> &str {
+    pub fn ledger_id(&self) -> &LedgerId {
         &self.ledger_id
     }
 
@@ -135,7 +136,9 @@ impl Fluree {
             t: state.t(),
         });
         Ok(CypherTransaction {
-            ledger_id: ledger_id.to_string(),
+            // The id the handle resolved to, not the caller's spelling: the
+            // commit derives storage paths and cache keys from it.
+            ledger_id: handle.id().clone(),
             base_t: state.t(),
             base_head,
             state,

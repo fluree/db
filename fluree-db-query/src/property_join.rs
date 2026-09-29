@@ -163,8 +163,11 @@ pub struct PropertyJoinOperator {
     mode: TemporalMode,
     /// Binding emitted for an optional predicate with no values.
     unmatched: Binding,
-    /// Row budget from an outer `LIMIT`; sizes the first chunk.
+    /// Row budget from an outer `LIMIT`; sizes the first chunk, and with
+    /// `rows_emitted` the later ones.
     row_budget: Option<usize>,
+    /// Rows emitted so far.
+    rows_emitted: usize,
     /// Predicate indices in read order, the driver first.
     scan_order: Vec<usize>,
     /// Presence bits a subject must collect to produce rows.
@@ -628,6 +631,16 @@ impl PropertyJoinOperator {
         }
 
         let chunk_start = self.subject_values.len();
+        // Sized here rather than after the last chunk's probe: only once that
+        // chunk is emitted is its yield known.
+        if chunk_start > 0 {
+            if let Some(schedule) = self.chunk_schedule.as_mut() {
+                match self.row_budget {
+                    Some(wanted) => schedule.advance_toward(wanted, chunk_start, self.rows_emitted),
+                    None => schedule.advance(),
+                }
+            }
+        }
         self.fill_chunk(ctx, chunk_start).await?;
         let mut ids = self.chunk_subject_ids(ctx, chunk_start..self.subject_values.len());
         if ids.is_some() && self.lanes.is_none() {
@@ -645,10 +658,6 @@ impl PropertyJoinOperator {
         self.subject_idx = chunk_start;
         if !self.chunk.is_empty() && self.scan_order.len() > 1 {
             self.read_lanes(ctx, self.chunk.clone(), ids).await?;
-        }
-
-        if let Some(schedule) = self.chunk_schedule.as_mut() {
-            schedule.advance();
         }
         self.stats.chunks += 1;
         Ok(())
@@ -1030,6 +1039,7 @@ impl PropertyJoinOperator {
             mode: planning.mode(),
             unmatched: planning.unmatched_optional.binding(),
             row_budget: None,
+            rows_emitted: 0,
             scan_order: Vec::new(),
             required_mask: 0,
             driver: None,
@@ -1341,6 +1351,7 @@ impl Operator for PropertyJoinOperator {
             self.driver_pending = None;
             self.last_driver_id = None;
             self.lanes = None;
+            self.rows_emitted = 0;
             self.stats = ProbeStats::default();
 
             // presence_mask has one bit per predicate index, regardless of emit flag.
@@ -1479,6 +1490,7 @@ impl Operator for PropertyJoinOperator {
             self.state = OperatorState::Exhausted;
             return Ok(None);
         }
+        self.rows_emitted += all_rows.len();
 
         // Convert rows to columnar batch
         let num_cols = self.output_schema.len();

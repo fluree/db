@@ -1323,7 +1323,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        LedgerSnapshot::genesis("test/main")
+        LedgerSnapshot::genesis("test:main")
     }
 
     /// `fast_count`'s exact NumBig branch keys its whole slice with a constant

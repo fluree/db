@@ -99,7 +99,9 @@ async fn index_and_load(
     alias: &str,
     t: i64,
 ) -> LedgerState {
-    let completion = handle.trigger(alias, t).await;
+    let completion = handle
+        .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
+        .await;
     match completion.wait().await {
         fluree_db_api::IndexOutcome::Completed { .. } => {}
         fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),

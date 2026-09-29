@@ -218,14 +218,27 @@ pub struct WhoAmIScopes {
 }
 
 /// Extract scope fields from a verified payload into the response shape.
+///
+/// Ledger lists are the scopes authorization applies: `mydb` reads as
+/// `mydb:main`, and an entry that grants nothing is left out.
 fn scopes_from_payload(p: &fluree_db_credential::jwt_claims::EventsTokenPayload) -> WhoAmIScopes {
+    let effective = |scopes: &Option<Vec<String>>| {
+        scopes.as_ref().map(|listed| {
+            let mut ids: Vec<String> = crate::extract::parse_scopes(Some(listed))
+                .into_iter()
+                .map(String::from)
+                .collect();
+            ids.sort();
+            ids
+        })
+    };
     WhoAmIScopes {
         ledger_read_all: p.ledger_read_all,
         ledger_write_all: p.ledger_write_all,
         storage_all: p.storage_all,
-        ledger_read_ledgers: p.ledger_read_ledgers.clone(),
-        ledger_write_ledgers: p.ledger_write_ledgers.clone(),
-        storage_ledgers: p.storage_ledgers.clone(),
+        ledger_read_ledgers: effective(&p.ledger_read_ledgers),
+        ledger_write_ledgers: effective(&p.ledger_write_ledgers),
+        storage_ledgers: effective(&p.storage_ledgers),
     }
 }
 
@@ -673,4 +686,30 @@ pub async fn openapi_spec() -> Result<Json<serde_json::Value>> {
     });
 
     Ok(Json(spec))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A token that lists `mydb` and an id that parses to nothing shows what
+    /// it authorizes, not what it says.
+    #[test]
+    fn whoami_reports_the_scopes_that_authorize() {
+        let payload: fluree_db_credential::jwt_claims::EventsTokenPayload =
+            serde_json::from_value(serde_json::json!({
+                "iss": "did:key:z6Mk",
+                "exp": 0,
+                "fluree.ledger.read.ledgers": ["mydb", "bad@x", "other:dev"],
+                "fluree.storage.ledgers": ["mydb#g"],
+            }))
+            .unwrap();
+        let scopes = scopes_from_payload(&payload);
+        assert_eq!(
+            scopes.ledger_read_ledgers.unwrap(),
+            ["mydb:main", "other:dev"]
+        );
+        assert_eq!(scopes.storage_ledgers.unwrap(), Vec::<String>::new());
+        assert!(scopes.ledger_write_ledgers.is_none());
+    }
 }

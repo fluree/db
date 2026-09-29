@@ -19,7 +19,9 @@
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
-use crate::extract::{negotiate_graph_format, FlureeHeaders, MaybeCredential, MaybeDataBearer};
+use crate::extract::{
+    negotiate_graph_format, FlureeHeaders, GraphFormat, MaybeCredential, MaybeDataBearer,
+};
 use crate::routes::query::SparqlParams;
 use crate::routes::transact::{
     effective_author, enforce_write_access, execute_transaction, execute_turtle_transaction,
@@ -111,9 +113,7 @@ fn request_graph(request: &Request, ledger: &str) -> Result<GraphSel> {
             config_graph_iri, txn_meta_graph_iri, validate_absolute_graph_iri,
         };
         validate_absolute_graph_iri(iri).map_err(ServerError::bad_request)?;
-        // An unparseable ledger id fails later as a missing ledger.
-        let ledger_id =
-            fluree_db_core::normalize_ledger_id(ledger).unwrap_or_else(|_| ledger.to_string());
+        let ledger_id = crate::error::scope_id(ledger)?;
         if *iri == txn_meta_graph_iri(&ledger_id) || *iri == config_graph_iri(&ledger_id) {
             return Err(ServerError::bad_request(format!(
                 "<{iri}> is a system graph; the Graph Store Protocol reads and writes user graphs"
@@ -243,51 +243,93 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let format = negotiate_graph_format(accept.as_deref()).ok_or_else(|| {
-        ServerError::not_acceptable(
-            "a graph is available as application/ld+json, text/turtle, \
+    let format =
+        negotiate_graph_format(accept.as_deref(), GraphFormat::SINGLE_GRAPH).ok_or_else(|| {
+            ServerError::not_acceptable(
+                "a graph is available as application/ld+json, text/turtle, \
              application/n-triples or application/rdf+xml",
-        )
-    })?;
+            )
+        })?;
     let head = request.method() == Method::HEAD;
     let (parts, _) = request.into_parts();
 
     // Existence is asked through the query route, so authentication and read
-    // policy answer first: a graph with no triple the caller may see is
-    // indistinguishable from an absent one. `HEAD` stops here rather than
-    // serializing the graph. A plain `GET` of the default graph needs no probe;
-    // the CONSTRUCT is authorized the same way.
-    if head || matches!(graph, GraphSel::Graph(_)) {
-        let probe = match &graph {
-            GraphSel::Graph(iri) => format!("ASK {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"),
-            GraphSel::Default => "ASK { ?s ?p ?o }".to_string(),
-        };
-        let response = query_as_caller(
-            &state,
-            &ledger,
-            parts.clone(),
-            probe,
-            "application/sparql-results+json",
-        )
-        .await?;
-        if !response.status().is_success() {
-            return Ok(response);
-        }
-        if !ask_answer(response).await? && matches!(graph, GraphSel::Graph(_)) {
-            return Err(missing_graph(&graph));
-        }
-        if head {
-            return Ok(([(header::CONTENT_TYPE, format.media_type())], ()).into_response());
-        }
+    // policy answer before anything else touches the ledger: a graph with no
+    // triple the caller may see is indistinguishable from an absent one, and
+    // the default graph always exists. `HEAD` stops here rather than
+    // serializing the graph.
+    let probe = match &graph {
+        GraphSel::Graph(iri) => format!("ASK {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}"),
+        GraphSel::Default => "ASK { ?s ?p ?o }".to_string(),
+    };
+    let response = query_as_caller(
+        &state,
+        &ledger,
+        parts.clone(),
+        probe,
+        "application/sparql-results+json",
+    )
+    .await?;
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+    if matches!(graph, GraphSel::Graph(_)) && !ask_answer(response).await? {
+        return Err(missing_graph(&graph));
+    }
+    if head {
+        return Ok(([(header::CONTENT_TYPE, format.media_type())], ()).into_response());
     }
 
-    let sparql = match &graph {
-        GraphSel::Graph(iri) => {
-            format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}")
-        }
-        GraphSel::Default => "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }".to_string(),
+    // Edge annotations come back with their triples, so a GET of an annotated
+    // graph PUT back unchanged commits nothing. The lookup costs about a
+    // quarter of the query's time, so a ledger that has never held an
+    // annotation skips it. That flag only ever turns on: if it is still off
+    // after the query ran, the snapshot the query read had no annotations;
+    // if a commit or refresh turned it on meanwhile, run again with the
+    // lookup. A failed check only drops the lookup; the query route answers
+    // for the ledger.
+    let annotated = state.fluree.has_annotations(&ledger).await.unwrap_or(false);
+    let response =
+        construct_graph(&state, &ledger, parts.clone(), &graph, format, annotated).await?;
+    if !annotated
+        && response.status().is_success()
+        && state.fluree.has_annotations(&ledger).await.unwrap_or(false)
+    {
+        return construct_graph(&state, &ledger, parts, &graph, format, true).await;
+    }
+    Ok(response)
+}
+
+/// `CONSTRUCT` the graph through the query route. With `annotated`, each
+/// annotated edge also brings its reifier (`?s ?p ?o ~ ?r`). The annotations
+/// come from a `UNION` branch rooted at `rdf:reifies`, which adds about a
+/// quarter to the read even when nothing matches; an `OPTIONAL` probing
+/// every triple is several times slower inside a named graph.
+async fn construct_graph(
+    state: &Arc<AppState>,
+    ledger: &str,
+    parts: axum::http::request::Parts,
+    graph: &GraphSel,
+    format: GraphFormat,
+    annotated: bool,
+) -> Result<Response> {
+    let (template, pattern) = if annotated {
+        (
+            "?s ?p ?o ~ ?r",
+            "{ ?s ?p ?o } UNION \
+             { ?r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( ?s ?p ?o )>> }",
+        )
+    } else {
+        ("?s ?p ?o", "?s ?p ?o")
     };
-    query_as_caller(&state, &ledger, parts, sparql, format.media_type()).await
+    // The IRI was validated by `request_graph`, so it cannot close the `<…>`.
+    let sparql = match graph {
+        GraphSel::Graph(iri) => {
+            format!("CONSTRUCT {{ {template} }} WHERE {{ GRAPH <{iri}> {{ {pattern} }} }}")
+        }
+        GraphSel::Default => format!("CONSTRUCT {{ {template} }} WHERE {{ {pattern} }}"),
+    };
+    query_as_caller(state, ledger, parts, sparql, format.media_type()).await
 }
 
 /// Run `sparql` through the query route as the caller would: same auth

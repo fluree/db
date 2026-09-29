@@ -46,12 +46,12 @@ For TriG format transactions with named graphs (GRAPH blocks). Supported on `/up
 ```http
 Content-Type: application/n-triples
 ```
-For N-Triples format (future support).
+For N-Triples bodies, parsed as Turtle; accepted wherever Turtle is.
 
 ```http
 Content-Type: application/rdf+xml
 ```
-For RDF/XML format (future support).
+RDF/XML is an output format only; it is not accepted as a request body.
 
 ### Accept
 
@@ -95,6 +95,12 @@ Accept: application/rdf+xml
 RDF/XML graph format (for CONSTRUCT/DESCRIBE queries and Graph Store `GET`).
 
 ```http
+Accept: application/trig
+Accept: application/n-quads
+```
+TriG and N-Quads (for CONSTRUCT/DESCRIBE queries). Required, with JSON-LD, for a CONSTRUCT whose template writes into named graphs (`GRAPH` blocks).
+
+```http
 Accept: application/vnd.fluree.agent+json
 ```
 Agent JSON format — optimized for LLM/agent consumption. Returns a self-describing envelope with schema, compact rows, and pagination support. See [Output Formats](../query/output-formats.md#agent-json-format) for details.
@@ -103,11 +109,6 @@ Use the `Fluree-Max-Bytes` header to set a byte budget for response truncation:
 ```http
 Fluree-Max-Bytes: 32768
 ```
-
-```http
-Accept: application/n-triples
-```
-N-Triples format (future support).
 
 **Multiple Accept Values:**
 
@@ -153,18 +154,8 @@ Most HTTP clients set this automatically.
 
 ### Accept-Encoding
 
-Request compressed responses:
-
-```http
-Accept-Encoding: gzip, deflate
-```
-
-The server will compress responses when appropriate, reducing bandwidth usage.
-
-**Response Header:**
-```http
-Content-Encoding: gzip
-```
+The server does not compress responses and ignores `Accept-Encoding`. See
+[Compression](#compression).
 
 ### User-Agent
 
@@ -184,7 +175,7 @@ Client-supplied request ID for tracing:
 X-Request-ID: abc-123-def-456
 ```
 
-The server will include this in logs and response headers for correlation. When a request queues background indexing work, the copied `X-Request-ID` also appears on the background indexer worker logs so you can connect the foreground request and later indexing activity in plain log search.
+The server includes this in its logs for correlation; it does not echo it in the response. When a request queues background indexing work, the copied `X-Request-ID` also appears on the background indexer worker logs so you can connect the foreground request and later indexing activity in plain log search.
 
 ### Fluree-Min-T
 
@@ -218,75 +209,27 @@ Size of the response body in bytes:
 Content-Length: 5678
 ```
 
-### X-Fluree-T
+### Tracking Headers
 
-The transaction time of the data returned (for queries):
+A request that asks for tracking (see [Fluree Request Headers](#fluree-request-headers)) gets
+its metrics in the response body and in these headers:
 
-```http
-X-Fluree-T: 42
-```
+| Header | Content |
+|--------|---------|
+| `x-fdb-time` | Execution time, e.g. `12.34ms` |
+| `x-fdb-fuel` | Fuel consumed |
+| `x-fdb-policy` | Per-policy statistics, as base64-encoded JSON |
+| `x-fdb-policy-enforcement` | JSON, sent only when policy governed the request |
+| `x-fdb-reasoning` | JSON, sent only when a reasoning mode ran; `"capped": true` means results may be incomplete |
 
-Useful for tracking which version of data was queried.
+Query responses carry no transaction-time, commit, `ETag` or `Cache-Control` headers. Read a
+ledger's current `t` from [`GET /info/<ledger>`](endpoints.md).
 
-### X-Fluree-Commit
+### Rate Limit Headers
 
-The commit ContentId of the data returned:
-
-```http
-X-Fluree-Commit: abc123def456789...
-```
-
-### ETag
-
-Entity tag for caching:
-
-```http
-ETag: "abc123def456"
-```
-
-Can be used with `If-None-Match` for conditional requests.
-
-### Cache-Control
-
-Caching directives:
-
-**For current queries:**
-```http
-Cache-Control: no-cache
-```
-
-**For historical queries:**
-```http
-Cache-Control: public, max-age=31536000, immutable
-```
-
-Historical queries are immutable and cache indefinitely.
-
-### X-RateLimit Headers
-
-Rate limit information (if enabled):
-
-```http
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 95
-X-RateLimit-Reset: 1642857600
-```
-
-### X-Request-ID
-
-Echo of client-supplied request ID or server-generated ID:
-
-```http
-X-Request-ID: abc-123-def-456
-```
-
-### X-Response-Time
-
-Server processing time in milliseconds:
-
-```http
-X-Response-Time: 45
-```
+The server does not rate-limit requests and sends no `X-RateLimit-*` headers. If a reverse
+proxy or API gateway in front of it enforces rate limits, any such headers come from that
+layer.
 
 ## Content Type Details
 
@@ -420,19 +363,11 @@ ex:alice schema:name "Alice" .
 
 ### Default Limits
 
-The server enforces size limits to prevent resource exhaustion:
+The server enforces a single request body size limit to prevent resource exhaustion. It
+applies to every request body — transactions, queries, and history requests alike:
 
-**Transaction Requests:**
-- Default limit: 10 MB
-- Configurable: `--max-transaction-size`
-
-**Query Requests:**
-- Default limit: 1 MB
-- Configurable: `--max-query-size`
-
-**History Requests:**
-- Default limit: 1 MB
-- Configurable: `--max-history-size`
+- Default limit: 50 MB (52428800 bytes)
+- Configurable: `--body-limit` (env `FLUREE_BODY_LIMIT`, config file `body_limit`)
 
 ### Exceeding Limits
 
@@ -451,35 +386,18 @@ If a request exceeds size limits:
 
 ### Configuration
 
-Set custom limits when starting the server:
+Set a custom limit when starting the server:
 
 ```bash
-./fluree-db-server \
-  --max-transaction-size 20971520 \    # 20 MB
-  --max-query-size 2097152 \           # 2 MB
-  --max-response-size 104857600        # 100 MB
+fluree server run -- --body-limit 20971520   # 20 MB
 ```
 
-### Response Size Limits
+See [Configuration](../operations/configuration.md) for all server options.
 
-The server also limits response sizes:
+### Response Size
 
-**Default limit:** 100 MB
-
-If a query result exceeds the limit:
-
-**Status Code:** `413 Payload Too Large`
-
-**Response:**
-```json
-{
-  "error": "Query result exceeds maximum response size",
-  "status": 413,
-  "@type": "err:http/ResponseTooLarge"
-}
-```
-
-**Solution:** Use LIMIT and pagination:
+The server has no configurable response size limit. To keep large result sets manageable, use
+LIMIT and pagination:
 
 ```json
 {
@@ -492,40 +410,9 @@ If a query result exceeds the limit:
 
 ## Compression
 
-### Request Compression
-
-Send compressed requests (for large transactions):
-
-```http
-Content-Encoding: gzip
-Content-Type: application/json
-```
-
-The request body should be gzip-compressed JSON.
-
-### Response Compression
-
-Request compressed responses:
-
-```http
-Accept-Encoding: gzip, deflate
-```
-
-The server will compress responses when:
-- Client accepts compression
-- Response is larger than threshold (typically 1 KB)
-- Content-Type is compressible
-
-**Response Headers:**
-```http
-Content-Encoding: gzip
-Vary: Accept-Encoding
-```
-
-**Compression Benefits:**
-- Reduced bandwidth usage (typically 70-90% for JSON)
-- Faster response times on slower connections
-- Lower costs for cloud deployments
+The server neither compresses responses nor decodes compressed request bodies
+(`Content-Encoding: gzip`). To compress traffic, put a reverse proxy in front of the server
+and let it handle compression.
 
 ## Character Encoding
 
@@ -565,112 +452,59 @@ Access-Control-Request-Headers: Content-Type
 
 **Preflight Response:**
 ```http
-Access-Control-Allow-Origin: https://example.com
-Access-Control-Allow-Methods: GET, POST, OPTIONS
-Access-Control-Allow-Headers: Content-Type, Authorization
-Access-Control-Max-Age: 86400
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: *
+Access-Control-Allow-Headers: Content-Type
 ```
+
+The requested headers are mirrored back in `Access-Control-Allow-Headers`.
 
 **Actual Response:**
 ```http
-Access-Control-Allow-Origin: https://example.com
-Access-Control-Allow-Credentials: true
+Access-Control-Allow-Origin: *
 ```
 
 ### CORS Configuration
 
-Configure CORS when starting the server:
+CORS is either on or off. It is on by default; disable it with `--cors-enabled=false`,
+`FLUREE_CORS_ENABLED=false`, or `cors_enabled = false` in the `[server]` section of the config
+file. When on, the server allows any
+origin and any method and does not send `Access-Control-Allow-Credentials`.
 
-```bash
-./fluree-db-server \
-  --cors-origin "https://example.com" \
-  --cors-methods "GET,POST,OPTIONS" \
-  --cors-headers "Content-Type,Authorization"
-```
-
-**Allow all origins (development only):**
-```bash
-./fluree-db-server --cors-origin "*"
-```
-
-Never use `--cors-origin "*"` in production with credentials.
+The server has no per-origin, per-method, or per-header allow lists. To restrict CORS to
+specific origins, disable it on the server and set the CORS headers in a reverse proxy in
+front of it.
 
 ## Caching Headers
 
-### ETag and Conditional Requests
+Query and transaction responses carry no `ETag` or `Cache-Control` headers, and the server does
+not answer conditional requests (`If-None-Match`) for them. Only the storage proxy's block
+endpoints, used for replication, send an `ETag` and an immutable `Cache-Control`.
 
-The server supports ETags for efficient caching.
+## Fluree Request Headers
 
-**Initial Request:**
-```http
-GET /ledgers/mydb:main HTTP/1.1
-```
+| Header | Value | Effect |
+|--------|-------|--------|
+| `fluree-ledger` | Ledger ID | Target ledger for connection-scoped endpoints; a ledger in the path takes precedence |
+| `fluree-identity` | Identity IRI | Identity whose policies apply |
+| `fluree-policy` | JSON | Inline policy for the request |
+| `fluree-policy-class` | IRI(s), comma-separated or repeated | Policy classes to apply |
+| `fluree-policy-values` | JSON | Values bound into policy queries |
+| `fluree-default-allow` | `true` / `false` | Access when no policy matches; overrides the ledger's `f:defaultAllow` |
+| `fluree-track-meta` | `true` | Track everything below |
+| `fluree-track-fuel` | `true` | Report fuel consumed |
+| `fluree-track-time` | `true` | Report execution time |
+| `fluree-track-policy` | `true` | Report per-policy statistics |
+| `fluree-max-fuel` | Number | Fail the query once it consumes this much fuel |
+| `fluree-min-t` | Transaction `t` | See [Fluree-Min-T](#fluree-min-t) |
 
-**Response:**
-```http
-HTTP/1.1 200 OK
-ETag: "abc123def456"
-Cache-Control: no-cache
-```
+Whether a request may choose its own identity or policy depends on the server's
+authorization settings; see [Policy in Queries](../security/policy-in-queries.md). Tracking and
+fuel are covered in [Tracking and Fuel Limits](../query/tracking-and-fuel.md).
 
-**Conditional Request:**
-```http
-GET /ledgers/mydb:main HTTP/1.1
-If-None-Match: "abc123def456"
-```
-
-**Not Modified Response:**
-```http
-HTTP/1.1 304 Not Modified
-ETag: "abc123def456"
-```
-
-### Immutable Historical Data
-
-Historical queries with time specifiers are immutable:
-
-**Query:**
-```http
-POST /query HTTP/1.1
-{"from": "mydb:main@t:100", ...}
-```
-
-**Response:**
-```http
-HTTP/1.1 200 OK
-Cache-Control: public, max-age=31536000, immutable
-ETag: "mydb:main@t:100:query-hash"
-```
-
-Clients can cache these responses indefinitely.
-
-## Custom Headers
-
-### X-Fluree-Fuel-Limit
-
-Set query fuel limit to prevent runaway queries:
-
-```http
-X-Fluree-Fuel-Limit: 1000000
-```
-
-See [Tracking and Fuel Limits](../query/tracking-and-fuel.md) for details.
-
-### X-Fluree-Timeout
-
-Set query timeout in milliseconds:
-
-```http
-X-Fluree-Timeout: 30000
-```
-
-### X-Fluree-Policy
-
-Specify a policy to apply (if authorized):
-
-```http
-X-Fluree-Policy: ex:restrictive-policy
-```
+There is no per-request timeout header. Queries are bounded by the server-wide
+`--query-timeout-ms` (`FLUREE_QUERY_TIMEOUT_MS`, default 15 minutes); see
+[Configuration](../operations/configuration.md).
 
 ## Best Practices
 
@@ -682,15 +516,7 @@ Explicitly set Content-Type for all requests:
 Content-Type: application/json
 ```
 
-### 2. Accept Compression
-
-Always request compression for better performance:
-
-```http
-Accept-Encoding: gzip, deflate
-```
-
-### 3. Use Appropriate Accept Headers
+### 2. Use Appropriate Accept Headers
 
 Request the format you need:
 
@@ -698,7 +524,7 @@ Request the format you need:
 Accept: application/json
 ```
 
-### 4. Include User-Agent
+### 3. Include User-Agent
 
 Identify your application:
 
@@ -706,20 +532,10 @@ Identify your application:
 User-Agent: MyApp/1.0.0
 ```
 
-### 5. Handle ETags
+### 4. Monitor Rate Limits
 
-Implement ETag caching for frequently accessed resources:
-
-```javascript
-const etag = localStorage.getItem('ledger-etag');
-if (etag) {
-  headers['If-None-Match'] = etag;
-}
-```
-
-### 6. Monitor Rate Limits
-
-Check rate limit headers and back off when needed:
+If a proxy or gateway in front of the server enforces rate limits, check its headers and back
+off when needed:
 
 ```javascript
 const remaining = response.headers.get('X-RateLimit-Remaining');
@@ -728,7 +544,7 @@ if (remaining < 10) {
 }
 ```
 
-### 7. Use Request IDs
+### 5. Use Request IDs
 
 Include request IDs for tracing:
 

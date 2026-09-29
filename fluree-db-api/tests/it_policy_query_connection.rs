@@ -1136,3 +1136,136 @@ async fn scoped_explain_withholds_statistics_for_every_language() {
     }
     assert_eq!(view.snapshot.stats.as_ref().unwrap().flakes, 987_654);
 }
+
+// =========================================================================
+// Hydration under policy on the single-ledger connection path
+// =========================================================================
+
+/// A subgraph ("crawl") projection is filtered while the formatter hydrates each
+/// subject, so it needs the policy the rows were filtered by. The single-ledger
+/// fast path used to drop the wrapped view and re-resolve the alias, handing the
+/// formatter an unwrapped view: rows were correct and the hydrated nodes still
+/// carried the denied property.
+///
+/// The multi-ledger form of the same query was always correct, because it keeps
+/// its `DataSetDb` and routes hydration through each view's own policy. That
+/// contrast is the second assertion.
+#[tokio::test]
+async fn crawl_hydration_honors_policy_on_a_single_ledger() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    const A: &str = "policy/crawl-hydration-a:main";
+    const B: &str = "policy/crawl-hydration-b:main";
+    let _ = seed_people_with_ssn(&fluree, A).await;
+    let _ = seed_people_with_ssn(&fluree, B).await;
+
+    let crawl = |from: serde_json::Value| {
+        json!({
+            "@context": {
+                "ex": "http://example.org/ns/",
+                "schema": "http://schema.org/",
+                "f": "https://ns.flur.ee/db#"
+            },
+            "from": from,
+            "opts": {
+                "policy": [{
+                    "@id": "http://example.org/ns/denySsn",
+                    "@type": "f:AccessPolicy",
+                    "f:action": { "@id": "f:view" },
+                    "f:onProperty": [{ "@id": "http://schema.org/ssn" }],
+                    "f:allow": false
+                }],
+                "default-allow": true
+            },
+            "select": { "?s": ["*"] },
+            "where": { "@id": "?s", "@type": "ex:User" },
+        })
+    };
+    let run = |q: serde_json::Value| {
+        let fluree = fluree.clone();
+        async move {
+            fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{q}: {e}"))
+        }
+    };
+
+    // Control: the crawl hydrates ex:ssn when nothing denies it, so its absence
+    // below cannot be an empty or unhydrated result.
+    let mut open = crawl(json!(A));
+    open.as_object_mut().expect("object").remove("opts");
+    let open = run(open).await;
+    assert!(
+        open.to_string().contains("111-11-1111"),
+        "control: an unrestricted crawl must hydrate schema:ssn: {open}"
+    );
+
+    let single = run(crawl(json!(A))).await;
+    assert_eq!(
+        single.as_array().map_or(0, Vec::len),
+        2,
+        "the deny targets one property, so both users still bind: {single}"
+    );
+    assert!(
+        !single.to_string().contains("111-11-1111"),
+        "single-ledger crawl hydrated a denied property: {single}"
+    );
+    assert!(
+        single.to_string().contains("Alice"),
+        "the rest of each node must survive: {single}"
+    );
+
+    let multi = run(crawl(json!([A, B]))).await;
+    assert!(
+        !multi.to_string().contains("111-11-1111"),
+        "multi-ledger crawl hydrated a denied property: {multi}"
+    );
+}
+
+/// `execute_formatted_string` shares the single-ledger formatting path and had
+/// the same defect, with no coverage of its own.
+#[tokio::test]
+async fn crawl_hydration_honors_policy_via_formatted_string() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    const LEDGER: &str = "policy/crawl-hydration-string:main";
+    let _ = seed_people_with_ssn(&fluree, LEDGER).await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "from": LEDGER,
+        "opts": {
+            "policy": [{
+                "@id": "http://example.org/ns/denySsn",
+                "@type": "f:AccessPolicy",
+                "f:action": { "@id": "f:view" },
+                "f:onProperty": [{ "@id": "http://schema.org/ssn" }],
+                "f:allow": false
+            }],
+            "default-allow": true
+        },
+        "select": { "?s": ["*"] },
+        "where": { "@id": "?s", "@type": "ex:User" },
+    });
+    let out = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted_string()
+        .await
+        .expect("formatted string");
+    assert!(
+        out.contains("Alice"),
+        "the crawl must still hydrate the allowed properties: {out}"
+    );
+    assert!(
+        !out.contains("111-11-1111"),
+        "formatted-string crawl hydrated a denied property: {out}"
+    );
+}
