@@ -41,20 +41,17 @@ pub fn dt_compatible(expected: &Sid, actual: &Sid) -> bool {
 /// Reserved datatypes hold fixed dictionary IDs. Every other datatype takes
 /// a new ID the first time a ledger uses it, up to [`DatatypeDictId::MAX`].
 pub fn is_reserved_datatype(dt: &Sid) -> bool {
-    use fluree_vocab::{fluree, namespaces, rdf, xsd};
-    let prefix = match dt.namespace_code {
-        namespaces::JSON_LD => "@",
-        namespaces::XSD => xsd::NS,
-        namespaces::RDF => rdf::NS,
-        namespaces::FLUREE_DB => fluree::DB,
+    use fluree_vocab::{datatype::KnownDatatype, namespaces};
+    let known = match dt.namespace_code {
         // The full IRI lives in `name` for these two.
-        namespaces::EMPTY | namespaces::OVERFLOW => "",
-        _ => return false,
+        namespaces::EMPTY | namespaces::OVERFLOW => {
+            KnownDatatype::from_canonical_form(dt.name_str())
+        }
+        code => KnownDatatype::from_ns_and_local(code, dt.name_str()),
     };
-    let name = dt.name_str();
-    DatatypeDictId::RESERVED_IRIS
-        .iter()
-        .any(|iri| iri.strip_prefix(prefix) == Some(name))
+    // Compare the canonical IRI with `RESERVED_IRIS`, so this check agrees
+    // with that list by construction.
+    known.is_some_and(|k| DatatypeDictId::RESERVED_IRIS.contains(&k.canonical_form()))
 }
 
 /// Whether literals of this datatype are interned in the shared **string

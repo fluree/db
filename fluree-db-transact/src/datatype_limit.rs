@@ -13,6 +13,7 @@
 
 use crate::commit::binary_store;
 use crate::error::{Result, TransactError};
+use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::datatypes::is_reserved_datatype;
 use fluree_db_core::ids::RuntimeDatatypeId;
 use fluree_db_core::{DatatypeDictId, Flake, RuntimeSmallDicts, Sid};
@@ -31,6 +32,14 @@ pub const MAX_NON_RESERVED_DATATYPES: usize =
 /// Runs under the ledger's write lock against the authoritative base, so
 /// writes re-based over one another cannot jointly cross the limit.
 pub fn check_commit(base: &LedgerState, flakes: &[Flake], txn_meta: &[TxnMetaEntry]) -> Result<()> {
+    // Skip the scan when the commit cannot reach the limit. The maximum
+    // number of datatypes the commit could add is its flake count plus its
+    // txn-meta entry count, because each adds at most one. If the ledger's
+    // count plus that maximum is within the limit, the commit cannot
+    // exceed it.
+    if used_upper_bound(base) + flakes.len() + txn_meta.len() <= MAX_NON_RESERVED_DATATYPES {
+        return Ok(());
+    }
     let known = known_datatypes(base);
     let meta_datatypes: Vec<Sid> = txn_meta
         .iter()
@@ -52,7 +61,7 @@ pub fn check_commit(base: &LedgerState, flakes: &[Flake], txn_meta: &[TxnMetaEnt
 pub fn known_datatypes(state: &LedgerState) -> Arc<RuntimeSmallDicts> {
     let dicts = &state.runtime_small_dicts;
     match binary_store(state) {
-        Some(store) if usize::from(dicts.persisted_datatype_count()) != store.dt_sids().len() => {
+        Some(store) if !is_seeded_from(dicts, &store) => {
             let mut seeded =
                 RuntimeSmallDicts::from_seeded_sids([], store.dt_sids().iter().cloned());
             for id in 0..dicts.datatype_count() {
@@ -64,6 +73,24 @@ pub fn known_datatypes(state: &LedgerState) -> Arc<RuntimeSmallDicts> {
         }
         _ => Arc::clone(dicts),
     }
+}
+
+/// An upper bound on the non-reserved datatypes `state` holds.
+///
+/// It counts the runtime dictionaries, plus every datatype of an index they
+/// were not seeded from. It needs no rebuild of the dictionaries.
+fn used_upper_bound(state: &LedgerState) -> usize {
+    let dicts = &state.runtime_small_dicts;
+    let unseeded_index = binary_store(state)
+        .filter(|store| !is_seeded_from(dicts, store))
+        .map_or(0, |store| store.dt_sids().len());
+    dicts.non_reserved_datatype_count() + unseeded_index
+}
+
+/// Whether `dicts` was seeded from `store`, and so holds every datatype the
+/// index does.
+fn is_seeded_from(dicts: &RuntimeSmallDicts, store: &BinaryIndexStore) -> bool {
+    usize::from(dicts.persisted_datatype_count()) == store.dt_sids().len()
 }
 
 /// The distinct datatypes in `datatypes` that are neither reserved nor
