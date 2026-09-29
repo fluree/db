@@ -110,3 +110,43 @@ async fn bm25_index_updates_with_ledger() {
         .await
         .unwrap();
 }
+
+/// A graph source may be named without its branch, as `ledger: "docs"` names
+/// a ledger. Every entry point resolves it once, so nothing downstream sees
+/// the branchless spelling.
+#[tokio::test]
+async fn bm25_index_answers_to_its_branchless_name() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = support::genesis_ledger(&fluree, "notes:main");
+    let tx = |id: &str, text: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@graph": [{"@id": id, "ex:title": text, "ex:content": text}]
+        })
+    };
+    let ledger = fluree
+        .insert(ledger, &tx("ex:n1", "first note about graphs"))
+        .await
+        .unwrap()
+        .ledger;
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where": [{"@id": "?x", "ex:title": "?title", "ex:content": "?content"}],
+        "select": {"?x": ["@id", "ex:title", "ex:content"]}
+    });
+    fluree
+        .create_full_text_index(Bm25CreateConfig::new("note-search", "notes:main", query))
+        .await
+        .unwrap();
+    fluree
+        .insert(ledger, &tx("ex:n2", "second note about queries"))
+        .await
+        .unwrap();
+
+    let synced = fluree.sync_bm25_index("note-search").await.unwrap();
+    assert_eq!(synced.graph_source_id, "note-search:main");
+    assert!(synced.upserted >= 1);
+    let idx = fluree.load_bm25_index("note-search").await.unwrap();
+    assert_eq!(idx.num_docs(), 2);
+    fluree.drop_full_text_index("note-search").await.unwrap();
+}

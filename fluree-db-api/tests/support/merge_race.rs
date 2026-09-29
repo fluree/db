@@ -1,14 +1,16 @@
-//! A deterministic pause immediately before the merge's ref CAS.
-//! All other operations use the real nameservice, including rollback.
+//! A deterministic pause immediately before the merge's ref CAS, and an
+//! opt-in listing failure. All other operations use the real nameservice,
+//! including rollback.
 
 use async_trait::async_trait;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceLookup,
-    NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
-    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
+    NameServiceLookup, NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
+    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
+    StatusValue,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -20,6 +22,7 @@ use tokio::sync::Notify;
 pub(super) struct PausingNameService {
     inner: Arc<dyn NameServicePublisher>,
     armed: AtomicBool,
+    failing_listings: AtomicBool,
     pub(super) entered: Notify,
     pub(super) resume: Notify,
 }
@@ -29,9 +32,15 @@ impl PausingNameService {
         Self {
             inner,
             armed: AtomicBool::new(true),
+            failing_listings: AtomicBool::new(false),
             entered: Notify::new(),
             resume: Notify::new(),
         }
+    }
+
+    /// Make every `all_records` call fail from now on.
+    pub(super) fn fail_listings(&self) {
+        self.failing_listings.store(true, Ordering::SeqCst);
     }
 }
 
@@ -81,6 +90,9 @@ impl NameServiceLookup for PausingNameService {
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
+        if self.failing_listings.load(Ordering::SeqCst) {
+            return Err(NameServiceError::storage("injected listing failure"));
+        }
         self.inner.all_records().await
     }
 

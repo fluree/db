@@ -30,7 +30,24 @@ A ledger ID serves as both a human-readable identifier and the canonical lookup 
 - The `:branch` suffix allows multiple isolated versions of the same logical ledger to coexist
 - The default branch name is `main` when not specified (e.g., `mydb` is equivalent to `mydb:main`)
 - Branches are independent—changes in one branch don't affect others
-- Branch names can include slashes for hierarchical organization
+- Ledger names can include slashes for hierarchical organization (`tenant/app`); branch names cannot
+
+### Naming Rules
+
+`:`, `@` and `#` delimit the parts of a ledger address (`name:branch@t:5#graph`), so neither a ledger name nor a branch name can contain them. An ID that breaks a rule is rejected with a 400 that names the ID and the rule.
+
+A ledger name:
+
+- is one or more `/`-separated segments, none empty (`/mydb`, `mydb/` and `a//b` are invalid) and none `.` or `..`
+- has no segment named `commit`, `txn`, `index`, `config` or `blob`, and no first segment `graph-sources`: these are storage-layout directories
+
+A new branch name:
+
+- contains no `/`: a ledger's files live under `name/branch/`, so `mydb:release/v1` and `mydb/release:v1` would share one directory
+- is not `commit`, `txn`, `index`, `config` or `blob`, and does not end in `.index` or `.snapshots`
+- is at most 128 characters
+
+Ledgers and branches created before these rules were enforced stay readable when they break only the layout rules. One whose name contains `@` or `#` is still listed and kept by cleanup, but no request can address it. One whose name has an empty or `.`/`..` segment is skipped, with a warning naming its record.
 
 ### Ledger Lifecycle
 

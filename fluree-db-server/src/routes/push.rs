@@ -116,7 +116,7 @@ async fn push_ledger_local(
 
     // Enforce bearer ledger scope (avoid existence leak).
     if let Some(p) = bearer.as_ref() {
-        if !p.can_write(&ledger) {
+        if !p.can_write(&crate::error::scope_id(&ledger)?) {
             return Err(ServerError::not_found("Ledger not found"));
         }
     }

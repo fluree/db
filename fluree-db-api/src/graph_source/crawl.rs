@@ -1967,7 +1967,7 @@ mod e2e {
 
         // Which forward properties does /info type as `@id`?
         let record = GraphSourceRecord {
-            graph_source_id: "crawl-e2e:main".to_string(),
+            graph_source_id: fluree_db_core::LedgerId::parse("crawl-e2e:main").unwrap(),
             name: "crawl-e2e".to_string(),
             branch: "main".to_string(),
             source_type: GraphSourceType::Iceberg,

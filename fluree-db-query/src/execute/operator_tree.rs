@@ -3939,7 +3939,7 @@ mod tests {
         }
 
         let value = VarId(0);
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         for planning in [PlanningContext::current(), PlanningContext::history()] {
@@ -4070,7 +4070,7 @@ mod tests {
             plan.contains("GroupByOperator") && plan.contains("DistinctOperator"),
             "{plan}"
         );
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         op.open(&ctx).await.unwrap();

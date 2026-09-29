@@ -697,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn compact_index_checks_distinct_key_memory_and_cancellation() {
         use fluree_db_core::{LedgerSnapshot, QueryCancellation, QueryCancellationReason};
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         for (budget, cancelled) in [(16, false), (15, false), (16, true)] {
             let cancellation = QueryCancellation::new();

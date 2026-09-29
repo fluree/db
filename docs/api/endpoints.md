@@ -372,7 +372,8 @@ The W3C SPARQL 1.1 Graph Store HTTP Protocol: read (`GET`/`HEAD`), replace
 (`PUT`), add to (`POST`) or remove (`DELETE`) one graph, named by
 `?graph={iri}` or `?default`. `PUT` is [sync](../transactions/sync.md), so it
 commits only the difference. `PUT`/`POST` take Turtle, N-Triples, TriG or
-JSON-LD; `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML. See
+JSON-LD; `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML. `GET` and
+`HEAD` accept a time pin in the path (`/data/mydb:main@t:5?graph=...`). See
 [Graph Store Protocol](graph-store.md) for status codes, formats and policy.
 
 ```bash
@@ -1317,20 +1318,23 @@ The full byte-format negotiation below is available on the **ledger-scoped**
 [`POST /query/{ledger}`](#post-queryledger) route. The **connection-scoped**
 `POST /query` route (SPARQL with `FROM <ledger>`) returns pre-formatted JSON only
 — it supports the JSON family (JSON-LD, SPARQL-results JSON, AgentJson) but not the
-byte formats; Turtle, N-Triples, RDF/XML, SPARQL-results XML, and CSV/TSV require
-the ledger-scoped route (see the [connection-scoped note](#connection-scoped-sparql-output) below).
+byte formats; Turtle, N-Triples, RDF/XML, TriG, N-Quads, SPARQL-results XML, and CSV/TSV
+require the ledger-scoped route (see the [connection-scoped note](#connection-scoped-sparql-output) below).
 
-| Query form | Default (no/`*/*`/`application/json`) | `application/ld+json` | `text/turtle` / `application/n-triples` / `application/rdf+xml` | `application/sparql-results+json` | `text/csv` / `text/tab-separated-values` | `application/sparql-results+xml` | `application/vnd.fluree.agent+json` |
+| Query form | Default (no/`*/*`/`application/json`) | `application/ld+json` | `text/turtle` / `application/n-triples` / `application/rdf+xml` / `application/trig` / `application/n-quads` | `application/sparql-results+json` | `text/csv` / `text/tab-separated-values` | `application/sparql-results+xml` | `application/vnd.fluree.agent+json` |
 |---|---|---|---|---|---|---|---|
 | `SELECT` / `ASK` | SPARQL-results JSON | JSON-LD | **406** | SPARQL-results JSON | CSV / TSV | SPARQL-results XML | AgentJson |
-| `CONSTRUCT` / `DESCRIBE` | **JSON-LD** | JSON-LD | Turtle / N-Triples / RDF/XML | JSON-LD | **406** | **406** | **406** |
+| `CONSTRUCT` / `DESCRIBE` | **JSON-LD** | JSON-LD | the requested format | JSON-LD | **406** | **406** | **406** |
 
 A `CONSTRUCT` / `DESCRIBE` produces an RDF graph, which has no solution/binding-table
 form. It is returned as **JSON-LD** (`Content-Type: application/ld+json`) unless
 `Accept` prefers one of the graph text formats: among `application/ld+json`,
-`application/json`, `text/turtle`, `application/n-triples` and `application/rdf+xml`
-the highest `q` wins (equal weights keep the header's order; `text/*` means Turtle).
-Turtle output declares the query's `PREFIX`es and uses them. The solution-table formats
+`application/json`, `text/turtle`, `application/n-triples`, `application/rdf+xml`,
+`application/trig` and `application/n-quads` the highest `q` wins (equal weights keep the
+header's order; `text/*` means Turtle). Turtle and TriG output declare the query's `PREFIX`es
+and use them. A `CONSTRUCT` whose template has `GRAPH` blocks produces a dataset, so it
+negotiates only among TriG, N-Quads and JSON-LD; an `Accept` that admits only Turtle,
+N-Triples or RDF/XML is a `406` (see [CONSTRUCT](../query/construct.md#named-graphs-in-the-template)). The solution-table formats
 (SPARQL-results XML, CSV/TSV, AgentJson) are rejected with `406`. A `SELECT` / `ASK`
 defaults to SPARQL-results JSON and only switches to JSON-LD when `application/ld+json`
 is requested explicitly — a bare `application/json` keeps the SPARQL-results-JSON
@@ -1341,7 +1345,7 @@ shape — and an `Accept` that admits only graph formats is rejected with `406`.
 > JSON only. The JSON-family columns above apply (CONSTRUCT/DESCRIBE → JSON-LD;
 > SELECT/ASK → SPARQL-results JSON, or JSON-LD with `Accept: application/ld+json`;
 > AgentJson via `application/vnd.fluree.agent+json`, rejected `406` for graph
-> queries). CSV/TSV, Turtle, N-Triples and RDF/XML are rejected with `406`, and
+> queries). CSV/TSV, Turtle, N-Triples, RDF/XML, TriG and N-Quads are rejected with `406`, and
 > `application/sparql-results+xml` is **not** negotiated here — use
 > `POST /query/{ledger}` for those byte formats.
 
@@ -1399,6 +1403,33 @@ POST /query/{ledger}
 **Ledger mismatch protection:**
 
 If the body includes a ledger reference that targets a different ledger than `{ledger}`, the server returns `400 Bad Request` with a "Ledger mismatch" error.
+
+**Time pin in the path:**
+
+Add a time pin to the ledger in the path to read the whole ledger, default graph and named graphs, as it was at that point. The pin takes the same forms as a pinned `from` / `FROM` ledger reference:
+
+```
+POST /query/{ledger}@t:5
+POST /query/{ledger}@time:2025-01-15T00:00:00Z      (alias @iso:)
+POST /query/{ledger}@recorded:2025-01-15T00:00:00Z
+POST /query/{ledger}@commit:bafyreif...
+POST /query/{ledger}@t:latest
+```
+
+It works for `GET` and `POST`, and for JSON-LD, SPARQL and Cypher bodies. `GRAPH ?g { ... }` (JSON-LD `["graph", "?g", ...]`) enumerates the named graphs that existed at the pin, and `GRAPH <iri> { ... }` reads that graph as it was then. Graphs the body selects with `FROM` / `FROM NAMED` or `from` / `fromNamed` are read at the pin too.
+
+- A body that names its own time for this ledger (`FROM <mydb:main@t:5>`, `"from": "mydb:main@t:5"`, `"from": {"@id": "mydb:main", "t": 5}`) must agree with the path: the same `t`, the same timestamp, or the same commit. Any other time is a `400`, including a different form that happens to resolve to the same commit (a `t` against a timestamp).
+- A history query (a `to` key) names its own range and is a `400` on a pinned path.
+- A malformed pin (`mydb@t:abc`, `mydb@bogus:1`, `mydb@`) is a `400`, as is a pin together with a `#graph` fragment in the path.
+- `@t:N` waits for the ledger to reach `t=N`, as a pinned `from` does, and returns `408` if it doesn't in time.
+- A pinned read goes through the dataset path, which has no CSV/TSV output (`406`).
+
+```bash
+# SPARQL over the ledger as of t=5, named graphs included
+curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main@t:5" \
+  -H "Content-Type: application/sparql-query" \
+  -d 'SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }'
+```
 
 **Examples:**
 
@@ -1567,9 +1598,10 @@ interleaved `heartbeat`s → a terminal `end` or `error`). SELECT only; ASK,
 CONSTRUCT/DESCRIBE, `selectOne`, hydration, and history (JSON-LD `to` / SPARQL
 `FROM … TO …`) are rejected with `4xx`. Policy, `from`/`fromNamed`, SPARQL
 `FROM`, and multi-ledger queries (JSON-LD and SPARQL) are enforced identically
-to `/query`. See **[Streaming query (NDJSON)](streaming-query.md)** for the full
-record protocol, the terminal-record (truncation) contract, policy behavior,
-and client examples.
+to `/query`. A time pin in the ledger path (`/stream/query/{ledger}@t:5`) is a
+`400`; use [`/query/{ledger}@t:5`](#post-queryledger). See
+**[Streaming query (NDJSON)](streaming-query.md)** for the full record protocol,
+the terminal-record (truncation) contract, policy behavior, and client examples.
 
 ### POST /multi-query
 
@@ -1644,7 +1676,8 @@ POST /explain[/{ledger...}]
 
 **Behavior:**
 - JSON-LD body: returns the logical plan for the parsed query.
-- SPARQL body: returns the plan for the parsed SPARQL query. The ledger-scoped endpoint (`/explain/{ledger}`) rejects queries containing `FROM` / `FROM NAMED` — strip dataset clauses to explain the core plan.
+- SPARQL body: returns the plan for the parsed SPARQL query. On the ledger-scoped endpoint (`/explain/{ledger}`) a `FROM` must name the path's ledger, optionally with a time pin (`FROM <mydb:main@t:5>`), and the plan is for that snapshot.
+- A time pin in the path (`/explain/{ledger}@t:5`) plans against that snapshot, with the same forms and rules as [`/query/{ledger}`](#post-queryledger). On a pinned path a SPARQL `FROM` must repeat the pin.
 - Cypher body (`Content-Type: application/cypher`): returns the plan for the lowered Cypher query. Accepts raw Cypher or the `{"cypher": "...", "params": {...}}` envelope — `$param` references are substituted before lowering, exactly like `/query`. Ledger-scoped endpoint only (the connection-scoped `/explain` returns 400 for Cypher).
 - SPARQL UPDATE is rejected (HTTP 400) — use `/update` for updates.
 - Same ledger-scope enforcement for Bearer tokens as `/query`.
@@ -1655,7 +1688,7 @@ A JSON object describing the logical / physical plan. Shape mirrors the query en
 
 **Status Codes:**
 - `200 OK` — plan returned
-- `400 Bad Request` — SPARQL UPDATE sent, or `FROM` clauses on the ledger-scoped explain
+- `400 Bad Request` — SPARQL UPDATE sent, a `FROM` naming another ledger, or a malformed or conflicting time pin
 - `401 Unauthorized` — authentication required and missing
 - `404 Not Found` — ledger not found or not authorized
 
@@ -1859,7 +1892,11 @@ endpoint. Use `GET /ledgers` to list ledgers and graph sources,
 
 ### GET /ledgers
 
-List all ledgers and graph sources.
+List ledgers and graph sources.
+
+Follows data auth like `/info` and `/exists`: when data auth is required, a Bearer token is
+required, and a request carrying a token lists only the ledgers and graph sources its
+`fluree.ledger.read.*` claims cover.
 
 **URL:**
 ```

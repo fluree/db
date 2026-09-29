@@ -252,7 +252,7 @@ mod tests {
     /// row (a constant-template `CONSTRUCT … OFFSET 2` built an empty graph).
     #[tokio::test]
     async fn test_offset_partial_skip_keeps_zero_column_row_count() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -276,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_offset_within_first_batch() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -310,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_offset_skips_entire_batch() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -341,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_offset_spans_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -382,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_offset_larger_than_input() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -400,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_offset_zero() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -419,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_offset_preserves_schema() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -457,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_offset_state_transitions() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

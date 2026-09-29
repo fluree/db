@@ -369,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_all_unique() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -404,7 +404,7 @@ mod tests {
     /// returned an empty graph instead of its one triple.
     #[tokio::test]
     async fn test_distinct_zero_column_batches_yield_exactly_one_row() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -435,7 +435,7 @@ mod tests {
     /// the fix must not manufacture a row out of an empty solution sequence.
     #[tokio::test]
     async fn test_distinct_zero_column_empty_child_stays_empty() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -448,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_all_duplicates() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -467,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_mixed() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -504,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_across_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -537,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_batch_all_dupes_skipped() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -565,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_multi_column() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -585,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_with_unbound() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -610,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_with_poisoned() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -635,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_preserves_schema() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -666,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_state_transitions() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

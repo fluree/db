@@ -186,7 +186,7 @@ fn overlay_epoch_from_flakes(flakes: &[Flake]) -> u64 {
 #[tokio::test]
 async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
     // Base DB is empty; all facts come from overlay.
-    let mut snapshot = LedgerSnapshot::genesis("test/main");
+    let mut snapshot = LedgerSnapshot::genesis("test:main");
     // The query parser lowers IRIs as `Term::Iri` and scan time encodes them via `snapshot.encode_iri`.
     // Since this test constructs facts directly as SIDs in an overlay, we must teach the DB
     // the namespace codes used by those SIDs so encoding succeeds.
@@ -395,7 +395,7 @@ async fn owl2rl_enabled_rules_filters_rule_families() {
     // Same shape as the test above: domain/range axioms + a property chain,
     // but reasoning runs with only `prp-spo2` enabled, so chain facts must
     // derive while domain/range rdf:type facts must not.
-    let mut snapshot = LedgerSnapshot::genesis("test/enabled-rules");
+    let mut snapshot = LedgerSnapshot::genesis("test:enabled-rules");
     snapshot
         .insert_namespace_code(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string())
         .unwrap();

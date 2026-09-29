@@ -226,7 +226,7 @@ fn print_fetch_result(result: &FetchResult) {
 /// no upstream remote is configured.
 pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) -> CliResult<()> {
     let ledger_id = context::resolve_ledger(ledger, dirs)?;
-    let ledger_id = context::to_ledger_id(&ledger_id);
+    let ledger_id = context::to_ledger_id(&ledger_id)?;
 
     let config_store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     let upstream = config_store
@@ -776,7 +776,7 @@ async fn send_push(
 /// Push a ledger to its upstream remote
 pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
     let ledger_id = context::resolve_ledger(ledger, dirs)?;
-    let ledger_id = context::to_ledger_id(&ledger_id);
+    let ledger_id = context::to_ledger_id(&ledger_id)?;
 
     let config_store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     let upstream = config_store
@@ -922,9 +922,10 @@ pub async fn run_publish(
     dirs: &FlureeDir,
 ) -> CliResult<()> {
     let ledger_id = context::resolve_ledger(explicit_ledger, dirs)?;
-    let ledger_id = context::to_ledger_id(&ledger_id);
+    let ledger_id = context::to_ledger_id(&ledger_id)?;
     let remote_ledger_id = remote_ledger_name
         .map(context::to_ledger_id)
+        .transpose()?
         .unwrap_or_else(|| ledger_id.clone());
 
     // Resolve remote config.
@@ -1071,8 +1072,8 @@ pub async fn run_clone(
     no_txns: bool,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
-    let ledger_id = context::to_ledger_id(ledger);
-    let local_id = alias.map_or_else(|| ledger_id.clone(), context::to_ledger_id);
+    let ledger_id = context::to_ledger_id(ledger)?;
+    let local_id = alias.map_or_else(|| Ok(ledger_id.clone()), context::to_ledger_id)?;
 
     // Clone aliasing is supported: commits use CID-based references (not
     // storage addresses), so the local ledger ID can differ from the remote.
@@ -1409,8 +1410,8 @@ pub async fn run_clone_origin(
     no_txns: bool,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
-    let ledger_id = context::to_ledger_id(ledger);
-    let local_id = alias.map_or_else(|| ledger_id.clone(), context::to_ledger_id);
+    let ledger_id = context::to_ledger_id(ledger)?;
+    let local_id = alias.map_or_else(|| Ok(ledger_id.clone()), context::to_ledger_id)?;
 
     // 1. Build bootstrap fetcher from the single origin URI.
     let mut fetcher = MultiOriginFetcher::from_bootstrap(origin_uri, token.map(String::from));

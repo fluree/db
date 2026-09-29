@@ -3,6 +3,7 @@
 //! Tracks what the transaction server has committed/indexed via SSE events.
 //! This is separate from local ledger state which may lag behind.
 
+use fluree_db_api::LedgerId;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -35,9 +36,9 @@ pub struct RemoteGraphSourceWatermark {
 /// The peer's local ledger state may lag behind these watermarks.
 pub struct PeerState {
     /// Remote ledger watermarks from SSE
-    ledgers: RwLock<HashMap<String, RemoteLedgerWatermark>>,
+    ledgers: RwLock<HashMap<LedgerId, RemoteLedgerWatermark>>,
     /// Remote graph source watermarks from SSE
-    graph_sources: RwLock<HashMap<String, RemoteGraphSourceWatermark>>,
+    graph_sources: RwLock<HashMap<LedgerId, RemoteGraphSourceWatermark>>,
     /// Whether SSE connection is active
     connected: RwLock<bool>,
 }
@@ -62,7 +63,7 @@ impl PeerState {
     /// local state (if available) or reject the query.
     pub async fn check_ledger_freshness(
         &self,
-        ledger_id: &str,
+        ledger_id: &LedgerId,
         local_index_t: i64,
     ) -> NeedsRefresh {
         match self.ledgers.read().await.get(ledger_id) {
@@ -84,7 +85,7 @@ impl PeerState {
     /// Check if a graph source needs refresh based on local vs remote state.
     pub async fn check_graph_source_freshness(
         &self,
-        graph_source_id: &str,
+        graph_source_id: &LedgerId,
         local_index_t: i64,
         local_config_hash: &str,
     ) -> GraphSourceNeedsRefresh {
@@ -107,14 +108,14 @@ impl PeerState {
     }
 
     /// Get remote watermark for a ledger (if known from SSE)
-    pub async fn get_remote_ledger(&self, ledger_id: &str) -> Option<RemoteLedgerWatermark> {
+    pub async fn get_remote_ledger(&self, ledger_id: &LedgerId) -> Option<RemoteLedgerWatermark> {
         self.ledgers.read().await.get(ledger_id).cloned()
     }
 
     /// Update ledger watermark from SSE event (returns true if changed)
     pub async fn update_ledger(
         &self,
-        ledger_id: &str,
+        ledger_id: &LedgerId,
         commit_t: i64,
         index_t: i64,
         commit_head_id: Option<String>,
@@ -129,7 +130,7 @@ impl PeerState {
 
         if changed {
             ledgers.insert(
-                ledger_id.to_string(),
+                ledger_id.clone(),
                 RemoteLedgerWatermark {
                     ledger_id: ledger_id.to_string(),
                     commit_t,
@@ -145,14 +146,14 @@ impl PeerState {
     }
 
     /// Remove ledger (on retraction)
-    pub async fn remove_ledger(&self, ledger_id: &str) {
+    pub async fn remove_ledger(&self, ledger_id: &LedgerId) {
         self.ledgers.write().await.remove(ledger_id);
     }
 
     /// Update graph source watermark from SSE event (returns true if changed)
     pub async fn update_graph_source(
         &self,
-        graph_source_id: &str,
+        graph_source_id: &LedgerId,
         index_t: i64,
         config_hash: String,
         index_id: Option<String>,
@@ -166,7 +167,7 @@ impl PeerState {
 
         if changed {
             graph_sources.insert(
-                graph_source_id.to_string(),
+                graph_source_id.clone(),
                 RemoteGraphSourceWatermark {
                     graph_source_id: graph_source_id.to_string(),
                     index_t,
@@ -181,7 +182,7 @@ impl PeerState {
     }
 
     /// Remove graph source (on retraction)
-    pub async fn remove_graph_source(&self, graph_source_id: &str) {
+    pub async fn remove_graph_source(&self, graph_source_id: &LedgerId) {
         self.graph_sources.write().await.remove(graph_source_id);
     }
 
@@ -201,12 +202,12 @@ impl PeerState {
     }
 
     /// Get all known ledger aliases (for introspection/health)
-    pub async fn known_ledgers(&self) -> Vec<String> {
+    pub async fn known_ledgers(&self) -> Vec<LedgerId> {
         self.ledgers.read().await.keys().cloned().collect()
     }
 
     /// Get all known graph source aliases (for introspection/health)
-    pub async fn known_graph_sources(&self) -> Vec<String> {
+    pub async fn known_graph_sources(&self) -> Vec<LedgerId> {
         self.graph_sources.read().await.keys().cloned().collect()
     }
 
@@ -265,7 +266,7 @@ impl fluree_db_api::FreshnessSource for PeerState {
     /// - The ledger hasn't been seen in SSE yet
     ///
     /// When None is returned, the caller uses lenient policy (treat as current).
-    fn watermark(&self, ledger_id: &str) -> Option<fluree_db_api::RemoteWatermark> {
+    fn watermark(&self, ledger_id: &LedgerId) -> Option<fluree_db_api::RemoteWatermark> {
         // Try to read without blocking
         let ledgers = self.ledgers.try_read().ok()?;
         let w = ledgers.get(ledger_id)?;
@@ -285,13 +286,17 @@ impl fluree_db_api::FreshnessSource for PeerState {
 mod tests {
     use super::*;
 
+    fn id(s: &str) -> fluree_db_api::LedgerId {
+        fluree_db_api::LedgerId::parse(s).unwrap()
+    }
+
     #[tokio::test]
     async fn test_new_ledger_update() {
         let state = PeerState::new();
 
         let changed = state
             .update_ledger(
-                "books:main",
+                &id("books:main"),
                 5,
                 3,
                 Some("commit-cid:5".to_string()),
@@ -301,7 +306,7 @@ mod tests {
 
         assert!(changed);
 
-        let ledger = state.get_remote_ledger("books:main").await.unwrap();
+        let ledger = state.get_remote_ledger(&id("books:main")).await.unwrap();
         assert_eq!(ledger.commit_t, 5);
         assert_eq!(ledger.index_t, 3);
     }
@@ -311,10 +316,14 @@ mod tests {
         let state = PeerState::new();
 
         // Initial update
-        state.update_ledger("books:main", 5, 3, None, None).await;
+        state
+            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .await;
 
         // Same watermarks - no change
-        let changed = state.update_ledger("books:main", 5, 3, None, None).await;
+        let changed = state
+            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .await;
         assert!(!changed);
     }
 
@@ -322,13 +331,17 @@ mod tests {
     async fn test_ledger_update_commit_advanced() {
         let state = PeerState::new();
 
-        state.update_ledger("books:main", 5, 3, None, None).await;
+        state
+            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .await;
 
         // Higher commit_t
-        let changed = state.update_ledger("books:main", 6, 3, None, None).await;
+        let changed = state
+            .update_ledger(&id("books:main"), 6, 3, None, None)
+            .await;
         assert!(changed);
 
-        let ledger = state.get_remote_ledger("books:main").await.unwrap();
+        let ledger = state.get_remote_ledger(&id("books:main")).await.unwrap();
         assert_eq!(ledger.commit_t, 6);
     }
 
@@ -336,31 +349,39 @@ mod tests {
     async fn test_ledger_update_index_advanced() {
         let state = PeerState::new();
 
-        state.update_ledger("books:main", 5, 3, None, None).await;
+        state
+            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .await;
 
         // Higher index_t
-        let changed = state.update_ledger("books:main", 5, 5, None, None).await;
+        let changed = state
+            .update_ledger(&id("books:main"), 5, 5, None, None)
+            .await;
         assert!(changed);
 
-        let ledger = state.get_remote_ledger("books:main").await.unwrap();
+        let ledger = state.get_remote_ledger(&id("books:main")).await.unwrap();
         assert_eq!(ledger.index_t, 5);
     }
 
     #[tokio::test]
     async fn test_check_ledger_freshness_no() {
         let state = PeerState::new();
-        state.update_ledger("books:main", 5, 3, None, None).await;
+        state
+            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .await;
 
-        let result = state.check_ledger_freshness("books:main", 3).await;
+        let result = state.check_ledger_freshness(&id("books:main"), 3).await;
         assert!(matches!(result, NeedsRefresh::No));
     }
 
     #[tokio::test]
     async fn test_check_ledger_freshness_yes() {
         let state = PeerState::new();
-        state.update_ledger("books:main", 5, 5, None, None).await;
+        state
+            .update_ledger(&id("books:main"), 5, 5, None, None)
+            .await;
 
-        let result = state.check_ledger_freshness("books:main", 3).await;
+        let result = state.check_ledger_freshness(&id("books:main"), 3).await;
         match result {
             NeedsRefresh::Yes {
                 local_index_t,
@@ -378,26 +399,30 @@ mod tests {
     async fn test_check_ledger_freshness_unknown() {
         let state = PeerState::new();
 
-        let result = state.check_ledger_freshness("unknown:main", 0).await;
+        let result = state.check_ledger_freshness(&id("unknown:main"), 0).await;
         assert!(matches!(result, NeedsRefresh::Unknown));
     }
 
     #[tokio::test]
     async fn test_remove_ledger() {
         let state = PeerState::new();
-        state.update_ledger("books:main", 5, 3, None, None).await;
-        assert!(state.get_remote_ledger("books:main").await.is_some());
+        state
+            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .await;
+        assert!(state.get_remote_ledger(&id("books:main")).await.is_some());
 
-        state.remove_ledger("books:main").await;
-        assert!(state.get_remote_ledger("books:main").await.is_none());
+        state.remove_ledger(&id("books:main")).await;
+        assert!(state.get_remote_ledger(&id("books:main")).await.is_none());
     }
 
     #[tokio::test]
     async fn test_clear() {
         let state = PeerState::new();
-        state.update_ledger("books:main", 5, 3, None, None).await;
         state
-            .update_graph_source("search:main", 2, "abc123".to_string(), None)
+            .update_ledger(&id("books:main"), 5, 3, None, None)
+            .await;
+        state
+            .update_graph_source(&id("search:main"), 2, "abc123".to_string(), None)
             .await;
 
         assert_eq!(state.ledger_count().await, 1);
@@ -413,11 +438,11 @@ mod tests {
     async fn test_graph_source_freshness_no() {
         let state = PeerState::new();
         state
-            .update_graph_source("search:main", 2, "abc123".to_string(), None)
+            .update_graph_source(&id("search:main"), 2, "abc123".to_string(), None)
             .await;
 
         let result = state
-            .check_graph_source_freshness("search:main", 2, "abc123")
+            .check_graph_source_freshness(&id("search:main"), 2, "abc123")
             .await;
         assert!(matches!(result, GraphSourceNeedsRefresh::No));
     }
@@ -426,11 +451,11 @@ mod tests {
     async fn test_graph_source_freshness_index_advanced() {
         let state = PeerState::new();
         state
-            .update_graph_source("search:main", 5, "abc123".to_string(), None)
+            .update_graph_source(&id("search:main"), 5, "abc123".to_string(), None)
             .await;
 
         let result = state
-            .check_graph_source_freshness("search:main", 2, "abc123")
+            .check_graph_source_freshness(&id("search:main"), 2, "abc123")
             .await;
         match result {
             GraphSourceNeedsRefresh::IndexAdvanced { remote_index_t } => {
@@ -444,11 +469,11 @@ mod tests {
     async fn test_graph_source_freshness_config_changed() {
         let state = PeerState::new();
         state
-            .update_graph_source("search:main", 2, "def456".to_string(), None)
+            .update_graph_source(&id("search:main"), 2, "def456".to_string(), None)
             .await;
 
         let result = state
-            .check_graph_source_freshness("search:main", 2, "abc123")
+            .check_graph_source_freshness(&id("search:main"), 2, "abc123")
             .await;
         match result {
             GraphSourceNeedsRefresh::ConfigChanged { remote_config_hash } => {

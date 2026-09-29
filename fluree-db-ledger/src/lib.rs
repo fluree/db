@@ -531,7 +531,7 @@ impl LedgerState {
     }
 
     /// Get the ledger ID
-    pub fn ledger_id(&self) -> &str {
+    pub fn ledger_id(&self) -> &fluree_db_core::LedgerId {
         &self.snapshot.ledger_id
     }
 
@@ -799,7 +799,7 @@ impl LedgerState {
         };
         tracing::debug!(
             target: "fluree::write_path",
-            ledger_id = self.ledger_id(),
+            ledger_id = %self.ledger_id(),
             index_t = self.snapshot.t,
             novelty_us,
             merge_us,
@@ -1699,7 +1699,7 @@ mod tests {
         let mut state = LedgerState::new(snapshot, Novelty::new(0));
 
         // Set up an ns_record
-        state.ns_record = Some(NsRecord::new("test", "main"));
+        state.ns_record = Some(NsRecord::new("test:main"));
 
         let commit = Commit::new(1, vec![make_flake(10, 1, 100, 1)])
             .with_id(make_test_commit_id("commit:1"));

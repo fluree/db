@@ -659,7 +659,7 @@ impl Fluree {
         let Some(model) = model else {
             return Ok(Vec::new());
         };
-        let id = fluree_db_core::normalize_ledger_id(model).unwrap_or_else(|_| model.to_string());
+        let id = fluree_db_core::LedgerId::parse(model)?;
         let ns = self.nameservice();
         if ns
             .lookup_graph_source(&id)
@@ -733,8 +733,7 @@ impl Fluree {
         // identical to the native `db()` path (this also fixes the rarer
         // `{ds}:main#...` NotFound).
         let (base_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
-        let gs_id =
-            fluree_db_core::normalize_ledger_id(base_id).unwrap_or_else(|_| base_id.to_string());
+        let gs_id = fluree_db_core::LedgerId::parse(base_id)?;
 
         let Some(record) = self
             .nameservice()
@@ -771,7 +770,7 @@ impl Fluree {
         // configuration. Shared graph selection removes both when selecting an
         // empty system graph, for fragments and explicit dataset selectors alike.
         db.resolved_config = Self::graph_source_model_config(&record);
-        db.graph_source_id = Some(gs_id.into());
+        db.graph_source_id = Some(gs_id.to_string().into());
         db.graph_source_time = graph_source_time;
         Self::select_graph(db, graph_ref).map(Some)
     }
@@ -853,9 +852,9 @@ impl Fluree {
             // written back below so the subsequent `query` call's
             // own ResolveCtx observes the same per-ledger head-t.
             //
-            // `ledger_id_owned` keeps a string alive past the
+            // `ledger_id_owned` keeps the id alive past the
             // eventual `view` move at the end of this branch.
-            let ledger_id_owned: String = view.snapshot.ledger_id.to_string();
+            let ledger_id_owned = view.snapshot.ledger_id.clone();
             let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
                 &ledger_id_owned,
                 self,
@@ -953,7 +952,7 @@ impl Fluree {
             .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
         {
             Some(reasoning) => {
-                let ledger_id_owned: String = view.snapshot.ledger_id.to_string();
+                let ledger_id_owned = view.snapshot.ledger_id.clone();
                 let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
                     &ledger_id_owned,
                     self,
