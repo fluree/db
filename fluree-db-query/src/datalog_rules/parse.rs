@@ -209,14 +209,21 @@ pub(super) fn parse_sparql_rule(
              nodes (every round would mint new ones and the fixpoint would never end)",
         ));
     }
-    if template.patterns.is_empty() {
+    if template.patterns().is_empty() {
         return Err(invalid(
             &label,
             "the CONSTRUCT template has no triple patterns",
         ));
     }
+    if template.names_graphs() || !template.reifications().is_empty() {
+        return Err(invalid(
+            &label,
+            "the CONSTRUCT template writes into a named graph or annotates an edge; a rule \
+             head can only infer default-graph triples",
+        ));
+    }
     let heads = template
-        .patterns
+        .patterns()
         .iter()
         .map(|tp| head_from_triple(tp, snapshot, &label))
         .collect::<Result<Vec<_>>>()?;

@@ -1108,6 +1108,7 @@ non-zero, so a clean export carries none of them.
 | `400` | Source has no parent (e.g., `main`) and `target` is omitted; `source == target`; unknown strategy; unsupported strategy; `include_conflict_details=true` with `include_conflicts=false`; `strategy=abort` with `include_conflicts=false`. Body must include `"no source branch"` or `"itself"` for the first two cases so the CLI's matcher works. |
 | `401` | Bearer required and absent/invalid. |
 | `404` | Ledger or branch does not exist; or the bearer cannot `can_read`. |
+| `409` | `BranchConflict` — the source's namespace allocations conflict with the target's. |
 | `5xx` | Storage / nameservice errors. |
 
 ### Reference implementation
@@ -1242,7 +1243,7 @@ The CLI's pretty-printer (`print_branch_created` in
 
 | Status | When |
 |--------|------|
-| `400` | Invalid branch name (per `validate_branch_name`); malformed JSON body. |
+| `400` | Invalid branch name (per `validate_branch_name`); the source branch has no commits yet (`ApiError::InvalidBranch`); malformed JSON body. |
 | `401` / `403` | Admin token required and absent/invalid (see admin-auth middleware). |
 | `404` | Source branch does not exist. |
 | `409` | A branch with this name already exists (`ApiError::LedgerExists` → 409). |

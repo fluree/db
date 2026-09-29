@@ -84,6 +84,10 @@ impl ServerError {
             //
             // Map common statuses to stable error types so clients can branch on `@type`.
             ServerError::Api(ApiError::Http { status, .. }) => match status {
+                // The committer flattens typed errors to this shape (merge,
+                // rebase and revert's `InvalidBranch`, among others), so a 400
+                // must not read as an internal error here.
+                400 => errors::BAD_REQUEST,
                 401 => errors::UNAUTHORIZED,
                 403 => errors::ACCESS_DENIED,
                 409 => errors::COMMIT_CONFLICT,
@@ -117,6 +121,9 @@ impl ServerError {
                 }
             }
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
+            // The code a merge or rebase conflict already gets from the
+            // committer as a flattened 409.
+            ServerError::Api(ApiError::BranchConflict(_)) => errors::COMMIT_CONFLICT,
 
             // Index operations
             ServerError::Api(ApiError::IndexTimeout(_)) => errors::INDEX_TIMEOUT,
@@ -280,6 +287,7 @@ impl ServerError {
 
             // 409 - Conflict
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
+            ServerError::Api(ApiError::BranchConflict(_)) => StatusCode::CONFLICT,
             // Optimistic-concurrency / namespace-allocation conflicts are
             // retryable: 409 lets clients distinguish "retry" from a 400 "bad
             // request". (After server-side reconcile-and-retry these only reach
@@ -1017,6 +1025,31 @@ mod tests {
                     .is_none(),
                 "413 must not invite a retry"
             );
+        }
+    }
+
+    /// Merge, rebase and revert reach the HTTP layer through the committer,
+    /// which flattens a typed error to `ApiError::Http { status }`; previews
+    /// and sweeps return it typed. A branch error answers the same either way.
+    #[test]
+    fn branch_errors_answer_the_same_typed_or_flattened() {
+        for (api, status, code) in [
+            (
+                ApiError::InvalidBranch("Branch main has no source branch".into()),
+                StatusCode::BAD_REQUEST,
+                errors::BAD_REQUEST,
+            ),
+            (
+                ApiError::BranchConflict("another maintenance operation holds db:main".into()),
+                StatusCode::CONFLICT,
+                errors::COMMIT_CONFLICT,
+            ),
+        ] {
+            let flattened = ServerError::Api(ApiError::http(api.status_code(), api.to_string()));
+            for se in [ServerError::Api(api), flattened] {
+                assert_eq!(se.status_code(), status, "{se}");
+                assert_eq!(se.error_type(), code, "{se}");
+            }
         }
     }
 
