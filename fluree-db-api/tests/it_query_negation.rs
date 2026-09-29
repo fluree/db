@@ -163,6 +163,63 @@ async fn jsonld_minus_after_values_undef_binds_shared_variable() {
     }
 }
 
+/// EXISTS and NOT EXISTS are FILTERs, so they apply to the whole group wherever
+/// they are written: here they must see the UNDEF row after the triple written
+/// after them fills it in.
+#[tokio::test]
+async fn negation_written_before_its_binder_sees_the_whole_group() {
+    use fluree_db_api::{QueryInput, ReindexOptions};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "negation-before-binder:main";
+    seed_minus_regression_people(&fluree, ledger_id).await;
+    let p = |i: usize| json!({"@type": "@id", "@value": format!("ex:p{i}")});
+    let values = json!(["values", ["?p", [p(0), p(1), p(1), null]]]);
+    for indexed in [false, true] {
+        if indexed {
+            fluree
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .unwrap();
+        }
+        let view = fluree.db(ledger_id).await.unwrap();
+        for (sparql, jsonld, expected) in [
+            (
+                "FILTER NOT EXISTS",
+                "not-exists",
+                &[1, 1, 1, 2, 4, 5, 7, 8, 10, 11][..],
+            ),
+            ("FILTER EXISTS", "exists", &[0, 0, 3, 6, 9]),
+        ] {
+            let body = format!(
+                "VALUES ?p {{ ex:p0 ex:p1 ex:p1 UNDEF }} {sparql} {{ ?p ex:worksFor ?org }} ?p a ex:Person"
+            );
+            assert_negation_subjects(&fluree, &view, &body, expected).await;
+
+            let q = json!({
+                "@context": ctx_ex(),
+                "select": "?p",
+                "where": [
+                    values.clone(),
+                    [jsonld, {"@id": "?p", "ex:worksFor": "?org"}],
+                    {"@id": "?p", "@type": "ex:Person"}
+                ]
+            });
+            let rows = fluree
+                .query(&view, QueryInput::JsonLd(&q))
+                .await
+                .unwrap()
+                .to_jsonld(&view.snapshot)
+                .unwrap();
+            let expected: Vec<_> = expected.iter().map(|i| format!("ex:p{i}")).collect();
+            assert_eq!(
+                normalize_rows(&rows),
+                normalize_rows(&json!(expected)),
+                "{jsonld}, indexed: {indexed}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn minus_at_historical_time_after_reindex() {
     use fluree_db_api::ReindexOptions;
@@ -950,6 +1007,41 @@ async fn jsonld_not_exists_treats_optional_unbound_var_as_free() {
         normalize_rows(&rows),
         normalize_rows(&json!([["ex:carol", "ex:globex"], ["ex:dave", null]]))
     );
+}
+
+/// Written before the OPTIONAL, the NOT EXISTS still applies to the group and
+/// sees `?org` wherever the OPTIONAL bound it: the same rows as written after.
+#[tokio::test]
+async fn not_exists_written_before_an_optional_sees_its_binding() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_knows_works_for(&fluree, "negation:before-optional").await;
+    let expected = normalize_rows(&json!([["ex:carol", "ex:globex"], ["ex:dave", null]]));
+
+    let q = r"PREFIX ex: <http://example.com/>
+SELECT ?p ?org WHERE {
+  ?p ex:knows ?f
+  FILTER NOT EXISTS { ?p ex:knows ?x . ?x ex:worksFor ?org }
+  OPTIONAL { ?p ex:worksFor ?org }
+}";
+    assert_eq!(sparql_rows(&fluree, &ledger, q).await, expected);
+
+    let q = json!({
+        "@context": ctx_ex(),
+        "select": ["?p", "?org"],
+        "where": [
+            {"@id": "?p", "ex:knows": "?f"},
+            ["not-exists",
+                {"@id": "?p", "ex:knows": "?x"},
+                {"@id": "?x", "ex:worksFor": "?org"}],
+            ["optional", {"@id": "?p", "ex:worksFor": "?org"}]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(normalize_rows(&rows), expected);
 }
 
 /// A missing OPTIONAL binding must use a reusable existence lookup, while
