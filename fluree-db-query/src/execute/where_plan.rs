@@ -1329,29 +1329,44 @@ fn selective_object_values_seed(
     best
 }
 
-/// Whether every variable in `required` is bound and can no longer change.
+/// The variables a BIND or FILTER may read at one point of a join chain.
 ///
-/// `unsettled` holds variables that may be unbound on some rows (UNDEF in a
-/// VALUES table, an OPTIONAL, a BIND whose expression errored) and that a triple
-/// not yet joined will still bind. A BIND or FILTER reading one before that
-/// triple would see the wrong value.
-fn all_settled(
-    required: &HashSet<VarId>,
-    bound: &HashSet<VarId>,
-    unsettled: &HashSet<VarId>,
-) -> bool {
-    required.is_subset(bound) && required.is_disjoint(unsettled)
+/// `bound` alone is not enough: a variable can be in the schema yet unbound on
+/// some rows (UNDEF in a VALUES table, an OPTIONAL, a BIND whose expression
+/// errored, a per-row seed). While a triple not yet joined can still bind it,
+/// it is `unsettled`, and a BIND or FILTER reading it would see the wrong value.
+#[derive(Clone, Debug, Default)]
+struct Settled {
+    bound: HashSet<VarId>,
+    unsettled: HashSet<VarId>,
+}
+
+impl Settled {
+    /// `bound`, with no triple left that could bind any of them again.
+    fn all(bound: HashSet<VarId>) -> Self {
+        Self {
+            bound,
+            unsettled: HashSet::new(),
+        }
+    }
+
+    fn admits(&self, required: &HashSet<VarId>) -> bool {
+        required.is_subset(&self.bound) && required.is_disjoint(&self.unsettled)
+    }
+
+    fn admits_var(&self, var: VarId) -> bool {
+        self.bound.contains(&var) && !self.unsettled.contains(&var)
+    }
 }
 
 /// Partition filters into those eligible for inline evaluation and those still waiting.
 ///
-/// Filters consumed by pushdown are silently dropped. Filters whose required
-/// variables are all settled (see [`all_settled`]) are returned as ready
-/// expressions (first element); the rest are returned as-is (second element).
+/// Filters consumed by pushdown are silently dropped. Filters `settled` admits
+/// are returned as ready expressions (first element); the rest are returned
+/// as-is (second element).
 fn partition_eligible_filters(
     filters: Vec<FilterPattern>,
-    bound: &HashSet<VarId>,
-    unsettled: &HashSet<VarId>,
+    settled: &Settled,
     filter_idxs_consumed: &[usize],
 ) -> (Vec<Expression>, Vec<FilterPattern>) {
     let mut ready = Vec::new();
@@ -1364,7 +1379,7 @@ fn partition_eligible_filters(
         // inline evaluation is synchronous, and both require the async path on
         // FilterOperator (EXISTS via filter_batch_with_exists, metadata via the
         // policy-filtered resolver). Defer them to a real FilterOperator.
-        if all_settled(&pf.required_vars, bound, unsettled)
+        if settled.admits(&pf.required_vars)
             && !contains_exists(&pf.expr)
             && !crate::eval::metadata_resolve::contains_metadata_read(&pf.expr)
         {
@@ -1376,15 +1391,14 @@ fn partition_eligible_filters(
     (ready, pending)
 }
 
-/// Apply eligible BINDs whose required variables are all bound.
+/// Apply the BINDs `settled` admits.
 ///
 /// Each ready BIND is fused with any filters that become ready once the BIND's
-/// variable enters `bound`.  Returns the updated operator, any BINDs whose
+/// variable enters `settled`.  Returns the updated operator, any BINDs whose
 /// dependencies are not yet satisfied, and the remaining filters.
 fn apply_eligible_binds(
     mut child: BoxedOperator,
-    bound: &mut HashSet<VarId>,
-    unsettled: &HashSet<VarId>,
+    settled: &mut Settled,
     pending_binds: Vec<BindPattern>,
     mut pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
@@ -1393,11 +1407,11 @@ fn apply_eligible_binds(
     let mut remaining_binds = Vec::new();
 
     for pending in pending_binds {
-        if all_settled(&pending.required_vars, bound, unsettled) {
-            bound.insert(pending.var);
+        if settled.admits(&pending.required_vars) {
+            settled.bound.insert(pending.var);
 
             let (bind_filters, still_pending) =
-                partition_eligible_filters(pending_filters, bound, unsettled, filter_idxs_consumed);
+                partition_eligible_filters(pending_filters, settled, filter_idxs_consumed);
             pending_filters = still_pending;
 
             child = Box::new(
@@ -1412,14 +1426,12 @@ fn apply_eligible_binds(
     (child, remaining_binds, pending_filters)
 }
 
-/// Apply BINDs and FILTERs whose required variables are all bound.
+/// Apply the BINDs and FILTERs `settled` admits.
 ///
 /// Returns the updated operator and the remaining items.
-#[allow(clippy::too_many_arguments)]
 fn apply_deferred_patterns(
     child: BoxedOperator,
-    bound: &mut HashSet<VarId>,
-    unsettled: &HashSet<VarId>,
+    settled: &mut Settled,
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
@@ -1427,8 +1439,7 @@ fn apply_deferred_patterns(
 ) -> (BoxedOperator, Vec<BindPattern>, Vec<FilterPattern>) {
     let (mut child, remaining_binds, pending_filters) = apply_eligible_binds(
         child,
-        bound,
-        unsettled,
+        settled,
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
@@ -1436,7 +1447,7 @@ fn apply_deferred_patterns(
     );
 
     let (ready, remaining_filters) =
-        partition_eligible_filters(pending_filters, bound, unsettled, filter_idxs_consumed);
+        partition_eligible_filters(pending_filters, settled, filter_idxs_consumed);
     for expr in ready {
         child = Box::new(FilterOperator::new_with_planning(child, expr, *planning));
     }
@@ -1456,12 +1467,11 @@ fn apply_all_remaining(
     filter_idxs_consumed: &[usize],
     planning: &PlanningContext,
 ) -> BoxedOperator {
-    let mut bound: HashSet<VarId> = child.schema().iter().copied().collect();
+    let mut settled = Settled::all(child.schema().iter().copied().collect());
 
     let (mut child, _, remaining_filters) = apply_eligible_binds(
         child,
-        &mut bound,
-        &HashSet::new(),
+        &mut settled,
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
@@ -1610,8 +1620,7 @@ fn build_property_join_block(
     let (inline_ops, pending_binds, pending_filters) = build_inline_ops(
         pending_binds,
         pending_filters,
-        &available_vars,
-        &HashSet::new(),
+        Settled::all(available_vars),
         &pushdown.consumed_indices,
     );
     for op in &inline_ops {
@@ -1638,12 +1647,11 @@ fn build_property_join_block(
         operator = apply_values(operator, block_values);
     }
 
-    let mut bound = bound_vars_from_operator(&operator);
+    let mut settled = Settled::all(bound_vars_from_operator(&operator));
     if let Some(child) = operator.take() {
         let (child, _, _) = apply_deferred_patterns(
             child,
-            &mut bound,
-            &HashSet::new(),
+            &mut settled,
             pending_binds,
             pending_filters,
             &pushdown.consumed_indices,
@@ -1666,27 +1674,19 @@ fn build_property_join_block(
 fn build_inline_ops(
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
-    available_vars: &HashSet<VarId>,
-    unsettled: &HashSet<VarId>,
+    mut available: Settled,
     filter_idxs_consumed: &[usize],
 ) -> (Vec<InlineOperator>, Vec<BindPattern>, Vec<FilterPattern>) {
     let mut ops = Vec::new();
-    let mut available = available_vars.clone();
 
-    let remaining_filters = inline_eligible_filters(
-        &mut ops,
-        pending_filters,
-        &available,
-        unsettled,
-        filter_idxs_consumed,
-    );
+    let remaining_filters =
+        inline_eligible_filters(&mut ops, pending_filters, &available, filter_idxs_consumed);
 
     let (remaining_binds, remaining_filters) = inline_chain(
         &mut ops,
         pending_binds,
         remaining_filters,
         &mut available,
-        unsettled,
         filter_idxs_consumed,
     );
 
@@ -1697,12 +1697,11 @@ fn build_inline_ops(
 fn inline_eligible_filters(
     ops: &mut Vec<InlineOperator>,
     pending_filters: Vec<FilterPattern>,
-    available: &HashSet<VarId>,
-    unsettled: &HashSet<VarId>,
+    available: &Settled,
     filter_idxs_consumed: &[usize],
 ) -> Vec<FilterPattern> {
     let (ready, remaining) =
-        partition_eligible_filters(pending_filters, available, unsettled, filter_idxs_consumed);
+        partition_eligible_filters(pending_filters, available, filter_idxs_consumed);
     for expr in ready {
         ops.push(InlineOperator::Filter(PreparedBoolExpression::new(expr)));
     }
@@ -1718,8 +1717,7 @@ fn inline_chain(
     ops: &mut Vec<InlineOperator>,
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
-    available: &mut HashSet<VarId>,
-    unsettled: &HashSet<VarId>,
+    available: &mut Settled,
     filter_idxs_consumed: &[usize],
 ) -> (Vec<BindPattern>, Vec<FilterPattern>) {
     let mut remaining_binds = pending_binds;
@@ -1734,10 +1732,10 @@ fn inline_chain(
             // is synchronous and so cannot run the async view-policy filter. Keep
             // it as a deferred `BindOperator`, which resolves metadata through the
             // policy-filtered async path. Cheap to defer — metadata calls are rare.
-            if all_settled(&bind.required_vars, available, unsettled)
+            if available.admits(&bind.required_vars)
                 && !crate::eval::metadata_resolve::contains_metadata_read(&bind.expr)
             {
-                available.insert(bind.var);
+                available.bound.insert(bind.var);
                 ops.push(InlineOperator::Bind {
                     var: bind.var,
                     expr: bind.expr,
@@ -1748,7 +1746,6 @@ fn inline_chain(
                     ops,
                     remaining_filters,
                     available,
-                    unsettled,
                     filter_idxs_consumed,
                 );
             } else {
@@ -1786,7 +1783,7 @@ impl<'a> TriplePlanContext<'a> {
 }
 
 /// Variables the not-yet-joined, not-folded `remaining` triples bind that are
-/// not already bound in every row (see [`all_settled`]).
+/// not already bound in every row (see [`Settled`]).
 fn unsettled_vars(
     remaining: &[TriplePattern],
     folded: &[bool],
@@ -1832,7 +1829,7 @@ fn build_sequential_join_block(
         operator = apply_values(operator, block_values);
     }
 
-    let mut bound = bound_vars_from_operator(&operator);
+    let mut settled = Settled::all(bound_vars_from_operator(&operator));
     let mut pending_binds = pending_binds;
     let mut pending_filters = pending_filters;
 
@@ -1854,13 +1851,11 @@ fn build_sequential_join_block(
         if folded[k] {
             continue;
         }
-        hash_planner.before_step(tp, &bound);
-        let mut vars_after: HashSet<VarId> = bound.clone();
-        for v in tp.produced_vars() {
-            vars_after.insert(v);
-        }
+        hash_planner.before_step(tp, &settled.bound);
         guaranteed.extend(tp.produced_vars());
-        let unsettled = unsettled_vars(&triples[k + 1..], &folded[k + 1..], &guaranteed);
+        settled.unsettled = unsettled_vars(&triples[k + 1..], &folded[k + 1..], &guaranteed);
+        let mut after = settled.clone();
+        after.bound.extend(tp.produced_vars());
 
         // Later `?s <p> ?v . FILTER(range on ?v)` pairs answered as a semi-join
         // behind this step — see `RangeSemiJoinOperator`.
@@ -1870,9 +1865,8 @@ fn build_sequential_join_block(
                 k,
                 triples,
                 &folded,
-                &bound,
-                &vars_after,
-                &unsettled,
+                &settled.bound,
+                &after,
                 base,
                 &pending_binds,
                 &pending_filters,
@@ -1900,8 +1894,7 @@ fn build_sequential_join_block(
         let (inline_ops, remaining_binds, remaining_filters) = build_inline_ops(
             pending_binds,
             pending_filters,
-            &vars_after,
-            &unsettled,
+            after.clone(),
             &pushdown.consumed_indices,
         );
         pending_binds = remaining_binds;
@@ -1931,7 +1924,8 @@ fn build_sequential_join_block(
         let pruned_vars: Option<HashSet<VarId>> = if ctx.where_dedup_safe {
             live_vars.as_ref().map(|live| {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
-                vars_after
+                after
+                    .bound
                     .iter()
                     .copied()
                     .filter(|v| !live_set.contains(v))
@@ -1980,14 +1974,13 @@ fn build_sequential_join_block(
                 *ctx.planning,
             ))
         };
-        bound.extend(op.schema().iter().copied());
+        settled.bound.extend(op.schema().iter().copied());
         operator = Some(op);
 
         if let Some(child) = operator.take() {
             let (child, new_binds, new_filters) = apply_deferred_patterns(
                 child,
-                &mut bound,
-                &unsettled,
+                &mut settled,
                 pending_binds,
                 pending_filters,
                 &pushdown.consumed_indices,
@@ -3816,8 +3809,7 @@ fn collect_range_semijoin_folds(
     triples: &[TriplePattern],
     folded: &[bool],
     bound_before: &HashSet<VarId>,
-    vars_after: &HashSet<VarId>,
-    unsettled: &HashSet<VarId>,
+    after: &Settled,
     base_vars: &HashSet<VarId>,
     pending_binds: &[BindPattern],
     pending_filters: &[FilterPattern],
@@ -3860,7 +3852,7 @@ fn collect_range_semijoin_folds(
         };
         if !produced.contains(s)
             || subject.is_some_and(|chosen| chosen != *s)
-            || vars_after.contains(v)
+            || after.bound.contains(v)
             || base_vars.contains(v)
         {
             continue;
@@ -3887,7 +3879,7 @@ fn collect_range_semijoin_folds(
             .expr
             .referenced_vars()
             .iter()
-            .all(|x| x == v || (vars_after.contains(x) && !unsettled.contains(x)))
+            .all(|x| x == v || after.admits_var(*x))
         {
             continue;
         }
@@ -6056,8 +6048,7 @@ mod tests {
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
             Vec::new(),
             vec![FilterPattern::new(0, filter_expr.clone())],
-            &available,
-            &HashSet::new(),
+            Settled::all(available),
             &[],
         );
 
@@ -6084,8 +6075,7 @@ mod tests {
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
             vec![make_bind(age2, bind_expr)],
             Vec::new(),
-            &available,
-            &HashSet::new(),
+            Settled::all(available),
             &[],
         );
 
@@ -6117,8 +6107,7 @@ mod tests {
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
             vec![make_bind(y, bind_expr)],
             vec![FilterPattern::new(0, filter_expr)],
-            &available,
-            &HashSet::new(),
+            Settled::all(available),
             &[],
         );
 
@@ -6156,8 +6145,7 @@ mod tests {
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
             vec![bind_a, bind_b],
             Vec::new(),
-            &available,
-            &HashSet::new(),
+            Settled::all(available),
             &[],
         );
 
@@ -6186,8 +6174,7 @@ mod tests {
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
             vec![make_bind(alias, bind_expr)],
             Vec::new(),
-            &available,
-            &HashSet::new(),
+            Settled::all(available),
             &[],
         );
 
