@@ -2716,6 +2716,7 @@ When `include_conflict_details=true`, `conflicts.details[]` contains one entry f
 - `400 Bad Request` — Source has no branch point (e.g., main), `source == target`, unknown strategy, unsupported preview strategy, `include_conflict_details=true` with `include_conflicts=false`, `strategy=abort` with `include_conflicts=false`, or `changes_after_subject` without `include_changes=true`
 - `401 Unauthorized` — Bearer token required
 - `404 Not Found` — Ledger or branch does not exist (or bearer cannot read it)
+- `409 Conflict` — The source's namespace allocations conflict with the target's (`@type` `err:db/CommitConflict`)
 
 **Examples:**
 
