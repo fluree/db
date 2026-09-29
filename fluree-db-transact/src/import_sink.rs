@@ -24,6 +24,8 @@
 
 mod inner {
     use crate::commit_v2::StreamingCommitWriter;
+    use crate::datatype_limit::MAX_NON_RESERVED_DATATYPES;
+    use crate::error::TransactError;
     use crate::generate::{infer_datatype, DT_ID, DT_JSON};
     use crate::namespace::{NamespaceRegistry, NsAllocator, SharedNamespaceAllocator, WorkerCache};
     use crate::value_convert::{convert_native_literal, convert_string_literal};
@@ -33,7 +35,7 @@ mod inner {
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::value_id::{ObjKey, ObjKind};
     use fluree_db_core::DatatypeConstraint;
-    use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
+    use fluree_db_core::{DatatypeDictId, Flake, FlakeMeta, FlakeValue, GraphId, Sid};
     use fluree_db_indexer::run_index::chunk_dict::{ChunkStringDict, ChunkSubjectDict};
     use fluree_db_indexer::run_index::global_dict::{DictWorkerCache, SharedDictAllocator};
     use fluree_db_indexer::run_index::shared_pool::{SharedNumBigPool, SharedVectorArenaPool};
@@ -339,7 +341,10 @@ mod inner {
         }
 
         /// Assign a global datatype ID via `DictWorkerCache`.
-        fn assign_datatype_id(&mut self, sid: &Sid) -> u16 {
+        ///
+        /// Fails once the import holds more non-reserved datatypes than a
+        /// ledger can, so no record carries an ID the index cannot store.
+        fn assign_datatype_id(&mut self, sid: &Sid) -> Result<u16, CommitCodecError> {
             let code = sid.namespace_code;
             self.cache_prefix(code);
             let prefix = self
@@ -348,11 +353,17 @@ mod inner {
                 .map(std::string::String::as_str)
                 .unwrap_or("");
             let id = self.datatypes.get_or_insert_parts(prefix, &sid.name);
-            // Convert the ID to a `u16`, using `u16::MAX` when it does not fit.
-            // `u16::MAX` is past `DatatypeDictId::MAX`, so it never names a
-            // real datatype. The import refuses IDs past the maximum before
-            // any record reaches an `OType`.
-            u16::try_from(id).unwrap_or(u16::MAX)
+            DatatypeDictId::try_from_dict_id(id)
+                .map(DatatypeDictId::as_u16)
+                .ok_or_else(|| {
+                    let max = MAX_NON_RESERVED_DATATYPES;
+                    let limit = TransactError::DatatypeLimitExceeded {
+                        used: max,
+                        adding: 1,
+                        max,
+                    };
+                    CommitCodecError::InvalidOp(limit.to_string())
+                })
         }
 
         /// Assign a chunk-local string ID via `ChunkStringDict`.
@@ -493,7 +504,9 @@ mod inner {
         }
 
         /// Write a spool record for one flake.
-        fn write_record(&mut self, rec: FlakeRecord) {
+        ///
+        /// Fails if the flake's datatype would pass the datatype limit.
+        fn write_record(&mut self, rec: FlakeRecord) -> Result<(), CommitCodecError> {
             let FlakeRecord {
                 s,
                 p,
@@ -505,9 +518,9 @@ mod inner {
             } = rec;
             let s_id = self.assign_subject_id(s);
             let p_id = self.assign_predicate_id(p);
-            let dt_id = self.assign_datatype_id(dt);
+            let dt_id = self.assign_datatype_id(dt)?;
             let Some((o_kind, o_key)) = self.resolve_object_value(o, p_id) else {
-                return; // skip spool record on unresolvable value (e.g. bad vector)
+                return Ok(()); // skip spool record on unresolvable value (e.g. bad vector)
             };
             let lang_id = lang.map(|l| self.assign_lang_id(l)).unwrap_or(0);
             let i = list_index
@@ -536,6 +549,7 @@ mod inner {
             };
 
             self.records.push(record);
+            Ok(())
         }
 
         /// Allocate (or look up) the `g_id` for a named-graph IRI via the shared
@@ -558,11 +572,16 @@ mod inner {
         /// they enter the Tier-2 index (and the `named_graphs` routing) exactly
         /// like default-graph triples. Only invoked when an import contains named
         /// graphs — the single-graph hot path never touches this.
-        pub fn push_named_graph_record(&mut self, g_id: GraphId, rec: FlakeRecord) {
+        pub fn push_named_graph_record(
+            &mut self,
+            g_id: GraphId,
+            rec: FlakeRecord,
+        ) -> Result<(), CommitCodecError> {
             let saved = self.g_id;
             self.g_id = g_id;
-            self.write_record(rec);
+            let result = self.write_record(rec);
             self.g_id = saved;
+            result
         }
     }
 
@@ -792,7 +811,7 @@ mod inner {
 
             // Write spool record only after commit encoding succeeded
             if let Some(ctx) = &mut self.spool_ctx {
-                ctx.write_record(FlakeRecord {
+                let written = ctx.write_record(FlakeRecord {
                     s: &s,
                     p: &p,
                     o: &o,
@@ -801,6 +820,9 @@ mod inner {
                     list_index,
                     t: self.t,
                 });
+                if let Err(e) = written {
+                    self.encode_error.get_or_insert(e);
+                }
             }
         }
     }
@@ -973,7 +995,7 @@ mod inner {
                     return Ok(()); // Don't spool a flake that failed to encode
                 }
                 if let Some(ctx) = &mut self.spool_ctx {
-                    ctx.write_record(FlakeRecord {
+                    let written = ctx.write_record(FlakeRecord {
                         s: &flake.s,
                         p: &flake.p,
                         o: &flake.o,
@@ -982,6 +1004,9 @@ mod inner {
                         list_index: None,
                         t: self.t,
                     });
+                    if let Err(e) = written {
+                        self.encode_error.get_or_insert(e);
+                    }
                 }
             }
             Ok(())
@@ -1059,6 +1084,52 @@ mod inner {
             let _ = ctx.assign_predicate_id(&rogue);
         }
 
+        /// A record whose datatype would take an ID past `DatatypeDictId::MAX`
+        /// is refused, so no spooled record carries an ID the index cannot
+        /// store.
+        #[test]
+        fn spool_record_past_datatype_limit_is_refused() {
+            let ns = NamespaceRegistry::new();
+            let mut config = make_spool_config(&ns);
+            let mut full = PredicateDict::new();
+            for i in 0..DatatypeDictId::MAX {
+                full.get_or_insert(&format!("urn:dt:{i}"));
+            }
+            full.get_or_insert(fluree_vocab::xsd::STRING);
+            config.datatype_alloc = Arc::new(SharedDictAllocator::from_predicate_dict(&full));
+
+            let path = std::env::temp_dir().join(format!(
+                "fluree-spool-datatype-limit-{}.spool",
+                std::process::id()
+            ));
+            let mut ctx = SpoolContext::new(&path, 0, 0, &config).unwrap();
+            let s = Sid::new(fluree_vocab::namespaces::RDF, "subject");
+            let p = Sid::new(fluree_vocab::namespaces::RDF, "pred");
+            let o = FlakeValue::String("v".to_string());
+            let rec = |dt| FlakeRecord {
+                s: &s,
+                p: &p,
+                o: &o,
+                dt,
+                lang: None,
+                list_index: None,
+                t: 1,
+            };
+
+            let known = Sid::new(fluree_vocab::namespaces::XSD, "string");
+            ctx.write_record(rec(&known))
+                .expect("a datatype the dictionary holds is accepted");
+            assert_eq!(ctx.records[0].dt, DatatypeDictId::MAX);
+
+            let new = Sid::new(fluree_vocab::namespaces::XSD, "int");
+            let err = ctx.write_record(rec(&new)).unwrap_err();
+            assert!(
+                err.to_string().contains("datatype limit exceeded"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(ctx.record_count(), 1, "the refused record is not spooled");
+        }
+
         /// The sticky list-position bit is per-import, not per-chunk: a chunk
         /// with no list rows must leave it alone, and a single list row in any
         /// later chunk must flip it. Root assembly reads it to write
@@ -1089,7 +1160,7 @@ mod inner {
 
             let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-a.spool"), 0, 0, &config)
                 .expect("spool ctx");
-            ctx.write_record(rec(None));
+            ctx.write_record(rec(None)).unwrap();
             let _ = ctx.finish_buffered();
             assert!(
                 !config.saw_list_meta.load(Ordering::Relaxed),
@@ -1098,7 +1169,7 @@ mod inner {
 
             let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-b.spool"), 1, 0, &config)
                 .expect("spool ctx");
-            ctx.write_record(rec(Some(0)));
+            ctx.write_record(rec(Some(0))).unwrap();
             let _ = ctx.finish_buffered();
             assert!(
                 config.saw_list_meta.load(Ordering::Relaxed),
@@ -1108,7 +1179,7 @@ mod inner {
             // Sticky: a later list-free chunk must not clear it.
             let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-c.spool"), 2, 0, &config)
                 .expect("spool ctx");
-            ctx.write_record(rec(None));
+            ctx.write_record(rec(None)).unwrap();
             let _ = ctx.finish_buffered();
             assert!(config.saw_list_meta.load(Ordering::Relaxed));
         }
