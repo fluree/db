@@ -89,13 +89,18 @@ WHERE { ?p schema:name ?name }
 
 ### HTTP API
 
-Ledger-scoped queries put the ledger in the path; time travel rides on the `FROM` clause (SPARQL) or the `from` key (JSON-LD) at the connection-scoped endpoint.
+Ledger-scoped queries put the ledger in the path, and a time pin can go there too: the whole ledger, named graphs included, is read as of that point. Time travel can also ride on the `FROM` clause (SPARQL) or the `from` key (JSON-LD).
 
 ```bash
 # Ledger-scoped, current state
 curl -X POST 'http://localhost:8090/v1/fluree/query/mydb:main' \
   -H 'Content-Type: application/sparql-query' \
   -d 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
+
+# Ledger-scoped, pinned to t=5 in the path (GRAPH ?g sees the named graphs as of t=5)
+curl -X POST 'http://localhost:8090/v1/fluree/query/mydb:main@t:5' \
+  -H 'Content-Type: application/sparql-query' \
+  -d 'SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }'
 
 # Connection-scoped, pinned to t=5
 curl -X POST 'http://localhost:8090/v1/fluree/query' \

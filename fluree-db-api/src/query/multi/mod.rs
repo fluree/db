@@ -632,7 +632,7 @@ fn extract_jsonld_from_string(s: &str) -> ExtractedFrom {
     let pin_location =
         snapshot::string_has_explicit_pin(s).then(|| format!("'from' contains temporal pin: {s}"));
     ExtractedFrom {
-        ledger: snapshot::bare_ledger_id(s).to_string(),
+        ledger: snapshot::bare_ledger_id(s),
         pin_location,
     }
 }
@@ -1130,7 +1130,7 @@ mod tests {
         let req = envelope_with(&[("a", jsonld("ledgerA"))], Some(AsOf::T(42)));
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 1);
-        assert!(distinct.contains("ledgerA"));
+        assert!(distinct.contains("ledgerA:main"));
     }
 
     #[test]
@@ -1327,7 +1327,20 @@ mod tests {
         );
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 1);
-        assert!(distinct.contains("ledgerA"));
+        assert!(distinct.contains("ledgerA:main"));
+    }
+
+    /// `mydb` and `mydb:main` are one ledger: counting them twice trips the
+    /// distinct-ledger limit and the single-ledger `asOf` rule.
+    #[test]
+    fn distinct_ledger_set_counts_spellings_of_one_ledger_once() {
+        let req = envelope_with(
+            &[("a", jsonld("mydb")), ("b", jsonld("mydb:main@t:3"))],
+            None,
+        );
+        let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
+        assert_eq!(distinct.len(), 1, "{distinct:?}");
+        assert!(distinct.contains("mydb:main"));
     }
 
     /// Every tag of the shared grammar is a pin to the validator — the same
@@ -1355,7 +1368,7 @@ mod tests {
             let req = envelope_with(&[("a", jsonld(pinned)), ("b", jsonld("ledgerA"))], None);
             let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
             assert_eq!(distinct.len(), 1, "{pinned}: {distinct:?}");
-            assert!(distinct.contains("ledgerA"), "{pinned}: {distinct:?}");
+            assert!(distinct.contains("ledgerA:main"), "{pinned}: {distinct:?}");
         }
     }
 
@@ -1373,9 +1386,9 @@ mod tests {
         );
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 3);
-        assert!(distinct.contains("ledgerA"));
-        assert!(distinct.contains("ledgerB"));
-        assert!(distinct.contains("ledgerC"));
+        assert!(distinct.contains("ledgerA:main"));
+        assert!(distinct.contains("ledgerB:main"));
+        assert!(distinct.contains("ledgerC:main"));
     }
 
     // -------------------------------------------------------------------------
@@ -1629,7 +1642,7 @@ mod tests {
         };
         let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
-        assert!(distinct.contains("ledgerA"));
+        assert!(distinct.contains("ledgerA:main"));
     }
 
     #[test]

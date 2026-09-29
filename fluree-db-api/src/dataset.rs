@@ -226,7 +226,7 @@ impl DatasetSpec {
             })?;
 
             // Verify same ledger
-            if from_source.identifier != to_identifier {
+            if !same_ledger(&from_source.identifier, &to_identifier) {
                 return Err(DatasetParseError::InvalidFrom(format!(
                     "FROM and TO must reference the same ledger: {} vs {}",
                     from_source.identifier, to_identifier
@@ -774,7 +774,7 @@ impl DatasetSpec {
             let to_source = parse_single_graph_source(to_val, "to")?;
 
             // Validate same ledger
-            if from_source.identifier != to_source.identifier {
+            if !same_ledger(&from_source.identifier, &to_source.identifier) {
                 return Err(DatasetParseError::InvalidFrom(format!(
                     "'from' and 'to' must reference the same ledger: '{}' vs '{}'",
                     from_source.identifier, to_source.identifier
@@ -872,7 +872,7 @@ impl DatasetSpec {
             let to_source = parse_single_graph_source(to_v, "to")?;
 
             // Validate same ledger
-            if from_source.identifier != to_source.identifier {
+            if !same_ledger(&from_source.identifier, &to_source.identifier) {
                 return Err(DatasetParseError::InvalidFrom(format!(
                     "'from' and 'to' must reference the same ledger: '{}' vs '{}'",
                     from_source.identifier, to_source.identifier
@@ -1164,6 +1164,19 @@ fn parse_ledger_id_time_travel(
     };
 
     Ok((format!("{identifier}{fragment_suffix}"), time_spec))
+}
+
+/// Whether two time-stripped identifiers name the same ledger and graph, so
+/// `mydb@t:1` → `mydb:main@t:5` is one ledger. Identifiers that do not parse
+/// compare as written and fail at load.
+fn same_ledger(a: &str, b: &str) -> bool {
+    match (
+        fluree_db_core::LedgerRef::parse(a),
+        fluree_db_core::LedgerRef::parse(b),
+    ) {
+        (Ok(a), Ok(b)) => a.id == b.id && a.fragment == b.fragment,
+        _ => a == b,
+    }
 }
 
 /// Parse graph sources from a JSON value
@@ -2492,6 +2505,38 @@ mod tests {
             &spec.named_graphs[0].time_spec,
             Some(TimeSpec::AtCommit(s)) if s == "abc123def456"
         ));
+    }
+
+    /// FROM and TO spelling one ledger two ways (`ledger` vs `ledger:main`)
+    /// are the same ledger; two different ledgers still aren't. JSON-LD and
+    /// SPARQL both check this.
+    #[test]
+    fn history_range_accepts_two_spellings_of_one_ledger() {
+        let json_spec = |from: &str, to: &str| {
+            DatasetSpec::from_json(&json!({
+                "from": from,
+                "to": to,
+                "select": ["?s"],
+                "where": {"@id": "?s"}
+            }))
+        };
+        let sparql_spec = |from: &str, to: &str| {
+            DatasetSpec::from_sparql_clause(&SparqlDatasetClause {
+                default_graphs: vec![Iri::full(from, make_span())],
+                named_graphs: vec![],
+                to_graph: Some(Iri::full(to, make_span())),
+                span: make_span(),
+            })
+        };
+
+        for spec in [
+            json_spec("ledger@t:1", "ledger:main@t:latest"),
+            sparql_spec("ledger@t:1", "ledger:main@t:latest"),
+        ] {
+            assert!(spec.expect("same ledger").is_history_mode());
+        }
+        assert!(json_spec("ledger@t:1", "other:main@t:latest").is_err());
+        assert!(sparql_spec("ledger@t:1", "ledger:dev@t:latest").is_err());
     }
 
     #[test]

@@ -4865,7 +4865,7 @@ mod tests {
         use fluree_db_core::LedgerSnapshot;
         use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -4942,7 +4942,7 @@ mod tests {
         use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
         use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -5014,7 +5014,7 @@ mod tests {
         use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
         use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -5143,7 +5143,7 @@ mod tests {
         use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
         use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -5401,7 +5401,7 @@ mod tests {
                 object_map: ObjectMap::column("SEGMENT"),
             });
         let mapping = CompiledR2rmlMapping::new(vec![customer]);
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let tm = mapping.triples_maps.values().next().unwrap();
 
         let s = VarId(0);
@@ -5852,7 +5852,7 @@ mod tests {
             FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()))
         };
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let map_provider = MapProvider(Arc::clone(&mapping));
 
@@ -5958,7 +5958,7 @@ mod tests {
             aggregates: vec![(cnt, AggregateFn::CountAll)],
         };
         let mut op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let provider = P {
             m: mapping,
@@ -6136,7 +6136,7 @@ mod tests {
             vec![batch_of(vec![i64_col("CID", 1, vec![Some(10), Some(20)])])],
         );
         let provider = CrtProvider { mapping, batches };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -6336,7 +6336,7 @@ mod tests {
         let mut op =
             FusedR2rmlAggregateOperator::new(s2_two_ref_plan(), Box::new(EmptyOperator::new()));
         op.multifact_gen = true; // the ≥2-ref widening must admit
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let provider = P {
             m: mapping,
@@ -6612,7 +6612,7 @@ mod tests {
             "http://ex/prod/{PID}",
             fluree_vocab::xsd::INTEGER,
         );
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let provider = P {
             m: Arc::clone(&mapping),
@@ -6733,7 +6733,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -7725,7 +7725,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -7871,7 +7871,7 @@ mod tests {
                 object_map: ObjectMap::column("REGION"),
             });
         let mapping = CompiledR2rmlMapping::new(vec![customer]);
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let (c, r) = (VarId(3), VarId(30));
         let seg_const = Pattern::Triple(TriplePattern::new(
             Ref::Var(c),
@@ -7935,7 +7935,7 @@ mod tests {
         let (ol, o, p, c) = (VarId(0), VarId(1), VarId(2), VarId(3));
         let (qty, cat, r) = (VarId(10), VarId(12), VarId(30));
         let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let t = |s: VarId, pred: &str, obj: Term| {
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(s),
@@ -7998,7 +7998,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches: clean_batches(),
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -8042,7 +8042,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches: clean_batches(),
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -8096,7 +8096,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -8217,7 +8217,7 @@ mod tests {
             };
             FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()))
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
 
         // ON: multiple bounded chunks, each ≤ the bound, union == full result.
@@ -8404,7 +8404,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches: m,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let cancel = QueryCancellation::new();
         cancel.set_memory_limit(64); // < GROUP_EST_BYTES → the first batch's charge trips
@@ -8436,7 +8436,7 @@ mod tests {
         let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
         let pats = crt_patterns();
         let refs: Vec<&R2rmlPattern> = pats.iter().collect();
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
 
         // OFF → decline (Ok(None)).
@@ -8733,7 +8733,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -9235,7 +9235,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);

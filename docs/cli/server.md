@@ -23,12 +23,16 @@ These options are available on `run`, `start`, and `restart`:
 | `--storage-path <PATH>` | Storage path override (local file storage) |
 | `--connection-config <FILE>` | JSON-LD connection config for S3, DynamoDB, etc. |
 | `--log-level <LEVEL>` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
+| `--bolt-listen-addr <ADDR>` | Bolt protocol listen address (e.g., `0.0.0.0:7687`); unset = Bolt disabled |
+| `--bolt-default-db <LEDGER>` | Default ledger for Bolt sessions that select no database |
 | `--profile <NAME>` | Configuration profile to activate |
 | `-- <ARGS>...` | Additional server flags (passed through to server config) |
 
+`run` also takes `--memory` (see [run](#run)).
+
 `--storage-path` and `--connection-config` are mutually exclusive. Use `--storage-path` for local file storage or `--connection-config` for remote backends (S3, DynamoDB, split storage). See [Configuration](../operations/configuration.md#connection-configuration-s3-dynamodb-etc) for details.
 
-When no flags are provided, the server discovers its configuration using the same search as the CLI: it walks up from the current working directory looking for a `.fluree/config.toml` (or `config.jsonld`), then falls back to the global Fluree config directory (`$FLUREE_HOME`, or the platform config directory — see [Configuration](../operations/configuration.md)). Server settings live under the `[server]` section. The CLI's `--config` flag is also honored.
+When no flags are provided, the server discovers its configuration using the same search as the CLI: it walks up from the current working directory looking for a `.fluree/config.toml` (or `config.jsonld`). Unlike read-only CLI commands, `run` and `start` do not fall back to the global Fluree directory: with no `.fluree/` found they exit with an error (run `fluree init` first, pass `--config`, or use `run --memory`). Server settings live under the `[server]` section. The CLI's `--config` flag is also honored.
 
 ## run
 
@@ -46,11 +50,23 @@ fluree server run --connection-config /etc/fluree/connection.jsonld
 
 # Pass through advanced server flags
 fluree server run -- --cors-enabled --indexing-enabled
+
+# Throwaway server: data in memory only, no .fluree/ needed
+fluree server run --memory
 ```
+
+`--memory` keeps every ledger in memory: the server needs no `.fluree/` directory, writes nothing
+to the directory it runs in (not even `server.meta.json`), and loses all data when it exits. It
+cannot be combined with `--storage-path` or `--connection-config`, and it replaces a storage path
+set by `FLUREE_STORAGE_PATH`, a profile, or the config file, logging a warning at startup when it
+does. `FLUREE_MEMORY_STORAGE=true` does the same as the flag. With no `server.meta.json`, CLI auto-routing does not see a memory server (and,
+like any foreground server, it has no PID file for `status` or `stop`); use its HTTP API directly.
+It suits tests and CI; see
+[Throwaway server for tests and CI](../operations/running-fluree.md#throwaway-server-for-tests-and-ci).
 
 ## start
 
-Start the server as a background daemon. Writes PID and metadata to `.fluree/` and redirects output to `.fluree/server.log`.
+Start the server as a background daemon. Writes PID and metadata to `.fluree/` and redirects output to `.fluree/server.log`. Memory storage is foreground-only: `start` and `restart` refuse `--memory` and `FLUREE_MEMORY_STORAGE`.
 
 ```bash
 # Start in background

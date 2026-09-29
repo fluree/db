@@ -1,14 +1,5 @@
 //! Application state management
 //!
-//! # Thread Safety Note
-//!
-//! The HTTP server requires `Send + Sync` for state shared across handlers.
-//! This server currently only supports **file-based storage** for production use.
-//!
-//! Memory storage support would require either:
-//! - A single-threaded runtime with `LocalSet`
-//! - Or refactoring `MemoryNameService` to use `Arc<RwLock<...>>`
-//!
 //! # Storage Access Modes
 //!
 //! Peers can operate in two storage access modes:
@@ -22,7 +13,6 @@ use crate::telemetry::TelemetryConfig;
 use dashmap::DashMap;
 use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, NameServiceMode};
 use fluree_db_consensus::{CachingCommitter, SubmittingCommitter};
-use fluree_db_core::ledger_id::normalize_ledger_id;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -87,7 +77,7 @@ pub struct AppState {
     /// This gates optional DynamoDB nameservice checks on long-running query
     /// servers. It stores attempts, not successes, to prevent bursty failures
     /// from stampeding the nameservice.
-    query_refresh_last_checked: DashMap<String, Instant>,
+    query_refresh_last_checked: DashMap<fluree_db_api::LedgerId, Instant>,
 
     /// Serving posture memo, keyed by ledger id with value `(t, posture)`.
     ///
@@ -342,7 +332,10 @@ impl AppState {
             return false;
         }
 
-        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        // An id that does not parse names no ledger to refresh.
+        let Ok(canonical) = fluree_db_api::LedgerId::parse(ledger_id) else {
+            return false;
+        };
         let now = Instant::now();
         let ttl = Duration::from_millis(self.config.query_refresh_ttl_ms);
 
@@ -368,9 +361,10 @@ impl AppState {
             return;
         }
 
-        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
-        self.query_refresh_last_checked
-            .insert(canonical, Instant::now());
+        if let Ok(canonical) = fluree_db_api::LedgerId::parse(ledger_id) {
+            self.query_refresh_last_checked
+                .insert(canonical, Instant::now());
+        }
     }
 
     /// Get server uptime in seconds
@@ -405,8 +399,8 @@ impl Drop for AppState {
 //
 // Two paths:
 //
-// - [`build_default_fluree`] — backend-implied nameservice (file /
-//   S3 / proxy). The convenience path for single-node and peer
+// - [`build_default_fluree`] — backend-implied nameservice (memory /
+//   file / S3 / proxy). The convenience path for single-node and peer
 //   deployments.
 // - [`build_fluree_with_nameservice`] — explicit nameservice, for
 //   the Raft startup path where every node's reads must observe
@@ -486,7 +480,7 @@ pub async fn build_fluree_with_nameservice(
     .await
 }
 
-/// Build a direct-storage `Fluree` (file, S3, DynamoDB, etc.) from
+/// Build a direct-storage `Fluree` (memory, file, S3, DynamoDB, etc.) from
 /// config. When `nameservice` is `Some`, it replaces the
 /// backend-implied nameservice. When `event_bus` is `Some`, it
 /// replaces Fluree's default per-instance bus.
@@ -499,7 +493,9 @@ async fn build_direct_fluree(
     catchup_sweeps: CatchupSweeps,
     wal_owner: Option<String>,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
-    let mut builder = if let Some(ref path) = config.connection_config {
+    let mut builder = if config.memory {
+        FlureeBuilder::memory()
+    } else if let Some(ref path) = config.connection_config {
         // Connection config: build from JSON-LD (supports S3,
         // DynamoDB, split storage, etc.)
         let json_str = std::fs::read_to_string(path).map_err(|e| {

@@ -11,6 +11,9 @@
 //!   B — a sub-SELECT that binds a correlation variable only via OPTIONAL must
 //!       reconcile it against the parent at the join, not pin it to the parent
 //!       value (W3C `var-scope-join-1`, aka join-scope-1).
+//!   C — a FILTER applies to its whole group wherever it is written (§18.2.2.6),
+//!       so it sees a variable an OPTIONAL left unbound after a later triple
+//!       fills it in. Checked on both surfaces.
 
 use crate::support::{genesis_ledger, graphdb_from_ledger};
 use fluree_db_api::FlureeBuilder;
@@ -300,4 +303,70 @@ async fn subselect_group_by_correlation_var_joins_per_group() {
         "the grouped sub-SELECT must join on ?x per §18.2 (john's group only, \
          count of BOTH emails); got {rows}"
     );
+}
+
+/// Family C. `?org` is bound by the OPTIONAL for carol, and for alice only by
+/// the later `?f ex:worksFor ?org`; dave has neither. Before or after that
+/// triple, the filter must see its value: alice/acme is the group's only row.
+#[tokio::test]
+async fn filter_sees_a_value_a_later_triple_fills_after_an_optional() {
+    use crate::support::{query_jsonld, query_sparql};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "filter-scope:optional-fill");
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:worksFor": {"@id": "ex:acme"}},
+            {"@id": "ex:carol", "ex:knows": {"@id": "ex:bob"}, "ex:worksFor": {"@id": "ex:globex"}},
+            {"@id": "ex:dave", "ex:knows": {"@id": "ex:erin"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &txn).await.expect("seed").ledger;
+
+    for (sparql_filter, jsonld_filter, expected) in [
+        (
+            "FILTER(BOUND(?org))",
+            json!(["filter", "(bound ?org)"]),
+            json!([["ex:alice", "ex:acme"]]),
+        ),
+        (
+            "FILTER(!BOUND(?org))",
+            json!(["filter", "(not (bound ?org))"]),
+            json!([]),
+        ),
+    ] {
+        for filter_last in [true, false] {
+            let (mid, end) = if filter_last {
+                ("", sparql_filter)
+            } else {
+                (sparql_filter, "")
+            };
+            let q = format!(
+                "PREFIX ex: <http://example.org/ns/> SELECT ?p ?org WHERE {{ \
+                 ?p ex:knows ?f OPTIONAL {{ ?p ex:worksFor ?org }} {mid} \
+                 ?f ex:worksFor ?org {end} }}"
+            );
+            let rows = query_sparql(&fluree, &ledger, &q)
+                .await
+                .expect("sparql")
+                .to_jsonld(&ledger.snapshot)
+                .expect("format");
+            assert_eq!(rows, expected, "{q}");
+
+            let mut wh = vec![
+                json!({"@id": "?p", "ex:knows": "?f"}),
+                json!(["optional", {"@id": "?p", "ex:worksFor": "?org"}]),
+                json!({"@id": "?f", "ex:worksFor": "?org"}),
+            ];
+            wh.insert(if filter_last { 3 } else { 2 }, jsonld_filter.clone());
+            let q = json!({"@context": ctx(), "select": ["?p", "?org"], "where": wh});
+            let rows = query_jsonld(&fluree, &ledger, &q)
+                .await
+                .expect("jsonld")
+                .to_jsonld(&ledger.snapshot)
+                .expect("format");
+            assert_eq!(rows, expected, "{q}");
+        }
+    }
 }

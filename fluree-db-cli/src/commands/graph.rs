@@ -68,7 +68,7 @@ async fn run_list(
                 info
             }
             LedgerMode::Local { fluree, alias } => {
-                let ledger_id = context::to_ledger_id(&alias);
+                let ledger_id = context::to_ledger_id(&alias)?;
                 fluree.ledger_info(&ledger_id).execute().await?
             }
         }

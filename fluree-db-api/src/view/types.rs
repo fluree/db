@@ -232,7 +232,8 @@ pub struct GraphDb {
     ///
     /// Empty by default. Cloned via `Arc` so policy-wrap doesn't
     /// inflate the cached `GraphDb` cost.
-    pub(crate) cross_ledger_resolved_ts: Arc<std::collections::HashMap<String, i64>>,
+    pub(crate) cross_ledger_resolved_ts:
+        Arc<std::collections::HashMap<fluree_db_core::LedgerId, i64>>,
 
     // ========================================================================
     // Graph source context (optional — set when view is created from a graph source)
@@ -708,14 +709,16 @@ impl GraphDb {
     /// `resolved_t`s seen so far in this logical request).
     pub fn with_cross_ledger_resolved_ts(
         mut self,
-        ts: Arc<std::collections::HashMap<String, i64>>,
+        ts: Arc<std::collections::HashMap<fluree_db_core::LedgerId, i64>>,
     ) -> Self {
         self.cross_ledger_resolved_ts = ts;
         self
     }
 
     /// Read the carried governance-context capture.
-    pub fn cross_ledger_resolved_ts(&self) -> &Arc<std::collections::HashMap<String, i64>> {
+    pub fn cross_ledger_resolved_ts(
+        &self,
+    ) -> &Arc<std::collections::HashMap<fluree_db_core::LedgerId, i64>> {
         &self.cross_ledger_resolved_ts
     }
 }

@@ -543,11 +543,17 @@ fn parse_construct_query(
     // Parse template into patterns
     let template_patterns = match construct_val {
         JsonValue::Bool(true) => {
-            // Shorthand: use WHERE patterns as template (filter to triples only)
+            // Shorthand: use the WHERE clause's triples (and their edge
+            // annotations) as the template
             query
                 .patterns
                 .iter()
-                .filter(|p| matches!(p, UnresolvedPattern::Triple(_)))
+                .filter(|p| {
+                    matches!(
+                        p,
+                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
+                    )
+                })
                 .cloned()
                 .collect()
         }
@@ -578,66 +584,82 @@ fn parse_construct_query(
 
 /// Parse a CONSTRUCT template (explicit form)
 ///
-/// Parses the template node-map(s) into unresolved triple patterns.
-/// Only triple patterns are valid in templates (filters/optionals are ignored).
+/// Parses the template node-map(s) into unresolved triple patterns, edge
+/// annotations (`@annotation` on an object) and named-graph blocks
+/// (`["graph", "<iri or ?var>", node-map, ...]`, the `where` clause's form).
+/// Other patterns (filters, optionals) are ignored.
 fn parse_construct_template(
     template: &JsonValue,
     ctx: &JsonLdParseCtx,
 ) -> Result<Vec<UnresolvedPattern>> {
     let mut subject_counter = 0u32;
     let mut nested_counter = 0u32;
-
     match template {
-        JsonValue::Object(map) => {
-            // Single node-map template
-            let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
-            node_map::parse_node_map(
-                map,
-                ctx,
-                &mut temp_query,
-                &mut subject_counter,
-                &mut nested_counter,
-                true,
-            )?;
-            // Filter to triple patterns only (templates don't have filters/optionals)
-            Ok(temp_query
-                .patterns
-                .into_iter()
-                .filter(|p| matches!(p, UnresolvedPattern::Triple(_)))
-                .collect())
-        }
-        JsonValue::Array(arr) => {
-            // Array of node-map templates
-            let mut patterns = Vec::new();
-            for item in arr {
-                if let JsonValue::Object(map) = item {
-                    let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
-                    node_map::parse_node_map(
-                        map,
-                        ctx,
-                        &mut temp_query,
-                        &mut subject_counter,
-                        &mut nested_counter,
-                        true,
-                    )?;
-                    patterns.extend(
-                        temp_query
-                            .patterns
-                            .into_iter()
-                            .filter(|p| matches!(p, UnresolvedPattern::Triple(_))),
-                    );
-                } else {
-                    return Err(ParseError::InvalidConstruct(
-                        "construct array items must be objects".to_string(),
-                    ));
-                }
-            }
-            Ok(patterns)
+        JsonValue::Object(_) => parse_construct_items(
+            std::slice::from_ref(template),
+            ctx,
+            &mut subject_counter,
+            &mut nested_counter,
+        ),
+        JsonValue::Array(items) => {
+            parse_construct_items(items, ctx, &mut subject_counter, &mut nested_counter)
         }
         _ => Err(ParseError::InvalidConstruct(
             "construct template must be an object or array".to_string(),
         )),
     }
+}
+
+fn parse_construct_items(
+    items: &[JsonValue],
+    ctx: &JsonLdParseCtx,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+) -> Result<Vec<UnresolvedPattern>> {
+    let mut patterns = Vec::new();
+    for item in items {
+        match item {
+            JsonValue::Object(map) => {
+                let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
+                node_map::parse_node_map(
+                    map,
+                    ctx,
+                    &mut temp_query,
+                    subject_counter,
+                    nested_counter,
+                    true,
+                )?;
+                patterns.extend(temp_query.patterns.into_iter().filter(|p| {
+                    matches!(
+                        p,
+                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
+                    )
+                }));
+            }
+            JsonValue::Array(arr) if arr.first().and_then(JsonValue::as_str) == Some("graph") => {
+                let name = arr.get(1).and_then(JsonValue::as_str).ok_or_else(|| {
+                    ParseError::InvalidConstruct(
+                        "a construct graph block is [\"graph\", <graph IRI or ?var>, node-map, ...]"
+                            .to_string(),
+                    )
+                })?;
+                let name = if name.starts_with('?') {
+                    name.to_string()
+                } else {
+                    ctx.expand_id(name)?.0
+                };
+                let inner = parse_construct_items(&arr[2..], ctx, subject_counter, nested_counter)?;
+                patterns.push(UnresolvedPattern::graph(name.as_str(), inner));
+            }
+            _ => {
+                return Err(ParseError::InvalidConstruct(
+                    "construct items must be node-map objects or [\"graph\", ...] blocks"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(patterns)
 }
 
 /// Parse the select clause

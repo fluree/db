@@ -121,7 +121,13 @@ async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25W
         Ok(records) => {
             let indexes = indexes_to_auto_sync(&records);
             for gs in &indexes {
-                handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies);
+                // A persisted dependency that no longer parses cannot name a
+                // ledger any commit event will carry; skip it, loudly.
+                if let Err(e) =
+                    handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies)
+                {
+                    tracing::warn!(graph_source = %gs.graph_source_id, error = %e, "Skipping BM25 index with unparseable dependencies");
+                }
             }
             info!(registered = indexes.len(), "BM25 auto-sync starting");
         }
@@ -453,6 +459,19 @@ impl FlureeServer {
             ),
             None => None,
         };
+        if self.state.config.events_open_under_data_auth() {
+            tracing::warn!(
+                "data auth is required but events auth is off: /v1/fluree/events lists every \
+                 ledger and its nameservice record to anyone; set --events-auth-mode to require \
+                 tokens there too"
+            );
+        }
+        if let Some(displaced) = &self.state.config.memory_displaced {
+            tracing::warn!(
+                "memory storage replaces the configured {displaced}; everything written \
+                 is lost when the server stops"
+            );
+        }
         #[cfg(not(feature = "bolt"))]
         if self.state.config.bolt_listen_addr.is_some() {
             tracing::warn!(
@@ -617,7 +636,8 @@ pub struct FlureeServerBuilder {
 }
 
 impl FlureeServerBuilder {
-    /// Create a new builder with default config (memory storage)
+    /// Create a new builder with default config (file storage in
+    /// `.fluree/storage`)
     pub fn new() -> Self {
         Self::for_config(ServerConfig::default())
     }
@@ -636,7 +656,9 @@ impl FlureeServerBuilder {
 
     /// Create a builder configured for memory storage
     pub fn memory() -> Self {
-        Self::new()
+        let mut builder = Self::new();
+        builder.config.memory = true;
+        builder
     }
 
     /// Create a builder configured for file storage
@@ -1006,6 +1028,13 @@ impl Default for FlureeServerBuilder {
 mod tests {
     use super::*;
     use fluree_db_nameservice::GraphSourceType;
+
+    #[test]
+    fn memory_builder_selects_memory_storage() {
+        let storage = |b: FlureeServerBuilder| b.config.storage_type_str();
+        assert_eq!(storage(FlureeServerBuilder::memory()), "memory");
+        assert_eq!(storage(FlureeServerBuilder::new()), "file");
+    }
 
     fn auto_sync_config(server_role: ServerRole) -> ServerConfig {
         ServerConfig {

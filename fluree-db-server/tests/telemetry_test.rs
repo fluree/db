@@ -69,16 +69,16 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
                 subject: Some("user".into()),
                 identity,
                 read_all: false,
-                read_ledgers: ["allowed:main".into()].into(),
+                read_ledgers: [id("allowed:main")].into(),
                 write_all: false,
-                write_ledgers: ["allowed:main".into()].into(),
+                write_ledgers: [id("allowed:main")].into(),
                 expires_unix: u64::MAX,
                 policy_authorization: authorization,
             };
-            assert!(principal.can_read("allowed:main"));
-            assert!(!principal.can_read("denied:main"));
-            assert!(principal.can_write("allowed:main"));
-            assert!(!principal.can_write("denied:main"));
+            assert!(principal.can_read(&id("allowed:main")));
+            assert!(!principal.can_read(&id("denied:main")));
+            assert!(principal.can_write(&id("allowed:main")));
+            assert!(!principal.can_write(&id("denied:main")));
         }
     });
     let events = events.lock().unwrap();
@@ -405,4 +405,7 @@ async fn error_code_is_empty_on_success() {
         error_code.is_none() || error_code == Some(&String::new()),
         "error_code should be empty/absent on success path, got: {error_code:?}"
     );
+}
+fn id(s: &str) -> fluree_db_api::LedgerId {
+    fluree_db_api::LedgerId::parse(s).unwrap()
 }

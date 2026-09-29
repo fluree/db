@@ -133,6 +133,53 @@ fn property_stats<'a>(stats: &'a StatsView, pred: &Ref) -> Option<&'a PropertySt
     None
 }
 
+/// Estimate the size of a DISTINCT projection from mandatory triple domains.
+/// Their NDVs are approximate: use this only for costing, never to cap results.
+/// Multiplying the per-variable domains avoids assuming independence/selectivity
+/// will reduce the projection. Missing domains and computed bindings stay unknown.
+pub(crate) fn estimate_projected_distinct_rows(
+    patterns: &[Pattern],
+    vars: &[VarId],
+    stats: &StatsView,
+) -> Option<f64> {
+    if vars.is_empty()
+        || !patterns.iter().all(|p| {
+            matches!(
+                p,
+                Pattern::Triple(_) | Pattern::Filter(_) | Pattern::Values { .. }
+            )
+        })
+    {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut rows = 1.0;
+    for &var in vars {
+        if !seen.insert(var) {
+            continue;
+        }
+        let ndv = patterns
+            .iter()
+            .filter_map(|pattern| {
+                let Pattern::Triple(tp) = pattern else {
+                    return None;
+                };
+                let prop = property_stats(stats, &tp.p)?;
+                [
+                    (tp.s.as_var() == Some(var)).then_some(prop.ndv_subjects),
+                    (tp.o.as_var() == Some(var)).then_some(prop.ndv_values),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|&n| n > 0)
+                .min()
+            })
+            .min()?;
+        rows *= ndv as f64;
+    }
+    Some(rows)
+}
+
 fn property_known_absent(stats: &StatsView, pred: &Ref) -> bool {
     stats.has_property_stats()
         && match pred {
@@ -1427,6 +1474,77 @@ struct DeferredPattern {
     /// `?b` otherwise drains the VALUES before the OPTIONAL that introduces `?b`
     /// is placed at all. Empty for every dependency-placed deferral.
     after_indices: Vec<usize>,
+    /// For FILTER, EXISTS and NOT EXISTS: who binds each variable the pattern
+    /// reads (see [`attach_filter_binders`]). Empty for everything else.
+    binders: Vec<VarBinders>,
+}
+
+/// The patterns in a group that bind one variable a filter reads.
+///
+/// A variable can be in the schema while unbound on some rows: VALUES with
+/// UNDEF, an OPTIONAL, or one UNION branch leaves it unbound, and a later
+/// pattern may still fill it in. A filter applies to its whole group, so it
+/// must see the value those rows end up with. That value is settled once a
+/// pattern binding the variable on every row has been placed, or once every
+/// pattern that can bind it has.
+struct VarBinders {
+    every_row: Vec<usize>,
+    any: Vec<usize>,
+}
+
+impl VarBinders {
+    fn settled(&self, placed: &HashSet<usize>) -> bool {
+        self.every_row.iter().any(|i| placed.contains(i))
+            || self.any.iter().all(|i| placed.contains(i))
+    }
+}
+
+/// Fill [`DeferredPattern::binders`] for each deferred FILTER, EXISTS and NOT
+/// EXISTS: one [`VarBinders`] per variable it reads that another pattern in the
+/// group binds, by original index. SPARQL applies a FILTER to its group
+/// wherever it is written (§18.2.2.6), so binders written after it count too.
+fn attach_filter_binders(
+    deferred: &mut [DeferredPattern],
+    patterns: &[Pattern],
+    initial_bound_vars: &HashSet<VarId>,
+) {
+    let is_filter = |p: &Pattern| {
+        matches!(
+            p,
+            Pattern::Filter(_) | Pattern::Exists(_) | Pattern::NotExists(_)
+        )
+    };
+    if !deferred.iter().any(|dp| is_filter(&dp.pattern)) {
+        return;
+    }
+    let produced: Vec<Vec<VarId>> = patterns.iter().map(Pattern::produced_vars).collect();
+    let mut every_row_vars: Vec<Option<HashSet<VarId>>> = vec![None; patterns.len()];
+    for dp in deferred.iter_mut().filter(|dp| is_filter(&dp.pattern)) {
+        let mut reads = dp.pattern.referenced_vars();
+        reads.sort_unstable();
+        reads.dedup();
+        for v in reads {
+            if initial_bound_vars.contains(&v) {
+                continue;
+            }
+            let any: Vec<usize> = (0..patterns.len())
+                .filter(|&j| j != dp.orig_index && produced[j].contains(&v))
+                .collect();
+            if any.is_empty() {
+                continue;
+            }
+            let every_row = any
+                .iter()
+                .copied()
+                .filter(|&j| {
+                    every_row_vars[j]
+                        .get_or_insert_with(|| must_bind_vars(&patterns[j]))
+                        .contains(&v)
+                })
+                .collect();
+            dp.binders.push(VarBinders { every_row, any });
+        }
+    }
 }
 
 /// Variables `pattern` binds in **every** solution it emits.
@@ -1690,13 +1808,13 @@ fn values_optional_barrier_indices(
 /// the variable before it), which keeps it ahead of the OPTIONAL and so makes
 /// the exemption hold in the reordered plan too.
 ///
-/// A FILTER is never the earlier side: it constrains the whole group wherever
-/// it is written, so an OPTIONAL after it must not be held behind it.
+/// A FILTER, EXISTS or NOT EXISTS is never the earlier side: it constrains the
+/// whole group wherever it is written, so an OPTIONAL after it must not be held
+/// behind it. It waits for the OPTIONAL instead (see [`VarBinders`]).
 ///
-/// Only an OPTIONAL anchors an edge. MINUS, EXISTS and NOT EXISTS are
-/// order-sensitive too, but `reorder_patterns` already defers each until every
-/// variable produced by the patterns written before it is bound, which keeps
-/// it behind them.
+/// Only an OPTIONAL anchors an edge. MINUS is order-sensitive too, but
+/// `reorder_patterns` already gives it positional dependencies on the
+/// preceding binding-producing patterns.
 fn left_join_order_barriers(
     patterns: &[Pattern],
     initial_bound_vars: &HashSet<VarId>,
@@ -1711,7 +1829,10 @@ fn left_join_order_barriers(
         .collect();
     let mut certain_before: HashSet<VarId> = initial_bound_vars.clone();
     for (i, earlier) in patterns.iter().enumerate() {
-        if !matches!(earlier, Pattern::Filter(_)) {
+        if !matches!(
+            earlier,
+            Pattern::Filter(_) | Pattern::Exists(_) | Pattern::NotExists(_)
+        ) {
             let earlier_is_optional = matches!(earlier, Pattern::Optional(_));
             for (j, later) in patterns.iter().enumerate().skip(i + 1) {
                 if !earlier_is_optional && !matches!(later, Pattern::Optional(_)) {
@@ -1845,10 +1966,15 @@ pub fn reorder_patterns(
     let mut deferred: Vec<DeferredPattern> = Vec::new();
 
     for (i, pattern) in patterns.iter().enumerate() {
-        // MINUS, EXISTS, and NOT EXISTS are order-sensitive: they operate on
-        // the solution produced by ALL preceding patterns. Treat them as
-        // deferred with required_vars = variables from all preceding patterns
-        // so the reorder cannot hoist them above sources that feed them.
+        // MINUS, EXISTS, and NOT EXISTS are order-sensitive: MINUS operates on
+        // the solution produced by ALL preceding patterns, and EXISTS/NOT
+        // EXISTS on the whole group (their `binders` cover patterns written
+        // after them). Treat them as deferred until the preceding
+        // binding-producing patterns are placed. Variable readiness alone is
+        // insufficient: VALUES/OPTIONAL may leave a shared variable unbound,
+        // and a later triple fills it in without adding a new schema variable.
+        // Hoisting negation ahead of that triple changes which mappings it can
+        // remove.
         if matches!(
             pattern,
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_)
@@ -1868,7 +1994,10 @@ pub fn reorder_patterns(
                 required_vars: required,
                 pattern: pattern.clone(),
                 nestable: true,
-                after_indices: Vec::new(),
+                after_indices: (0..i)
+                    .filter(|&j| !patterns[j].produced_vars().is_empty())
+                    .collect(),
+                binders: Vec::new(),
             });
             continue;
         }
@@ -1914,6 +2043,7 @@ pub fn reorder_patterns(
                     pattern: pattern.clone(),
                     nestable: false,
                     after_indices: blockers,
+                    binders: Vec::new(),
                 });
                 continue;
             }
@@ -1939,6 +2069,7 @@ pub fn reorder_patterns(
                     pattern: pattern.clone(),
                     nestable: true,
                     after_indices: Vec::new(),
+                    binders: Vec::new(),
                 });
                 continue;
             }
@@ -1970,6 +2101,7 @@ pub fn reorder_patterns(
                     pattern: pattern.clone(),
                     nestable: true,
                     after_indices: Vec::new(),
+                    binders: Vec::new(),
                 });
                 continue;
             }
@@ -2032,6 +2164,7 @@ pub fn reorder_patterns(
                     pattern: pattern.clone(),
                     nestable: true,
                     after_indices: Vec::new(),
+                    binders: Vec::new(),
                 });
             }
         }
@@ -2044,6 +2177,7 @@ pub fn reorder_patterns(
             }
         }
     }
+    attach_filter_binders(&mut deferred, patterns, initial_bound_vars);
 
     let mut result: Vec<Pattern> = Vec::with_capacity(patterns.len());
     // Original indices already emitted into `result`, for the positional
@@ -2722,6 +2856,7 @@ fn drain_ready_deferred(
             .filter(|(_, dp)| {
                 dp.required_vars.is_subset(bound_vars)
                     && dp.after_indices.iter().all(|i| placed.contains(i))
+                    && dp.binders.iter().all(|b| b.settled(placed))
             })
             .map(|(idx, _)| idx)
             .collect();
@@ -3179,6 +3314,89 @@ mod tests {
         stats
     }
 
+    #[test]
+    fn projected_distinct_estimate_uses_domains_without_collapsing_columns() {
+        let s = VarId(0);
+        let city = VarId(1);
+        let category = VarId(2);
+        let mut stats = stats_with(&[("city", 50_000, 500), ("category", 50_000, 10)]);
+        stats
+            .properties
+            .get_mut(&Sid::new(100, "city"))
+            .unwrap()
+            .ndv_subjects = 50_000;
+        let patterns = vec![
+            Pattern::Triple(make_pattern(s, "city", city)),
+            Pattern::Triple(make_pattern(s, "category", category)),
+        ];
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city], &stats),
+            Some(500.0)
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city, category], &stats),
+            Some(5000.0)
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city, city], &stats),
+            Some(500.0)
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns[..1], &[s], &stats),
+            Some(50_000.0)
+        );
+
+        // A second mandatory domain can tighten the estimate of the same var.
+        let constrained = vec![
+            patterns[0].clone(),
+            Pattern::Triple(make_pattern(s, "category", city)),
+        ];
+        assert_eq!(
+            estimate_projected_distinct_rows(&constrained, &[city], &stats),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn projected_distinct_estimate_keeps_unknown_and_computed_domains_unknown() {
+        let s = VarId(0);
+        let city = VarId(1);
+        let stats = stats_with(&[("city", 50_000, 500)]);
+        let mut patterns = vec![Pattern::Triple(make_pattern(s, "city", city))];
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city], &StatsView::default()),
+            None
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city, VarId(2)], &stats),
+            None
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(
+                &patterns,
+                &[city],
+                &stats_with(&[("city", 50_000, 0)])
+            ),
+            None
+        );
+        patterns.push(Pattern::Bind {
+            var: city,
+            expr: crate::ir::Expression::Var(s),
+        });
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city], &stats),
+            None
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(
+                &[Pattern::Optional(vec![patterns[0].clone()])],
+                &[city],
+                &stats
+            ),
+            None
+        );
+    }
+
     /// A `GRAPH <iri>` block naming one of this ledger's own named graphs must
     /// keep the ledger's statistics: `properties` is the cross-graph aggregate,
     /// so the predicates inside it are the same ones the default graph is
@@ -3456,6 +3674,7 @@ mod tests {
             )),
             nestable: false,
             after_indices: Vec::new(),
+            binders: Vec::new(),
         }];
         assert_eq!(
             unlocked_object_hash_scan(0, &remaining, &bound, Some(&stats)),
@@ -5236,6 +5455,120 @@ mod tests {
             matches!(&reordered[2], Pattern::Minus(_)),
             "MINUS should be placed after sources, got: {:?}",
             reordered[2]
+        );
+    }
+
+    #[test]
+    fn negation_waits_for_preceding_patterns_even_when_schema_is_already_bound() {
+        let p = VarId(0);
+        let values = Pattern::Values {
+            vars: vec![p],
+            rows: vec![vec![crate::binding::Binding::Unbound]],
+        };
+        // This triple supplies the value missing from VALUES, but produces
+        // no new schema variable. A variable-readiness check alone is unsound.
+        let person = Pattern::Triple(TriplePattern::new(
+            Ref::Var(p),
+            Ref::Sid(Sid::new(100, "type")),
+            Term::Sid(Sid::new(100, "Person")),
+        ));
+        let inner = vec![triple(p, "worksFor", VarId(1))];
+        for negation in [
+            Pattern::Minus(inner.clone()),
+            Pattern::Exists(inner.clone()),
+            Pattern::NotExists(inner),
+        ] {
+            let patterns = vec![values.clone(), person.clone(), negation.clone()];
+            for seed in [HashSet::new(), HashSet::from([p])] {
+                let reordered = reorder_patterns(&patterns, None, &seed);
+                assert_eq!(
+                    format!("{:?}", reordered.last().unwrap()),
+                    format!("{negation:?}"),
+                    "negation must follow both binders: {reordered:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_placed_last(reordered: &[Pattern], pattern: &Pattern) {
+        assert_eq!(
+            format!("{:?}", reordered.last().unwrap()),
+            format!("{pattern:?}"),
+            "{reordered:?}"
+        );
+    }
+
+    #[test]
+    fn filters_wait_for_binders_written_after_them() {
+        let p = VarId(0);
+        let values = Pattern::Values {
+            vars: vec![p],
+            rows: vec![vec![crate::binding::Binding::Unbound]],
+        };
+        let person = Pattern::Triple(TriplePattern::new(
+            Ref::Var(p),
+            Ref::Sid(Sid::new(100, "type")),
+            Term::Sid(Sid::new(100, "Person")),
+        ));
+        let inner = vec![triple(p, "worksFor", VarId(1))];
+        let bound = Pattern::Filter(Expression::Call {
+            func: Function::Bound,
+            args: vec![Expression::Var(p)],
+        });
+        // A FILTER applies to its whole group, so each waits for the triple
+        // that fills the UNDEF row even though it is written first.
+        for filter in [
+            Pattern::Exists(inner.clone()),
+            Pattern::NotExists(inner),
+            bound,
+        ] {
+            let patterns = vec![values.clone(), filter.clone(), person.clone()];
+            let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+            assert_placed_last(&reordered, &filter);
+        }
+    }
+
+    #[test]
+    fn filters_wait_for_a_required_binder_after_an_optional() {
+        let (p, f, org, x) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let knows = triple(p, "knows", f);
+        let works = optional(p, "worksFor", org);
+        // Fills `?org` on the rows the OPTIONAL left unbound.
+        let fills = triple(f, "worksFor", org);
+        let bound = Pattern::Filter(Expression::Call {
+            func: Function::Bound,
+            args: vec![Expression::Var(org)],
+        });
+        for patterns in [
+            vec![knows.clone(), works.clone(), fills.clone(), bound.clone()],
+            vec![knows.clone(), works.clone(), bound.clone(), fills],
+        ] {
+            let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+            assert_placed_last(&reordered, &bound);
+        }
+
+        // A NOT EXISTS written before the OPTIONAL that binds one of its
+        // variables waits for it, rather than the OPTIONAL waiting for it.
+        let negation = Pattern::NotExists(vec![triple(p, "knows", x), triple(x, "worksFor", org)]);
+        let reordered = reorder_patterns(&[knows, negation.clone(), works], None, &HashSet::new());
+        assert_placed_last(&reordered, &negation);
+    }
+
+    #[test]
+    fn filters_on_a_required_variable_do_not_wait_for_an_optional() {
+        let (s, a, b) = (VarId(0), VarId(1), VarId(2));
+        let first = triple(s, "a", a);
+        // Binds `?s` too, but the triple already binds it on every row.
+        let opt = optional(s, "b", b);
+        let filter = Pattern::Filter(Expression::Call {
+            func: Function::Bound,
+            args: vec![Expression::Var(s)],
+        });
+        let reordered = reorder_patterns(&[first, opt, filter], None, &HashSet::new());
+        assert!(
+            position_of(&reordered, |p| matches!(p, Pattern::Filter(_)))
+                < position_of(&reordered, |p| matches!(p, Pattern::Optional(_))),
+            "{reordered:?}"
         );
     }
 

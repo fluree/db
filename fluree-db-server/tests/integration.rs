@@ -28,6 +28,115 @@ async fn test_state() -> (TempDir, Arc<AppState>) {
     (tmp, state)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn http_queries_use_fast_paths_after_background_index_publication() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: true,
+        storage_path: Some(tmp.path().to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("server state"));
+    let app = build_router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ledger":"index-adoption"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let handle = state
+        .fluree
+        .ledger_cached("index-adoption:main")
+        .await
+        .unwrap();
+
+    let mut turtle = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..2000 {
+        use std::fmt::Write as _;
+        writeln!(turtle, "ex:p{i} a ex:Person ; ex:name \"Person {i}\" .").unwrap();
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert/index-adoption:main")
+                .header("content-type", "text/turtle")
+                .body(Body::from(turtle))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "insert: {body}");
+
+    // Keep the original handle: reloading or explicit reindexing would mask
+    // the distinction between a drained overlay and a never-written overlay.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if handle.snapshot().await.snapshot.t == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background index installed on the original handle");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/index-adoption:main")
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/sparql-results+json")
+                .header("fluree-track-fuel", "true")
+                .body(Body::from(
+                    "SELECT ?p WHERE { ?p a <http://example.org/Person> } LIMIT 10",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    assert_eq!(
+        body["result"]["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let fuel = body["fuel"].as_f64().expect("tracked fuel");
+    // One index batch costs ~3 fuel. Eagerly decoding all 2,000 subjects
+    // despite LIMIT 10 used ~23 fuel on this same cached state.
+    assert!(fuel < 4.0, "cached indexed query used {fuel} fuel");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/fluree/info/index-adoption:main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "info: {body}");
+    assert_eq!(body["ledger"]["commit-t"], 1);
+    assert_eq!(body["ledger"]["index-t"], 1);
+}
+
 // Regression for #1369: querying a registered Iceberg/R2RML graph source by
 // alias (SPARQL `POST /query/<alias>`, the `execute_sparql_ledger` path) must
 // route to the graph-source engine, not load it as a ledger (which deserialized
@@ -480,6 +589,206 @@ async fn create_branch_at_historical_t() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `at` takes a point in time, as a query's `@time:` does. Event times are
+/// pinned through `opts.eventTime` so the instants between commits are exact.
+#[tokio::test]
+async fn create_branch_at_time() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "dated:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    for (i, event_time) in [
+        "2020-01-01T00:00:00Z",
+        "2021-01-01T00:00:00Z",
+        "2022-01-01T00:00:00Z",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": format!("ex:item{i}"), "ex:val": i}],
+            "opts": {"eventTime": event_time},
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert")
+                    .header("content-type", "application/json")
+                    .header("fluree-ledger", "dated:main")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "insert {i} failed: {json}");
+    }
+
+    let branch = |name: &str, at: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/branch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"ledger": "dated", "branch": name, "at": at}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    for (name, at, expected_t) in [
+        ("q2020", "time:2020-06-01T00:00:00Z", 1),
+        ("q2021", "iso:2021-06-01T00:00:00Z", 2),
+    ] {
+        let resp = app.clone().oneshot(branch(name, at)).await.unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::CREATED, "{at}: {json}");
+        assert_eq!(
+            json.get("t").and_then(serde_json::Value::as_i64),
+            Some(expected_t),
+            "{at}: {json}"
+        );
+    }
+
+    for (at, expect) in [
+        ("time:2019-01-01T00:00:00Z", "no data as of"),
+        ("time:2021-13-45T00:00:00Z", "Invalid ISO-8601 timestamp"),
+        ("t:0", "must be >= 1"),
+        ("0", "must be >= 1"),
+        ("-3", "must be >= 1"),
+        ("snapshot:7", "@snapshot:"),
+        ("time:", "Missing value after 'time:'"),
+    ] {
+        let resp = app.clone().oneshot(branch("nowhere", at)).await.unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{at}: {json}");
+        // A branch request, so not reported as an invalid query.
+        assert_eq!(json["@type"], "err:api/BadRequest", "{at}: {json}");
+        assert!(json.to_string().contains(expect), "{at}: {json}");
+    }
+}
+
+#[tokio::test]
+async fn create_branch_from_empty_ledger_is_bad_request() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "empty:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "empty", "branch": "dev"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got: {json}");
+    assert_eq!(json["@type"], "err:api/BadRequest", "{json}");
+    assert!(
+        json.to_string().contains("no commits yet"),
+        "expected the empty-source message, got: {json}"
+    );
+}
+
+/// Merge-preview returns the API error typed; merge reaches the HTTP layer
+/// through the committer, flattened to a bare status. Both answer alike.
+#[tokio::test]
+async fn merging_a_root_branch_is_bad_request_on_both_routes() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "root:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/root?source=main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let merge = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/merge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "root", "source": "main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    for resp in [preview, merge] {
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "got: {json}");
+        assert_eq!(json["@type"], "err:api/BadRequest", "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("no source branch")),
+            "expected the root-branch message, got: {json}"
+        );
+    }
 }
 
 #[tokio::test]

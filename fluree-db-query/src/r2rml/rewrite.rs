@@ -1767,7 +1767,7 @@ mod tests {
 
         // `LedgerSnapshot` is both the IRI encoder (for parse) and the snapshot
         // (for convert's `decode_sid`, unused here since class objects stay IRIs).
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let class = "http://example.org/Geography";
 
         // --- Bound class: `@type: <class>` (≡ SPARQL `?s a <class>`) ---
@@ -1820,7 +1820,7 @@ mod tests {
     #[test]
     fn wildcard_predicate_binds_predicate_var() {
         use fluree_db_core::LedgerSnapshot;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
 
         // ?s ?p ?o
         let tp = TriplePattern::new(Ref::Var(VarId(0)), Ref::Var(VarId(1)), Term::Var(VarId(2)));
@@ -2107,7 +2107,7 @@ mod tests {
             .with_subject_template("http://example.org/person/{id}")
             .with_predicate_object(pom(COUNTRY, "country"));
         let mapping = CompiledR2rmlMapping::new(vec![names, countries]);
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let star = |pred: &str, obj: u16| {
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(VarId(0)),
@@ -2172,7 +2172,7 @@ mod tests {
             .with_class("http://example.org/CustomerCountry")
             .with_predicate_object(pom(COUNTRY, "country"))
             .with_predicate_object(pom(LABEL, "name"));
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let star = |pred: &str, obj: u16| {
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(VarId(0)),
@@ -2542,7 +2542,7 @@ mod tests {
     ) -> Vec<R2rmlPattern> {
         use fluree_db_core::LedgerSnapshot;
         const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let patterns = vec![
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(VarId(0)),
@@ -2616,7 +2616,7 @@ mod tests {
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
         const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
         const KEY_PRED: &str = "http://example.org/orderLineKey";
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let tm = TriplesMap::new("#OL", "fact_order_line")
             .with_subject_template("http://example.org/ol/{k}")
             .with_class(CLASS)
@@ -2791,7 +2791,7 @@ mod tests {
         // the merge is refused (keeps the two-scan plan) so no binding is dropped.
         use fluree_db_core::LedgerSnapshot;
         const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mapping = single_class_mapping();
         let patterns = vec![
             Pattern::Triple(TriplePattern::new(
@@ -2848,7 +2848,7 @@ mod tests {
     #[test]
     fn optional_star_member_is_not_fused_into_star() {
         use fluree_db_core::LedgerSnapshot;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let tm = TriplesMap::new("#Store", "dim_store")
             .with_subject_template("http://ex/store/{k}")
             .with_predicate_object(pom("http://ex/name", "store_name"))
@@ -2919,7 +2919,7 @@ mod tests {
     fn non_lowered_subscopes_are_flagged_unsupported() {
         use crate::ir::path::{PathModifier, PropertyPathPattern};
         use crate::ir::pattern::SubqueryPattern;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
 
         // Transitive property path.
         let path = Pattern::PropertyPath(PropertyPathPattern::new(
@@ -2956,7 +2956,7 @@ mod tests {
     /// NOT flagged — a VALUES-bearing R2RML query must still rewrite cleanly.
     #[test]
     fn values_is_not_flagged_unsupported() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let patterns = vec![
             Pattern::Values {
                 vars: vec![VarId(0)],

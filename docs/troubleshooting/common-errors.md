@@ -240,11 +240,10 @@ curl http://localhost:8090/v1/fluree/info/mydb:main
 - Remove unnecessary joins
 - Use more specific patterns
 
-**Increase timeout:**
+**Increase timeout:** the limit is server-wide (default 15 minutes; `0` disables it), not per
+request:
 ```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Timeout: 60000" \
-  -d '{...}'
+FLUREE_QUERY_TIMEOUT_MS=1800000 fluree server run
 ```
 
 ## POLICY_DENIED
@@ -395,7 +394,11 @@ for (let i = 0; i < entities.length; i += batchSize) {
 
 **Increase limits (if appropriate):**
 ```bash
-./fluree-db-server --max-transaction-size 20971520
+# Raise the request body limit (err:db/PayloadTooLarge); default 50 MB
+fluree server run -- --body-limit 104857600
+
+# Raise the novelty hard limit (err:db/NoveltyDeltaTooLarge)
+fluree server run -- --reindex-max-bytes 2147483648
 ```
 
 ## DATATYPE_LIMIT_EXCEEDED
@@ -501,7 +504,7 @@ curl http://localhost:8090/v1/fluree/info/mydb:main
 
 **Tune indexing:**
 ```bash
-fluree-server \
+fluree server run -- \
   --indexing-enabled \
   --reindex-min-bytes 100000 \
   --reindex-max-bytes 1000000

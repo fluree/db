@@ -443,7 +443,7 @@ impl RaftIntegration {
                         if actual.as_ref().is_some_and(|a| a.t >= record.commit_t) => {}
                     Ok(CasResult::Conflict { actual }) => {
                         return Err(FileRegistryAdoptionError::Diverged {
-                            ledger_id: ledger_id.clone(),
+                            ledger_id: ledger_id.clone().to_string(),
                             kind: "commit head",
                             detail: format!(
                                 "machine holds {actual:?}, registry carries t={}",
@@ -481,7 +481,7 @@ impl RaftIntegration {
                         Ok(CasResult::Updated) => {}
                         Ok(CasResult::Conflict { actual }) => {
                             return Err(FileRegistryAdoptionError::Diverged {
-                                ledger_id: ledger_id.clone(),
+                                ledger_id: ledger_id.clone().to_string(),
                                 kind: "index head",
                                 detail: format!(
                                     "machine holds {actual:?}, registry carries t={}",
@@ -529,7 +529,7 @@ impl RaftIntegration {
                         Ok(ConfigCasResult::Updated) => {}
                         Ok(ConfigCasResult::Conflict { actual }) => {
                             return Err(FileRegistryAdoptionError::Diverged {
-                                ledger_id: ledger_id.clone(),
+                                ledger_id: ledger_id.clone().to_string(),
                                 kind: "config",
                                 detail: format!(
                                     "machine holds {actual:?}, registry carries v={}",
@@ -560,7 +560,7 @@ impl RaftIntegration {
                         Ok(StatusCasResult::Updated) => {}
                         Ok(StatusCasResult::Conflict { actual }) => {
                             return Err(FileRegistryAdoptionError::Diverged {
-                                ledger_id: ledger_id.clone(),
+                                ledger_id: ledger_id.clone().to_string(),
                                 kind: "status",
                                 detail: format!(
                                     "machine holds {actual:?}, registry carries v={}",

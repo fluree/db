@@ -767,18 +767,6 @@ fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String
 
 /// Build the `ledger` block with ledger-wide metadata.
 fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
-    let index_t = ledger
-        .ns_record
-        .as_ref()
-        .map(|r| r.index_t)
-        .unwrap_or(ledger.snapshot.t);
-
-    let commit_t = ledger
-        .ns_record
-        .as_ref()
-        .map(|r| r.commit_t)
-        .unwrap_or(ledger.t());
-
     let graph_sizes = stats.graphs.as_deref().unwrap_or_default();
     let graph_totals = |g_id: GraphId| -> (u64, u64) {
         graph_sizes
@@ -821,10 +809,12 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
     }
 
     Ledger {
-        alias: ledger.snapshot.ledger_id.clone(),
+        alias: ledger.snapshot.ledger_id.clone().to_string(),
         t: Some(ledger.t()),
-        commit_t: Some(commit_t),
-        index_t: Some(index_t),
+        // The record saved at load time can lag cached commits or index installs.
+        // Describe the state serving this request, not that saved record.
+        commit_t: Some(ledger.t()),
+        index_t: Some(ledger.index_t()),
         flakes: Some(stats.flakes as i64),
         size: stats.size,
         named_graphs,
@@ -1527,10 +1517,10 @@ pub fn build_virtual_ledger_info(
         // Top-level parity with the native `/info` response (which the server
         // route stamps `ledger_id`/`t` onto for native ledgers). For a virtual
         // dataset the Iceberg snapshot id serves as the version `t`.
-        ledger_id: Some(record.graph_source_id.clone()),
+        ledger_id: Some(record.graph_source_id.clone().to_string()),
         t: Some(meta.snapshot_id),
         ledger: Ledger {
-            alias: record.graph_source_id.clone(),
+            alias: record.graph_source_id.clone().to_string(),
             t: meta.snapshot_id,
             // A virtual dataset has no commit/index chain.
             commit_t: None,
@@ -2843,12 +2833,27 @@ mod tests {
     }
 
     #[test]
+    fn ledger_block_uses_live_watermarks_instead_of_saved_nameservice_record() {
+        let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("info-watermarks:main");
+        snapshot.t = 1;
+        let mut novelty = fluree_db_novelty::Novelty::new(1);
+        novelty.t = 2;
+        let mut ledger = LedgerState::new(snapshot, novelty);
+        ledger.ns_record = Some(NsRecord::new("info-watermarks:main"));
+
+        let block = build_ledger_block(&ledger, &IndexStats::default());
+        assert_eq!(block.t, Some(2));
+        assert_eq!(block.commit_t, Some(2));
+        assert_eq!(block.index_t, Some(1));
+    }
+
+    #[test]
     fn test_ns_record_to_jsonld() {
         use fluree_db_core::{ContentId, ContentKind};
         let commit_cid = ContentId::new(ContentKind::Commit, b"abc");
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"def");
         let record = NsRecord {
-            ledger_id: "mydb:main".to_string(),
+            ledger_id: fluree_db_core::LedgerId::parse("mydb:main").unwrap(),
             name: "mydb:main".to_string(),
             branch: "main".to_string(),
             commit_head_id: Some(commit_cid.clone()),
@@ -2879,7 +2884,7 @@ mod tests {
         use fluree_db_core::{ContentId, ContentKind};
         let commit_cid = ContentId::new(ContentKind::Commit, b"commit-data");
         let record = NsRecord {
-            ledger_id: "mydb:main".to_string(),
+            ledger_id: fluree_db_core::LedgerId::parse("mydb:main").unwrap(),
             name: "mydb:main".to_string(),
             branch: "main".to_string(),
             commit_head_id: Some(commit_cid),
@@ -2902,7 +2907,7 @@ mod tests {
         use fluree_db_core::{ContentId, ContentKind};
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"snapshot-data");
         let record = GraphSourceRecord {
-            graph_source_id: "my-search:main".to_string(),
+            graph_source_id: fluree_db_core::LedgerId::parse("my-search:main").unwrap(),
             name: "my-search".to_string(),
             branch: "main".to_string(),
             source_type: fluree_db_nameservice::GraphSourceType::Bm25,
@@ -3030,7 +3035,7 @@ mod tests {
 
     fn virtual_record(config: &str) -> GraphSourceRecord {
         GraphSourceRecord {
-            graph_source_id: "sales:main".to_string(),
+            graph_source_id: fluree_db_core::LedgerId::parse("sales:main").unwrap(),
             name: "sales".to_string(),
             branch: "main".to_string(),
             source_type: GraphSourceType::Iceberg,

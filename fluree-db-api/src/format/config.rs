@@ -61,6 +61,18 @@ pub enum OutputFormat {
     /// **Graph results only** (SPARQL CONSTRUCT / DESCRIBE). Produces `String`.
     NTriples,
 
+    /// TriG dataset serialization (`application/trig`)
+    ///
+    /// **Graph results only.** Needed when a CONSTRUCT template writes into
+    /// named graphs (`GRAPH` blocks); otherwise the output is plain Turtle.
+    TriG,
+
+    /// N-Quads dataset serialization (`application/n-quads`)
+    ///
+    /// **Graph results only.** Needed when a CONSTRUCT template writes into
+    /// named graphs (`GRAPH` blocks); otherwise the output is plain N-Triples.
+    NQuads,
+
     /// Typed JSON format
     ///
     /// Always includes explicit datatype (even for inferable types):
@@ -262,12 +274,33 @@ impl FormatterConfig {
         }
     }
 
+    /// Create a TriG config (graph results only: CONSTRUCT/DESCRIBE)
+    pub fn trig() -> Self {
+        Self {
+            format: OutputFormat::TriG,
+            ..Default::default()
+        }
+    }
+
+    /// Create an N-Quads config (graph results only: CONSTRUCT/DESCRIBE)
+    pub fn nquads() -> Self {
+        Self {
+            format: OutputFormat::NQuads,
+            ..Default::default()
+        }
+    }
+
     /// Whether this format serializes a graph to text (RDF/XML, Turtle,
-    /// N-Triples), and so only applies to CONSTRUCT / DESCRIBE results.
+    /// N-Triples, TriG, N-Quads), and so only applies to CONSTRUCT /
+    /// DESCRIBE results.
     pub fn is_graph_text(&self) -> bool {
         matches!(
             self.format,
-            OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples
+            OutputFormat::RdfXml
+                | OutputFormat::Turtle
+                | OutputFormat::NTriples
+                | OutputFormat::TriG
+                | OutputFormat::NQuads
         )
     }
 
