@@ -331,7 +331,14 @@ async fn time_and_commit_pins_select_the_same_state_as_t() {
 async fn malformed_path_pin_is_a_400() {
     let (_tmp, app, _) = fixture().await;
 
-    for pin in ["@t:abc", "@bogus:1", "@", "@commit:abc", "@t:1%23txn-meta"] {
+    for pin in [
+        "@t:abc",
+        "@bogus:1",
+        "@",
+        "@commit:abc",
+        "@t:1%23txn-meta",
+        "%23txn-meta@t:1",
+    ] {
         let uri = query_uri(pin);
         let (status, body) = sparql(&app, &uri, SPARQL_DEFAULT).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "SPARQL {pin}: {body}");
@@ -344,6 +351,19 @@ async fn malformed_path_pin_is_a_400() {
 
     let (_, body) = sparql(&app, &query_uri("@t:abc"), SPARQL_DEFAULT).await;
     assert!(body.contains("Invalid time pin"), "{body}");
+
+    // The transposed spelling puts the pin inside the fragment. It is refused
+    // as the pin-and-fragment combination it is, not left to a later parse.
+    for uri in [
+        query_uri("%23txn-meta@t:1"),
+        format!("/v1/fluree/explain/{LEDGER}%23txn-meta@t:1"),
+    ] {
+        let (_, body) = sparql(&app, &uri, SPARQL_DEFAULT).await;
+        assert!(
+            body.contains("combines a time pin with a graph fragment"),
+            "{uri}: {body}"
+        );
+    }
 }
 
 #[tokio::test]

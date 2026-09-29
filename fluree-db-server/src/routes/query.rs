@@ -1921,6 +1921,16 @@ pub(crate) struct PathPin {
 impl PathLedger {
     pub(crate) fn parse(raw: &str) -> Result<Self> {
         let parsed = fluree_db_api::LedgerRef::parse(raw)?;
+        // `LedgerRef` splits at `#` before `@`, so `<ledger>#g@t:1` arrives as a
+        // fragment carrying the pin. Refuse it as `<ledger>@t:1#g` is refused,
+        // rather than read head.
+        let pin_in_fragment = parsed.fragment.as_deref().is_some_and(|f| f.contains('@'));
+        if parsed.fragment.is_some() && (parsed.at.is_some() || pin_in_fragment) {
+            return Err(ServerError::bad_request(format!(
+                "Ledger path '{raw}' combines a time pin with a graph fragment; \
+                 select the graph in the query instead"
+            )));
+        }
         let Some(at) = parsed.at else {
             return Ok(Self {
                 ledger: raw.to_string(),
@@ -1928,12 +1938,6 @@ impl PathLedger {
                 pin: None,
             });
         };
-        if parsed.fragment.is_some() {
-            return Err(ServerError::bad_request(format!(
-                "Ledger path '{raw}' combines a time pin with a graph fragment; \
-                 select the graph in the query instead"
-            )));
-        }
         // The grammar a body `from: "<ledger>@..."` is parsed with.
         let spec = TimeSpec::parse_address_suffix(&at).map_err(|e| {
             ServerError::bad_request(format!("Invalid time pin in ledger path '{raw}': {e}"))

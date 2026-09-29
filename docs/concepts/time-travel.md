@@ -104,6 +104,10 @@ Query at a specific commit using `@commit:` with a commit ContentId:
 
 Over HTTP, the pin can go on the ledger in the path of a ledger-scoped query instead of in the body. `POST /v1/fluree/query/ledger:main@t:100` (or `@time:`, `@recorded:`, `@commit:`) reads the whole ledger as of that point, including its named graphs: `GRAPH ?g` enumerates the graphs that existed then. A time the body names for the same ledger must agree with the path's. See [`POST /query/{ledger}`](../api/endpoints.md#post-queryledger).
 
+### Policy at a Past Point
+
+A read at a past point is governed by the ledger's policy as it stood at that point, however the time is given (a path pin, `from: "ledger:main@t:1"`, or `FROM <ledger:main@t:1>`): its configured policy defaults, such as `f:defaultAllow`, and its policy rules are read from the pinned state. Tightening policy later does not protect earlier states. A ledger that allowed anonymous reads at t=1 and denies them from t=2 still answers a read pinned to t=1. To keep a reader away from a ledger's history, restrict the reader's access to the ledger itself, for example with token ledger scopes. See [Policy in queries](../security/policy-in-queries.md#time-travel-queries).
+
 ## Event Time: Backdated Commits
 
 Every commit carries an **event time** (`db:time` in the txn-meta graph) — the
