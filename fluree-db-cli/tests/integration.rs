@@ -2286,44 +2286,55 @@ fn insert_of_an_nquads_file_names_create_from() {
         .stderr(predicate::str::contains("fluree create <ledger> --from"));
 }
 
-/// `sync` replaces one graph, so a TriG file is refused with the commands
-/// that do read it, rather than a Turtle parse error on its first block.
+/// `sync` sends TriG as TriG, so a document whose blocks name the target
+/// graph syncs it, from a `.trig` file or piped in. A block for another graph
+/// is refused by the API, and nothing is committed.
 #[test]
-fn sync_of_a_trig_file_names_insert_and_upsert() {
+fn sync_of_a_trig_document_replaces_its_named_graph() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
+    let graph = "http://example.org/g1";
     let src = tmp.path().join("data.trig");
     std::fs::write(
         &src,
-        "GRAPH <http://example.org/g1> { \
-         <http://example.org/s> <http://example.org/p> \"v\" . }\n",
+        format!("GRAPH <{graph}> {{ <http://example.org/s> <http://example.org/p> \"v1\" , \"v2\" . }}\n"),
     )
     .unwrap();
     fluree_cmd(&tmp)
-        .args(["sync", "ds", "-f"])
+        .args(["sync", "ds", "--graph", graph, "-f"])
         .arg(&src)
         .assert()
+        .success()
+        .stdout(predicate::str::contains("+2 asserted, -0 retracted (t=1)"));
+
+    // Piped, with no name to go by: detected as TriG, and only the delta commits.
+    fluree_cmd(&tmp)
+        .args(["sync", "ds", "--graph", graph])
+        .write_stdin(format!(
+            "<{graph}> {{ <http://example.org/s> <http://example.org/p> \"v1\" , \"v3\" . }}\n"
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+1 asserted, -1 retracted (t=2)"));
+
+    fluree_cmd(&tmp)
+        .args(["sync", "ds", "--graph", graph])
+        .write_stdin(
+            "GRAPH <http://example.org/g2> { <http://example.org/s> <http://example.org/p> \"v\" . }\n",
+        )
+        .assert()
         .failure()
-        .stderr(predicate::str::contains("fluree insert"));
+        .stderr(predicate::str::contains("also has a GRAPH block for <http://example.org/g2>"));
 }
 
-/// The same refusal when a TriG body arrives without a `.trig` name: piped to
-/// `sync`, or in a `.ttl` file given to `validate` or `--shacl`.
+/// `validate` and `--shacl` read one graph, so they refuse a TriG body even
+/// when it arrives in a `.ttl` file.
 #[test]
 fn a_trig_body_under_another_name_is_refused_by_one_graph_commands() {
     let tmp = TempDir::new().unwrap();
-    fluree_cmd(&tmp).arg("init").assert().success();
-    fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
     let trig = "GRAPH <http://example.org/g1> { \
                 <http://example.org/s> <http://example.org/p> \"v\" . }\n";
-    fluree_cmd(&tmp)
-        .args(["sync", "ds"])
-        .write_stdin(trig)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("sync reads one graph"));
-
     std::fs::write(tmp.path().join("trig.ttl"), trig).unwrap();
     std::fs::write(tmp.path().join("shapes.ttl"), VALIDATE_SHAPES_TTL).unwrap();
     fluree_cmd(&tmp)

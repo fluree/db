@@ -77,8 +77,9 @@ pub fn detect_data_format(
     }
 
     // Content sniffing. A TriG body sniffs as Turtle, which is fine for
-    // insert and upsert: their Turtle entry points read graph blocks too. The
-    // commands that read one graph check with `refuse_trig_body`.
+    // insert and upsert: their Turtle entry points read graph blocks too.
+    // `sync` looks for it with `is_trig_body`, and `validate` and `--shacl`
+    // refuse it with `refuse_trig_body`.
     sniff_data_format(content)
 }
 
@@ -114,18 +115,23 @@ pub fn trig_refused(command: &str) -> CliError {
     ))
 }
 
+/// Whether a body that sniffed or was named as Turtle is TriG: it has graph
+/// blocks or txn-meta. This parses rather than looking for braces, since a
+/// `{` inside a Turtle string literal is not a graph block. A body that is
+/// not well-formed TriG either is left to the Turtle parser to report.
+pub fn is_trig_body(content: &str) -> bool {
+    fluree_db_transact::might_contain_graph_block(content)
+        && fluree_db_transact::parse_trig_phase1(content)
+            .is_ok_and(|p| !p.named_graphs.is_empty() || p.raw_meta.is_some())
+}
+
 /// [`trig_refused`] for a TriG body that reached a one-graph command as
-/// Turtle, by sniffing or a `.ttl` name. This parses rather than looking for
-/// braces, since a `{` inside a Turtle string literal is not a graph block.
+/// Turtle, by sniffing or a `.ttl` name.
 pub fn refuse_trig_body(command: &str, content: &str) -> CliResult<()> {
-    if !fluree_db_transact::might_contain_graph_block(content) {
-        return Ok(());
-    }
-    match fluree_db_transact::parse_trig_phase1(content) {
-        Ok(p) if !p.named_graphs.is_empty() || p.raw_meta.is_some() => Err(trig_refused(command)),
-        // No graph blocks, or not well-formed TriG either: the Turtle parser
-        // reports it.
-        _ => Ok(()),
+    if is_trig_body(content) {
+        Err(trig_refused(command))
+    } else {
+        Ok(())
     }
 }
 
@@ -319,10 +325,10 @@ mod tests {
                 super::detect_data_format(None, trig, None).unwrap(),
                 super::DataFormat::Turtle
             );
-            let err = super::refuse_trig_body("sync", trig)
+            let err = super::refuse_trig_body("validate", trig)
                 .expect_err("graph blocks are TriG")
                 .to_string();
-            assert!(err.contains("sync reads one graph"), "{trig}: {err}");
+            assert!(err.contains("validate reads one graph"), "{trig}: {err}");
         }
         for turtle in [
             "<http://example.org/s> <http://example.org/p> \"{\\\"a\\\": 1}\" .",
@@ -330,7 +336,10 @@ mod tests {
             // Malformed either way: the Turtle parser reports it.
             "GRAPH <http://example.org/g> <http://example.org/s>",
         ] {
-            assert!(super::refuse_trig_body("sync", turtle).is_ok(), "{turtle}");
+            assert!(
+                super::refuse_trig_body("validate", turtle).is_ok(),
+                "{turtle}"
+            );
         }
     }
 

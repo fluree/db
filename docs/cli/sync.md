@@ -23,9 +23,9 @@ fluree sync [LEDGER] [DATA] [--graph <IRI>] [OPTIONS]
 |--------|-------------|
 | `-g, --graph <IRI>` | Target named graph IRI — the sync scope. The payload never widens or narrows it. Omit it to sync the default graph. |
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
-| `-e, --expr <EXPR>` | Inline data expression (Turtle or JSON-LD) |
+| `-e, --expr <EXPR>` | Inline data expression (Turtle, TriG or JSON-LD) |
 | `-f, --file <FILE>` | Read data from a file |
-| `--format <FORMAT>` | Data format: `turtle` (`nt` for N-Triples) or `jsonld` (auto-detected if omitted) |
+| `--format <FORMAT>` | Data format: `turtle` (`nt` for N-Triples), `trig` or `jsonld` (auto-detected if omitted) |
 | `--dry-run` | Compute and report the delta (asserted / retracted counts) without committing |
 | `--allow-empty` | Allow an empty payload, which clears the graph (off by default so a truncated export cannot silently wipe it) |
 | `--json` | Emit the report as JSON — the same shape as the server's dry-run response — instead of a sentence |
@@ -47,10 +47,17 @@ Turtle export works against any server that implements the `/sync`
 endpoint, including servers from before it accepted Turtle bodies. A `.nt`
 file is read as Turtle, of which N-Triples is a subset.
 
-The CLI does not read TriG yet. It refuses a TriG body whether it is named
-`.trig`, passed with `--format trig`, or piped in or saved under another
-name with graph blocks in it. `POST` a TriG file to
-[`/sync`](../transactions/sync.md#payload-formats) directly.
+TriG is sent as TriG rather than converted. It is recognized by a `.trig`
+name or `--format trig`, and also when a body read as Turtle turns out to
+hold graph blocks, as when it is piped in. Its blocks must name the
+`--graph` target, and cannot sit beside default-graph triples (see
+[payload formats](../transactions/sync.md#payload-formats)):
+
+```bash
+fluree sync mydb --graph http://example.org/graphs/ontology -f ontology.trig
+```
+
+With `--remote`, the server must accept TriG on `/sync`.
 
 ### Sources
 

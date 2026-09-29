@@ -1264,6 +1264,43 @@ impl RemoteLedgerClient {
         dry_run: bool,
         allow_empty: bool,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.sync_url(ledger, graph, dry_run, allow_empty);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// [`sync_jsonld`](Self::sync_jsonld) with a TriG body, sent as
+    /// `application/trig`. Its graph blocks must name `graph`.
+    pub async fn sync_trig(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        body: &str,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.sync_url(ledger, graph, dry_run, allow_empty);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/trig",
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
+    fn sync_url(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> String {
         let mut params = Vec::new();
         if let Some(graph) = graph {
             params.push(format!("graph={}", urlencoding::encode(graph)));
@@ -1279,13 +1316,7 @@ impl RemoteLedgerClient {
             url.push('?');
             url.push_str(&params.join("&"));
         }
-        self.send_json(
-            reqwest::Method::POST,
-            &url,
-            "application/json",
-            Some(RequestBody::Json(body)),
-        )
-        .await
+        url
     }
 
     // =========================================================================
