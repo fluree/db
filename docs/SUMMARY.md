@@ -187,6 +187,7 @@
   - [BM25 graph source](graph-sources/bm25.md)
 
 - [Fluree for AI and agents](ai/README.md)
+  - [Connect an agent over MCP](ai/mcp-server.md)
   - [Claude Code and the CLI](ai/claude-code.md)
 
 - [Memory](memory/README.md)

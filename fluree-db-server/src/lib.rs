@@ -459,6 +459,13 @@ impl FlureeServer {
             ),
             None => None,
         };
+        if self.state.config.events_open_under_data_auth() {
+            tracing::warn!(
+                "data auth is required but events auth is off: /v1/fluree/events lists every \
+                 ledger and its nameservice record to anyone; set --events-auth-mode to require \
+                 tokens there too"
+            );
+        }
         #[cfg(not(feature = "bolt"))]
         if self.state.config.bolt_listen_addr.is_some() {
             tracing::warn!(

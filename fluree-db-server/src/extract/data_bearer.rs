@@ -242,24 +242,33 @@ pub(crate) fn parse_scopes(scopes: Option<&Vec<String>>) -> HashSet<LedgerId> {
         .collect()
 }
 
-/// Build a `DataPrincipal` from verified claims.
-fn build_principal(
-    payload: &EventsTokenPayload,
-    policy_authorization: CredentialPolicy,
-) -> DataPrincipal {
-    DataPrincipal {
-        policy_authorization,
-        issuer: payload.iss.clone(),
-        subject: payload.sub.clone(),
-        identity: payload.resolve_identity(),
-        // Read: use explicit ledger.read.* if present, else fall back to storage.*
-        read_all: payload.ledger_read_all.unwrap_or(false) || payload.storage_all.unwrap_or(false),
-        read_ledgers: parse_scopes(
+/// Read access a token grants: `fluree.ledger.read.*`, falling back to the
+/// `fluree.storage.*` claims. Shared by every surface that reads ledger data.
+pub(crate) fn read_scopes(payload: &EventsTokenPayload) -> (bool, HashSet<LedgerId>) {
+    (
+        payload.ledger_read_all.unwrap_or(false) || payload.storage_all.unwrap_or(false),
+        parse_scopes(
             payload
                 .ledger_read_ledgers
                 .as_ref()
                 .or(payload.storage_ledgers.as_ref()),
         ),
+    )
+}
+
+/// Build a `DataPrincipal` from verified claims.
+fn build_principal(
+    payload: &EventsTokenPayload,
+    policy_authorization: CredentialPolicy,
+) -> DataPrincipal {
+    let (read_all, read_ledgers) = read_scopes(payload);
+    DataPrincipal {
+        policy_authorization,
+        issuer: payload.iss.clone(),
+        subject: payload.sub.clone(),
+        identity: payload.resolve_identity(),
+        read_all,
+        read_ledgers,
         write_all: payload.ledger_write_all.unwrap_or(false),
         write_ledgers: parse_scopes(payload.ledger_write_ledgers.as_ref()),
         expires_unix: payload.exp,
