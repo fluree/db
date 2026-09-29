@@ -105,7 +105,8 @@ where
     tracing::debug!(earliest_time, "datetime_to_t: earliest ledger#time");
 
     // A time before the ledger existed is the caller's mistake, not a fault:
-    // a 400 on every surface that resolves one (query, export, branch).
+    // a 400 on every surface that resolves one (query, export, branch, and a
+    // multi-query `asOf`).
     if target_epoch_ms < earliest_time {
         let target_iso = epoch_ms_to_iso(target_epoch_ms);
         let earliest_iso = epoch_ms_to_iso(earliest_time);
