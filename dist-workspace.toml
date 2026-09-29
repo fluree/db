@@ -60,8 +60,10 @@ aarch64-apple-darwin = "macos-14-xlarge"
 # default 4-core/16GB ubuntu-24.04-arm OOM'd at link time under fat LTO
 # (runner lost communication ~59min); 32GB gives ~2x headroom.
 aarch64-unknown-linux-gnu = "asset-publisher-8-core"
-# The org's larger x64 release runners (8-core/32GB). The default 4-core/16GB
+# The org's larger x64 runners (8-core/32GB). The default 4-core/16GB
 # ubuntu-24.04 runner was shut down during the fat-LTO link for v4.2.2, the
 # same failure as the ARM64 one above; Windows ran on the same 16GB class.
-x86_64-unknown-linux-gnu = "standalone-release-linux-x64"
+# Linux needs an Ubuntu 24.04 image: `standalone-release-linux-x64` is 22.04,
+# whose GCC 11 cannot compile usearch's AVX-512 FP16 kernels.
+x86_64-unknown-linux-gnu = "ci-cd-large"
 x86_64-pc-windows-msvc = "standalone-release-windows-x64"
