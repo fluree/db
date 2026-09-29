@@ -2022,7 +2022,7 @@ fn export_all_graphs_nquads_on_never_indexed_ledger() {
 }
 
 /// A ledger with one triple in the default graph and one in a named graph,
-/// built through the bulk-import path (`insert` has no TriG reader).
+/// built through the bulk-import path.
 fn seed_two_graphs(tmp: &TempDir, ledger: &str) {
     let src = tmp.path().join(format!("{ledger}-src"));
     std::fs::create_dir_all(&src).unwrap();
@@ -2202,21 +2202,68 @@ fn export_all_graphs_round_trips_into_a_same_named_ledger() {
         .stdout(predicate::str::contains("urn:fluree").not());
 }
 
-/// `fluree export --format trig` now produces dataset files routinely, so
-/// feeding one back to `insert` is the obvious next thing to try. It cannot
-/// work — `insert` has nowhere to put a named graph — but it used to fail
-/// inside the Turtle parser with `expected subject, found 'GRAPH'`, which
-/// names neither the cause nor the command that does work.
+/// `fluree export --format trig` produces dataset files routinely, and
+/// feeding one back to an existing ledger is the obvious next thing to try.
+/// `insert` and `upsert` read TriG, by extension or by `--format` (#1849).
 #[test]
-fn insert_of_a_dataset_file_names_create_from() {
+fn insert_and_upsert_read_an_exported_trig_file() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "src");
+    let out = tmp.path().join("src.trig");
+    fluree_cmd(&tmp)
+        .args(["export", "src", "--format", "trig", "--all-graphs", "-o"])
+        .arg(&out)
+        .assert()
+        .success();
+
+    for (cmd, ledger, extra) in [
+        ("insert", "by-ext", &[][..]),
+        ("upsert", "by-flag", &["--format", "trig"][..]),
+    ] {
+        fluree_cmd(&tmp).args(["create", ledger]).assert().success();
+        fluree_cmd(&tmp)
+            .args([cmd, ledger])
+            .args(extra)
+            .arg("-f")
+            .arg(&out)
+            .assert()
+            .success();
+        fluree_cmd(&tmp)
+            .args([
+                "query",
+                ledger,
+                "--sparql",
+                "SELECT ?o WHERE { GRAPH <http://example.org/g1> { ?s ?p ?o } }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("in-g1"));
+        fluree_cmd(&tmp)
+            .args([
+                "query",
+                ledger,
+                "--sparql",
+                "SELECT ?o WHERE { <http://example.org/default1> <http://example.org/p> ?o }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("in-default"));
+    }
+}
+
+/// N-Quads is the dataset format no data command reads. It used to fail
+/// inside the Turtle parser on its fourth term, which names neither the cause
+/// nor the command that does work.
+#[test]
+fn insert_of_an_nquads_file_names_create_from() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
-    let src = tmp.path().join("data.trig");
+    let src = tmp.path().join("data.nq");
     std::fs::write(
         &src,
-        "GRAPH <http://example.org/g1> { \
-         <http://example.org/s> <http://example.org/p> \"v\" . }\n",
+        "<http://example.org/s> <http://example.org/p> \"v\" <http://example.org/g1> .\n",
     )
     .unwrap();
 
@@ -2226,17 +2273,91 @@ fn insert_of_a_dataset_file_names_create_from() {
         .arg(&src)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("dataset format"))
+        .stderr(predicate::str::contains("N-Quads"))
         .stderr(predicate::str::contains("fluree create <ledger> --from"));
 
     // And by an explicit --format, which took a different path to the same
     // dead end.
     fluree_cmd(&tmp)
-        .args(["insert", "ds", "--format", "trig", "-f"])
+        .args(["insert", "ds", "--format", "nquads", "-f"])
         .arg(&src)
         .assert()
         .failure()
         .stderr(predicate::str::contains("fluree create <ledger> --from"));
+}
+
+/// `sync` sends TriG as TriG, so a document whose blocks name the target
+/// graph syncs it, from a `.trig` file or piped in. A block for another graph
+/// is refused by the API, and nothing is committed.
+#[test]
+fn sync_of_a_trig_document_replaces_its_named_graph() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
+    let graph = "http://example.org/g1";
+    let src = tmp.path().join("data.trig");
+    std::fs::write(
+        &src,
+        format!("GRAPH <{graph}> {{ <http://example.org/s> <http://example.org/p> \"v1\" , \"v2\" . }}\n"),
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["sync", "ds", "--graph", graph, "-f"])
+        .arg(&src)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+2 asserted, -0 retracted (t=1)"));
+
+    // Piped, with no name to go by: detected as TriG, and only the delta commits.
+    fluree_cmd(&tmp)
+        .args(["sync", "ds", "--graph", graph])
+        .write_stdin(format!(
+            "<{graph}> {{ <http://example.org/s> <http://example.org/p> \"v1\" , \"v3\" . }}\n"
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+1 asserted, -1 retracted (t=2)"));
+
+    fluree_cmd(&tmp)
+        .args(["sync", "ds", "--graph", graph])
+        .write_stdin(
+            "GRAPH <http://example.org/g2> { <http://example.org/s> <http://example.org/p> \"v\" . }\n",
+        )
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("also has a GRAPH block for <http://example.org/g2>"));
+}
+
+/// `validate` and `--shacl` read one graph, so they refuse a TriG body even
+/// when it arrives in a `.ttl` file.
+#[test]
+fn a_trig_body_under_another_name_is_refused_by_one_graph_commands() {
+    let tmp = TempDir::new().unwrap();
+    let trig = "GRAPH <http://example.org/g1> { \
+                <http://example.org/s> <http://example.org/p> \"v\" . }\n";
+    std::fs::write(tmp.path().join("trig.ttl"), trig).unwrap();
+    std::fs::write(tmp.path().join("shapes.ttl"), VALIDATE_SHAPES_TTL).unwrap();
+    fluree_cmd(&tmp)
+        .args(["validate", "trig.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("validate reads one graph"));
+
+    // A brace inside a literal is not a graph block.
+    std::fs::write(
+        tmp.path().join("data.ttl"),
+        "<http://example.org/s> <http://example.org/p> \"{v}\" .\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["validate", "data.ttl", "--shacl", "trig.ttl"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--shacl reads one graph"));
+    fluree_cmd(&tmp)
+        .args(["validate", "data.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .success();
 }
 
 // ============================================================================

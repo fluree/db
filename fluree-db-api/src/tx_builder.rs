@@ -26,10 +26,7 @@ use crate::ledger_manager::{
 use crate::tx::{
     IndexingMode, IndexingStatus, StageResult, TransactResult, TransactResultRef, WriteScope,
 };
-use crate::{
-    ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
-    Tracker, TrackingOptions, TrackingTally,
-};
+use crate::{ApiError, Fluree, PolicyContext, Result, Tracker, TrackingOptions, TrackingTally};
 use fluree_db_core::{ContentId, ContentStore, LedgerSnapshot, Sid, TxnMetaValue};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
@@ -878,144 +875,26 @@ impl<'a> OwnedTransactBuilder<'a> {
             .index_config
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
-
-        // Pre-built Txn IR path (e.g., SPARQL UPDATE lowered to Txn)
-        if let Some(txn) = self.core.pre_built_txn {
-            let txn_type = txn.txn_type;
-            let tracker = self
-                .core
-                .tracking
-                .clone()
-                .map(Tracker::new)
-                .unwrap_or_default();
-            let staged = if let Some(followup) = self.core.pre_built_txn_followup {
-                // Per-row relationship MERGE … ON MATCH SET: both branches stage
-                // into one commit, or an error returns with nothing committed.
-                self.fluree
-                    .stage_pair_from_txns(
-                        self.ledger,
-                        txn,
-                        followup,
-                        Some(&index_config),
-                        self.core.policy.as_ref(),
-                        Some(&tracker),
-                    )
-                    .await?
-            } else {
-                self.fluree
-                    .stage_transaction_from_txn(
-                        self.ledger,
-                        txn,
-                        Some(&index_config),
-                        self.core.policy.as_ref(),
-                        Some(&tracker),
-                    )
-                    .await?
-            };
-
-            return self
-                .fluree
-                .commit_stage_result(staged, txn_type, self.core.commit_opts, &index_config)
-                .await;
-        }
-
-        let op = self.core.operation.unwrap_or_else(|| {
-            unreachable!("validate ensures operation exists when pre_built_txn is None")
-        });
-
-        // Direct flake path for InsertTurtle (bypass JSON-LD / IR).
-        // Carry the caller's policy so f:modify enforcement still runs.
-        if let TransactOperation::InsertTurtle(turtle) = op {
-            let policy = self.core.policy;
-            return self
-                .fluree
-                .insert_turtle_with_opts(
-                    self.ledger,
-                    turtle,
-                    self.core.txn_opts,
-                    self.core.commit_opts,
-                    &index_config,
-                    policy.as_ref(),
-                )
-                .await;
-        }
-
-        // Graph ops: dedicated staging (a sync's whole-graph retraction wave
-        // has the no-change short-circuit — an identical payload commits
-        // nothing).
-        if let TransactOperation::Graph(op) = op {
-            let tracker = self
-                .core
-                .tracking
-                .clone()
-                .map(Tracker::new)
-                .unwrap_or_default();
-            let stage_result = self
-                .fluree
-                .stage_graph_op_tracked(
-                    self.ledger,
-                    &op,
-                    self.core.txn_opts,
-                    Some(&index_config),
-                    Some(&tracker),
-                    self.core.policy.as_ref(),
-                )
-                .await?;
-            return self
-                .fluree
-                .commit_stage_result(
-                    stage_result,
-                    TxnType::Insert,
-                    self.core.commit_opts,
-                    &index_config,
-                )
-                .await;
-        }
-        let txn_type = op.txn_type();
-        // Parse transaction, extracting TriG metadata and named graphs for Turtle inputs
-        let parsed = op.to_json_with_trig_meta()?;
-        let txn_json = parsed.json;
-        let trig_meta = parsed.trig_meta;
-        let named_graphs = parsed.named_graphs;
-
-        // Spawn raw transaction upload in parallel with the rest of the
-        // pipeline when explicitly opted-in, or let downstream attach it if
-        // a signed credential envelope has already been pre-set.
         let store_raw_txn = self.core.txn_opts.store_raw_txn.unwrap_or(false);
-        let commit_opts = if self.core.commit_opts.raw_txn_upload.is_none() && store_raw_txn {
-            let content_store = self.fluree.content_store(self.ledger.ledger_id());
-            self.core
-                .commit_opts
-                .with_raw_txn_spawned(content_store, txn_json.clone())
-        } else {
-            self.core.commit_opts
-        };
+        let tracker = self
+            .core
+            .tracking
+            .clone()
+            .map(Tracker::new)
+            .unwrap_or_default();
 
-        // If policy + tracking are set, use the tracked+policy path
-        // TODO: Add named_graphs support to tracked+policy path
-        if let Some(policy) = &self.core.policy {
-            let input =
-                TrackedTransactionInput::new(txn_type, &txn_json, self.core.txn_opts, policy);
-            let (result, _tally) = self
-                .fluree
-                .transact_tracked_with_policy(self.ledger, input, commit_opts, &index_config)
-                .await
-                .map_err(|e: TrackedErrorResponse| ApiError::http(e.status, e.error))?;
-            return Ok(result);
-        }
-
-        // Standard path: delegate to transact_with_named_graphs
-        self.fluree
-            .transact_with_named_graphs(
+        let (staged, txn_type, commit_opts, _) = self
+            .fluree
+            .stage_core(
                 self.ledger,
-                txn_type,
-                &txn_json,
-                self.core.txn_opts,
-                commit_opts,
+                self.core,
+                &tracker,
                 &index_config,
-                trig_meta.as_ref(),
-                &named_graphs,
+                store_raw_txn,
             )
+            .await?;
+        self.fluree
+            .commit_stage_result(staged, txn_type, commit_opts, &index_config)
             .await
     }
 
@@ -1030,138 +909,18 @@ impl<'a> OwnedTransactBuilder<'a> {
             .index_config
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
+        let tracker = self
+            .core
+            .tracking
+            .clone()
+            .map(Tracker::new)
+            .unwrap_or_else(Tracker::disabled);
 
-        // Pre-built Txn IR path
-        if let Some(txn) = self.core.pre_built_txn {
-            let tracker = self
-                .core
-                .tracking
-                .clone()
-                .map(Tracker::new)
-                .unwrap_or_default();
-            let stage_result = self
-                .fluree
-                .stage_transaction_from_txn(
-                    self.ledger,
-                    txn,
-                    Some(&index_config),
-                    self.core.policy.as_ref(),
-                    Some(&tracker),
-                )
-                .await?;
-            return Ok(Staged {
-                view: stage_result.view,
-                ns_registry: stage_result.ns_registry,
-                graph_delta: stage_result.graph_delta,
-            });
-        }
-
-        let op = self.core.operation.unwrap_or_else(|| {
-            unreachable!("validate ensures operation exists when pre_built_txn is None")
-        });
-
-        // Direct flake path for InsertTurtle
-        if let TransactOperation::InsertTurtle(turtle) = op {
-            let tracker = self
-                .core
-                .tracking
-                .clone()
-                .map(Tracker::new)
-                .unwrap_or_else(Tracker::disabled);
-            let tracker_ref = tracker.is_enabled().then_some(&tracker);
-            let stage_result = self
-                .fluree
-                .stage_turtle_insert(
-                    self.ledger,
-                    turtle,
-                    Some(&index_config),
-                    tracker_ref,
-                    self.core.policy.as_ref(),
-                )
-                .await?;
-            return Ok(Staged {
-                view: stage_result.view,
-                ns_registry: stage_result.ns_registry,
-                graph_delta: stage_result.graph_delta,
-            });
-        }
-
-        // Graph ops: dedicated staging (graph scope, sync retraction wave).
-        if let TransactOperation::Graph(op) = op {
-            let tracker = self
-                .core
-                .tracking
-                .clone()
-                .map(Tracker::new)
-                .unwrap_or_else(Tracker::disabled);
-            let tracker_ref = tracker.is_enabled().then_some(&tracker);
-            let stage_result = self
-                .fluree
-                .stage_graph_op_tracked(
-                    self.ledger,
-                    &op,
-                    self.core.txn_opts,
-                    Some(&index_config),
-                    tracker_ref,
-                    self.core.policy.as_ref(),
-                )
-                .await?;
-            return Ok(Staged {
-                view: stage_result.view,
-                ns_registry: stage_result.ns_registry,
-                graph_delta: stage_result.graph_delta,
-            });
-        }
-        let txn_type = op.txn_type();
-        // Parse transaction, extracting TriG metadata and named graphs for Turtle inputs
-        let parsed = op.to_json_with_trig_meta()?;
-        let txn_json = parsed.json;
-        let trig_meta = parsed.trig_meta;
-        let named_graphs = parsed.named_graphs;
-
-        // If policy is set, use the tracked+policy staging path
-        // TODO: Add named_graphs support to tracked+policy path
-        if let Some(policy) = &self.core.policy {
-            let tracker = Tracker::new(self.core.tracking.unwrap_or(TrackingOptions {
-                track_time: true,
-                track_fuel: true,
-                track_policy: true,
-                max_fuel: None,
-            }));
-            let input =
-                TrackedTransactionInput::new(txn_type, &txn_json, self.core.txn_opts, policy);
-            let stage_result = self
-                .fluree
-                .stage_transaction_tracked_with_policy(
-                    self.ledger,
-                    input,
-                    Some(&index_config),
-                    &tracker,
-                )
-                .await
-                .map_err(|e: TrackedErrorResponse| ApiError::http(e.status, e.error))?;
-
-            return Ok(Staged {
-                view: stage_result.view,
-                ns_registry: stage_result.ns_registry,
-                graph_delta: stage_result.graph_delta,
-            });
-        }
-
-        // Standard staging path with named graphs support
-        let stage_result = self
+        // No commit follows, so there is no raw transaction to upload.
+        let (stage_result, ..) = self
             .fluree
-            .stage_transaction_with_named_graphs(
-                self.ledger,
-                txn_type,
-                &txn_json,
-                self.core.txn_opts,
-                Some(&index_config),
-                trig_meta.as_ref(),
-                &named_graphs,
-            )
+            .stage_core(self.ledger, self.core, &tracker, &index_config, false)
             .await?;
-
         Ok(Staged {
             view: stage_result.view,
             ns_registry: stage_result.ns_registry,
@@ -1579,14 +1338,20 @@ impl Fluree {
         }
     }
 
-    /// Stage the request under the held write lock — the fast path's
-    /// three-way dispatch.
+    /// Stage a builder's request against `ledger_state`.
+    ///
+    /// The owned builder's `execute()` and `stage()`, the graph builder's
+    /// `stage()`, and the cached-handle commits that hold the write lock all
+    /// dispatch here, so they cannot stage a payload differently. The
+    /// lock-free cached-handle commit pre-parses into an [`OpPlan`] for its
+    /// retry loop and stages through [`Self::stage_plan`], whose arms call the
+    /// same staging functions.
     ///
     /// Handles pre-built `Txn` IR, pending SPARQL UPDATE text (parsed and
-    /// lowered here so the namespace registry built from the locked state
-    /// IS the staging registry), and document operations (insert/upsert/
+    /// lowered here so the namespace registry built from `ledger_state` IS
+    /// the staging registry), and document operations (insert/upsert/
     /// update for JSON-LD or Turtle/TriG).
-    async fn stage_under_lock(
+    pub(crate) async fn stage_core(
         &self,
         ledger_state: LedgerState,
         core: TransactCore<'_>,
@@ -1689,9 +1454,10 @@ impl Fluree {
         // Direct flake path for InsertTurtle (bypass JSON-LD / IR).
         if let TransactOperation::InsertTurtle(turtle) = op {
             let stage_result = self
-                .stage_turtle_insert(
+                .stage_turtle_insert_with_opts(
                     ledger_state,
                     turtle,
+                    core.txn_opts,
                     Some(index_config),
                     tracker_ref,
                     core.policy.as_ref(),
@@ -1800,9 +1566,10 @@ impl Fluree {
                     store_raw_txn,
                 );
                 let stage_result = self
-                    .stage_turtle_insert(
+                    .stage_turtle_insert_with_opts(
                         ledger_state,
                         turtle,
+                        txn_opts,
                         Some(index_config),
                         tracker_ref,
                         None,
@@ -2378,7 +2145,7 @@ impl Fluree {
         // Cypher RETURN — callers reject RETURN-carrying sequential
         // statements before submission.
         let (stage_result, txn_type, commit_opts, _cypher_return) = self
-            .stage_under_lock(
+            .stage_core(
                 write_guard.clone_state(),
                 core,
                 &tracker,
@@ -2512,7 +2279,7 @@ impl Fluree {
         {
             let write_guard = ledger.lock_for_write().await;
             let (stage_result, txn_type, commit_opts, cypher_return) = self
-                .stage_under_lock(
+                .stage_core(
                     write_guard.clone_state(),
                     core,
                     &tracker,

@@ -3,10 +3,10 @@
 //!
 //! The target graph is the constant of this command; the source of the
 //! desired contents is pluggable ([`SyncSource`]). Every source resolves to
-//! one JSON-LD payload and flows through the same verb — locally
-//! `Fluree::sync_named_graph_with`, remotely `POST /sync` — so adding a
-//! mapped source (R2RML over Iceberg / CSV / Excel) is one new variant here,
-//! not a new command or endpoint.
+//! one [`SyncPayload`] and flows through the same verb — locally
+//! `Fluree::sync_graph_with`, remotely `POST /sync` — so adding a mapped
+//! source (R2RML over Iceberg / CSV / Excel) is one new variant here, not a
+//! new command or endpoint.
 
 use crate::cli::PolicyArgs;
 use crate::commands::insert::{build_policy_ctx, resolve_inputs};
@@ -51,18 +51,34 @@ pub enum SyncSource {
     },
 }
 
+/// The desired contents, as submitted.
+pub enum SyncPayload {
+    JsonLd(serde_json::Value),
+    /// Sent as TriG: the Turtle-to-JSON-LD conversion has no graph blocks.
+    /// The API or server requires every block to name the target graph.
+    Trig(String),
+}
+
 impl SyncSource {
-    /// Materialize the desired contents as one JSON-LD payload.
+    /// Materialize the desired contents as one payload.
     ///
-    /// Turtle is converted client-side: the sync endpoint is JSON-LD only,
-    /// so a Turtle export (the common ontology-editor case) works against
-    /// any server that implements it.
-    pub fn into_payload(self) -> CliResult<serde_json::Value> {
+    /// Turtle is converted to JSON-LD client-side, so a Turtle export (the
+    /// common ontology-editor case) works against a server from before
+    /// `/sync` read RDF bodies. TriG is sent as-is.
+    pub fn into_payload(self) -> CliResult<SyncPayload> {
         match self {
             SyncSource::RdfText { content, format } => match format {
-                detect::DataFormat::JsonLd => Ok(serde_json::from_str(&content)?),
-                detect::DataFormat::Turtle => fluree_graph_turtle::parse_to_json(&content)
-                    .map_err(|e| CliError::Usage(format!("failed to parse Turtle: {e}"))),
+                detect::DataFormat::JsonLd => {
+                    Ok(SyncPayload::JsonLd(serde_json::from_str(&content)?))
+                }
+                // TriG always fails the Turtle parse, so a TriG body sniffed
+                // or named as Turtle is only looked for once that happens.
+                detect::DataFormat::Turtle => match fluree_graph_turtle::parse_to_json(&content) {
+                    Ok(json) => Ok(SyncPayload::JsonLd(json)),
+                    Err(_) if detect::is_trig_body(&content) => Ok(SyncPayload::Trig(content)),
+                    Err(e) => Err(CliError::Usage(format!("failed to parse Turtle: {e}"))),
+                },
+                detect::DataFormat::Trig => Ok(SyncPayload::Trig(content)),
             },
         }
     }
@@ -89,10 +105,13 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
 
     // The empty-payload gate is enforced server-side too; checking here
     // gives a precise message before any network or staging work.
-    let explicitly_empty = payload
-        .get("@graph")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(Vec::is_empty);
+    let explicitly_empty = match &payload {
+        SyncPayload::JsonLd(json) => json
+            .get("@graph")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty),
+        SyncPayload::Trig(_) => false,
+    };
     if explicitly_empty && !a.allow_empty {
         return Err(CliError::Usage(
             "payload is empty; syncing it would clear the graph — pass --allow-empty to confirm"
@@ -120,9 +139,18 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
             ..
         } => {
             let client = client.with_policy(a.policy.clone());
-            let response = client
-                .sync_jsonld(&remote_alias, a.graph, &payload, a.dry_run, a.allow_empty)
-                .await?;
+            let response = match &payload {
+                SyncPayload::JsonLd(json) => {
+                    client
+                        .sync_jsonld(&remote_alias, a.graph, json, a.dry_run, a.allow_empty)
+                        .await?
+                }
+                SyncPayload::Trig(trig) => {
+                    client
+                        .sync_trig(&remote_alias, a.graph, trig, a.dry_run, a.allow_empty)
+                        .await?
+                }
+            };
             context::persist_refreshed_tokens(&client, &remote_name, a.dirs).await;
             if a.json {
                 println!(
@@ -140,11 +168,15 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
                 Some(iri) => GraphSel::Graph(iri.to_string()),
                 None => GraphSel::Default,
             };
+            let graph_payload = match &payload {
+                SyncPayload::JsonLd(json) => GraphPayload::JsonLd(json),
+                SyncPayload::Trig(trig) => GraphPayload::Rdf(trig),
+            };
             let report = fluree
                 .sync_graph_with(
                     &alias,
                     &graph,
-                    GraphPayload::JsonLd(&payload),
+                    graph_payload,
                     SyncGraphOpts {
                         dry_run: a.dry_run,
                         allow_empty: a.allow_empty,
@@ -251,7 +283,10 @@ mod tests {
                 .to_string(),
             format: detect::DataFormat::Turtle,
         };
-        let payload = source.into_payload().expect("Turtle-star converts");
+        let SyncPayload::JsonLd(payload) = source.into_payload().expect("Turtle-star converts")
+        else {
+            panic!("Turtle converts to JSON-LD");
+        };
         let alice = payload
             .as_array()
             .expect("node array")
@@ -262,5 +297,43 @@ mod tests {
             alice["http://example.org/knows"][0]["@annotation"]["@id"],
             "http://example.org/claim1"
         );
+    }
+
+    fn payload_of(content: &str, format: detect::DataFormat) -> CliResult<SyncPayload> {
+        SyncSource::RdfText {
+            content: content.to_string(),
+            format,
+        }
+        .into_payload()
+    }
+
+    /// TriG goes out as TriG whether it was named as TriG or detected in a
+    /// body that sniffed as Turtle; Turtle with a `{` in a literal stays
+    /// Turtle, converted to JSON-LD.
+    #[test]
+    fn trig_is_sent_as_trig_and_turtle_as_json_ld() {
+        let trig =
+            "GRAPH <http://example.org/g> { <http://example.org/s> <http://example.org/p> 1 . }";
+        for format in [detect::DataFormat::Trig, detect::DataFormat::Turtle] {
+            assert!(matches!(
+                payload_of(trig, format),
+                Ok(SyncPayload::Trig(t)) if t == trig
+            ));
+        }
+        assert!(matches!(
+            payload_of(
+                "<http://example.org/s> <http://example.org/p> \"{v}\" .",
+                detect::DataFormat::Turtle
+            ),
+            Ok(SyncPayload::JsonLd(_))
+        ));
+        let err = payload_of(
+            "<http://example.org/s> <http://example.org/p>",
+            detect::DataFormat::Turtle,
+        )
+        .err()
+        .expect("malformed Turtle")
+        .to_string();
+        assert!(err.contains("failed to parse Turtle"), "{err}");
     }
 }

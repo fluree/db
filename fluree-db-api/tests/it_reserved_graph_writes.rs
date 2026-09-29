@@ -140,6 +140,16 @@ async fn trig_data_writes_refuse_the_txn_meta_graph() {
         err.contains("reserved system graph") && err.contains("#txn-meta"),
         "expected a reserved-graph refusal naming the graph, got: {err}"
     );
+    let err = fluree
+        .insert_turtle(ledger.clone(), &forged)
+        .await
+        .map(|_| ())
+        .expect_err("TriG insert into #txn-meta must be refused")
+        .to_string();
+    assert!(
+        err.contains("reserved system graph") && err.contains("#txn-meta"),
+        "insert: expected a reserved-graph refusal naming the graph, got: {err}"
+    );
 
     // Control: the same TriG shape into a user graph still commits.
     let ok =

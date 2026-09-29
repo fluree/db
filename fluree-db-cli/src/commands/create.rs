@@ -467,7 +467,7 @@ pub async fn run(
             let format = detect::detect_data_format(Some(path), &content, None)?;
 
             match format {
-                detect::DataFormat::Turtle => {
+                detect::DataFormat::Turtle | detect::DataFormat::Trig => {
                     // Safety redirect: if a .ttl file reaches this branch
                     // (e.g., due to path/extension edge cases), always route
                     // through the import pipeline to avoid novelty limits.

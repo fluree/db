@@ -223,7 +223,7 @@ See [SPARQL UPDATE](../query/sparql.md#sparql-update) for complete documentation
 
 Fluree exposes four transaction endpoints (all under `/v1/fluree/`):
 
-- `POST /insert` — add triples (JSON-LD or Turtle)
+- `POST /insert` — add triples (JSON-LD, Turtle, TriG)
 - `POST /update` — WHERE/DELETE/INSERT (JSON-LD) and SPARQL UPDATE
 - `POST /upsert` — replace values for the predicates you supply (JSON-LD, Turtle, TriG)
 - `POST /sync` — make one graph's contents exactly the payload, committing only the delta (JSON-LD, Turtle, N-Triples or TriG)

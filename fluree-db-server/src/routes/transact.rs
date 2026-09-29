@@ -4,7 +4,7 @@
 //! - `application/json`: JSON-LD transaction format (update/insert/upsert)
 //! - `application/sparql-update`: SPARQL UPDATE syntax (update only)
 //! - `text/turtle`: Turtle RDF format (insert/upsert only)
-//! - `application/trig`: TriG format with named graphs (upsert only)
+//! - `application/trig`: TriG format with named graphs (insert/upsert only)
 //!
 //! # Ledger Selection Priority
 //!
@@ -17,7 +17,7 @@
 //! # Turtle vs TriG Semantics
 //!
 //! - **Turtle on `/insert`**: Uses fast direct flake path. Pure insert semantics.
-//! - **TriG on `/insert`**: Returns 400 error. Named graphs require upsert path.
+//! - **TriG on `/insert`**: Insert semantics; GRAPH blocks land in their named graphs.
 //! - **Turtle/TriG on `/upsert`**: Uses upsert path with GRAPH block extraction for named graphs.
 
 use crate::config::ServerRole;
@@ -2088,14 +2088,13 @@ fn graph_iri(graph: &GraphSel) -> Option<String> {
 ///
 /// This function handles both:
 /// - text/turtle: Standard Turtle format (insert, upsert or sync)
-/// - application/trig: TriG format with GRAPH blocks for named graphs (upsert or sync)
+/// - application/trig: TriG format with GRAPH blocks for named graphs (insert, upsert or sync)
 ///
 /// # Insert vs Upsert Semantics
 ///
-/// - **Insert with Turtle** (`text/turtle` on `/insert`): Uses direct flake parsing (fast path).
-///   Pure insert - will fail if subjects already exist with conflicting data.
-/// - **Insert with TriG** (`application/trig` on `/insert`): Not supported - returns 400.
-///   Named graphs require the upsert path for GRAPH block extraction.
+/// - **Insert with Turtle/TriG** (`/insert`): Pure insert. Turtle parses directly to flakes;
+///   a TriG body (detected by the API, under either content type) lands its GRAPH blocks in
+///   their named graphs. Both travel as `TransactionBody::TurtleInsert`.
 /// - **Upsert with Turtle/TriG** (`/upsert`): Uses `upsert_turtle` which handles GRAPH blocks
 ///   and supports named graph ingestion. For each (subject, predicate) pair, existing values
 ///   are retracted before new values are asserted.
@@ -2124,19 +2123,6 @@ pub(crate) async fn execute_turtle_transaction(
     );
     async move {
         let span = tracing::Span::current();
-
-        // TriG carries `GRAPH` blocks, which need the upsert path. The
-        // op-type is constrained by [`TurtleOp`] at the boundary; the
-        // is_trig check below is the one invariant that lives at runtime
-        // because content-type is parsed from HTTP.
-        if is_trig && op == TurtleOp::Insert {
-            set_span_error_code(&span, "error:BadRequest");
-            tracing::warn!("TriG format not supported on insert endpoint");
-            return Err(ServerError::bad_request(
-                "TriG format (application/trig) is not supported on the insert endpoint. \
-                 Named graph ingestion requires the upsert endpoint (/upsert or /:ledger/upsert).",
-            ));
-        }
 
         // Compute tx-id from Turtle string
         let tx_id = compute_tx_id_turtle(turtle);
@@ -2174,8 +2160,8 @@ pub(crate) async fn execute_turtle_transaction(
 
         // Tracking is header-driven and applies to every format.
         let tracking = tracking_from_headers(headers);
-        // (TriG, Insert) was rejected above. Sync reads GRAPH blocks from
-        // either content type.
+        // Sync, insert and upsert all read GRAPH blocks from either content
+        // type.
         let body = match op {
             TurtleOp::Graph {
                 graph,

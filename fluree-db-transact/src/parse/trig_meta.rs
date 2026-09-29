@@ -54,6 +54,7 @@ use crate::namespace::NamespaceRegistry;
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES};
 use fluree_graph_turtle::{tokenize, Token, TokenKind};
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 
 /// IRI reference for the transaction metadata named graph.
 ///
@@ -121,9 +122,10 @@ pub struct RawReifiedTriple {
 
 /// Result of Phase 1 TriG parsing (before namespace resolution).
 #[derive(Debug, Clone)]
-pub struct TrigPhase1Result {
-    /// Cleaned Turtle content (GRAPH blocks removed).
-    pub turtle: String,
+pub struct TrigPhase1Result<'a> {
+    /// Cleaned Turtle content (GRAPH blocks removed). Borrows the input when
+    /// it cannot contain a graph block, so plain Turtle is not copied.
+    pub turtle: Cow<'a, str>,
     /// Raw metadata entries from txn-meta graph (if present).
     pub raw_meta: Option<RawTrigMeta>,
     /// Named graph blocks (non-txn-meta graphs).
@@ -195,11 +197,11 @@ pub enum RawObject {
 ///
 /// The raw metadata can be converted to `TxnMetaEntry` using `resolve_trig_meta()`
 /// once a `NamespaceRegistry` is available.
-pub fn parse_trig_phase1(input: &str) -> Result<TrigPhase1Result> {
+pub fn parse_trig_phase1(input: &str) -> Result<TrigPhase1Result<'_>> {
     // Check if input might contain a graph block - if not, pass through as-is
     if !might_contain_graph_block(input) {
         return Ok(TrigPhase1Result {
-            turtle: input.to_string(),
+            turtle: Cow::Borrowed(input),
             raw_meta: None,
             named_graphs: Vec::new(),
         });
@@ -438,13 +440,16 @@ pub fn extract_trig_txn_meta(
 /// The `GRAPH` keyword is still checked so a malformed `GRAPH <iri>` (missing
 /// braces) is routed to the parser for a proper error rather than passed
 /// through silently.
-fn might_contain_graph_block(input: &str) -> bool {
+///
+/// Scans without copying: a caller that only needs to rule TriG out, such as
+/// a failed Turtle insert, may be holding a very large document.
+pub fn might_contain_graph_block(input: &str) -> bool {
     // Cheap, common-case-first: a brace is present in every graph block.
-    if input.contains('{') {
-        return true;
-    }
-    // Case-insensitive check for the GRAPH keyword.
-    input.to_ascii_uppercase().contains("GRAPH")
+    input.contains('{')
+        || input
+            .as_bytes()
+            .windows(5)
+            .any(|w| w.eq_ignore_ascii_case(b"GRAPH"))
 }
 
 /// Parser state for TriG metadata extraction.
@@ -1735,7 +1740,7 @@ impl<'a> TrigMetaParser<'a> {
     }
 
     /// Phase 1 extraction: return raw triples without namespace resolution.
-    fn extract_phase1(self) -> Result<TrigPhase1Result> {
+    fn extract_phase1(self) -> Result<TrigPhase1Result<'static>> {
         // Reconstruct Turtle content (directives + default triples)
         let mut turtle = String::new();
 
@@ -1859,7 +1864,7 @@ impl<'a> TrigMetaParser<'a> {
         }
 
         Ok(TrigPhase1Result {
-            turtle,
+            turtle: Cow::Owned(turtle),
             raw_meta,
             named_graphs,
         })
@@ -1918,6 +1923,28 @@ mod tests {
 
     fn test_registry() -> NamespaceRegistry {
         NamespaceRegistry::new()
+    }
+
+    #[test]
+    fn graph_block_check_matches_the_keyword_in_any_case() {
+        for trig in [
+            "<http://example.org/g> { <s> <p> <o> . }",
+            "GRAPH <http://example.org/g>",
+            "graph <http://example.org/g>",
+            "Graph <http://example.org/g>",
+        ] {
+            assert!(might_contain_graph_block(trig), "{trig}");
+        }
+        assert!(!might_contain_graph_block(
+            "@prefix ex: <http://example.org/> . ex:a ex:b \"grap\" ."
+        ));
+    }
+
+    #[test]
+    fn phase1_borrows_a_document_with_no_graph_blocks() {
+        let turtle = "@prefix ex: <http://example.org/> . ex:a ex:b \"c\" .";
+        let phase1 = parse_trig_phase1(turtle).unwrap();
+        assert!(matches!(phase1.turtle, Cow::Borrowed(t) if t == turtle));
     }
 
     #[test]

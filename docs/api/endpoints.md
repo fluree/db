@@ -88,7 +88,7 @@ Note: Cypher targets a ledger directly and must use the path form
 raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the
 [Cypher reference](../query/cypher.md) for details.
 
-Note: Turtle/TriG are not accepted on `/update`. Use `/insert` (Turtle) or `/upsert` (Turtle/TriG).
+Note: Turtle/TriG are not accepted on `/update`. Use `/insert` or `/upsert`.
 
 **Request Body (JSON-LD):**
 
@@ -244,7 +244,7 @@ curl -X POST http://localhost:8090/v1/fluree/update \
       WHERE { ?s ex:name "Alice" . ?s ex:age ?old }'
 ```
 
-Note: Turtle and TriG are not accepted on `/update`. Use `/insert` (Turtle) or `/upsert` (Turtle/TriG).
+Note: Turtle and TriG are not accepted on `/update`. Use `/insert` or `/upsert`.
 
 ### POST /insert
 
@@ -260,8 +260,7 @@ POST /insert/{ledger-id}
 - `application/json` - JSON-LD
 - `text/turtle` - Turtle (fast direct flake path)
 - `application/n-triples` - N-Triples (parsed as Turtle)
-
-**Note:** TriG (`application/trig`) is **not supported** on the insert endpoint. Named graph ingestion via GRAPH blocks requires the upsert path. Use `/upsert` for TriG data, or [`/sync`](#post-sync) to replace one named graph's contents.
+- `application/trig` - TriG: `GRAPH` blocks land in their named graphs, and a `<#txn-meta>` block becomes commit metadata. A `text/turtle` body with graph blocks is read the same way. To replace one named graph's contents instead, use [`/sync`](#post-sync).
 
 **Example (JSON-LD):**
 ```bash

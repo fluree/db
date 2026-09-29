@@ -491,7 +491,7 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Data format (turtle or jsonld); auto-detected if omitted
+        /// Data format (turtle, trig or jsonld); auto-detected if omitted
         #[arg(long)]
         format: Option<String>,
 
@@ -578,7 +578,7 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Data format (turtle or jsonld); auto-detected if omitted
+        /// Data format (turtle, trig or jsonld); auto-detected if omitted
         #[arg(long)]
         format: Option<String>,
 

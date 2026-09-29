@@ -347,10 +347,11 @@ MATCH (n:Person {id: 7}) RETURN n
 
 - `POST {api_base_url}/sync/*ledger?graph=<iri>[&dryRun=true][&allowEmpty=true]`
 
-Makes one named graph's contents exactly the JSON-LD payload, committing
-only the delta. Data-bearer auth (same bracket as `/insert` / `/upsert`),
-not admin. The CLI converts Turtle to JSON-LD client-side, so the endpoint
-only ever sees `application/json`. A dry run answers with a delta report and
+Makes one named graph's contents exactly the payload, committing only the
+delta. Data-bearer auth (same bracket as `/insert` / `/upsert`), not admin.
+The CLI converts Turtle to JSON-LD client-side and sends it as
+`application/json`; TriG, which that conversion cannot carry, is sent as
+`application/trig`. A dry run answers with a delta report and
 must commit nothing; a real run answers with the standard transact response.
 Designed so the CLI's source of desired contents (today RDF text; later
 R2RML-mapped Iceberg / CSV / spreadsheet data) is invisible to the server —
@@ -1516,7 +1517,7 @@ Content-Type: application/json
 | `default` (query) | No | Bare key: sync the default graph, said explicitly. Passing it with `graph` is a `400`. The CLI omits `graph` for the default graph. |
 | `dryRun` (query) | No | `true` → stage and report the delta; commit nothing. |
 | `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |
-| body | Yes | The graph's desired full contents: insert-shaped JSON-LD, or Turtle / N-Triples / TriG by `Content-Type` (see [Payload formats](../transactions/sync.md#payload-formats)). The CLI always sends JSON-LD (Turtle is converted client-side), so it works against servers that predate RDF bodies. Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
+| body | Yes | The graph's desired full contents: insert-shaped JSON-LD, or Turtle / N-Triples / TriG by `Content-Type` (see [Payload formats](../transactions/sync.md#payload-formats)). The CLI sends JSON-LD for JSON-LD and Turtle (converted client-side), so those work against servers that predate RDF bodies; it sends TriG as `application/trig`. Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
 
 ### Auth
 

@@ -6,7 +6,7 @@ instead of rejecting a transaction the way staging-time enforcement does,
 result it finds.
 
 ```bash
-fluree validate [<ledger[:branch]> | <file.ttl|file.jsonld>] [options]
+fluree validate [<ledger[:branch]> | <file.ttl|file.nt|file.jsonld>] [options]
 ```
 
 Requires the `shacl` build feature (enabled by default).
@@ -38,12 +38,18 @@ A file that embeds its own shapes validates against them (staging-time
 enforcement is disabled during the ephemeral load, so violating data can't
 be rejected before the report is produced).
 
+File mode reads Turtle (`.ttl`, or `.nt` for N-Triples) and JSON-LD. It
+validates one graph, so a TriG file is refused, including one saved under
+another extension. To validate TriG data, load it into a ledger with
+`fluree insert` and validate that ledger with `--graph <iri>` for each named
+graph.
+
 ## Options
 
 | Option | Description |
 |--------|-------------|
 | `--graph <iri>` | Validate a named data graph instead of the default graph |
-| `--shacl <file>` | Shapes file (Turtle or JSON-LD). **Replaces** the ledger's attached shapes by default |
+| `--shacl <file>` | Shapes file (Turtle, N-Triples or JSON-LD; TriG is refused). **Replaces** the ledger's attached shapes by default |
 | `--shacl-graph <iri>` | Named graph in the target ledger holding the shapes (conflicts with `--shacl`) |
 | `--include-attached` | Union ad-hoc shapes with the attached shapes instead of replacing them |
 | `--format <fmt>` | `table` (default, human), `jsonld`, or `turtle` (W3C `sh:ValidationReport`) |
