@@ -265,6 +265,89 @@ fn branch_create_at_and_query_at_accept_the_same_spellings() {
     }
 }
 
+/// `branch create --at time:X` starts the branch where `query --at time:X`
+/// reads, by either timestamp spelling. No `index` first: time resolution
+/// reads unindexed commits too.
+#[test]
+fn branch_create_at_time_matches_query_at_time() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "tttime"])
+        .assert()
+        .success();
+    let insert = |val: &str| {
+        fluree_cmd(&tmp)
+            .args([
+                "insert",
+                "-e",
+                &format!("@prefix ex: <http://example.org/> .\nex:{val} ex:val \"{val}\" ."),
+            ])
+            .assert()
+            .success();
+    };
+    insert("first");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let between = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    insert("second");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--at",
+            &format!("time:{between}"),
+            "-e",
+            SELECT_VALS,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("first"))
+        .stdout(predicate::str::contains("second").not());
+
+    for (branch, tag) in [("b_time", "time"), ("b_iso", "iso")] {
+        fluree_cmd(&tmp)
+            .args([
+                "branch",
+                "create",
+                branch,
+                "--at",
+                &format!("{tag}:{between}"),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("t=1"));
+        fluree_cmd(&tmp)
+            .args([
+                "query",
+                "-l",
+                &format!("tttime:{branch}"),
+                "--sparql",
+                "-e",
+                SELECT_VALS,
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("first"))
+            .stdout(predicate::str::contains("second").not());
+    }
+
+    // Before the first commit: the time resolver's refusal, not a commit lookup.
+    fluree_cmd(&tmp)
+        .args([
+            "branch",
+            "create",
+            "b_early",
+            "--at",
+            "time:2000-01-01T00:00:00Z",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no data as of"))
+        .stderr(predicate::str::contains("No commit found with prefix").not());
+}
+
 /// `fluree show` named the same commit two ways depending on the spelling, and
 /// rejected the bare integer that `query --at` required.
 #[test]
@@ -396,11 +479,11 @@ fn history_on_the_default_branch_is_unchanged() {
 /// looks for them. All four surfaces list the same grammar.
 #[test]
 fn help_text_lists_the_accepted_spellings() {
-    for (args, expect_time_axes) in [
-        (vec!["query", "--help"], true),
-        (vec!["export", "--help"], true),
-        (vec!["history", "--help"], true),
-        (vec!["branch", "create", "--help"], false),
+    for args in [
+        vec!["query", "--help"],
+        vec!["export", "--help"],
+        vec!["history", "--help"],
+        vec!["branch", "create", "--help"],
     ] {
         let out = cargo_bin_cmd!("fluree")
             .env("NO_COLOR", "1")
@@ -418,15 +501,12 @@ fn help_text_lists_the_accepted_spellings() {
             "`fluree {}` must document commit:<prefix>:\n{stdout}",
             args.join(" ")
         );
-        if expect_time_axes {
-            // `branch create --at` names a commit, so it has no timestamp axes.
-            assert!(
-                stdout.contains("time:<ISO-8601>")
-                    && stdout.contains("`iso:` is an alias")
-                    && stdout.contains("recorded:<ISO-8601>"),
-                "`fluree {}` must document the timestamp axes and the iso: alias:\n{stdout}",
-                args.join(" ")
-            );
-        }
+        assert!(
+            stdout.contains("time:<ISO-8601>")
+                && stdout.contains("`iso:` is an alias")
+                && stdout.contains("recorded:<ISO-8601>"),
+            "`fluree {}` must document the timestamp axes and the iso: alias:\n{stdout}",
+            args.join(" ")
+        );
     }
 }

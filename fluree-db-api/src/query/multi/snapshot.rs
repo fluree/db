@@ -25,6 +25,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use crate::query::multi::AsOf;
 use crate::{time_resolve, ApiError, Fluree, Result};
 use fluree_db_core::ledger_id::TIME_TRAVEL_TAGS;
+use fluree_db_query::QueryError;
 
 /// Resolved per-ledger `t` map for an envelope, plus the wall-clock moment it
 /// represents (echoed back to the client).
@@ -44,9 +45,8 @@ pub struct EnvelopeSnapshot {
     pub ledgers: HashMap<String, i64>,
 }
 
-/// Failure modes specific to snapshot resolution. These map to a 5xx envelope
-/// response — they indicate an infrastructure-side failure to honor a
-/// syntactically-valid `asOf`.
+/// Failure modes specific to snapshot resolution. The caller's mistakes keep
+/// their class as an [`ApiError`]; see its `From` impl.
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeSnapshotError {
     #[error("invalid ISO 8601 timestamp for asOf: {iso} ({source})")]
@@ -60,9 +60,27 @@ pub enum EnvelopeSnapshotError {
     PerLedgerResolve { ledger: String, source: ApiError },
 }
 
+/// An `asOf` that is malformed or names no data on a ledger is a 400, and a
+/// ledger that does not exist a 404, as each is on a single query. Anything
+/// else is a failure to honor a valid `asOf`.
 impl From<EnvelopeSnapshotError> for ApiError {
     fn from(err: EnvelopeSnapshotError) -> Self {
-        ApiError::internal(err.to_string())
+        match err {
+            EnvelopeSnapshotError::InvalidIso { .. } => ApiError::invalid_query(err.to_string()),
+            EnvelopeSnapshotError::LedgerLoad { source, .. }
+            | EnvelopeSnapshotError::PerLedgerResolve { source, .. }
+                if source.is_not_found() =>
+            {
+                source
+            }
+            EnvelopeSnapshotError::PerLedgerResolve {
+                ledger,
+                source: ApiError::Query(QueryError::InvalidQuery(msg)),
+            } => ApiError::invalid_query(format!(
+                "failed to resolve asOf for ledger '{ledger}': {msg}"
+            )),
+            other => ApiError::internal(other.to_string()),
+        }
     }
 }
 

@@ -26,14 +26,16 @@ fluree branch create <NAME> [OPTIONS]
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--from <BRANCH>` | Source branch to create from (defaults to "main") |
-| `--at <COMMIT-REF>` | Commit to branch at (defaults to source branch HEAD). Accepts `t:<N>` or a bare transaction number, `commit:<prefix>` or a bare hex digest prefix (min 6 chars), or a full CID. A bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Unlike `query --at` this names a *commit*, so it has no `time:`, `recorded:` or `latest` forms; the spellings the two share mean the same thing on both. |
+| `--at <TIME>` | Point on the source branch to branch at (defaults to its HEAD). Same spellings as `query --at`: `t:<N>` or a bare transaction number, `time:<ISO-8601>` (commit event time; `iso:` is an alias) or a bare ISO-8601 timestamp, `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), `commit:<prefix>` or a bare hex digest prefix (min 6 chars), a full CID, or `latest` / `t:latest` (the HEAD). A bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
 
 Creates a new branch for a ledger. By default the branch starts at the source branch's current HEAD, and is fully isolated — subsequent transactions on either branch are invisible to the other.
 
-Pass `--at` to branch from a historical commit on the source branch instead of its HEAD. The commit must be on the source branch's line of commits, which runs through its fork point into the branch it came from. A commit that reached the branch through a merge is refused: the branch never replays it, because what the merge contributed is folded into the merge commit. Branch at the merge commit instead, or on the branch that made the commit. The new branch starts with no index and replays from genesis on first query. `t:N` and hex-prefix resolution require the source branch to be indexed (full CIDs work unconditionally).
+Pass `--at` to branch from an earlier point on the source branch instead of its HEAD. The new branch starts at the commit that `fluree query --at` with the same value reads on the source: `--at time:2026-01-01T00:00:00Z` gives you the data as of that instant, resolved exactly as a query at that time resolves it. A time before the source's first commit, a malformed timestamp, a transaction number below 1, and `snapshot:<id>` (which names a graph source's table snapshot, not a commit) are rejected.
+
+The commit must be on the source branch's line of commits, which runs through its fork point into the branch it came from. A commit that reached the branch through a merge is refused: the branch never replays it, because what the merge contributed is folded into the merge commit. Branch at the merge commit instead, or on the branch that made the commit. The new branch starts with no index and replays from genesis on first query.
 
 Branches can be nested: you can create a branch from any existing branch, not just "main".
 
@@ -55,6 +57,9 @@ fluree branch create rewind --at 5          # same commit
 
 # Branch at a historical commit by hex-digest prefix
 fluree branch create rewind --at 3dd028a7
+
+# Branch at the data as of a point in time
+fluree branch create q2 --at time:2026-07-01T00:00:00Z
 
 # Create a branch on a remote server
 fluree branch create staging --ledger mydb --remote origin
@@ -375,7 +380,7 @@ fluree branch revert <COMMITS>...
 fluree branch revert --from <COMMIT> --to <COMMIT>
 ```
 
-Accepts either positional commit references (cherry-pick style, one or several) or a git-style range. Each commit reference may be a `t:<N>` or bare transaction number, a `commit:<prefix>` or bare hex digest prefix, or a full commit ID — the same forms `branch create --at` accepts.
+Accepts either positional commit references (cherry-pick style, one or several) or a git-style range. Each commit reference may be a `t:<N>` or bare transaction number, a `commit:<prefix>` or bare hex digest prefix, or a full commit ID — the commit spellings `branch create --at` also accepts. A revert names the commit to undo, so it has no timestamp forms.
 
 A commit must be on the branch's own history, which is the line of commits reached by following each merge's first parent. When the selected commits have nothing to undo, such as one that only registered a graph, no commit is written: the command reports that nothing was reverted and HEAD stays where it was. The genesis commit, a merge commit, and a commit that reached this branch through a merge are all refused: the first two have no single change to undo, and the third belongs to the branch that authored it, where its own history can say what changed after it. Revert it there and merge again.
 

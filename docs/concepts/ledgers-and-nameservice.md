@@ -519,10 +519,14 @@ This metadata enables the system to reconstruct the `BranchedContentStore` tree 
 **Rust:**
 ```rust
 // Create a branch from main (default)
-let record = fluree.create_branch("mydb", "dev", None).await?;
+let record = fluree.create_branch("mydb", "dev", None, None).await?;
 
 // Create a branch from another branch
-let record = fluree.create_branch("mydb", "feature", Some("dev")).await?;
+let record = fluree.create_branch("mydb", "feature", Some("dev"), None).await?;
+
+// Create a branch from main's data as of a point in time
+let at = TimeSpec::parse_at("time:2026-06-30T23:59:59Z")?;
+let record = fluree.create_branch("mydb", "q2-close", None, Some(at)).await?;
 
 // List all branches
 let branches = fluree.list_branches("mydb").await?;

@@ -480,7 +480,7 @@ when the bearer cannot read it). See
 
 ### `fluree branch create --remote <name>` (admin-protected)
 
-- `POST {api_base_url}/branch` with `{ ledger, branch, source? }`
+- `POST {api_base_url}/branch` with `{ ledger, branch, source?, at? }`
 
 Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 [Branch Create Contract](#branch-create-contract).
@@ -1210,6 +1210,7 @@ The body type mirrors `fluree-db-server::routes::ledger::CreateBranchRequest`.
 | `ledger` | string | Yes | — | Ledger name without branch suffix. |
 | `branch` | string | Yes | — | New branch name. Must pass `validate_branch_name`. |
 | `source` | string | No | `"main"` | Parent branch to fork from. The source must already exist and have at least one commit. |
+| `at` | string | No | source HEAD | Point on the source to branch at, sent as typed to `--at`. The server parses it with `TimeSpec::parse_at`, the grammar local `--at` uses: `t:<N>`, `time:<ISO-8601>` / `iso:`, `recorded:<ISO-8601>`, `commit:<prefix>`, `latest`, or a bare transaction number, timestamp, hex prefix or CID. |
 
 ### Auth
 
@@ -1243,9 +1244,9 @@ The CLI's pretty-printer (`print_branch_created` in
 
 | Status | When |
 |--------|------|
-| `400` | Invalid branch name (per `validate_branch_name`); the source branch has no commits yet (`ApiError::InvalidBranch`); malformed JSON body. |
+| `400` | Invalid branch name (per `validate_branch_name`); malformed JSON body; malformed `at`; the source branch has no commits yet (`ApiError::InvalidBranch`); `at` names no commit on the source (a time before its first commit, a malformed timestamp, a transaction number below 1, `snapshot:<id>`). |
 | `401` / `403` | Admin token required and absent/invalid (see admin-auth middleware). |
-| `404` | Source branch does not exist. |
+| `404` | Source branch does not exist, or `at` names a commit that is not on the source's line. |
 | `409` | A branch with this name already exists (`ApiError::LedgerExists` → 409). |
 | `5xx` | Nameservice / storage / index-copy errors. |
 

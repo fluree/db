@@ -461,7 +461,7 @@ async fn resolve_t_to_commit_id(
     use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB};
 
     if target_t < 1 {
-        return Err(ApiError::query(format!(
+        return Err(ApiError::invalid_query(format!(
             "Transaction number must be >= 1, got {target_t}"
         )));
     }

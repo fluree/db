@@ -591,6 +591,102 @@ async fn create_branch_at_historical_t() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// `at` takes a point in time, as a query's `@time:` does. Event times are
+/// pinned through `opts.eventTime` so the instants between commits are exact.
+#[tokio::test]
+async fn create_branch_at_time() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "dated:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    for (i, event_time) in [
+        "2020-01-01T00:00:00Z",
+        "2021-01-01T00:00:00Z",
+        "2022-01-01T00:00:00Z",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": format!("ex:item{i}"), "ex:val": i}],
+            "opts": {"eventTime": event_time},
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert")
+                    .header("content-type", "application/json")
+                    .header("fluree-ledger", "dated:main")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "insert {i} failed: {json}");
+    }
+
+    let branch = |name: &str, at: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/branch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"ledger": "dated", "branch": name, "at": at}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    for (name, at, expected_t) in [
+        ("q2020", "time:2020-06-01T00:00:00Z", 1),
+        ("q2021", "iso:2021-06-01T00:00:00Z", 2),
+    ] {
+        let resp = app.clone().oneshot(branch(name, at)).await.unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::CREATED, "{at}: {json}");
+        assert_eq!(
+            json.get("t").and_then(serde_json::Value::as_i64),
+            Some(expected_t),
+            "{at}: {json}"
+        );
+    }
+
+    for (at, expect) in [
+        ("time:2019-01-01T00:00:00Z", "no data as of"),
+        ("time:2021-13-45T00:00:00Z", "Invalid ISO-8601 timestamp"),
+        ("t:0", "must be >= 1"),
+        ("0", "must be >= 1"),
+        ("-3", "must be >= 1"),
+        ("snapshot:7", "@snapshot:"),
+        ("time:", "Missing value after 'time:'"),
+    ] {
+        let resp = app.clone().oneshot(branch("nowhere", at)).await.unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{at}: {json}");
+        // A branch request, so not reported as an invalid query.
+        assert_eq!(json["@type"], "err:api/BadRequest", "{at}: {json}");
+        assert!(json.to_string().contains(expect), "{at}: {json}");
+    }
+}
+
 #[tokio::test]
 async fn create_branch_from_empty_ledger_is_bad_request() {
     let (_tmp, state) = test_state().await;

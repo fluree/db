@@ -1731,17 +1731,16 @@ pub enum BranchAction {
         #[arg(long)]
         from: Option<String>,
 
-        /// Commit to branch at (defaults to source branch HEAD).
+        /// Point on the source branch to branch at (defaults to its HEAD).
         ///
-        /// Accepts `t:<N>` or a bare transaction number, `commit:<prefix>` or
-        /// a bare hex digest prefix, or a full CID. A bare integer is read as
-        /// a transaction number, so use `commit:<prefix>` to force a prefix
-        /// that is all digits. The source branch must be indexed for `t:` /
-        /// prefix resolution (full CIDs work unconditionally).
-        ///
-        /// Unlike `query --at` this names a *commit*, so it has no `time:`,
-        /// `recorded:` or `latest` forms; the spellings the two share mean the
-        /// same thing on both.
+        /// Same spellings as `query --at`: `t:<N>` (transaction number),
+        /// `t:latest`/`latest`, `time:<ISO-8601>` (commit event time; `iso:` is
+        /// an alias), `recorded:<ISO-8601>` (the wall-clock time the commit was
+        /// recorded), and `commit:<prefix>` (hex digest, min 6 chars). A bare
+        /// transaction number, ISO-8601 timestamp, commit prefix, or full CID
+        /// also works; a bare integer is read as a transaction number, so use
+        /// `commit:<prefix>` to force a prefix that is all digits. The branch
+        /// starts at the commit `query --at` with the same value would read.
         #[arg(long)]
         at: Option<String>,
 

@@ -219,9 +219,10 @@ A sub-query whose opts didn't enable tracking will not appear in the `tracking` 
 | HTTP code | Meaning |
 |-----------|---------|
 | `200` | Envelope parsed, validated, executed. Body's `status` reports the aggregate (`ok` / `partial` / `all_failed`). Per-alias errors and timeouts live inside `errors`. |
-| `400` | Envelope validation failed (bounds violation, `asOf` collision, missing `from`, malformed body, history query, envelope `max-fuel`, `maxConcurrency: 0`, etc.). No `results` / `errors` keys — the body is the standard error shape. |
+| `400` | Envelope validation failed (bounds violation, `asOf` collision, missing `from`, malformed body, history query, envelope `max-fuel`, `maxConcurrency: 0`, etc.), or an ISO `asOf` is malformed or falls before a referenced ledger's first commit. No `results` / `errors` keys — the body is the standard error shape. |
 | `401` | Authentication required and missing. |
-| `500` | Envelope infrastructure failed: snapshot resolution couldn't load a ledger, response would exceed the configured size cap during assembly, server-side panic. |
+| `404` | A referenced ledger does not exist. |
+| `500` | Envelope infrastructure failed: snapshot resolution couldn't load a ledger that exists, response would exceed the configured size cap during assembly, server-side panic. |
 
 ---
 

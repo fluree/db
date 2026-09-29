@@ -2173,8 +2173,9 @@ impl RemoteLedgerClient {
     /// Create a new branch on the remote server.
     ///
     /// Calls `POST {base_url}/branch` with a JSON body. `at` optionally
-    /// specifies a historical commit to branch from (as accepted by
-    /// `CommitRef::parse`, e.g. `"t:5"` or a hex digest / full CID).
+    /// specifies the point on the source to branch from, passed through
+    /// unparsed: the server reads it with `TimeSpec::parse_at`, as the local
+    /// path does (e.g. `"t:5"`, `"time:2026-01-01T00:00:00Z"`, a hex digest).
     pub async fn create_branch(
         &self,
         ledger: &str,

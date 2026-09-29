@@ -202,13 +202,13 @@ fn parse_format(s: &str) -> Result<ExportFormat> {
     }
 }
 
-/// Parse the request's `at` field.
+/// Parse the request's `at` field. `POST /branch` parses its `at` here too.
 ///
 /// Shares [`TimeSpec::parse_at`] with `fluree query --at` and `fluree export
 /// --at` (#1805). This was a byte-identical copy of the CLI's old heuristic, so
 /// `POST /export {"at": "t:2"}` sent the literal string `t:2` to the commit
 /// prefix resolver exactly as the CLI did.
-fn parse_time_spec(at: &str) -> Result<TimeSpec> {
+pub(crate) fn parse_time_spec(at: &str) -> Result<TimeSpec> {
     TimeSpec::parse_at(at)
         .map_err(|e| ServerError::bad_request(format!("invalid 'at' time spec: {e}")))
 }
