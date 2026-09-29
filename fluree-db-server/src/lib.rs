@@ -121,7 +121,13 @@ async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25W
         Ok(records) => {
             let indexes = indexes_to_auto_sync(&records);
             for gs in &indexes {
-                handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies);
+                // A persisted dependency that no longer parses cannot name a
+                // ledger any commit event will carry; skip it, loudly.
+                if let Err(e) =
+                    handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies)
+                {
+                    tracing::warn!(graph_source = %gs.graph_source_id, error = %e, "Skipping BM25 index with unparseable dependencies");
+                }
             }
             info!(registered = indexes.len(), "BM25 auto-sync starting");
         }

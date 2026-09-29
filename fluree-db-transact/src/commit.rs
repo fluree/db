@@ -1197,7 +1197,7 @@ where
 {
     let commit_span = tracing::debug_span!(
         "txn_commit",
-        alias = view.base().ledger_id(),
+        alias = %view.base().ledger_id(),
         base_t = view.base().t(),
         flake_count = tracing::field::Empty,
         delta_bytes = tracing::field::Empty,

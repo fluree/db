@@ -93,10 +93,7 @@ pub mod verified_identity;
 pub mod wasm_cache;
 
 // Re-export main types
-pub use address::{
-    extract_identifier, extract_ledger_prefix, extract_path, parse_fluree_address,
-    ParsedFlureeAddress,
-};
+pub use address::{extract_identifier, extract_path, parse_fluree_address, ParsedFlureeAddress};
 pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
 pub use cancellation::{QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
@@ -144,8 +141,9 @@ pub use index_stats::{
 };
 pub use ledger_id::{
     format_ledger_id, normalize_ledger_id, parse_ledger_id_with_time, parse_time_travel_spec,
-    split_ledger_id, split_time_travel_suffix, validate_branch_name, LedgerIdParseError,
-    LedgerIdTimeSpec, ParsedLedgerId, COMMIT_PREFIX_MIN_LEN, DEFAULT_BRANCH, TIME_TRAVEL_TAGS,
+    split_ledger_id, split_time_travel_suffix, validate_branch_name, validate_ledger_name,
+    IntoLedgerId, LedgerId, LedgerIdParseError, LedgerIdTimeSpec, LedgerName, LedgerRef,
+    ParsedLedgerId, COMMIT_PREFIX_MIN_LEN, DEFAULT_BRANCH, LEDGER_URN_PREFIX, TIME_TRAVEL_TAGS,
 };
 pub use namespaces::{
     default_namespace_codes, is_owl_class_class, is_owl_datatype_property_class,

@@ -121,7 +121,6 @@ impl ServerError {
                 }
             }
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
-            ServerError::Api(ApiError::InvalidBranch(_)) => errors::BAD_REQUEST,
             // The code a merge or rebase conflict already gets from the
             // committer as a flattened 409.
             ServerError::Api(ApiError::BranchConflict(_)) => errors::COMMIT_CONFLICT,
@@ -211,7 +210,13 @@ impl ServerError {
 
             // API-level errors
             ServerError::MissingLedger => errors::MISSING_LEDGER,
-            ServerError::BadRequest(_) => errors::BAD_REQUEST,
+            // The same code as an id refused at the edge (`From<LedgerIdParseError>`).
+            ServerError::BadRequest(_)
+            | ServerError::Api(
+                ApiError::InvalidLedgerId(_)
+                | ApiError::InvalidBranch(_)
+                | ApiError::NameService(NameServiceError::InvalidId(_)),
+            ) => errors::BAD_REQUEST,
             ServerError::InvalidHeader(_) => errors::INVALID_HEADER,
             ServerError::NotImplemented(_) => errors::NOT_IMPLEMENTED,
             ServerError::Unauthorized(_) => errors::UNAUTHORIZED,
@@ -348,7 +353,11 @@ impl ServerError {
             // Operator data, not caller input. See `ApiError::LedgerConfig`.
             ServerError::Api(ApiError::LedgerConfig(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Api(ApiError::Format(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::InvalidBranch(_)) => StatusCode::BAD_REQUEST,
+            ServerError::Api(
+                ApiError::InvalidLedgerId(_)
+                | ApiError::InvalidBranch(_)
+                | ApiError::NameService(NameServiceError::InvalidId(_)),
+            ) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::AwaitTNotReached { .. }) => StatusCode::REQUEST_TIMEOUT,
             ServerError::MissingLedger => StatusCode::BAD_REQUEST,
             ServerError::Json(_) => StatusCode::BAD_REQUEST,
@@ -437,6 +446,21 @@ impl ServerError {
     pub fn unsupported_media_type(msg: impl Into<String>) -> Self {
         ServerError::UnsupportedMediaType(msg.into())
     }
+}
+
+impl From<fluree_db_api::LedgerIdParseError> for ServerError {
+    fn from(e: fluree_db_api::LedgerIdParseError) -> Self {
+        ServerError::bad_request(e.to_string())
+    }
+}
+
+/// The ledger id a request names, for authorizing it.
+///
+/// Accepts the full address grammar (`name[:branch][@t:..][#graph]`) and
+/// returns the id the API will resolve it to, so a scope check and the
+/// operation it guards cannot disagree about which ledger that is.
+pub(crate) fn scope_id(raw: &str) -> std::result::Result<fluree_db_api::LedgerId, ServerError> {
+    Ok(fluree_db_api::LedgerRef::parse(raw)?.id)
 }
 
 impl From<NameServiceError> for ServerError {
@@ -616,6 +640,23 @@ pub type Result<T> = std::result::Result<T, ServerError>;
 mod tests {
     use super::*;
     use fluree_vocab::errors;
+
+    /// An id refused below the edge is still the caller's input.
+    #[test]
+    fn an_invalid_ledger_id_is_a_bad_request_wherever_it_is_refused() {
+        let parse = fluree_db_api::LedgerIdParseError::new("Invalid ledger id 'a@b'");
+        for err in [
+            ServerError::from(parse.clone()),
+            ServerError::Api(ApiError::InvalidLedgerId(parse)),
+            ServerError::Api(ApiError::InvalidBranch("a@b".into())),
+            ServerError::Api(ApiError::NameService(NameServiceError::InvalidId(
+                "a@b".into(),
+            ))),
+        ] {
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST, "{err:?}");
+            assert_eq!(err.error_type(), errors::BAD_REQUEST, "{err:?}");
+        }
+    }
 
     fn storage_denied_direct() -> ApiError {
         ApiError::StorageAccessDenied {

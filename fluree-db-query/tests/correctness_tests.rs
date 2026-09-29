@@ -96,7 +96,7 @@ impl OptionalBuilder for NoMatchOptionalBuilder {
 #[tokio::test]
 async fn test_optional_poison_blocks_subsequent() {
     // Minimal db/context.
-    let snapshot = LedgerSnapshot::genesis("test/main");
+    let snapshot = LedgerSnapshot::genesis("test:main");
     let mut vars = VarRegistry::new();
     let s = vars.get_or_insert("?s");
     let opt = vars.get_or_insert("?opt");

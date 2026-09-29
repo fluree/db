@@ -546,12 +546,13 @@ async fn an_unauthenticated_read_does_not_load_the_ledger() {
     assert_eq!(status, StatusCode::CREATED, "create ledger: {body}");
 
     let manager = state.fluree.ledger_manager().expect("ledger caching");
-    manager.disconnect(LEDGER).await;
+    let ledger_id = fluree_db_api::LedgerId::parse(LEDGER).unwrap();
+    manager.disconnect(&ledger_id).await;
     for uri in [default_graph(), named(TOOLS)] {
         let (status, _, body) = send_as(&app, "GET", &uri, None, None, "", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "GET {uri}: {body}");
         assert!(
-            manager.get_loaded_handle(LEDGER).await.is_none(),
+            manager.get_loaded_handle(&ledger_id).await.is_none(),
             "GET {uri} loaded the ledger before authenticating"
         );
     }

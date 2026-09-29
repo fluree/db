@@ -129,13 +129,7 @@ async fn stream_query_connection_inner(
         // Bearer scope over every FROM/FROM NAMED ledger.
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() {
-                if let Ok(ledger_ids) = fluree_db_api::sparql_dataset_ledger_ids(&sparql) {
-                    for lid in &ledger_ids {
-                        if !p.can_read(lid) {
-                            return Err(ServerError::not_found("Ledger not found"));
-                        }
-                    }
-                }
+                crate::routes::query::authorize_sparql_dataset(p, &sparql)?;
             }
         }
 
@@ -199,7 +193,7 @@ async fn stream_query_connection_inner(
 
         inject_headers_into_query(&mut query_json, &headers);
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger_id) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger_id)?) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
@@ -283,7 +277,7 @@ async fn stream_query_inner(
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
@@ -385,7 +379,7 @@ async fn stream_query_inner(
         normalize_ledger_scoped_from(&ledger, &mut query_json)?;
         inject_headers_into_query(&mut query_json, &headers);
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }

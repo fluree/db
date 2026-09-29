@@ -14,7 +14,7 @@ use crate::error::{ApiError, Result};
 use crate::format::iri::IriCompactor;
 use crate::graph_commit_builder::resolve_flake;
 use crate::rebase::{current_asserted_for_key, ConflictStrategy};
-use fluree_db_core::ledger_id::format_ledger_id;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{
     commit_to_summary, diff_branches, load_commit_by_id, load_commit_envelope_by_id,
     walk_commit_summaries, BranchedContentStore, CommitSummary, ConflictKey, ContentId,
@@ -380,12 +380,12 @@ impl crate::Fluree {
         }
 
         // ---- Resolve records (mirrors merge_branch_inner). ----------------
-        let source_id = format_ledger_id(ledger_name, source_branch);
+        let source_id = LedgerId::from_parts(ledger_name, source_branch)?;
         let source_record = self
             .nameservice()
             .lookup(&source_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(source_id.clone().to_string()))?;
 
         // Resolve target: explicit, or the branch the source was created
         // from. Only the second needs the source to have a parent. Mirrors
@@ -406,12 +406,12 @@ impl crate::Fluree {
             ));
         }
 
-        let target_id = format_ledger_id(ledger_name, resolved_target);
+        let target_id = LedgerId::from_parts(ledger_name, resolved_target)?;
         let target_record = self
             .nameservice()
             .lookup(&target_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(target_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(target_id.clone().to_string()))?;
 
         // ---- Build branched stores. ---------------------------------------
         // Either side may be a root branch, which has only its own

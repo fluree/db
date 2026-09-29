@@ -358,6 +358,7 @@ impl crate::Fluree {
         &self,
         graph_source_id: &str,
     ) -> crate::Result<SqlCheckResult> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         let record = self
             .nameservice()
             .lookup_graph_source(graph_source_id)
@@ -494,7 +495,7 @@ impl SqlSource {
             }
         };
         Ok(Self {
-            graph_source_id: record.graph_source_id.clone(),
+            graph_source_id: record.graph_source_id.to_string(),
             config,
             client,
         })

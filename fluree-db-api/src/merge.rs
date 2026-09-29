@@ -10,7 +10,7 @@ use crate::ledger_manager::GuardedStagedCommit;
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::content_kind::ContentKind;
-use fluree_db_core::ledger_id::format_ledger_id;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{collect_dag_cids, load_commit_by_id, BranchDiff};
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
 use fluree_db_ledger::LedgerState;
@@ -47,9 +47,9 @@ pub struct StagedMerge {
     /// Source branch name (without ledger prefix).
     pub source: String,
     /// Fully-qualified target id (`"<ledger>:<target>"`).
-    pub target_id: String,
+    pub target_id: LedgerId,
     /// Fully-qualified source id (`"<ledger>:<source>"`).
-    pub source_id: String,
+    pub source_id: LedgerId,
     /// `true` when the target's head is on the source's first-parent
     /// line. The apply step then just advances the ref, with no new commit
     /// body to write.
@@ -92,7 +92,7 @@ pub struct StagedMerge {
     /// Source ledger id used as the source for any best-effort
     /// post-apply index copy. Carried through so the apply path can
     /// address content-store namespaces without a re-lookup.
-    pub source_ledger_id: String,
+    pub source_ledger_id: LedgerId,
 }
 
 /// Summary report of a completed merge operation.
@@ -230,12 +230,12 @@ impl crate::Fluree {
         target_branch: Option<&str>,
         strategy: ConflictStrategy,
     ) -> Result<StagedMerge> {
-        let source_id = format_ledger_id(ledger_name, source_branch);
+        let source_id = LedgerId::from_parts(ledger_name, source_branch)?;
         let source_record = self
             .nameservice()
             .lookup(&source_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(source_id.clone().to_string()))?;
 
         // Resolve target: explicit, or the branch the source was created
         // from. Only the second needs the source to have a parent.
@@ -255,12 +255,12 @@ impl crate::Fluree {
             ));
         }
 
-        let target_id = format_ledger_id(ledger_name, &resolved_target);
+        let target_id = LedgerId::from_parts(ledger_name, &resolved_target)?;
         let target_record = self
             .nameservice()
             .lookup(&target_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(target_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(target_id.clone().to_string()))?;
 
         let source_head_id = source_record.commit_head_id.clone().ok_or_else(|| {
             ApiError::InvalidBranch(format!(
@@ -505,8 +505,8 @@ impl crate::Fluree {
         &self,
         source_branch: &str,
         resolved_target: &str,
-        source_id: String,
-        target_id: String,
+        source_id: LedgerId,
+        target_id: LedgerId,
         source_record: &NsRecord,
         source_store: &impl ContentStore,
         diff: Option<&BranchDiff>,
@@ -560,8 +560,8 @@ impl crate::Fluree {
         &self,
         source_branch: &str,
         resolved_target: &str,
-        source_id: String,
-        target_id: String,
+        source_id: LedgerId,
+        target_id: LedgerId,
         source_record: &NsRecord,
         target_record: &NsRecord,
         source_store: &BranchedContentStore,

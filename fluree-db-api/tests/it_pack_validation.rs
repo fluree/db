@@ -244,7 +244,11 @@ async fn full_ledger_pack_request_errors_when_no_head_commit() {
     let ledger_id = "pack-validation/no-head:main";
     let snapshot = fluree_db_core::LedgerSnapshot::genesis(ledger_id);
     let state = fluree_db_api::LedgerState::new(snapshot, fluree_db_api::Novelty::new(0));
-    let handle = fluree_db_api::LedgerHandle::new(ledger_id.to_string(), state, None);
+    let handle = fluree_db_api::LedgerHandle::new(
+        fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+        state,
+        None,
+    );
 
     let err = full_ledger_pack_request(&handle, false)
         .await

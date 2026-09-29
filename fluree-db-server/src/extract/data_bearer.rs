@@ -21,6 +21,7 @@ use super::CredentialPolicy;
 use crate::config::DataAuthMode;
 use crate::error::ServerError;
 use crate::state::AppState;
+use fluree_db_api::LedgerId;
 use fluree_db_credential::jwt_claims::EventsTokenPayload;
 use fluree_db_credential::jwt_claims::PolicyClaim;
 
@@ -35,12 +36,13 @@ pub struct DataPrincipal {
     pub identity: Option<String>,
     /// Read access to all ledgers
     pub read_all: bool,
-    /// Read access to specific ledgers (HashSet for O(1) lookup)
-    pub read_ledgers: HashSet<String>,
+    /// Read access to specific ledgers. A bare `mydb` scope means `mydb:main`;
+    /// there is no whole-ledger scope.
+    pub read_ledgers: HashSet<LedgerId>,
     /// Write access to all ledgers
     pub write_all: bool,
-    /// Write access to specific ledgers (HashSet for O(1) lookup)
-    pub write_ledgers: HashSet<String>,
+    /// Write access to specific ledgers, parsed like `read_ledgers`.
+    pub write_ledgers: HashSet<LedgerId>,
     /// Token expiry (Unix seconds). HTTP re-verifies per request so this is
     /// redundant there; long-lived transports (Bolt sessions) re-check it
     /// before each statement.
@@ -50,13 +52,13 @@ pub struct DataPrincipal {
 }
 
 impl DataPrincipal {
-    pub fn can_read(&self, ledger_id: &str) -> bool {
+    pub fn can_read(&self, ledger_id: &LedgerId) -> bool {
         let allowed = self.read_all || self.read_ledgers.contains(ledger_id);
         self.audit_scope(ledger_id, "read", allowed);
         allowed
     }
 
-    pub fn can_write(&self, ledger_id: &str) -> bool {
+    pub fn can_write(&self, ledger_id: &LedgerId) -> bool {
         let allowed = self.write_all || self.write_ledgers.contains(ledger_id);
         self.audit_scope(ledger_id, "write", allowed);
         allowed
@@ -65,7 +67,7 @@ impl DataPrincipal {
     /// Request/statement-level evidence of the authority used for a scope
     /// check, not a claim that subsequent per-fact policy enforcement allowed
     /// the operation. Disabled unless this tracing target is enabled at DEBUG.
-    fn audit_scope(&self, ledger_id: &str, action: &str, allowed: bool) {
+    fn audit_scope(&self, ledger_id: &LedgerId, action: &str, allowed: bool) {
         let effective_identity = self
             .policy_authorization
             .fixed_options()
@@ -76,7 +78,7 @@ impl DataPrincipal {
             issuer = %self.issuer,
             effective_identity = ?effective_identity,
             authorization_mode = mode,
-            ledger = ledger_id,
+            ledger = %ledger_id,
             action,
             scope_allowed = allowed,
             "data authorization scope check"
@@ -224,6 +226,22 @@ pub(crate) async fn verify_data_principal(
     Ok(build_principal(&payload, authorization))
 }
 
+/// Parse token ledger scopes once, at verification. An entry that is not a
+/// ledger id grants nothing (fail closed) rather than matching itself.
+pub(crate) fn parse_scopes(scopes: Option<&Vec<String>>) -> HashSet<LedgerId> {
+    scopes
+        .into_iter()
+        .flatten()
+        .filter_map(|s| match LedgerId::parse(s) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(scope = %s, error = %e, "ignoring token ledger scope that is not a ledger id");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Build a `DataPrincipal` from verified claims.
 fn build_principal(
     payload: &EventsTokenPayload,
@@ -236,20 +254,14 @@ fn build_principal(
         identity: payload.resolve_identity(),
         // Read: use explicit ledger.read.* if present, else fall back to storage.*
         read_all: payload.ledger_read_all.unwrap_or(false) || payload.storage_all.unwrap_or(false),
-        read_ledgers: payload
-            .ledger_read_ledgers
-            .clone()
-            .or_else(|| payload.storage_ledgers.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
+        read_ledgers: parse_scopes(
+            payload
+                .ledger_read_ledgers
+                .as_ref()
+                .or(payload.storage_ledgers.as_ref()),
+        ),
         write_all: payload.ledger_write_all.unwrap_or(false),
-        write_ledgers: payload
-            .ledger_write_ledgers
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
+        write_ledgers: parse_scopes(payload.ledger_write_ledgers.as_ref()),
         expires_unix: payload.exp,
     }
 }

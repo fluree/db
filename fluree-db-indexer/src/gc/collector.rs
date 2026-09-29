@@ -687,8 +687,8 @@ pub async fn release_garbage_plan(
     plan: GarbagePlan,
     backend: &fluree_db_core::StorageBackend,
     nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
-    ledger_id: &str,
-    sibling_candidates: Option<&[String]>,
+    ledger_id: &fluree_db_core::LedgerId,
+    sibling_candidates: Option<&[fluree_db_core::LedgerId]>,
     cache_dir: Option<&Path>,
 ) -> Result<CleanGarbageResult> {
     let head = nameservice
@@ -697,7 +697,7 @@ pub async fn release_garbage_plan(
         .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?
         .and_then(|record| record.index_head_id);
     let Some(head) = head else {
-        tracing::debug!(ledger_id, "ledger has no index head; releasing nothing");
+        tracing::debug!(ledger_id = %ledger_id, "ledger has no index head; releasing nothing");
         return Ok(CleanGarbageResult::default());
     };
     let shared_blobs = match sibling_candidates {
@@ -708,7 +708,7 @@ pub async fn release_garbage_plan(
                 }
                 Err(e) => {
                     tracing::warn!(
-                        ledger_id,
+                        ledger_id = %ledger_id,
                         error = %e,
                         "could not read a sibling branch's record; deferring shared blobs this pass"
                     );

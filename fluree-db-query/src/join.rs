@@ -3809,7 +3809,7 @@ mod tests {
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
 
         // Minimal context (db is unused here; only batch_size matters).
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x"); // VarId(0)
         let v = vars.get_or_insert("?v"); // VarId(1)
@@ -3937,7 +3937,7 @@ mod tests {
             )
         };
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
 
         // Root / no policy on an overlay-free single graph => Clean (the batched
@@ -4202,7 +4202,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let s = vars.get_or_insert("?s"); // VarId(0)
         let x = vars.get_or_insert("?x"); // VarId(1)

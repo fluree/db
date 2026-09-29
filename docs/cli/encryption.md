@@ -35,7 +35,7 @@ fluree encryption generate-key
 | `--json` | Print the raw JSON response |
 | `--retire <ID>` | The key being retired (`rotate`, `verify`) |
 | `--dry-run` | Count what a rotation would rewrite without writing anything. The count is `progress.on_retired`, shown only with `--json` |
-| `--ledger <LEDGER>` | Limit the sweep to one ledger: a name covers every branch, a branch-qualified id only that branch. The ledger's shared dictionaries are included, graph sources are not |
+| `--ledger <LEDGER>` | Limit the sweep to one ledger: a name covers every branch, a branch-qualified id only that branch. This is deliberately unlike a token scope, where a bare name means `main`: like drop and sweep, rotation acts on a ledger's storage, which its branches share. The ledger's shared dictionaries are included, graph sources are not |
 | `--rate <BYTES/S>` | Cap rewritten plaintext bytes per second, as a number with an optional `kb`, `mb` or `gb` suffix. Suffixes are binary (`1mb` = 1 MiB); a bare number is bytes. Not stored: a resumed sweep runs unthrottled unless restarted with `rotate --rate` |
 | `--wait` | Poll status every two seconds until the record is no longer `running`, printing progress to stderr. A stalled or released record is still `running`, so `--wait` keeps waiting |
 
