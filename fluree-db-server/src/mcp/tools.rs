@@ -6,6 +6,7 @@
 use crate::mcp::auth::McpPrincipal;
 use crate::query_control::run_query_task;
 use crate::state::AppState;
+use fluree_db_api::{LedgerId, LedgerRef};
 use fluree_db_core::VerifiedIdentity;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -32,10 +33,38 @@ fn extract_principal(context: &rmcp::service::RequestContext<RoleServer>) -> Opt
 /// The principal, if its ledger claims cover `ledger`.
 fn authorize(
     context: &rmcp::service::RequestContext<RoleServer>,
-    ledger: &str,
+    ledger: &LedgerId,
 ) -> Option<McpPrincipal> {
-    extract_principal(context)
-        .filter(|p| crate::error::scope_id(ledger).is_ok_and(|id| p.can_read(&id)))
+    extract_principal(context).filter(|p| p.can_read(ledger))
+}
+
+/// Parse a tool's `ledger` argument once, so the scope check and the load
+/// see the same ledger. A `@` time suffix is refused rather than stripped:
+/// the loaders refuse it too, and `sparql_query` takes `t` instead. The error
+/// is the reason [`invalid_ledger`] reports.
+fn parse_ledger(raw: &str) -> Result<LedgerRef, String> {
+    let address = LedgerRef::parse(raw).map_err(|e| e.to_string())?;
+    if address.at.is_some() {
+        return Err(
+            "a ledger here takes no `@` time suffix; sparql_query takes `t` instead".to_string(),
+        );
+    }
+    Ok(address)
+}
+
+/// What a malformed `ledger` argument gets, whether or not the ledger exists.
+fn invalid_ledger(raw: &str, why: &str) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(format!(
+        "Invalid ledger '{raw}': {why}"
+    ))])
+}
+
+/// The address the loader resolves: the parsed id and any graph selector.
+fn load_address(address: &LedgerRef) -> String {
+    match &address.fragment {
+        Some(graph) => format!("{}#{graph}", address.id),
+        None => address.id.to_string(),
+    }
 }
 
 /// What an unauthorized ledger gets: the same answer as one that does not exist.
@@ -115,7 +144,11 @@ impl FlureeToolService {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = std::time::Instant::now();
 
-        let Some(principal) = authorize(&context, &req.ledger) else {
+        let address = match parse_ledger(&req.ledger) {
+            Ok(address) => address,
+            Err(why) => return Ok(invalid_ledger(&req.ledger, &why)),
+        };
+        let Some(principal) = authorize(&context, &address.id) else {
             return Ok(ledger_not_found());
         };
         // The principal's identity drives policy enforcement.
@@ -131,7 +164,13 @@ impl FlureeToolService {
 
         let max_bytes = self.state.config.mcp_agent_json_max_bytes;
         let result = self
-            .execute_sparql_agent_json(&req.ledger, &req.query, identity, req.t, max_bytes)
+            .execute_sparql_agent_json(
+                &load_address(&address),
+                &req.query,
+                identity,
+                req.t,
+                max_bytes,
+            )
             .await;
 
         match result {
@@ -304,7 +343,17 @@ impl FlureeToolService {
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = std::time::Instant::now();
-        if authorize(&context, &req.ledger).is_none() {
+        let address = match parse_ledger(&req.ledger) {
+            Ok(address) if address.fragment.is_none() => address,
+            Ok(_) => {
+                return Ok(invalid_ledger(
+                    &req.ledger,
+                    "the data model covers the whole ledger; drop the `#` graph selector",
+                ))
+            }
+            Err(why) => return Ok(invalid_ledger(&req.ledger, &why)),
+        };
+        if authorize(&context, &address.id).is_none() {
             return Ok(ledger_not_found());
         }
 
@@ -317,7 +366,7 @@ impl FlureeToolService {
         let info = self
             .state
             .fluree
-            .ledger_info(&req.ledger)
+            .ledger_info(&address.id)
             .execute()
             .await
             .map_err(|e| {
@@ -364,5 +413,24 @@ impl ServerHandler for FlureeToolService {
                     .to_string(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ledger_argument_is_parsed_once_for_scope_and_load() {
+        let address = parse_ledger("urn:fluree:open#txn-meta").unwrap();
+        assert_eq!(&*address.id, "open:main");
+        assert_eq!(load_address(&address), "open:main#txn-meta");
+        assert_eq!(load_address(&parse_ledger("open").unwrap()), "open:main");
+
+        // Refused before the scope check, the same way whether or not the
+        // ledger exists, rather than authorized and then refused by the loader.
+        let pinned = parse_ledger("open@t:1").unwrap_err();
+        assert!(pinned.contains("`t`"), "{pinned}");
+        assert!(parse_ledger("").is_err());
     }
 }

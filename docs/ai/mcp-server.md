@@ -144,7 +144,7 @@ more open than it already is:
 |--------------|-----------------|
 | Data auth `none` (the default) and no MCP issuer configured | Open. No token needed, every ledger readable. A token that is sent anyway is ignored, as it is on the data API. |
 | An MCP issuer is configured (`--mcp-auth-trusted-issuer`, or `--events-auth-trusted-issuer` as a fallback) | A token is required, whatever the data auth mode. |
-| Data auth `optional` or `required` | A token is required. The server refuses to start unless an MCP issuer is configured. |
+| Data auth `optional` or `required` | A token is required, even under `optional`, where an anonymous `/query` is still served. The server refuses to start unless an MCP issuer is configured. |
 
 ## Protecting it
 
@@ -184,6 +184,12 @@ TOKEN=$(fluree token create --private-key @agent.key \
 claude mcp add --transport http fluree https://fluree.example.com/mcp \
   --header "Authorization: Bearer $TOKEN"
 ```
+
+Data auth doesn't cover the events stream. `/v1/fluree/events?all=true` lists every
+ledger and its nameservice record unless events auth is on as well, and the server logs a
+warning at startup when data auth is required and events auth is not. Add
+`--events-auth-mode required` and `--events-auth-trusted-issuer did:key:z6Mk...`, and give
+any [query peers](../operations/query-peers.md) an events token (`--peer-events-token`).
 
 For Cursor and VS Code, add a `headers` entry next to `url`:
 

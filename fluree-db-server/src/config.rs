@@ -1053,6 +1053,16 @@ impl ServerConfig {
         }
     }
 
+    /// Whether the data API requires a token while `/events` requires none.
+    /// The two are configured separately, so `/events?all=true` then lists
+    /// every ledger's nameservice record to anyone. They stay separate on
+    /// purpose: query peers subscribe to `/events`, without a token when
+    /// events auth is off.
+    pub fn events_open_under_data_auth(&self) -> bool {
+        self.data_auth_mode == DataAuthMode::Required
+            && self.events_auth_mode == EventsAuthMode::None
+    }
+
     /// Get the data API authentication configuration
     pub fn data_auth(&self) -> DataAuthConfig {
         DataAuthConfig {
@@ -1553,6 +1563,27 @@ mod policy_authority_tests {
 #[cfg(test)]
 mod mcp_auth_tests {
     use super::*;
+
+    #[test]
+    fn events_left_open_under_required_data_auth_is_flagged() {
+        let config = |data_auth_mode, events_auth_mode| ServerConfig {
+            events_auth_mode,
+            data_auth_mode,
+            ..Default::default()
+        };
+        assert!(config(DataAuthMode::Required, EventsAuthMode::None).events_open_under_data_auth());
+        for (data, events) in [
+            (DataAuthMode::Required, EventsAuthMode::Required),
+            (DataAuthMode::Required, EventsAuthMode::Optional),
+            (DataAuthMode::Optional, EventsAuthMode::None),
+            (DataAuthMode::None, EventsAuthMode::None),
+        ] {
+            assert!(
+                !config(data, events).events_open_under_data_auth(),
+                "{data:?} data auth, {events:?} events auth"
+            );
+        }
+    }
 
     #[test]
     fn mcp_runs_tokenless_only_without_data_auth_or_an_mcp_issuer() {

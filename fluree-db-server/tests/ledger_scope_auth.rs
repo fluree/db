@@ -604,5 +604,15 @@ async fn tokenless_mcp_applies_the_ledgers_policy_defaults() {
         Some(0),
         "anonymous /query is denied by the defaults: {body}"
     );
-    assert_eq!(rows(app).await, 0, "tokenless MCP must be denied too");
+    assert_eq!(
+        rows(app.clone()).await,
+        0,
+        "tokenless MCP must be denied too"
+    );
+
+    // `get_data_model` reports the schema and counts without the policy, as
+    // `GET /info` does. Pinned so that changing either is a deliberate choice
+    // (#1981).
+    let model = tool_text(&mcp_tool(&app, "", "get_data_model", json!({"ledger": "gov"})).await);
+    assert!(model.contains("- Triples (flakes): 2"), "{model}");
 }
