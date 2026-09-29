@@ -176,6 +176,9 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
     // Datatype SIDs
     let string_dt = Sid::new(XSD, xsd_names::STRING);
     let long_dt = Sid::new(XSD, xsd_names::LONG);
+    // Matches what the indexer and bulk import write for these counters, so a
+    // typed query constant finds them before and after indexing.
+    let integer_dt = Sid::new(XSD, xsd_names::INTEGER);
     let ref_dt = Sid::new(JSON_LD, "id"); // Reference datatype
 
     // === Commit subject flakes ===
@@ -221,7 +224,7 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
         commit_sid.clone(),
         Sid::new(FLUREE_DB, db::T),
         FlakeValue::Long(commit.t),
-        long_dt.clone(),
+        integer_dt.clone(),
         t,
         true,
         None,
@@ -233,7 +236,7 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
         commit_sid.clone(),
         Sid::new(FLUREE_DB, db::ASSERTS),
         FlakeValue::Long(asserts),
-        long_dt.clone(),
+        integer_dt.clone(),
         t,
         true,
         None,
@@ -245,7 +248,7 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
         commit_sid.clone(),
         Sid::new(FLUREE_DB, db::RETRACTS),
         FlakeValue::Long(retracts),
-        long_dt.clone(),
+        integer_dt.clone(),
         t,
         true,
         None,

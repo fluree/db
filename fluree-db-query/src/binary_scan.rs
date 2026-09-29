@@ -7,7 +7,7 @@
 //!   for `eager_materialization` contexts, and when one variable fills two
 //!   positions (`?x ?x ?o`, `?s ?x ?x`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,8 +23,8 @@ use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::ObjKey;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{
-    dt_compatible, range_with_overlay, Flake, FlakeMeta, FlakeValue, GraphId, IndexType,
-    LedgerSnapshot, NoOverlay, ObjectBounds, OverlayProvider, RangeMatch, RangeOptions, RangeTest,
+    range_with_overlay, Flake, FlakeMeta, FlakeValue, GraphId, IndexType, LedgerSnapshot,
+    NoOverlay, ObjectBounds, OverlayProvider, RangeMatch, RangeOptions, RangeTest,
     RuntimePredicateId, RuntimeSmallDicts, Sid,
 };
 
@@ -185,6 +185,9 @@ pub struct BinaryScanOperator {
     store: Option<Arc<BinaryIndexStore>>,
     g_id: GraphId,
     cursor: Option<BinaryCursor>,
+    /// Cursors for the remaining object slices of a bare numeric bound
+    /// object, drained in order after `cursor`.
+    pending_cursors: VecDeque<BinaryCursor>,
     /// Persisted p_id → Sid table, shared from the store's per-instance cache.
     p_sids: Arc<[Sid]>,
     /// Novelty-only predicate overrides keyed by ephemeral p_id, populated
@@ -732,6 +735,7 @@ impl BinaryScanOperator {
             store: None,
             g_id: 0,
             cursor: None,
+            pending_cursors: VecDeque::new(),
             p_sids: Vec::new().into(),
             p_sids_ephemeral: HashMap::new(),
             sid_cache: HashMap::new(),
@@ -850,7 +854,7 @@ impl BinaryScanOperator {
 
             // Datatype / language constraint checks (range fallback path).
             if let Some(dtc) = &self.pattern.dtc {
-                if !dt_compatible(dtc.datatype(), &flake.dt) {
+                if dtc.datatype() != &flake.dt {
                     continue;
                 }
                 if let Some(tag) = dtc.lang_tag() {
@@ -967,6 +971,7 @@ impl BinaryScanOperator {
 
         self.range_iter = Some(out.into_iter());
         self.cursor = None;
+        self.pending_cursors.clear();
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -1000,6 +1005,7 @@ impl BinaryScanOperator {
         self.include_system_facts = ctx.include_system_facts || self.mode.is_history();
         self.range_iter = Some(flakes.into_iter());
         self.cursor = None;
+        self.pending_cursors.clear();
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -1291,7 +1297,7 @@ impl BinaryScanOperator {
                 Err(_) => return false,
             },
         };
-        if !dt_compatible(dtc.datatype(), &dt_sid) {
+        if dtc.datatype() != &dt_sid {
             return false;
         }
 
@@ -1786,6 +1792,7 @@ impl BinaryScanOperator {
         let Some(overlay) = ctx.overlay else {
             self.range_iter = Some(Vec::<Flake>::new().into_iter());
             self.cursor = None;
+            self.pending_cursors.clear();
             self.state = OperatorState::Open;
             return Ok(());
         };
@@ -1873,6 +1880,7 @@ impl BinaryScanOperator {
 
         self.range_iter = Some(flakes.into_iter());
         self.cursor = None;
+        self.pending_cursors.clear();
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -2137,6 +2145,7 @@ impl Operator for BinaryScanOperator {
         //
         // For overlay/novelty queries, we keep this conservative: if the value isn't present in
         // the persisted dictionaries, fall back to overlay-only to avoid a wide base scan.
+        let mut object_slices: Vec<(OType, u64)> = Vec::new();
         if let Some(bound_o) = self.bound_o.as_ref() {
             let dtc = self.pattern.dtc.as_ref();
             let lang = dtc.and_then(|d| d.lang_tag());
@@ -2197,6 +2206,24 @@ impl Operator for BinaryScanOperator {
                 && inferred_dt_sid.is_none()
                 && matches!(bound_o, FlakeValue::String(_));
 
+            // A bare integer or double matches every numeric datatype holding an
+            // equal value, so seek each numeric datatype the predicate carries.
+            let untyped_number = dt_sid.is_none()
+                && lang.is_none()
+                && matches!(bound_o, FlakeValue::Long(_) | FlakeValue::Double(_));
+            let numeric_slices = if untyped_number {
+                filter.p_id.and_then(|p_id| {
+                    untyped_numeric_slices(
+                        stats_view.as_deref(),
+                        self.g_id,
+                        RuntimePredicateId::from_u32(p_id),
+                        bound_o,
+                    )
+                })
+            } else {
+                None
+            };
+
             if let FlakeValue::Ref(sid) = bound_o {
                 // Refs carry no datatype/lang, so they bypass the literal-value
                 // machinery and resolve snapshot-aware (decode_sid → store IRI
@@ -2236,6 +2263,18 @@ impl Operator for BinaryScanOperator {
                         Err(_) => {}
                     }
                 }
+            } else if let Some(slices) = numeric_slices {
+                match slices.as_slice() {
+                    [] => return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await,
+                    [(o_type, o_key)] => {
+                        filter.o_type = Some(o_type.as_u16());
+                        filter.o_key = Some(*o_key);
+                    }
+                    _ => object_slices = slices,
+                }
+            } else if untyped_number {
+                // Without the predicate's datatypes no seek is provably complete;
+                // scan unnarrowed under the decoded-value filter.
             } else {
                 let encoded = match (dt_sid.or(inferred_dt_sid.as_ref()), lang) {
                     (Some(dt_sid), lang) => {
@@ -2486,8 +2525,34 @@ impl Operator for BinaryScanOperator {
             || range_min_okey.is_some()
             || range_max_okey.is_some();
 
-        let mut range_keys: Option<(RunRecordV2, RunRecordV2)> = None;
-        let mut cursor = if use_range {
+        // A bare number spanning several numeric datatypes seeks each
+        // (o_type, o_key) slice with its own cursor, drained in turn. When the
+        // chained slices would leave index order, scan unnarrowed instead.
+        let slice_filters: Vec<BinaryFilter> =
+            if object_slices.len() > 1 && object_slices_stay_ordered(order, &filter) {
+                object_slices
+                    .iter()
+                    .map(|&(o_type, o_key)| BinaryFilter {
+                        o_type: Some(o_type.as_u16()),
+                        o_key: Some(o_key),
+                        ..filter.clone()
+                    })
+                    .collect()
+            } else {
+                vec![filter]
+            };
+        let open_cursor = |filter: BinaryFilter| {
+            if !use_range {
+                let cursor = BinaryCursor::scan_all(
+                    Arc::clone(&store_arc),
+                    order,
+                    Arc::clone(&branch),
+                    filter,
+                    projection,
+                )
+                .with_tracker(ctx.tracker.clone());
+                return (cursor, None);
+            }
             let min_key = RunRecordV2 {
                 s_id: SubjectId(filter.s_id.unwrap_or(0)),
                 o_key: filter.o_key.or(range_min_okey).unwrap_or(0),
@@ -2509,19 +2574,17 @@ impl Operator for BinaryScanOperator {
             let cursor = BinaryCursor::new(
                 Arc::clone(&store_arc),
                 order,
-                branch,
+                Arc::clone(&branch),
                 &min_key,
                 &max_key,
                 filter,
                 projection,
             )
             .with_tracker(ctx.tracker.clone());
-            range_keys = Some((min_key, max_key));
-            cursor
-        } else {
-            BinaryCursor::scan_all(Arc::clone(&store_arc), order, branch, filter, projection)
-                .with_tracker(ctx.tracker.clone())
+            (cursor, Some((min_key, max_key)))
         };
+        let mut cursors: Vec<(BinaryCursor, Option<(RunRecordV2, RunRecordV2)>)> =
+            slice_filters.into_iter().map(open_cursor).collect();
 
         // Overlay: translate novelty flakes to OverlayOp and attach to cursor.
         //
@@ -2794,17 +2857,21 @@ impl Operator for BinaryScanOperator {
                 // filter, and carrying them costs an O(overlay) merge walk per
                 // cursor (per probe row in nested-loop joins) while defeating
                 // leaflet pre-skips.
-                let (start, end) = match &range_keys {
-                    Some((min_key, max_key)) => fluree_db_binary_index::overlay_window_for_range(
-                        &translated.ops,
-                        min_key,
-                        max_key,
-                        order,
-                    ),
-                    None => (0, translated.ops.len()),
-                };
-                if start < end {
-                    cursor.set_overlay_ops_window(Arc::clone(&translated.ops), start, end);
+                for (cursor, range_keys) in &mut cursors {
+                    let (start, end) = match range_keys {
+                        Some((min_key, max_key)) => {
+                            fluree_db_binary_index::overlay_window_for_range(
+                                &translated.ops,
+                                min_key,
+                                max_key,
+                                order,
+                            )
+                        }
+                        None => (0, translated.ops.len()),
+                    };
+                    if start < end {
+                        cursor.set_overlay_ops_window(Arc::clone(&translated.ops), start, end);
+                    }
                 }
             }
 
@@ -2846,9 +2913,12 @@ impl Operator for BinaryScanOperator {
                 }
             }
         }
-        cursor.set_to_t(ctx.to_t);
-
-        self.cursor = Some(cursor);
+        let mut cursors = cursors.into_iter().map(|(mut cursor, _)| {
+            cursor.set_to_t(ctx.to_t);
+            cursor
+        });
+        self.cursor = cursors.next();
+        self.pending_cursors = cursors.collect();
         self.state = OperatorState::Open;
 
         // Compile pre-filters that can run on encoded columns (no decoding).
@@ -2912,9 +2982,9 @@ impl Operator for BinaryScanOperator {
                     ctx.check_cancelled()?;
                 }
                 Ok(None) => {
-                    // Cursor exhausted — drop it so we can proceed to `range_iter`.
-                    self.cursor = None;
-                    break;
+                    // Cursor exhausted: move to the next object slice, then to
+                    // `range_iter`.
+                    self.cursor = self.pending_cursors.pop_front();
                 }
                 Err(e) => {
                     // Residency mode: the cursor is re-enterable after a
@@ -3000,8 +3070,7 @@ impl Operator for BinaryScanOperator {
                     })?;
                 }
                 Ok(None) => {
-                    self.cursor = None;
-                    break;
+                    self.cursor = self.pending_cursors.pop_front();
                 }
                 Err(e) => {
                     // Same residency retry as `next_batch`'s cursor frame.
@@ -3029,6 +3098,7 @@ impl Operator for BinaryScanOperator {
 
     fn close(&mut self) {
         self.cursor = None;
+        self.pending_cursors.clear();
         self.range_iter = None;
         self.store = None;
         self.sid_cache.clear();
@@ -4082,59 +4152,6 @@ fn datatype_sid_for_untyped_value(
         FlakeValue::Decimal(_) if tag == fluree_db_core::ValueTypeTag::DECIMAL => {
             Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL))
         }
-        FlakeValue::Long(_) => match tag {
-            fluree_db_core::ValueTypeTag::INTEGER => {
-                Some(Sid::new(namespaces::XSD, xsd_names::INTEGER))
-            }
-            fluree_db_core::ValueTypeTag::LONG => Some(Sid::new(namespaces::XSD, xsd_names::LONG)),
-            fluree_db_core::ValueTypeTag::INT => Some(Sid::new(namespaces::XSD, xsd_names::INT)),
-            fluree_db_core::ValueTypeTag::SHORT => {
-                Some(Sid::new(namespaces::XSD, xsd_names::SHORT))
-            }
-            fluree_db_core::ValueTypeTag::BYTE => Some(Sid::new(namespaces::XSD, xsd_names::BYTE)),
-            fluree_db_core::ValueTypeTag::UNSIGNED_LONG => {
-                Some(Sid::new(namespaces::XSD, xsd_names::UNSIGNED_LONG))
-            }
-            fluree_db_core::ValueTypeTag::UNSIGNED_INT => {
-                Some(Sid::new(namespaces::XSD, xsd_names::UNSIGNED_INT))
-            }
-            fluree_db_core::ValueTypeTag::UNSIGNED_SHORT => {
-                Some(Sid::new(namespaces::XSD, xsd_names::UNSIGNED_SHORT))
-            }
-            fluree_db_core::ValueTypeTag::UNSIGNED_BYTE => {
-                Some(Sid::new(namespaces::XSD, xsd_names::UNSIGNED_BYTE))
-            }
-            fluree_db_core::ValueTypeTag::NON_NEGATIVE_INTEGER => {
-                Some(Sid::new(namespaces::XSD, xsd_names::NON_NEGATIVE_INTEGER))
-            }
-            fluree_db_core::ValueTypeTag::POSITIVE_INTEGER => {
-                Some(Sid::new(namespaces::XSD, xsd_names::POSITIVE_INTEGER))
-            }
-            fluree_db_core::ValueTypeTag::NON_POSITIVE_INTEGER => {
-                Some(Sid::new(namespaces::XSD, xsd_names::NON_POSITIVE_INTEGER))
-            }
-            fluree_db_core::ValueTypeTag::NEGATIVE_INTEGER => {
-                Some(Sid::new(namespaces::XSD, xsd_names::NEGATIVE_INTEGER))
-            }
-            _ => None,
-        },
-        FlakeValue::Double(_) => match tag {
-            fluree_db_core::ValueTypeTag::DOUBLE => {
-                Some(Sid::new(namespaces::XSD, xsd_names::DOUBLE))
-            }
-            fluree_db_core::ValueTypeTag::FLOAT => {
-                Some(Sid::new(namespaces::XSD, xsd_names::FLOAT))
-            }
-            fluree_db_core::ValueTypeTag::DECIMAL => {
-                Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL))
-            }
-            fluree_db_core::ValueTypeTag::INTEGER => {
-                Some(Sid::new(namespaces::XSD, xsd_names::INTEGER))
-            }
-            fluree_db_core::ValueTypeTag::LONG => Some(Sid::new(namespaces::XSD, xsd_names::LONG)),
-            fluree_db_core::ValueTypeTag::INT => Some(Sid::new(namespaces::XSD, xsd_names::INT)),
-            _ => None,
-        },
         // Untyped string → the single string-compatible datatype the caller's
         // stats gate selected. langString is intentionally absent: it needs a
         // language id, so it routes through the (future) multi-slice path.
@@ -4163,6 +4180,86 @@ fn datatype_sid_for_untyped_value(
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Every `(o_type, o_key)` an untyped `Long` or `Double` can be stored under
+/// on this predicate: one slice per numeric datatype the predicate's stats have
+/// observed, keyed by that datatype's encoding of the value, in `o_type` order.
+///
+/// A bare number matches every numeric datatype holding an equal value, and
+/// the families encode differently (`i64` keys for integer types, `f64` keys
+/// for `xsd:double`/`xsd:float`), so no single seek covers them. Equality
+/// follows `FlakeValue::numeric_cmp`: an integer has a float slice only when
+/// `f64` holds it exactly, and a double has integer slices only when it is
+/// integral.
+///
+/// `None` when the slices can't be proven — no observed set, a non-finite
+/// value, or decimal / big-number values, whose keys are per-predicate arena
+/// handles — so the caller scans unnarrowed under the decoded-value filter.
+/// `Some(vec![])` means no numeric datatype is present at all.
+pub(crate) fn untyped_numeric_slices(
+    stats_view: Option<&fluree_db_core::StatsView>,
+    g_id: GraphId,
+    p_id: RuntimePredicateId,
+    value: &FlakeValue,
+) -> Option<Vec<(OType, u64)>> {
+    use fluree_db_core::ValueTypeTag;
+
+    let (as_i64, as_f64) = match value {
+        FlakeValue::Long(n) => (Some(*n), (n.unsigned_abs() <= 1 << 53).then_some(*n as f64)),
+        FlakeValue::Double(d) if d.is_finite() => {
+            let integral = d.fract() == 0.0 && *d >= -(2f64.powi(63)) && *d < 2f64.powi(63);
+            (integral.then_some(*d as i64), Some(*d))
+        }
+        _ => return None,
+    };
+
+    let stats = stats_view?.get_graph_property(g_id, p_id)?;
+    if stats.observed_datatypes.is_empty() {
+        return None;
+    }
+    let mut slices = Vec::new();
+    for &tag in &stats.observed_datatypes {
+        if tag == ValueTypeTag::DECIMAL || tag == ValueTypeTag::UNKNOWN {
+            return None;
+        }
+        let key = if tag.is_integer_type() {
+            as_i64.map(|n| ObjKey::encode_i64(n).as_u64())
+        } else if tag.is_float_type() {
+            match as_f64 {
+                Some(f) => Some(ObjKey::encode_f64(f).ok()?.as_u64()),
+                None => None,
+            }
+        } else {
+            continue;
+        };
+        if let Some(key) = key {
+            slices.push((numeric_tag_o_type(tag)?, key));
+        }
+    }
+    slices.sort_unstable();
+    slices.dedup();
+    Some(slices)
+}
+
+fn numeric_tag_o_type(tag: fluree_db_core::ValueTypeTag) -> Option<OType> {
+    let sid = tag.to_sid()?;
+    if sid.namespace_code != namespaces::XSD {
+        return None;
+    }
+    fluree_vocab::datatype::KnownDatatype::from_xsd_local(&sid.name)
+        .map(fluree_db_core::o_type_registry::known_datatype_to_otype)
+}
+
+/// Whether scanning `slices` one after another yields rows in `order`: true
+/// when every key component that sorts ahead of `o_type` is bound, so the
+/// slices are disjoint, ascending runs of one key prefix.
+fn object_slices_stay_ordered(order: RunSortOrder, filter: &BinaryFilter) -> bool {
+    match order {
+        RunSortOrder::Opst => true,
+        RunSortOrder::Post => filter.p_id.is_some(),
+        RunSortOrder::Spot | RunSortOrder::Psot => filter.s_id.is_some() && filter.p_id.is_some(),
     }
 }
 
@@ -4752,19 +4849,80 @@ mod tests {
         stats
     }
 
-    #[test]
-    fn infer_exact_datatype_for_integer_family() {
-        let stats = stats_with(vec![(ValueTypeTag::INT, 10)], vec![ValueTypeTag::INT]);
+    fn slices_for(stats: &StatsView, value: FlakeValue) -> Option<Vec<(OType, u64)>> {
+        untyped_numeric_slices(Some(stats), 0, RuntimePredicateId::from_u32(7), &value)
+    }
 
-        let inferred = infer_exact_datatype_sid_from_stats(
-            Some(&stats),
-            0,
-            RuntimePredicateId::from_u32(7),
-            &FlakeValue::Long(42),
-        )
-        .expect("datatype");
-        assert_eq!(inferred.namespace_code, namespaces::XSD);
-        assert_eq!(inferred.name, xsd_names::INT.into());
+    fn int_key(n: i64) -> u64 {
+        ObjKey::encode_i64(n).as_u64()
+    }
+
+    fn f64_key(f: f64) -> u64 {
+        ObjKey::encode_f64(f).unwrap().as_u64()
+    }
+
+    #[test]
+    fn bare_number_seeks_every_numeric_datatype_of_the_predicate() {
+        let stats = stats_with(
+            vec![],
+            vec![
+                ValueTypeTag::INTEGER,
+                ValueTypeTag::LONG,
+                ValueTypeTag::DOUBLE,
+                ValueTypeTag::STRING,
+            ],
+        );
+        let expected = vec![
+            (OType::XSD_INTEGER, int_key(25)),
+            (OType::XSD_LONG, int_key(25)),
+            (OType::XSD_DOUBLE, f64_key(25.0)),
+        ];
+        assert_eq!(
+            slices_for(&stats, FlakeValue::Long(25)),
+            Some(expected.clone())
+        );
+        assert_eq!(slices_for(&stats, FlakeValue::Double(25.0)), Some(expected));
+        assert_eq!(
+            slices_for(&stats, FlakeValue::Double(2.5)),
+            Some(vec![(OType::XSD_DOUBLE, f64_key(2.5))]),
+            "a fractional double has no integer representation"
+        );
+    }
+
+    #[test]
+    fn single_numeric_datatype_is_one_slice() {
+        let stats = stats_with(vec![(ValueTypeTag::INT, 10)], vec![ValueTypeTag::INT]);
+        assert_eq!(
+            slices_for(&stats, FlakeValue::Long(42)),
+            Some(vec![(OType::XSD_INT, int_key(42))])
+        );
+    }
+
+    #[test]
+    fn integer_beyond_f64_precision_has_no_float_slice() {
+        let stats = stats_with(vec![], vec![ValueTypeTag::LONG, ValueTypeTag::DOUBLE]);
+        let n = (1i64 << 53) + 1;
+        assert_eq!(
+            slices_for(&stats, FlakeValue::Long(n)),
+            Some(vec![(OType::XSD_LONG, int_key(n))])
+        );
+    }
+
+    #[test]
+    fn no_numeric_datatype_is_no_slices() {
+        let stats = stats_with(vec![], vec![ValueTypeTag::STRING, ValueTypeTag::DATE]);
+        assert_eq!(slices_for(&stats, FlakeValue::Long(25)), Some(vec![]));
+    }
+
+    #[test]
+    fn arena_keyed_or_unknown_datatypes_decline_slicing() {
+        for tag in [ValueTypeTag::DECIMAL, ValueTypeTag::UNKNOWN] {
+            let stats = stats_with(vec![], vec![ValueTypeTag::INTEGER, tag]);
+            assert_eq!(slices_for(&stats, FlakeValue::Long(25)), None, "{tag:?}");
+        }
+        let stats = stats_with(vec![], vec![ValueTypeTag::DOUBLE]);
+        assert_eq!(slices_for(&stats, FlakeValue::Double(f64::NAN)), None);
+        assert_eq!(slices_for(&stats, FlakeValue::Double(f64::INFINITY)), None);
     }
 
     #[test]
@@ -4832,56 +4990,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn does_not_infer_when_multiple_datatypes_present() {
-        let stats = stats_with(
-            vec![(ValueTypeTag::INT, 5), (ValueTypeTag::LONG, 5)],
-            vec![ValueTypeTag::INT, ValueTypeTag::LONG],
-        );
-
-        assert!(infer_exact_datatype_sid_from_stats(
-            Some(&stats),
-            0,
-            RuntimePredicateId::from_u32(7),
-            &FlakeValue::Long(42),
-        )
-        .is_none());
-    }
-
     /// #1738's mechanism, pinned at the consumer: a spurious retraction can
     /// zero a tag out of the count breakdown while its data still exists, so
-    /// the counts saying "one tag" while the observed set remembers two must
-    /// NOT narrow — the set wins.
+    /// slices come from the observed set, never the counts.
     #[test]
-    fn observed_set_vetoes_narrowing_when_counts_dropped_a_tag() {
+    fn observed_set_not_counts_decides_the_slices() {
         let stats = stats_with(
             vec![(ValueTypeTag::LONG, 5)],
             vec![ValueTypeTag::INT, ValueTypeTag::LONG],
         );
-
-        assert!(infer_exact_datatype_sid_from_stats(
-            Some(&stats),
-            0,
-            RuntimePredicateId::from_u32(7),
-            &FlakeValue::Long(42),
-        )
-        .is_none());
+        assert_eq!(
+            slices_for(&stats, FlakeValue::Long(42)),
+            Some(vec![
+                (OType::XSD_LONG, int_key(42)),
+                (OType::XSD_INT, int_key(42)),
+            ])
+        );
     }
 
     /// An empty observed set means "unknown" (a read below the historical
     /// accumulation boundary, or a producer that could not fill it) and must
     /// fail closed, even when the counts look conclusive.
     #[test]
-    fn empty_observed_set_declines_narrowing() {
+    fn empty_observed_set_declines_slicing() {
         let stats = stats_with(vec![(ValueTypeTag::INT, 10)], vec![]);
-
-        assert!(infer_exact_datatype_sid_from_stats(
-            Some(&stats),
-            0,
-            RuntimePredicateId::from_u32(7),
-            &FlakeValue::Long(42),
-        )
-        .is_none());
+        assert_eq!(slices_for(&stats, FlakeValue::Long(42)), None);
     }
 
     /// Every upper-bound builder in the tree must pin `t` to `i64::MAX` and
