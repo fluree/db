@@ -354,6 +354,20 @@ unchanged:
 - A bulk import (`fluree create --from`) fails with a "datatype limit
   exceeded" error.
 
+#### Upgrading and Downgrading
+
+Fluree 4.2.1 and earlier cannot index a ledger that holds more than 241
+non-reserved datatypes. Those releases still accept writes past that point,
+so such a ledger may already exist. Later releases index it with no
+migration.
+
+Rolling back to 4.2.1 or earlier affects any ledger that holds more than 241
+non-reserved datatypes. The older release can read the ledger's existing
+index, but its index builds can fail. When they do, new data stays in
+novelty, where queries are slower, and writes are refused once novelty
+reaches its size limit. Moving the ledger back to a newer release clears
+both.
+
 Vocabularies of units or currencies can define hundreds of datatypes. If
 data needs more distinct datatypes than the limit allows, record the unit
 in its own property instead of in the datatype:
