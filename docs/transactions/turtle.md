@@ -34,7 +34,9 @@ Fluree supports Turtle and TriG on different endpoints with different semantics:
 
 - **Insert** (`/insert`): Pure insert semantics: triples are added and existing values are kept. Turtle is parsed straight to flakes. A TriG body's graph blocks land in their named graphs and a `<#txn-meta>` block becomes commit metadata; a body with graph blocks is read as TriG under either content type.
 - **Upsert** (`/upsert`): For each (subject, predicate) pair, existing values are retracted before new values are asserted. Supports TriG with GRAPH blocks for named graph ingestion.
-- **Sync** (`/sync?graph=<iri>`): The body becomes the named graph's entire contents, committing only the difference; an unchanged body commits nothing. N-Triples (`application/n-triples`) is accepted too. See [Sync](sync.md#payload-formats) for the TriG rules.
+- **Sync** (`/sync?graph=<iri>`): The body becomes the named graph's entire contents, committing only the difference; an unchanged body commits nothing. See [Sync](sync.md#payload-formats) for the TriG rules.
+
+N-Triples is a subset of Turtle and is accepted wherever Turtle is: as `application/n-triples` over HTTP, and as a `.nt` file or `--format nt` from the CLI.
 
 ## Basic Turtle Transaction
 
@@ -283,11 +285,10 @@ riot --output=turtle data.jsonld > data.ttl
 rapper -i rdfxml -o turtle data.rdf > data.ttl
 ```
 
-### From N-Triples to Turtle
+### N-Triples
 
-```bash
-rapper -i ntriples -o turtle data.nt > data.ttl
-```
+N-Triples needs no conversion. Send it as `application/n-triples`, or pass a
+`.nt` file to the CLI.
 
 ## Validation
 

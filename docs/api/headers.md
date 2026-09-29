@@ -36,12 +36,12 @@ For SPARQL UPDATE operations. See [SPARQL UPDATE](../query/sparql.md#sparql-upda
 ```http
 Content-Type: text/turtle
 ```
-For Turtle RDF format transactions. Supported on `/insert` (fast direct path) and `/upsert`.
+For Turtle RDF format transactions. Supported on `/insert` (fast direct path), `/upsert`, `/sync` and the Graph Store `/data` endpoint. `application/x-turtle` is accepted as an alias. On `/insert` and `/upsert`, a Turtle body that contains graph blocks is read as TriG.
 
 ```http
 Content-Type: application/trig
 ```
-For TriG format transactions with named graphs (GRAPH blocks). Supported on `/insert`, `/upsert`, and on `/sync` (one graph per request).
+For TriG format transactions with named graphs (GRAPH blocks). Supported on `/insert` and `/upsert`, and on `/sync` and the Graph Store `/data` endpoint (one graph per request). `application/x-trig` is accepted as an alias.
 
 ```http
 Content-Type: application/n-triples

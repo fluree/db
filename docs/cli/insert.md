@@ -75,14 +75,13 @@ Commit ID: bafybeig...
 
 ## Data Format Detection
 
-The format is auto-detected:
-- `@prefix` or `@base` at line start → Turtle
-- Starts with `{` or `[` → JSON-LD
-- `.ttl` or `.nt` file extension → Turtle (N-Triples is parsed as Turtle)
-- `.trig` extension → TriG
-- `.json` or `.jsonld` extension → JSON-LD
+The format comes from `--format` when given, then from the file extension, then from the content:
+- `.ttl` or `.nt` → Turtle (N-Triples is a subset of Turtle and uses the same parser)
+- `.trig` → TriG
+- `.json` or `.jsonld` → JSON-LD
+- No extension, or inline or piped data: content that parses as JSON is JSON-LD, and anything else is Turtle
 
-Turtle input that turns out to contain graph blocks is read as TriG, so a TriG body needs no flag. Override with `--format turtle`, `--format trig` or `--format jsonld`.
+Turtle input that turns out to contain graph blocks is read as TriG, so a TriG body needs no flag. Override detection with `--format turtle` (or `ttl`, or `nt`), `--format trig` or `--format jsonld`.
 
 N-Quads (`.nq`) is not read by `insert`; import it into a new ledger with `fluree create <ledger> --from <file>.nq`.
 

@@ -44,8 +44,12 @@ for the full semantics, safety rails, and blank-node behavior.
 
 Turtle input is converted to JSON-LD client-side before submission, so a
 Turtle export works against any server that implements the `/sync`
-endpoint, including servers from before it accepted Turtle bodies. The CLI
-does not read TriG yet; `POST` a TriG file to
+endpoint, including servers from before it accepted Turtle bodies. A `.nt`
+file is read as Turtle, of which N-Triples is a subset.
+
+The CLI does not read TriG yet. It refuses a TriG body whether it is named
+`.trig`, passed with `--format trig`, or piped in or saved under another
+name with graph blocks in it. `POST` a TriG file to
 [`/sync`](../transactions/sync.md#payload-formats) directly.
 
 ### Sources

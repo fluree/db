@@ -35,6 +35,8 @@ Upserts RDF data into a ledger. Unlike `insert`, upsert will:
 
 This is useful for updating data without needing to know whether it exists.
 
+Supports Turtle, N-Triples, TriG and JSON-LD. In TriG, values are replaced within each `GRAPH <iri> { ... }` block's named graph, and a `GRAPH <#txn-meta> { ... }` block becomes commit metadata. The format is detected the same way as for [`insert`](insert.md#data-format-detection): `--format`, then the extension (`.ttl`/`.nt`, `.trig`, `.json`/`.jsonld`), then the content, and Turtle that contains graph blocks is read as TriG.
+
 ## Examples
 
 ```bash
