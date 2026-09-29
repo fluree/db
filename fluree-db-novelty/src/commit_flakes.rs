@@ -64,7 +64,7 @@ pub fn stamp_graph_on_commit_flakes(flakes: &mut [Flake], graph_sid: &Sid) {
 /// impersonating a commit *record* can steer the commit resolvers, and
 /// restricting to that keeps the check symmetric with the stamp above.
 #[inline]
-fn is_forged_commit_flake(flake: &Flake, txn_meta_graph_sid: &Sid) -> bool {
+pub fn is_forged_commit_flake(flake: &Flake, txn_meta_graph_sid: &Sid) -> bool {
     flake.s.namespace_code == FLUREE_COMMIT
         && flake.g.as_ref().is_some_and(|g| g == txn_meta_graph_sid)
 }

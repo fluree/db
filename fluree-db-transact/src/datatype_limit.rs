@@ -41,15 +41,23 @@ pub fn check_commit(base: &LedgerState, flakes: &[Flake], txn_meta: &[TxnMetaEnt
         return Ok(());
     }
     let known = known_datatypes(base);
-    let meta_datatypes: Vec<Sid> = txn_meta
+    let meta_datatypes = txn_meta_datatypes(txn_meta);
+    let adding = new_datatypes(&known, flakes.iter().map(|f| &f.dt).chain(&meta_datatypes));
+    check_datatype_capacity(&known, adding.len())
+}
+
+/// The datatypes of the typed literals in `txn_meta`.
+///
+/// These are the only txn-meta datatypes that can be new. Every other
+/// txn-meta value has a reserved datatype.
+pub fn txn_meta_datatypes(txn_meta: &[TxnMetaEntry]) -> Vec<Sid> {
+    txn_meta
         .iter()
         .filter_map(|entry| match &entry.value {
             TxnMetaValue::TypedLiteral { dt_ns, dt_name, .. } => Some(Sid::new(*dt_ns, dt_name)),
             _ => None,
         })
-        .collect();
-    let adding = new_datatypes(&known, flakes.iter().map(|f| &f.dt).chain(&meta_datatypes));
-    check_datatype_capacity(&known, adding.len())
+        .collect()
 }
 
 /// Every datatype `state` holds, in its index and in its novelty.

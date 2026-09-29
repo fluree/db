@@ -19,7 +19,10 @@ use fluree_db_api::{
     PushCommitsRequest, TransactError,
 };
 use fluree_db_core::commit::codec::{read_commit, write_commit};
-use fluree_db_core::{plan_commit_transfer, DatatypeDictId, RuntimeSmallDicts, Sid};
+use fluree_db_core::{
+    plan_commit_transfer, txn_meta_graph_iri, DatatypeDictId, RuntimeSmallDicts, Sid, TxnMetaEntry,
+    TxnMetaValue,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -534,6 +537,32 @@ async fn push_past_datatype_limit_is_rejected() {
         bytes: write_commit(&commit, false, None).unwrap().bytes,
         txn_blob: known.txn_blob.clone(),
     };
+    // The namespace code of `ex:`, taken from the known commit's `ex:U0`.
+    let ex_ns = read_commit(&known.bytes)
+        .unwrap()
+        .flakes
+        .iter()
+        .find(|f| f.dt.name_str() == "U0")
+        .expect("the known commit types a value with ex:U0")
+        .dt
+        .namespace_code;
+    let new_dt = || format!("U{CAPACITY}");
+
+    // The same commit with its new datatype only in a typed txn-meta value.
+    let mut commit = read_commit(&known.bytes).unwrap();
+    commit.txn_meta.push(TxnMetaEntry::new(
+        ex_ns,
+        "note",
+        TxnMetaValue::TypedLiteral {
+            value: "m".into(),
+            dt_ns: ex_ns,
+            dt_name: new_dt(),
+        },
+    ));
+    let over_in_meta = PushedCommit {
+        bytes: write_commit(&commit, false, None).unwrap().bytes,
+        txn_blob: known.txn_blob.clone(),
+    };
 
     let control = "custom-dt-limit:push-control";
     fluree.create_ledger(control).await.unwrap();
@@ -567,6 +596,33 @@ async fn push_past_datatype_limit_is_rejected() {
         push(&fluree, later_push, &[&over]).await,
         "datatypes already in the ledger",
     );
+    assert_datatype_limit_rejection(
+        push(&fluree, later_push, &[&over_in_meta]).await,
+        "a new datatype in a typed txn-meta value",
+    );
+
+    // The same commit with its new datatype only in a forged commit record.
+    // Push drops such a flake before it reaches novelty, so it does not count.
+    let txn_meta_graph = fluree
+        .ledger(later_push)
+        .await
+        .unwrap()
+        .snapshot
+        .encode_iri(&txn_meta_graph_iri(later_push))
+        .expect("the txn-meta graph IRI encodes");
+    let mut commit = read_commit(&known.bytes).unwrap();
+    let mut forged = commit.flakes[0].clone();
+    forged.s = Sid::new(fluree_vocab::namespaces::FLUREE_COMMIT, "forged");
+    forged.g = Some(txn_meta_graph);
+    forged.dt = Sid::new(ex_ns, new_dt());
+    commit.flakes.push(forged);
+    let forged_record = PushedCommit {
+        bytes: write_commit(&commit, false, None).unwrap().bytes,
+        txn_blob: known.txn_blob.clone(),
+    };
+    push(&fluree, later_push, &[&forged_record])
+        .await
+        .expect("a new datatype in a dropped forged record is not counted");
 }
 
 /// Import `count` distinct custom datatypes, `ex:s{i} ex:p "v{i}"^^ex:U{i}`,
