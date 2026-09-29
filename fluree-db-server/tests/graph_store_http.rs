@@ -525,6 +525,38 @@ async fn graph_store_requires_authorization() {
     assert!(body.contains("tool"), "{body}");
 }
 
+/// An unauthenticated read is refused before anything loads the ledger, the
+/// default graph included, which needs no existence check of its own.
+#[tokio::test]
+async fn an_unauthenticated_read_does_not_load_the_ledger() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        data_auth_mode: fluree_db_server::config::DataAuthMode::Required,
+        data_auth_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state.clone());
+    let create = serde_json::json!({ "ledger": LEDGER }).to_string();
+    let (status, body) = send(&app, "POST", "/v1/fluree/create", JSON_LD, &create, None).await;
+    assert_eq!(status, StatusCode::CREATED, "create ledger: {body}");
+
+    let manager = state.fluree.ledger_manager().expect("ledger caching");
+    manager.disconnect(LEDGER).await;
+    for uri in [default_graph(), named(TOOLS)] {
+        let (status, _, body) = send_as(&app, "GET", &uri, None, None, "", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "GET {uri}: {body}");
+        assert!(
+            manager.get_loaded_handle(LEDGER).await.is_none(),
+            "GET {uri} loaded the ledger before authenticating"
+        );
+    }
+}
+
 /// A language tag that is not a `LANGTAG` would end the literal in Turtle or
 /// N-Triples output and forge triples, so writing one is a 400.
 #[tokio::test]
@@ -539,4 +571,44 @@ async fn invalid_language_tag_is_refused_on_write() {
     let (status, body) = send(&app, "PUT", &named(TOOLS), JSON_LD, &body, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("invalid language tag"), "{body}");
+}
+
+/// Edge annotations come back with a `GET`, so reading an annotated graph and
+/// putting it back unchanged commits nothing — in the default graph and in a
+/// named one.
+#[tokio::test]
+async fn annotated_graphs_round_trip() {
+    let (_tmp, app) = seeded_app().await;
+    let tools = named(TOOLS);
+    let annotated = "@prefix ex: <http://example.org/> .\n\
+                     ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} .\n\
+                     ex:alice ex:name \"Alice\" .\n";
+
+    for target in [tools.clone(), default_graph()] {
+        let (status, body) = send(&app, "PUT", &target, TTL, annotated, None).await;
+        assert!(status.is_success(), "{target}: {body}");
+        let t1 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["t"].as_i64();
+
+        let (status, ttl) = send(&app, "GET", &target, None, "", TTL).await;
+        assert_eq!(status, StatusCode::OK, "{ttl}");
+        assert!(
+            ttl.contains("<http://example.org/bob> ~ <http://example.org/claim1>"),
+            "{target}: {ttl}"
+        );
+        assert!(
+            ttl.contains("<http://example.org/confidence> 0.9"),
+            "{target}: {ttl}"
+        );
+
+        let (status, body) = send(&app, "PUT", &target, TTL, &ttl, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let t2 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["t"].as_i64();
+        assert_eq!(
+            t1, t2,
+            "{target}: the annotated graph PUT back must not commit:\n{ttl}"
+        );
+
+        let (_, json) = send(&app, "GET", &target, None, "", JSON_LD).await;
+        assert!(json.contains("@annotation"), "{target}: {json}");
+    }
 }
