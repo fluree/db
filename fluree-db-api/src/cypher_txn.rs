@@ -46,7 +46,8 @@ use crate::{
     CommitReceipt, Fluree, GovernanceOptions, IndexingStatus, Result, Tracker, TrackingOptions,
     TransactResultRef,
 };
-use fluree_db_core::{ContentId, ContentKind};
+use fluree_db_core::ContentId;
+use fluree_db_core::LedgerId;
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, RefKind, RefValue};
 use fluree_db_transact::{CommitOpts, TransactError};
@@ -54,7 +55,7 @@ use fluree_db_transact::{CommitOpts, TransactError};
 /// An open interactive Cypher transaction. Create with
 /// [`Fluree::begin_cypher_transaction`]; drop to roll back.
 pub struct CypherTransaction {
-    ledger_id: String,
+    ledger_id: LedgerId,
     /// `t` of the pinned base — the commit-time precondition.
     base_t: i64,
     /// Head ref of the pinned base (`None` on an empty ledger) — the
@@ -99,7 +100,7 @@ pub struct CypherTxnWriteOutcome {
 }
 
 impl CypherTransaction {
-    pub fn ledger_id(&self) -> &str {
+    pub fn ledger_id(&self) -> &LedgerId {
         &self.ledger_id
     }
 
@@ -135,7 +136,9 @@ impl Fluree {
             t: state.t(),
         });
         Ok(CypherTransaction {
-            ledger_id: ledger_id.to_string(),
+            // The id the handle resolved to, not the caller's spelling: the
+            // commit derives storage paths and cache keys from it.
+            ledger_id: handle.id().clone(),
             base_t: state.t(),
             base_head,
             state,
@@ -350,7 +353,7 @@ impl Fluree {
 
         let mut commit_opts = CommitOpts::default()
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
         if let Some(identity) = &txn.governance.identity {
             commit_opts = commit_opts.identity(identity.clone());
         }
@@ -435,13 +438,7 @@ impl Fluree {
             // record but no genesis commit, so `base_head` is legitimately
             // `None` here; that must stay a successful no-op, not an error.
             return Ok(TransactResultRef {
-                receipt: CommitReceipt {
-                    commit_id: ContentId::new(ContentKind::Commit, &[]),
-                    t: txn.base_t,
-                    flake_count: 0,
-                    assert_count: 0,
-                    retract_count: 0,
-                },
+                receipt: CommitReceipt::no_op(txn.base_t),
                 indexing: IndexingStatus {
                     enabled: self.indexing_mode.is_enabled(),
                     needed: false,

@@ -394,32 +394,7 @@ impl<'a> Validator<'a> {
                         self.validate_no_blank_nodes_in_delete_triple(triple, context);
                     }
                 }
-                QuadPatternElement::Graph {
-                    name,
-                    triples,
-                    span,
-                } => {
-                    match name {
-                        crate::ast::pattern::GraphName::Iri(_iri) => {
-                            // Allowed (Phase 1)
-                        }
-                        crate::ast::pattern::GraphName::Var(v) => {
-                            self.diagnostics.push(
-                                Diagnostic::error(
-                                    DiagCode::UnsupportedGraphInUpdate,
-                                    format!(
-                                        "GRAPH ?{} is not supported in SPARQL Update {} templates",
-                                        v.name, context
-                                    ),
-                                    *span,
-                                )
-                                .with_label(Label::new(v.span, "graph variables not supported here"))
-                                .with_help(
-                                    "Use GRAPH <iri> { ... } with an explicit graph IRI, or rewrite to a fixed target graph.",
-                                ),
-                            );
-                        }
-                    }
+                QuadPatternElement::Graph { triples, .. } => {
                     if reject_blank_nodes {
                         for triple in triples {
                             self.validate_no_blank_nodes_in_delete_triple(triple, context);
@@ -894,15 +869,24 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_where_graph_variable_rejected() {
-        // Graph variables are unsupported in update templates (Phase 1), and
-        // the DELETE WHERE pattern is also the delete template.
+    fn test_delete_where_graph_variable_allowed() {
         let diags = validate_query("DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
         assert!(
-            diags
-                .iter()
-                .any(|d| d.code == DiagCode::UnsupportedGraphInUpdate),
-            "GRAPH ?var should be rejected in DELETE WHERE: {diags:?}"
+            diags.iter().all(|d| !d.is_error()),
+            "GRAPH ?var should be allowed in DELETE WHERE: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_modify_graph_variable_templates_allowed() {
+        let diags = validate_query(
+            "DELETE { GRAPH ?g { ?s <http://example.org/p> \"old\" } } \
+             INSERT { GRAPH ?g { ?s <http://example.org/p> \"new\" } } \
+             WHERE { GRAPH ?g { ?s <http://example.org/p> \"old\" } }",
+        );
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "GRAPH ?var should be allowed in DELETE/INSERT templates: {diags:?}"
         );
     }
 
@@ -1081,10 +1065,8 @@ mod tests {
         );
         let diags = validate_with(&caps, "DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
         assert!(
-            diags
-                .iter()
-                .any(|d| d.code == DiagCode::UnsupportedGraphInUpdate),
-            "graph variables stay rejected in DELETE WHERE: {diags:?}"
+            diags.iter().all(|d| !d.is_error()),
+            "graph variables are allowed in DELETE WHERE: {diags:?}"
         );
         let diags = validate_with(
             &caps,

@@ -43,6 +43,7 @@ fn render(graph: &mut Graph) -> JsonValue {
         graph,
         &JsonLdFormatConfig::construct_parity(None, std::string::ToString::to_string),
     )
+    .unwrap()
 }
 
 fn triple(g: &mut Graph, s: &str, p: &str, o: Term) {

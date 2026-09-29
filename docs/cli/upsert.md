@@ -24,7 +24,7 @@ fluree upsert [LEDGER] [DATA] [OPTIONS]
 | `-e, --expr <EXPR>` | Inline data expression (alternative to positional) |
 | `-f, --file <FILE>` | Read data from a file |
 | `-m, --message <MSG>` | Commit message |
-| `--format <FORMAT>` | Data format: `turtle` or `jsonld` (auto-detected if omitted) |
+| `--format <FORMAT>` | Data format: `turtle` (`nt` for N-Triples), `trig` or `jsonld` (auto-detected if omitted) |
 | `--remote <NAME>` | Execute against a remote server (by remote name, e.g., `origin`) |
 
 ## Description
@@ -35,6 +35,8 @@ Upserts RDF data into a ledger. Unlike `insert`, upsert will:
 
 This is useful for updating data without needing to know whether it exists.
 
+Supports Turtle, N-Triples, TriG and JSON-LD. In TriG, values are replaced within each `GRAPH <iri> { ... }` block's named graph, and a `GRAPH <#txn-meta> { ... }` block becomes commit metadata. The format is detected the same way as for [`insert`](insert.md#data-format-detection): `--format`, then the extension (`.ttl`/`.nt`, `.trig`, `.json`/`.jsonld`), then the content, and Turtle that contains graph blocks is read as TriG.
+
 ## Examples
 
 ```bash
@@ -44,6 +46,9 @@ ex:alice ex:name "Alice Smith" ; ex:age 31 .'
 
 # Upsert from file
 fluree upsert -f updates.ttl
+
+# Upsert a TriG file: values are replaced within each named graph
+fluree upsert -f updates.trig
 
 # Upsert with commit message
 fluree upsert '{"@id": "ex:alice", "ex:status": "active"}' -m "Updated Alice status"

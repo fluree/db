@@ -2,7 +2,7 @@
 
 A semantic graph database with time travel, branching, and verifiable data — built on W3C standards.
 
-Fluree DB is a single binary that stores your data as an RDF knowledge graph, queryable with SPARQL, JSON-LD Query, Cypher, or GraphQL, with every commit immutably recorded so you can travel back to any prior state. It supports git-style branching and merging, signed and policy-gated transactions, SHACL validation, OWL/RDFS reasoning, and full-text and vector search — over local files, S3, or IPFS — without bolting on external services.
+Fluree DB is a single binary that stores your data as an RDF knowledge graph, queryable with SPARQL, JSON-LD Query, Cypher, or GraphQL, with every commit immutably recorded so you can travel back to any prior state. It supports git-style branching and merging, signed and policy-gated transactions, SHACL validation, OWL/RDFS reasoning, and full-text and vector search — over local files or S3 — without bolting on external services.
 
 ## What you get
 
@@ -12,7 +12,7 @@ Fluree DB is a single binary that stores your data as an RDF knowledge graph, qu
 - **Branching and merging.** Create a branch off any commit, transact against it in isolation, then merge it back. Useful for staging changes, running what-if analyses, or maintaining environment-specific overlays.
 - **Verifiable data.** Transactions and commits can be signed (JWS / W3C Verifiable Credentials). The commit chain is content-addressed, so any tampering is detectable. Pair it with policy enforcement to prove *who* changed *what* and *when* they were allowed to.
 - **Policy-based access control.** Policies are written as graph data, evaluated per query and per transaction, and travel with the ledger — not bolted on at the API layer.
-- **Storage your way.** Local filesystem for development, S3 + DynamoDB for production, IPFS for content-addressed distribution. The same ledger format works across all of them.
+- **Storage your way.** Local filesystem for development, S3 + DynamoDB for production, and (experimentally, from the Rust API) IPFS for content-addressed distribution. The same ledger format works across all of them.
 - **Search built in.** BM25 full-text indexing and HNSW vector search live alongside SPARQL — no separate search service to operate.
 - **Reasoning.** OWL/RDFS inference and Datalog rules run inside the query engine, so derived facts are queryable without a materialization step.
 - **Embeddable.** The same engine that powers the server runs as a Rust library, generic over storage and nameservice. Use it directly in your application or run it standalone over HTTP.

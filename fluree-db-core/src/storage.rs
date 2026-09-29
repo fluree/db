@@ -128,7 +128,7 @@ mod wal;
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
 
-use crate::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};
+use crate::address_path::{storage_ledger_id, SHARED_NAMESPACE};
 use crate::error::Result;
 use async_trait::async_trait;
 use sha2::Digest;
@@ -232,6 +232,26 @@ pub trait StorageRead: Debug + Send + Sync {
         let _ = address;
         None
     }
+
+    /// Whether bytes read from this storage may be persisted unencrypted
+    /// outside it. The binary-index disk cache spills fetched leaves,
+    /// branches and dictionaries to a local directory as a read-through
+    /// cache; a storage that decrypts on read must answer `false`, or that
+    /// cache becomes a plaintext copy of the ledger. Storages whose reads
+    /// return exactly the bytes at rest answer `true`; wrappers delegate to
+    /// what they wrap.
+    ///
+    /// Deliberately without a default: a wrapper that forgot to delegate
+    /// would silently re-open the plaintext leak, so every implementation
+    /// has to answer.
+    fn permits_plaintext_cache(&self) -> bool;
+
+    /// The encryption administration surface, when this storage encrypts
+    /// at rest. `None` for plaintext storages; wrappers delegate to what
+    /// they wrap. Required for the same reason as
+    /// [`Self::permits_plaintext_cache`]: a wrapper that answered `None` by
+    /// default would report an encrypted store as plaintext.
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>>;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
@@ -463,6 +483,29 @@ pub trait StorageMethod {
 ///
 /// Used for type erasure in `AnyStorage`.
 pub trait Storage: StorageRead + ContentAddressedWrite + StorageMethod {}
+
+/// What a key rotation needs from an encrypting storage.
+///
+/// Addresses are hashes of plaintext, so re-enveloping a blob under a new
+/// key is an in-place overwrite at the same address: no pointer changes,
+/// and a crash between blobs leaves each one on exactly one key.
+#[async_trait]
+pub trait EncryptionAdmin: Send + Sync {
+    /// Ids of every key the storage can decrypt with, current first.
+    fn key_ids(&self) -> Vec<u32>;
+
+    /// Id of the key that encrypts new writes.
+    fn current_key_id(&self) -> u32;
+
+    /// The key id recorded in the envelope at `address`, read from its
+    /// header alone. `None` when the bytes there are not an envelope.
+    async fn key_id_at(&self, address: &str) -> Result<Option<u32>>;
+
+    /// Re-envelope the blob at `address` under the current key, verifying
+    /// the result reads back. Returns the plaintext size rewritten, or
+    /// `None` when the blob was already on the current key.
+    async fn reencrypt(&self, address: &str) -> Result<Option<u64>>;
+}
 impl<T: StorageRead + ContentAddressedWrite + StorageMethod> Storage for T {}
 
 // ============================================================================
@@ -501,6 +544,14 @@ impl StorageRead for Arc<dyn Storage> {
 
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         self.as_ref().resolve_local_path(address)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+        self.as_ref().encryption_admin()
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
@@ -599,6 +650,12 @@ pub trait ContentStore: Debug + Send + Sync {
         let _ = id;
         None
     }
+
+    /// Whether bytes returned by [`Self::get`] may be persisted unencrypted
+    /// outside this store — see [`StorageRead::permits_plaintext_cache`],
+    /// including why there is no default. The disk artifact cache consults
+    /// this before reading or writing an artifact in its directory.
+    fn permits_plaintext_cache(&self) -> bool;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
@@ -724,6 +781,10 @@ impl ContentStore for Arc<dyn ContentStore> {
         self.as_ref().resolve_local_path(id)
     }
 
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
+    }
+
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
         self.as_ref().resolve_cached_bytes(id)
     }
@@ -767,6 +828,8 @@ pub struct StorageContentStore<S: Storage> {
     storage: S,
     ledger_id: String,
     method: String,
+    /// `(name/branch, name/@shared)`, derived once rather than per address.
+    prefixes: (String, String),
 }
 
 impl<S: Storage> StorageContentStore<S> {
@@ -778,10 +841,13 @@ impl<S: Storage> StorageContentStore<S> {
     /// * `ledger_id` - Ledger identifier (e.g., `"mydb:main"`)
     /// * `method` - Storage method name for address generation (e.g., `"file"`, `"memory"`)
     pub fn new(storage: S, ledger_id: impl Into<String>, method: impl Into<String>) -> Self {
+        let ledger_id = ledger_id.into();
+        let prefixes = storage_path_prefixes(&ledger_id);
         Self {
             storage,
-            ledger_id: ledger_id.into(),
+            ledger_id,
             method: method.into(),
+            prefixes,
         }
     }
 
@@ -790,9 +856,9 @@ impl<S: Storage> StorageContentStore<S> {
         let kind = id.content_kind().ok_or_else(|| {
             crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
         })?;
-        let hex_digest = id.digest_hex();
-        let addr = content_address(&self.method, kind, &self.ledger_id, &hex_digest);
-        Ok(addr)
+        let (prefix, shared) = &self.prefixes;
+        let path = content_path_from_prefixes(kind, prefix, shared, &id.digest_hex());
+        Ok(format!("fluree:{}://{path}", self.method))
     }
 
     /// For dict blobs, return the pre-global-dicts address where dicts lived
@@ -1000,6 +1066,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // A resident tier indexes by CID regardless of which (current or
         // legacy) address the bytes were fetched from.
         self.storage.resolve_cached_bytes(id)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.storage.permits_plaintext_cache()
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
@@ -1343,6 +1413,16 @@ impl ContentStore for BranchedContentStore {
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_cached_bytes(id)))
     }
 
+    /// A read may be served by any ancestor, so every store in the
+    /// ancestry must permit the spill.
+    fn permits_plaintext_cache(&self) -> bool {
+        self.branch_store.permits_plaintext_cache()
+            && self
+                .parents
+                .iter()
+                .all(ContentStore::permits_plaintext_cache)
+    }
+
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.branch_store
             .miss_register()
@@ -1402,11 +1482,24 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
-/// Convert a ledger ID to a path prefix.
-///
-/// Handles the standard ledger ID format (e.g., "mydb:main" -> "mydb/main").
+/// Convert a ledger ID to a path prefix (`"mydb:main"` -> `"mydb/main"`).
 pub fn ledger_id_prefix_for_path(ledger_id: &str) -> String {
-    ledger_id_to_path_prefix(ledger_id).unwrap_or_else(|_| ledger_id.replace(':', "/"))
+    storage_path_prefixes(ledger_id).0
+}
+
+/// `(name/branch, name/@shared)` for a ledger id a storage seam received.
+///
+/// An id that neither the current nor the persisted grammar accepts is never
+/// listed or addressed; its paths keep the pre-validation shape so a read of
+/// it misses rather than landing in another ledger's namespace.
+fn storage_path_prefixes(ledger_id: &str) -> (String, String) {
+    match storage_ledger_id(ledger_id, "a storage path") {
+        Ok(id) => (id.path_prefix(), id.shared_prefix()),
+        Err(_) => (
+            ledger_id.replace(':', "/"),
+            format!("{ledger_id}/{SHARED_NAMESPACE}").replace(':', "/"),
+        ),
+    }
 }
 
 /// Leading path segment under which graph-source artifacts (snapshots and
@@ -1426,7 +1519,16 @@ pub const GRAPH_SOURCES_PATH_SEGMENT: &str = "graph-sources";
 ///   (note: keyed by graph_source_id, not a ledger id)
 /// - etc.
 pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> String {
-    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let (prefix, shared) = storage_path_prefixes(ledger_id);
+    content_path_from_prefixes(kind, &prefix, &shared, hash_hex)
+}
+
+fn content_path_from_prefixes(
+    kind: ContentKind,
+    prefix: &str,
+    shared: &str,
+    hash_hex: &str,
+) -> String {
     match kind {
         ContentKind::Commit => format!("{prefix}/commit/{hash_hex}.fcv2"),
         ContentKind::Txn => format!("{prefix}/txn/{hash_hex}.json"),
@@ -1435,7 +1537,6 @@ pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> Strin
         ContentKind::DictBlob { dict } => {
             // Dictionaries are global per ledger — shared across all branches.
             // Use the @shared namespace (can't collide with branch names since @ is forbidden).
-            let shared = shared_prefix_for_path(ledger_id);
             let ext = dict_kind_extension(dict);
             format!("{shared}/dicts/{hash_hex}.{ext}")
         }

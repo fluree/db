@@ -18,7 +18,7 @@ use super::grouping::Grouping;
 use super::pattern::Pattern;
 use super::projection::{Column, Projection};
 use super::reasoning::ReasoningConfig;
-use super::triple::TriplePattern;
+use super::triple::{Ref, TriplePattern};
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 
@@ -28,10 +28,14 @@ use crate::var_registry::VarId;
 /// to produce output triples. Uses the same TriplePattern type as WHERE clause
 /// patterns, but variables are resolved against the query result bindings rather
 /// than matched against the database.
+///
+/// `patterns`, `graphs` and `reifications` index into one another, so they
+/// change only through [`push_pattern`](Self::push_pattern) and
+/// [`push_reification`](Self::push_reification).
 #[derive(Debug, Clone)]
 pub struct ConstructTemplate {
     /// Template patterns (resolved TriplePatterns with Sids and VarIds)
-    pub patterns: Vec<TriplePattern>,
+    patterns: Vec<TriplePattern>,
     /// Variables that originated as template blank nodes (`[ ]`, `_:a`, or the
     /// blank cells of a desugared RDF collection `( ... )`).
     ///
@@ -41,15 +45,31 @@ pub struct ConstructTemplate {
     /// than resolving them against the (absent) bindings. Empty for templates
     /// with no blank nodes, including every JSON-LD/FQL construct and DESCRIBE.
     pub bnode_vars: HashSet<VarId>,
+    /// The named graph each pattern writes into, parallel to `patterns`
+    /// (`None`: the default graph). Empty when no pattern names a graph. A
+    /// template that names one produces a dataset, not a single graph.
+    graphs: Vec<Option<Ref>>,
+    /// RDF 1.2 reifier attachments: `reifier` reifies the triple that
+    /// `patterns[triple]` instantiates to. A row that leaves either unbound
+    /// contributes no attachment.
+    reifications: Vec<TemplateReification>,
+}
+
+/// A reifier attachment in a CONSTRUCT template (see
+/// [`ConstructTemplate::reifications`]).
+#[derive(Debug, Clone)]
+pub struct TemplateReification {
+    /// Index into [`ConstructTemplate::patterns`] of the reified triple.
+    pub triple: usize,
+    /// The reifier: a variable (a template blank node for `[ ]`-style
+    /// reifiers), or a constant.
+    pub reifier: Ref,
 }
 
 impl ConstructTemplate {
     /// Create a construct template from patterns with no template blank nodes.
     pub fn new(patterns: Vec<TriplePattern>) -> Self {
-        Self {
-            patterns,
-            bnode_vars: HashSet::new(),
-        }
+        Self::with_bnode_vars(patterns, HashSet::new())
     }
 
     /// Create a construct template carrying its template blank-node variables
@@ -58,15 +78,74 @@ impl ConstructTemplate {
         Self {
             patterns,
             bnode_vars,
+            graphs: Vec::new(),
+            reifications: Vec::new(),
         }
     }
 
-    /// Collect all variables referenced in the template patterns.
-    pub fn referenced_vars(&self) -> HashSet<VarId> {
+    /// Append a pattern that writes into `graph` (`None`: the default graph)
+    /// and return its index. `graphs` stays empty until the first named
+    /// graph appears, then is kept aligned with `patterns`.
+    pub fn push_pattern(&mut self, pattern: TriplePattern, graph: Option<Ref>) -> usize {
+        if graph.is_some() || !self.graphs.is_empty() {
+            self.graphs.resize(self.patterns.len(), None);
+            self.graphs.push(graph);
+        }
+        self.patterns.push(pattern);
+        self.patterns.len() - 1
+    }
+
+    /// Attach `reifier` to `patterns[triple]`, an index
+    /// [`push_pattern`](Self::push_pattern) returned.
+    pub fn push_reification(&mut self, triple: usize, reifier: Ref) {
+        assert!(
+            triple < self.patterns.len(),
+            "reification of pattern {triple}, but the template has {}",
+            self.patterns.len()
+        );
+        self.reifications
+            .push(TemplateReification { triple, reifier });
+    }
+
+    /// The template patterns.
+    pub fn patterns(&self) -> &[TriplePattern] {
+        &self.patterns
+    }
+
+    /// The reifier attachments, each naming a pattern that exists.
+    pub fn reifications(&self) -> &[TemplateReification] {
+        &self.reifications
+    }
+
+    /// The graph `patterns[i]` writes into (`None`: the default graph).
+    pub fn graph(&self, i: usize) -> Option<&Ref> {
+        self.graphs.get(i).and_then(Option::as_ref)
+    }
+
+    /// Whether any pattern writes into a named graph, which makes the result
+    /// a dataset.
+    pub fn names_graphs(&self) -> bool {
+        self.graphs.iter().any(Option::is_some)
+    }
+
+    /// Iterate over variables in the patterns, graph names and reifiers.
+    /// Variables mentioned more than once appear more than once.
+    pub fn var_iter(&self) -> impl Iterator<Item = VarId> + '_ {
+        let refs = self
+            .graphs
+            .iter()
+            .flatten()
+            .chain(self.reifications.iter().map(|r| &r.reifier));
         self.patterns
             .iter()
             .flat_map(TriplePattern::referenced_vars)
-            .collect()
+            .chain(refs.filter_map(Ref::as_var))
+    }
+
+    /// Collect all variables referenced in the template: its patterns, graph
+    /// names and reifiers.
+    pub fn referenced_vars(&self) -> HashSet<VarId> {
+        self.var_iter().collect()
     }
 }
 
@@ -105,28 +184,26 @@ pub enum QueryOutput {
 }
 
 impl QueryOutput {
-    /// Construct a plain `Select` from a variable list (`select ?x ?y ...`).
-    pub fn select_all(vars: Vec<VarId>) -> Self {
+    fn select_vars(vars: Vec<VarId>, restriction: Option<Restriction>) -> Self {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
-            restriction: None,
+            restriction,
         }
+    }
+
+    /// Construct a plain `Select` from a variable list (`select ?x ?y ...`).
+    pub fn select_all(vars: Vec<VarId>) -> Self {
+        Self::select_vars(vars, None)
     }
 
     /// Construct a `Select` with `Distinct` restriction (`selectDistinct ?x ...`).
     pub fn select_distinct(vars: Vec<VarId>) -> Self {
-        Self::Select {
-            projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
-            restriction: Some(Restriction::Distinct),
-        }
+        Self::select_vars(vars, Some(Restriction::Distinct))
     }
 
     /// Construct a `Select` with `One` restriction (`selectOne ?x ...`).
     pub fn select_one(vars: Vec<VarId>) -> Self {
-        Self::Select {
-            projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
-            restriction: Some(Restriction::One),
-        }
+        Self::select_vars(vars, Some(Restriction::One))
     }
 
     /// Construct a `Select` with a Wildcard projection (`select *`).
@@ -308,6 +385,10 @@ pub struct Query {
     /// prefix when it applies, otherwise keep the full IRI (round-trippable).
     /// `None` for JSON-LD/SPARQL queries and vocab-less Cypher.
     pub cypher_vocab: Option<std::sync::Arc<str>>,
+    /// What an unmatched OPTIONAL binds its optional-only variables to: the
+    /// surface language's null semantics. SPARQL / JSON-LD leave the default
+    /// `Unbound`; Cypher lowering sets `Poisoned`.
+    pub unmatched_optional: crate::binding::UnmatchedOptional,
 }
 
 impl Query {
@@ -327,6 +408,7 @@ impl Query {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: crate::binding::UnmatchedOptional::Unbound,
         }
     }
 
@@ -349,6 +431,7 @@ impl Query {
             post_values: self.post_values.clone(),
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            unmatched_optional: self.unmatched_optional,
         }
     }
 }

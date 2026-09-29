@@ -85,7 +85,7 @@ mod tests {
     use where_plan::collect_inner_join_block;
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        LedgerSnapshot::genesis("test/main")
+        LedgerSnapshot::genesis("test:main")
     }
 
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
@@ -116,6 +116,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
         let executable = ExecutableQuery::simple(query);
         let results = execute(db, &vars, &executable, ContextConfig::default())
@@ -146,6 +147,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
 
         let result = build_operator_tree(
@@ -175,6 +177,7 @@ mod tests {
             post_values: None,
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
         };
 
         let result = build_operator_tree(

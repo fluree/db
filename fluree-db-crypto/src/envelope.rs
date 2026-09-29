@@ -164,6 +164,38 @@ pub fn parse_header(envelope: &[u8]) -> Result<ParsedHeader> {
     Ok(ParsedHeader { key_id, nonce })
 }
 
+/// The key id recorded in an envelope, from its header bytes alone.
+///
+/// Accepts a prefix as short as [`HEADER_LEN`], so a caller can classify a
+/// blob by key with a ranged read of its first bytes and no decryption.
+/// Validates magic, version and algorithm like [`parse_header`].
+pub fn key_id_of_header(prefix: &[u8]) -> Result<u32> {
+    if prefix.len() < HEADER_LEN {
+        return Err(EncryptionError::invalid_format(
+            "header prefix too short for an envelope",
+        ));
+    }
+    if &prefix[MAGIC_OFFSET..MAGIC_OFFSET + MAGIC_LEN] != MAGIC {
+        return Err(EncryptionError::invalid_format(
+            "not a Fluree encrypted object (magic mismatch)",
+        ));
+    }
+    if prefix[VERSION_OFFSET] != VERSION {
+        return Err(EncryptionError::invalid_format(
+            "unsupported envelope version",
+        ));
+    }
+    if prefix[ALG_OFFSET] != ALG_AES256_GCM {
+        return Err(EncryptionError::invalid_format(
+            "unsupported encryption algorithm",
+        ));
+    }
+    let key_id_bytes: [u8; KEY_ID_LEN] = prefix[KEY_ID_OFFSET..KEY_ID_OFFSET + KEY_ID_LEN]
+        .try_into()
+        .expect("slice length verified");
+    Ok(u32::from_le_bytes(key_id_bytes))
+}
+
 /// Extract the ciphertext portion (after header) from an envelope.
 ///
 /// # Panics

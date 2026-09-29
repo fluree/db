@@ -85,14 +85,21 @@ The `addressIdentifiers` field maps identifier strings to storage backends, enab
 
 ```json
 {
-  "@id": "connection",
-  "@type": "Connection",
-  "indexStorage": {"@id": "indexS3"},
-  "commitStorage": {"@id": "commitS3"},
-  "addressIdentifiers": {
-    "commit-storage": {"@id": "commitS3"},
-    "index-storage": {"@id": "indexS3"}
-  }
+  "@context": {"@vocab": "https://ns.flur.ee/system#"},
+  "@graph": [
+    {"@id": "indexS3", "@type": "Storage", "s3Bucket": "my-index-bucket"},
+    {"@id": "commitS3", "@type": "Storage", "s3Bucket": "my-commit-bucket"},
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "indexStorage": {"@id": "indexS3"},
+      "commitStorage": {"@id": "commitS3"},
+      "addressIdentifiers": {
+        "commit-storage": {"@id": "commitS3"},
+        "index-storage": {"@id": "indexS3"}
+      }
+    }
+  ]
 }
 ```
 
@@ -118,17 +125,31 @@ Not yet supported (parsed/ignored or absent):
 { "@id": "mem", "@type": "Storage" }
 ```
 
+Supported:
+- `AES256Key` (supports `ConfigurationValue`) — encrypts the in-memory blobs;
+  mainly useful for testing an encrypted configuration without a filesystem
+- `AES256Keys` + `AES256CurrentKey` — a rotation key set; see
+  [Key Rotation](../security/encryption.md#key-rotation)
+
 ### File storage (requires `native`)
 
 Supported:
 - `filePath`
 - `AES256Key` (supports `ConfigurationValue`)
+- `AES256Keys` (list of `{keyId, AES256Key}` nodes) + `AES256CurrentKey` — a
+  rotation key set; mutually exclusive with `AES256Key`. See
+  [Key Rotation](../security/encryption.md#key-rotation)
 - `durability` — `"wal"` (default), `"sync"` or `"page-cache"`
 
 Notes:
-- Rust expects `AES256Key` to be **base64-encoded** and decode to exactly 32 bytes.
+- Rust expects `AES256Key` to be **base64-encoded** (standard or URL-safe) and decode to
+  exactly 32 bytes.
 - This encrypts the **index/commit blobs** written via the storage layer. The file-based
   nameservice remains plaintext, matching the existing builder behavior.
+- A key that is configured but does not resolve (an `envVar` that is unset or empty, with
+  no `defaultVal`) is a config error: the storage is never started unencrypted by accident.
+- Put the key on the `indexStorage` node. With a separate `commitStorage`, the
+  `indexStorage` key encrypts both; a `commitStorage` node with a different key is rejected.
 
 ```json
 {
@@ -164,6 +185,9 @@ variable overrides the `durability` property. See
 Supported fields (parsed and **applied** by Rust):
 - `s3Bucket`
 - `s3Prefix`
+- `AES256Key` (supports `ConfigurationValue`; see the file storage notes — the
+  nameservice, whether DynamoDB or storage-backed, stays plaintext)
+- `AES256Keys` + `AES256CurrentKey` — a rotation key set, as for file storage
 - `s3Endpoint` (optional; recommended **only** for LocalStack/MinIO/custom endpoints)
 - `s3ForcePathStyle` (optional; `true` for MinIO-class endpoints without bucket-subdomain DNS)
 - `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`
@@ -285,37 +309,11 @@ rather than by two storage nodes.
 }
 ```
 
-### IPFS storage (requires `ipfs`)
+### IPFS storage (not available here)
 
-Supported:
-- `ipfsApiUrl` (default `http://127.0.0.1:5001`): Kubo HTTP RPC API base URL
-- `ipfsPinOnPut` (default `true`): pin blocks after writing
-
-```json
-{
-  "@id": "ipfsStorage",
-  "@type": "Storage",
-  "ipfsApiUrl": "http://127.0.0.1:5001",
-  "ipfsPinOnPut": true
-}
-```
-
-With env var indirection:
-
-```json
-{
-  "@id": "ipfsStorage",
-  "@type": "Storage",
-  "ipfsApiUrl": { "envVar": "FLUREE_IPFS_API_URL", "defaultVal": "http://127.0.0.1:5001" },
-  "ipfsPinOnPut": true
-}
-```
-
-Notes:
-- Requires a running Kubo node at the specified URL
-- Fluree's CIDs (SHA-256 + private-use multicodec) are stored directly into IPFS
-- No encryption support (`AES256Key` is not applicable)
-- See [IPFS Storage Guide](../operations/ipfs-storage.md) for Kubo setup and operational details
+A connection config cannot select IPFS storage: a storage node with `ipfsApiUrl` is rejected
+with an error. IPFS storage is experimental and available only through the Rust API
+(`FlureeBuilder::build_ipfs`); see the [IPFS Storage Guide](../operations/ipfs-storage.md).
 
 ## Publisher (nameservice) node fields
 

@@ -3098,6 +3098,7 @@ dependencies = [
  "fluree-db-query",
  "fluree-db-r2rml",
  "fluree-db-server",
+ "fluree-db-transact",
  "fluree-graph-turtle",
  "fluree-vocab",
  "futures",
@@ -3467,6 +3468,7 @@ dependencies = [
  "fluree-db-api",
  "fluree-db-core",
  "fluree-db-nameservice",
+ "fluree-graph-ir",
  "fluree-graph-turtle",
  "fs2",
  "regex",
@@ -3700,6 +3702,8 @@ dependencies = [
  "fluree-db-peer",
  "fluree-db-query",
  "fluree-db-sparql",
+ "fluree-graph-ir",
+ "fluree-graph-turtle",
  "fluree-sse",
  "fluree-test-support",
  "fluree-vocab",
@@ -4007,6 +4011,7 @@ name = "fluree-graph-format"
 version = "4.2.2"
 dependencies = [
  "fluree-graph-ir",
+ "fluree-graph-turtle",
  "fluree-vocab",
  "pretty_assertions",
  "serde",

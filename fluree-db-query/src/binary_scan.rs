@@ -1,11 +1,11 @@
-//! Binary scan operator — eagerly materializes `ColumnBatch` rows into `Binding` values.
+//! Binary scan operator — turns `ColumnBatch` rows into `Binding` values.
 //!
 //! - Uses `BinaryCursor` (leaflet-at-a-time columnar batches)
 //! - Uses `o_type` for value dispatch
-//! - Eagerly materializes all values (no EncodedLit/EncodedSid)
-//!
-//! The eager approach trades some allocation for simplicity. Deferred decoding
-//! can be added in a follow-up when perf requires it.
+//! - Emits encoded bindings (`EncodedSid`/`EncodedPid`/`EncodedLit`) when the
+//!   persisted index is authoritative; decodes eagerly under a novelty overlay,
+//!   for `eager_materialization` contexts, and when one variable fills two
+//!   positions (`?x ?x ?o`, `?s ?x ?x`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -214,6 +214,9 @@ pub struct BinaryScanOperator {
     object_bounds: Option<ObjectBounds>,
     /// Bound object value, if the triple pattern's object is a constant.
     bound_o: Option<FlakeValue>,
+    /// `bound_o` as its persisted `(o_type, o_key)` when it is an IRI the
+    /// store resolves. Cursor rows are then matched by id, with no decode.
+    bound_o_encoded: Option<(u16, u64)>,
     /// Pre-computed repeated-variable flags from the triple pattern.
     check_s_eq_o: bool,
     check_s_eq_p: bool,
@@ -740,6 +743,7 @@ impl BinaryScanOperator {
             index_hint,
             object_bounds,
             bound_o: None,
+            bound_o_encoded: None,
             check_s_eq_o,
             check_s_eq_p,
             check_p_eq_o,
@@ -1362,12 +1366,13 @@ impl BinaryScanOperator {
         // Late materialization is safe only when the BinaryIndexStore is authoritative
         // for decoding (no novelty overlay with ephemeral IDs).
         //
-        // Note: ExecutionContext always carries an overlay provider; `NoOverlay` has epoch=0.
+        // An indexed cached ledger retains a nonzero overlay epoch even after
+        // all novelty is drained. Test for live overlay rows, not past writes.
         // When `eager_materialization` is set (via `GraphDbRef::eager()`), always resolve
         // bindings eagerly — infrastructure queries (config, policy) need concrete
         // `Binding::Sid`/`Lit`, not `EncodedSid`/`EncodedLit`.
         let late_materialize = ctx.is_some_and(|c| {
-            c.overlay.map(fluree_db_core::OverlayProvider::epoch).unwrap_or(0) == 0 && !c.eager_materialization
+            !crate::fast_path_common::overlay_has_novelty(c) && !c.eager_materialization
         })
             // If a repeated variable forces two components into the same output slot,
             // late-materialization must produce comparable binding representations.
@@ -1424,7 +1429,12 @@ impl BinaryScanOperator {
             // - object is bound (must filter)
             // - object bounds are present (must filter)
             // - object is emitted but late-materialization is disabled (e.g., overlay)
-            let needs_o_decode = self.bound_o.is_some()
+            if let Some(encoded) = self.bound_o_encoded {
+                if (o_type, o_key) != encoded {
+                    continue;
+                }
+            }
+            let needs_o_decode = (self.bound_o.is_some() && self.bound_o_encoded.is_none())
                 || self.object_bounds.is_some()
                 || (!late_materialize && self.o_var_pos.is_some());
             // BinaryGraphView::decode_value is novelty-aware: dict-backed types
@@ -1441,7 +1451,11 @@ impl BinaryScanOperator {
                 None
             };
 
-            if let Some(bound) = &self.bound_o {
+            if let Some(bound) = self
+                .bound_o
+                .as_ref()
+                .filter(|_| self.bound_o_encoded.is_none())
+            {
                 let Some(val) = decoded_o.as_ref() else {
                     return Err(QueryError::Internal(
                         "bound object requires object decoding".to_string(),
@@ -2080,6 +2094,7 @@ impl Operator for BinaryScanOperator {
         let (s_sid, p_sid, o_val) =
             Self::extract_bound_terms_snapshot(ctx.active_snapshot, &self.pattern);
         self.bound_o = o_val;
+        self.bound_o_encoded = None;
         let mut filter = Self::build_filter_from_snapshot_sids(
             ctx.active_snapshot,
             &self.pattern,
@@ -2193,6 +2208,7 @@ impl Operator for BinaryScanOperator {
                     Ok(Some(s_id)) => {
                         filter.o_type = Some(OType::IRI_REF.as_u16());
                         filter.o_key = Some(s_id);
+                        self.bound_o_encoded = Some((OType::IRI_REF.as_u16(), s_id));
                     }
                     Ok(None) => return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await,
                     // Genuine error — keep correctness by leaving the filter un-narrowed.
@@ -2519,7 +2535,13 @@ impl Operator for BinaryScanOperator {
         // subject per left row — memoizing per-scope products would grow the
         // map by one entry per probed subject for the whole execution, with no
         // eviction, to save ~a microsecond on a duplicate probe.
-        if ctx.overlay.is_some() {
+        //
+        // A drained overlay (a cached handle after an index install) has
+        // nothing to merge. This asks the overlay itself rather than
+        // `overlay_has_novelty`, which also trusts a zero epoch: this block is
+        // the scan's only overlay merge, so a wrong answer here drops rows
+        // instead of declining a fast path.
+        if ctx.overlay.is_some_and(|o| !o.is_effectively_empty()) {
             let epoch = ctx.overlay().epoch();
             // A bound subject (or, failing that, a bound predicate) turns the
             // translation from a whole-novelty walk into a seek. Without it the
@@ -2834,10 +2856,7 @@ impl Operator for BinaryScanOperator {
             &self.inline_ops,
             &self.pattern,
             store_ref,
-            ctx.overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                == 0,
+            !crate::fast_path_common::overlay_has_novelty(ctx),
         );
         self.encoded_pre_filters = encoded;
         self.inline_ops = pruned;

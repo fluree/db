@@ -14,7 +14,7 @@ pub async fn get(
     direct: bool,
 ) -> CliResult<()> {
     let alias = context::resolve_ledger(explicit_ledger, dirs)?;
-    let ledger_id = context::to_ledger_id(&alias);
+    let ledger_id = context::to_ledger_id(&alias)?;
 
     if let Some(remote_name) = remote_flag {
         let client = context::build_remote_client(remote_name, dirs).await?;
@@ -82,7 +82,7 @@ pub async fn set(
     direct: bool,
 ) -> CliResult<()> {
     let alias = context::resolve_ledger(explicit_ledger, dirs)?;
-    let ledger_id = context::to_ledger_id(&alias);
+    let ledger_id = context::to_ledger_id(&alias)?;
 
     // Read context from expr, file, or stdin
     let json_str = if let Some(e) = expr {

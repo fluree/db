@@ -276,6 +276,7 @@ mod tests {
             reasoning: crate::ir::ReasoningConfig::default(),
             include_system_facts: false,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
             grouping: None,
             ordering: Vec::new(),
             order_binds: Vec::new(),

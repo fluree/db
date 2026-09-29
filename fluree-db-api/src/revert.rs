@@ -24,7 +24,7 @@ use crate::ledger_manager::GuardedStagedCommit;
 use crate::ledger_view::{CommitRef, LedgerView};
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
-use fluree_db_core::ledger_id::format_ledger_id;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{
     collect_dag_cids, collect_first_parent_cids, load_commit_by_id, load_commit_envelope_by_id,
     trace_first_parent_commits_by_id, BranchedContentStore, CommitId, ConflictKey, ContentStore,
@@ -342,12 +342,12 @@ impl crate::Fluree {
         branch: &str,
         selection: RevertSelection,
     ) -> Result<RevertContext> {
-        let branch_id = format_ledger_id(ledger_name, branch);
+        let branch_id = LedgerId::from_parts(ledger_name, branch)?;
         let branch_record = self
             .nameservice()
             .lookup(&branch_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(branch_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(branch_id.clone().to_string()))?;
         let branch_head_id = branch_record.commit_head_id.clone().ok_or_else(|| {
             ApiError::InvalidBranch(format!("Branch {branch_id} has no commits to revert"))
         })?;
@@ -435,9 +435,8 @@ impl crate::Fluree {
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         // Load reverted commits oldest-first then fold via the shared
         // accumulator: invert each flake's `op` (assertion ⇄ retraction),
-        // net per fact, and accumulate `namespace_delta`/`graph_delta` with
-        // earlier-wins semantics, matching the merge path's
-        // `collect_commit_data`.
+        // net per fact, and accumulate `namespace_delta` (earlier wins) and
+        // named graphs, matching the merge path's `collect_commit_data`.
         let mut commits = Vec::with_capacity(plan.ordered_commits.len());
         for commit_id in plan.ordered_commits.iter().rev() {
             commits.push(load_commit_by_id(&branch_store, commit_id).await?);
@@ -445,7 +444,7 @@ impl crate::Fluree {
         let CollectedCommitData {
             flakes: inverted,
             namespace_delta,
-            graph_delta,
+            graph_iris,
         } = collect_from_commits(commits, Fold::Undo);
 
         // Acquire state under the ledger write lock when a manager is
@@ -474,11 +473,12 @@ impl crate::Fluree {
                 &conflict_keys,
                 &strategy,
                 &namespace_delta,
+                &graph_iris,
             )
             .await?;
         let Some((view, outcome)) = staged_view else {
             return Ok(StagedRevert {
-                branch_id: branch_id.to_string(),
+                branch_id: branch_id.clone(),
                 branch: branch.to_string(),
                 reverted_commits,
                 conflict_count,
@@ -508,8 +508,8 @@ impl crate::Fluree {
         if !namespace_delta.is_empty() {
             commit_opts = commit_opts.with_namespace_delta(namespace_delta);
         }
-        if !graph_delta.is_empty() {
-            commit_opts = commit_opts.with_graph_delta(graph_delta);
+        if !graph_iris.is_empty() {
+            commit_opts = commit_opts.with_graph_iris(graph_iris);
         }
 
         // With the lock held the staged base is authoritative — derive
@@ -534,7 +534,7 @@ impl crate::Fluree {
         .await?;
 
         Ok(StagedRevert {
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.clone(),
             branch: branch.to_string(),
             reverted_commits,
             conflict_count,
@@ -583,7 +583,7 @@ impl RevertSelection {
 /// Everything [`Fluree::revert_selection`] needs after resolution and validation
 /// but before mutating state. Shared with the preview path.
 pub(crate) struct RevertContext {
-    pub(crate) branch_id: String,
+    pub(crate) branch_id: LedgerId,
     pub(crate) branch_record: fluree_db_nameservice::NsRecord,
     pub(crate) branch_store: BranchedContentStore,
     pub(crate) plan: RevertPlan,
@@ -626,7 +626,7 @@ pub(crate) struct RevertPlan {
 pub struct StagedRevert {
     /// Fully-qualified branch id (`"<ledger>:<branch>"`) used by the
     /// apply path for content-store + publisher addressing.
-    pub branch_id: String,
+    pub branch_id: LedgerId,
     /// Branch name (without ledger prefix) — echoed onto the
     /// resulting receipt.
     pub branch: String,

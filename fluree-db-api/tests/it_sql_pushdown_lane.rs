@@ -1308,12 +1308,33 @@ fn cases() -> Vec<Case> {
             declined: Some("ref object map into a union entity over templates the lane cannot relate"),
         },
         Case {
+            // Cy has no orders, so ?o stays unbound and the second OPTIONAL
+            // joins every order's total, including the customerless one.
             name: "an optional hanging off an optional entity declines",
             sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?o ex:customer ?c } OPTIONAL { ?o ex:total ?t } }",
             sql: &[],
-            rows: &["n=Ada t=5.00", "n=Ada t=99.50", "n=Bo t=42.00", "n=Cy t="],
+            rows: &[
+                "n=Ada t=5.00",
+                "n=Ada t=99.50",
+                "n=Bo t=42.00",
+                "n=Cy t=42.00",
+                "n=Cy t=5.00",
+                "n=Cy t=7.00",
+                "n=Cy t=99.50",
+            ],
             routing: Routing::MustNotFire,
             declined: Some("optional chained on an optional entity"),
+        },
+        Case {
+            // The second `?c ex:name` shares ?k with the OPTIONAL, so it must not
+            // join the star opened above it: Ada and Cy bind ?k to a country no
+            // name equals, and only Bo, with no country, survives.
+            name: "a triple after an optional that reuses its variable declines",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } ?c ex:name ?k }",
+            sql: &[],
+            rows: &["k=Bo n=Bo"],
+            routing: Routing::MustNotFire,
+            declined: Some("optional variable already bound"),
         },
         Case {
             name: "an inexact filter inside OPTIONAL declines",

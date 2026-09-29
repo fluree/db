@@ -85,7 +85,7 @@ WHERE {
 }
 ```
 
-See [CONSTRUCT Queries](construct.md) for details.
+A `GRAPH` block in the template writes into a named graph, and annotation syntax attaches reifiers to template triples. See [CONSTRUCT Queries](construct.md) for details.
 
 ### ASK Queries
 
@@ -1090,7 +1090,7 @@ INSERT DATA {
 }
 ```
 
-Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates. Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
+Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates, and in `CONSTRUCT` templates, where they carry reifiers into every result format (see [CONSTRUCT](construct.md#edge-annotations-in-the-template)). Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
 
 ### Boundaries (rejected at parse / lowering time)
 
@@ -1098,7 +1098,7 @@ Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } 
 - **Simple-predicate triples only.** `?s ex:p1/ex:p2 ?o {| ... |}` (property-path) is rejected.
 - **Triple terms only as `rdf:reifies` objects**; any other use errors at parse time.
 - **No reserved predicates by hand.** The [system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
-- **No annotations in `CONSTRUCT` templates** (the template output form is deferred); a `CONSTRUCT` whose `WHERE` uses annotations to filter still works.
+- **`CONSTRUCT` template annotation blocks take simple predicates only**, and a template triple term cannot nest.
 - **SPARQL 1.2 triple-term functions** (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` constructor) are deferred.
 
 ## SPARQL UPDATE
@@ -1202,6 +1202,24 @@ SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
 - **`USING <iri>`**: scopes the default graph(s) for `WHERE` evaluation. Repeated `USING` clauses are evaluated as a **merged default graph**.
 - **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs.
 
+### Graph variables in templates
+
+A `GRAPH ?g { ... }` block in an INSERT or DELETE template writes to whichever graph `?g` names in each `WHERE` solution. This rewrites every match in the graph it was found in:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+DELETE { GRAPH ?g { ?s ex:status "old" } }
+INSERT { GRAPH ?g { ?s ex:status "new" } }
+WHERE  { GRAPH ?g { ?s ex:status "old" } }
+```
+
+`DELETE WHERE { GRAPH ?g { ... } }` works the same way.
+
+- In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>`.
+- `?g` may name a graph that does not exist yet, for example one built with `BIND(IRI(...) AS ?g)`. The commit registers it.
+- A solution that leaves `?g` unbound writes nothing for that block. A `?g` bound to a literal or a blank node is an error, as is a `?g` that names `#txn-meta`.
+
 ### Blank Nodes in INSERT
 
 Blank nodes can be used in INSERT templates to create new entities:
@@ -1271,9 +1289,7 @@ like a database without deferred constraints).
 
 Current restrictions / boundaries:
 
-- **Graph management operations**: `LOAD`, `CLEAR`, `DROP`, `CREATE`, `ADD`, `MOVE`, `COPY` are not yet supported.
-- **Template graph variables**: INSERT/DELETE templates support `GRAPH <iri> { ... }` blocks, but `GRAPH ?g { ... }` is not yet supported.
-- **DELETE WHERE + GRAPH blocks**: `GRAPH <iri> { ... }` blocks are not yet supported inside `DELETE WHERE { ... }`.
+- **Graph management operations**: `CREATE`, `CLEAR`, `DROP`, `ADD`, `MOVE` and `COPY` are supported, and `CLEAR`/`DROP` accept `GRAPH <iri>`, `DEFAULT`, `NAMED` and `ALL`. `DROP` behaves like `CLEAR`: the graph registry is additive, so a dropped graph stays registered but empty. These operations refuse the reserved `#config` and `#txn-meta` graphs. Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op.
 - **SERVICE**: Only local-ledger endpoints of the form `fluree:ledger:<name>[:<branch>]` are supported; arbitrary remote HTTP `SERVICE` endpoints are not supported.
 - **Property paths**: Supported in `WHERE` (subject to Fluree capability settings).
 - **Edge annotations are default-graph only**: an annotation tail (`{| ... |}`) inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected; a blank or anonymous reifier is rejected in `DELETE DATA`. See [Edge annotations](#edge-annotations-sparql-12--rdf-12) for the full boundary list.
@@ -1308,7 +1324,7 @@ curl -X POST http://localhost:8090/v1/fluree/update \
 
 1. **Use PREFIX Declarations**: Makes queries readable
 2. **Automatic Pattern Optimization**: The query planner automatically reorders patterns for efficient execution using statistics-driven cardinality estimates
-3. **Flexible FILTER Placement**: Filters can be placed anywhere in the WHERE clause — the query engine automatically applies each filter as soon as all its required variables are bound
+3. **Flexible FILTER Placement**: Filters, including `FILTER EXISTS` and `FILTER NOT EXISTS`, can be placed anywhere in their group — the query engine applies each one to the whole group, as soon as every variable it reads has its final value. A variable that an `OPTIONAL` or an `UNDEF` in `VALUES` leaves unbound on some rows waits for any later pattern that fills it in
 4. **Limit Results**: Use LIMIT for large result sets
 5. **Avoid Cartesian Products**: Structure queries to avoid large joins
 

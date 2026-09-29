@@ -218,14 +218,27 @@ pub struct WhoAmIScopes {
 }
 
 /// Extract scope fields from a verified payload into the response shape.
+///
+/// Ledger lists are the scopes authorization applies: `mydb` reads as
+/// `mydb:main`, and an entry that grants nothing is left out.
 fn scopes_from_payload(p: &fluree_db_credential::jwt_claims::EventsTokenPayload) -> WhoAmIScopes {
+    let effective = |scopes: &Option<Vec<String>>| {
+        scopes.as_ref().map(|listed| {
+            let mut ids: Vec<String> = crate::extract::parse_scopes(Some(listed))
+                .into_iter()
+                .map(String::from)
+                .collect();
+            ids.sort();
+            ids
+        })
+    };
     WhoAmIScopes {
         ledger_read_all: p.ledger_read_all,
         ledger_write_all: p.ledger_write_all,
         storage_all: p.storage_all,
-        ledger_read_ledgers: p.ledger_read_ledgers.clone(),
-        ledger_write_ledgers: p.ledger_write_ledgers.clone(),
-        storage_ledgers: p.storage_ledgers.clone(),
+        ledger_read_ledgers: effective(&p.ledger_read_ledgers),
+        ledger_write_ledgers: effective(&p.ledger_write_ledgers),
+        storage_ledgers: effective(&p.storage_ledgers),
     }
 }
 
@@ -291,6 +304,15 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     if any_auth_enabled {
         doc["auth"] = serde_json::json!({
             "type": "token",
+        });
+    }
+
+    // Key rotation is available whenever the storage encrypts at rest.
+    if let Ok(status) = state.fluree.key_rotation_status().await {
+        doc["encryption"] = serde_json::json!({
+            "current_key_id": status.current_key_id,
+            "key_ids": status.key_ids,
+            "rotation": true,
         });
     }
 
@@ -375,6 +397,53 @@ pub async fn openapi_spec() -> Result<Json<serde_json::Value>> {
                             "description": "Server is healthy"
                         }
                     }
+                }
+            },
+            "/v1/fluree/encryption": {
+                "get": {
+                    "summary": "Encryption key ids held by this node (admin)",
+                    "responses": {"200": {"description": "encrypted flag, key_ids, current_key_id"}}
+                }
+            },
+            "/v1/fluree/encryption/rotate": {
+                "post": {
+                    "summary": "Start or resume a key rotation sweep (admin; runs on the leader)",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "retire_key_id": {"type": "integer", "description": "Key whose blobs are rewritten under the current key"},
+                                        "dry_run": {"type": "boolean"},
+                                        "ledger": {"type": "string", "description": "Limit to one ledger (name or branch-qualified id)"},
+                                        "max_bytes_per_sec": {"type": "integer"}
+                                    },
+                                    "required": ["retire_key_id"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "The progress record"}, "409": {"description": "A rotation is already running"}}
+                }
+            },
+            "/v1/fluree/encryption/rotate/status": {
+                "get": {
+                    "summary": "Rotation progress record (admin; any node)",
+                    "responses": {"200": {"description": "key_ids, current_key_id, progress, active_here, seconds_since_update, stalled, released"}}
+                }
+            },
+            "/v1/fluree/encryption/rotate/pause": {
+                "post": {"summary": "Pause the sweep running on this node (admin)", "responses": {"200": {"description": "ok"}}}
+            },
+            "/v1/fluree/encryption/rotate/cancel": {
+                "post": {"summary": "Cancel the sweep running on this node (admin)", "responses": {"200": {"description": "ok"}}}
+            },
+            "/v1/fluree/encryption/rotate/verify": {
+                "post": {
+                    "summary": "Count blobs still on a retiring key and stamp the record (admin)",
+                    "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"retire_key_id": {"type": "integer"}}, "required": ["retire_key_id"]}}}},
+                    "responses": {"200": {"description": "The progress record with its completion stamp"}}
                 }
             },
             "/v1/fluree/create": {
@@ -617,4 +686,30 @@ pub async fn openapi_spec() -> Result<Json<serde_json::Value>> {
     });
 
     Ok(Json(spec))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A token that lists `mydb` and an id that parses to nothing shows what
+    /// it authorizes, not what it says.
+    #[test]
+    fn whoami_reports_the_scopes_that_authorize() {
+        let payload: fluree_db_credential::jwt_claims::EventsTokenPayload =
+            serde_json::from_value(serde_json::json!({
+                "iss": "did:key:z6Mk",
+                "exp": 0,
+                "fluree.ledger.read.ledgers": ["mydb", "bad@x", "other:dev"],
+                "fluree.storage.ledgers": ["mydb#g"],
+            }))
+            .unwrap();
+        let scopes = scopes_from_payload(&payload);
+        assert_eq!(
+            scopes.ledger_read_ledgers.unwrap(),
+            ["mydb:main", "other:dev"]
+        );
+        assert_eq!(scopes.storage_ledgers.unwrap(), Vec::<String>::new());
+        assert!(scopes.ledger_write_ledgers.is_none());
+    }
 }

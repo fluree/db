@@ -118,8 +118,7 @@ impl Operator for HavingOperator {
                 continue;
             }
 
-            if let Some(filtered) = filter_batch(&batch, &self.prepared_expr, &self.in_schema, ctx)?
-            {
+            if let Some(filtered) = filter_batch(batch, &self.prepared_expr, ctx)? {
                 return Ok(trim_batch(&self.out_schema, filtered));
             }
         }
@@ -148,7 +147,7 @@ mod tests {
     }
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        LedgerSnapshot::genesis("test/main")
+        LedgerSnapshot::genesis("test:main")
     }
 
     #[tokio::test]

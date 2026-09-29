@@ -67,11 +67,9 @@ fluree upsert -f 01-data.ttl
 # → Committed t=1, 8 flakes
 ```
 
-> Use `upsert` (not `insert`) for any TriG document that contains `GRAPH`
-> blocks. The CLI's `insert` path parses Turtle straight to flakes and does
-> not extract `GRAPH` blocks; over HTTP, `/v1/fluree/insert` rejects
-> `Content-Type: application/trig` outright. `upsert` handles both Turtle
-> and TriG.
+> `insert` and `upsert` both read TriG `GRAPH` blocks. This guide uses
+> `upsert` so that re-running a step replaces values rather than adding a
+> second copy.
 
 ---
 
@@ -326,6 +324,11 @@ curl -X POST 'http://localhost:8090/v1/fluree/upsert/demo:main' \
 
 The same TriG `GRAPH` blocks land in the same named graphs as via the CLI;
 nothing else changes about the reasoning wiring.
+
+To reload an edited ontology later, `POST /sync?graph=<ontology graph IRI>`
+with the new file replaces that one graph and commits only what changed.
+Sync takes one graph per request, so send each graph's block separately
+(see [Sync](../transactions/sync.md#payload-formats)).
 
 See [HTTP endpoints](../api/endpoints.md) for the full surface area and
 [Datasets and named graphs](../concepts/datasets-and-named-graphs.md) for

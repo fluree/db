@@ -744,7 +744,7 @@ mod tests {
         let ast = parse_and_validate_sparql(sparql).expect("parse");
         assert_eq!(sparql_parse_count(), 1, "exactly one parse so far");
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let _ = lower_sparql_ast(ast, &snapshot, None, sparql).expect("lower");
 
         assert_eq!(
@@ -759,7 +759,7 @@ mod tests {
     #[test]
     fn parse_sparql_to_ir_parses_once() {
         reset_sparql_parse_count();
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None).expect("lower");
         assert_eq!(sparql_parse_count(), 1);
     }

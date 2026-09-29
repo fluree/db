@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -44,7 +44,7 @@ use crate::routes::query::{
     collect_sparql_min_t_requirements, enforce_bearer_dataset_scope, get_ledger_id,
     has_policy_opts, inject_default_context_if_requested, inject_headers_into_query,
     is_sparql_request, load_ledger_for_query, normalize_ledger_scoped_from,
-    requires_dataset_features, resolve_sparql_text, SparqlParams,
+    requires_dataset_features, resolve_sparql_text, PathLedger, SparqlParams,
 };
 use crate::state::AppState;
 
@@ -56,7 +56,7 @@ const STREAM_CHANNEL_DEPTH: usize = 64;
 pub async fn stream_query_ledger_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    Query(params): Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -74,7 +74,7 @@ pub async fn stream_query_ledger_tail(
 /// connection/dataset path — there is no single-ledger shortcut.
 pub async fn stream_query_connection(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -87,10 +87,10 @@ pub async fn stream_query_connection(
 
 async fn stream_query_connection_inner(
     state: Arc<AppState>,
-    params: SparqlParams,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -121,19 +121,15 @@ async fn stream_query_connection_inner(
     // only named graphs and then matches outside them (see `X_FDB_WARNING`).
     // Both branches below set it, so there is no default to fall back on.
     let warn_headers;
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
 
         // Bearer scope over every FROM/FROM NAMED ledger.
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() {
-                if let Ok(ledger_ids) = fluree_db_api::sparql_dataset_ledger_ids(&sparql) {
-                    for lid in &ledger_ids {
-                        if !p.can_read(lid) {
-                            return Err(ServerError::not_found("Ledger not found"));
-                        }
-                    }
-                }
+                crate::routes::query::authorize_sparql_dataset(p, &sparql)?;
             }
         }
 
@@ -197,7 +193,7 @@ async fn stream_query_connection_inner(
 
         inject_headers_into_query(&mut query_json, &headers);
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger_id) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger_id)?) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
@@ -237,10 +233,10 @@ async fn stream_query_connection_inner(
 async fn stream_query_inner(
     state: Arc<AppState>,
     ledger: String,
-    params: SparqlParams,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -267,6 +263,15 @@ async fn stream_query_inner(
         ));
     }
 
+    // The streaming dataset path does not enumerate a ledger's named graphs
+    // under `GRAPH ?g`, so a pinned read here would silently drop them.
+    if PathLedger::parse(&ledger)?.pin.is_some() {
+        return Err(ServerError::bad_request(
+            "A time pin in the ledger path is not supported on the streaming endpoint; \
+             use /v1/fluree/query/<ledger>@<pin>",
+        ));
+    }
+
     // Resolve into one of two execution shapes, planned before the 200 stream
     // commits so parse errors / unsupported shapes return a clean 4xx:
     //  - Single: the lean single-ledger GraphDb path (common case).
@@ -276,10 +281,12 @@ async fn stream_query_inner(
     // Advisory headers attached to the 200 — empty unless the request names
     // only named graphs and then matches outside them (see `X_FDB_WARNING`).
     let mut warn_headers = HeaderMap::new();
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
@@ -327,7 +334,7 @@ async fn stream_query_inner(
                     dc,
                     parsed.ast.as_ref(),
                 );
-                crate::routes::query::ledger_scoped_sparql_dataset_spec(&ledger, dc)?
+                crate::routes::query::ledger_scoped_sparql_dataset_spec(&ledger, dc, None)?
             } else {
                 let mut spec = fluree_db_api::DatasetSpec::new();
                 spec.default_graphs.push(
@@ -381,7 +388,7 @@ async fn stream_query_inner(
         normalize_ledger_scoped_from(&ledger, &mut query_json)?;
         inject_headers_into_query(&mut query_json, &headers);
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }

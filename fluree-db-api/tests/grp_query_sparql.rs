@@ -1,6 +1,15 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_query_aggregate_distinct.rs"]
+mod it_query_aggregate_distinct;
+
+#[path = "it_query_join_count.rs"]
+mod it_query_join_count;
+
+#[path = "it_limit_stops_work.rs"]
+mod it_limit_stops_work;
+
 #[path = "it_novelty_subject_iri_formats.rs"]
 mod it_novelty_subject_iri_formats;
 

@@ -132,11 +132,12 @@ jobs:
       # (review item 10), nor a corpus block from a run that never read that
       # corpus. Clear Criterion's cached comparisons too: rust-cache prunes
       # sample.json, leaving dangling comparisons. One Cargo invocation builds
-      # both binaries in parallel, then measures them sequentially.
+      # the binaries in parallel, then measures them sequentially.
       - name: Run cheap benches (tiny, quick)
         run: |
           rm -rf target/criterion target/fluree-bench-mem target/fluree-bench-meta
-          cargo bench -p fluree-db-api --bench query_overlay_matrix --bench query_hot_bsbm
+          cargo bench -p fluree-db-api --bench query_overlay_matrix --bench query_hot_bsbm \
+            --bench query_hot_negation_count --bench query_hot_limit_startup
 
       # Compare against the committed baseline. Exit 1 on any breach of a metric
       # the host-class match makes enforcing, 2 on a refusal to compare.
@@ -208,7 +209,8 @@ jobs:
             echo "::group::capture pass $pass/$samples"
             rm -rf target/criterion target/fluree-bench-mem target/fluree-bench-meta
             for scale in tiny small; do
-              FLUREE_BENCH_SCALE=$scale cargo bench -p fluree-db-api --bench query_overlay_matrix --bench query_hot_bsbm
+              FLUREE_BENCH_SCALE=$scale cargo bench -p fluree-db-api --bench query_overlay_matrix --bench query_hot_bsbm \
+                --bench query_hot_negation_count --bench query_hot_limit_startup
             done
             cargo run -p fluree-bench-support --bin bench-baseline -- \
               capture --label guardrails-pre-ci --out bench-baselines/guardrails-pre-ci.json \

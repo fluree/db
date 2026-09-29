@@ -47,7 +47,8 @@ impl Operator for SingleBatchOp {
     fn close(&mut self) {}
 }
 
-/// Builder that always yields no matches, forcing OPTIONAL to emit Poisoned for optional-only vars.
+/// Builder that always yields no matches under Cypher null semantics, forcing
+/// OPTIONAL to emit Poisoned for optional-only vars.
 struct NoMatchOptionalBuilder {
     schema: Arc<[VarId]>,
     optional_only: Vec<VarId>,
@@ -83,6 +84,10 @@ impl OptionalBuilder for NoMatchOptionalBuilder {
     fn unify_instructions(&self) -> &[fluree_db_query::UnifyInstruction] {
         &[]
     }
+
+    fn unmatched_optional(&self) -> fluree_db_query::UnmatchedOptional {
+        fluree_db_query::UnmatchedOptional::Poisoned
+    }
 }
 
 /// Verifies Poisoned vars block subsequent pattern matching:
@@ -91,7 +96,7 @@ impl OptionalBuilder for NoMatchOptionalBuilder {
 #[tokio::test]
 async fn test_optional_poison_blocks_subsequent() {
     // Minimal db/context.
-    let snapshot = LedgerSnapshot::genesis("test/main");
+    let snapshot = LedgerSnapshot::genesis("test:main");
     let mut vars = VarRegistry::new();
     let s = vars.get_or_insert("?s");
     let opt = vars.get_or_insert("?opt");

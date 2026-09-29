@@ -14,8 +14,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::{
-    format, Batch, FormatterConfig, FuelExceededError, OverlayProvider, PolicyContext, PolicyStats,
-    Tracker, TrackingTally, VarRegistry,
+    format, Batch, FormatterConfig, FuelExceededError, GraphDb, OverlayProvider, PolicyContext,
+    PolicyStats, Tracker, TrackingTally, VarRegistry,
 };
 
 use fluree_db_binary_index::BinaryGraphView;
@@ -587,6 +587,47 @@ impl QueryResult {
         config: &FormatterConfig,
     ) -> format::Result<JsonValue> {
         format::format_results_async(self, &self.context, db, config, None, None).await
+    }
+
+    /// Format against a view, filtered by whatever policy that view carries.
+    ///
+    /// Prefer this over [`Self::format_async`] and [`Self::format_async_with_policy`]
+    /// whenever a `&GraphDb` is in hand. Those take a `GraphDbRef`, which does not
+    /// carry policy, so the caller has to remember to pass it separately; three of
+    /// the sites that forgot were the hydration bypasses fixed in #1935.
+    pub async fn format_async_for_view(
+        &self,
+        view: &GraphDb,
+        config: &FormatterConfig,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(
+            self,
+            &self.context,
+            view.as_graph_db_ref(),
+            config,
+            view.policy(),
+            None,
+        )
+        .await
+    }
+
+    /// Tracked twin of [`Self::format_async_for_view`]: hydration counts fuel and
+    /// policy against `tracker`.
+    pub async fn format_async_for_view_tracked(
+        &self,
+        view: &GraphDb,
+        config: &FormatterConfig,
+        tracker: &Tracker,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(
+            self,
+            &self.context,
+            view.as_graph_db_ref(),
+            config,
+            view.policy(),
+            Some(tracker),
+        )
+        .await
     }
 
     // ========================================================================

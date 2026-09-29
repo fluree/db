@@ -71,7 +71,7 @@ async fn sparql_data_writes_refuse_the_txn_meta_graph() {
     let user_graph = "http://example.org/g1";
     let ledger = genesis_ledger(&fluree, ledger_id);
 
-    // Three spellings reach `Txn::graph_delta`: a GRAPH block, the WITH
+    // Three spellings reach `Txn::write_graphs`: a GRAPH block, the WITH
     // default target, and CREATE (which lowers to an update carrying only a
     // graph registration).
     let refused = [
@@ -112,10 +112,9 @@ async fn sparql_data_writes_refuse_the_txn_meta_graph() {
     }
 }
 
-/// TriG reaches `graph_delta` through a *different* parser — the named-graph
-/// blocks in `fluree-db-api/src/tx.rs`, with their own IRI→id counter, rather
-/// than `parse/jsonld.rs`'s `GraphIdAssigner`. It gets its own case rather than
-/// being assumed covered by the shared chokepoint.
+/// TriG reaches `write_graphs` through a *different* parser — the named-graph
+/// blocks in `fluree-db-api/src/tx.rs` rather than `parse/jsonld.rs`. It gets
+/// its own case rather than being assumed covered by the shared chokepoint.
 ///
 /// `upsert_turtle`, not `insert_turtle`: `insert` on TriG hits the documented
 /// `expected subject, found 'GRAPH'` trap (`docs/transactions/turtle.md`),
@@ -141,6 +140,16 @@ async fn trig_data_writes_refuse_the_txn_meta_graph() {
         err.contains("reserved system graph") && err.contains("#txn-meta"),
         "expected a reserved-graph refusal naming the graph, got: {err}"
     );
+    let err = fluree
+        .insert_turtle(ledger.clone(), &forged)
+        .await
+        .map(|_| ())
+        .expect_err("TriG insert into #txn-meta must be refused")
+        .to_string();
+    assert!(
+        err.contains("reserved system graph") && err.contains("#txn-meta"),
+        "insert: expected a reserved-graph refusal naming the graph, got: {err}"
+    );
 
     // Control: the same TriG shape into a user graph still commits.
     let ok =
@@ -155,7 +164,7 @@ async fn trig_data_writes_refuse_the_txn_meta_graph() {
 
 /// SPARQL and JSON-LD share the transaction IR, so the JSON-LD named-graph
 /// spelling (`"@graph": "<iri>"` as a node-level selector) reaches the same
-/// `graph_delta` and must be refused identically.
+/// `write_graphs` and must be refused identically.
 #[tokio::test]
 async fn jsonld_data_writes_refuse_the_txn_meta_graph() {
     let fluree = FlureeBuilder::memory().build_memory();

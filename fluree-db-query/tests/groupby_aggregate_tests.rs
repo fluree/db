@@ -61,7 +61,7 @@ fn implicit_grouping(aggregates: Vec<AggregateSpec>) -> Grouping {
 }
 
 fn make_test_snapshot() -> LedgerSnapshot {
-    LedgerSnapshot::genesis("test/main")
+    LedgerSnapshot::genesis("test:main")
 }
 
 fn xsd_long() -> Sid {
@@ -92,6 +92,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         post_values: None,
         include_system_facts: false,
         cypher_vocab: None,
+        unmatched_optional: Default::default(),
     }
 }
 

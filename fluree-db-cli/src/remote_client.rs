@@ -1250,29 +1250,21 @@ impl RemoteLedgerClient {
     // Sync (graph synchronization)
     // =========================================================================
 
-    /// Synchronize a named graph: make its contents exactly `body`,
-    /// committing only the delta.
+    /// Synchronize a graph: make its contents exactly `body`, committing
+    /// only the delta. `graph: None` is the default graph.
     ///
-    /// `POST {base}/sync/{ledger}?graph=<iri>[&dryRun=true][&allowEmpty=true]`
+    /// `POST {base}/sync/{ledger}[?graph=<iri>][&dryRun=true][&allowEmpty=true]`
     /// with a JSON-LD body. A dry run answers with the delta report; a real
     /// run with the standard transact response.
     pub async fn sync_jsonld(
         &self,
         ledger: &str,
-        graph: &str,
+        graph: Option<&str>,
         body: &serde_json::Value,
         dry_run: bool,
         allow_empty: bool,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let mut url = self.op_url("sync", ledger);
-        url.push_str("?graph=");
-        url.push_str(&urlencoding::encode(graph));
-        if dry_run {
-            url.push_str("&dryRun=true");
-        }
-        if allow_empty {
-            url.push_str("&allowEmpty=true");
-        }
+        let url = self.sync_url(ledger, graph, dry_run, allow_empty);
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -1280,6 +1272,51 @@ impl RemoteLedgerClient {
             Some(RequestBody::Json(body)),
         )
         .await
+    }
+
+    /// [`sync_jsonld`](Self::sync_jsonld) with a TriG body, sent as
+    /// `application/trig`. Its graph blocks must name `graph`.
+    pub async fn sync_trig(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        body: &str,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.sync_url(ledger, graph, dry_run, allow_empty);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/trig",
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
+    fn sync_url(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> String {
+        let mut params = Vec::new();
+        if let Some(graph) = graph {
+            params.push(format!("graph={}", urlencoding::encode(graph)));
+        }
+        if dry_run {
+            params.push("dryRun=true".to_string());
+        }
+        if allow_empty {
+            params.push("allowEmpty=true".to_string());
+        }
+        let mut url = self.op_url("sync", ledger);
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+        url
     }
 
     // =========================================================================
@@ -2085,6 +2122,68 @@ impl RemoteLedgerClient {
     }
 
     // =========================================================================
+    // Encryption key rotation
+    // =========================================================================
+
+    /// Key ids the server holds: `GET {base_url}/encryption`.
+    pub async fn encryption_keys(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// The rotation progress record: `GET {base_url}/encryption/rotate/status`.
+    pub async fn encryption_rotate_status(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/status");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Start or resume a rotation: `POST {base_url}/encryption/rotate`.
+    pub async fn encryption_rotate(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Pause or cancel the sweep on the node that holds it:
+    /// `POST {base_url}/encryption/rotate/{signal}`.
+    pub async fn encryption_rotate_signal(
+        &self,
+        signal: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("encryption/rotate/{signal}"));
+        self.send_json(reqwest::Method::POST, &url, "application/json", None)
+            .await
+    }
+
+    /// Verify a rotation: `POST {base_url}/encryption/rotate/verify`. Shares
+    /// `REINDEX_TIMEOUT`: it reads every blob's header in the store.
+    pub async fn encryption_rotate_verify(
+        &self,
+        retire_key_id: u32,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/verify");
+        let body = serde_json::json!({ "retire_key_id": retire_key_id });
+        self.send_json_with_timeout(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+            Self::REINDEX_TIMEOUT,
+        )
+        .await
+    }
+
+    // =========================================================================
     // List ledgers
     // =========================================================================
 
@@ -2105,8 +2204,9 @@ impl RemoteLedgerClient {
     /// Create a new branch on the remote server.
     ///
     /// Calls `POST {base_url}/branch` with a JSON body. `at` optionally
-    /// specifies a historical commit to branch from (as accepted by
-    /// `CommitRef::parse`, e.g. `"t:5"` or a hex digest / full CID).
+    /// specifies the point on the source to branch from, passed through
+    /// unparsed: the server reads it with `TimeSpec::parse_at`, as the local
+    /// path does (e.g. `"t:5"`, `"time:2026-01-01T00:00:00Z"`, a hex digest).
     pub async fn create_branch(
         &self,
         ledger: &str,
@@ -3558,7 +3658,7 @@ mod tests {
     use futures::stream;
 
     fn sample_ns_record() -> NsRecord {
-        let mut record = NsRecord::new("mydb".to_string(), "main".to_string());
+        let mut record = NsRecord::new("mydb:main");
         record.commit_head_id = Some(ContentId::new(ContentKind::Commit, b"head"));
         record.commit_t = 7;
         record.index_head_id = Some(ContentId::new(ContentKind::IndexRoot, b"idx"));
