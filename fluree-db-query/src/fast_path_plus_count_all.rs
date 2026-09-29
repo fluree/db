@@ -87,7 +87,7 @@ fn count_reachable_plus_from_fixed_subject(
     subj: &Ref,
 ) -> Result<Option<u64>> {
     let Some(p_id) = store.sid_to_p_id(pred_sid) else {
-        return if ctx.overlay.is_some() {
+        return if crate::fast_path_common::overlay_has_novelty(ctx) {
             Ok(None)
         } else {
             Ok(Some(0))
@@ -111,12 +111,7 @@ fn count_reachable_plus_from_fixed_subject(
     // under an uncommitted overlay the start subject may exist solely in novelty
     // (e.g. `ex:new` inserted but not yet indexed), so it would never match and we
     // would undercount to 0. Bail to the (correct) generic pipeline in that case.
-    if ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0
-    {
+    if crate::fast_path_common::overlay_has_novelty(ctx) {
         return Ok(None);
     }
 
@@ -199,11 +194,7 @@ fn count_p1_then_p2_plus(
     p1: &Ref,
     p2: &Ref,
 ) -> Result<Option<u64>> {
-    let overlay_has_rows = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0;
+    let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
     let p1_sid = normalize_pred_sid(store, p1)?;
     let p2_sid = normalize_pred_sid(store, p2)?;
     let Some(p1_id) = store.sid_to_p_id(&p1_sid) else {
@@ -286,4 +277,76 @@ fn count_p1_then_p2_plus(
     }
 
     Ok(Some(total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ExecutionContext;
+    use crate::var_registry::VarRegistry;
+    use fluree_db_binary_index::BinaryIndexStore;
+    use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, NoOverlay, Sid};
+    use fluree_db_novelty::Novelty;
+
+    #[test]
+    fn missing_predicate_count_tracks_novelty_lifecycle() {
+        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let snapshot = LedgerSnapshot::genesis("missing-path:main");
+        let vars = VarRegistry::new();
+        let predicate = Sid::new(0, "http://example.org/edge");
+        let subject = Ref::Iri("http://example.org/start".into());
+        let count = |ctx: &ExecutionContext<'_>| {
+            count_reachable_plus_from_fixed_subject(&store, ctx, 0, &predicate, &subject)
+                .expect("path count")
+        };
+
+        assert_eq!(count(&ExecutionContext::new(&snapshot, &vars)), Some(0));
+        assert_eq!(
+            count(&ExecutionContext::with_overlay(
+                &snapshot, &vars, &NoOverlay
+            )),
+            Some(0)
+        );
+
+        let mut novelty = Novelty::new(0);
+        let edge = |t, op| Flake {
+            g: None,
+            s: Sid::new(0, "http://example.org/start"),
+            p: predicate.clone(),
+            o: FlakeValue::Ref(Sid::new(0, "http://example.org/end")),
+            dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+            t,
+            op,
+            m: None,
+        };
+
+        for t in 1..=2 {
+            novelty
+                .apply_commit(vec![edge(t, true)], t, &Default::default())
+                .unwrap();
+            assert_eq!(
+                count(&ExecutionContext::with_overlay(&snapshot, &vars, &novelty)),
+                None,
+                "a predicate present only in novelty must use the fallback"
+            );
+
+            novelty.clear_up_to(t);
+            assert!(novelty.is_empty());
+            assert_ne!(novelty.epoch, 0);
+            assert_eq!(
+                count(&ExecutionContext::with_overlay(&snapshot, &vars, &novelty)),
+                Some(0),
+                "drained novelty must allow the empty-result shortcut"
+            );
+        }
+
+        novelty
+            .apply_commit(vec![edge(3, false)], 3, &Default::default())
+            .unwrap();
+        assert_eq!(
+            count(&ExecutionContext::with_overlay(&snapshot, &vars, &novelty)),
+            None,
+            "a retraction-only overlay still requires the fallback"
+        );
+    }
 }

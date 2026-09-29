@@ -30,7 +30,7 @@ pub struct ImportOpts {
 /// remote storage is separate from local.
 pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> CliResult<()> {
     let client = context::build_remote_client(remote_name, dirs).await?;
-    let ledger_id = context::to_ledger_id(ledger);
+    let ledger_id = context::to_ledger_id(ledger)?;
     let response = client.create_ledger(&ledger_id).await.map_err(|e| {
         CliError::Remote(format!(
             "failed to create '{ledger}' on remote '{remote_name}': {e}"
@@ -65,7 +65,7 @@ pub async fn run_remote_flpack_import(
     let size = meta.len();
 
     let client = context::build_remote_client(remote_name, dirs).await?;
-    let ledger_id = context::to_ledger_id(ledger);
+    let ledger_id = context::to_ledger_id(ledger)?;
 
     let cap = client.fetch_import_capability().await;
     let result = if cap.needs_negotiated_upload(size) {
@@ -315,7 +315,7 @@ pub async fn run_remote_source_import(
     let size = meta.len();
 
     let client = context::build_remote_client(remote_name, dirs).await?;
-    let ledger_id = context::to_ledger_id(ledger);
+    let ledger_id = context::to_ledger_id(ledger)?;
 
     let cap = client.fetch_import_capability().await;
     if !cap.supports_source_upload() {
@@ -405,7 +405,7 @@ pub async fn run(
 ) -> CliResult<()> {
     // Refuse if this alias is already tracked (mutual exclusion)
     let store = config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    if store.get_tracked(ledger).is_some() {
+    if store.get_tracked(&context::to_ledger_id(ledger)?).is_some() {
         return Err(CliError::Usage(format!(
             "alias '{ledger}' is already used by a tracked ledger.\n  \
              Run `fluree track remove {ledger}` first, or choose a different name."

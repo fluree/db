@@ -43,7 +43,7 @@ pub async fn run(
     // the active ledger straight out of config — so it may already carry a
     // branch. Normalizing here rather than pasting `:main` on is what makes
     // `history` work on a branch at all (#1872).
-    let ledger_id = context::to_ledger_id(&alias);
+    let ledger_id = context::to_ledger_id(&alias)?;
 
     let query = build_history_query(
         &ledger_id,
@@ -71,9 +71,7 @@ pub async fn run(
 
     // Local path: tracked ledgers have no commit chain, so history can't run.
     let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    if store.get_tracked(&alias).is_some()
-        || store.get_tracked(&context::to_ledger_id(&alias)).is_some()
-    {
+    if store.get_tracked(&context::to_ledger_id(&alias)?).is_some() {
         return Err(CliError::Usage(
             "history is not available locally for tracked ledgers (no commit chain).\n  \
              Use `fluree track status`, or pass `--remote <name>` to query the upstream."

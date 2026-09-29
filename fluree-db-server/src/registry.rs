@@ -94,7 +94,7 @@ impl LoadedLedgerHandle {
 #[derive(Debug)]
 pub struct LedgerRegistry {
     /// Map of ledger_id -> handle for tracked ledgers
-    entries: RwLock<HashMap<String, Arc<LoadedLedgerHandle>>>,
+    entries: RwLock<HashMap<fluree_db_api::LedgerId, Arc<LoadedLedgerHandle>>>,
 
     /// Time-to-live for idle entries before they can be swept
     idle_ttl: Duration,
@@ -113,7 +113,7 @@ impl LedgerRegistry {
     ///
     /// If the ledger is already tracked, returns the existing handle and touches it.
     /// Otherwise, creates a new handle.
-    pub fn get_or_create(&self, ledger_id: &str) -> Arc<LoadedLedgerHandle> {
+    pub fn get_or_create(&self, ledger_id: &fluree_db_api::LedgerId) -> Arc<LoadedLedgerHandle> {
         // Fast path: read lock to check if exists
         if let Ok(entries) = self.entries.read() {
             if let Some(handle) = entries.get(ledger_id) {
@@ -131,7 +131,7 @@ impl LedgerRegistry {
             }
 
             let handle = Arc::new(LoadedLedgerHandle::new(ledger_id));
-            entries.insert(ledger_id.to_string(), handle.clone());
+            entries.insert(ledger_id.clone(), handle.clone());
             return handle;
         }
 
@@ -142,7 +142,7 @@ impl LedgerRegistry {
     /// Touch a ledger to update its last access time
     ///
     /// No-op if the ledger is not tracked.
-    pub fn touch(&self, ledger_id: &str) {
+    pub fn touch(&self, ledger_id: &fluree_db_api::LedgerId) {
         if let Ok(entries) = self.entries.read() {
             if let Some(handle) = entries.get(ledger_id) {
                 handle.touch();
@@ -151,7 +151,7 @@ impl LedgerRegistry {
     }
 
     /// Check if a ledger is currently being tracked
-    pub fn is_tracked(&self, ledger_id: &str) -> bool {
+    pub fn is_tracked(&self, ledger_id: &fluree_db_api::LedgerId) -> bool {
         self.entries
             .read()
             .map(|e| e.contains_key(ledger_id))
@@ -161,18 +161,21 @@ impl LedgerRegistry {
     /// Disconnect (remove) a ledger from tracking
     ///
     /// Returns the handle if it was tracked, None otherwise.
-    pub fn disconnect(&self, ledger_id: &str) -> Option<Arc<LoadedLedgerHandle>> {
+    pub fn disconnect(
+        &self,
+        ledger_id: &fluree_db_api::LedgerId,
+    ) -> Option<Arc<LoadedLedgerHandle>> {
         self.entries.write().ok()?.remove(ledger_id)
     }
 
     /// Sweep idle entries and return the ledger IDs that were removed
-    pub fn sweep_idle(&self) -> Vec<String> {
+    pub fn sweep_idle(&self) -> Vec<fluree_db_api::LedgerId> {
         let Ok(mut entries) = self.entries.write() else {
             return Vec::new();
         };
         let ttl = self.idle_ttl;
 
-        let idle_ledger_ids: Vec<String> = entries
+        let idle_ledger_ids: Vec<fluree_db_api::LedgerId> = entries
             .iter()
             .filter(|(_, handle)| handle.is_idle(ttl))
             .map(|(ledger_id, _)| ledger_id.clone())
@@ -232,7 +235,7 @@ impl LedgerRegistry {
     }
 
     /// Get all tracked ledger IDs
-    pub fn ledger_ids(&self) -> Vec<String> {
+    pub fn ledger_ids(&self) -> Vec<fluree_db_api::LedgerId> {
         self.entries
             .read()
             .map(|e| e.keys().cloned().collect())
@@ -309,6 +312,10 @@ mod tests {
     use super::*;
     use fluree_db_core::{ContentId, ContentKind};
 
+    fn id(s: &str) -> fluree_db_api::LedgerId {
+        fluree_db_api::LedgerId::parse(s).unwrap()
+    }
+
     #[test]
     fn test_loaded_ledger_handle_new() {
         let handle = LoadedLedgerHandle::new("test:main");
@@ -341,8 +348,8 @@ mod tests {
     fn test_registry_get_or_create() {
         let registry = LedgerRegistry::new(Duration::from_secs(60));
 
-        let handle1 = registry.get_or_create("test:main");
-        let handle2 = registry.get_or_create("test:main");
+        let handle1 = registry.get_or_create(&id("test:main"));
+        let handle2 = registry.get_or_create(&id("test:main"));
 
         // Should be the same handle
         assert!(Arc::ptr_eq(&handle1, &handle2));
@@ -353,15 +360,15 @@ mod tests {
     fn test_registry_disconnect() {
         let registry = LedgerRegistry::new(Duration::from_secs(60));
 
-        registry.get_or_create("test:main");
-        assert!(registry.is_tracked("test:main"));
+        registry.get_or_create(&id("test:main"));
+        assert!(registry.is_tracked(&id("test:main")));
 
-        let handle = registry.disconnect("test:main");
+        let handle = registry.disconnect(&id("test:main"));
         assert!(handle.is_some());
-        assert!(!registry.is_tracked("test:main"));
+        assert!(!registry.is_tracked(&id("test:main")));
 
         // Disconnect again should return None
-        let handle2 = registry.disconnect("test:main");
+        let handle2 = registry.disconnect(&id("test:main"));
         assert!(handle2.is_none());
     }
 
@@ -370,12 +377,12 @@ mod tests {
         let registry = LedgerRegistry::new(Duration::from_secs(60));
 
         // Create a tracked ledger
-        let handle = registry.get_or_create("test:main");
+        let handle = registry.get_or_create(&id("test:main"));
         assert_eq!(handle.commit_t(), 0);
 
         // Process commit event
         registry.on_ns_event(&NameServiceEvent::LedgerCommitPublished {
-            ledger_id: "test:main".to_string(),
+            ledger_id: id("test:main"),
             commit_id: ContentId::new(ContentKind::Commit, b"test-commit"),
             commit_t: 42,
         });
@@ -383,7 +390,7 @@ mod tests {
 
         // Process index event
         registry.on_ns_event(&NameServiceEvent::LedgerIndexPublished {
-            ledger_id: "test:main".to_string(),
+            ledger_id: id("test:main"),
             index_id: ContentId::new(ContentKind::IndexRoot, b"test-index"),
             index_t: 40,
         });
@@ -391,7 +398,7 @@ mod tests {
 
         // Untracked ledger should be ignored
         registry.on_ns_event(&NameServiceEvent::LedgerCommitPublished {
-            ledger_id: "other:main".to_string(),
+            ledger_id: id("other:main"),
             commit_id: ContentId::new(ContentKind::Commit, b"other-commit"),
             commit_t: 100,
         });
@@ -402,21 +409,21 @@ mod tests {
     fn test_registry_retraction_removes_entry() {
         let registry = LedgerRegistry::new(Duration::from_secs(60));
 
-        registry.get_or_create("test:main");
-        assert!(registry.is_tracked("test:main"));
+        registry.get_or_create(&id("test:main"));
+        assert!(registry.is_tracked(&id("test:main")));
 
         registry.on_ns_event(&NameServiceEvent::LedgerRetracted {
-            ledger_id: "test:main".to_string(),
+            ledger_id: id("test:main"),
         });
-        assert!(!registry.is_tracked("test:main"));
+        assert!(!registry.is_tracked(&id("test:main")));
     }
 
     #[test]
     fn test_registry_sweep_idle() {
         let registry = LedgerRegistry::new(Duration::from_millis(1));
 
-        registry.get_or_create("test:main");
-        registry.get_or_create("test:dev");
+        registry.get_or_create(&id("test:main"));
+        registry.get_or_create(&id("test:dev"));
 
         // Wait for entries to become idle
         std::thread::sleep(Duration::from_millis(10));

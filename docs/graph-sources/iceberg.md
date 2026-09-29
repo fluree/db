@@ -1038,8 +1038,11 @@ ledger's config uses. Rule selection follows the cross-ledger contract: an
 explicit `policy-class` on the request (or token) selects rules; a bare
 `identity` is looked up in the model ledger for its `f:policyClass`; an
 anonymous request carrying `default-allow` applies the baseline
-`f:AccessPolicy` rules. A request with no policy inputs is unrestricted, as
-for a native ledger. Inline `opts.policy` works with or without a model.
+`f:AccessPolicy` rules. A request with no policy inputs at all is governed by
+the model's own rules, as a native ledger's configured `f:policyDefaults`
+govern a bare read of it; a source registered without `--default-allow` is
+fail-closed, so such a request sees nothing. Inline `opts.policy` works with
+or without a model.
 
 The model is validated when the source is registered: it must be an existing
 native ledger (not a graph source), so a mistyped name fails at `map` time

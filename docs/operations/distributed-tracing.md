@@ -204,14 +204,14 @@ W3C trace context propagation requires:
 
 1. **`otel` feature enabled** at build time:
    ```bash
-   cargo build -p fluree-db-server --features otel --release
+   cargo build -p fluree-db-cli --features "otel,fluree-db-server/otel" --release
    ```
 
 2. **OTEL environment variables set** at runtime:
    ```bash
    OTEL_SERVICE_NAME=fluree-server \
    OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
-   ./fluree-server
+   ./target/release/fluree server run
    ```
 
 Without the `otel` feature, the `traceparent` header is still parsed and the trace ID is recorded as a log field for text-based correlation, but the span is not linked as a child in the OTEL trace.

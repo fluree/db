@@ -13,6 +13,7 @@
 //!   and reported at `.execute()` / `.stage()` / `.validate()`.
 //! - **Composition**: Both builders share `TransactCore` for common fields.
 
+use fluree_db_core::LedgerId;
 use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 
@@ -200,7 +201,7 @@ struct DetachedCacheSlot {
     /// the handle is ephemeral (ledger caching disabled), which is also the
     /// case where there is no shared cache left to repair.
     manager: Option<Arc<LedgerManager>>,
-    ledger_id: String,
+    ledger_id: LedgerId,
     /// True while the slot still holds the placeholder.
     detached: bool,
 }
@@ -209,7 +210,7 @@ impl DetachedCacheSlot {
     /// Empty the cache slot, leaving a genesis placeholder, so the in-flight
     /// commit uniquely owns the state it staged against.
     fn detach(mut guard: LedgerWriteGuard, manager: Option<Arc<LedgerManager>>) -> Self {
-        let ledger_id = guard.state().ledger_id().to_string();
+        let ledger_id = guard.state().ledger_id().clone();
         let placeholder = LedgerState::new(LedgerSnapshot::genesis(&ledger_id), Novelty::new(0));
         drop(std::mem::replace(guard.state_mut(), placeholder));
         Self {
@@ -350,7 +351,7 @@ impl Drop for DetachedCacheSlot {
             );
             return;
         };
-        let ledger_id = std::mem::take(&mut self.ledger_id);
+        let ledger_id = self.ledger_id.clone();
         runtime.spawn(async move {
             if let Err(error) = manager.reload(&ledger_id).await {
                 tracing::error!(
@@ -1215,7 +1216,10 @@ impl Fluree {
     /// Returns `None` when no ledger manager is configured (embedded use
     /// without a shared cache to protect). Callers in that mode should
     /// fall back to a fresh storage load.
-    pub(crate) async fn lock_ledger(&self, ledger_id: &str) -> Result<Option<LedgerWriteGuard>> {
+    pub(crate) async fn lock_ledger(
+        &self,
+        ledger_id: &LedgerId,
+    ) -> Result<Option<LedgerWriteGuard>> {
         match self.ledger_manager.as_ref() {
             Some(mgr) => Ok(Some(
                 mgr.get_or_load(ledger_id).await?.lock_for_write().await,
@@ -1233,7 +1237,7 @@ impl Fluree {
     /// `fallback_store`/`fallback_record`.
     pub(crate) async fn lock_or_load<C>(
         &self,
-        ledger_id: &str,
+        ledger_id: &LedgerId,
         fallback_store: C,
         fallback_record: NsRecord,
     ) -> Result<(Option<LedgerWriteGuard>, LedgerState)>
@@ -1841,7 +1845,7 @@ impl Fluree {
         slot.guard_mut().ledger().record_commit(footprint);
         tracing::debug!(
             target: "fluree::write_path",
-            ledger = slot.guard_mut().ledger().id(),
+            ledger = %slot.guard_mut().ledger().id(),
             t = receipt.t,
             pre_us,
             detach_us,
@@ -1885,7 +1889,7 @@ impl Fluree {
     ) -> Option<StageResult> {
         let ledger_id = guard.ledger().id();
         let WriteScope::Subjects(touched) = &stage.scope else {
-            tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, reason = "unbounded", "restage");
+            tracing::debug!(target: "fluree::write_path", ledger = %ledger_id, base_t, reason = "unbounded", "restage");
             return None;
         };
         let current = guard.state();
@@ -1895,7 +1899,7 @@ impl Fluree {
             current.t(),
             current.head_commit_id.as_ref(),
         ) else {
-            tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, current_t = current.t(), reason = "chain unknown", "restage");
+            tracing::debug!(target: "fluree::write_path", ledger = %ledger_id, base_t, current_t = current.t(), reason = "chain unknown", "restage");
             return None;
         };
         // Re-allocate this stage's new namespaces against the current table
@@ -1910,7 +1914,7 @@ impl Fluree {
         for (code, prefix) in allocations {
             let now = ns_registry.get_or_allocate(prefix);
             if now == fluree_vocab::namespaces::OVERFLOW {
-                tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, reason = "namespace overflow", "restage");
+                tracing::debug!(target: "fluree::write_path", ledger = %ledger_id, base_t, reason = "namespace overflow", "restage");
                 return None;
             }
             if now != *code {
@@ -1938,7 +1942,7 @@ impl Fluree {
                 (&*touched, subjects.as_ref())
             };
             if small.iter().any(|s| large.contains(s)) {
-                tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, current_t = current.t(), reason = "subject conflict", "restage");
+                tracing::debug!(target: "fluree::write_path", ledger = %ledger_id, base_t, current_t = current.t(), reason = "subject conflict", "restage");
                 return None;
             }
         }
@@ -2005,7 +2009,7 @@ impl Fluree {
         };
         tracing::debug!(
             target: "fluree::write_path",
-            ledger = ledger_id,
+            ledger = %ledger_id,
             base_t,
             current_t = current.t(),
             behind = since.len(),
@@ -2369,7 +2373,7 @@ impl Fluree {
                 let write_guard = ledger.lock_for_write().await;
                 tracing::debug!(
                     target: "fluree::write_path",
-                    ledger = ledger.id(),
+                    ledger = %ledger.id(),
                     base_t,
                     snapshot_us,
                     stage_us,
@@ -2380,7 +2384,7 @@ impl Fluree {
                     && write_guard.state().head_commit_id.as_ref() == base_head_id.as_ref();
                 if unchanged {
                     ledger.note_write_path(WritePath::Direct);
-                    tracing::debug!(target: "fluree::write_path", ledger = ledger.id(), base_t, "direct");
+                    tracing::debug!(target: "fluree::write_path", ledger = %ledger.id(), base_t, "direct");
                     (write_guard, stage_result, txn_type, commit_opts)
                 } else if let Some(rebased) =
                     Self::rebase_stage(&write_guard, stage_result, base_t, base_head_id.as_ref())

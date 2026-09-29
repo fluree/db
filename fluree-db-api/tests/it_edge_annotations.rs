@@ -6665,7 +6665,8 @@ async fn annotation_form_delete_matrix() {
 
     for (label, op, expected) in rows {
         let fluree = FlureeBuilder::memory().build_memory();
-        let ledger_id = format!("ann-matrix/{}:main", label.replace(' ', "-"));
+        // Labels carry `@` (as in `@annotation`), which ledger ids reserve.
+        let ledger_id = format!("ann-matrix/{}:main", label.replace([' ', '@'], "-"));
         let seeded = fluree
             .insert_turtle(genesis_ledger(&fluree, &ledger_id), ANNOTATION_MATRIX_SEED)
             .await

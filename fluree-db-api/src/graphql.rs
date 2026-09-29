@@ -263,7 +263,7 @@ pub async fn derive_schema(db: &GraphDb) -> Arc<DerivedSchema> {
 /// Everything the derived schema depends on, reduced to something comparable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SchemaCacheKey {
-    ledger_id: String,
+    ledger_id: fluree_db_core::LedgerId,
     /// The indexed snapshot: its statistics are the schema's base.
     index_t: i64,
     /// The view's as-of time, which bounds the overlay half of the merge.
@@ -293,6 +293,27 @@ fn cache_key(db: &GraphDb) -> Option<SchemaCacheKey> {
         overlay_version: db.overlay.content_version()?,
         context: hash_context(db.default_context.as_ref()),
     })
+}
+
+/// Format a lowered GraphQL read's rows, filtered by the view's policy.
+///
+/// Every GraphQL root field lowers to a subgraph projection, so this is where the
+/// whole surface's policy filtering happens. Formatting without the view's policy
+/// expands subjects the request was denied, even though its rows were filtered.
+async fn hydrate_rows(
+    result: &crate::QueryResult,
+    db: &GraphDb,
+) -> std::result::Result<JsonValue, GqlError> {
+    crate::format::format_results_async(
+        result,
+        &result.context,
+        db.as_graph_db_ref(),
+        &crate::format::FormatterConfig::jsonld(),
+        db.policy(),
+        None,
+    )
+    .await
+    .map_err(|e| GqlError::Execution(e.to_string()))
 }
 
 fn hash_context(context: Option<&JsonValue>) -> u64 {
@@ -819,7 +840,7 @@ type ShapeCache =
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ShapeCacheKey {
-    ledger_id: String,
+    ledger_id: fluree_db_core::LedgerId,
     index_t: i64,
     shacl_epoch: u64,
     /// The compiled shapes bake in subclass expansion, so a hierarchy change
@@ -954,10 +975,7 @@ impl RootExecutor for LedgerExecutor {
             .query_with_options(&self.db, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
-        let rows = result
-            .to_jsonld_async(self.db.as_graph_db_ref())
-            .await
-            .map_err(|e| GqlError::Execution(e.to_string()))?;
+        let rows = hydrate_rows(&result, &self.db).await?;
         reshape::reshape(
             &lowered.shape,
             &self.schema.model,
@@ -1111,10 +1129,7 @@ impl LedgerExecutor {
             .query_with_options(view, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
-        let rows = result
-            .to_jsonld_async(view.as_graph_db_ref())
-            .await
-            .map_err(|e| GqlError::Execution(e.to_string()))?;
+        let rows = hydrate_rows(&result, view).await?;
         let objects = reshape::reshape(
             &lowered.shape,
             &self.schema.model,

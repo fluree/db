@@ -25,6 +25,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use crate::query::multi::AsOf;
 use crate::{time_resolve, ApiError, Fluree, Result};
 use fluree_db_core::ledger_id::TIME_TRAVEL_TAGS;
+use fluree_db_query::QueryError;
 
 /// Resolved per-ledger `t` map for an envelope, plus the wall-clock moment it
 /// represents (echoed back to the client).
@@ -44,9 +45,8 @@ pub struct EnvelopeSnapshot {
     pub ledgers: HashMap<String, i64>,
 }
 
-/// Failure modes specific to snapshot resolution. These map to a 5xx envelope
-/// response — they indicate an infrastructure-side failure to honor a
-/// syntactically-valid `asOf`.
+/// Failure modes specific to snapshot resolution. The caller's mistakes keep
+/// their class as an [`ApiError`]; see its `From` impl.
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeSnapshotError {
     #[error("invalid ISO 8601 timestamp for asOf: {iso} ({source})")]
@@ -60,9 +60,27 @@ pub enum EnvelopeSnapshotError {
     PerLedgerResolve { ledger: String, source: ApiError },
 }
 
+/// An `asOf` that is malformed or names no data on a ledger is a 400, and a
+/// ledger that does not exist a 404, as each is on a single query. Anything
+/// else is a failure to honor a valid `asOf`.
 impl From<EnvelopeSnapshotError> for ApiError {
     fn from(err: EnvelopeSnapshotError) -> Self {
-        ApiError::internal(err.to_string())
+        match err {
+            EnvelopeSnapshotError::InvalidIso { .. } => ApiError::invalid_query(err.to_string()),
+            EnvelopeSnapshotError::LedgerLoad { source, .. }
+            | EnvelopeSnapshotError::PerLedgerResolve { source, .. }
+                if source.is_not_found() =>
+            {
+                source
+            }
+            EnvelopeSnapshotError::PerLedgerResolve {
+                ledger,
+                source: ApiError::Query(QueryError::InvalidQuery(msg)),
+            } => ApiError::invalid_query(format!(
+                "failed to resolve asOf for ledger '{ledger}': {msg}"
+            )),
+            other => ApiError::internal(other.to_string()),
+        }
     }
 }
 
@@ -235,7 +253,7 @@ fn pin_string_entry(s: String, ledgers: &HashMap<String, i64>) -> JsonValue {
         return JsonValue::String(s);
     }
     let bare = bare_ledger_id(&s);
-    if let Some(t) = ledgers.get(bare) {
+    if let Some(t) = ledgers.get(&bare) {
         let mut obj = JsonMap::new();
         obj.insert("@id".to_string(), JsonValue::String(s));
         obj.insert("t".to_string(), JsonValue::Number((*t).into()));
@@ -262,7 +280,7 @@ fn pin_object_entry(obj: &mut JsonMap<String, JsonValue>, ledgers: &HashMap<Stri
         return;
     }
     let bare = bare_ledger_id(&id);
-    let Some(t) = ledgers.get(bare).copied() else {
+    let Some(t) = ledgers.get(&bare).copied() else {
         return;
     };
     obj.insert("t".to_string(), JsonValue::Number(t.into()));
@@ -287,14 +305,17 @@ pub(super) fn string_has_explicit_pin(s: &str) -> bool {
     explicit_pin_at(s).is_some()
 }
 
-/// Bare ledger id (no temporal suffix, no named-graph fragment): what distinct
-/// ledger counting and snapshot resolution key on.
-pub(super) fn bare_ledger_id(s: &str) -> &str {
+/// Canonical ledger id (no temporal suffix, no named-graph fragment, default
+/// branch applied): what distinct-ledger counting and snapshot resolution key
+/// on, so `mydb` and `mydb:main` are one ledger. An id that does not parse
+/// keys on its bare spelling and fails later, at load.
+pub(super) fn bare_ledger_id(s: &str) -> String {
     let bare = s.split('#').next().unwrap_or(s);
-    match explicit_pin_at(bare) {
+    let bare = match explicit_pin_at(bare) {
         Some(idx) => &bare[..idx],
         None => bare,
-    }
+    };
+    fluree_db_core::LedgerId::parse(bare).map_or_else(|_| bare.to_string(), String::from)
 }
 
 /// Apply the envelope snapshot to a SPARQL sub-query, returning a new query
@@ -334,7 +355,7 @@ pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> St
         if let IriValue::Full(value) = &iri.value {
             let value_str: &str = value.as_ref();
             let bare = bare_ledger_id(value_str);
-            if let Some(t) = snapshot.ledgers.get(bare) {
+            if let Some(t) = snapshot.ledgers.get(&bare) {
                 // Defensive: skip IRIs that already carry an explicit
                 // temporal pin. Validation rejects collisions when
                 // envelope asOf is set, so this only fires in the
@@ -377,8 +398,9 @@ mod tests {
 
     fn snapshot(pairs: &[(&str, i64)]) -> EnvelopeSnapshot {
         let mut ledgers = HashMap::new();
+        // Keys as production builds them: from the canonical distinct set.
         for (k, v) in pairs {
-            ledgers.insert((*k).to_string(), *v);
+            ledgers.insert(bare_ledger_id(k), *v);
         }
         EnvelopeSnapshot {
             as_of: Some("2024-01-01T00:00:00.000Z".into()),
@@ -639,7 +661,7 @@ mod tests {
             });
             apply_snapshot_to_jsonld(&mut query, &snap);
             assert_eq!(query["from"], pinned);
-            assert_eq!(bare_ledger_id(pinned), "ledgerA");
+            assert_eq!(bare_ledger_id(pinned), "ledgerA:main");
         }
     }
 

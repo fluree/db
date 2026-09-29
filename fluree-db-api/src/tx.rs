@@ -12,6 +12,7 @@ use crate::{ApiError, Result};
 use crate::{TrackedErrorResponse, Tracker, TrackingOptions, TrackingTally};
 use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::DatatypeConstraint;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{
     range_with_overlay, FlakeValue, GraphId, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
 };
@@ -2612,7 +2613,7 @@ impl crate::Fluree {
         txn_context: Option<&JsonValue>,
     ) -> std::result::Result<CheckedStage, fluree_db_transact::TransactError> {
         let inline_unique_properties = txn.opts.unique_properties.clone();
-        let ledger_id = ledger.snapshot.ledger_id.to_string();
+        let ledger_id = ledger.snapshot.ledger_id.clone();
         let base_t = ledger.t();
         let mut resolve_ctx =
             crate::cross_ledger::ResolveCtx::new(&ledger_id, self).with_data_state(ledger.clone());
@@ -2777,7 +2778,7 @@ impl crate::Fluree {
     /// for up to two sweep intervals.
     pub(crate) async fn request_index_after_novelty_rejection(
         &self,
-        ledger_id: &str,
+        ledger_id: &LedgerId,
         base_t: i64,
         err: &fluree_db_transact::TransactError,
     ) {
@@ -3508,7 +3509,7 @@ impl crate::Fluree {
             drop(guard);
             tracing::warn!(
                 error = %e,
-                ledger_id = new_state.ledger_id(),
+                ledger_id = %new_state.ledger_id(),
                 "post-commit cache refresh failed; evicting cached handle"
             );
             mgr.disconnect(new_state.ledger_id()).await;
@@ -3823,7 +3824,7 @@ impl crate::Fluree {
         let new_t = ledger.t() + 1;
         // Captured before `ledger` moves into `stage_flakes`, so a max-novelty
         // rejection can name the ledger and the t the indexer should build to.
-        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        let ledger_id_owned = ledger.snapshot.ledger_id.clone();
         let base_t = ledger.t();
         let txn_id = generate_txn_id();
 
@@ -3874,7 +3875,7 @@ impl crate::Fluree {
                     "failed to load ledger config for cross-ledger governance resolution: {e}"
                 )))
             })?;
-            let ledger_id_owned = ledger.ledger_id().to_string();
+            let ledger_id_owned = ledger.ledger_id().clone();
             let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
                 .with_data_state(ledger.clone());
             let shapes = open_cross_ledger_shapes_model(config.as_ref(), &mut resolve_ctx)
@@ -4371,7 +4372,9 @@ mod tests {
             let mode = fluree.indexing_mode.clone();
             async move {
                 match &mode {
-                    IndexingMode::Background(handle) => handle.is_pending(id).await,
+                    IndexingMode::Background(handle) => {
+                        handle.is_pending(&LedgerId::parse(id).unwrap()).await
+                    }
                     IndexingMode::Disabled => panic!("this test needs a background indexer"),
                 }
             }
@@ -4387,7 +4390,7 @@ mod tests {
         // would fire on every split.
         fluree
             .request_index_after_novelty_rejection(
-                "wedged:main",
+                &LedgerId::parse("wedged:main").unwrap(),
                 42,
                 &fluree_db_transact::TransactError::NoveltyWouldExceed {
                     current_bytes: 1_500,
@@ -4403,7 +4406,7 @@ mod tests {
 
         fluree
             .request_index_after_novelty_rejection(
-                "wedged:main",
+                &LedgerId::parse("wedged:main").unwrap(),
                 42,
                 &fluree_db_transact::TransactError::NoveltyAtMax,
             )
@@ -4449,7 +4452,9 @@ mod tests {
         fluree.set_indexing_mode(IndexingMode::Background(handle.clone()));
 
         assert!(
-            !handle.is_pending("turtle:main").await,
+            !handle
+                .is_pending(&LedgerId::parse("turtle:main").unwrap())
+                .await,
             "nothing has asked for a build yet"
         );
 
@@ -4479,7 +4484,9 @@ mod tests {
         );
 
         assert!(
-            handle.is_pending("turtle:main").await,
+            handle
+                .is_pending(&LedgerId::parse("turtle:main").unwrap())
+                .await,
             "a Turtle write rejected at max novelty must ask the indexer for a build; \
              without it this write family never asks for the thing that unblocks it"
         );

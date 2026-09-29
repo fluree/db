@@ -3,6 +3,7 @@
 //! A `RemoteWatch` provides a stream of changes from a remote, either via
 //! SSE (real-time) or polling (fallback).
 
+use fluree_db_core::LedgerId;
 use fluree_db_nameservice::{GraphSourceRecord, NsRecord};
 use futures::Stream;
 use std::fmt::Debug;
@@ -15,11 +16,11 @@ pub enum RemoteEvent {
     /// A ledger record was created or updated on the remote
     LedgerUpdated(NsRecord),
     /// A ledger was retracted on the remote
-    LedgerRetracted { ledger_id: String },
+    LedgerRetracted { ledger_id: LedgerId },
     /// A graph source record was created or updated on the remote
     GraphSourceUpdated(GraphSourceRecord),
     /// A graph source was retracted on the remote
-    GraphSourceRetracted { graph_source_id: String },
+    GraphSourceRetracted { graph_source_id: LedgerId },
     /// Connected to the remote
     Connected,
     /// Disconnected from the remote (will attempt reconnect)

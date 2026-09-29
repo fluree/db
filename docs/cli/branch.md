@@ -18,7 +18,7 @@ fluree branch create <NAME> [OPTIONS]
 
 | Argument | Description |
 |----------|-------------|
-| `<NAME>` | Name for the new branch (e.g., "dev", "feature-x") |
+| `<NAME>` | Name for the new branch (e.g., "dev", "feature-x"). Cannot contain `/`, `:`, `@` or `#`; see [naming rules](../concepts/ledgers-and-nameservice.md#naming-rules) |
 
 **Options:**
 
@@ -26,14 +26,16 @@ fluree branch create <NAME> [OPTIONS]
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--from <BRANCH>` | Source branch to create from (defaults to "main") |
-| `--at <COMMIT-REF>` | Commit to branch at (defaults to source branch HEAD). Accepts `t:<N>` or a bare transaction number, `commit:<prefix>` or a bare hex digest prefix (min 6 chars), or a full CID. A bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Unlike `query --at` this names a *commit*, so it has no `time:`, `recorded:` or `latest` forms; the spellings the two share mean the same thing on both. |
+| `--at <TIME>` | Point on the source branch to branch at (defaults to its HEAD). Same spellings as `query --at`: `t:<N>` or a bare transaction number, `time:<ISO-8601>` (commit event time; `iso:` is an alias) or a bare ISO-8601 timestamp, `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), `commit:<prefix>` or a bare hex digest prefix (min 6 chars), a full CID, or `latest` / `t:latest` (the HEAD). A bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
 
 Creates a new branch for a ledger. By default the branch starts at the source branch's current HEAD, and is fully isolated — subsequent transactions on either branch are invisible to the other.
 
-Pass `--at` to branch from a historical commit on the source branch instead of its HEAD. The commit must be on the source branch's line of commits, which runs through its fork point into the branch it came from. A commit that reached the branch through a merge is refused: the branch never replays it, because what the merge contributed is folded into the merge commit. Branch at the merge commit instead, or on the branch that made the commit. The new branch starts with no index and replays from genesis on first query. `t:N` and hex-prefix resolution require the source branch to be indexed (full CIDs work unconditionally).
+Pass `--at` to branch from an earlier point on the source branch instead of its HEAD. The new branch starts at the commit that `fluree query --at` with the same value reads on the source: `--at time:2026-01-01T00:00:00Z` gives you the data as of that instant, resolved exactly as a query at that time resolves it. A time before the source's first commit, a malformed timestamp, a transaction number below 1, and `snapshot:<id>` (which names a graph source's table snapshot, not a commit) are rejected.
+
+The commit must be on the source branch's line of commits, which runs through its fork point into the branch it came from. A commit that reached the branch through a merge is refused: the branch never replays it, because what the merge contributed is folded into the merge commit. Branch at the merge commit instead, or on the branch that made the commit. The new branch starts with no index and replays from genesis on first query.
 
 Branches can be nested: you can create a branch from any existing branch, not just "main".
 
@@ -55,6 +57,9 @@ fluree branch create rewind --at 5          # same commit
 
 # Branch at a historical commit by hex-digest prefix
 fluree branch create rewind --at 3dd028a7
+
+# Branch at the data as of a point in time
+fluree branch create q2 --at time:2026-07-01T00:00:00Z
 
 # Create a branch on a remote server
 fluree branch create staging --ledger mydb --remote origin
@@ -201,7 +206,9 @@ fluree branch rebase <NAME> [OPTIONS]
 
 **Description:**
 
-Replays a branch's unique commits on top of the source branch's current HEAD. This brings the branch up to date with upstream changes. The `main` branch cannot be rebased.
+Replays a branch's unique commits on top of the source branch's current HEAD. This brings the branch up to date with upstream changes, and rewrites the branch's commits to do it. To keep the branch's commits as they are, merge the source into the branch instead. The `main` branch cannot be rebased.
+
+A branch that already merged its source in is rebased on its own commits, and that merge is replayed among them. Only the edits that resolved the overlap between the two sides are replayed with it. Everything else it carries came from the source, which already holds it.
 
 If the branch has no unique commits, a fast-forward rebase is performed — the branch point is simply updated to the source's current HEAD.
 
@@ -258,7 +265,7 @@ fluree branch diff <SOURCE> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--target <BRANCH>` | Target branch to preview merging into (defaults to source's parent branch) |
+| `--target <BRANCH>` | Target branch to preview merging into (defaults to the branch the source was created from) |
 | `--max-commits <N>` | Cap on per-side commit summaries shown (default: 50; pass 0 for unbounded in local mode) |
 | `--max-conflict-keys <N>` | Cap on conflict keys shown (default: 50; pass 0 for unbounded in local mode) |
 | `--no-conflicts` | Skip conflict computation for a cheaper preview |
@@ -271,7 +278,7 @@ fluree branch diff <SOURCE> [OPTIONS]
 
 **Description:**
 
-`branch diff` reports ahead/behind commits, fast-forward eligibility, and conflicting `(subject, predicate, graph)` keys without mutating state. With `--conflict-details`, the preview also shows the source and target values for the returned conflict keys and annotates what the selected strategy would do.
+`branch diff` reports ahead/behind commits, fast-forward eligibility, and conflicting `(subject, predicate, graph)` keys without mutating state. It previews the same directions `branch merge` supports, so `fluree branch diff main --target dev` works. With `--conflict-details`, the preview also shows the source and target values for the returned conflict keys and annotates what the selected strategy would do.
 
 By default the preview also stages the merge's resolved change set on the target and validates it against the target's SHACL configuration and shapes, through the same code path `branch merge` uses. The `validation:` line reports `conforms` or the violation report the merge would fail with, and `mergeable:` is `yes` only when the strategy applies and the result conforms. A preview that says `mergeable: yes` therefore means neither the strategy nor the target's shapes will reject the merge. Other conditions still apply at commit time, novelty backpressure among them, so a ledger due for indexing can refuse a merge the preview passed. Fast-forward previews carry no validation line: the adopted commits were validated when they were authored. Pass `--no-validate` for a cheaper count-only preview.
 
@@ -312,15 +319,19 @@ fluree branch merge <SOURCE> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
-| `--target <BRANCH>` | Target branch to merge into (defaults to source's parent branch) |
+| `--target <BRANCH>` | Target branch to merge into (defaults to the branch the source was created from) |
 | `--strategy <STRATEGY>` | Conflict resolution strategy (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-branch`. |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
 
-Merges a source branch into a target branch. When the target hasn't advanced since the source branched, this is a fast-forward; otherwise `--strategy` controls how conflicting edits are resolved (mirroring `branch rebase`).
+Merges a source branch into a target branch. Any two branches of a ledger can be merged: a branch into the one it came from, a branch into one created from it, or two branches that share an earlier commit. `main` can be the source when `--target` names where to merge it.
 
-When `--target` is omitted, the merge target is inferred from the source branch's parent (the branch it was created from).
+When `--target` is omitted, the target is the branch the source was created from. Only then does the source need to have been created from another branch.
+
+The merge fast-forwards when the target's head is on the source's line of commits, which means the source continues where the target left off. The target then adopts the source's head. Otherwise the merge folds the source's changes into one commit on the target, and `--strategy` controls how conflicting edits are resolved (mirroring `branch rebase`).
+
+Each branch numbers its commits from its own fork point, so the two branches' `t` values cannot be compared. The merge finds what each side changed by commit identity instead. A branch that already merged the other in does not count that merge as its own change, because those changes came from the other side to begin with. The edits that resolved the overlap are its own, so merging back does not undo a resolution.
 
 After a successful merge, the source branch remains intact and can continue to receive new transactions and be merged again. Only the new commits since the last merge (or branch creation) are copied.
 
@@ -334,6 +345,9 @@ fluree branch merge dev
 
 # Merge feature-x into dev (explicit target)
 fluree branch merge feature-x --target dev
+
+# Bring main's latest into a branch, keeping the branch's history
+fluree branch merge main --target dev
 
 # Merge for a specific ledger
 fluree branch merge dev --ledger mydb
@@ -366,7 +380,7 @@ fluree branch revert <COMMITS>...
 fluree branch revert --from <COMMIT> --to <COMMIT>
 ```
 
-Accepts either positional commit references (cherry-pick style, one or several) or a git-style range. Each commit reference may be a `t:<N>` or bare transaction number, a `commit:<prefix>` or bare hex digest prefix, or a full commit ID — the same forms `branch create --at` accepts.
+Accepts either positional commit references (cherry-pick style, one or several) or a git-style range. Each commit reference may be a `t:<N>` or bare transaction number, a `commit:<prefix>` or bare hex digest prefix, or a full commit ID — the commit spellings `branch create --at` also accepts. A revert names the commit to undo, so it has no timestamp forms.
 
 A commit must be on the branch's own history, which is the line of commits reached by following each merge's first parent. When the selected commits have nothing to undo, such as one that only registered a graph, no commit is written: the command reports that nothing was reverted and HEAD stays where it was. The genesis commit, a merge commit, and a commit that reached this branch through a merge are all refused: the first two have no single change to undo, and the third belongs to the branch that authored it, where its own history can say what changed after it. Revert it there and merge again.
 

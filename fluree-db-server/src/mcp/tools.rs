@@ -6,6 +6,7 @@
 use crate::mcp::auth::McpPrincipal;
 use crate::query_control::run_query_task;
 use crate::state::AppState;
+use fluree_db_api::{LedgerId, LedgerRef};
 use fluree_db_core::VerifiedIdentity;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -27,6 +28,48 @@ fn extract_principal(context: &rmcp::service::RequestContext<RoleServer>) -> Opt
         .get::<http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<McpPrincipal>())
         .cloned()
+}
+
+/// The principal, if its ledger claims cover `ledger`.
+fn authorize(
+    context: &rmcp::service::RequestContext<RoleServer>,
+    ledger: &LedgerId,
+) -> Option<McpPrincipal> {
+    extract_principal(context).filter(|p| p.can_read(ledger))
+}
+
+/// Parse a tool's `ledger` argument once, so the scope check and the load
+/// see the same ledger. A `@` time suffix is refused rather than stripped:
+/// the loaders refuse it too, and `sparql_query` takes `t` instead. The error
+/// is the reason [`invalid_ledger`] reports.
+fn parse_ledger(raw: &str) -> Result<LedgerRef, String> {
+    let address = LedgerRef::parse(raw).map_err(|e| e.to_string())?;
+    if address.at.is_some() {
+        return Err(
+            "a ledger here takes no `@` time suffix; sparql_query takes `t` instead".to_string(),
+        );
+    }
+    Ok(address)
+}
+
+/// What a malformed `ledger` argument gets, whether or not the ledger exists.
+fn invalid_ledger(raw: &str, why: &str) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(format!(
+        "Invalid ledger '{raw}': {why}"
+    ))])
+}
+
+/// The address the loader resolves: the parsed id and any graph selector.
+fn load_address(address: &LedgerRef) -> String {
+    match &address.fragment {
+        Some(graph) => format!("{}#{graph}", address.id),
+        None => address.id.to_string(),
+    }
+}
+
+/// What an unauthorized ledger gets: the same answer as one that does not exist.
+fn ledger_not_found() -> CallToolResult {
+    CallToolResult::error(vec![Content::text("Ledger not found")])
 }
 
 /// Request parameters for SPARQL query tool
@@ -101,9 +144,15 @@ impl FlureeToolService {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = std::time::Instant::now();
 
-        // Extract identity from MCP principal for policy enforcement
-        let principal = extract_principal(&context);
-        let identity = principal.as_ref().and_then(|p| p.identity.as_deref());
+        let address = match parse_ledger(&req.ledger) {
+            Ok(address) => address,
+            Err(why) => return Ok(invalid_ledger(&req.ledger, &why)),
+        };
+        let Some(principal) = authorize(&context, &address.id) else {
+            return Ok(ledger_not_found());
+        };
+        // The principal's identity drives policy enforcement.
+        let identity = principal.identity.as_deref();
 
         tracing::info!(
             ledger = %req.ledger,
@@ -115,7 +164,13 @@ impl FlureeToolService {
 
         let max_bytes = self.state.config.mcp_agent_json_max_bytes;
         let result = self
-            .execute_sparql_agent_json(&req.ledger, &req.query, identity, req.t, max_bytes)
+            .execute_sparql_agent_json(
+                &load_address(&address),
+                &req.query,
+                identity,
+                req.t,
+                max_bytes,
+            )
             .await;
 
         match result {
@@ -198,44 +253,37 @@ impl FlureeToolService {
         // auth-layer verified: it gates `f:overrideControl` as well as policy.
         let server_identity = identity.clone().map(VerifiedIdentity::new);
         let mut envelope = run_query_task(timeout_ms, server_identity, move || async move {
-            let envelope = match identity.as_deref() {
+            let view = match identity.as_deref() {
                 Some(id) => {
                     let opts = fluree_db_api::GovernanceOptions {
                         identity: Some(id.to_string()),
                         server_identity: Some(VerifiedIdentity::new(id)),
                         ..Default::default()
                     };
-                    let view = match t {
+                    match t {
                         Some(t) => state.fluree.db_at_t_with_policy(&ledger, t, &opts).await?,
                         None => state.fluree.db_with_policy(&ledger, &opts).await?,
-                    };
-                    view.query(state.fluree.as_ref())
-                        .sparql(&query)
-                        .format(config)
-                        .execution_options(crate::query_control::current_query_execution_options(
-                            timeout_ms,
-                        ))
-                        .execute_formatted()
-                        .await?
+                    }
                 }
+                // No identity is an anonymous read: the ledger's configured
+                // policy defaults govern it, as on `/query`.
                 None => {
-                    let graph = match t {
-                        Some(t) => state
-                            .fluree
-                            .graph_at(&ledger, fluree_db_api::TimeSpec::AtT(t)),
-                        None => state.fluree.graph(&ledger),
+                    let view = match t {
+                        Some(t) => state.fluree.db_at_t(&ledger, t).await?,
+                        None => state.fluree.db(&ledger).await?,
                     };
-                    graph
-                        .query()
-                        .sparql(&query)
-                        .format(config)
-                        .execution_options(crate::query_control::current_query_execution_options(
-                            timeout_ms,
-                        ))
-                        .execute_formatted()
-                        .await?
+                    state.fluree.wrap_policy_defaults(view).await?
                 }
             };
+            let envelope = view
+                .query(state.fluree.as_ref())
+                .sparql(&query)
+                .format(config)
+                .execution_options(crate::query_control::current_query_execution_options(
+                    timeout_ms,
+                ))
+                .execute_formatted()
+                .await?;
             Ok(envelope)
         })
         .await
@@ -292,9 +340,22 @@ impl FlureeToolService {
     async fn get_data_model(
         &self,
         Parameters(req): Parameters<GetDataModelRequest>,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = std::time::Instant::now();
+        let address = match parse_ledger(&req.ledger) {
+            Ok(address) if address.fragment.is_none() => address,
+            Ok(_) => {
+                return Ok(invalid_ledger(
+                    &req.ledger,
+                    "the data model covers the whole ledger; drop the `#` graph selector",
+                ))
+            }
+            Err(why) => return Ok(invalid_ledger(&req.ledger, &why)),
+        };
+        if authorize(&context, &address.id).is_none() {
+            return Ok(ledger_not_found());
+        }
 
         tracing::info!(
             ledger = %req.ledger,
@@ -305,7 +366,7 @@ impl FlureeToolService {
         let info = self
             .state
             .fluree
-            .ledger_info(&req.ledger)
+            .ledger_info(&address.id)
             .execute()
             .await
             .map_err(|e| {
@@ -352,5 +413,24 @@ impl ServerHandler for FlureeToolService {
                     .to_string(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ledger_argument_is_parsed_once_for_scope_and_load() {
+        let address = parse_ledger("urn:fluree:open#txn-meta").unwrap();
+        assert_eq!(&*address.id, "open:main");
+        assert_eq!(load_address(&address), "open:main#txn-meta");
+        assert_eq!(load_address(&parse_ledger("open").unwrap()), "open:main");
+
+        // Refused before the scope check, the same way whether or not the
+        // ledger exists, rather than authorized and then refused by the loader.
+        let pinned = parse_ledger("open@t:1").unwrap_err();
+        assert!(pinned.contains("`t`"), "{pinned}");
+        assert!(parse_ledger("").is_err());
     }
 }

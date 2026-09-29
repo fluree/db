@@ -85,7 +85,7 @@ WHERE {
 }
 ```
 
-See [CONSTRUCT Queries](construct.md) for details.
+A `GRAPH` block in the template writes into a named graph, and annotation syntax attaches reifiers to template triples. See [CONSTRUCT Queries](construct.md) for details.
 
 ### ASK Queries
 
@@ -1090,7 +1090,7 @@ INSERT DATA {
 }
 ```
 
-Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates. Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
+Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates, and in `CONSTRUCT` templates, where they carry reifiers into every result format (see [CONSTRUCT](construct.md#edge-annotations-in-the-template)). Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
 
 ### Boundaries (rejected at parse / lowering time)
 
@@ -1098,7 +1098,7 @@ Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } 
 - **Simple-predicate triples only.** `?s ex:p1/ex:p2 ?o {| ... |}` (property-path) is rejected.
 - **Triple terms only as `rdf:reifies` objects**; any other use errors at parse time.
 - **No reserved predicates by hand.** The [system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
-- **No annotations in `CONSTRUCT` templates** (the template output form is deferred); a `CONSTRUCT` whose `WHERE` uses annotations to filter still works.
+- **`CONSTRUCT` template annotation blocks take simple predicates only**, and a template triple term cannot nest.
 - **SPARQL 1.2 triple-term functions** (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` constructor) are deferred.
 
 ## SPARQL UPDATE
@@ -1324,7 +1324,7 @@ curl -X POST http://localhost:8090/v1/fluree/update \
 
 1. **Use PREFIX Declarations**: Makes queries readable
 2. **Automatic Pattern Optimization**: The query planner automatically reorders patterns for efficient execution using statistics-driven cardinality estimates
-3. **Flexible FILTER Placement**: Filters can be placed anywhere in the WHERE clause — the query engine automatically applies each filter as soon as all its required variables are bound
+3. **Flexible FILTER Placement**: Filters, including `FILTER EXISTS` and `FILTER NOT EXISTS`, can be placed anywhere in their group — the query engine applies each one to the whole group, as soon as every variable it reads has its final value. A variable that an `OPTIONAL` or an `UNDEF` in `VALUES` leaves unbound on some rows waits for any later pattern that fills it in
 4. **Limit Results**: Use LIMIT for large result sets
 5. **Avoid Cartesian Products**: Structure queries to avoid large joins
 

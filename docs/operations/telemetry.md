@@ -20,10 +20,13 @@ Configure log verbosity:
 
 ### Log Formats
 
+The log format is set with the `LOG_FORMAT` environment variable (there is no command-line
+flag for it).
+
 #### JSON Format (Recommended)
 
 ```bash
---log-format json
+LOG_FORMAT=json
 ```
 
 Output:
@@ -50,9 +53,7 @@ Benefits:
 
 #### Text Format
 
-```bash
---log-format text
-```
+The default. Any `LOG_FORMAT` value other than `json` (or leaving it unset) selects it.
 
 Output:
 ```text
@@ -69,21 +70,22 @@ Benefits:
 #### Standard Output (Default)
 
 ```bash
-./fluree-db-server
+fluree server run
 ```
 
-Logs to stdout/stderr.
+Logs to stdout.
 
 #### Log File
 
+The server has no log-file flag or config setting; it always logs to stdout. To write a file,
+redirect the output or let your service manager capture it:
+
 ```bash
---log-file /var/log/fluree/server.log
+fluree server run >> /var/log/fluree/server.log 2>&1
 ```
 
-```toml
-[logging]
-file = "/var/log/fluree/server.log"
-```
+A server started in the background with `fluree server start` writes its output to
+`server.log` in the Fluree data directory; view it with `fluree server logs`.
 
 #### Log Rotation
 
@@ -171,16 +173,15 @@ Fluree supports OpenTelemetry (OTEL) distributed tracing, providing deep visibil
 
 ### Enabling OTEL
 
-Build the server with the `otel` feature flag:
+Build the CLI with the `otel` feature enabled on both the CLI and the server crate:
 
 ```bash
-cargo build -p fluree-db-server --features otel --release
+cargo build -p fluree-db-cli --features "otel,fluree-db-server/otel" --release
 ```
 
-> **Building via the CLI crate?** Feature flags do not propagate across
-> binaries: `cargo build -p fluree-db-cli --features otel` enables OTEL only
-> for the CLI's import pipeline, not for the server the daemon launches. Use
-> `--features "otel,fluree-db-server/otel"` to enable both.
+> **Why both?** `cargo build -p fluree-db-cli --features otel` enables OTEL only
+> for the CLI's import pipeline, not for the server that `fluree server run`
+> starts; `fluree-db-server/otel` turns it on for the server.
 
 Then set environment variables to configure the OTLP exporter:
 
@@ -189,14 +190,17 @@ OTEL_SERVICE_NAME=fluree-server \
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
 OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
 RUST_LOG=info,fluree_db_query=debug,fluree_db_transact=debug \
-./target/release/fluree-db-server --data-dir ./data
+./target/release/fluree server run --storage-path ./data
 ```
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `OTEL_SERVICE_NAME` | `fluree-db-server` | Service name in traces |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP receiver endpoint |
+| `OTEL_SERVICE_NAME` | (none) | Service name in traces |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | (none) | OTLP receiver endpoint |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | Protocol: `grpc` or `http/protobuf` |
+
+OTEL export is active only when both `OTEL_SERVICE_NAME` and `OTEL_EXPORTER_OTLP_ENDPOINT`
+are set.
 
 ### Quick Start with Jaeger
 
@@ -493,8 +497,7 @@ Import Fluree dashboard:
 Send logs to Datadog:
 
 ```bash
-./fluree-db-server \
-  --log-format json | \
+LOG_FORMAT=json fluree server run | \
   datadog-agent stream --service=fluree
 ```
 
@@ -506,7 +509,7 @@ Use New Relic agent:
 export NEW_RELIC_LICENSE_KEY=your-key
 export NEW_RELIC_APP_NAME=fluree-prod
 
-./fluree-db-server
+fluree server run
 ```
 
 ### Elasticsearch/Kibana
@@ -514,8 +517,7 @@ export NEW_RELIC_APP_NAME=fluree-prod
 Ship logs to Elasticsearch:
 
 ```bash
-./fluree-db-server \
-  --log-format json | \
+LOG_FORMAT=json fluree server run | \
   filebeat -e -c filebeat.yml
 ```
 

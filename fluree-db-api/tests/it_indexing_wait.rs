@@ -162,7 +162,12 @@ async fn cached_handle_applies_local_background_index_publish_without_refresh() 
     );
     drop(before);
 
-    let completion = indexer.trigger(ledger_id, commit_t).await;
+    let completion = indexer
+        .trigger(
+            &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+            commit_t,
+        )
+        .await;
     match completion.wait().await {
         fluree_db_api::IndexOutcome::Completed { index_t, .. } => {
             assert!(
@@ -257,7 +262,15 @@ async fn an_index_publish_reuses_the_artifacts_of_the_store_it_replaces() {
                 .expect("insert")
                 .receipt
                 .t;
-            match indexer.trigger(ledger_id, commit_t).await.wait().await {
+            match indexer
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    commit_t,
+                )
+                .await
+                .wait()
+                .await
+            {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 other => panic!("indexing did not complete: {other:?}"),
             }
@@ -328,7 +341,15 @@ async fn publishes_retire_the_dictionary_entries_the_index_covers() {
                 .expect("insert")
                 .receipt
                 .t;
-            match indexer.trigger(ledger_id, commit_t).await.wait().await {
+            match indexer
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    commit_t,
+                )
+                .await
+                .wait()
+                .await
+            {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 other => panic!("indexing did not complete: {other:?}"),
             }
