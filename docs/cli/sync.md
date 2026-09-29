@@ -25,7 +25,7 @@ fluree sync [LEDGER] [DATA] [--graph <IRI>] [OPTIONS]
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `-e, --expr <EXPR>` | Inline data expression (Turtle or JSON-LD) |
 | `-f, --file <FILE>` | Read data from a file |
-| `--format <FORMAT>` | Data format: `turtle` or `jsonld` (auto-detected if omitted) |
+| `--format <FORMAT>` | Data format: `turtle` (`nt` for N-Triples) or `jsonld` (auto-detected if omitted) |
 | `--dry-run` | Compute and report the delta (asserted / retracted counts) without committing |
 | `--allow-empty` | Allow an empty payload, which clears the graph (off by default so a truncated export cannot silently wipe it) |
 | `--json` | Emit the report as JSON — the same shape as the server's dry-run response — instead of a sentence |

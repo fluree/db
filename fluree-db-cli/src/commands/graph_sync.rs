@@ -61,8 +61,16 @@ impl SyncSource {
         match self {
             SyncSource::RdfText { content, format } => match format {
                 detect::DataFormat::JsonLd => Ok(serde_json::from_str(&content)?),
-                detect::DataFormat::Turtle => fluree_graph_turtle::parse_to_json(&content)
-                    .map_err(|e| CliError::Usage(format!("failed to parse Turtle: {e}"))),
+                // TriG always fails the Turtle parse, so only a failure is checked.
+                detect::DataFormat::Turtle => {
+                    fluree_graph_turtle::parse_to_json(&content).map_err(|e| {
+                        detect::refuse_trig_body("sync", &content)
+                            .err()
+                            .unwrap_or_else(|| {
+                                CliError::Usage(format!("failed to parse Turtle: {e}"))
+                            })
+                    })
+                }
                 detect::DataFormat::Trig => Err(detect::trig_refused("sync")),
             },
         }

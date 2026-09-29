@@ -3972,6 +3972,11 @@ impl crate::Fluree {
         tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
+        // Most rejected documents are plain Turtle with a typo; rule TriG out
+        // without copying them.
+        if !fluree_db_transact::might_contain_graph_block(trig) {
+            return Err(turtle_err);
+        }
         let phase1 = fluree_db_transact::parse_trig_phase1(trig)?;
         if phase1.named_graphs.is_empty() && phase1.raw_meta.is_none() {
             return Err(turtle_err);

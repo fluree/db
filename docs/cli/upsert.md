@@ -24,7 +24,7 @@ fluree upsert [LEDGER] [DATA] [OPTIONS]
 | `-e, --expr <EXPR>` | Inline data expression (alternative to positional) |
 | `-f, --file <FILE>` | Read data from a file |
 | `-m, --message <MSG>` | Commit message |
-| `--format <FORMAT>` | Data format: `turtle`, `trig` or `jsonld` (auto-detected if omitted) |
+| `--format <FORMAT>` | Data format: `turtle` (`nt` for N-Triples), `trig` or `jsonld` (auto-detected if omitted) |
 | `--remote <NAME>` | Execute against a remote server (by remote name, e.g., `origin`) |
 
 ## Description

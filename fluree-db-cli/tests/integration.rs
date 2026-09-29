@@ -2308,6 +2308,47 @@ fn sync_of_a_trig_file_names_insert_and_upsert() {
         .stderr(predicate::str::contains("fluree insert"));
 }
 
+/// The same refusal when a TriG body arrives without a `.trig` name: piped to
+/// `sync`, or in a `.ttl` file given to `validate` or `--shacl`.
+#[test]
+fn a_trig_body_under_another_name_is_refused_by_one_graph_commands() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
+    let trig = "GRAPH <http://example.org/g1> { \
+                <http://example.org/s> <http://example.org/p> \"v\" . }\n";
+    fluree_cmd(&tmp)
+        .args(["sync", "ds"])
+        .write_stdin(trig)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("sync reads one graph"));
+
+    std::fs::write(tmp.path().join("trig.ttl"), trig).unwrap();
+    std::fs::write(tmp.path().join("shapes.ttl"), VALIDATE_SHAPES_TTL).unwrap();
+    fluree_cmd(&tmp)
+        .args(["validate", "trig.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("validate reads one graph"));
+
+    // A brace inside a literal is not a graph block.
+    std::fs::write(
+        tmp.path().join("data.ttl"),
+        "<http://example.org/s> <http://example.org/p> \"{v}\" .\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["validate", "data.ttl", "--shacl", "trig.ttl"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--shacl reads one graph"));
+    fluree_cmd(&tmp)
+        .args(["validate", "data.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .success();
+}
+
 // ============================================================================
 // #1859 — RDF 1.2 annotation syntax
 // ============================================================================

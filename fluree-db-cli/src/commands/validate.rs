@@ -104,6 +104,8 @@ async fn validate_file(
     match data_format {
         detect::DataFormat::Trig => return Err(detect::trig_refused("validate")),
         detect::DataFormat::Turtle => {
+            // `insert_turtle` would accept TriG and load it into named graphs.
+            detect::refuse_trig_body("validate", &content)?;
             ledger_graph
                 .transact()
                 .insert_turtle(&content)
@@ -158,7 +160,10 @@ fn resolve_shapes_source(
         })?;
         return Ok(
             match detect::detect_data_format(Some(path), &content, None)? {
-                detect::DataFormat::Turtle => ShapesSource::InlineTurtle(content),
+                detect::DataFormat::Turtle => {
+                    detect::refuse_trig_body("--shacl", &content)?;
+                    ShapesSource::InlineTurtle(content)
+                }
                 detect::DataFormat::Trig => return Err(detect::trig_refused("--shacl")),
                 detect::DataFormat::JsonLd => {
                     ShapesSource::InlineJsonLd(serde_json::from_str(&content)?)

@@ -438,13 +438,16 @@ pub fn extract_trig_txn_meta(
 /// The `GRAPH` keyword is still checked so a malformed `GRAPH <iri>` (missing
 /// braces) is routed to the parser for a proper error rather than passed
 /// through silently.
-fn might_contain_graph_block(input: &str) -> bool {
+///
+/// Scans without copying: a caller that only needs to rule TriG out, such as
+/// a failed Turtle insert, may be holding a very large document.
+pub fn might_contain_graph_block(input: &str) -> bool {
     // Cheap, common-case-first: a brace is present in every graph block.
-    if input.contains('{') {
-        return true;
-    }
-    // Case-insensitive check for the GRAPH keyword.
-    input.to_ascii_uppercase().contains("GRAPH")
+    input.contains('{')
+        || input
+            .as_bytes()
+            .windows(5)
+            .any(|w| w.eq_ignore_ascii_case(b"GRAPH"))
 }
 
 /// Parser state for TriG metadata extraction.
@@ -1918,6 +1921,21 @@ mod tests {
 
     fn test_registry() -> NamespaceRegistry {
         NamespaceRegistry::new()
+    }
+
+    #[test]
+    fn graph_block_check_matches_the_keyword_in_any_case() {
+        for trig in [
+            "<http://example.org/g> { <s> <p> <o> . }",
+            "GRAPH <http://example.org/g>",
+            "graph <http://example.org/g>",
+            "Graph <http://example.org/g>",
+        ] {
+            assert!(might_contain_graph_block(trig), "{trig}");
+        }
+        assert!(!might_contain_graph_block(
+            "@prefix ex: <http://example.org/> . ex:a ex:b \"grap\" ."
+        ));
     }
 
     #[test]

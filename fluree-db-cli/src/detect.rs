@@ -30,7 +30,8 @@ pub fn detect_data_format(
     // Explicit flag
     if let Some(fmt) = explicit {
         return match fmt.to_lowercase().as_str() {
-            "turtle" | "ttl" => Ok(DataFormat::Turtle),
+            // N-Triples is a subset of Turtle; `.nt` files already route here.
+            "turtle" | "ttl" | "nt" => Ok(DataFormat::Turtle),
             "trig" => Ok(DataFormat::Trig),
             "jsonld" | "json-ld" | "json" => Ok(DataFormat::JsonLd),
             other if is_nquads(other) => Err(CliError::Usage(nquads_help(other))),
@@ -75,13 +76,14 @@ pub fn detect_data_format(
         }
     }
 
-    // Content sniffing. A TriG body sniffs as Turtle, which is fine: the
-    // Turtle entry points read graph blocks too.
+    // Content sniffing. A TriG body sniffs as Turtle, which is fine for
+    // insert and upsert: their Turtle entry points read graph blocks too. The
+    // commands that read one graph check with `refuse_trig_body`.
     sniff_data_format(content)
 }
 
 /// Every spelling `--format` accepts, for the errors that list them.
-const ACCEPTED_FORMATS: &str = "turtle (ttl), trig, jsonld (json-ld, json)";
+const ACCEPTED_FORMATS: &str = "turtle (ttl, nt), trig, jsonld (json-ld, json)";
 
 fn is_nquads(s: &str) -> bool {
     matches!(s, "nq" | "nquads" | "n-quads")
@@ -110,6 +112,21 @@ pub fn trig_refused(command: &str) -> CliError {
          `fluree upsert`, which place TriG graph blocks in their named graphs",
         colored::Colorize::bold(colored::Colorize::cyan("help:"))
     ))
+}
+
+/// [`trig_refused`] for a TriG body that reached a one-graph command as
+/// Turtle, by sniffing or a `.ttl` name. This parses rather than looking for
+/// braces, since a `{` inside a Turtle string literal is not a graph block.
+pub fn refuse_trig_body(command: &str, content: &str) -> CliResult<()> {
+    if !fluree_db_transact::might_contain_graph_block(content) {
+        return Ok(());
+    }
+    match fluree_db_transact::parse_trig_phase1(content) {
+        Ok(p) if !p.named_graphs.is_empty() || p.raw_meta.is_some() => Err(trig_refused(command)),
+        // No graph blocks, or not well-formed TriG either: the Turtle parser
+        // reports it.
+        _ => Ok(()),
+    }
 }
 
 fn sniff_data_format(content: &str) -> CliResult<DataFormat> {
@@ -242,7 +259,7 @@ mod tests {
     /// accepts is the one moment where being incomplete costs the most.
     #[test]
     fn the_usage_error_names_every_format_the_flag_accepts() {
-        let accepted = ["turtle", "ttl", "trig", "jsonld", "json-ld", "json"];
+        let accepted = ["turtle", "ttl", "nt", "trig", "jsonld", "json-ld", "json"];
         for fmt in accepted {
             assert!(
                 super::detect_data_format(None, "", Some(fmt)).is_ok(),
@@ -285,6 +302,35 @@ mod tests {
                 super::DataFormat::Trig,
                 "{name}"
             );
+        }
+    }
+
+    /// A TriG body that sniffs as Turtle is still refused by the one-graph
+    /// commands, while Turtle whose literals contain `{` or "graph" is not.
+    #[test]
+    fn a_trig_body_is_refused_whatever_it_was_detected_as() {
+        for trig in [
+            "GRAPH <http://example.org/g> { <http://example.org/s> <http://example.org/p> 1 . }",
+            "<http://example.org/g> { <http://example.org/s> <http://example.org/p> 1 . }",
+            "@prefix fluree: <https://ns.flur.ee/db#> .\n\
+             GRAPH <#txn-meta> { fluree:commit:this <http://example.org/machine> \"m\" . }",
+        ] {
+            assert_eq!(
+                super::detect_data_format(None, trig, None).unwrap(),
+                super::DataFormat::Turtle
+            );
+            let err = super::refuse_trig_body("sync", trig)
+                .expect_err("graph blocks are TriG")
+                .to_string();
+            assert!(err.contains("sync reads one graph"), "{trig}: {err}");
+        }
+        for turtle in [
+            "<http://example.org/s> <http://example.org/p> \"{\\\"a\\\": 1}\" .",
+            "<http://example.org/s> <http://example.org/p> \"graph theory\" .",
+            // Malformed either way: the Turtle parser reports it.
+            "GRAPH <http://example.org/g> <http://example.org/s>",
+        ] {
+            assert!(super::refuse_trig_body("sync", turtle).is_ok(), "{turtle}");
         }
     }
 
