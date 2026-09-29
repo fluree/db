@@ -57,6 +57,8 @@ mod it_query_ti3;
 mod it_query_unwind;
 #[path = "it_query_values.rs"]
 mod it_query_values;
+#[path = "it_values_undef_placement.rs"]
+mod it_values_undef_placement;
 #[path = "it_w3c_result_formats.rs"]
 mod it_w3c_result_formats;
 

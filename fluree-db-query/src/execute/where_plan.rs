@@ -26,7 +26,7 @@ use crate::minus::MinusOperator;
 use crate::operator::inline::InlineOperator;
 use crate::operator::{BoxedOperator, Operator};
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
-use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
+use crate::planner::{analyze_property_join, is_property_join, reorder_patterns_with_seed};
 use crate::property_join::PropertyJoinOperator;
 use crate::property_path::PropertyPathOperator;
 use crate::range_semijoin::{RangeSemiJoinCondition, RangeSemiJoinOperator};
@@ -898,6 +898,19 @@ pub struct ValuesPattern {
 }
 
 impl ValuesPattern {
+    /// Columns with no UNDEF cell: bound in every row the table emits.
+    fn bound_in_every_row(&self) -> impl Iterator<Item = VarId> + '_ {
+        self.vars
+            .iter()
+            .enumerate()
+            .filter(|(col, _)| {
+                self.rows
+                    .iter()
+                    .all(|row| row.get(*col).is_some_and(crate::binding::Binding::is_bound))
+            })
+            .map(|(_, var)| *var)
+    }
+
     pub fn new(vars: Vec<VarId>, rows: Vec<Vec<crate::binding::Binding>>) -> Self {
         Self { vars, rows }
     }
@@ -1322,14 +1335,29 @@ fn selective_object_values_seed(
     best
 }
 
+/// Whether every variable in `required` is bound and can no longer change.
+///
+/// `unsettled` holds variables that may be unbound on some rows (UNDEF in a
+/// VALUES table, an OPTIONAL, a BIND whose expression errored) and that a triple
+/// not yet joined will still bind. A BIND or FILTER reading one before that
+/// triple would see the wrong value.
+fn all_settled(
+    required: &HashSet<VarId>,
+    bound: &HashSet<VarId>,
+    unsettled: &HashSet<VarId>,
+) -> bool {
+    required.is_subset(bound) && required.is_disjoint(unsettled)
+}
+
 /// Partition filters into those eligible for inline evaluation and those still waiting.
 ///
 /// Filters consumed by pushdown are silently dropped. Filters whose required
-/// variables are all in `bound` are returned as ready expressions (first element);
-/// the rest are returned as-is (second element).
+/// variables are all settled (see [`all_settled`]) are returned as ready
+/// expressions (first element); the rest are returned as-is (second element).
 fn partition_eligible_filters(
     filters: Vec<FilterPattern>,
     bound: &HashSet<VarId>,
+    unsettled: &HashSet<VarId>,
     filter_idxs_consumed: &[usize],
 ) -> (Vec<Expression>, Vec<FilterPattern>) {
     let mut ready = Vec::new();
@@ -1342,7 +1370,7 @@ fn partition_eligible_filters(
         // inline evaluation is synchronous, and both require the async path on
         // FilterOperator (EXISTS via filter_batch_with_exists, metadata via the
         // policy-filtered resolver). Defer them to a real FilterOperator.
-        if pf.required_vars.is_subset(bound)
+        if all_settled(&pf.required_vars, bound, unsettled)
             && !contains_exists(&pf.expr)
             && !crate::eval::metadata_resolve::contains_metadata_read(&pf.expr)
         {
@@ -1362,6 +1390,7 @@ fn partition_eligible_filters(
 fn apply_eligible_binds(
     mut child: BoxedOperator,
     bound: &mut HashSet<VarId>,
+    unsettled: &HashSet<VarId>,
     pending_binds: Vec<BindPattern>,
     mut pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
@@ -1370,11 +1399,11 @@ fn apply_eligible_binds(
     let mut remaining_binds = Vec::new();
 
     for pending in pending_binds {
-        if pending.required_vars.is_subset(bound) {
+        if all_settled(&pending.required_vars, bound, unsettled) {
             bound.insert(pending.var);
 
             let (bind_filters, still_pending) =
-                partition_eligible_filters(pending_filters, bound, filter_idxs_consumed);
+                partition_eligible_filters(pending_filters, bound, unsettled, filter_idxs_consumed);
             pending_filters = still_pending;
 
             child = Box::new(
@@ -1396,6 +1425,7 @@ fn apply_eligible_binds(
 fn apply_deferred_patterns(
     child: BoxedOperator,
     bound: &mut HashSet<VarId>,
+    unsettled: &HashSet<VarId>,
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
@@ -1404,6 +1434,7 @@ fn apply_deferred_patterns(
     let (mut child, remaining_binds, pending_filters) = apply_eligible_binds(
         child,
         bound,
+        unsettled,
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
@@ -1411,7 +1442,7 @@ fn apply_deferred_patterns(
     );
 
     let (ready, remaining_filters) =
-        partition_eligible_filters(pending_filters, bound, filter_idxs_consumed);
+        partition_eligible_filters(pending_filters, bound, unsettled, filter_idxs_consumed);
     for expr in ready {
         child = Box::new(FilterOperator::new_with_planning(child, expr, *planning));
     }
@@ -1436,6 +1467,7 @@ fn apply_all_remaining(
     let (mut child, _, remaining_filters) = apply_eligible_binds(
         child,
         &mut bound,
+        &HashSet::new(),
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
@@ -1585,6 +1617,7 @@ fn build_property_join_block(
         pending_binds,
         pending_filters,
         &available_vars,
+        &HashSet::new(),
         &pushdown.consumed_indices,
     );
     for op in &inline_ops {
@@ -1616,6 +1649,7 @@ fn build_property_join_block(
         let (child, _, _) = apply_deferred_patterns(
             child,
             &mut bound,
+            &HashSet::new(),
             pending_binds,
             pending_filters,
             &pushdown.consumed_indices,
@@ -1639,19 +1673,26 @@ fn build_inline_ops(
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
     available_vars: &HashSet<VarId>,
+    unsettled: &HashSet<VarId>,
     filter_idxs_consumed: &[usize],
 ) -> (Vec<InlineOperator>, Vec<BindPattern>, Vec<FilterPattern>) {
     let mut ops = Vec::new();
     let mut available = available_vars.clone();
 
-    let remaining_filters =
-        inline_eligible_filters(&mut ops, pending_filters, &available, filter_idxs_consumed);
+    let remaining_filters = inline_eligible_filters(
+        &mut ops,
+        pending_filters,
+        &available,
+        unsettled,
+        filter_idxs_consumed,
+    );
 
     let (remaining_binds, remaining_filters) = inline_chain(
         &mut ops,
         pending_binds,
         remaining_filters,
         &mut available,
+        unsettled,
         filter_idxs_consumed,
     );
 
@@ -1663,10 +1704,11 @@ fn inline_eligible_filters(
     ops: &mut Vec<InlineOperator>,
     pending_filters: Vec<FilterPattern>,
     available: &HashSet<VarId>,
+    unsettled: &HashSet<VarId>,
     filter_idxs_consumed: &[usize],
 ) -> Vec<FilterPattern> {
     let (ready, remaining) =
-        partition_eligible_filters(pending_filters, available, filter_idxs_consumed);
+        partition_eligible_filters(pending_filters, available, unsettled, filter_idxs_consumed);
     for expr in ready {
         ops.push(InlineOperator::Filter(PreparedBoolExpression::new(expr)));
     }
@@ -1683,6 +1725,7 @@ fn inline_chain(
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
     available: &mut HashSet<VarId>,
+    unsettled: &HashSet<VarId>,
     filter_idxs_consumed: &[usize],
 ) -> (Vec<BindPattern>, Vec<FilterPattern>) {
     let mut remaining_binds = pending_binds;
@@ -1697,7 +1740,7 @@ fn inline_chain(
             // is synchronous and so cannot run the async view-policy filter. Keep
             // it as a deferred `BindOperator`, which resolves metadata through the
             // policy-filtered async path. Cheap to defer — metadata calls are rare.
-            if bind.required_vars.is_subset(available)
+            if all_settled(&bind.required_vars, available, unsettled)
                 && !crate::eval::metadata_resolve::contains_metadata_read(&bind.expr)
             {
                 available.insert(bind.var);
@@ -1711,6 +1754,7 @@ fn inline_chain(
                     ops,
                     remaining_filters,
                     available,
+                    unsettled,
                     filter_idxs_consumed,
                 );
             } else {
@@ -1747,13 +1791,36 @@ impl<'a> TriplePlanContext<'a> {
     }
 }
 
+/// Variables the not-yet-joined, not-folded `remaining` triples bind that are
+/// not already bound in every row (see [`all_settled`]).
+fn unsettled_vars(
+    remaining: &[TriplePattern],
+    folded: &[bool],
+    guaranteed: &HashSet<VarId>,
+) -> HashSet<VarId> {
+    remaining
+        .iter()
+        .zip(folded)
+        .filter(|(_, folded)| !**folded)
+        .flat_map(|(tp, _)| tp.produced_vars())
+        .filter(|var| !guaranteed.contains(var))
+        .collect()
+}
+
 /// Build an operator tree for a sequential scan/join block of triples.
 ///
 /// Applies VALUES first (if any), then iterates triples building scan/join
 /// operators, inlining eligible filters and binds into each step and applying
 /// deferred BINDs/FILTERs as their dependencies become bound.
+///
+/// `guaranteed_upstream` holds the variables `operator` binds in every row.
+/// Any other variable in its schema may be unbound on some rows, and a triple
+/// of this block can still bind it, so a BIND or FILTER reading it waits for
+/// that triple.
+#[allow(clippy::too_many_arguments)]
 fn build_sequential_join_block(
     operator: Option<BoxedOperator>,
+    guaranteed_upstream: &HashSet<VarId>,
     triples: &[TriplePattern],
     block_values: Vec<ValuesPattern>,
     pending_binds: Vec<BindPattern>,
@@ -1763,6 +1830,10 @@ fn build_sequential_join_block(
 ) -> Result<Option<BoxedOperator>> {
     let mut operator = operator;
 
+    let mut guaranteed = guaranteed_upstream.clone();
+    for vp in &block_values {
+        guaranteed.extend(vp.bound_in_every_row());
+    }
     if !block_values.is_empty() {
         operator = apply_values(operator, block_values);
     }
@@ -1794,6 +1865,8 @@ fn build_sequential_join_block(
         for v in tp.produced_vars() {
             vars_after.insert(v);
         }
+        guaranteed.extend(tp.produced_vars());
+        let unsettled = unsettled_vars(&triples[k + 1..], &folded[k + 1..], &guaranteed);
 
         // Later `?s <p> ?v . FILTER(range on ?v)` pairs answered as a semi-join
         // behind this step — see `RangeSemiJoinOperator`.
@@ -1805,6 +1878,7 @@ fn build_sequential_join_block(
                 &folded,
                 &bound,
                 &vars_after,
+                &unsettled,
                 base,
                 &pending_binds,
                 &pending_filters,
@@ -1833,6 +1907,7 @@ fn build_sequential_join_block(
             pending_binds,
             pending_filters,
             &vars_after,
+            &unsettled,
             &pushdown.consumed_indices,
         );
         pending_binds = remaining_binds;
@@ -1918,6 +1993,7 @@ fn build_sequential_join_block(
             let (child, new_binds, new_filters) = apply_deferred_patterns(
                 child,
                 &mut bound,
+                &unsettled,
                 pending_binds,
                 pending_filters,
                 &pushdown.consumed_indices,
@@ -2081,6 +2157,15 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
     }
 }
 
+/// Variables `pattern` binds in every solution it produces. A BIND's target is
+/// left out: an expression error leaves it unbound.
+fn bound_in_every_solution(pattern: &Pattern) -> HashSet<VarId> {
+    match pattern {
+        Pattern::Bind { .. } => HashSet::new(),
+        other => crate::planner::must_bind_vars(other),
+    }
+}
+
 /// Build WHERE operators with an optional initial seed operator (back-compat wrapper).
 ///
 /// Treats all WHERE-bound vars as needed and does not provide GROUP BY hints.
@@ -2196,6 +2281,94 @@ fn values_cell_as_ref_term(binding: &crate::binding::Binding) -> Option<Term> {
         crate::binding::Binding::IriMatch { iri, .. } => Some(Term::Iri(iri.clone())),
         _ => None,
     }
+}
+
+/// Drop VALUES columns that are UNDEF in every row, and a VALUES left with no
+/// columns and exactly one row.
+///
+/// Such a column constrains nothing, yet planning reads its variable as bound:
+/// the cost model prices triples on it as lookups, and BINDs and FILTERs on it
+/// must be held back until a triple really binds it. Without it,
+/// `VALUES ?x { UNDEF }` (a parameterized query's "any value") plans exactly
+/// like the query written without the VALUES.
+///
+/// A column is dropped only while another pattern of the group still binds its
+/// variable, so the variable stays in scope for `SELECT *` and projection. A
+/// table with no column left keeps its row count, so one with several rows (a
+/// multiplicity) or none (an empty result) stays as written.
+///
+/// Returns `None` when nothing changed, so callers keep borrowing the original
+/// slice.
+fn drop_undef_values_columns(patterns: &[Pattern]) -> Option<Vec<Pattern>> {
+    use crate::binding::Binding;
+
+    let all_undef = |rows: &[Vec<Binding>], col: usize| {
+        !rows.is_empty()
+            && rows
+                .iter()
+                .all(|row| matches!(row.get(col), Some(Binding::Unbound)))
+    };
+    let bound_elsewhere = |at: usize, var: VarId| {
+        patterns.iter().enumerate().any(|(j, p)| {
+            j != at
+                && match p {
+                    Pattern::Values { vars, rows } => vars
+                        .iter()
+                        .position(|v| *v == var)
+                        .is_some_and(|col| !all_undef(rows, col)),
+                    other => other.produced_vars().contains(&var),
+                }
+        })
+    };
+
+    let mut rewrites: Vec<(usize, Option<Pattern>)> = Vec::new();
+    for (at, p) in patterns.iter().enumerate() {
+        let Pattern::Values { vars, rows } = p else {
+            continue;
+        };
+        let dropped: Vec<usize> = (0..vars.len())
+            .filter(|&col| all_undef(rows, col) && bound_elsewhere(at, vars[col]))
+            .collect();
+        if dropped.is_empty() {
+            continue;
+        }
+        if dropped.len() == vars.len() {
+            if rows.len() == 1 {
+                rewrites.push((at, None));
+            }
+            continue;
+        }
+        let kept = |col: &usize| !dropped.contains(col);
+        rewrites.push((
+            at,
+            Some(Pattern::Values {
+                vars: (0..vars.len()).filter(kept).map(|col| vars[col]).collect(),
+                rows: rows
+                    .iter()
+                    .map(|row| {
+                        (0..row.len())
+                            .filter(kept)
+                            .map(|col| row[col].clone())
+                            .collect()
+                    })
+                    .collect(),
+            }),
+        ));
+    }
+    if rewrites.is_empty() {
+        return None;
+    }
+
+    let mut out = patterns.to_vec();
+    for (at, replacement) in rewrites.into_iter().rev() {
+        match replacement {
+            Some(values) => out[at] = values,
+            None => {
+                out.remove(at);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Substitute a single-row VALUES' IRI into the object position of the triples
@@ -2387,6 +2560,9 @@ pub fn build_where_operators_seeded_with_needed(
     let elided_storage = elide_redundant_type_filters(patterns, stats.as_deref(), planning);
     let patterns: &[Pattern] = elided_storage.as_deref().unwrap_or(patterns);
 
+    let undef_dropped_storage = drop_undef_values_columns(patterns);
+    let patterns: &[Pattern] = undef_dropped_storage.as_deref().unwrap_or(patterns);
+
     // Within each inner-join region, fold a single-row VALUES' IRI into the
     // object position it constrains, so reordering and the scan layer both see
     // a constant instead of a variable the VALUES wrapper only filters later.
@@ -2403,7 +2579,18 @@ pub fn build_where_operators_seeded_with_needed(
         .as_ref()
         .map(|op| op.schema().iter().copied().collect::<HashSet<_>>())
         .unwrap_or_default();
-    let reordered_storage = reorder_patterns(patterns, stats.as_deref(), &initial_bound);
+    let seed_bound_in_every_row: HashSet<VarId> = match &seed {
+        Some(op) => op
+            .bound_in_every_row()
+            .map_or_else(|| initial_bound.clone(), |vars| vars.into_iter().collect()),
+        None => HashSet::new(),
+    };
+    let reordered_storage = reorder_patterns_with_seed(
+        patterns,
+        stats.as_deref(),
+        &initial_bound,
+        &seed_bound_in_every_row,
+    );
     let patterns = &reordered_storage;
 
     // Compute variable stats for emission pruning and join heuristics.
@@ -2443,11 +2630,19 @@ pub fn build_where_operators_seeded_with_needed(
         )
     };
 
+    // Variables bound in every row of `operator`, grown as patterns are applied.
+    let mut guaranteed = seed_bound_in_every_row;
+    let mut guaranteed_through = 0;
+
     let mut i = 0;
     while i < patterns.len() {
         match &patterns[i] {
             Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. } => {
                 let start = i;
+                for applied in &patterns[guaranteed_through..start] {
+                    guaranteed.extend(bound_in_every_solution(applied));
+                }
+                guaranteed_through = start;
                 let block = collect_inner_join_block(patterns, start);
                 let end = block.end_index;
 
@@ -2771,6 +2966,7 @@ pub fn build_where_operators_seeded_with_needed(
                     };
                     operator = build_sequential_join_block(
                         operator,
+                        &guaranteed,
                         &triples_for_exec,
                         block.values,
                         pending_binds,
@@ -3643,6 +3839,7 @@ fn collect_range_semijoin_folds(
     folded: &[bool],
     bound_before: &HashSet<VarId>,
     vars_after: &HashSet<VarId>,
+    unsettled: &HashSet<VarId>,
     base_vars: &HashSet<VarId>,
     pending_binds: &[BindPattern],
     pending_filters: &[FilterPattern],
@@ -3712,7 +3909,7 @@ fn collect_range_semijoin_folds(
             .expr
             .referenced_vars()
             .iter()
-            .all(|x| x == v || vars_after.contains(x))
+            .all(|x| x == v || (vars_after.contains(x) && !unsettled.contains(x)))
         {
             continue;
         }
@@ -5047,7 +5244,7 @@ mod tests {
         );
 
         let as_patterns: Vec<Pattern> = block.triples.into_iter().map(Pattern::Triple).collect();
-        let ordered = reorder_patterns(&as_patterns, Some(&stats), &HashSet::new());
+        let ordered = crate::planner::reorder_patterns(&as_patterns, Some(&stats), &HashSet::new());
         let first_triple = ordered[0]
             .as_triple()
             .expect("first reordered pattern should be a triple");
@@ -5882,6 +6079,7 @@ mod tests {
             Vec::new(),
             vec![FilterPattern::new(0, filter_expr.clone())],
             &available,
+            &HashSet::new(),
             &[],
         );
 
@@ -5909,6 +6107,7 @@ mod tests {
             vec![make_bind(age2, bind_expr)],
             Vec::new(),
             &available,
+            &HashSet::new(),
             &[],
         );
 
@@ -5941,6 +6140,7 @@ mod tests {
             vec![make_bind(y, bind_expr)],
             vec![FilterPattern::new(0, filter_expr)],
             &available,
+            &HashSet::new(),
             &[],
         );
 
@@ -5975,8 +6175,13 @@ mod tests {
         );
         let available: HashSet<VarId> = [VarId(0), age].into();
 
-        let (ops, remaining_binds, remaining_filters) =
-            build_inline_ops(vec![bind_a, bind_b], Vec::new(), &available, &[]);
+        let (ops, remaining_binds, remaining_filters) = build_inline_ops(
+            vec![bind_a, bind_b],
+            Vec::new(),
+            &available,
+            &HashSet::new(),
+            &[],
+        );
 
         assert_eq!(ops.len(), 2, "both binds should be inlined");
         assert!(
@@ -6004,6 +6209,7 @@ mod tests {
             vec![make_bind(alias, bind_expr)],
             Vec::new(),
             &available,
+            &HashSet::new(),
             &[],
         );
 

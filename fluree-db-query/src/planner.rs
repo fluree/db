@@ -1474,8 +1474,8 @@ struct DeferredPattern {
     /// `?b` otherwise drains the VALUES before the OPTIONAL that introduces `?b`
     /// is placed at all. Empty for every dependency-placed deferral.
     after_indices: Vec<usize>,
-    /// For FILTER, EXISTS and NOT EXISTS: who binds each variable the pattern
-    /// reads (see [`attach_filter_binders`]). Empty for everything else.
+    /// For FILTER, EXISTS, NOT EXISTS and BIND: who binds each variable the
+    /// pattern reads (see [`attach_filter_binders`]). Empty for everything else.
     binders: Vec<VarBinders>,
 }
 
@@ -1499,32 +1499,41 @@ impl VarBinders {
     }
 }
 
-/// Fill [`DeferredPattern::binders`] for each deferred FILTER, EXISTS and NOT
-/// EXISTS: one [`VarBinders`] per variable it reads that another pattern in the
-/// group binds, by original index. SPARQL applies a FILTER to its group
-/// wherever it is written (§18.2.2.6), so binders written after it count too.
+/// Fill [`DeferredPattern::binders`] for each deferred FILTER, EXISTS, NOT
+/// EXISTS and BIND: one [`VarBinders`] per variable it reads that another
+/// pattern in the group binds, by original index. SPARQL applies a FILTER to
+/// its group wherever it is written (§18.2.2.6), so binders written after it
+/// count too. A BIND is placed by its dependencies rather than where it is
+/// written, so it waits on the same binders; otherwise a VALUES UNDEF column
+/// lets it run before the triple that actually binds the variable.
+///
+/// `seed_bound_in_every_row` are the seed variables no pattern can change;
+/// any other seed variable may be unbound on some rows and gets binders too.
 fn attach_filter_binders(
     deferred: &mut [DeferredPattern],
     patterns: &[Pattern],
-    initial_bound_vars: &HashSet<VarId>,
+    seed_bound_in_every_row: &HashSet<VarId>,
 ) {
-    let is_filter = |p: &Pattern| {
+    let waits_for_binders = |p: &Pattern| {
         matches!(
             p,
-            Pattern::Filter(_) | Pattern::Exists(_) | Pattern::NotExists(_)
+            Pattern::Filter(_) | Pattern::Exists(_) | Pattern::NotExists(_) | Pattern::Bind { .. }
         )
     };
-    if !deferred.iter().any(|dp| is_filter(&dp.pattern)) {
+    if !deferred.iter().any(|dp| waits_for_binders(&dp.pattern)) {
         return;
     }
     let produced: Vec<Vec<VarId>> = patterns.iter().map(Pattern::produced_vars).collect();
     let mut every_row_vars: Vec<Option<HashSet<VarId>>> = vec![None; patterns.len()];
-    for dp in deferred.iter_mut().filter(|dp| is_filter(&dp.pattern)) {
+    for dp in deferred
+        .iter_mut()
+        .filter(|dp| waits_for_binders(&dp.pattern))
+    {
         let mut reads = dp.pattern.referenced_vars();
         reads.sort_unstable();
         reads.dedup();
         for v in reads {
-            if initial_bound_vars.contains(&v) {
+            if seed_bound_in_every_row.contains(&v) {
                 continue;
             }
             let any: Vec<usize> = (0..patterns.len())
@@ -1578,7 +1587,7 @@ fn attach_filter_binders(
 /// Note `collect_guaranteed_vars` is NOT this function despite the name: it is
 /// plain `produced_vars`, with the branch intersection done at its
 /// `try_nest_deferred` call site.
-fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
+pub(crate) fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
     match pattern {
         // A left join binds nothing unconditionally.
         Pattern::Optional(_) => HashSet::new(),
@@ -1890,6 +1899,19 @@ pub fn reorder_patterns(
     stats: Option<&StatsView>,
     initial_bound_vars: &HashSet<VarId>,
 ) -> Vec<Pattern> {
+    reorder_patterns_with_seed(patterns, stats, initial_bound_vars, initial_bound_vars)
+}
+
+/// [`reorder_patterns`] for a group planned on top of a seed whose schema is
+/// `initial_bound_vars`, of which only `seed_bound_in_every_row` are bound on
+/// every row. A FILTER or BIND reading any other seed variable waits for the
+/// group's patterns that can still bind it.
+pub fn reorder_patterns_with_seed(
+    patterns: &[Pattern],
+    stats: Option<&StatsView>,
+    initial_bound_vars: &HashSet<VarId>,
+    seed_bound_in_every_row: &HashSet<VarId>,
+) -> Vec<Pattern> {
     if patterns.len() <= 1 {
         return patterns.to_vec();
     }
@@ -2177,7 +2199,7 @@ pub fn reorder_patterns(
             }
         }
     }
-    attach_filter_binders(&mut deferred, patterns, initial_bound_vars);
+    attach_filter_binders(&mut deferred, patterns, seed_bound_in_every_row);
 
     let mut result: Vec<Pattern> = Vec::with_capacity(patterns.len());
     // Original indices already emitted into `result`, for the positional

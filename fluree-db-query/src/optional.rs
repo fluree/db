@@ -2225,6 +2225,13 @@ impl Operator for MaterializedSeedOperator {
     fn estimated_rows(&self) -> Option<usize> {
         Some(self.batches.iter().map(Batch::len).sum())
     }
+
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        Some(crate::seed::vars_bound_in_every_row(
+            &self.schema,
+            self.batches.iter(),
+        ))
+    }
 }
 
 /// Left-join operator for OPTIONAL semantics
