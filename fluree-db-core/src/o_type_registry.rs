@@ -105,9 +105,17 @@ impl OTypeRegistry {
             ObjKind::NUM_F64 => self.resolve_by_dt(dt),
             ObjKind::LEX_ID => {
                 if dt == DatatypeDictId::LANG_STRING {
-                    OType::lang_string(lang_id)
+                    return OType::lang_string(lang_id);
+                }
+                // A lexical string under a non-string datatype is an ill-typed
+                // literal (e.g. "1990-00-00"^^xsd:date). It keeps its string
+                // and its datatype; decoding the string id as that datatype's
+                // value would read a dictionary position as a date or number.
+                let by_dt = self.resolve_by_dt(dt);
+                if by_dt.is_string_keyed() {
+                    by_dt
                 } else {
-                    self.resolve_by_dt(dt)
+                    OType::customer_datatype(dt.as_u16())
                 }
             }
 
@@ -375,6 +383,41 @@ mod tests {
         assert_eq!(
             reg.resolve(ObjKind::LEX_ID, DatatypeDictId::FULL_TEXT, 0),
             OType::FULLTEXT
+        );
+    }
+
+    /// Issue #1987: a lexical string under a non-string datatype must keep a
+    /// string-keyed o_type, never the datatype's inline o_type.
+    #[test]
+    fn lex_id_under_non_string_datatype_stays_string_keyed() {
+        let reg = OTypeRegistry::new(&[
+            "http://www.w3.org/2001/XMLSchema#gYear".to_string(),
+            "http://www.w3.org/2001/XMLSchema#duration".to_string(),
+        ]);
+        for dt in [
+            DatatypeDictId::DATE,
+            DatatypeDictId::DATE_TIME,
+            DatatypeDictId::TIME,
+            DatatypeDictId::LONG,
+            DatatypeDictId::INTEGER,
+            DatatypeDictId::DOUBLE,
+            DatatypeDictId::BOOLEAN,
+            DatatypeDictId::from_u16(15),
+        ] {
+            assert_eq!(
+                reg.resolve(ObjKind::LEX_ID, dt, 0),
+                OType::customer_datatype(dt.as_u16()),
+                "dt={}",
+                dt.as_u16()
+            );
+        }
+        assert_eq!(
+            reg.resolve(ObjKind::LEX_ID, DatatypeDictId::from_u16(16), 0),
+            OType::XSD_DURATION
+        );
+        assert_eq!(
+            reg.resolve(ObjKind::DATE, DatatypeDictId::DATE, 0),
+            OType::XSD_DATE
         );
     }
 

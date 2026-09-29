@@ -347,6 +347,17 @@ impl OType {
             || self.0 == Self::FULLTEXT.0
     }
 
+    /// True if `o_key` is a string-dictionary id — the only o_types that can
+    /// carry a literal's lexical string. Every other o_type decodes `o_key` as
+    /// the value itself, so pairing it with a string id misreads the id.
+    #[inline]
+    pub const fn is_string_keyed(self) -> bool {
+        matches!(
+            self.decode_kind(),
+            DecodeKind::StringDict | DecodeKind::JsonArena | DecodeKind::Duration
+        )
+    }
+
     // ── langString helpers ─────────────────────────────────────────────
 
     /// Extract `lang_id` from a langString OType. Returns `None` if not langString.
@@ -695,6 +706,37 @@ mod tests {
             OType::customer_datatype(10).decode_kind(),
             DecodeKind::StringDict
         );
+    }
+
+    #[test]
+    fn string_keyed_o_types() {
+        for ot in [
+            OType::XSD_STRING,
+            OType::XSD_ANY_URI,
+            OType::FULLTEXT,
+            OType::RDF_JSON,
+            OType::XSD_DURATION,
+            OType::lang_string(3),
+            OType::customer_datatype(9),
+        ] {
+            assert!(ot.is_string_keyed(), "{ot:?}");
+        }
+        for ot in [
+            OType::XSD_BOOLEAN,
+            OType::XSD_INTEGER,
+            OType::XSD_LONG,
+            OType::XSD_DOUBLE,
+            OType::XSD_DATE,
+            OType::XSD_DATE_TIME,
+            OType::XSD_TIME,
+            OType::XSD_G_YEAR,
+            OType::XSD_DAY_TIME_DURATION,
+            OType::IRI_REF,
+            OType::VECTOR,
+            OType::NUM_BIG_OVERFLOW,
+        ] {
+            assert!(!ot.is_string_keyed(), "{ot:?}");
+        }
     }
 
     #[test]

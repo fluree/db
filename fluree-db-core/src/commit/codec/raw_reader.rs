@@ -24,6 +24,9 @@ use super::op_codec::ReadDicts;
 use super::reader::load_dicts;
 use super::varint::{decode_varint, read_exact, read_u8, zigzag_decode};
 use super::CodecEnvelope;
+use crate::FlakeValue;
+use fluree_vocab::datatype::KnownDatatype;
+use fluree_vocab::{namespaces, xsd_names};
 
 // ============================================================================
 // CommitOps
@@ -403,7 +406,11 @@ fn decode_raw_op<'a>(
 
     // Object tag
     let o_tag = OTag::from_u8(read_u8(data, pos)?)?;
-    let o = decode_raw_object(o_tag, data, pos, dicts)?;
+    let o = retype_string_literal(
+        decode_raw_object(o_tag, data, pos, dicts)?,
+        dt_ns_code,
+        dt_name,
+    );
 
     // Flags
     let flags = read_u8(data, pos)?;
@@ -443,6 +450,48 @@ fn decode_raw_op<'a>(
         lang,
         i,
     })
+}
+
+/// Read a string object under a typed XSD datatype as that datatype's value.
+///
+/// SPARQL UPDATE used to commit well-typed literals such as
+/// `"2026-09-08"^^xsd:date` as plain strings (#1987), while every other
+/// surface commits the parsed value. Retagging on read gives those commits the
+/// same fact identity, index encoding and query semantics. A lexical that does
+/// not parse as its datatype is an ill-typed literal and stays a string.
+pub(super) fn retype_string_literal<'a>(
+    raw: RawObject<'a>,
+    dt_ns_code: u16,
+    dt_name: &str,
+) -> RawObject<'a> {
+    let RawObject::Str(lexical) = raw else {
+        return raw;
+    };
+    if dt_ns_code != namespaces::XSD || xsd_names::is_string_like_name(dt_name) {
+        return raw;
+    }
+    let Some(datatype) = KnownDatatype::from_xsd_local(dt_name) else {
+        return raw;
+    };
+    match crate::coerce::coerce_string_value(lexical, datatype.canonical_form()) {
+        Ok(FlakeValue::Long(n)) => RawObject::Long(n),
+        Ok(FlakeValue::BigInt(_)) => RawObject::BigIntStr(lexical),
+        Ok(FlakeValue::Decimal(_)) => RawObject::DecimalStr(lexical),
+        Ok(FlakeValue::Double(d)) => RawObject::Double(d),
+        Ok(FlakeValue::Boolean(b)) => RawObject::Boolean(b),
+        Ok(FlakeValue::DateTime(_)) => RawObject::DateTimeStr(lexical),
+        Ok(FlakeValue::Date(_)) => RawObject::DateStr(lexical),
+        Ok(FlakeValue::Time(_)) => RawObject::TimeStr(lexical),
+        Ok(FlakeValue::GYear(_)) => RawObject::GYearStr(lexical),
+        Ok(FlakeValue::GYearMonth(_)) => RawObject::GYearMonthStr(lexical),
+        Ok(FlakeValue::GMonth(_)) => RawObject::GMonthStr(lexical),
+        Ok(FlakeValue::GDay(_)) => RawObject::GDayStr(lexical),
+        Ok(FlakeValue::GMonthDay(_)) => RawObject::GMonthDayStr(lexical),
+        Ok(FlakeValue::Duration(_)) => RawObject::DurationStr(lexical),
+        Ok(FlakeValue::DayTimeDuration(_)) => RawObject::DayTimeDurationStr(lexical),
+        Ok(FlakeValue::YearMonthDuration(_)) => RawObject::YearMonthDurationStr(lexical),
+        _ => raw,
+    }
 }
 
 /// Decode an object value without allocation. String-like values borrow
