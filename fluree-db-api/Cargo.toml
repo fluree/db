@@ -625,6 +625,10 @@ name = "insert_formats"
 harness = false
 
 [[bench]]
+name = "jsonld_parse"
+harness = false
+
+[[bench]]
 name = "import_bulk"
 harness = false
 

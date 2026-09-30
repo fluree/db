@@ -226,6 +226,7 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `vector_math` | SIMD vs scalar math micro-benches | `fluree-db-query/benches/vector_math.rs` |
 | `spatial` | S2 covering / build / query | `fluree-db-spatial/benches/spatial_bench.rs` |
 | `insert_formats` | JSON-LD vs Turtle insert format comparison | `fluree-db-api/benches/insert_formats.rs` |
+| `jsonld_parse` | JSON-LD transaction parsing alone (expansion, annotation lowering, templates; no staging) | `fluree-db-api/benches/jsonld_parse.rs` |
 | `vector_query` | end-to-end vector similarity through the query engine | `fluree-db-api/benches/vector_query.rs` |
 | `fulltext_query` | full-text scoring through novelty + index | `fluree-db-api/benches/fulltext_query.rs` |
 | `graphql_schema` | GraphQL schema derivation + registration, and the GraphQL request path against the JSON-LD query it lowers to | `fluree-db-api/benches/graphql_schema.rs` |
