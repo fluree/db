@@ -232,6 +232,52 @@ fn attach_time_suffix_preserving_fragment(ledger: &str, suffix: &str) -> String 
     }
 }
 
+/// The remote ledger path pinned to `--at` (`<ledger>@t:5`), which a server's
+/// ledger routes read as the whole ledger at that time. `None` for an alias
+/// that names a graph: a path pin cannot ride with a `#graph`.
+fn pinned_remote_path(remote_alias: &str, at_str: &str) -> CliResult<Option<String>> {
+    if remote_alias.contains('#') {
+        return Ok(None);
+    }
+    let spec = parse_time_spec(at_str)?;
+    Ok(Some(format!(
+        "{remote_alias}{}",
+        time_spec_to_suffix(&spec)
+    )))
+}
+
+/// Whether a server refused the pinned ledger path because it predates path
+/// pins (before v4.2.2): it parses the whole path, pin included, as a ledger
+/// id and refuses it. v4.1 and v4.2.1 answer with a 500, "Invalid ledger ID
+/// format '<path>': expected 'name' or 'name:branch'". Such a server still
+/// reads the older FROM / `from` rewrite; any other error stands.
+fn server_predates_path_pins(
+    e: &crate::remote_client::RemoteLedgerError,
+    pinned_path: &str,
+) -> bool {
+    use crate::remote_client::RemoteLedgerError;
+    let (RemoteLedgerError::BadRequest(msg)
+    | RemoteLedgerError::NotFound(msg)
+    | RemoteLedgerError::ServerError(msg)) = e
+    else {
+        return false;
+    };
+    msg.to_ascii_lowercase().contains("invalid ledger id")
+        && msg.contains(&format!("'{pinned_path}'"))
+}
+
+/// A response from the pinned ledger path, or `None` when the server predates
+/// path pins and the caller takes the older rewrite.
+fn unless_server_predates_path_pins<T>(
+    response: Result<T, crate::remote_client::RemoteLedgerError>,
+    pinned_path: &str,
+) -> CliResult<Option<T>> {
+    match response {
+        Err(e) if server_predates_path_pins(&e, pinned_path) => Ok(None),
+        other => Ok(Some(other?)),
+    }
+}
+
 fn inject_sparql_from_before_where(sparql: &str, from_iri: &str) -> Option<String> {
     // Minimal injection strategy for CLI ergonomics:
     // - Works for the common `SELECT ... WHERE { ... }` shape.
@@ -671,52 +717,49 @@ pub async fn run(
             let timer = Instant::now();
             let result = match (query_format, at, explain) {
                 (detect::QueryFormat::Sparql, Some(at_str), true) => {
-                    // Remote `--at --explain` over SPARQL: inject the time
-                    // suffix as a FROM and POST to the ledger-scoped explain
-                    // endpoint. Same shape as the non-explain SPARQL `--at`
-                    // case below — the server's `/explain/{ledger}` accepts
-                    // same-ledger FROM with time travel (see the
-                    // explain-time-travel fix). Queries with their own
-                    // FROM/FROM NAMED must encode time travel there.
-                    if fluree_db_api::sparql_has_dataset_clause(&content) {
-                        return Err(CliError::Usage(
-                            "SPARQL query already contains FROM/FROM NAMED; \
-                             for remote time travel, encode time travel in the FROM IRI \
-                             (e.g., FROM <ledger@t:1>) instead of using --at"
-                                .to_string(),
-                        ));
+                    // The ledger path pinned to `--at`: the query goes as written,
+                    // so its own FROM / `from` keeps what it names. A server that
+                    // predates path pins, or an alias with a `#graph`, takes the
+                    // older rewrite below.
+                    let pinned = match pinned_remote_path(&remote_alias, at_str)? {
+                        Some(path) => {
+                            let response = client.explain_sparql(&path, &content).await;
+                            unless_server_predates_path_pins(response, &path)?
+                        }
+                        None => None,
+                    };
+                    match pinned {
+                        Some(result) => result,
+                        None => {
+                            // The older rewrite: the time as an injected FROM.
+                            let injected =
+                                inject_remote_time_travel_sparql(&content, &remote_alias, at_str)?;
+                            client.explain_sparql(&remote_alias, &injected).await?
+                        }
                     }
-                    let spec = parse_time_spec(at_str)?;
-                    let suffix = time_spec_to_suffix(&spec);
-                    let from_iri = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
-                    let injected = inject_sparql_from_before_where(&content, &from_iri).ok_or_else(
-                        || {
-                            CliError::Usage(
-                                "unable to inject SPARQL FROM clause for remote time travel; \
-                                 please write the query as `SELECT ... WHERE { ... }` or include an explicit FROM"
-                                    .to_string(),
-                            )
-                        },
-                    )?;
-                    client.explain_sparql(&remote_alias, &injected).await?
                 }
                 (detect::QueryFormat::JsonLd, Some(at_str), true) => {
-                    // Remote `--at --explain` over JSON-LD: inject the
-                    // time-suffixed `from` into the body and POST to the
-                    // ledger-scoped explain endpoint. Path drives auth,
-                    // body's `from` drives snapshot selection.
-                    let spec = parse_time_spec(at_str)?;
-                    let suffix = time_spec_to_suffix(&spec);
-                    let from_id = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
-                    let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
-                    if let Some(obj) = json_query.as_object_mut() {
-                        obj.insert("from".to_string(), serde_json::Value::String(from_id));
-                    } else {
-                        return Err(CliError::Input(
-                            "JSON-LD query must be a JSON object".to_string(),
-                        ));
+                    // The ledger path pinned to `--at`: the query goes as written,
+                    // so its own FROM / `from` keeps what it names. A server that
+                    // predates path pins, or an alias with a `#graph`, takes the
+                    // older rewrite below.
+                    let pinned = match pinned_remote_path(&remote_alias, at_str)? {
+                        Some(path) => {
+                            let json_query: serde_json::Value = serde_json::from_str(&content)?;
+                            let response = client.explain_jsonld(&path, &json_query).await;
+                            unless_server_predates_path_pins(response, &path)?
+                        }
+                        None => None,
+                    };
+                    match pinned {
+                        Some(result) => result,
+                        None => {
+                            // The older rewrite: the time in the body's `from`.
+                            let json_query =
+                                inject_remote_time_travel_jsonld(&content, &remote_alias, at_str)?;
+                            client.explain_jsonld(&remote_alias, &json_query).await?
+                        }
                     }
-                    client.explain_jsonld(&remote_alias, &json_query).await?
                 }
                 (detect::QueryFormat::Sparql, None, true) => {
                     client.explain_sparql(&remote_alias, &content).await?
@@ -726,64 +769,84 @@ pub async fn run(
                     client.explain_jsonld(&remote_alias, &json_query).await?
                 }
                 (detect::QueryFormat::Sparql, Some(at_str), false) => {
-                    // Remote time-travel via ledger-scoped SPARQL: path drives
-                    // auth (`can_read("mydb:main")` matches scoped tokens),
-                    // injected FROM carries the @t:N suffix for snapshot
-                    // resolution. We inject a single FROM before WHERE for
-                    // the common SELECT shape; queries with their own
-                    // FROM/FROM NAMED must encode time travel there.
-                    if fluree_db_api::sparql_has_dataset_clause(&content) {
-                        return Err(CliError::Usage(
-                            "SPARQL query already contains FROM/FROM NAMED; \
-                             for remote time travel, encode time travel in the FROM IRI \
-                             (e.g., FROM <ledger@t:1>) instead of using --at"
-                                .to_string(),
-                        ));
-                    }
-                    let spec = parse_time_spec(at_str)?;
-                    let suffix = time_spec_to_suffix(&spec);
-                    let from_iri = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
-                    let injected = inject_sparql_from_before_where(&content, &from_iri).ok_or_else(
-                        || {
-                            CliError::Usage(
-                                "unable to inject SPARQL FROM clause for remote time travel; \
-                                 please write the query as `SELECT ... WHERE { ... }` or include an explicit FROM"
-                                    .to_string(),
-                            )
-                        },
-                    )?;
-                    if is_tracked {
-                        client
-                            .query_sparql_with_headers(&remote_alias, &injected, &tracking_headers)
-                            .await?
-                    } else {
-                        client.query_sparql(&remote_alias, &injected).await?
+                    // The ledger path pinned to `--at`: the query goes as written,
+                    // so its own FROM / `from` keeps what it names. A server that
+                    // predates path pins, or an alias with a `#graph`, takes the
+                    // older rewrite below.
+                    let pinned = match pinned_remote_path(&remote_alias, at_str)? {
+                        Some(path) => {
+                            let response = if is_tracked {
+                                client
+                                    .query_sparql_with_headers(&path, &content, &tracking_headers)
+                                    .await
+                            } else {
+                                client.query_sparql(&path, &content).await
+                            };
+                            unless_server_predates_path_pins(response, &path)?
+                        }
+                        None => None,
+                    };
+                    match pinned {
+                        Some(result) => result,
+                        None => {
+                            // The older rewrite: the time as an injected FROM.
+                            let injected =
+                                inject_remote_time_travel_sparql(&content, &remote_alias, at_str)?;
+                            if is_tracked {
+                                client
+                                    .query_sparql_with_headers(
+                                        &remote_alias,
+                                        &injected,
+                                        &tracking_headers,
+                                    )
+                                    .await?
+                            } else {
+                                client.query_sparql(&remote_alias, &injected).await?
+                            }
+                        }
                     }
                 }
                 (detect::QueryFormat::JsonLd, Some(at_str), false) => {
-                    // Remote time-travel via ledger-scoped JSON-LD: path
-                    // drives auth, body's `from` carries the @t:N suffix.
-                    let spec = parse_time_spec(at_str)?;
-                    let suffix = time_spec_to_suffix(&spec);
-                    let from_id = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
-                    let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
-                    if let Some(obj) = json_query.as_object_mut() {
-                        obj.insert("from".to_string(), serde_json::Value::String(from_id));
-                    } else {
-                        return Err(CliError::Input(
-                            "JSON-LD query must be a JSON object".to_string(),
-                        ));
-                    }
-                    if is_tracked {
-                        client
-                            .query_jsonld_with_headers(
-                                &remote_alias,
-                                &json_query,
-                                &tracking_headers,
-                            )
-                            .await?
-                    } else {
-                        client.query_jsonld(&remote_alias, &json_query).await?
+                    // The ledger path pinned to `--at`: the query goes as written,
+                    // so its own FROM / `from` keeps what it names. A server that
+                    // predates path pins, or an alias with a `#graph`, takes the
+                    // older rewrite below.
+                    let pinned = match pinned_remote_path(&remote_alias, at_str)? {
+                        Some(path) => {
+                            let json_query: serde_json::Value = serde_json::from_str(&content)?;
+                            let response = if is_tracked {
+                                client
+                                    .query_jsonld_with_headers(
+                                        &path,
+                                        &json_query,
+                                        &tracking_headers,
+                                    )
+                                    .await
+                            } else {
+                                client.query_jsonld(&path, &json_query).await
+                            };
+                            unless_server_predates_path_pins(response, &path)?
+                        }
+                        None => None,
+                    };
+                    match pinned {
+                        Some(result) => result,
+                        None => {
+                            // The older rewrite: the time in the body's `from`.
+                            let json_query =
+                                inject_remote_time_travel_jsonld(&content, &remote_alias, at_str)?;
+                            if is_tracked {
+                                client
+                                    .query_jsonld_with_headers(
+                                        &remote_alias,
+                                        &json_query,
+                                        &tracking_headers,
+                                    )
+                                    .await?
+                            } else {
+                                client.query_jsonld(&remote_alias, &json_query).await?
+                            }
+                        }
                     }
                 }
                 (detect::QueryFormat::Sparql, None, false) => {
@@ -1237,6 +1300,26 @@ fn inject_remote_time_travel_sparql(
                 .to_string(),
         )
     })
+}
+
+/// The older `--remote --at` rewrite for JSON-LD: the body's `from` becomes the
+/// ledger pinned to `--at`, in place of any `from` the query had.
+fn inject_remote_time_travel_jsonld(
+    content: &str,
+    remote_alias: &str,
+    at_str: &str,
+) -> CliResult<serde_json::Value> {
+    let spec = parse_time_spec(at_str)?;
+    let suffix = time_spec_to_suffix(&spec);
+    let from_id = attach_time_suffix_preserving_fragment(remote_alias, &suffix);
+    let mut json_query: serde_json::Value = serde_json::from_str(content)?;
+    let Some(obj) = json_query.as_object_mut() else {
+        return Err(CliError::Input(
+            "JSON-LD query must be a JSON object".to_string(),
+        ));
+    };
+    obj.insert("from".to_string(), serde_json::Value::String(from_id));
+    Ok(json_query)
 }
 
 /// Stream a SELECT query against a local ledger as NDJSON.
@@ -2163,8 +2246,9 @@ mod tests {
     use super::{
         attach_time_suffix_preserving_fragment, cli_delimited_config, cli_sparql_json_config,
         format_tally_suffix, inject_sparql_from_before_where, json_path_display_format,
-        json_path_formatter_config, parse_time_spec, query_needs_connection,
-        reject_graph_source_unsupported, time_spec_to_suffix, EndpointPath,
+        json_path_formatter_config, parse_time_spec, pinned_remote_path, query_needs_connection,
+        reject_graph_source_unsupported, server_predates_path_pins, time_spec_to_suffix,
+        EndpointPath,
     };
     use crate::detect::QueryFormat;
     use crate::output::OutputFormatKind;
@@ -2474,6 +2558,76 @@ mod tests {
         assert!(remote(
             QueryFormat::JsonLd,
             r#"{"from":{"@id":"warehouse-orders"},"select":["?s"]}"#
+        ));
+    }
+
+    /// `--remote --at` pins the ledger path, as every `--at` spelling; an
+    /// alias that names a graph keeps the older rewrite (a pin cannot ride with
+    /// a `#graph` in a path).
+    #[test]
+    fn remote_at_pins_the_ledger_path() {
+        assert_eq!(
+            pinned_remote_path("mydb:main", "t:5").unwrap().as_deref(),
+            Some("mydb:main@t:5")
+        );
+        assert_eq!(
+            pinned_remote_path("mydb", "5").unwrap().as_deref(),
+            Some("mydb@t:5")
+        );
+        assert_eq!(
+            pinned_remote_path("mydb:main", "2024-01-15T10:30:00Z")
+                .unwrap()
+                .as_deref(),
+            Some("mydb:main@iso:2024-01-15T10:30:00Z")
+        );
+        assert!(pinned_remote_path("mydb:main#txn-meta", "t:5")
+            .unwrap()
+            .is_none());
+        assert!(pinned_remote_path("mydb:main", "t:x").is_err());
+    }
+
+    /// Only a server that predates path pins (it refuses the pinned path as a
+    /// ledger id) falls back to the older rewrite; any other error stands.
+    #[test]
+    fn only_a_server_without_path_pins_falls_back() {
+        use crate::remote_client::RemoteLedgerError;
+        let path = "mydb:main@t:5";
+        // What v4.1 and v4.2.1 answer, verbatim: a 500.
+        assert!(server_predates_path_pins(
+            &RemoteLedgerError::ServerError(
+                "Ledger error: Nameservice error: Invalid ID format: Invalid ledger ID format \
+                 'mydb:main@t:5': expected 'name' or 'name:branch'"
+                    .to_string()
+            ),
+            path
+        ));
+        // The ledger id parser's own wording, as a 400.
+        assert!(server_predates_path_pins(
+            &RemoteLedgerError::BadRequest(
+                "Invalid ledger id 'mydb:main@t:5': branch cannot contain '@'".to_string()
+            ),
+            path
+        ));
+        // Anything else stands: another id, another error, another status.
+        assert!(!server_predates_path_pins(
+            &RemoteLedgerError::BadRequest(
+                "Invalid ledger id 'other:main@t:5': branch cannot contain '@'".to_string()
+            ),
+            path
+        ));
+        assert!(!server_predates_path_pins(
+            &RemoteLedgerError::BadRequest(
+                "Invalid time pin in ledger path 'mydb:main@t:5': no such t".to_string()
+            ),
+            path
+        ));
+        assert!(!server_predates_path_pins(
+            &RemoteLedgerError::ServerError("storage unavailable".to_string()),
+            path
+        ));
+        assert!(!server_predates_path_pins(
+            &RemoteLedgerError::Forbidden,
+            path
         ));
     }
 
