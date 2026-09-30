@@ -8,7 +8,7 @@
 //! When the `shacl` feature is enabled, [`validate_view_with_shacl`] validates a
 //! staged view against SHACL shapes.
 
-use crate::current_facts::{CurrentFacts, Retraction, Slot};
+use crate::current_facts::{CurrentFacts, Retraction, Slot, StoredFact};
 use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
 use crate::ir::InlineValues;
@@ -19,8 +19,6 @@ use crate::ir::{
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::graph_registry::{FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
-use fluree_db_core::query_bounds::RangeTest;
-use fluree_db_core::range::RangeMatch;
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
@@ -908,13 +906,11 @@ pub async fn stage_with_graph_delta(
             acc.push_retractions(upsert_retractions.into_iter().map(Retraction::into_flake));
         }
 
-        // Graph-sync wave: push every currently-asserted flake of the target
-        // graph as a retraction (see [`Txn::sync_graph`]). The accumulator
-        // nets retract+assert of the same fact to nothing, so what survives
-        // `finalize()` is exactly `current − payload` retractions plus
-        // `payload − current` assertions — the delta. Scanned flakes carry
-        // correct `m` from storage, so (like the upsert wave) no hydration
-        // is needed.
+        // Graph-sync wave: retract every current fact of the target graph
+        // (see [`Txn::sync_graph`]). The accumulator nets retract+assert of
+        // the same fact to nothing, so what survives `finalize()` is exactly
+        // `current − payload` retractions plus `payload − current`
+        // assertions — the delta.
         //
         // Policy model follows CLEAR (roadmap O4): the scan is not
         // view-policy filtered — sync is an authoritative whole-graph
@@ -926,28 +922,24 @@ pub async fn stage_with_graph_delta(
         // graph's flakes at staging time; backpressure is the pre-check
         // above plus `NoveltyWouldExceed` sizing at commit (which sees only
         // the surviving delta). Chunked staging for whole-graph ops is the
-        // same known follow-up flagged on `scan_graph_flakes`.
+        // known follow-up flagged on `whole_graph_facts`.
         if let Some((sync_g_id, sync_graph_sid)) = &sync_scan {
-            // The scan attributes every flake to the graph Sid, matching the
+            // Every fact comes back attributed to the graph Sid, matching the
             // payload's assertions — both sides must agree on `flake.g` for
             // the accumulator's unchanged-fact cancellation to fire.
-            let mut sync_retractions = scan_graph_flakes(
+            let current = whole_graph_facts(
                 &ledger,
                 *sync_g_id,
                 sync_graph_sid.as_ref(),
                 options.tracker,
             )
             .await?;
-            for f in &mut sync_retractions {
-                f.op = false;
-                f.t = new_t;
-            }
             tracing::debug!(
                 graph_id = sync_g_id,
-                scanned = sync_retractions.len(),
+                scanned = current.len(),
                 "graph-sync retractions generated"
             );
-            acc.push_retractions(sync_retractions);
+            acc.push_retractions(current.into_iter().map(|f| f.retract(new_t).into_flake()));
         }
 
         let retraction_count = stream_stats.retraction_count;
@@ -1309,22 +1301,9 @@ fn whole_graph_scan_limit() -> Option<usize> {
     }
 }
 
-/// Scan every currently-asserted flake in graph `g_id` (merged snapshot +
-/// novelty view as of the ledger's current `t`), attributed to `g_sid`.
-///
-/// Every flake comes back with `g = g_sid` (`None` for the default graph).
-/// The range provider materializes index-resident rows with `g: None`
-/// regardless of graph — only novelty-resident flakes carry it — and every
-/// caller here routes by `flake.g` (`resolve_flake_graph_id`, where `None`
-/// is the default graph). Without the stamp, retracting an indexed named
-/// graph silently retracted phantoms from the default graph instead.
-///
-/// Scale note: a whole-graph operation (`CLEAR ALL`, a large COPY/MOVE)
-/// materializes every scanned flake into a `Vec` and re-stages it, and
-/// backpressure (`at_max_novelty`) is only checked at commit entry — so one
-/// graph-management op can roughly double novelty in a single commit. That is
-/// exactly the op class most likely to touch the whole store; chunked staging
-/// for whole-graph ops is a known follow-up if this cliff is hit in practice.
+/// Every current fact of graph `g_id`, attributed to `g_sid`, under the
+/// [`whole_graph_scan_limit`] backstop. The graph-management verbs
+/// (CLEAR/DROP/COPY/MOVE/ADD) and graph sync read through this.
 ///
 /// O4 (by design): this scan is NOT view-policy filtered — unlike the
 /// DELETE-WHERE path, which reads through a `QueryPolicyEnforcer`. So the set a
@@ -1336,41 +1315,22 @@ fn whole_graph_scan_limit() -> Option<usize> {
 /// not a privilege escalation; it only means that under `default_allow` + a
 /// view restriction, a `CLEAR` can retract flakes an equivalent DELETE-WHERE
 /// (which only sees viewable rows) would not.
-async fn scan_graph_flakes(
+///
+/// Scale note: a whole-graph operation (`CLEAR ALL`, a large COPY/MOVE)
+/// materializes every scanned flake into a `Vec` and re-stages it, and
+/// backpressure (`at_max_novelty`) is only checked at commit entry — so one
+/// graph-management op can roughly double novelty in a single commit. That is
+/// exactly the op class most likely to touch the whole store; chunked staging
+/// for whole-graph ops is a known follow-up if this cliff is hit in practice.
+async fn whole_graph_facts(
     ledger: &LedgerState,
     g_id: GraphId,
     g_sid: Option<&Sid>,
     tracker: Option<&Tracker>,
-) -> Result<Vec<Flake>> {
-    let db_ref = match tracker {
-        Some(t) => ledger.as_graph_db_ref(g_id).with_tracker(t),
-        None => ledger.as_graph_db_ref(g_id),
-    };
-    // `Eq` with an empty match is the whole-graph scan on both range paths:
-    // the V3 provider treats "nothing bound" as a full-index cursor and
-    // rejects every other `RangeTest`, and the genesis (overlay-only) path
-    // matches an empty `Eq` against every flake. `Ge` only ever worked on
-    // the genesis path, where non-`Eq` tests pass through unfiltered.
-    // `flake_limit` stops the provider's drain loop mid-scan, so the
-    // backstop bounds what is materialized, not just what is returned.
-    let limit = whole_graph_scan_limit();
-    let opts = fluree_db_core::RangeOptions {
-        flake_limit: limit.map(|l| l.saturating_add(1)),
-        ..Default::default()
-    };
-    let mut flakes = db_ref
-        .range_with_opts(IndexType::Spot, RangeTest::Eq, RangeMatch::new(), opts)
+) -> Result<Vec<StoredFact>> {
+    CurrentFacts::new(ledger)
+        .whole_graph(g_id, g_sid, whole_graph_scan_limit(), tracker)
         .await
-        .map_err(|e| TransactError::FlakeGeneration(format!("graph scan failed: {e}")))?;
-    if let Some(l) = limit {
-        if flakes.len() > l {
-            return Err(TransactError::WholeGraphScanTooLarge { limit: l });
-        }
-    }
-    for f in &mut flakes {
-        f.g = g_sid.cloned();
-    }
-    Ok(flakes)
 }
 
 /// Resolve the ledger `GraphId` and graph `Sid` for a named graph IRI, if it
@@ -1490,13 +1450,9 @@ async fn stage_graph_mgmt(
                     if let Some(sid) = &sid {
                         graph_sids.insert(g_id, sid.clone());
                     }
-                    for mut f in
-                        scan_graph_flakes(&ledger, g_id, sid.as_ref(), options.tracker).await?
-                    {
-                        f.op = false;
-                        f.t = new_t;
-                        flakes.push(f);
-                    }
+                    let current =
+                        whole_graph_facts(&ledger, g_id, sid.as_ref(), options.tracker).await?;
+                    flakes.extend(current.into_iter().map(|f| f.retract(new_t).into_flake()));
                 }
             }
 
@@ -1600,19 +1556,22 @@ async fn stage_graph_mgmt(
                         graph_sids.insert(dest_g_id, sid.clone());
                     }
 
-                    let src_flakes = match src_g_id {
+                    let src_facts = match src_g_id {
                         Some(g) => {
-                            scan_graph_flakes(&ledger, g, src_sid.as_ref(), options.tracker).await?
+                            whole_graph_facts(&ledger, g, src_sid.as_ref(), options.tracker).await?
                         }
                         None => Vec::new(),
                     };
+                    let src_flakes: Vec<&Flake> = src_facts.iter().map(StoredFact::flake).collect();
 
-                    let dest_flakes =
-                        scan_graph_flakes(&ledger, dest_g_id, dest_sid.as_ref(), options.tracker)
+                    let dest_facts =
+                        whole_graph_facts(&ledger, dest_g_id, dest_sid.as_ref(), options.tracker)
                             .await?;
 
-                    let dest_contents: HashSet<FlakeContent> =
-                        dest_flakes.iter().map(flake_content).collect();
+                    let dest_contents: HashSet<FlakeContent> = dest_facts
+                        .iter()
+                        .map(|f| flake_content(f.flake()))
+                        .collect();
 
                     // O5: re-homing rewrites the `f:reifiesGraph` anchor per src/
                     // dest graph (see the assert loop below), so an
@@ -1638,7 +1597,7 @@ async fn stage_graph_mgmt(
                         // produce a `Duplicate`; same signature (same edge) dedups
                         // cleanly against `dest_contents` and is fine.
                         let edge_signatures =
-                            |bundle: &[Flake]| -> HashMap<Sid, HashSet<FlakeContent>> {
+                            |bundle: &mut dyn Iterator<Item = &Flake>| -> HashMap<Sid, HashSet<FlakeContent>> {
                                 let mut sigs: HashMap<Sid, HashSet<FlakeContent>> = HashMap::new();
                                 for f in bundle {
                                     if fluree_db_core::is_reserved_reifies_predicate(&f.p)
@@ -1651,9 +1610,10 @@ async fn stage_graph_mgmt(
                                 }
                                 sigs
                             };
-                        let dest_sigs = edge_signatures(&dest_flakes);
+                        let dest_sigs =
+                            edge_signatures(&mut dest_facts.iter().map(StoredFact::flake));
                         if !dest_sigs.is_empty() {
-                            let src_sigs = edge_signatures(&src_flakes);
+                            let src_sigs = edge_signatures(&mut src_flakes.iter().copied());
                             for (subject, src_sig) in &src_sigs {
                                 if let Some(dest_sig) = dest_sigs.get(subject) {
                                     if src_sig != dest_sig {
@@ -1700,7 +1660,7 @@ async fn stage_graph_mgmt(
                     };
                     let mut rehomed: Vec<Flake> =
                         Vec::with_capacity(src_flakes.len() + synthesized);
-                    for f in &src_flakes {
+                    for &f in &src_flakes {
                         if fluree_db_core::is_reifies_graph(&f.p) {
                             if let Some(dest) = &dest_sid {
                                 let mut a = f.clone();
@@ -1721,7 +1681,7 @@ async fn stage_graph_mgmt(
                     }
                     if src_is_default {
                         if let Some(dest) = &dest_sid {
-                            for f in &src_flakes {
+                            for &f in &src_flakes {
                                 if fluree_db_core::is_reifies_subject(&f.p) {
                                     rehomed.push(Flake::new_in_graph(
                                         dest.clone(),
@@ -1758,12 +1718,9 @@ async fn stage_graph_mgmt(
                     // is the intended behavior, so this no longer silently loses data
                     // on a typo.
                     if *clear_dest {
-                        for f in &dest_flakes {
-                            if !rehomed_contents.contains(&flake_content(f)) {
-                                let mut r = f.clone();
-                                r.op = false;
-                                r.t = new_t;
-                                flakes.push(r);
+                        for fact in dest_facts {
+                            if !rehomed_contents.contains(&flake_content(fact.flake())) {
+                                flakes.push(fact.retract(new_t).into_flake());
                             }
                         }
                     }
@@ -1781,13 +1738,11 @@ async fn stage_graph_mgmt(
                     // destination assertions, so there is no cancellation.
                     if *clear_src {
                         if let Some(src_g) = src_g_id {
-                            for mut f in src_flakes {
-                                if let Some(g_sid) = &f.g {
+                            for fact in src_facts {
+                                if let Some(g_sid) = &fact.flake().g {
                                     graph_sids.entry(src_g).or_insert_with(|| g_sid.clone());
                                 }
-                                f.op = false;
-                                f.t = new_t;
-                                flakes.push(f);
+                                flakes.push(fact.retract(new_t).into_flake());
                             }
                         }
                     }
