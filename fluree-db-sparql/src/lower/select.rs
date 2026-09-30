@@ -167,21 +167,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// the SELECT expressions. Shared by the top level and sub-SELECTs.
     ///
     /// `patterns` are the level's WHERE patterns; the WHERE-side additions are
-    /// appended to them. `post_values` is a trailing VALUES clause kept out of
-    /// `patterns` (the top level's); Fluree joins it before grouping.
+    /// appended to them. A trailing VALUES clause is not among them: it joins
+    /// after HAVING (§18.2.4), so its variables are not bound before grouping.
     pub(super) fn lower_select_level(
         &mut self,
         select: &SelectClause,
         modifiers: &SolutionModifiers,
         patterns: &mut Vec<Pattern>,
-        post_values: Option<&Pattern>,
     ) -> Result<LoweredSelectLevel> {
-        // Variables bound before grouping: the patterns', plus the trailing
-        // VALUES clause joined before grouping.
         let mut where_vars = produced_vars_of(patterns);
-        if let Some(values) = post_values {
-            where_vars.extend(values.produced_vars());
-        }
         let mut lowered = self.lower_solution_modifiers(modifiers, select, &where_vars)?;
         // One definition of "groups": validation (V4) reads it off the AST,
         // lowering off the lowered keys and aggregates.
@@ -812,8 +806,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         // Solution modifiers, SELECT expressions and HAVING through the same
         // path as a top-level SELECT.
-        let level =
-            self.lower_select_level(&select_clause, &subselect.modifiers, &mut patterns, None)?;
+        let level = self.lower_select_level(&select_clause, &subselect.modifiers, &mut patterns)?;
 
         // `SELECT *` of a grouping level projects its keys; implicit grouping
         // has none, so the sub-SELECT exports nothing and keeps its row count.

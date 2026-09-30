@@ -546,7 +546,6 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     &select_query.select,
                     &select_query.modifiers,
                     &mut patterns,
-                    post_values.as_ref(),
                 )?;
                 let star_projection = level.star_projection;
                 let grouping = level.grouping;

@@ -947,6 +947,7 @@ impl SubqueryOperator {
         crate::execute::operator_tree::apply_solution_modifiers(
             where_op,
             self.subquery.grouping.as_ref(),
+            None,
             &self.subquery.order_binds,
             &self.subquery.ordering,
             select_vars,

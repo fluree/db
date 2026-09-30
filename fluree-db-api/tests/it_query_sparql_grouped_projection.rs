@@ -607,6 +607,47 @@ async fn having_without_grouping_filters() {
     assert_eq!(result.row_count(), 0);
 }
 
+/// A trailing VALUES clause joins after HAVING (SPARQL 1.1 §18.2.4), so
+/// HAVING cannot read its variables: grouped or not, `HAVING (?v = 1)` over
+/// `VALUES ?v { 1 }` keeps nothing. The grouped form used to read `?v` as a
+/// SAMPLE of the VALUES column, which was joined before grouping, and kept
+/// every group.
+///
+/// Joined after grouping, the VALUES rows no longer multiply the aggregates'
+/// input: each group row pairs with each VALUES row instead. Before, `COUNT`
+/// counted twice as many rows.
+#[tokio::test]
+async fn trailing_values_joins_after_having() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/trailing-values:main").await;
+    for body in [
+        format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING (?v = 1) VALUES ?v {{ 1 }}"),
+        format!("SELECT ?a {W} HAVING (?v = 1) VALUES ?v {{ 1 }}"),
+    ] {
+        let result = run(&fluree, &ledger, &body).await;
+        assert_eq!(result.row_count(), 0, "{body}");
+    }
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a VALUES ?x {{ 1 2 }}"),
+        json!([
+            {"a": "Net", "n": "3"}, {"a": "Net", "n": "3"},
+            {"a": "Local", "n": "2"}, {"a": "Local", "n": "2"},
+            {"a": "Remote", "n": "1"}, {"a": "Remote", "n": "1"}
+        ]),
+        json!([
+            ["Net", 3],
+            ["Net", 3],
+            ["Local", 2],
+            ["Local", 2],
+            ["Remote", 1],
+            ["Remote", 1]
+        ]),
+    )
+    .await;
+}
+
 /// Cypher parity. Cypher makes a non-aggregate RETURN expression a grouping
 /// key, so `RETURN CASE … AS seg, count(e)` groups by the label — SPARQL's
 /// `GROUP BY (IF(…) AS ?seg)`. Grouping by the area first and mapping it after
