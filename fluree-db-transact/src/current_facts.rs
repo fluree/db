@@ -438,7 +438,9 @@ impl<'l> CurrentFacts<'l> {
     ///   bound by another pattern — is matched against the stored facts of
     ///   its slot ([`match_stored`]): by term, else, for a fact read from
     ///   the index, by index key ([`IndexKeys`]). The fact is retracted as
-    ///   read. An intent that names no stored fact stages nothing.
+    ///   read. An intent that names no stored fact stages nothing; with
+    ///   `unmatched`, it is also appended there as instantiated, for the
+    ///   caller's modify-policy check.
     ///
     /// `graph_of` gives the ledger graph id of an intent's graph Sid.
     pub(crate) async fn resolve_intents(
@@ -446,6 +448,7 @@ impl<'l> CurrentFacts<'l> {
         intents: Vec<RetractIntent>,
         list_free: Option<&ListFree>,
         graph_of: impl Fn(&Flake) -> Result<GraphId>,
+        mut unmatched: Option<&mut Vec<Flake>>,
     ) -> Result<(Vec<Retraction>, ResolveStats)> {
         let mut stats = ResolveStats::default();
         let mut out = Vec::with_capacity(intents.len());
@@ -522,6 +525,9 @@ impl<'l> CurrentFacts<'l> {
                 out.push(stored.clone().retract(t));
             } else {
                 stats.phantom_intents += 1;
+                if let Some(unmatched) = unmatched.as_deref_mut() {
+                    unmatched.push(intent.flake);
+                }
             }
         }
         Ok((out, stats))

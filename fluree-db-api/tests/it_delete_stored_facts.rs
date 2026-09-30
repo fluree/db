@@ -20,7 +20,10 @@
 //! `dateTime`'s digits past the microsecond.
 
 use crate::support;
-use fluree_db_api::{Fluree, FlureeBuilder, LedgerState, TransactResult};
+use fluree_db_api::policy_builder::build_policy_context_from_opts;
+use fluree_db_api::{
+    Fluree, FlureeBuilder, GovernanceOptions, LedgerState, PolicyContext, TransactResult,
+};
 use serde_json::{json, Value as JsonValue};
 
 const EX: &str = "http://example.org/ns/";
@@ -672,5 +675,168 @@ async fn a_delete_names_a_big_integer_in_a_named_graph() {
             0,
             "indexed={indexed}"
         );
+    }
+}
+
+// =============================================================================
+// Modify policy judges every delete a transaction asks for
+// =============================================================================
+
+async fn policy(ledger: &LedgerState, opts: GovernanceOptions) -> PolicyContext {
+    build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context")
+}
+
+/// The identity may view and modify `ex:name` and nothing else.
+async fn name_only(ledger: &LedgerState) -> PolicyContext {
+    policy(
+        ledger,
+        GovernanceOptions {
+            policy: Some(json!([{
+                "@id": "http://example.org/ns/nameOnly",
+                "f:onProperty": [{"@id": "http://example.org/ns/name"}],
+                "f:action": [{"@id": "f:view"}, {"@id": "f:modify"}],
+                "f:allow": true
+            }])),
+            default_allow: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// The identity may modify everything but `ex:ssn`.
+async fn all_but_ssn(ledger: &LedgerState) -> PolicyContext {
+    policy(
+        ledger,
+        GovernanceOptions {
+            policy: Some(json!([{
+                "@id": "http://example.org/ns/denySsn",
+                "f:required": true,
+                "f:onProperty": [{"@id": "http://example.org/ns/ssn"}],
+                "f:action": "f:modify",
+                "f:allow": false
+            }])),
+            default_allow: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn sparql_update_as(
+    fluree: &Fluree,
+    ledger: LedgerState,
+    body: &str,
+    policy: PolicyContext,
+) -> Result<TransactResult, fluree_db_api::ApiError> {
+    let text =
+        format!("PREFIX ex: <{EX}>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n{body}");
+    let parsed = fluree_db_sparql::parse_sparql(&text);
+    assert!(!parsed.has_errors(), "{text}: {:?}", parsed.diagnostics);
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &parsed.ast.expect("ast"),
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower");
+    fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .policy(policy)
+        .execute()
+        .await
+}
+
+fn salary_seed() -> JsonValue {
+    json!({"@id": "ex:alice", "ex:name": "Alice", "ex:salary": 100})
+}
+
+/// A delete the identity may not perform is refused with one answer whether
+/// or not the value it names is stored: here `ex:salary 100` is stored and
+/// 999 and 50 are not.
+#[tokio::test]
+async fn delete_refused_by_policy_regardless_of_stored_value() {
+    for indexed in [false, true] {
+        for body in [
+            "DELETE DATA { ex:alice ex:salary 100 }",
+            "DELETE DATA { ex:alice ex:salary 999 }",
+            "DELETE DATA { ex:alice ex:salary 50 }",
+            "DELETE { ?s ex:salary 100 } WHERE { ?s ex:name ?n }",
+            "DELETE { ?s ex:salary 999 } WHERE { ?s ex:name ?n }",
+        ] {
+            let (_d, fluree, ledger) = seeded("policy-sparql", salary_seed(), indexed).await;
+            let policy = name_only(&ledger).await;
+            let err = sparql_update_as(&fluree, ledger, body, policy)
+                .await
+                .map(|r| r.receipt.flake_count)
+                .expect_err(body);
+            assert!(
+                err.to_string()
+                    .contains("Policy enforcement prevents modification"),
+                "{body}, indexed={indexed}: {err}"
+            );
+        }
+        for salary in [100, 999] {
+            let (_d, fluree, ledger) = seeded("policy-jsonld", salary_seed(), indexed).await;
+            let policy = name_only(&ledger).await;
+            let txn = json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:alice", "ex:salary": salary}
+            });
+            let err = fluree
+                .stage_owned(ledger)
+                .update(&txn)
+                .policy(policy)
+                .execute()
+                .await
+                .map(|r| r.receipt.flake_count)
+                .expect_err("JSON-LD delete");
+            assert!(
+                err.to_string()
+                    .contains("Policy enforcement prevents modification"),
+                "JSON-LD {salary}, indexed={indexed}: {err}"
+            );
+        }
+    }
+}
+
+/// An identity the policy lets modify the value: deleting it retracts it,
+/// and deleting a value that is not stored commits nothing.
+#[tokio::test]
+async fn a_permitted_delete_of_an_absent_value_commits_nothing() {
+    for indexed in [false, true] {
+        let (_d, fluree, ledger) = seeded("policy-allowed", salary_seed(), indexed).await;
+        let t = ledger.t();
+        let policy = all_but_ssn(&ledger).await;
+        let r = sparql_update_as(
+            &fluree,
+            ledger,
+            "DELETE DATA { ex:alice ex:salary 999 }",
+            policy,
+        )
+        .await
+        .expect("permitted");
+        no_commit(&r, t, &format!("absent value, indexed={indexed}"));
+
+        let policy = all_but_ssn(&r.ledger).await;
+        let r = sparql_update_as(
+            &fluree,
+            r.ledger,
+            "DELETE DATA { ex:alice ex:salary 100 }",
+            policy,
+        )
+        .await
+        .expect("permitted");
+        assert_eq!(r.receipt.retract_count, 1, "indexed={indexed}");
     }
 }

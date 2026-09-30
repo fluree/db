@@ -1055,13 +1055,26 @@ pub async fn stage_with_graph_delta(
             tracker.consume_fuel(flakes.len() as u64)?;
         }
 
-        // Enforce modify policies (if policy context provided and not root)
+        // Enforce modify policies (if policy context provided and not root).
+        //
+        // Modify policy judges every delete the transaction asked for,
+        // including DELETE intents that named no stored fact and stage
+        // nothing: a delete the identity may not perform is refused the same
+        // way whether or not its target is stored.
         if let Some(policy) = options.policy_ctx {
             if !policy.wrapper().is_root() {
+                let judged: std::borrow::Cow<'_, [Flake]> =
+                    if stream_stats.unmatched_intents.is_empty() {
+                        std::borrow::Cow::Borrowed(&flakes)
+                    } else {
+                        let mut all = flakes.clone();
+                        all.extend(stream_stats.unmatched_intents.iter().cloned());
+                        std::borrow::Cow::Owned(all)
+                    };
                 let policy_span = tracing::debug_span!("policy_enforce");
                 async {
                     enforce_modify_policies(
-                        &flakes,
+                        &judged,
                         policy,
                         &ledger,
                         options.tracker,
@@ -2467,6 +2480,9 @@ struct WhereStreamStats {
     total_binding_rows: u64,
     retraction_count: usize,
     assertion_count: usize,
+    /// DELETE intents that named no stored fact, as instantiated. Collected
+    /// only under a non-root policy, for the modify-policy check.
+    unmatched_intents: Vec<Flake>,
 }
 
 /// Stream the WHERE result into `acc`, projecting → materializing encoded
@@ -2791,6 +2807,10 @@ async fn stream_where_into_accumulator(
     }
     let current_facts = CurrentFacts::new(ledger);
     let mut resolve_stats = ResolveStats::default();
+    // Under a non-root policy, intents that name no stored fact still go to
+    // the modify-policy check (see `stage_with_graph_delta`).
+    let collect_unmatched = view_policy.is_some_and(|p| !p.wrapper().is_root());
+    let mut unmatched_intents: Vec<Flake> = Vec::new();
     generator.set_graph_aliases(graph_aliases);
 
     // Open the streaming WHERE cursor. For empty patterns it emits one
@@ -2845,9 +2865,12 @@ async fn stream_where_into_accumulator(
         // Resolve BEFORE push (see the doc comment above).
         let routing: &HashMap<Sid, GraphId> = reverse_graph;
         let (retractions, stats) = current_facts
-            .resolve_intents(intents, list_free.as_ref(), |f| {
-                resolve_flake_graph_id(f, routing)
-            })
+            .resolve_intents(
+                intents,
+                list_free.as_ref(),
+                |f| resolve_flake_graph_id(f, routing),
+                collect_unmatched.then_some(&mut unmatched_intents),
+            )
             .instrument(delete_span.clone())
             .await?;
         delete_span.record("retraction_count", retractions.len() as u64);
@@ -2895,6 +2918,7 @@ async fn stream_where_into_accumulator(
         total_binding_rows,
         retraction_count,
         assertion_count,
+        unmatched_intents,
     })
 }
 
