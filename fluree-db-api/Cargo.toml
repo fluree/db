@@ -182,6 +182,11 @@ path = "tests/grp_graphsource.rs"
 name = "grp_import"
 path = "tests/grp_import.rs"
 
+# Own binary: the triple-term link lowering tests set a process-wide flag.
+[[test]]
+name = "grp_triple_terms"
+path = "tests/grp_triple_terms.rs"
+
 # Standalone (NOT in grp_import): re-execs itself and lowers RLIMIT_NOFILE
 # hard+soft in the child, which must not share a process with other tests.
 [[test]]

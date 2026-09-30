@@ -153,6 +153,15 @@ pub(crate) fn late_materialized_object_binding(
             i_val: encoded_i_val(o_i),
             t,
         }),
+        DecodeKind::TripleTermDict => Some(Binding::EncodedLit {
+            o_kind: ObjKind::TRIPLE_TERM.as_u8(),
+            o_key,
+            p_id,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: encoded_i_val(o_i),
+            t,
+        }),
         DecodeKind::NumBigArena => Some(Binding::EncodedLit {
             o_kind: ObjKind::NUM_BIG.as_u8(),
             o_key,

@@ -109,7 +109,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
             match &tp.annotation {
                 Some(ann) => self.lower_annotation_units(edge, ann, &mut result)?,
-                None => result.push(Pattern::Triple(edge)),
+                None => {
+                    for v in [edge.s.as_var(), edge.p.as_var(), edge.o.as_var()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        self.link_bound_vars.insert(v);
+                    }
+                    result.push(Pattern::Triple(edge));
+                }
             }
         }
 

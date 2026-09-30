@@ -400,6 +400,13 @@ struct LoweringContext<'a, E> {
     pp_counter: u32,
     /// Monotonic counter for generating expression-based ORDER BY bind variables (`?__order_by_0`, …).
     order_counter: u32,
+    /// Monotonic counter for the triple-term variables the link lowering
+    /// mints (`?__term_0`, …).
+    term_counter: u32,
+    /// Variables some earlier pattern binds. The link lowering binds a term's
+    /// components with `BIND` only for variables not in this set, and joins
+    /// with a `FILTER` equality otherwise, since `BIND` overwrites.
+    link_bound_vars: std::collections::HashSet<VarId>,
     /// Original SPARQL source text (for extracting SERVICE body text).
     source_text: Option<&'a str>,
 }
@@ -424,6 +431,8 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             agg_counter: 0,
             pp_counter: 0,
             order_counter: 0,
+            term_counter: 0,
+            link_bound_vars: std::collections::HashSet::new(),
             source_text,
         }
     }

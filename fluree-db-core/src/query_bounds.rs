@@ -133,6 +133,10 @@ pub struct ObjectBounds {
     /// Upper bound: (value, inclusive)
     /// For `?x < 100`, use `(100, false)`. For `?x <= 100`, use `(100, true)`.
     pub upper: Option<(FlakeValue, bool)>,
+    /// Restrict triple-term objects to terms whose inner predicate is this
+    /// SID. Handles are partitioned by inner predicate, so a scan turns this
+    /// into one `o_key` interval; on materialized values it checks the term.
+    pub term_predicate: Option<crate::sid::Sid>,
 }
 
 impl ObjectBounds {
@@ -153,6 +157,20 @@ impl ObjectBounds {
         self
     }
 
+    /// Bounds that only restrict a triple term's inner predicate.
+    pub fn term_predicate(sid: crate::sid::Sid) -> Self {
+        Self {
+            term_predicate: Some(sid),
+            ..Self::default()
+        }
+    }
+
+    /// True when a lower or upper value bound is set (as opposed to only a
+    /// term-predicate restriction, which an index seek can enforce alone).
+    pub fn has_value_bounds(&self) -> bool {
+        self.lower.is_some() || self.upper.is_some()
+    }
+
     /// Check if a value satisfies the bounds
     ///
     /// Uses **type class comparison**:
@@ -160,6 +178,12 @@ impl ObjectBounds {
     /// - Temporal types are only comparable within the same kind (Date vs Date, etc.)
     /// - Other types require exact type match
     pub fn matches(&self, value: &FlakeValue) -> bool {
+        if let Some(p) = &self.term_predicate {
+            match value {
+                FlakeValue::TripleTerm(t) if &t.p == p => {}
+                _ => return false,
+            }
+        }
         // Check lower bound
         if let Some((lower, inclusive)) = &self.lower {
             match Self::class_cmp(value, lower) {

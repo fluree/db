@@ -447,6 +447,68 @@ pub fn eval_bnode<R: RowAccess>(
     }
 }
 
+// ── SPARQL 1.2 triple-term functions ────────────────────────────────────────
+
+/// The triple term an argument evaluates to, or `None` when it is unbound
+/// or not a term (a SPARQL type error, which yields no value).
+fn triple_term_arg<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+    name: &str,
+) -> Result<Option<fluree_db_core::TripleTermValue>> {
+    check_arity(args, 1, name)?;
+    Ok(match args[0].eval_to_comparable(row, ctx)? {
+        Some(ComparableValue::TypedLiteral {
+            val: fluree_db_core::FlakeValue::TripleTerm(t),
+            ..
+        }) => Some(*t),
+        _ => None,
+    })
+}
+
+pub fn eval_triple_subject<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    Ok(triple_term_arg(args, row, ctx, "SUBJECT")?.map(|t| ComparableValue::Sid(t.s)))
+}
+
+pub fn eval_triple_predicate<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    Ok(triple_term_arg(args, row, ctx, "PREDICATE")?.map(|t| ComparableValue::Sid(t.p)))
+}
+
+pub fn eval_triple_object<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    Ok(triple_term_arg(args, row, ctx, "OBJECT")?
+        .and_then(|t| ComparableValue::try_from(&t.o).ok()))
+}
+
+pub fn eval_is_triple<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "ISTRIPLE")?;
+    Ok(args[0].eval_to_comparable(row, ctx)?.map(|v| {
+        ComparableValue::Bool(matches!(
+            v,
+            ComparableValue::TypedLiteral {
+                val: fluree_db_core::FlakeValue::TripleTerm(_),
+                ..
+            }
+        ))
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

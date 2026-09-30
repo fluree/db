@@ -349,10 +349,12 @@ mod tests {
         let a = ObjectBounds {
             lower: Some((FlakeValue::Long(10), false)),
             upper: Some((FlakeValue::Long(100), true)),
+            term_predicate: None,
         };
         let b = ObjectBounds {
             lower: Some((FlakeValue::Long(20), true)),
             upper: Some((FlakeValue::Long(80), false)),
+            term_predicate: None,
         };
 
         let merged = merge_object_bounds(&a, &b);

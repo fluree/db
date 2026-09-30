@@ -233,16 +233,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // parse time, but have no evaluable implementation yet: defer per
         // burn-down decision D-1 (accept-then-defer). A query that reaches here
         // fails at lower time with a clean `not_implemented`, not a parse error.
-        if matches!(
-            name,
-            FunctionName::Triple
-                | FunctionName::Subject
-                | FunctionName::Predicate
-                | FunctionName::Object
-                | FunctionName::IsTriple
-        ) {
+        if matches!(name, FunctionName::Triple) {
             return Err(LowerError::not_implemented(
-                "SPARQL 1.2 triple-term functions (TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE)",
+                "SPARQL 1.2 TRIPLE(s, p, o) construction",
                 span,
             ));
         }
@@ -327,13 +320,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             FunctionName::CosineSimilarity => Function::CosineSimilarity,
             FunctionName::EuclideanDistance => Function::EuclideanDistance,
 
+            // SPARQL 1.2 triple-term accessors over `FlakeValue::TripleTerm`.
+            FunctionName::Subject => Function::TripleSubject,
+            FunctionName::Predicate => Function::TriplePredicate,
+            FunctionName::Object => Function::TripleObject,
+            FunctionName::IsTriple => Function::IsTriple,
             // Handled by the `not_implemented` early return above.
-            FunctionName::Triple
-            | FunctionName::Subject
-            | FunctionName::Predicate
-            | FunctionName::Object
-            | FunctionName::IsTriple => {
-                unreachable!("triple-term functions defer via the early return")
+            FunctionName::Triple => {
+                unreachable!("TRIPLE() defers via the early return")
             }
 
             // Extension functions

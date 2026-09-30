@@ -44,7 +44,6 @@ pub fn extract_bounds_from_filters(
             consumed_indices.push(idx);
         }
     }
-
     (bounds, consumed_indices)
 }
 
@@ -137,6 +136,10 @@ pub fn merge_object_bounds(a: &ObjectBounds, b: &ObjectBounds) -> ObjectBounds {
     ObjectBounds {
         lower: merge_lower_bound(a.lower.as_ref(), b.lower.as_ref()),
         upper: merge_upper_bound(a.upper.as_ref(), b.upper.as_ref()),
+        term_predicate: a
+            .term_predicate
+            .clone()
+            .or_else(|| b.term_predicate.clone()),
     }
 }
 
@@ -299,10 +302,12 @@ mod tests {
         let a = ObjectBounds {
             lower: Some((FlakeValue::Long(10), false)),
             upper: Some((FlakeValue::Long(100), true)),
+            term_predicate: None,
         };
         let b = ObjectBounds {
             lower: Some((FlakeValue::Long(20), true)),
             upper: Some((FlakeValue::Long(80), false)),
+            term_predicate: None,
         };
 
         let merged = merge_object_bounds(&a, &b);

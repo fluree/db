@@ -84,6 +84,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let mut out = Vec::new();
         let annotation_ref = self.lower_subject(reifier)?;
         let edge = self.lower_triple_term(triple_term, &mut out)?;
+        if link_terms_enabled() {
+            self.lower_reified_link(annotation_ref, edge, &mut out);
+            return Ok(out);
+        }
         out.push(Pattern::AnnotationTarget {
             annotation: annotation_ref,
             edge,
@@ -118,11 +122,19 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let p = self.lower_predicate(&qt.predicate)?;
         let (o, dtc) = self.lower_object_desugared(&qt.object, cache, out, true)?;
 
-        out.push(Pattern::AnnotationTarget {
-            annotation: annotation_ref.clone(),
-            edge: IrTriplePattern { s, p, o, dtc },
-            body: Vec::new(),
-        });
+        if link_terms_enabled() {
+            self.lower_reified_link(
+                annotation_ref.clone(),
+                IrTriplePattern { s, p, o, dtc },
+                out,
+            );
+        } else {
+            out.push(Pattern::AnnotationTarget {
+                annotation: annotation_ref.clone(),
+                edge: IrTriplePattern { s, p, o, dtc },
+                body: Vec::new(),
+            });
+        }
         cache.insert(qt.span, annotation_ref.clone());
         Ok(annotation_ref)
     }
@@ -256,4 +268,125 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let (o, dtc) = self.lower_object_desugared(&term.object, &mut cache, out, true)?;
         Ok(IrTriplePattern { s, p, o, dtc })
     }
+}
+
+/// `FLUREE_ANNOTATION_TERMS=1` routes reified-triple patterns through the
+/// `rdf:reifies` link flake and the term dictionary instead of the
+/// `f:reifies*` bundle chain. Read per lowering so tests can flip it.
+pub(super) fn link_terms_enabled() -> bool {
+    std::env::var("FLUREE_ANNOTATION_TERMS").is_ok_and(|v| v == "1")
+}
+
+impl<E: IriEncoder> LoweringContext<'_, E> {
+    /// Lower a reified-triple pattern to the link form: one
+    /// `annotation rdf:reifies ?__term` triple whose object is a triple-term
+    /// handle, then each component of the reified edge either bound from the
+    /// term (`BIND(SUBJECT(?__term) AS ?s)`) or constrained against it
+    /// (`FILTER(PREDICATE(?__term) = <p>)`). A predicate constraint is what the
+    /// planner turns into one handle interval; a fully constant edge composes
+    /// to a constant term the scan looks up directly.
+    pub(super) fn lower_reified_link(
+        &mut self,
+        annotation_ref: Ref,
+        edge: IrTriplePattern,
+        out: &mut Vec<Pattern>,
+    ) {
+        use fluree_db_core::FlakeValue;
+        use fluree_db_query::ir::{Expression, Function};
+
+        let reifies = self.encoder.encode_ref(fluree_vocab::rdf::REIFIES);
+
+        // Fully constant edge: compose the term itself.
+        if let Some(term) = constant_term(&edge) {
+            out.push(Pattern::Triple(IrTriplePattern {
+                s: annotation_ref,
+                p: reifies,
+                o: IrTerm::Value(FlakeValue::TripleTerm(Box::new(term))),
+                dtc: None,
+            }));
+            return;
+        }
+
+        let name = format!("?__term_{}", self.term_counter);
+        self.term_counter += 1;
+        let t = self.vars.get_or_insert(&name);
+        out.push(Pattern::Triple(IrTriplePattern {
+            s: annotation_ref,
+            p: reifies,
+            o: IrTerm::Var(t),
+            dtc: None,
+        }));
+        self.link_bound_vars.insert(t);
+
+        let accessor = |f: Function| Expression::call(f, vec![Expression::Var(t)]);
+        let mut component = |func: Function, term: IrTerm, out: &mut Vec<Pattern>| match term {
+            IrTerm::Var(v) => {
+                if self.link_bound_vars.insert(v) {
+                    out.push(Pattern::Bind {
+                        var: v,
+                        expr: accessor(func),
+                    });
+                } else {
+                    out.push(Pattern::Filter(Expression::call(
+                        Function::Eq,
+                        vec![accessor(func), Expression::Var(v)],
+                    )));
+                }
+            }
+            IrTerm::Sid(sid) => out.push(Pattern::Filter(Expression::call(
+                Function::Eq,
+                vec![accessor(func), Expression::Const(FlakeValue::Ref(sid))],
+            ))),
+            IrTerm::Iri(iri) => match self.encoder.encode_iri(&iri) {
+                Some(sid) => out.push(Pattern::Filter(Expression::call(
+                    Function::Eq,
+                    vec![accessor(func), Expression::Const(FlakeValue::Ref(sid))],
+                ))),
+                // An IRI in no registered namespace names nothing in this
+                // ledger, so the pattern cannot match.
+                None => out.push(Pattern::Filter(Expression::Const(FlakeValue::Boolean(
+                    false,
+                )))),
+            },
+            IrTerm::Value(v) => out.push(Pattern::Filter(Expression::call(
+                Function::Eq,
+                vec![accessor(func), Expression::Const(v)],
+            ))),
+        };
+        component(Function::TripleSubject, edge.s.into(), out);
+        component(Function::TriplePredicate, edge.p.into(), out);
+        component(Function::TripleObject, edge.o, out);
+    }
+}
+
+/// The materialized term for an edge whose three positions are constants
+/// and whose object datatype is known; `None` otherwise.
+fn constant_term(edge: &IrTriplePattern) -> Option<fluree_db_core::TripleTermValue> {
+    use fluree_db_core::FlakeValue;
+    let s = match &edge.s {
+        Ref::Sid(s) => s.clone(),
+        _ => return None,
+    };
+    let p = match &edge.p {
+        Ref::Sid(p) => p.clone(),
+        _ => return None,
+    };
+    let (o, dt, lang) = match (&edge.o, &edge.dtc) {
+        (IrTerm::Sid(sid), _) => (
+            FlakeValue::Ref(sid.clone()),
+            fluree_db_core::edge::id_datatype_sid(),
+            None,
+        ),
+        (IrTerm::Value(v), Some(DatatypeConstraint::Explicit(dt))) => (v.clone(), dt.clone(), None),
+        (IrTerm::Value(v), Some(DatatypeConstraint::LangTag(tag))) => (
+            v.clone(),
+            fluree_db_core::Sid::new(
+                fluree_vocab::namespaces::RDF,
+                fluree_vocab::rdf_names::LANG_STRING,
+            ),
+            Some(tag.to_string()),
+        ),
+        _ => return None,
+    };
+    Some(fluree_db_core::TripleTermValue { s, p, o, dt, lang })
 }

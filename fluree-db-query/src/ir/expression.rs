@@ -975,6 +975,14 @@ pub enum Function {
     },
     LangMatches,
     SameTerm,
+    /// SPARQL 1.2 `SUBJECT(term)`: the subject of a triple term.
+    TripleSubject,
+    /// SPARQL 1.2 `PREDICATE(term)`: the predicate of a triple term.
+    TriplePredicate,
+    /// SPARQL 1.2 `OBJECT(term)`: the object of a triple term.
+    TripleObject,
+    /// SPARQL 1.2 `isTRIPLE(term)`.
+    IsTriple,
 
     // =========================================================================
     // Fluree-specific functions

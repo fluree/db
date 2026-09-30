@@ -113,6 +113,10 @@ impl Function {
             Function::Datatype { strict } => rdf::eval_datatype(args, row, ctx, *strict),
             Function::LangMatches => rdf::eval_lang_matches(args, row, ctx),
             Function::SameTerm => rdf::eval_same_term(args, row, ctx),
+            Function::TripleSubject => rdf::eval_triple_subject(args, row, ctx),
+            Function::TriplePredicate => rdf::eval_triple_predicate(args, row, ctx),
+            Function::TripleObject => rdf::eval_triple_object(args, row, ctx),
+            Function::IsTriple => rdf::eval_is_triple(args, row, ctx),
             Function::Iri => rdf::eval_iri(args, row, ctx),
             Function::Bnode => rdf::eval_bnode(args, row, ctx),
 

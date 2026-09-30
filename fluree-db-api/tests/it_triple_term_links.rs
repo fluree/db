@@ -254,3 +254,91 @@ async fn incremental_index_appends_new_terms_and_reuses_existing_handles() {
         })
         .await;
 }
+
+/// The link-based lowering (`FLUREE_ANNOTATION_TERMS=1`): reified-triple
+/// patterns scan `rdf:reifies` and decompose or constrain the term instead
+/// of walking the bundle chain. Every shape the design doc's access-path
+/// table names, on the same imported claims.
+#[tokio::test]
+async fn link_lowering_answers_reified_triple_shapes() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let (fluree, ledger) = import(&[("claims.ttl", CLAIMS)], "it/triple-term-links:lowering").await;
+    let q = |body: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n{body}"
+        )
+    };
+    let run = |body: &str| {
+        let sparql = q(body);
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            let result = support::query_sparql_formatted(fluree, ledger, &sparql)
+                .await
+                .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+            rows(&result)
+        }
+    };
+
+    // Wildcard: every reifier's edge, decomposed from the term.
+    let got =
+        run("SELECT ?s ?p ?o WHERE { ?r rdf:reifies <<( ?s ?p ?o )>> } ORDER BY ?s ?p ?o").await;
+    assert_eq!(got.len(), 4, "{got:#?}");
+    assert!(
+        got.iter()
+            .any(|r| r[0].ends_with("alice") && r[1].ends_with("knows") && r[2].ends_with("bob")),
+        "{got:#?}"
+    );
+    assert!(
+        got.iter()
+            .any(|r| r[0].ends_with("carol") && r[1].ends_with("age") && r[2] == "42"),
+        "{got:#?}"
+    );
+
+    // Predicate-bound with no body join: the handle interval alone must
+    // exclude carol's `ex:age` claim.
+    let got =
+        run("SELECT ?s ?o WHERE { ?r rdf:reifies <<( ?s ex:knows ?o )>> } ORDER BY ?s ?o").await;
+    assert_eq!(got.len(), 3, "{got:#?}");
+    assert!(got.iter().all(|r| r[1] != "42"), "{got:#?}");
+
+    // Predicate-bound: the handle interval.
+    let got =
+        run("SELECT ?s ?o WHERE { << ?s ex:knows ?o >> ex:source ?src } ORDER BY ?s ?o").await;
+    assert_eq!(got.len(), 3, "{got:#?}");
+    assert!(
+        got.iter()
+            .all(|r| r[0].ends_with("alice") || r[0].ends_with("bob")),
+        "{got:#?}"
+    );
+
+    // Fully bound: the composed constant term.
+    let got = run("SELECT ?src WHERE { << ex:alice ex:knows ex:bob >> ex:source ?src }").await;
+    assert_eq!(got.len(), 1, "{got:#?}");
+    assert!(got[0][0].ends_with("hr"), "{got:#?}");
+
+    // Subject-bound with a literal object.
+    let got = run("SELECT ?p ?o WHERE { ?r rdf:reifies <<( ex:carol ?p ?o )>> }").await;
+    assert_eq!(got.len(), 1, "{got:#?}");
+    assert!(got[0][0].ends_with("age") && got[0][1] == "42", "{got:#?}");
+
+    // Object- and predicate-bound with the reifier's body joined.
+    let got = run(
+        "SELECT ?s ?src WHERE { ?r rdf:reifies <<( ?s ex:knows ex:bob )>> . ?r ex:source ?src }",
+    )
+    .await;
+    assert_eq!(got.len(), 1, "{got:#?}");
+    assert!(
+        got[0][0].ends_with("alice") && got[0][1].ends_with("hr"),
+        "{got:#?}"
+    );
+
+    // A component variable bound earlier joins instead of being rebound.
+    let got = run("SELECT ?o2 WHERE { ?r1 rdf:reifies <<( ex:alice ex:knows ?o1 )>> . ?r2 rdf:reifies <<( ?o1 ex:knows ?o2 )>> }").await;
+    assert_eq!(got.len(), 1, "{got:#?}");
+    assert!(
+        got[0][0].ends_with("dave"),
+        "bob knows dave via alice knows bob: {got:#?}"
+    );
+}

@@ -5448,6 +5448,7 @@ mod tests {
             ObjectBounds {
                 lower: Some((FlakeValue::String("2026-01-01".to_string()), true)),
                 upper: None,
+                term_predicate: None,
             },
         );
 

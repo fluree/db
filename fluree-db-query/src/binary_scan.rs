@@ -215,6 +215,11 @@ pub struct BinaryScanOperator {
     #[expect(dead_code)]
     index_hint: Option<IndexType>,
     object_bounds: Option<ObjectBounds>,
+    /// Set at open when a term-predicate bound became the POST seek range:
+    /// the inclusive `o_key` interval every emitted row must fall in. The
+    /// seek keys only narrow the leaflets read, so rows are checked against
+    /// it in encoded form, without a decode.
+    term_o_key_range: Option<(u64, u64)>,
     /// Bound object value, if the triple pattern's object is a constant.
     bound_o: Option<FlakeValue>,
     /// `bound_o` as its persisted `(o_type, o_key)` when it is an IRI the
@@ -746,6 +751,7 @@ impl BinaryScanOperator {
             emit,
             index_hint,
             object_bounds,
+            term_o_key_range: None,
             bound_o: None,
             bound_o_encoded: None,
             check_s_eq_o,
@@ -1440,8 +1446,17 @@ impl BinaryScanOperator {
                     continue;
                 }
             }
+            if let Some((lo, hi)) = self.term_o_key_range {
+                if o_key < lo || o_key > hi {
+                    continue;
+                }
+            }
+            let bounds_need_value = self.object_bounds.as_ref().is_some_and(|b| {
+                b.has_value_bounds()
+                    || (b.term_predicate.is_some() && self.term_o_key_range.is_none())
+            });
             let needs_o_decode = (self.bound_o.is_some() && self.bound_o_encoded.is_none())
-                || self.object_bounds.is_some()
+                || bounds_need_value
                 || (!late_materialize && self.o_var_pos.is_some());
             // BinaryGraphView::decode_value is novelty-aware: dict-backed types
             // (IriRef, StringDict, JsonArena) automatically route through
@@ -1472,7 +1487,7 @@ impl BinaryScanOperator {
                 }
             }
 
-            if let Some(bounds) = &self.object_bounds {
+            if let Some(bounds) = self.object_bounds.as_ref().filter(|_| bounds_need_value) {
                 let Some(val) = decoded_o.as_ref() else {
                     return Err(QueryError::Internal(
                         "object bounds require object decoding".to_string(),
@@ -2443,8 +2458,25 @@ impl Operator for BinaryScanOperator {
         let mut range_min_okey: Option<u64> = None;
         let mut range_max_okey: Option<u64> = None;
         let mut range_o_type: Option<u16> = None;
+        let mut term_o_key_range: Option<(u64, u64)> = None;
         if order == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
             if let Some(bounds) = self.object_bounds.as_ref() {
+                // A term-predicate bound is one contiguous handle interval:
+                // handles are `(inner p_id << 32) | seq`.
+                if let Some(sid) = bounds.term_predicate.as_ref() {
+                    if let Some(p) = store_ref
+                        .sid_to_iri(sid)
+                        .and_then(|iri| store_ref.find_predicate_id(&iri))
+                    {
+                        let (lo, hi) = fluree_db_core::triple_term::term_handle_range(p);
+                        let ot = OType::TRIPLE_TERM.as_u16();
+                        range_o_type = Some(ot);
+                        range_min_okey = Some(lo);
+                        range_max_okey = Some(hi);
+                        filter.o_type = Some(ot);
+                        term_o_key_range = Some((lo, hi));
+                    }
+                }
                 let supports_range = |ot: OType| -> bool {
                     matches!(
                         ot,
@@ -2527,6 +2559,8 @@ impl Operator for BinaryScanOperator {
         // Create cursor. If any of (s_id, p_id, o_type, o_key) are bound OR we have a
         // temporal object-key range (POST + bounds), construct a narrow min/max key range
         // so we can seek into the branch manifest rather than scanning all leaves.
+        self.term_o_key_range = term_o_key_range;
+
         let use_range = |filter: &BinaryFilter| {
             filter.s_id.is_some()
                 || filter.p_id.is_some()
@@ -3933,6 +3967,42 @@ fn value_to_otype_okey(
             find_numbig_okey(val, store, numbig_ctx)
         }
         FlakeValue::Decimal(_) => find_numbig_okey(val, store, numbig_ctx),
+        // A constant triple term composes to its handle through the term
+        // dictionary; a term that was never interned matches nothing, which
+        // the caller's decode-and-compare fallback preserves.
+        FlakeValue::TripleTerm(term) => {
+            let s_id = resolve_subject_v3(&term.s, store, dict_novelty)?;
+            let p_id = store
+                .sid_to_iri(&term.p)
+                .and_then(|iri| store.find_predicate_id(&iri))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "triple term predicate is not a known predicate",
+                    )
+                })?;
+            let (o_type, o_key) = value_to_otype_okey(
+                &term.o,
+                &term.dt,
+                term.lang.as_deref(),
+                store,
+                dict_novelty,
+                None,
+            )?;
+            let key = fluree_db_core::triple_term::TermKey {
+                s_id,
+                p_id,
+                o_type,
+                o_key,
+            };
+            match store.find_term_handle(&key)? {
+                Some(handle) => Ok((OType::TRIPLE_TERM, handle)),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "triple term is not interned",
+                )),
+            }
+        }
         // Not handled: Vector (arena + HNSW identity; raw-merge is the
         // intended lane).
         _ => Err(std::io::Error::new(

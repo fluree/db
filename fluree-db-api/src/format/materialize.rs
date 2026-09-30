@@ -90,13 +90,20 @@ fn materialize_encoded_lit(binding: &Binding, gv: &BinaryGraphView) -> std::io::
             // NUM_BIG arena values share one EncodedLit whose dt_id is hardcoded
             // to decimal — recover xsd:integer vs xsd:decimal from the decoded
             // value, not dt_id (issue #1329).
-            let dt_sid = other.overflow_numeric_datatype_sid().unwrap_or_else(|| {
-                store
-                    .dt_sids()
-                    .get(*dt_id as usize)
-                    .cloned()
-                    .unwrap_or_else(|| Sid::new(0, ""))
-            });
+            let dt_sid = other
+                .overflow_numeric_datatype_sid()
+                .or_else(|| {
+                    other
+                        .is_triple_term()
+                        .then(|| fluree_db_core::triple_term_datatype_sid().clone())
+                })
+                .unwrap_or_else(|| {
+                    store
+                        .dt_sids()
+                        .get(*dt_id as usize)
+                        .cloned()
+                        .unwrap_or_else(|| Sid::new(0, ""))
+                });
             let meta = store.decode_meta(*lang_id, *i_val);
             let dtc = match meta.and_then(|m| m.lang.map(std::sync::Arc::from)) {
                 Some(lang) => DatatypeConstraint::LangTag(lang),

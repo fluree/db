@@ -859,6 +859,9 @@ pub fn extract_object_bounds_for_var(
     filter: &Expression,
     object_var: VarId,
 ) -> Option<ObjectBounds> {
+    if let Some(sid) = term_predicate_constraint(filter, object_var) {
+        return Some(ObjectBounds::term_predicate(sid));
+    }
     // Only proceed if filter is range-safe
     let constraints = extract_range_constraints(filter)?;
 
@@ -879,6 +882,40 @@ pub fn extract_object_bounds_for_var(
 // =============================================================================
 // Generalized Selectivity Scoring for All Pattern Types
 // =============================================================================
+
+/// `PREDICATE(?t) = <p>` (either operand order) on the object variable of a
+/// triple-term scan: the one filter shape the scan can enforce as a handle
+/// interval, since handles are partitioned by inner predicate.
+fn term_predicate_constraint(
+    filter: &Expression,
+    object_var: VarId,
+) -> Option<fluree_db_core::Sid> {
+    let Expression::Call {
+        func: Function::Eq,
+        args,
+    } = filter
+    else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let is_pred_of = |e: &Expression| {
+        matches!(e, Expression::Call { func: Function::TriplePredicate, args }
+            if args.len() == 1 && args[0] == Expression::Var(object_var))
+    };
+    let const_sid = |e: &Expression| match e {
+        Expression::Const(FlakeValue::Ref(sid)) => Some(sid.clone()),
+        _ => None,
+    };
+    if is_pred_of(&args[0]) {
+        const_sid(&args[1])
+    } else if is_pred_of(&args[1]) {
+        const_sid(&args[0])
+    } else {
+        None
+    }
+}
 
 /// Cardinality estimate for a generalized pattern.
 ///
