@@ -629,3 +629,82 @@ async fn explain_select_distinct_plain_count_only_outer_distinct() {
          under a plain COUNT is unsound: {physical}"
     );
 }
+
+/// Physical plan of `sparql` over e1–e3 Net, e4–e5 Local, e6 Remote.
+async fn areas_physical_plan(sparql: &str) -> serde_json::Value {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "grouped-projection-plan:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@graph": [
+                    {"@id":"ex:e1","ex:area":"Net"},
+                    {"@id":"ex:e2","ex:area":"Net"},
+                    {"@id":"ex:e3","ex:area":"Net"},
+                    {"@id":"ex:e4","ex:area":"Local"},
+                    {"@id":"ex:e5","ex:area":"Local"},
+                    {"@id":"ex:e6","ex:area":"Remote"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    resp["plan"]["physical"].clone()
+}
+
+/// #1978: a grouped SELECT expression runs per group, above the grouping — so
+/// the query takes the same streaming `GroupAggregateOperator` plan as one that
+/// projects the key, instead of the list-carrying `GroupByOperator` +
+/// `AggregateOperator` pair (which stores every input row).
+#[tokio::test]
+async fn explain_grouped_select_expression_streams() {
+    let _env = HashJoinEnv::acquire();
+    for aggregate in ["(COUNT(?e) AS ?n)", "(MIN(?e) AS ?m)"] {
+        let physical = areas_physical_plan(&format!(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?seg) {aggregate}\n\
+             WHERE {{ ?e ex:area ?a }} GROUP BY ?a"
+        ))
+        .await;
+        let bind = physical_find_op(&physical, "BindOperator")
+            .unwrap_or_else(|| panic!("the Extend is a BindOperator: {physical}"));
+        assert!(
+            physical_contains_op(bind, "GroupAggregateOperator"),
+            "the Extend runs above the streaming grouping: {physical}"
+        );
+        assert!(
+            !physical_contains_op(&physical, "GroupByOperator"),
+            "no list-carrying GroupByOperator: {physical}"
+        );
+    }
+}
+
+/// Dedup-only `GROUP BY ?a` with a SELECT expression: the expression runs above
+/// the `GroupByOperator`, which now carries only the key — so WHERE-level early
+/// dedup applies below it, exactly as for `SELECT ?a … GROUP BY ?a`.
+#[tokio::test]
+async fn explain_dedup_only_grouped_select_expression() {
+    let _env = HashJoinEnv::acquire();
+    let physical = areas_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?seg)\n\
+         WHERE { ?e ex:area ?a } GROUP BY ?a",
+    )
+    .await;
+    let bind = physical_find_op(&physical, "BindOperator")
+        .unwrap_or_else(|| panic!("the Extend is a BindOperator: {physical}"));
+    let group_by = physical_find_op(bind, "GroupByOperator")
+        .unwrap_or_else(|| panic!("the Extend runs above the grouping: {physical}"));
+    assert!(
+        physical_contains_op(group_by, "DistinctOperator"),
+        "WHERE-level early dedup below the grouping: {physical}"
+    );
+}

@@ -512,14 +512,6 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // Lower SELECT clause to get selected variables
                 let select = self.lower_select_clause(&select_query.select)?;
 
-                // Aggregate aliases referenced by SELECT expressions (for post-aggregation binds)
-                let aggregate_aliases = self.collect_aggregate_alias_names(&select_query.select);
-
-                // Lower SELECT expression bindings (e.g., SELECT (SHA512(?x) AS ?hash))
-                let select_binds =
-                    self.lower_select_expression_binds(&select_query.select, &aggregate_aliases)?;
-                patterns.extend(select_binds.pre);
-
                 // Lower post-query VALUES clause.  Stored in `post_values` (not
                 // in `patterns`) so the WHERE-clause planner cannot reorder it
                 // relative to OPTIONAL/UNION.  Applied after the WHERE tree.
@@ -540,9 +532,32 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // Lower solution modifiers (LIMIT/OFFSET/ORDER BY/DISTINCT/GROUP BY/HAVING/aggregates).
                 // Expression-based GROUP BY produces pre-group BINDs that must be
                 // injected into the WHERE pattern list before query building.
-                let lowered_modifiers =
+                let mut lowered_modifiers =
                     self.lower_solution_modifiers(&select_query.modifiers, &select_query.select)?;
-                patterns.extend(lowered_modifiers.pre_group_binds);
+
+                // SELECT expressions (e.g. `(SHA512(?x) AS ?hash)`), placed once
+                // the level's grouping is known: WHERE binds for an ungrouped
+                // level (and a key's expression), per-group Extends otherwise.
+                let where_vars = select::pre_group_vars(&patterns, post_values.as_ref())
+                    .into_iter()
+                    .chain(
+                        lowered_modifiers
+                            .pre_group_binds
+                            .iter()
+                            .flat_map(Pattern::produced_vars),
+                    )
+                    .collect();
+                let extends = self.lower_select_extends(
+                    &select_query.select,
+                    &mut lowered_modifiers,
+                    where_vars,
+                )?;
+                patterns.extend(extends.pre);
+                patterns.extend(std::mem::take(&mut lowered_modifiers.pre_group_binds));
+                let groups = lowered_modifiers.groups();
+                let star_projection =
+                    (matches!(select_query.select.variables, SelectVariables::Star) && groups)
+                        .then(|| self.grouped_star_projection(&lowered_modifiers.group_by));
                 let BaseModifiers {
                     limit,
                     offset,
@@ -555,19 +570,14 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
-                // SELECT post-binds (`select_binds.post`, plus any compound-
-                // aggregate post-binds produced by `lower_solution_modifiers`)
-                // ride inside the aggregation stage. Expression-based ORDER BY
-                // binds ride on `Query.order_binds` (a dedicated post-grouping
-                // stage in the operator tree) so they evaluate uniformly with
-                // or without grouping — including dedup-only GROUP BY, which
-                // has no aggregation stage to carry binds.
-                let mut post_binds = select_binds.post;
-                post_binds.extend(lowered_modifiers.select_post_binds);
+                // SELECT Extends ride in the grouping phase. Expression-based
+                // ORDER BY binds ride on `Query.order_binds` (a dedicated
+                // post-grouping stage in the operator tree) so they evaluate
+                // uniformly with or without grouping.
                 let grouping = Grouping::assemble(
                     lowered_modifiers.group_by,
                     lowered_modifiers.aggregates,
-                    post_binds,
+                    extends.extends,
                     lowered_modifiers.having,
                 );
 
@@ -581,11 +591,18 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // `SELECT ?x` is a sequence of single-column rows, not a list
                 // of bare values. Projection shape is `Tuple` (the default of
                 // the `select`/`select_one` helpers).
-                let output = match (&select_query.select.variables, distinct) {
-                    (SelectVariables::Star, true) => QueryOutput::wildcard_distinct(),
-                    (SelectVariables::Star, false) => QueryOutput::wildcard(),
-                    (_, true) => QueryOutput::select_distinct(select),
-                    (_, false) => QueryOutput::select_all(select),
+                //
+                // `SELECT *` of a grouping level (an aggregate only in HAVING or
+                // ORDER BY) projects its GROUP BY keys — none, for implicit
+                // grouping (§18.2.4.4) — rather than every WHERE variable, which
+                // after grouping would be per-group lists.
+                let output = match (&select_query.select.variables, distinct, star_projection) {
+                    (SelectVariables::Star, true, Some(keys)) => QueryOutput::select_distinct(keys),
+                    (SelectVariables::Star, false, Some(keys)) => QueryOutput::select_all(keys),
+                    (SelectVariables::Star, true, None) => QueryOutput::wildcard_distinct(),
+                    (SelectVariables::Star, false, None) => QueryOutput::wildcard(),
+                    (_, true, _) => QueryOutput::select_distinct(select),
+                    (_, false, _) => QueryOutput::select_all(select),
                 };
 
                 Ok(Query {
@@ -2701,6 +2718,167 @@ mod tests {
             |p| matches!(p, Pattern::Bind { var, .. } if vars.name(*var).starts_with("?__group_expr_")),
         );
         assert!(!has_synthetic, "no synthetic group var should be generated");
+    }
+
+    /// Whether `var` is bound by a WHERE `BIND` of `query`.
+    fn is_where_bind(query: &Query, var: VarId) -> bool {
+        query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { var: v, .. } if *v == var))
+    }
+
+    /// The per-group Extend outputs of `query`, in evaluation order.
+    fn extend_vars(query: &Query) -> Vec<VarId> {
+        query
+            .grouping
+            .iter()
+            .flat_map(Grouping::binds)
+            .map(|(v, _)| *v)
+            .collect()
+    }
+
+    #[test]
+    fn grouped_select_expression_is_a_per_group_extend() {
+        // #1978: an aggregate-free SELECT expression over a GROUP BY key is an
+        // Extend after aggregation (SPARQL 1.1 §18.2.4.4), not a WHERE bind that
+        // survives grouping as a per-group list.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?seg) (COUNT(?e) AS ?n)
+             WHERE { ?e ex:area ?a } GROUP BY ?a",
+        )
+        .unwrap();
+        let seg = vars.get("?seg").expect("?seg registered");
+        assert!(!is_where_bind(&query, seg), "must not be a WHERE bind");
+        assert_eq!(extend_vars(&query), vec![seg]);
+    }
+
+    #[test]
+    fn grouped_select_expression_is_an_extend_for_every_grouping_form() {
+        for (label, sparql) in [
+            (
+                "implicit via a SELECT aggregate",
+                "SELECT (\"x\" AS ?c) (COUNT(*) AS ?n) WHERE { ?e ex:area ?a }",
+            ),
+            (
+                "implicit via a HAVING-only aggregate",
+                "SELECT (\"x\" AS ?c) WHERE { ?e ex:area ?a } HAVING (COUNT(*) > 1)",
+            ),
+            (
+                "implicit via an ORDER BY-only aggregate",
+                "SELECT (\"x\" AS ?c) WHERE { ?e ex:area ?a } ORDER BY DESC(COUNT(?e))",
+            ),
+            (
+                "dedup-only GROUP BY",
+                "SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?c) \
+                 WHERE { ?e ex:area ?a } GROUP BY ?a",
+            ),
+        ] {
+            let (query, vars) =
+                lower_query_with_vars(&format!("PREFIX ex: <http://example.org/>\n{sparql}"))
+                    .unwrap();
+            let c = vars.get("?c").expect("?c registered");
+            assert!(
+                !is_where_bind(&query, c),
+                "{label}: must not be a WHERE bind"
+            );
+            assert_eq!(extend_vars(&query), vec![c], "{label}");
+        }
+    }
+
+    #[test]
+    fn ungrouped_select_expression_stays_a_where_bind() {
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x (SHA512(?x) AS ?h) WHERE { ?s ex:p ?x }",
+        )
+        .unwrap();
+        let h = vars.get("?h").expect("?h registered");
+        assert!(is_where_bind(&query, h));
+        assert!(query.grouping.is_none());
+    }
+
+    #[test]
+    fn grouped_select_extends_run_in_select_order() {
+        // A compound-aggregate item and an alias chain: one list, SELECT order,
+        // so ?t (reading ?np1) runs after ?np1 in both shapes.
+        for sparql in [
+            "SELECT ?a (COUNT(?e) AS ?n) ((COUNT(?e) + 1) AS ?np1) ((?np1 * 10) AS ?t) \
+             WHERE { ?e ex:area ?a } GROUP BY ?a",
+            "SELECT ?a (COUNT(?e) AS ?n) ((?n + 1) AS ?np1) ((?np1 * 10) AS ?t) \
+             WHERE { ?e ex:area ?a } GROUP BY ?a",
+        ] {
+            let (query, vars) =
+                lower_query_with_vars(&format!("PREFIX ex: <http://example.org/>\n{sparql}"))
+                    .unwrap();
+            let np1 = vars.get("?np1").expect("?np1");
+            let t = vars.get("?t").expect("?t");
+            assert_eq!(extend_vars(&query), vec![np1, t], "{sparql}");
+            assert!(!is_where_bind(&query, t) && !is_where_bind(&query, np1));
+        }
+    }
+
+    #[test]
+    fn select_star_under_implicit_grouping_projects_nothing() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ?e ex:area ?a } HAVING (COUNT(*) > 1)",
+        )
+        .unwrap();
+        assert_eq!(query.output.projected_vars(), Some(Vec::new()));
+        assert!(!query.output.is_wildcard());
+
+        // An ungrouped `SELECT *` keeps the wildcard.
+        let query =
+            lower_query("PREFIX ex: <http://example.org/> SELECT * WHERE { ?e ex:area ?a }")
+                .unwrap();
+        assert!(query.output.is_wildcard());
+    }
+
+    #[test]
+    fn grouped_sub_select_expression_is_a_per_group_extend() {
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?seg ?n WHERE {
+               { SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?seg) (COUNT(?e) AS ?n)
+                 WHERE { ?e ex:area ?a } GROUP BY ?a }
+             }",
+        )
+        .unwrap();
+        let seg = vars.get("?seg").expect("?seg");
+        let sq = query
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Subquery(sq) => Some(sq),
+                _ => None,
+            })
+            .expect("sub-SELECT");
+        assert!(
+            !sq.patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == seg)),
+            "must not be a WHERE bind of the sub-SELECT"
+        );
+        let binds: Vec<VarId> = sq
+            .grouping
+            .iter()
+            .flat_map(Grouping::binds)
+            .map(|(v, _)| *v)
+            .collect();
+        assert_eq!(binds, vec![seg]);
+
+        // `SELECT *` of an implicitly grouped sub-SELECT exports nothing.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?a WHERE { { SELECT * WHERE { ?e ex:area ?a } HAVING (COUNT(*) > 1) } }",
+        )
+        .unwrap();
+        let Some(Pattern::Subquery(sq)) = query.patterns.first() else {
+            panic!("sub-SELECT expected: {:?}", query.patterns);
+        };
+        assert!(sq.select.is_empty(), "{:?}", sq.select);
     }
 
     #[test]

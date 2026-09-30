@@ -12,29 +12,29 @@ use crate::ast::query::{
 use crate::span::SourceSpan;
 
 use fluree_db_query::ir::AggregateSpec;
-use fluree_db_query::ir::{Expression, FlakeValue, Grouping, Pattern, SubqueryPattern};
+use fluree_db_query::ir::{
+    Expression, FlakeValue, Grouping, Pattern, SelectExprPlacement, SelectExprPlacer,
+    SubqueryPattern,
+};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::sort::{SortDirection, SortSpec};
 use fluree_db_query::var_registry::VarId;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use super::{LoweringContext, Result};
 
-/// Result of lowering SELECT expression binds.
-pub(super) struct SelectBinds {
-    /// BIND patterns to apply before grouping/aggregation
+/// The SELECT expressions of one query level, placed.
+pub(super) struct SelectExtends {
+    /// WHERE `BIND`s, appended to the level's patterns: every SELECT
+    /// expression of a level that does not group, and a grouping level's
+    /// expression whose alias is itself a group key.
     pub pre: Vec<Pattern>,
-    /// Post-aggregation binds (var, expr) to apply after GROUP BY.
-    ///
-    /// Includes binds whose expression references an aggregate **alias**
-    /// (e.g. `(?count + 1 AS ?bumped)`); compound-aggregate SELECT items —
-    /// expressions like `((MAX(?u) - MIN(?u)) AS ?spread)` whose aggregates
-    /// must first be hoisted into the alias map — are produced later by
-    /// [`Self::lower_solution_modifiers`] and appended onto this list by the
-    /// caller.
-    pub post: Vec<(VarId, Expression)>,
+    /// Per-group `Extend`s (SPARQL 1.1 §18.2.4.4), in SELECT order: every
+    /// other SELECT expression of a grouping level, compound aggregate items
+    /// included. They run after HAVING, so HAVING cannot see them
+    /// (§18.2.4.2).
+    pub extends: Vec<(VarId, Expression)>,
 }
 
 /// LIMIT / OFFSET / ORDER BY values produced by `lower_base_modifiers`.
@@ -78,11 +78,33 @@ pub(super) struct LoweredModifiers {
     /// Pre-GROUP-BY BIND patterns for expression-based GROUP BY conditions.
     /// These must be injected into the WHERE pattern list before query building.
     pub pre_group_binds: Vec<Pattern>,
-    /// Post-aggregation binds produced by compound-aggregate SELECT items
-    /// (e.g. `((MAX(?u) - MIN(?u)) AS ?spread)`). Each inner aggregate has
-    /// been hoisted into `aggregates`; the bind references those synthetic
-    /// output vars. The caller appends these onto `SelectBinds::post`.
-    pub select_post_binds: Vec<(VarId, Expression)>,
+    /// Compound-aggregate SELECT items (e.g. `((MAX(?u) - MIN(?u)) AS
+    /// ?spread)`), keyed by alias. Each inner aggregate has been hoisted into
+    /// `aggregates`, and the expression reads those synthetic output vars.
+    /// [`LoweringContext::lower_select_extends`] places them in SELECT order.
+    pub compound_select_exprs: HashMap<VarId, Expression>,
+}
+
+impl LoweredModifiers {
+    /// Whether the level groups (SPARQL 1.1 §18.2.4.1): a GROUP BY, or an
+    /// aggregate anywhere in SELECT, HAVING or ORDER BY. Every aggregate,
+    /// wherever it was written, has been hoisted into `aggregates` by now.
+    pub fn groups(&self) -> bool {
+        !self.group_by.is_empty() || !self.aggregates.is_empty()
+    }
+}
+
+/// The variables a level's pre-group pipeline binds: everything its patterns
+/// produce, plus a trailing VALUES clause joined before grouping.
+pub(super) fn pre_group_vars(
+    patterns: &[Pattern],
+    post_values: Option<&Pattern>,
+) -> HashSet<VarId> {
+    patterns
+        .iter()
+        .chain(post_values)
+        .flat_map(Pattern::produced_vars)
+        .collect()
 }
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
@@ -135,65 +157,76 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
     }
 
-    pub(super) fn collect_aggregate_alias_names(&self, clause: &SelectClause) -> HashSet<Arc<str>> {
-        let mut names = HashSet::new();
-        if let SelectVariables::Explicit(vars) = &clause.variables {
-            for var in vars {
-                if let SelectVariable::Expr { expr, alias, .. } = var {
-                    // Both bare aggregates (`MAX(?u) AS ?hi`) and compound
-                    // expressions that contain aggregates (`MAX(?u) - MIN(?u)
-                    // AS ?spread`) bind their alias only after the aggregation
-                    // stage. Anything depending on that alias must therefore
-                    // ride as a post-aggregation bind.
-                    if self.expr_contains_aggregate(expr) {
-                        names.insert(alias.name.clone());
-                    }
-                }
-            }
-        }
-        names
+    /// `SELECT *` of a grouping level: the user-visible GROUP BY keys
+    /// (§18.2.4.4 restricts the projection to them). Implicit grouping has
+    /// none, so it projects nothing. (An explicit GROUP BY with `SELECT *` is
+    /// a validation error; this is what an unvalidated entry point gets.)
+    pub(super) fn grouped_star_projection(&self, group_by: &[VarId]) -> Vec<VarId> {
+        let visible: HashSet<VarId> = self.user_visible_vars().into_iter().collect();
+        group_by
+            .iter()
+            .copied()
+            .filter(|v| visible.contains(v))
+            .collect()
     }
 
-    /// Lower non-aggregate SELECT expressions to BIND patterns (pre or post aggregation).
-    pub(super) fn lower_select_expression_binds(
+    /// Place the SELECT expressions of one query level, in SELECT order
+    /// (SPARQL 1.1 §18.2.4.4), after its solution modifiers are lowered —
+    /// whether the level groups is read from the lowered keys and aggregates,
+    /// not re-derived from the AST.
+    ///
+    /// A bare aggregate (`(COUNT(?x) AS ?n)`) needs nothing here: its
+    /// `AggregateSpec` binds the alias. A compound aggregate item was lowered
+    /// by [`Self::lower_solution_modifiers`] and always runs per group. Every
+    /// other expression goes where [`SelectExprPlacer`] puts it: in a
+    /// grouping level, per group after HAVING, except an expression whose
+    /// alias is a group key (the `GROUP BY (LCASE(?a))` shortcut), which has
+    /// to exist before grouping.
+    ///
+    /// `where_vars` are the variables the level's pre-group pipeline binds.
+    pub(super) fn lower_select_extends(
         &mut self,
-        clause: &SelectClause,
-        aggregate_aliases: &HashSet<Arc<str>>,
-    ) -> Result<SelectBinds> {
-        let mut pre_binds = Vec::new();
-        let mut post_binds = Vec::new();
-
-        if let SelectVariables::Explicit(vars) = &clause.variables {
-            for var in vars {
-                if let SelectVariable::Expr { expr, alias, .. } = var {
-                    // Bare aggregates (`MAX(?u) AS ?hi`) become AggregateSpecs
-                    // in `extract_aggregates`. Compound expressions that contain
-                    // aggregates (`MAX(?u) - MIN(?u) AS ?spread`) need their
-                    // inner aggregates hoisted before they can be lowered, so
-                    // `lower_solution_modifiers` produces their post-bind once
-                    // the alias map exists. Both are skipped here; the alias
-                    // VarId itself was already registered by `lower_select_clause`.
-                    if self.expr_contains_aggregate(expr) {
-                        continue;
-                    }
-                    let filter_expr = self.lower_expression(expr)?;
-                    let var_id = self.register_var(alias);
-                    if self.expr_references_vars(expr, aggregate_aliases) {
-                        post_binds.push((var_id, filter_expr));
-                    } else {
-                        pre_binds.push(Pattern::Bind {
-                            var: var_id,
-                            expr: filter_expr,
-                        });
-                    }
-                }
+        select: &SelectClause,
+        lowered: &mut LoweredModifiers,
+        where_vars: HashSet<VarId>,
+    ) -> Result<SelectExtends> {
+        let mut pre = Vec::new();
+        let mut extends = Vec::new();
+        let SelectVariables::Explicit(items) = &select.variables else {
+            return Ok(SelectExtends { pre, extends });
+        };
+        let mut placer = if lowered.groups() {
+            SelectExprPlacer::grouped(
+                lowered.group_by.iter().copied(),
+                &lowered.aggregates,
+                where_vars,
+            )
+        } else {
+            SelectExprPlacer::ungrouped()
+        };
+        for item in items {
+            let SelectVariable::Expr { expr, alias, .. } = item else {
+                continue;
+            };
+            if matches!(expr, AstExpression::Aggregate { .. }) {
+                continue;
+            }
+            let var = self.register_var(alias);
+            if let Some(compound) = lowered.compound_select_exprs.remove(&var) {
+                placer.record_post_group(var);
+                extends.push((var, compound));
+                continue;
+            }
+            let lowered_expr = self.lower_expression(expr)?;
+            match placer.place(var, &lowered_expr) {
+                SelectExprPlacement::PostGroup => extends.push((var, lowered_expr)),
+                SelectExprPlacement::PreGroup => pre.push(Pattern::Bind {
+                    var,
+                    expr: lowered_expr,
+                }),
             }
         }
-
-        Ok(SelectBinds {
-            pre: pre_binds,
-            post: post_binds,
-        })
+        Ok(SelectExtends { pre, extends })
     }
 
     /// Lower solution modifiers (DISTINCT, LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING)
@@ -258,9 +291,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let mut hoisted_aggregates: Vec<AggregateSpec> = Vec::new();
 
         // Compound-aggregate SELECT items: hoist their inner aggregates, then
-        // lower each outer expression to a post-aggregation bind referencing
-        // the synthetic alias vars.
-        let mut select_post_binds: Vec<(VarId, Expression)> = Vec::new();
+        // lower each outer expression against the synthetic alias vars. They
+        // are placed, in SELECT order, by `lower_select_extends`.
+        let mut compound_select_exprs: HashMap<VarId, Expression> = HashMap::new();
         if !compound_aggregate_select_items.is_empty() {
             let mut select_pre_binds: Vec<Pattern> = Vec::new();
             for (_, ast_expr) in &compound_aggregate_select_items {
@@ -274,7 +307,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             self.aggregate_aliases = Some(aggregate_aliases.clone());
             for (var_id, ast_expr) in &compound_aggregate_select_items {
                 let lowered = self.lower_expression(ast_expr)?;
-                select_post_binds.push((*var_id, lowered));
+                compound_select_exprs.insert(*var_id, lowered);
             }
             self.aggregate_aliases = None;
             pre_group_binds.extend(select_pre_binds);
@@ -343,7 +376,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             aggregates,
             having,
             pre_group_binds,
-            select_post_binds,
+            compound_select_exprs,
         })
     }
 
@@ -476,8 +509,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ///
     /// Used to recognize when an unaliased `GROUP BY (expr)` groups on an
     /// expression that the SELECT also projects, so both can share one variable.
-    /// The alias vars are already registered by `lower_select_expression_binds`;
-    /// `register_var` returns the existing id.
+    /// The alias vars are already registered by `lower_select_clause`;
+    /// `register_var` returns the existing id. The shared variable is a group
+    /// key, so `lower_select_extends` keeps its expression a WHERE bind.
     fn select_expr_alias_map(&mut self, select: &SelectClause) -> HashMap<String, VarId> {
         let mut map = HashMap::new();
         if let SelectVariables::Explicit(vars) = &select.variables {
@@ -501,8 +535,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// - `GROUP BY ?x`              → variable reference, no BIND needed
     /// - `GROUP BY (?x)`            → parenthesized variable, unwrapped to plain variable
     /// - `GROUP BY (expr AS ?alias)` → desugared to BIND(expr AS ?alias) + GROUP BY ?alias
-    /// - `GROUP BY (expr)` projected as `(expr AS ?k)` → group on ?k (already
-    ///   bound by the SELECT pre-bind), no new BIND
+    /// - `GROUP BY (expr)` projected as `(expr AS ?k)` → group on ?k (bound by
+    ///   the SELECT expression, which stays a WHERE bind because ?k is a
+    ///   key), no new BIND
     /// - `GROUP BY (expr)`          → otherwise, a synthetic `?__group_expr_N` alias
     fn lower_group_condition(
         &mut self,
@@ -532,10 +567,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
                         // Unaliased `GROUP BY (expr)`: if the SELECT projects the
                         // same expression as `(expr AS ?k)`, group on ?k. The
-                        // SELECT pre-bind already computes `?k = expr` in the
-                        // WHERE patterns, so no new BIND is needed and the
-                        // projected variable equals the group value. Otherwise
-                        // synthesize a fresh group var + BIND.
+                        // SELECT expression computes `?k = expr` as a WHERE bind
+                        // (a key's expression stays before grouping), so no new
+                        // BIND is needed and the projected variable equals the
+                        // group value. Otherwise synthesize a fresh group var +
+                        // BIND.
                         let key = Self::expr_key_no_span(expr);
                         if let Some(&alias_var) = select_expr_aliases.get(&key) {
                             return Ok((alias_var, None));
@@ -581,13 +617,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ///
     /// Subqueries have the form: `{ SELECT ?vars WHERE { ... } GROUP BY ?v
     /// HAVING (..) ORDER BY (..) LIMIT n }`. This mirrors the top-level SELECT
-    /// lowering — SELECT-expression binds, GROUP BY / aggregates / HAVING, and
+    /// lowering — SELECT expressions, GROUP BY / aggregates / HAVING, and
     /// expression/aggregate ORDER BY all go through the same shared helpers
-    /// (`lower_select_expression_binds`, `lower_solution_modifiers`) — so a
-    /// subquery inherits exactly the same modifier semantics as a top-level
-    /// query. The resulting `SubqueryPattern` is executed per correlated parent
-    /// row by `SubqueryOperator`, which applies the shared solution-modifier
-    /// tail (`apply_solution_modifiers`).
+    /// (`lower_solution_modifiers`, `lower_select_extends`) — so a subquery
+    /// inherits exactly the same modifier semantics as a top-level query. The
+    /// resulting `SubqueryPattern` is executed per correlated parent row by
+    /// `SubqueryOperator`, which applies the shared solution-modifier tail
+    /// (`apply_solution_modifiers`).
     pub(super) fn lower_subselect(
         &mut self,
         subselect: &SubSelect,
@@ -666,19 +702,36 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
         };
 
-        // SELECT-expression binds: pre-aggregation ones append to WHERE; post-
-        // aggregation ones (referencing an aggregate alias) ride in the grouping.
-        let aggregate_aliases = self.collect_aggregate_alias_names(&select_clause);
-        let select_binds =
-            self.lower_select_expression_binds(&select_clause, &aggregate_aliases)?;
-        patterns.extend(select_binds.pre);
-
         // Solution modifiers (GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET /
         // aggregates) through the same path as a top-level SELECT. This lowers
         // HAVING, hoists inline aggregates from HAVING / ORDER BY, and produces
         // expression-ORDER-BY binds — all previously dropped or rejected here.
-        let lowered = self.lower_solution_modifiers(&subselect.modifiers, &select_clause)?;
-        patterns.extend(lowered.pre_group_binds);
+        let mut lowered = self.lower_solution_modifiers(&subselect.modifiers, &select_clause)?;
+
+        // SELECT expressions, placed once the level's grouping is known: WHERE
+        // binds for an ungrouped level (and a key's expression), per-group
+        // Extends otherwise.
+        let where_vars = pre_group_vars(&patterns, None)
+            .into_iter()
+            .chain(
+                lowered
+                    .pre_group_binds
+                    .iter()
+                    .flat_map(Pattern::produced_vars),
+            )
+            .collect();
+        let extends = self.lower_select_extends(&select_clause, &mut lowered, where_vars)?;
+        patterns.extend(extends.pre);
+        patterns.extend(std::mem::take(&mut lowered.pre_group_binds));
+
+        // `SELECT *` of a grouping level projects its keys; implicit grouping
+        // has none, so the sub-SELECT exports nothing and keeps its row count.
+        let select = if matches!(subselect.variables, SelectVariables::Star) && lowered.groups() {
+            self.grouped_star_projection(&lowered.group_by)
+        } else {
+            select
+        };
+
         let BaseModifiers {
             limit,
             offset,
@@ -689,22 +742,17 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             deferred_order_exprs: _,
         } = lowered.base;
 
-        // Assemble the SubqueryPattern. Post-aggregation SELECT binds ride inside
-        // the grouping's aggregation stage; expression/aggregate ORDER BY binds
-        // ride on `order_binds` (a dedicated post-grouping stage in the shared
-        // modifier tail) so they evaluate uniformly with or without grouping.
-        // Compound-aggregate SELECT post-binds — produced by
-        // `lower_solution_modifiers` after aggregate hoisting — also ride in
-        // the aggregation stage.
-        let mut post_binds = select_binds.post;
-        post_binds.extend(lowered.select_post_binds);
+        // Assemble the SubqueryPattern. SELECT Extends ride in the grouping
+        // phase; expression/aggregate ORDER BY binds ride on `order_binds` (a
+        // dedicated post-grouping stage in the shared modifier tail) so they
+        // evaluate uniformly with or without grouping.
         // SPARQL sub-SELECTs are uncorrelated (§18.2): evaluated independently
         // of the enclosing pattern, then joined.
         let mut sq = SubqueryPattern::new(select, patterns).with_uncorrelated();
         if let Some(grouping) = Grouping::assemble(
             lowered.group_by,
             lowered.aggregates,
-            post_binds,
+            extends.extends,
             lowered.having,
         ) {
             sq = sq.with_grouping(grouping);

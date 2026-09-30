@@ -12,8 +12,7 @@ use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashMap;
 
 use super::{LowerError, LoweringContext, Result};
 
@@ -375,41 +374,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Ok(())
             }
             _ => Ok(()),
-        }
-    }
-
-    pub(super) fn expr_references_vars(&self, expr: &Expression, vars: &HashSet<Arc<str>>) -> bool {
-        match expr.unwrap_bracketed() {
-            Expression::Var(var) => vars.contains(&var.name),
-            Expression::Literal(_) | Expression::Iri(_) => false,
-            Expression::Unary { operand, .. } => self.expr_references_vars(operand, vars),
-            Expression::Binary { left, right, .. } => {
-                self.expr_references_vars(left, vars) || self.expr_references_vars(right, vars)
-            }
-            Expression::FunctionCall { args, .. } => {
-                args.iter().any(|a| self.expr_references_vars(a, vars))
-            }
-            Expression::If {
-                condition,
-                then_expr,
-                else_expr,
-                ..
-            } => {
-                self.expr_references_vars(condition, vars)
-                    || self.expr_references_vars(then_expr, vars)
-                    || self.expr_references_vars(else_expr, vars)
-            }
-            Expression::Coalesce { args, .. } => {
-                args.iter().any(|a| self.expr_references_vars(a, vars))
-            }
-            Expression::In { expr, list, .. } => {
-                self.expr_references_vars(expr, vars)
-                    || list.iter().any(|a| self.expr_references_vars(a, vars))
-            }
-            Expression::Exists { .. }
-            | Expression::NotExists { .. }
-            | Expression::Aggregate { .. } => false,
-            Expression::Bracketed { inner, .. } => self.expr_references_vars(inner, vars),
         }
     }
 
