@@ -473,6 +473,25 @@ async fn jsonld_ask_refuses_grouping() {
     }
 }
 
+/// JSON-LD `having` has no EXISTS form (unlike a `filter`): one is refused at
+/// parse time, never evaluated as false. The SPARQL twin
+/// (`having_exists_is_evaluated_per_group`) evaluates it per group.
+#[tokio::test]
+async fn jsonld_having_refuses_exists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/having-exists:main").await;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "(as (count ?e) ?n)"],
+        "where": {"@id": "?e", "ex:area": "?a"},
+        "groupBy": ["?a"],
+        "having": ["exists", {"@id": "?x", "ex:area": "?a"}]
+    });
+    support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect_err("EXISTS in a JSON-LD having");
+}
+
 /// Must-not-change guards: grouped JSON-LD shapes that fluree/solo runs today
 /// (keys, aggregates and expressions of aggregates only). Their answers are
 /// unchanged by the grouped-projection work.

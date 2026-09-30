@@ -2721,7 +2721,11 @@ fn build_operator_tree_inner(
                 crate::r2rml::sql_lane::SqlAggregateOperator::new(plan, fallback),
             );
             if let Some(having) = query.grouping.as_ref().and_then(|g| g.having()) {
-                op = Box::new(crate::having::HavingOperator::new(op, having.clone()));
+                op = Box::new(crate::having::HavingOperator::new(
+                    op,
+                    having.clone(),
+                    *planning,
+                ));
             }
             if !query.ordering.is_empty() {
                 op = Box::new(crate::sort::SortOperator::new(op, query.ordering.clone()));
@@ -2763,7 +2767,11 @@ fn build_operator_tree_inner(
             // HAVING expression sees only variables in the fused output — no
             // output trim is needed.
             if let Some(having) = query.grouping.as_ref().and_then(|g| g.having()) {
-                op = Box::new(crate::having::HavingOperator::new(op, having.clone()));
+                op = Box::new(crate::having::HavingOperator::new(
+                    op,
+                    having.clone(),
+                    *planning,
+                ));
             }
             // The fused operator emits the final grouped result; apply ORDER BY /
             // OFFSET / LIMIT on top with the engine's own operators (exact
@@ -3724,7 +3732,7 @@ pub(crate) fn apply_solution_modifiers(
     // HAVING (filter on aggregated results)
     if let Some(expr) = having_expr {
         operator = Box::new(
-            HavingOperator::new(operator, expr.clone()).with_out_schema(
+            HavingOperator::new(operator, expr.clone(), *planning).with_out_schema(
                 variable_deps
                     .as_ref()
                     .map(|d| d.required_having_vars.as_slice()),
