@@ -411,10 +411,6 @@ transactions and bulk import keep it, as RDF allows: the literal is stored with
 its text and its datatype and reads back exactly as written, but it is not a
 date or a number, so it never equals one.
 
-A valid literal is stored as its value whichever surface writes it:
-`"2024-01-15"^^xsd:date` from SPARQL, JSON-LD, or Turtle is the same term, and
-a query or a retraction through any surface matches it.
-
 ### Type Casting in Queries
 
 SPARQL provides functions for type conversion:

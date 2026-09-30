@@ -780,4 +780,29 @@ mod tests {
             );
         }
     }
+
+    /// SPARQL UPDATE also committed `geo:wktLiteral` POINTs as strings. They
+    /// read back as the point every other surface commits.
+    #[test]
+    fn wkt_point_string_reads_as_geo_point() {
+        use fluree_vocab::{geo, geo_names, namespaces};
+        let point = "POINT(2.35 48.85)";
+        let committed = crate::coerce::coerce_string_value(point, geo::WKT_LITERAL).unwrap();
+        assert!(matches!(committed, FlakeValue::GeoPoint(_)));
+        assert_eq!(
+            decode_string_under(point, namespaces::OGC_GEO, geo_names::WKT_LITERAL),
+            committed
+        );
+        for other in [
+            "POLYGON((0 0, 1 0, 1 1, 0 0))",
+            "POINT(0 91)",
+            "POINT EMPTY",
+        ] {
+            assert_eq!(
+                decode_string_under(other, namespaces::OGC_GEO, geo_names::WKT_LITERAL),
+                FlakeValue::String(other.to_string()),
+                "{other}"
+            );
+        }
+    }
 }

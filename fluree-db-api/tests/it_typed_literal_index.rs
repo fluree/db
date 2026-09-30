@@ -370,6 +370,28 @@ async fn ill_typed_literals_keep_their_lexical_form() {
         expected,
         "full rebuild"
     );
+
+    // SPARQL rejects the literal as a constant, so a delete binds it instead.
+    let ledger = sparql_update(
+        &fluree,
+        indexed,
+        &format!(
+            "DELETE {{ ?s <{EX}date> ?o }} WHERE {{ ?s <{EX}date> ?o FILTER(STR(?o) = \"1990-00-00\") }}"
+        ),
+    )
+    .await;
+    let remaining = expected[1..].to_vec();
+    assert_eq!(
+        objects_of(&fluree, &ledger, "a").await,
+        remaining,
+        "delete by bound variable, over an index"
+    );
+    let indexed = reindexed(&fluree, ledger_id).await;
+    assert_eq!(
+        objects_of(&fluree, &indexed, "a").await,
+        remaining,
+        "delete by bound variable, full rebuild"
+    );
 }
 
 #[tokio::test]
@@ -377,18 +399,20 @@ async fn sparql_update_rejects_ill_typed_literal() {
     let fluree = memory_fluree();
     let ledger_id = "typed-literal-index:reject";
     fluree.create_ledger(ledger_id).await.expect("create");
-    let sparql = format!("INSERT DATA {{ <{EX}a> <{EX}date> \"1990-00-00\"^^<{XSD}date> }}");
-    let err = fluree
-        .graph(ledger_id)
-        .transact()
-        .sparql_update(&sparql)
-        .commit()
-        .await
-        .expect_err("an ill-typed xsd:date must not commit");
-    assert!(
-        err.to_string().contains("xsd:date"),
-        "error should name the datatype: {err}"
-    );
+    for op in ["INSERT DATA", "DELETE DATA"] {
+        let sparql = format!("{op} {{ <{EX}a> <{EX}date> \"1990-00-00\"^^<{XSD}date> }}");
+        let err = fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(&sparql)
+            .commit()
+            .await
+            .expect_err("an ill-typed xsd:date must not lower");
+        assert!(
+            err.to_string().contains("xsd:date"),
+            "{op}: error should name the datatype: {err}"
+        );
+    }
 }
 
 /// Commits written before the fix hold these literals as strings. They read
@@ -439,4 +463,50 @@ async fn commits_holding_string_typed_literals_read_as_typed_values() {
             "reindexed: constant {literal:?} matches the repaired value"
         );
     }
+}
+
+/// SPARQL UPDATE also committed `geo:wktLiteral` POINTs as strings. SPARQL now
+/// lowers the same literal to a geo point, so the legacy string must read back
+/// as one for a SPARQL `DELETE DATA` to retract it.
+#[tokio::test]
+async fn commits_holding_string_wkt_points_retract_through_sparql() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_string_lossy().to_string();
+    let ledger_id = "typed-literal-index:legacy-wkt";
+    let point = "POINT(2.35 48.85)";
+    let insert = format!(
+        "INSERT DATA {{ <{EX}paris> <{EX}loc> \"{point}\"^^<{}> }}",
+        fluree_vocab::geo::WKT_LITERAL
+    );
+
+    {
+        let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+        let ledger = fluree.create_ledger(ledger_id).await.expect("create");
+        let mut txn = lower_sparql_update(&ledger, &insert);
+        // The object shape SPARQL UPDATE committed before the fix.
+        txn.insert_templates[0].object = TemplateTerm::Value(FlakeValue::String(point.into()));
+        commit_txn(&fluree, ledger, txn).await;
+    }
+
+    let fluree = FlureeBuilder::file(path).build().expect("reopen");
+    let ledger = fluree.ledger(ledger_id).await.expect("load from commits");
+    assert_eq!(objects_of(&fluree, &ledger, "paris").await.len(), 1);
+
+    let ledger = sparql_update(
+        &fluree,
+        ledger,
+        &insert.replacen("INSERT DATA", "DELETE DATA", 1),
+    )
+    .await;
+    assert_eq!(
+        objects_of(&fluree, &ledger, "paris").await,
+        Vec::<Row>::new(),
+        "novelty: the SPARQL delete retracts the legacy point"
+    );
+    let indexed = reindexed(&fluree, ledger_id).await;
+    assert_eq!(
+        objects_of(&fluree, &indexed, "paris").await,
+        Vec::<Row>::new(),
+        "reindexed: the SPARQL delete retracts the legacy point"
+    );
 }

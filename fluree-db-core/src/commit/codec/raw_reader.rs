@@ -26,7 +26,7 @@ use super::varint::{decode_varint, read_exact, read_u8, zigzag_decode};
 use super::CodecEnvelope;
 use crate::FlakeValue;
 use fluree_vocab::datatype::KnownDatatype;
-use fluree_vocab::{namespaces, xsd_names};
+use fluree_vocab::{geo_names, namespaces, xsd_names};
 
 // ============================================================================
 // CommitOps
@@ -452,13 +452,15 @@ fn decode_raw_op<'a>(
     })
 }
 
-/// Read a string object under a typed XSD datatype as that datatype's value.
+/// Read a string object under a typed XSD datatype as that datatype's value,
+/// and a `geo:wktLiteral` POINT as a geo point.
 ///
 /// SPARQL UPDATE used to commit well-typed literals such as
 /// `"2026-09-08"^^xsd:date` as plain strings (#1987), while every other
 /// surface commits the parsed value. Retagging on read gives those commits the
 /// same fact identity, index encoding and query semantics. A lexical that does
-/// not parse as its datatype is an ill-typed literal and stays a string.
+/// not parse as its datatype is an ill-typed literal and stays a string, as
+/// does WKT other than a POINT.
 pub(super) fn retype_string_literal<'a>(
     raw: RawObject<'a>,
     dt_ns_code: u16,
@@ -467,6 +469,16 @@ pub(super) fn retype_string_literal<'a>(
     let RawObject::Str(lexical) = raw else {
         return raw;
     };
+    if dt_ns_code == namespaces::OGC_GEO && dt_name == geo_names::WKT_LITERAL {
+        // Mirrors the wktLiteral arm of `coerce_string_value`, without its
+        // allocation for non-POINT geometries.
+        return match crate::geo::try_extract_point(lexical) {
+            Some((lat, lng)) if crate::GeoPointBits::new(lat, lng).is_some() => {
+                RawObject::GeoPoint { lat, lng }
+            }
+            _ => raw,
+        };
+    }
     if dt_ns_code != namespaces::XSD || xsd_names::is_string_like_name(dt_name) {
         return raw;
     }

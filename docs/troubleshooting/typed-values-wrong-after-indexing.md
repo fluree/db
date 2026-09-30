@@ -17,6 +17,9 @@ fixed version rebuilds it.
   other `xsd:g*` types, `xsd:dayTimeDuration`, `xsd:yearMonthDuration`,
   `xsd:float`, or an integer subtype other than `xsd:integer` (`xsd:long`,
   `xsd:int`, `xsd:short`, `xsd:unsignedInt`, …).
+- **`geo:wktLiteral` POINTs written through SPARQL UPDATE.** These read back
+  with the right text, but are stored as text rather than as points, so they
+  do not match the same point written through JSON-LD or Turtle.
 - **Turtle literals whose text is not a value of their datatype**, such as
   `"1990-00-00"^^xsd:date` or `"abc"^^xsd:integer`, whether transacted or
   bulk-imported.
@@ -58,15 +61,38 @@ curl -X POST https://<fluree-server>/v1/fluree/reindex \
   -d '{"ledger": "mydb:main"}'
 ```
 
+An application that embeds `fluree-db-api` instead of running the server or
+CLI calls `Fluree::reindex` for each ledger after upgrading:
+
+```rust
+fluree.reindex("mydb:main", ReindexOptions::default()).await?;
+```
+
 An index that already misreads the values keeps misreading them until it is
 rebuilt; incremental index builds do not rewrite it. A fixed version reads the
 committed SPARQL values as the typed values they denote, so the reindex
 restores them, and afterwards they match query constants and retract through
 either surface like values written as JSON-LD. Literals that are not values of
-their datatype keep their text and datatype.
+their datatype keep their text and datatype. SPARQL-written
+`geo:wktLiteral` points read back as points, as they do from every other
+surface.
 
 A ledger that has never been indexed needs no reindex: once upgraded, its
 values read correctly.
+
+## What changes on upgrade
+
+Two effects appear as soon as a fixed version loads the ledger:
+
+- **Until the reindex, a delete of an affected value that is already indexed
+  does not take effect.** The delete names the typed value, and the old index
+  holds the value under a different key. The commit succeeds and the reindex
+  applies it.
+- **A delete that removed nothing before the upgrade can take effect.** Before
+  the fix, a `DELETE DATA` sent through one surface for a value written through
+  the other committed without removing it. A fixed version reads that commit as
+  naming the same value, so once the ledger is loaded from its commits, or
+  reindexed, the value is gone with no new write.
 
 ## Related documentation
 
