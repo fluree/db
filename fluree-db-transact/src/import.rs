@@ -662,7 +662,7 @@ mod inner {
                                 list_index: None,
                                 t: new_t,
                             },
-                        );
+                        )?;
                     }
 
                     let meta = lang.as_deref().map(FlakeMeta::with_lang);
@@ -724,7 +724,7 @@ mod inner {
                                 list_index: None,
                                 t: new_t,
                             },
-                        );
+                        )?;
                     }
                     writer.push_flake(&flake).map_err(|e| {
                         TransactError::Parse(format!("failed to encode reifier bundle flake: {e}"))

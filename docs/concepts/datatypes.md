@@ -179,7 +179,7 @@ Beyond XSD, Fluree supports RDF-specific datatypes:
 
 **rdf:langString** represents strings with language tags. This is distinct from plain strings and enables language-aware queries.
 
-> **Matching a string literal in a query.** `"bob"`, `"bob"@en` and `"bob"@fr` are three different RDF terms. In SPARQL a constant object matches only its own term: `?s ex:name "bob"@en` returns just the English value, `?s ex:name "bob"` (an `xsd:string`) does not match tagged values, and a variable bound to a string joins only against its own term — the same language tag, or the same datatype, which holds for `xsd:anyURI`, `xsd:token` and customer-defined datatypes exactly as it does for `xsd:string`. In a JSON-LD query, `{"@value": "bob", "@language": "en"}` and `{"@value": "bob", "@type": "xsd:string"}` are likewise exact, while a bare JSON string **as a constant object** (`"ex:name": "bob"`) matches the lexical value under any string datatype or language tag. That leniency is specific to the constant-object position: the same bare string in a `values` cell is an `xsd:string` term and matches only `xsd:string` rows. An explicitly typed literal is exact for its datatype in both surfaces: `"25"^^xsd:int` matches `xsd:int` rows only, not the same number stored as `xsd:long`. Bare numeric literals (`25`) are the one lenient form — they match the value under any numeric subtype. Language tags are case-insensitive (BCP 47) and are stored and compared in lowercase: `"chat"@FR` is written, matched, and returned by `LANG()` as `fr`.
+> **Matching a string literal in a query.** `"bob"`, `"bob"@en` and `"bob"@fr` are three different RDF terms. In SPARQL a constant object matches only its own term: `?s ex:name "bob"@en` returns just the English value, `?s ex:name "bob"` (an `xsd:string`) does not match tagged values, and a variable bound to a string joins only against its own term — the same language tag, or the same datatype, which holds for `xsd:anyURI`, `xsd:token` and customer-defined datatypes exactly as it does for `xsd:string`. In a JSON-LD query, `{"@value": "bob", "@language": "en"}` and `{"@value": "bob", "@type": "xsd:string"}` are likewise exact, while a bare JSON string **as a constant object** (`"ex:name": "bob"`) matches the lexical value under any string datatype or language tag. That leniency is specific to the constant-object position: the same bare string in a `values` cell is an `xsd:string` term and matches only `xsd:string` rows. An explicitly typed literal is exact for its datatype in both surfaces: `"25"^^xsd:int` (or `{"@value": "25", "@type": "xsd:int"}`) matches `xsd:int` rows only, not the same number stored as `xsd:long`, and `"25"^^xsd:integer` written out matches `xsd:integer` rows only. Bare numeric literals (`25`, `25.0`, and a JSON number in a JSON-LD query) are the one lenient form — they match an equal value under any numeric datatype, so `25` finds `xsd:integer`, `xsd:long`, `xsd:int` and `xsd:double` values alike. Language tags are case-insensitive (BCP 47) and are stored and compared in lowercase: `"chat"@FR` is written, matched, and returned by `LANG()` as `fr`.
 
 > **Annotating literal values.** Any literal — plain, typed, or language-tagged — can carry statement-level metadata (source, confidence, timestamp) via an edge annotation. Because a JSON scalar has no room for sibling keys, an annotated literal must be written in value-object form (`@value` plus `@annotation`); language-tagged annotations are language-pinned, so `"chat"@fr` and `"chat"@en` annotate independently. See [Edge annotations → Annotating literal-valued edges](edge-annotations.md#annotating-literal-valued-edges).
 
@@ -317,6 +317,66 @@ Without this type annotation, strings are stored as plain `xsd:string` values an
 
 See [Inline Fulltext Search](../indexing-and-search/fulltext.md) for complete documentation.
 
+## Custom Datatypes
+
+Any IRI can serve as a datatype. A literal with a datatype Fluree does not
+recognize is stored with that datatype and returned exactly as written.
+
+```json
+{
+  "@context": {"unit": "http://example.org/unit/"},
+  "@id": "ex:room1",
+  "ex:area": {"@value": "42.5", "@type": "unit:SquareMetre"}
+}
+```
+
+In Turtle and SPARQL, use the `^^` syntax: `"42.5"^^unit:SquareMetre`.
+
+### Datatype Limit
+
+A ledger holds at most 16,369 distinct datatypes, plus 15 reserved ones that
+never count toward the limit. The reserved datatypes are `@id`,
+`xsd:string`, `xsd:boolean`, `xsd:integer`, `xsd:long`, `xsd:decimal`,
+`xsd:double`, `xsd:float`, `xsd:dateTime`, `xsd:date`, `xsd:time`,
+`rdf:langString`, `rdf:JSON`, `@vector`, and `@fulltext`. Every other
+datatype counts, including other XSD types such as `xsd:int` and
+`xsd:anyURI`.
+
+A datatype counts from the first write that uses it. It still counts after
+its data is retracted, because the index never releases a datatype's ID.
+
+A write that would pass the limit is refused, and the ledger is left
+unchanged:
+
+- Transactions and SPARQL updates fail with HTTP 422 and
+  `err:db/DatatypeLimitExceeded`. See [Common Errors](../troubleshooting/common-errors.md#datatype_limit_exceeded).
+- Pushed commits are refused with the same error.
+- A bulk import (`fluree create --from`) fails with a "datatype limit
+  exceeded" error.
+
+#### Upgrading and Downgrading
+
+Fluree 4.2.1 and earlier cannot index a ledger that holds more than 241
+non-reserved datatypes. Those releases still accept writes past that point,
+so such a ledger may already exist. Later releases index it with no
+migration.
+
+Rolling back to 4.2.1 or earlier affects any ledger that holds more than 241
+non-reserved datatypes. The older release can read the ledger's existing
+index, but its index builds can fail. When they do, new data stays in
+novelty, where queries are slower, and writes are refused once novelty
+reaches its size limit. Moving the ledger back to a newer release clears
+both.
+
+Vocabularies of units or currencies can define hundreds of datatypes. If
+data needs more distinct datatypes than the limit allows, record the unit
+in its own property instead of in the datatype:
+
+```turtle
+ex:room1 ex:area "42.5"^^xsd:decimal ;
+         ex:areaUnit unit:SquareMetre .
+```
+
 ## Type Coercion and Compatibility
 
 ### Automatic Type Promotion
@@ -341,6 +401,15 @@ When a filter compares values of incompatible types (e.g., a number and a string
 - **Ordering** (`<`, `<=`, `>`, `>=`) raises an error — ordering between incompatible types is undefined
 
 Numeric types (long, double, bigint, decimal) are mutually comparable via automatic promotion, so cross-numeric comparisons work as expected. Similarly, temporal types can be compared with string representations that parse to the same temporal type.
+
+### Text That Is Not a Value of Its Datatype
+
+A literal such as `"2024-02-30"^^xsd:date` or `"300"^^xsd:byte` names a
+built-in datatype but is not one of its values. JSON-LD transactions and
+SPARQL UPDATE reject it, naming the datatype in the error. Turtle
+transactions and bulk import keep it, as RDF allows: the literal is stored with
+its text and its datatype and reads back exactly as written, but it is not a
+date or a number, so it never equals one.
 
 ### Type Casting in Queries
 
@@ -369,7 +438,8 @@ WHERE {
    - String types support text search
 
 3. **Standards Alignment**: Use standard datatypes where possible
-   - Prefer XSD types over custom types
+   - Prefer XSD types over custom types; a ledger has a
+     [limit on distinct datatypes](#datatype-limit)
    - Use established vocabularies with well-defined ranges
 
 ### Type Consistency

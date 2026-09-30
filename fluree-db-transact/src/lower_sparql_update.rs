@@ -99,6 +99,10 @@ pub enum LowerError {
         context: &'static str,
         span: SourceSpan,
     },
+
+    /// Typed literal whose lexical form is not a value of its datatype
+    #[error("{message}")]
+    InvalidLiteral { message: String, span: SourceSpan },
 }
 
 /// Counter for generating anonymous blank node labels.
@@ -1981,7 +1985,7 @@ fn literal_to_template(
         SparqlLiteralValue::Typed { value, datatype } => {
             let dt_iri = expand_iri(datatype, prologue)?;
             let dt_sid = ns.sid_for_iri(&dt_iri);
-            let coerced = coerce_typed_flake_value(value, &dt_iri);
+            let coerced = coerce_typed_flake_value(value, &dt_iri, lit.span)?;
             Ok(LiteralResult {
                 term: TemplateTerm::Value(coerced),
                 dtc: Some(DatatypeConstraint::Explicit(dt_sid)),
@@ -2129,49 +2133,22 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
     UnresolvedTerm::Literal(LiteralValue::String(Arc::from(lexical)))
 }
 
-/// Coerce a typed literal lexical value to FlakeValue.
-fn coerce_typed_flake_value(lexical: &str, datatype_iri: &str) -> FlakeValue {
-    // MVP: basic coercion for common types
-    match datatype_iri {
-        xsd::INTEGER => {
-            // xsd:integer is unbounded: promote past i64 instead of falling
-            // back to a string-valued literal.
-            if let Ok(i) = lexical.parse::<i64>() {
-                return FlakeValue::Long(i);
-            }
-            if let Ok(n) = lexical.parse::<num_bigint::BigInt>() {
-                return FlakeValue::BigInt(Box::new(n));
-            }
+/// Coerce a typed literal to the value every write surface commits for it.
+///
+/// Shares `coerce_string_value` with JSON-LD so `"2026-09-08"^^xsd:date`
+/// commits a date, not a string carrying the date datatype — which no query
+/// for the date matches and which the index used to decode as a date (#1987).
+fn coerce_typed_flake_value(
+    lexical: &str,
+    datatype_iri: &str,
+    span: SourceSpan,
+) -> Result<FlakeValue, LowerError> {
+    fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri).map_err(|e| {
+        LowerError::InvalidLiteral {
+            message: e.message,
+            span,
         }
-        xsd::DOUBLE => {
-            if let Ok(d) = lexical.parse::<f64>() {
-                return FlakeValue::Double(d);
-            }
-        }
-        xsd::DECIMAL => {
-            if let Ok(d) = lexical.parse::<bigdecimal::BigDecimal>() {
-                return FlakeValue::Decimal(Box::new(d));
-            }
-        }
-        xsd::BOOLEAN => {
-            if lexical == "true" || lexical == "1" {
-                return FlakeValue::Boolean(true);
-            } else if lexical == "false" || lexical == "0" {
-                return FlakeValue::Boolean(false);
-            }
-        }
-        // See `coerce_typed_value` — share core's parser for f:embeddingVector.
-        fluree::EMBEDDING_VECTOR => {
-            if let Ok(fv @ FlakeValue::Vector(_)) =
-                fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri)
-            {
-                return fv;
-            }
-        }
-        _ => {}
-    }
-    // Fall back to string
-    FlakeValue::String(lexical.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -2708,7 +2685,12 @@ mod tests {
         // FlakeValue::String — otherwise downstream flake gen pairs a String
         // value with the embeddingVector datatype and the index decodes
         // garbage.
-        let result = coerce_typed_flake_value("[0.1, 0.2, 0.3, 0.4]", fluree::EMBEDDING_VECTOR);
+        let result = coerce_typed_flake_value(
+            "[0.1, 0.2, 0.3, 0.4]",
+            fluree::EMBEDDING_VECTOR,
+            SourceSpan::default(),
+        )
+        .unwrap();
         match result {
             FlakeValue::Vector(v) => assert_eq!(v.len(), 4),
             other => panic!("expected FlakeValue::Vector, got {other:?}"),

@@ -119,7 +119,6 @@ pub use content_kind::{
     CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
 };
 pub use datatype_constraint::DatatypeConstraint;
-pub use datatypes::dt_compatible;
 pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
 pub use dict_novelty::DictNovelty;
 pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError};

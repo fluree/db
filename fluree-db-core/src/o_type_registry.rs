@@ -105,9 +105,18 @@ impl OTypeRegistry {
             ObjKind::NUM_F64 => self.resolve_by_dt(dt),
             ObjKind::LEX_ID => {
                 if dt == DatatypeDictId::LANG_STRING {
-                    OType::lang_string(lang_id)
+                    return OType::lang_string(lang_id);
+                }
+                // A lexical string under a non-string datatype is an ill-typed
+                // literal (e.g. "1990-00-00"^^xsd:date). It keeps its string
+                // and its datatype; decoding the string id as that datatype's
+                // value would read a dictionary position as a date or number.
+                // RESERVED (a dt past the payload width) stays unknown.
+                let by_dt = self.resolve_by_dt(dt);
+                if by_dt.is_string_keyed() || by_dt == OType::RESERVED {
+                    by_dt
                 } else {
-                    self.resolve_by_dt(dt)
+                    OType::customer_datatype(dt.as_u16())
                 }
             }
 
@@ -122,9 +131,16 @@ impl OTypeRegistry {
         let idx = dt.as_u16() as usize;
         if idx < self.dt_otypes.len() {
             self.dt_otypes[idx]
-        } else {
-            // dt value beyond what we know — treat as customer datatype.
+        } else if dt.as_u16() <= OType::MAX_PAYLOAD {
+            // treat dt as customer datatype because its value is beyond what we
+            // know
             OType::customer_datatype(dt.as_u16())
+        } else {
+            // return `OType::RESERVED` because dt is past the payload width.
+            // No valid index holds such a dt, so it comes from a damaged or
+            // future-format row. `OType::RESERVED` decodes as an unknown
+            // value.
+            OType::RESERVED
         }
     }
 }
@@ -378,6 +394,41 @@ mod tests {
         );
     }
 
+    /// Issue #1987: a lexical string under a non-string datatype must keep a
+    /// string-keyed o_type, never the datatype's inline o_type.
+    #[test]
+    fn lex_id_under_non_string_datatype_stays_string_keyed() {
+        let reg = OTypeRegistry::new(&[
+            "http://www.w3.org/2001/XMLSchema#gYear".to_string(),
+            "http://www.w3.org/2001/XMLSchema#duration".to_string(),
+        ]);
+        for dt in [
+            DatatypeDictId::DATE,
+            DatatypeDictId::DATE_TIME,
+            DatatypeDictId::TIME,
+            DatatypeDictId::LONG,
+            DatatypeDictId::INTEGER,
+            DatatypeDictId::DOUBLE,
+            DatatypeDictId::BOOLEAN,
+            DatatypeDictId::from_u16(15),
+        ] {
+            assert_eq!(
+                reg.resolve(ObjKind::LEX_ID, dt, 0),
+                OType::customer_datatype(dt.as_u16()),
+                "dt={}",
+                dt.as_u16()
+            );
+        }
+        assert_eq!(
+            reg.resolve(ObjKind::LEX_ID, DatatypeDictId::from_u16(16), 0),
+            OType::XSD_DURATION
+        );
+        assert_eq!(
+            reg.resolve(ObjKind::DATE, DatatypeDictId::DATE, 0),
+            OType::XSD_DATE
+        );
+    }
+
     #[test]
     fn lang_string() {
         let reg = OTypeRegistry::builtin_only();
@@ -434,6 +485,25 @@ mod tests {
         let ot = reg.resolve(ObjKind::NUM_INT, DatatypeDictId::from_u16(100), 0);
         assert!(ot.is_customer_datatype());
         assert_eq!(ot.payload(), 100);
+    }
+
+    #[test]
+    fn dt_past_payload_width_resolves_to_reserved() {
+        let reg = OTypeRegistry::builtin_only();
+        let at_max = reg.resolve(
+            ObjKind::LEX_ID,
+            DatatypeDictId::from_u16(OType::MAX_PAYLOAD),
+            0,
+        );
+        assert!(at_max.is_customer_datatype());
+        assert_eq!(at_max.payload(), OType::MAX_PAYLOAD);
+
+        for dt in [OType::MAX_PAYLOAD + 1, u16::MAX] {
+            for kind in [ObjKind::LEX_ID, ObjKind::NUM_INT, ObjKind::NUM_F64] {
+                let ot = reg.resolve(kind, DatatypeDictId::from_u16(dt), 0);
+                assert_eq!(ot, OType::RESERVED, "dt {dt} with {kind:?}");
+            }
+        }
     }
 
     #[test]

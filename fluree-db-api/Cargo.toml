@@ -333,6 +333,12 @@ path = "tests/it_count_datatype_pin.rs"
 name = "it_fastpath_1652_regression"
 path = "tests/it_fastpath_1652_regression.rs"
 
+# Own binary: toggles the fast-path kill switch and asserts routing.
+[[test]]
+name = "it_numeric_constant_matching"
+path = "tests/it_numeric_constant_matching.rs"
+required-features = ["native"]
+
 # Own binary for the same reason (kill switch + routing assertions).
 [[test]]
 name = "it_fastpath_1863_regression"

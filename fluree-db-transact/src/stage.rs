@@ -2279,9 +2279,10 @@ async fn hydrate_list_index_meta_for_retractions(
             // facts: the candidate must match the retraction's tag (absent
             // on both for plain literals) as well as its datatype.
             let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
-            if let Some((_, m)) = candidates.iter().find(|(dt, m)| {
-                fluree_db_core::dt_compatible(&flake.dt, dt) && m.lang.as_deref() == lang
-            }) {
+            if let Some((_, m)) = candidates
+                .iter()
+                .find(|(dt, m)| &flake.dt == dt && m.lang.as_deref() == lang)
+            {
                 flake.m = Some(m.clone());
             }
         }
@@ -2481,9 +2482,10 @@ async fn classify_subject_lifecycle(
         return Ok(WriteVerb::Update);
     }
     let fully_retracted = pre_flakes.iter().filter(|f| f.op).all(|pre| {
-        delta.retracts.iter().any(|(p, o, dt)| {
-            p == &pre.p && o == &pre.o && fluree_db_core::dt_compatible(dt, &pre.dt)
-        })
+        delta
+            .retracts
+            .iter()
+            .any(|(p, o, dt)| p == &pre.p && o == &pre.o && dt == &pre.dt)
     });
     Ok(if fully_retracted {
         WriteVerb::Delete
