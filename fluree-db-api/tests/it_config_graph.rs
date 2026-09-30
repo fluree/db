@@ -2250,16 +2250,18 @@ async fn shacl_reads_the_named_graph_the_write_lands_in() {
 }
 
 // =============================================================================
-// Test 16: SHACL shapes-exist heuristic (no config)
+// Test 16: shapes without config do not enforce (explicit-only SHACL)
 // =============================================================================
 
-/// When no config graph exists but SHACL shapes are present in the database,
-/// the shapes-exist heuristic kicks in and SHACL validation runs (backward compat).
+/// Shapes alone never enable SHACL: a ledger that holds shapes but no config
+/// enabling SHACL accepts the record they forbid (#1979's control).
+/// `config_write_json_ld_nested_groups_land_in_config` refuses the same record
+/// once the documented config enables SHACL.
 #[cfg(feature = "shacl")]
 #[tokio::test]
-async fn shacl_default_shapes_exist_heuristic() {
+async fn shacl_shapes_without_config_do_not_enforce() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/shacl-heuristic:main";
+    let ledger_id = "it/shacl-shapes-only:main";
     let ledger = genesis_ledger(&fluree, ledger_id);
 
     // Seed SHACL shapes — no config graph at all
@@ -2286,8 +2288,8 @@ async fn shacl_default_shapes_exist_heuristic() {
         .unwrap();
     let ledger = result.ledger;
 
-    // Violating data should fail — shapes exist → implicit SHACL enablement
-    let err = fluree
+    // The record the shape forbids commits: no config enables SHACL.
+    fluree
         .insert(
             ledger,
             &json!({
@@ -2297,15 +2299,247 @@ async fn shacl_default_shapes_exist_heuristic() {
             }),
         )
         .await
-        .unwrap_err();
+        .expect("no config enables SHACL, so the shapes are not enforced");
+}
 
-    assert!(
-        matches!(
-            err,
-            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+/// Run a SPARQL UPDATE against `ledger`.
+#[cfg(feature = "shacl")]
+async fn sparql_update(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    sparql: &str,
+) -> fluree_db_api::Result<fluree_db_api::TransactResult> {
+    let ast = fluree_db_sparql::parse_sparql(sparql)
+        .ast
+        .expect("SPARQL AST");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &ast,
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower SPARQL UPDATE");
+    fluree.stage_owned(ledger).txn(txn).execute().await
+}
+
+/// A shape requiring `ex:name` on every `ex:Person`, in the default graph.
+#[cfg(feature = "shacl")]
+fn person_name_shape() -> serde_json::Value {
+    json!({
+        "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+        "@id": "ex:PersonShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Person"},
+        "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+    })
+}
+
+/// Explicit-only SHACL: whether a ledger that holds shapes enforces them
+/// depends on its config's SHACL group and nothing else. Each config here is
+/// written through SPARQL, the record the shape forbids through SPARQL too.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_posture_is_explicit_only() {
+    let shacl_enabled = |flag: &str| {
+        format!(
+            "<urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> . \
+             <urn:config:shacl> f:shaclEnabled {flag} ."
+        )
+    };
+    let per_graph_only = "<urn:config:main> a f:LedgerConfig ; \
+                            f:graphOverrides <urn:config:ga> . \
+                          <urn:config:ga> a f:GraphConfig ; \
+                            f:targetGraph <http://example.org/g/a> ; \
+                            f:shaclDefaults <urn:config:ga-shacl> . \
+                          <urn:config:ga-shacl> f:shaclEnabled true ."
+        .to_string();
+    // (case, #config content, graph the forbidden record is written to,
+    // whether it is refused)
+    let cases: [(&str, String, Option<&str>, bool); 8] = [
+        (
+            "a config with only reasoning defaults",
+            "<urn:config:main> a f:LedgerConfig ; f:reasoningDefaults <urn:config:r> . \
+             <urn:config:r> f:reasoningModes f:rdfs ."
+                .to_string(),
+            None,
+            false,
         ),
-        "shapes-exist heuristic should trigger SHACL rejection: {err:?}"
-    );
+        (
+            "a bare f:LedgerConfig",
+            "<urn:config:main> a f:LedgerConfig .".to_string(),
+            None,
+            false,
+        ),
+        (
+            "an empty SHACL group (read as absent)",
+            "<urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .".to_string(),
+            None,
+            false,
+        ),
+        ("f:shaclEnabled false", shacl_enabled("false"), None, false),
+        ("f:shaclEnabled true", shacl_enabled("true"), None, true),
+        (
+            "f:shaclEnabled true, write to a named graph",
+            shacl_enabled("true"),
+            Some("http://example.org/g/a"),
+            true,
+        ),
+        (
+            "per-graph f:shaclEnabled true, write to that graph",
+            per_graph_only.clone(),
+            Some("http://example.org/g/a"),
+            true,
+        ),
+        (
+            "per-graph f:shaclEnabled true, write to the default graph",
+            per_graph_only,
+            None,
+            false,
+        ),
+    ];
+    for (case, config, graph, refused) in cases {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = "it/shacl-explicit-only:main";
+        let ledger = fluree
+            .insert(genesis_ledger(&fluree, ledger_id), &person_name_shape())
+            .await
+            .expect("shape insert")
+            .ledger;
+        let ledger = sparql_update(
+            &fluree,
+            ledger,
+            &format!(
+                "PREFIX f: <https://ns.flur.ee/db#> \
+                 INSERT DATA {{ GRAPH <{}> {{ {config} }} }}",
+                config_graph_iri(ledger_id)
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{case}: config write: {e}"))
+        .ledger;
+
+        let record = "<http://example.org/alice> a <http://example.org/Person> .";
+        let write = match graph {
+            Some(g) => format!("INSERT DATA {{ GRAPH <{g}> {{ {record} }} }}"),
+            None => format!("INSERT DATA {{ {record} }}"),
+        };
+        let result = sparql_update(&fluree, ledger, &write).await;
+        match (refused, result) {
+            (true, Err(err)) => assert!(
+                matches!(
+                    err,
+                    fluree_db_api::ApiError::Transact(
+                        fluree_db_transact::TransactError::ShaclViolation(_)
+                    )
+                ),
+                "{case}: expected a SHACL violation: {err:?}"
+            ),
+            (true, Ok(_)) => panic!("{case}: the forbidden record must be refused"),
+            (false, Err(err)) => panic!("{case}: the record must commit: {err:?}"),
+            (false, Ok(_)) => {}
+        }
+    }
+}
+
+/// A Turtle insert on a ledger that holds shapes but no config enabling SHACL
+/// is not validated (`shacl_turtle_insert_rejected_when_violating` is the
+/// enabled twin).
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_turtle_insert_without_config_is_not_validated() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/shacl-turtle-no-config:main");
+    let ledger = fluree
+        .insert(ledger, &person_name_shape())
+        .await
+        .expect("shape insert")
+        .ledger;
+    fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> . ex:charlie a ex:Person .",
+        )
+        .await
+        .expect("no config enables SHACL, so the Turtle insert is not validated");
+}
+
+/// Push replays a commit under the receiving ledger's configured posture.
+/// The source commits here skip the source's own checks, so the forbidden
+/// record reaches the receiver either way: where the pushed config enables
+/// SHACL it is refused, and where the ledger only holds shapes it is not.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn push_validates_only_where_config_enables_shacl() {
+    for enabled in [false, true] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src_id = format!("it/shacl-push-src-{enabled}:main");
+        let mut seed = vec![json!({
+            "@id": "ex:PersonShape",
+            "@type": "sh:NodeShape",
+            "sh:targetClass": {"@id": "ex:Person"},
+            "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+        })];
+        if enabled {
+            seed.push(support::shacl_enabled_config_node());
+        }
+        let src = commit_unchecked(
+            &fluree,
+            genesis_ledger(&fluree, &src_id),
+            &json!({
+                "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+                "@graph": seed
+            }),
+        )
+        .await;
+        commit_unchecked(
+            &fluree,
+            src,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person"
+            }),
+        )
+        .await;
+
+        let src_handle = fluree.ledger_cached(&src_id).await.expect("source handle");
+        let export = fluree
+            .export_commit_range(
+                &src_handle,
+                &fluree_db_api::ExportCommitsRequest {
+                    limit: Some(100),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("export commits");
+        let tgt_id = format!("it/shacl-push-tgt-{enabled}:main");
+        fluree.create_ledger(&tgt_id).await.expect("create target");
+        let mut commits = export.commits;
+        commits.reverse();
+        let result = fluree
+            .push_commits(
+                &tgt_id,
+                fluree_db_api::PushCommitsRequest {
+                    commits,
+                    blobs: export.blobs,
+                    missing_blobs: Vec::new(),
+                    merged_commits: Vec::new(),
+                },
+                &GovernanceOptions::default(),
+                &fluree.default_index_config(),
+            )
+            .await;
+        match (enabled, result) {
+            (false, Ok(pushed)) => assert_eq!(pushed.accepted, 2),
+            (false, Err(err)) => panic!("shapes without config are not enforced on push: {err}"),
+            (true, Err(err)) => {
+                assert_eq!(err.status_code(), 422, "{err}");
+                assert!(err.to_string().contains("SHACL"), "{err}");
+            }
+            (true, Ok(_)) => panic!("the pushed config enables SHACL: the push must be refused"),
+        }
+    }
 }
 
 // =============================================================================
@@ -4703,77 +4937,6 @@ async fn shacl_txn_validation_mode_ignores_policy_identity() {
     )
     .await
     .expect("the verified identity alongside the same policy context is permitted");
-}
-
-/// The shapes-exist heuristic (shapes present, NO config graph) fails closed:
-/// a transaction-requested warn does NOT soften it.
-///
-/// This path never reaches `merge_shacl_opts`, so it consults no
-/// `f:overrideControl` and no identity. Honoring the request here would let
-/// anyone who can write downgrade enforcement on every ledger that has shapes
-/// but no `#config` graph — the back-compat default — with the violations
-/// reduced to a log line.
-#[cfg(feature = "shacl")]
-#[tokio::test]
-async fn shacl_heuristic_without_config_ignores_requested_warn_mode() {
-    use fluree_db_core::ledger_config::ValidationMode;
-
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "it/shacl-heuristic-no-config:main");
-    // Shapes, deliberately with no config graph written afterwards.
-    let result = fluree
-        .insert(
-            ledger,
-            &json!({
-                "@context": {
-                    "sh": "http://www.w3.org/ns/shacl#",
-                    "ex": "http://example.org/"
-                },
-                "@id": "ex:PersonShape",
-                "@type": "sh:NodeShape",
-                "sh:targetClass": {"@id": "ex:Person"},
-                "sh:property": [{
-                    "sh:path": {"@id": "ex:name"},
-                    "sh:minCount": 1
-                }]
-            }),
-        )
-        .await
-        .expect("shape insert");
-
-    // Baseline: the heuristic enforces without any opt.
-    let err = fluree
-        .insert(result.ledger.clone(), &violating_person())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
-        ),
-        "shapes-exist heuristic must reject: {err:?}"
-    );
-
-    // The same write asking for warn is still rejected — no config group
-    // exists to permit the override, so the request is not honored.
-    let opts = fluree_db_transact::TxnOpts {
-        validation_mode: Some(ValidationMode::Warn),
-        ..Default::default()
-    };
-    let err = fluree
-        .stage_owned(result.ledger)
-        .txn_opts(opts)
-        .insert(&violating_person())
-        .execute()
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
-        ),
-        "requested warn must NOT soften the ungated no-config heuristic: {err:?}"
-    );
 }
 
 /// Strengthening needs no permission: on a warn-mode ledger, a transaction

@@ -235,6 +235,24 @@ pub enum TransactError {
         graph_iri: String,
     },
 
+    /// A request-time setting that the ledger config's `f:overrideControl`
+    /// does not permit for this request, where applying less than the caller
+    /// asked for would be unsafe: inline SHACL shapes (`opts.shapes`) the
+    /// caller expects its data to be checked against. Refused rather than
+    /// dropped, so nothing commits unvalidated.
+    #[error(
+        "{setting} refused by this ledger's override control (f:overrideControl {control}) \
+         for {graph}"
+    )]
+    RequestOverrideRefused {
+        /// The request setting, as the caller wrote it.
+        setting: String,
+        /// The graph whose effective control refused it.
+        graph: String,
+        /// The effective `f:overrideControl` value.
+        control: String,
+    },
+
     /// Unique constraint violation (`f:enforceUnique`).
     ///
     /// A property annotated with `f:enforceUnique true` has duplicate values

@@ -3739,12 +3739,9 @@ impl ShaclValidationOutcome {
 /// Validate a staged [`StagedLedger`] against SHACL shapes, each focus node
 /// in the graph staging routed its flakes to.
 ///
-/// `per_graph_policy`:
-/// - `None` = treat every graph containing staged flakes as `Reject` mode
-///   (legacy / unconditional reject — matches commit-transfer's previous
-///   behavior and shapes-exist heuristic).
-/// - `Some(map)` = only graphs in the map are validated; their mode comes
-///   from the map. Graphs absent from the map are skipped (disabled).
+/// `per_graph_policy` names the graphs that participate: only graphs in the
+/// map are validated, each in the mode the map gives it. Graphs absent from
+/// the map are skipped, so an empty map validates nothing.
 ///
 /// Returns a [`ShaclValidationOutcome`] split into reject / warn buckets.
 /// The caller decides whether to propagate an error, log warnings, or both.
@@ -3755,13 +3752,13 @@ pub async fn validate_view_with_shacl(
     shacl_cache: std::sync::Arc<ShaclCache>,
     hierarchy: Option<fluree_db_core::SchemaHierarchy>,
     tracker: Option<&fluree_db_core::Tracker>,
-    per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
+    per_graph_policy: &HashMap<GraphId, ShaclGraphPolicy>,
     membership_g_ids: &[GraphId],
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
     sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ShaclValidationOutcome> {
-    // Fast path: if there are no SHACL shapes, elide validation entirely.
-    if shacl_cache.is_empty() {
+    // Fast path: no shapes or no participating graph, nothing to validate.
+    if shacl_cache.is_empty() || per_graph_policy.is_empty() {
         return Ok(ShaclValidationOutcome::default());
     }
 
@@ -3773,13 +3770,12 @@ pub async fn validate_view_with_shacl(
     // demand for `sh:class` membership.
     let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
         .with_membership_graphs(membership_g_ids.to_vec());
-    let enabled_graphs: Option<HashSet<GraphId>> =
-        per_graph_policy.map(|m| m.keys().copied().collect());
+    let enabled_graphs: HashSet<GraphId> = per_graph_policy.keys().copied().collect();
     let report = validate_staged_nodes(
         view,
         &engine,
         tracker,
-        enabled_graphs.as_ref(),
+        &enabled_graphs,
         cross_ledger,
         sparql_iri_encoder,
     )
@@ -3787,19 +3783,17 @@ pub async fn validate_view_with_shacl(
 
     // Split violations by the graph's configured mode. `graph_id` on each
     // result was tagged during the per-graph loop in validate_staged_nodes.
-    // When per_graph_policy is None, every violation defaults to Reject.
     let mut outcome = ShaclValidationOutcome::default();
     for r in report.results {
         if r.severity != fluree_db_shacl::Severity::Violation {
             continue;
         }
-        let mode = match (per_graph_policy, r.graph_id) {
-            (Some(m), Some(g_id)) => m
-                .get(&g_id)
-                .map(|p| p.mode)
-                .unwrap_or(fluree_db_core::ledger_config::ValidationMode::Reject),
-            _ => fluree_db_core::ledger_config::ValidationMode::Reject,
-        };
+        let mode = r
+            .graph_id
+            .and_then(|g_id| per_graph_policy.get(&g_id))
+            .map_or(fluree_db_core::ledger_config::ValidationMode::Reject, |p| {
+                p.mode
+            });
         match mode {
             fluree_db_core::ledger_config::ValidationMode::Reject => {
                 outcome.reject_violations.push(r);
@@ -3825,7 +3819,7 @@ async fn validate_staged_nodes(
     view: &StagedLedger,
     engine: &ShaclEngine,
     tracker: Option<&fluree_db_core::Tracker>,
-    enabled_graphs: Option<&HashSet<GraphId>>,
+    enabled_graphs: &HashSet<GraphId>,
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
     sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ValidationReport> {
@@ -3885,15 +3879,13 @@ async fn validate_staged_nodes(
     let mut all_results = Vec::new();
 
     for (g_id, subjects) in &subjects_by_graph {
-        // Per-graph enable/disable: when the caller supplies an explicit
-        // enabled set, graphs not in the set are skipped. Subjects staged in
-        // a disabled graph therefore receive no shape validation from this
-        // transaction, which matches the documented `shacl.enabled: false`
-        // semantics for that graph (`override-control.md`).
-        if let Some(enabled) = enabled_graphs {
-            if !enabled.contains(g_id) {
-                continue;
-            }
+        // Per-graph enable/disable: graphs not in the enabled set are
+        // skipped. Subjects staged in a disabled graph therefore receive no
+        // shape validation from this transaction, which matches the
+        // documented `shacl.enabled: false` semantics for that graph
+        // (`override-control.md`).
+        if !enabled_graphs.contains(g_id) {
+            continue;
         }
 
         // Build GraphDbRef for this graph.

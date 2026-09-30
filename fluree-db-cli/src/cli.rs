@@ -2191,9 +2191,9 @@ pub enum ModelClassAction {
 pub enum ModelEntityAction {
     /// Define (or update) an entity: compiles to a SHACL node shape
     ///
-    /// NOTE: Fluree enforces SHACL at transaction time once any shapes exist
-    /// in a ledger (reject mode by default) — defining an entity activates
-    /// validation for its class.
+    /// NOTE: Fluree enforces SHACL at transaction time only where the ledger
+    /// config enables it (`f:shaclEnabled true`) — defining an entity does not
+    /// by itself activate validation for its class.
     Define {
         /// Target dataset (ledger alias)
         dataset: String,

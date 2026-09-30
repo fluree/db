@@ -779,8 +779,8 @@ pub struct EffectiveShaclConfig {
 /// Compute effective SHACL settings from resolved config, honoring a
 /// transaction-requested validation mode under override control.
 ///
-/// Returns `None` if no SHACL config section is present. When `None`,
-/// callers fall back to the shapes-exist heuristic (see `stage_with_config_shacl`).
+/// Returns `None` if no SHACL config section is present, which means SHACL is
+/// off for the graph: shapes alone never enable validation.
 ///
 /// `requested_mode` is the transaction's `opts.validationMode`
 /// (`TxnOpts::validation_mode`); `server_identity` is the auth-layer-verified

@@ -165,6 +165,39 @@ async fn merge_rejected_when_result_violates_shape() {
     assert_eq!(names(&fluree, "mydb:dev").await, vec!["B"]);
 }
 
+/// Shapes that no config enables do not validate branch operations either:
+/// the take-both merge `merge_rejected_when_result_violates_shape` refuses
+/// goes through on a ledger that holds the shape without the config.
+#[tokio::test]
+async fn merge_is_not_validated_without_shacl_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let mut seed = alice_name_shape(None);
+    let nodes = seed["@graph"].as_array_mut().unwrap();
+    nodes.retain(|node| node["@id"] != "urn:config:main");
+    nodes.push(json!({"@id": "ex:alice", "ex:name": "A"}));
+    let main = fluree.insert(ledger, &seed).await.unwrap().ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(dev, &replace_name("ex:alice", "B"))
+        .await
+        .unwrap();
+    fluree
+        .update(main, &replace_name("ex:alice", "C"))
+        .await
+        .unwrap();
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::TakeBoth)
+        .await
+        .expect("no config enables SHACL, so the merge is not validated");
+    assert_eq!(names(&fluree, "mydb:main").await, vec!["B", "C"]);
+}
+
 /// A shape being installed does not make conforming merges fail.
 #[tokio::test]
 async fn merge_conforming_result_succeeds_with_shape_installed() {
