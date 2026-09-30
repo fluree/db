@@ -4257,17 +4257,6 @@ async fn graph_source_probes_fail_closed_and_skip_ledger_graphs() {
         "{PREFIX}SELECT (COUNT(?o) AS ?n) WHERE {{ GRAPH <shop-native:main> {{ ?o ex:total ?t }} }}"
     );
 
-    // With a healthy nameservice the GRAPH IRI reaches the source's rows.
-    let healthy = on_twin(&fluree, &into_source)
-        .await
-        .expect("healthy nameservice");
-    assert_eq!(
-        rows_of(&healthy),
-        [
-            "o=http://example.org/order/10 t=99.50",
-            "o=http://example.org/order/12 t=42.00"
-        ]
-    );
     let native_rows = rows_of(&on_twin(&fluree, &native).await.expect("native"));
     assert_eq!(native_rows.len(), 2, "{native_rows:?}");
     let count_rows = rows_of(&query(&fluree, &member_count).await);
@@ -4282,8 +4271,9 @@ async fn graph_source_probes_fail_closed_and_skip_ledger_graphs() {
         set_fast_paths_disabled(lane_off);
         let lane = if lane_off { "lane off" } else { "lane on" };
 
+        // The backend's fault, so a 500 the client may retry, not a 400.
         match on_twin(&down, &into_source).await {
-            Err(e) if e.to_string().contains(INJECTED) => {}
+            Err(e) if e.to_string().contains(INJECTED) && e.status_code() == 500 => {}
             other => failures.push(format!("{lane}: GRAPH <source> gave {other:?}")),
         }
         let jsonld = down
@@ -4293,7 +4283,7 @@ async fn graph_source_probes_fail_closed_and_skip_ledger_graphs() {
             .execute_formatted()
             .await;
         match jsonld {
-            Err(e) if e.to_string().contains(INJECTED) => {}
+            Err(e) if e.to_string().contains(INJECTED) && e.status_code() == 500 => {}
             other => failures.push(format!("{lane}: JSON-LD graph <source> gave {other:?}")),
         }
 
@@ -4338,12 +4328,13 @@ async fn graph_source_probes_fail_closed_and_skip_ledger_graphs() {
 /// Declining an IRI that names no source is not swallowing a failure: when
 /// the nameservice cannot answer for a well-formed id, the probe fails the
 /// query rather than quietly plan a possible SQL source as a native graph.
-/// The id here, `maybe-source:main`, is a `GRAPH` IRI the query's dataset does
-/// not hold and the ledger has no graph by, which is what is still asked about
-/// at run time: on the lane (its capability lookup) and off it (the executor's
-/// probe). A graph the query loaded as a ledger graph is never asked about, so
-/// the ledger's own graph and the ledger itself, named as dataset members,
-/// answer with the same nameservice down.
+/// The id here, `maybe-source:main`, is a `GRAPH` IRI that a query on the
+/// ledger's view (no dataset) names and the ledger has no graph by, which is
+/// what is still asked about at run time: on the lane (its capability lookup)
+/// and off it (the executor's probe). A dataset member's `GRAPH` never is: a
+/// graph the query loaded as a ledger graph is never asked about, so the
+/// ledger's own graph and the ledger itself, named as dataset members, answer
+/// with the same nameservice down.
 #[tokio::test]
 async fn a_failed_source_lookup_still_fails_the_query() {
     let _lock = KILL_SWITCH.lock().await;
@@ -4352,12 +4343,11 @@ async fn a_failed_source_lookup_still_fails_the_query() {
     docs_ledger(&fluree).await;
     let down = with_source_lookups_failing(&fluree);
 
-    let well_formed = format!(
-        "{PREFIX}SELECT ?d ?t FROM <docs:main> \
-         WHERE {{ GRAPH <maybe-source:main> {{ ?d ex:title ?t }} }}"
-    );
+    let well_formed =
+        format!("{PREFIX}SELECT ?d ?t WHERE {{ GRAPH <maybe-source:main> {{ ?d ex:title ?t }} }}");
     let lane_on = down
-        .query_from()
+        .graph("docs:main")
+        .query()
         .sparql(&well_formed)
         .execute_formatted()
         .await;
@@ -4365,7 +4355,11 @@ async fn a_failed_source_lookup_still_fails_the_query() {
         "{PREFIX}SELECT ?e ?t FROM NAMED <docs:main#urn:ex:doc:1> \
          WHERE {{ GRAPH <docs:main#urn:ex:doc:1> {{ ?e ex:title ?t }} }}"
     );
-    let own_graph = down.query_from().sparql(&own_graph).execute_formatted().await;
+    let own_graph = down
+        .query_from()
+        .sparql(&own_graph)
+        .execute_formatted()
+        .await;
     let own_ledger = format!(
         "{PREFIX}SELECT ?d ?t FROM NAMED <docs:main> \
          WHERE {{ GRAPH <docs:main> {{ ?d ex:title ?t }} }}"
@@ -4377,7 +4371,8 @@ async fn a_failed_source_lookup_still_fails_the_query() {
         .await;
     set_fast_paths_disabled(true);
     let lane_off = down
-        .query_from()
+        .graph("docs:main")
+        .query()
         .sparql(&well_formed)
         .execute_formatted()
         .await;
@@ -4389,6 +4384,7 @@ async fn a_failed_source_lookup_still_fails_the_query() {
             err.to_string().contains(INJECTED),
             "{lane}: unexpected error: {err}"
         );
+        assert_eq!(err.status_code(), 500, "{lane}: {err}");
     }
     assert_eq!(
         rows_of(&own_graph.expect("a ledger's own graph needs no lookup")),

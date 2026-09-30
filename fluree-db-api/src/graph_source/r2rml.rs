@@ -1381,7 +1381,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .nameservice()
             .lookup_graph_source(&id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))
+            .map_err(|e| QueryError::Nameservice(e.to_string()))
     }
 
     /// The SQL source behind `graph_source_id`, or `None` when it is
@@ -1447,7 +1447,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -1769,7 +1769,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -2328,7 +2328,7 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .nameservice()
             .lookup_graph_source(&id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
         Ok(record.is_some_and(|r| mapping_source_of(&r).is_some()))
     }
 
@@ -2346,7 +2346,7 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -3252,7 +3252,7 @@ impl FlureeR2rmlProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
