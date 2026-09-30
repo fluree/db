@@ -445,6 +445,7 @@ pub(crate) fn build_query_result(
         // (`query_view_with_r2rml_options`) overrides this to true so the
         // sparql_json formatter CURIE-compacts graph-source IRIs (F9).
         from_graph_source: false,
+        advisories: Vec::new(),
     }
 }
 

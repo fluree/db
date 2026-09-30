@@ -1032,6 +1032,9 @@ pub async fn run(
                 };
                 (result, timer.elapsed())
             };
+            for advisory in &result.advisories {
+                eprintln!("warning: {}", advisory.message());
+            }
 
             if bench {
                 // Benchmark output should be representative but cheap: show a table preview
@@ -2130,13 +2133,13 @@ async fn connection_query_local(
     normalize_arrays: bool,
 ) -> CliResult<serde_json::Value> {
     let fmt = json_path_formatter_config(query_format, output_format, normalize_arrays);
-    let result = match query_format {
+    let (result, advisories) = match query_format {
         detect::QueryFormat::Sparql => {
             fluree
                 .query_from()
                 .sparql(content)
                 .format(fmt)
-                .execute_formatted()
+                .execute_formatted_with_advisories()
                 .await?
         }
         detect::QueryFormat::JsonLd => {
@@ -2145,10 +2148,13 @@ async fn connection_query_local(
                 .query_from()
                 .jsonld(&json)
                 .format(fmt)
-                .execute_formatted()
+                .execute_formatted_with_advisories()
                 .await?
         }
     };
+    for advisory in advisories {
+        eprintln!("warning: {}", advisory.message());
+    }
     Ok(result)
 }
 

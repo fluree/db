@@ -37,6 +37,7 @@
 pub mod admin;
 pub mod authorization;
 pub use authorization::PolicyAuthorization;
+pub mod advisory;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
@@ -362,6 +363,7 @@ pub use fluree_db_transact::{
 };
 
 // Re-export SPARQL types (product feature; always enabled)
+pub use advisory::QueryAdvisory;
 pub use fluree_db_sparql::{
     lower_sparql, parse_sparql, resolve_dataset_clause, validate as validate_sparql,
     Capabilities as SparqlCapabilities, Diagnostic as SparqlDiagnostic,
