@@ -558,17 +558,14 @@ impl Fluree {
             let mut staged_view = staged_view;
             #[cfg(feature = "shacl")]
             {
+                let config = crate::tx::enforcement_config(&staged_view)
+                    .await
+                    .map_err(|e| ApiError::http(422, e.to_string()))?;
                 crate::tx::apply_shacl_policy_to_staged_view(
                     &mut staged_view,
                     crate::tx::StagedShaclContext {
                         graph_delta: Some(&routing.graph_iris),
                         tracker: None,
-                        // Commit replay doesn't engage the
-                        // cross-ledger dispatch (the leader
-                        // already validated against M when the
-                        // commit was authored); followers
-                        // re-validate same-ledger only.
-                        cross_ledger_shapes: None,
                         staged_ns: None,
                         // These commits' own namespaces do not reach the
                         // snapshot until after validation, so a violation on a
@@ -579,12 +576,10 @@ impl Fluree {
                         // authoring context to compact against — violations
                         // here name full IRIs.
                         txn_context: None,
-                        cross_ledger_schema: None,
                         // Inline shapes are an authoring-time
                         // construct; commit replay carries no
                         // `opts` payload.
                         inline_shape_bundle: None,
-                        cross_ledger_membership: None,
                         // Replay re-validates under the configured posture:
                         // any authoring-time softening was already applied
                         // (or denied) when the commit was first staged.
@@ -592,7 +587,11 @@ impl Fluree {
                         request_identity: None,
                         origin_validated_replay: true,
                     },
-                    // Commit replay resolves config internally.
+                    config.as_deref(),
+                    // Commit replay doesn't engage the cross-ledger dispatch
+                    // (the leader already validated against M when the
+                    // commit was authored); followers re-validate
+                    // same-ledger only.
                     None,
                 )
                 .await

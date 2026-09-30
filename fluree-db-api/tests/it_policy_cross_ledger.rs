@@ -1280,3 +1280,79 @@ async fn multiple_targeted_query_rules_any_allow_grants_across_materializations(
         );
     }
 }
+
+/// Policy is the exception to "a config write never depends on a model
+/// ledger": policy decides who may write the config, so a cross-ledger
+/// `f:policySource` whose model ledger is gone still fails every write
+/// closed, config writes included. Every surface that applies config policy
+/// to a write builds its context with `build_transact_policy_context`, which
+/// refuses here even for a request with no policy inputs of its own.
+#[tokio::test]
+async fn dropped_policy_model_still_fails_writes_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_name = "test/cross-ledger-e2e/dropped-policy-model";
+    let model_id = format!("{model_name}:main");
+    let policy_graph_iri = "http://example.org/governance/policy";
+    fluree
+        .stage_owned(genesis_ledger(&fluree, &model_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:  <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:allowAll a f:AccessPolicy ;
+                            f:action f:view, f:modify ;
+                            f:allow true .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M policy graph");
+
+    let data_id = "test/cross-ledger-e2e/dropped-policy-data:main";
+    let data = fluree
+        .stage_owned(genesis_ledger(&fluree, data_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow true .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        ",
+            config_iri = config_graph_iri(data_id),
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger policy config")
+        .ledger;
+    fluree
+        .drop_ledger(model_name, fluree_db_api::DropMode::Soft)
+        .await
+        .expect("drop M");
+
+    let err = fluree_db_api::build_transact_policy_context(
+        &fluree,
+        &data.snapshot,
+        data.novelty.as_ref(),
+        Some(data.novelty.as_ref()),
+        data.t(),
+        &GovernanceOptions::default(),
+    )
+    .await
+    .expect_err("an unresolvable policy source fails every write closed");
+    assert!(
+        err.to_string().contains(model_name) || err.to_string().contains("not present"),
+        "the refusal names the missing model ledger: {err}"
+    );
+}
