@@ -271,15 +271,13 @@ async fn delete_data_names_terms_exactly() {
     }
 }
 
-/// SPARQL `DELETE DATA` of typed literals whose datatype SPARQL UPDATE does
-/// not coerce today (`xsd:int`, `xsd:long`, `xsd:dateTime`): the lowering
-/// keeps the lexical form as a string, so the intent names no stored term.
-/// Before the retraction resolver that committed phantom retractions that
-/// deleted nothing; with it alone nothing is committed and the values still
-/// stay. #1988 lowers these literals through the same coercion JSON-LD uses,
-/// after which the intent names the stored term and the resolver deletes it.
+/// SPARQL `DELETE DATA` of typed literals (`xsd:int`, `xsd:long`,
+/// `xsd:dateTime`). SPARQL UPDATE used to keep their lexical form as a
+/// string, so the intent named no stored term and the delete committed
+/// phantom retractions that removed nothing. The lowering now coerces them
+/// as JSON-LD does (#1988), the intent names the stored term exactly, and
+/// the resolver deletes it.
 #[tokio::test]
-#[ignore = "needs #1988: SPARQL UPDATE keeps typed literal values"]
 async fn delete_data_of_typed_literals_deletes_them() {
     for indexed in [false, true] {
         let (_d, fluree, ledger) = seeded(
