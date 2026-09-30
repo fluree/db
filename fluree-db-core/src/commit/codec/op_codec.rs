@@ -150,6 +150,13 @@ fn encode_object(
             let name_id = dicts.object_ref.insert(sid.name.as_ref());
             encode_varint(name_id as u64, buf);
         }
+        // Commits still carry reifications as `f:reifies*` bundles; the term
+        // form is interned index-side only until the write path moves over.
+        FlakeValue::TripleTerm(_) => {
+            return Err(CommitCodecError::UnsupportedValue(
+                "triple term objects are not encodable in commits yet".into(),
+            ));
+        }
         FlakeValue::Long(n) => {
             buf.push(OTag::Long as u8);
             encode_varint(zigzag_encode(*n), buf);

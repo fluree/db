@@ -1418,6 +1418,12 @@ fn flake_to_jsonld(
         }
 
         FlakeValue::Null => serde_json::Value::Null,
+        FlakeValue::TripleTerm(_) => {
+            let dt = resolve_datatype_iri(store, o_type)
+                .unwrap_or_else(|| format!("{}tripleTerm", fluree_vocab::fluree::DB));
+            let compact_dt = compact_iri(&dt, prefixes);
+            serde_json::json!({ "@value": value.to_string(), "@type": compact_dt })
+        }
     }
 }
 
@@ -1842,6 +1848,16 @@ fn write_object<W: Write>(
         }
 
         FlakeValue::Null => Ok(()), // should have been filtered above
+        FlakeValue::TripleTerm(_) => {
+            let dt = resolve_datatype_iri(store, o_type)
+                .unwrap_or_else(|| format!("{}tripleTerm", fluree_vocab::fluree::DB));
+            let text = value.to_string();
+            w.write_all(b"\"")?;
+            syntax::write_string(w, &text)?;
+            w.write_all(b"\"^^<")?;
+            syntax::write_iri(w, &dt)?;
+            w.write_all(b">")
+        }
     }
 }
 

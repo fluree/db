@@ -158,8 +158,11 @@ impl OType {
     pub const NUM_BIG_OVERFLOW: Self = Self(0x800B);
     /// Spatial (complex geometry) — `o_key` is a spatial arena handle.
     pub const SPATIAL_COMPLEX: Self = Self(0x800C);
+    /// RDF 1.2 triple term — `o_key` is a triple-term dictionary handle
+    /// (`(inner p_id << 32) | seq`, see `fluree_db_core::triple_term`).
+    pub const TRIPLE_TERM: Self = Self(0x800D);
 
-    // Tag `10` payload range 0x800D–0xBFFF reserved for future Fluree domains.
+    // Tag `10` payload range 0x800E–0xBFFF reserved for future Fluree domains.
 
     // ── Tag `11` — rdf:langString ──────────────────────────────────────
 
@@ -430,6 +433,7 @@ impl OType {
             0x800A => DecodeKind::StringDict, // fulltext (string dict + BM25)
             0x800B => DecodeKind::NumBigArena,
             0x800C => DecodeKind::SpatialArena,
+            0x800D => DecodeKind::TripleTermDict,
             _ => DecodeKind::Sentinel, // future Fluree domains
         }
     }
@@ -489,6 +493,8 @@ pub enum DecodeKind {
     NumBigArena,
     /// Spatial arena handle (per-predicate).
     SpatialArena,
+    /// Triple-term dictionary handle (ledger-global, partitioned by inner predicate).
+    TripleTermDict,
 }
 
 impl DecodeKind {
@@ -519,6 +525,7 @@ impl DecodeKind {
             21 => Some(Self::VectorArena),
             22 => Some(Self::NumBigArena),
             23 => Some(Self::SpatialArena),
+            24 => Some(Self::TripleTermDict),
             _ => None,
         }
     }
@@ -574,6 +581,7 @@ impl fmt::Debug for OType {
             0x800A => write!(f, "OType::FULLTEXT"),
             0x800B => write!(f, "OType::NUM_BIG_OVERFLOW"),
             0x800C => write!(f, "OType::SPATIAL_COMPLEX"),
+            0x800D => write!(f, "OType::TRIPLE_TERM"),
             v if self.is_lang_string() => write!(f, "OType::LANG_STRING({})", v & 0x3FFF),
             v if self.is_customer_datatype() => {
                 write!(f, "OType::CUSTOMER({})", v & 0x3FFF)
@@ -735,6 +743,11 @@ mod tests {
             OType::NUM_BIG_OVERFLOW.decode_kind(),
             DecodeKind::NumBigArena
         );
+        assert_eq!(OType::TRIPLE_TERM.decode_kind(), DecodeKind::TripleTermDict);
+        assert_eq!(
+            DecodeKind::from_u8(DecodeKind::TripleTermDict as u8),
+            Some(DecodeKind::TripleTermDict)
+        );
         assert_eq!(OType::lang_string(5).decode_kind(), DecodeKind::StringDict);
         assert_eq!(
             OType::customer_datatype(10).decode_kind(),
@@ -768,6 +781,7 @@ mod tests {
             OType::IRI_REF,
             OType::VECTOR,
             OType::NUM_BIG_OVERFLOW,
+            OType::TRIPLE_TERM,
         ] {
             assert!(!ot.is_string_keyed(), "{ot:?}");
         }

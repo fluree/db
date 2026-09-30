@@ -516,6 +516,10 @@ pub(crate) fn format_binding(
                     "@value": v.to_string(),
                     "@type": dt_iri
                 })),
+                FlakeValue::TripleTerm(_) => Ok(json!({
+                    "@value": val.to_string(),
+                    "@type": dt_iri
+                })),
             }
         }
 

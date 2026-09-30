@@ -1517,6 +1517,9 @@ impl BinaryIndexStore {
             DecodeKind::SpatialArena => Err(io::Error::other(
                 "spatial arena decode not yet implemented in V6",
             )),
+            DecodeKind::TripleTermDict => Err(io::Error::other(
+                "triple-term decode needs the term dictionary (not yet wired)",
+            )),
         }
     }
 
@@ -2022,6 +2025,7 @@ impl BinaryIndexStore {
             OType::VECTOR => Some(Sid::new(namespaces::FLUREE_DB, "embeddingVector")),
             OType::FULLTEXT => Some(Sid::new(namespaces::FLUREE_DB, "fullText")),
             OType::GEO_POINT => Some(Sid::new(namespaces::OGC_GEO, geo_names::WKT_LITERAL)),
+            OType::TRIPLE_TERM => Some(fluree_db_core::triple_term_datatype_sid().clone()),
 
             // Types without a stable datatype (or not representable as typed literals)
             // return None so callers can either skip constraints or use a safe fallback.

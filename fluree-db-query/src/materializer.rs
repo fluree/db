@@ -107,6 +107,7 @@ impl Hash for FlakeValueKey {
             FlakeValue::DayTimeDuration(v) => v.hash(state),
             FlakeValue::Duration(v) => v.hash(state),
             FlakeValue::GeoPoint(v) => v.hash(state),
+            FlakeValue::TripleTerm(t) => t.hash(state),
         }
     }
 }
@@ -675,6 +676,7 @@ fn flake_value_to_comparable(val: &FlakeValue) -> Option<ComparableValue> {
         FlakeValue::DayTimeDuration(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
         FlakeValue::Duration(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
         FlakeValue::GeoPoint(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::TripleTerm(_) => Some(ComparableValue::String(Arc::from(val.to_string()))),
     }
 }
 

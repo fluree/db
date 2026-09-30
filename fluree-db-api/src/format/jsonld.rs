@@ -496,6 +496,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
                     FlakeValue::DayTimeDuration(v) => Ok(JsonValue::String(v.to_string())),
                     FlakeValue::Duration(v) => Ok(JsonValue::String(v.to_string())),
                     FlakeValue::GeoPoint(v) => Ok(JsonValue::String(v.to_string())),
+                    FlakeValue::TripleTerm(_) => Ok(JsonValue::String(val.to_string())),
                 };
             }
 
@@ -545,6 +546,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
                 FlakeValue::DayTimeDuration(v) => JsonValue::String(v.to_string()),
                 FlakeValue::Duration(v) => JsonValue::String(v.to_string()),
                 FlakeValue::GeoPoint(v) => JsonValue::String(v.to_string()),
+                FlakeValue::TripleTerm(_) => JsonValue::String(val.to_string()),
             };
 
             Ok(json!({

@@ -522,7 +522,7 @@ fn data_properties_from_flakes(mut flakes: Vec<Flake>) -> Vec<DataProperty> {
         // the reifier sidecar.
         if matches!(flake.o, FlakeValue::Ref(_))
             || fluree_db_core::is_rdf_type(&flake.p)
-            || fluree_db_core::is_reserved_reifies_predicate(&flake.p)
+            || fluree_db_core::is_scan_hidden_predicate(&flake.p)
         {
             continue;
         }

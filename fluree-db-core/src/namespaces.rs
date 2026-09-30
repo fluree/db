@@ -378,6 +378,37 @@ pub fn reifies_predicate_sids() -> [Sid; 7] {
     cached_reifies_predicate_sids().clone()
 }
 
+/// The cached `rdf:reifies` predicate SID: the RDF 1.2 link from a
+/// reifier to the triple term it reifies (`_:r rdf:reifies <<( s p o )>>`).
+#[inline]
+pub fn rdf_reifies_sid() -> &'static Sid {
+    static SID: OnceLock<Sid> = OnceLock::new();
+    SID.get_or_init(|| Sid::new(RDF, fluree_vocab::rdf_names::REIFIES))
+}
+
+/// True for `rdf:reifies`.
+#[inline]
+pub fn is_rdf_reifies(sid: &Sid) -> bool {
+    sid.namespace_code == RDF && sid.name.as_ref() == fluree_vocab::rdf_names::REIFIES
+}
+
+/// True for the predicates wildcard scans hide from users: the seven
+/// `f:reifies*` bundle predicates and, while the RDF 1.2 link form is
+/// index-internal, `rdf:reifies`. Read-side only; the write firewall is
+/// [`is_reserved_reifies_predicate`].
+#[inline]
+pub fn is_scan_hidden_predicate(sid: &Sid) -> bool {
+    is_reserved_reifies_predicate(sid) || is_rdf_reifies(sid)
+}
+
+/// The cached `f:tripleTerm` datatype SID carried by a triple-term object,
+/// as `@id` is carried by a reference.
+#[inline]
+pub fn triple_term_datatype_sid() -> &'static Sid {
+    static SID: OnceLock<Sid> = OnceLock::new();
+    SID.get_or_init(|| Sid::new(FLUREE_DB, fluree_db_predicates::TRIPLE_TERM))
+}
+
 /// Baseline namespace codes (code -> prefix) matching Fluree's reserved codepoints.
 pub fn default_namespace_codes() -> HashMap<u16, String> {
     let mut map = HashMap::new();

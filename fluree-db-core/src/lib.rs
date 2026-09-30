@@ -83,6 +83,7 @@ pub mod sysmem;
 pub mod task;
 pub mod temporal;
 pub mod tracking;
+pub mod triple_term;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
@@ -149,11 +150,12 @@ pub use namespaces::{
     is_owl_equivalent_class, is_owl_equivalent_property, is_owl_functional_property,
     is_owl_imports, is_owl_inverse_functional_property, is_owl_inverse_of,
     is_owl_object_property_class, is_owl_ontology_class, is_owl_same_as, is_owl_symmetric_property,
-    is_owl_transitive_property, is_rdf_first, is_rdf_nil, is_rdf_property_class, is_rdf_rest,
-    is_rdf_type, is_rdfs_domain, is_rdfs_range, is_rdfs_subclass_of, is_rdfs_subproperty_of,
-    is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
-    is_reifies_object, is_reifies_predicate, is_reifies_subject, is_reserved_reifies_predicate,
-    is_schema_class, is_schema_predicate, reifies_predicate_sids,
+    is_owl_transitive_property, is_rdf_first, is_rdf_nil, is_rdf_property_class, is_rdf_reifies,
+    is_rdf_rest, is_rdf_type, is_rdfs_domain, is_rdfs_range, is_rdfs_subclass_of,
+    is_rdfs_subproperty_of, is_reifies_datatype, is_reifies_graph, is_reifies_lang,
+    is_reifies_list_index, is_reifies_object, is_reifies_predicate, is_reifies_subject,
+    is_reserved_reifies_predicate, is_scan_hidden_predicate, is_schema_class, is_schema_predicate,
+    rdf_reifies_sid, reifies_predicate_sids, triple_term_datatype_sid,
 };
 pub use nonempty::NonEmpty;
 pub use ns_encoding::{
@@ -221,7 +223,7 @@ pub use tracking::{
 };
 pub use value::{
     parse_decimal, parse_decimal_string, parse_double, parse_integer, parse_integer_string,
-    FlakeValue, GeoPointBits,
+    FlakeValue, GeoPointBits, TripleTermValue,
 };
 pub use value_id::{ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag};
 pub use verified_identity::VerifiedIdentity;

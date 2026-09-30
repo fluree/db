@@ -1372,7 +1372,7 @@ impl<'a> HydrationFormatter<'a> {
                 // (which is what the `Pattern::EdgeAnnotation` /
                 // `AnnotationTarget` IR expansion does), but those
                 // patterns don't go through hydration.
-                if fluree_db_core::is_reserved_reifies_predicate(&pred) {
+                if fluree_db_core::is_scan_hidden_predicate(&pred) {
                     continue;
                 }
 
@@ -2267,6 +2267,7 @@ impl<'a> HydrationFormatter<'a> {
                 FlakeValue::DayTimeDuration(v) => Ok(JsonValue::String(v.to_string())),
                 FlakeValue::Duration(v) => Ok(JsonValue::String(v.to_string())),
                 FlakeValue::GeoPoint(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::TripleTerm(_) => Ok(JsonValue::String(flake.o.to_string())),
             };
         }
 
@@ -2311,6 +2312,7 @@ impl<'a> HydrationFormatter<'a> {
             FlakeValue::DayTimeDuration(v) => JsonValue::String(v.to_string()),
             FlakeValue::Duration(v) => JsonValue::String(v.to_string()),
             FlakeValue::GeoPoint(v) => JsonValue::String(v.to_string()),
+            FlakeValue::TripleTerm(_) => JsonValue::String(flake.o.to_string()),
         };
 
         Ok(json!({
@@ -2408,6 +2410,7 @@ impl<'a> HydrationFormatter<'a> {
             FlakeValue::DayTimeDuration(v) => json!(v.to_string()),
             FlakeValue::Duration(v) => json!(v.to_string()),
             FlakeValue::GeoPoint(v) => json!(v.to_string()),
+            FlakeValue::TripleTerm(_) => json!(flake.o.to_string()),
         };
 
         Ok(json!({
@@ -2535,6 +2538,7 @@ impl<'a> HydrationFormatter<'a> {
             FlakeValue::DayTimeDuration(v) => Ok(JsonValue::String(v.to_string())),
             FlakeValue::Duration(v) => Ok(JsonValue::String(v.to_string())),
             FlakeValue::GeoPoint(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::TripleTerm(_) => Ok(JsonValue::String(flake.o.to_string())),
         }
     }
 

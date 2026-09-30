@@ -327,5 +327,6 @@ fn flake_value_to_lexical(
                 ),
             });
         }
+        FlakeValue::TripleTerm(_) => o.to_string(),
     })
 }

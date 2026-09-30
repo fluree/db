@@ -631,7 +631,7 @@ fn overlay_all_subjects_count(
             // Mirror the pipeline's `?n ?p ?o` visibility: `f:reifies*` is
             // invisible to the scan but present in SPOT — its subjects must
             // not be counted.
-            if fluree_db_core::is_reserved_reifies_predicate(&flake.p) {
+            if fluree_db_core::is_scan_hidden_predicate(&flake.p) {
                 declined = true;
                 return;
             }
@@ -1085,7 +1085,7 @@ pub(crate) fn graph_has_scan_hidden_predicates(
             // Unresolvable dictionary entry — err toward declining.
             return Ok(true);
         };
-        if fluree_db_core::is_reserved_reifies_predicate(&sid)
+        if fluree_db_core::is_scan_hidden_predicate(&sid)
             && count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)? > 0
         {
             return Ok(true);

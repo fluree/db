@@ -820,7 +820,7 @@ impl BinaryScanOperator {
             // for debug / inspection workflows.
             if self.p_is_var
                 && !self.include_system_facts
-                && fluree_db_core::is_reserved_reifies_predicate(&flake.p)
+                && fluree_db_core::is_scan_hidden_predicate(&flake.p)
             {
                 continue;
             }
@@ -1201,7 +1201,7 @@ impl BinaryScanOperator {
                 None => return false,
             },
         };
-        fluree_db_core::is_reserved_reifies_predicate(sid)
+        fluree_db_core::is_scan_hidden_predicate(sid)
     }
 
     /// Enforce within-pattern repeated-variable constraints.

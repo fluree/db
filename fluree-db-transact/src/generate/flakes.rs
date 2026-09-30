@@ -617,6 +617,7 @@ pub fn infer_datatype(val: &FlakeValue) -> Sid {
         FlakeValue::DayTimeDuration(_) => DT_DAY_TIME_DURATION.clone(),
         FlakeValue::Duration(_) => DT_DURATION.clone(),
         FlakeValue::GeoPoint(_) => DT_WKT_LITERAL.clone(),
+        FlakeValue::TripleTerm(_) => fluree_db_core::triple_term_datatype_sid().clone(),
         // Null isn't a standard RDF literal; treat as xsd:string for now (MVP).
         FlakeValue::Null => DT_STRING.clone(),
     }

@@ -674,6 +674,11 @@ fn format_binding(
                     "value": v.to_string(),
                     "datatype": dt_iri
                 }))),
+                FlakeValue::TripleTerm(_) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": val.to_string(),
+                    "datatype": dt_iri
+                }))),
             }
         }
 

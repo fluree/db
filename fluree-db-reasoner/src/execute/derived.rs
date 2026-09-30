@@ -75,6 +75,15 @@ impl DerivedSet {
                     f.to_bits().hash(&mut hasher);
                 }
             }
+            FlakeValue::TripleTerm(t) => {
+                40u8.hash(&mut hasher);
+                Self::object_hash(&FlakeValue::Ref(t.s.clone())).hash(&mut hasher);
+                Self::object_hash(&FlakeValue::Ref(t.p.clone())).hash(&mut hasher);
+                Self::object_hash(&t.o).hash(&mut hasher);
+                t.dt.namespace_code.hash(&mut hasher);
+                t.dt.name.hash(&mut hasher);
+                t.lang.hash(&mut hasher);
+            }
             FlakeValue::Null => {
                 7u8.hash(&mut hasher);
             }

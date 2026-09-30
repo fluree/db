@@ -411,6 +411,7 @@ fn literal_value(val: &FlakeValue) -> Result<Option<LiteralValue>> {
         FlakeValue::DayTimeDuration(v) => LiteralValue::String(Arc::from(v.to_string())),
         FlakeValue::Duration(v) => LiteralValue::String(Arc::from(v.to_string())),
         FlakeValue::GeoPoint(v) => LiteralValue::String(Arc::from(v.to_string())),
+        FlakeValue::TripleTerm(_) => LiteralValue::String(Arc::from(val.to_string())),
     }))
 }
 
@@ -438,6 +439,9 @@ fn flake_value_to_ir_term(val: &FlakeValue) -> Result<Option<IrTerm>> {
         FlakeValue::GeoPoint(_) => Datatype::from_iri(geo::WKT_LITERAL),
         FlakeValue::Vector(_) | FlakeValue::Null | FlakeValue::Ref(_) => {
             return literal_value(val).map(|_| None)
+        }
+        FlakeValue::TripleTerm(_) => {
+            Datatype::from_iri(format!("{}tripleTerm", fluree_vocab::fluree::DB))
         }
     };
     Ok(literal_value(val)?.map(|value| IrTerm::Literal {

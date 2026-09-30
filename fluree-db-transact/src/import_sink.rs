@@ -461,6 +461,9 @@ mod inner {
                     (ObjKind::JSON_ID.as_u8(), ObjKey::encode_u32_id(id).as_u64())
                 }
                 FlakeValue::GeoPoint(bits) => (ObjKind::GEO_POINT.as_u8(), bits.0),
+                // Only the link path produces term objects, through the
+                // chunk's term table; a materialized term here has no encoding.
+                FlakeValue::TripleTerm(_) => return None,
                 FlakeValue::BigInt(bi) => {
                     use num_bigint::BigInt;
                     use std::convert::TryFrom;

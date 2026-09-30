@@ -116,6 +116,11 @@ impl ObjKind {
     /// Precision: approximately 0.3mm at the equator.
     pub const GEO_POINT: Self = Self(0x14);
 
+    /// RDF 1.2 triple term — triple-term dictionary handle (full u64,
+    /// `(inner p_id << 32) | seq`). Only ever produced by the index-side
+    /// interning of reification links; commits carry the materialized term.
+    pub const TRIPLE_TERM: Self = Self(0x15);
+
     /// Get the raw `u8` discriminant.
     #[inline]
     pub const fn as_u8(self) -> u8 {

@@ -636,6 +636,7 @@ fn write_flake_value(cell: &mut Vec<u8>, val: &FlakeValue, compactor: &IriCompac
         }
         FlakeValue::Json(json_str) => cell.extend_from_slice(json_str.as_bytes()),
         FlakeValue::GeoPoint(v) => cell.extend_from_slice(v.to_string().as_bytes()),
+        FlakeValue::TripleTerm(_) => cell.extend_from_slice(val.to_string().as_bytes()),
     }
 }
 
