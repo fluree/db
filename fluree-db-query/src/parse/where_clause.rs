@@ -807,6 +807,54 @@ mod tests {
         assert!(!query.patterns.is_empty());
     }
 
+    /// A node-level `@graph` selector in `where` is GRAPH sugar: the same
+    /// patterns as `["graph", <name>, {…}]`, nested nodes included. It used
+    /// to be parsed as a predicate named `@graph` and match nothing.
+    #[test]
+    fn node_level_graph_in_where_is_graph_sugar() {
+        let context = test_context();
+        let sugar = |where_val: JsonValue| {
+            let mut query = UnresolvedQuery::new(context.clone());
+            parse_where_test(&where_val, &context, &mut query).unwrap();
+            format!("{:?}", query.patterns)
+        };
+        let node_level = sugar(json!({
+            "@id": "?s", "@graph": "http://example.org/g",
+            "ex:p": "?o", "ex:child": {"ex:q": "?v"}
+        }));
+        let explicit = sugar(json!([[
+            "graph", "http://example.org/g",
+            {"@id": "?s", "ex:p": "?o", "ex:child": {"ex:q": "?v"}}
+        ]]));
+        assert_eq!(node_level, explicit);
+        assert!(node_level.contains("Graph"), "{node_level}");
+
+        // A variable graph and a context alias of `@graph` work the same way.
+        let aliased_ctx =
+            parse_context(&json!({"ex": "http://example.org/", "g": "@graph"})).unwrap();
+        let mut query = UnresolvedQuery::new(aliased_ctx.clone());
+        parse_where_test(
+            &json!({"@id": "?s", "g": "?graph", "ex:p": "?o"}),
+            &aliased_ctx,
+            &mut query,
+        )
+        .unwrap();
+        assert!(
+            matches!(&query.patterns[..], [UnresolvedPattern::Graph { name, .. }] if &**name == "?graph"),
+            "{:?}",
+            query.patterns
+        );
+
+        // Content is a named graph, not a pattern.
+        let mut query = UnresolvedQuery::new(context.clone());
+        assert!(parse_where_test(
+            &json!({"@id": "ex:G", "@graph": [{"@id": "?s", "ex:p": "?o"}]}),
+            &context,
+            &mut query
+        )
+        .is_err());
+    }
+
     #[test]
     fn test_parse_where_array() {
         let context = test_context();
