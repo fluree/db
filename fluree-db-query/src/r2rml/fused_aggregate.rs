@@ -407,7 +407,7 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     // projection check below still rejects any HAVING that lifts an aggregate not
     // present in the SELECT projection (that query stays on the generic path — the
     // conservative admission line). Post-aggregate BINDs are not foldable.
-    if !aggregation.binds.is_empty() {
+    if query.grouping.as_ref()?.binds().next().is_some() {
         return None;
     }
 

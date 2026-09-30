@@ -112,8 +112,7 @@ impl ExecutableQuery {
                 .iter()
                 .any(|(_, expr)| expr.contains_function(&target))
             || self.query.grouping.as_ref().is_some_and(|g| {
-                g.aggregation()
-                    .is_some_and(|a| a.binds.iter().any(|(_, e)| e.contains_function(&target)))
+                g.binds().any(|(_, e)| e.contains_function(&target))
                     || g.having().is_some_and(|h| h.contains_function(&target))
             })
     }

@@ -3683,16 +3683,14 @@ mod tests {
         let encoder = encode::MemoryEncoder::with_common_namespaces();
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
-        let agg = query
-            .grouping
-            .as_ref()
-            .and_then(|g| g.aggregation())
-            .expect("aggregation phase present");
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
         // One aggregate, one post-aggregation BIND.
         assert_eq!(agg.aggregates.len(), 1);
-        assert_eq!(agg.binds.len(), 1);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 1);
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
-        assert_eq!(agg.binds[0].0, adjusted_var);
+        assert_eq!(binds[0].0, adjusted_var);
     }
 
     #[test]
@@ -3840,18 +3838,16 @@ mod tests {
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
         // One aggregate, two post-aggregation BINDs (in select order).
-        let agg = query
-            .grouping
-            .as_ref()
-            .and_then(|g| g.aggregation())
-            .expect("aggregation phase present");
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
         assert_eq!(agg.aggregates.len(), 1);
-        assert_eq!(agg.binds.len(), 2);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 2);
 
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
         let again_var = vars.get("?again").expect("?again registered");
-        assert_eq!(agg.binds[0].0, adjusted_var);
-        assert_eq!(agg.binds[1].0, again_var);
+        assert_eq!(binds[0].0, adjusted_var);
+        assert_eq!(binds[1].0, again_var);
 
         // No leaked Pattern::Bind for these — they must NOT have been
         // pre-aggregation.

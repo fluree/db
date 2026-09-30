@@ -3936,7 +3936,8 @@ fn subquery_is_admissible(sq: &SubqueryPattern, enclosing: &[Pattern]) -> bool {
         return false;
     }
     if let Some(g) = &sq.grouping {
-        if g.aggregation().is_some_and(|a| !a.binds.is_empty()) {
+        // Per-group binds run with or without an aggregation stage.
+        if g.binds().next().is_some() {
             return false;
         }
         let outs: Vec<VarId> = g
