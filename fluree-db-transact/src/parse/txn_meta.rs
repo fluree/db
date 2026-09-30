@@ -569,6 +569,31 @@ mod tests {
         assert_eq!(names, ["author", "batch", "message"]);
     }
 
+    /// The same single-object envelope holding a bare reference (solo's MCP
+    /// wrapper around a context-free `{"@id"}` document) is still an
+    /// envelope, exactly like its one-element array form: the siblings stay
+    /// transaction metadata rather than becoming data in a graph named by
+    /// the reference.
+    #[test]
+    fn single_bare_reference_envelope_keeps_its_txn_meta() {
+        let mut ns = test_registry();
+        let ctx = fluree_graph_json_ld::parse_context(&json!({
+            "f": "https://ns.flur.ee/db#",
+            "ex": "http://example.org/"
+        }))
+        .unwrap();
+        for graph in [
+            json!({"@id": "http://example.org/X"}),
+            json!([{"@id": "http://example.org/X"}]),
+        ] {
+            let json = json!({"@graph": graph, "f:message": "hello", "ex:batch": 7});
+            let result = extract_txn_meta(&json, &ctx, &mut ns, true).unwrap();
+            let mut names: Vec<&str> = result.iter().map(|e| e.predicate_name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["batch", "message"], "{json}");
+        }
+    }
+
     #[test]
     fn test_boolean_value() {
         let mut ns = test_registry();

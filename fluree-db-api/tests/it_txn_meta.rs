@@ -201,6 +201,62 @@ async fn test_jsonld_single_object_no_meta() {
         .await;
 }
 
+/// solo's MCP `stamp_provenance` wraps an agent document as
+/// `{"@graph": <doc>, f:message, f:author, …}`. For a context-free bare
+/// reference that is `{"@graph": {"@id": X}, …}`: an envelope holding a node
+/// with no properties, refused exactly like its one-element array form. It
+/// must not become a node writing the provenance as data into a new graph
+/// named `X`.
+#[tokio::test]
+async fn single_bare_reference_envelope_is_refused_like_its_array_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/txn-meta-bare-reference:main";
+    let wrapped = |doc: serde_json::Value| {
+        json!({
+            "@graph": doc,
+            "https://ns.flur.ee/db#message": "agent did it",
+            "https://ns.flur.ee/db#author": {"@id": "urn:fsys:agent:a1"},
+            "https://ns.flur.ee/task#taskReference": {"@id": "urn:fsys:space:s1"}
+        })
+    };
+    let object_form = wrapped(json!({"@id": "http://example.org/X"}));
+    let array_form = wrapped(json!([{"@id": "http://example.org/X"}]));
+
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let outcome = |r: fluree_db_api::Result<fluree_db_api::TransactResult>| match r {
+        Ok(result) => format!("committed t={}", result.receipt.t),
+        Err(e) => e.to_string(),
+    };
+    let insert_object = outcome(fluree.insert(ledger.clone(), &object_form).await);
+    let insert_array = outcome(fluree.insert(ledger.clone(), &array_form).await);
+    assert_eq!(
+        insert_object, insert_array,
+        "insert: one shape, one reading"
+    );
+    assert!(
+        !insert_object.starts_with("committed"),
+        "a bare reference has nothing to insert: {insert_object}"
+    );
+    let upsert_object = outcome(fluree.upsert(ledger.clone(), &object_form).await);
+    let upsert_array = outcome(fluree.upsert(ledger, &array_form).await);
+    assert_eq!(
+        upsert_object, upsert_array,
+        "upsert: one shape, one reading"
+    );
+
+    // Whatever was accepted, no graph is named after the reference.
+    if let Ok(ledger) = fluree.ledger(ledger_id).await {
+        assert!(
+            ledger
+                .snapshot
+                .graph_registry
+                .graph_id_for_iri("http://example.org/X")
+                .is_none(),
+            "the reference must not become a graph"
+        );
+    }
+}
+
 /// P10e: a single object carrying a graph selector is a node, not an
 /// envelope. Its other keys are its data in the selected graph and nothing
 /// else; they used to be written as data AND as txn-meta on the commit.
