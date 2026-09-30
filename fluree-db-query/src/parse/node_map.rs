@@ -526,6 +526,34 @@ pub fn parse_node_map(
 ) -> Result<()> {
     let context = &ctx.context;
 
+    // A node-level `@graph` selector is GRAPH sugar: this node's patterns
+    // (and those of the nodes nested in it) match in the named graph, exactly
+    // as `["graph", <name>, {…this node…}]` does, and as the same key scopes
+    // the node in an insert or delete. The name follows the where-clause GRAPH
+    // rule: an alias or the graph's IRI as written. (It used to be read as a
+    // predicate named `@graph`, so the pattern matched nothing.)
+    if let Some((graph_key, name)) = node_graph_selector(map, context)? {
+        // Every other entry, in order (pattern order is the written order).
+        let inner_map: serde_json::Map<String, JsonValue> = map
+            .iter()
+            .filter(|(k, _)| k.as_str() != graph_key)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut inner = UnresolvedQuery::new(context.clone());
+        parse_node_map(
+            &inner_map,
+            ctx,
+            &mut inner,
+            subject_counter,
+            nested_counter,
+            object_var_parsing,
+        )?;
+        query
+            .patterns
+            .push(UnresolvedPattern::graph(name, inner.patterns));
+        return Ok(());
+    }
+
     // Check for vector search pattern first (has f:queryVector)
     if is_vector_search_pattern(map, context) {
         return parse_vector_search_pattern(map, context, query);
@@ -612,6 +640,31 @@ pub fn parse_node_map(
     }
 
     Ok(())
+}
+
+/// The graph a where node-map selects with a node-level `@graph` (the keyword
+/// or a context alias of it; a bare `graph` key stays a property in a
+/// pattern), with the key it was found under.
+fn node_graph_selector<'m>(
+    map: &'m serde_json::Map<String, JsonValue>,
+    context: &ParsedContext,
+) -> Result<Option<(&'m str, &'m str)>> {
+    let Some((key, value)) = map.iter().find(|(k, _)| {
+        k.as_str() == "@graph" || context.get(k).and_then(|e| e.id.as_deref()) == Some("@graph")
+    }) else {
+        return Ok(None);
+    };
+    match fluree_graph_json_ld::classify_graph_value(value) {
+        fluree_graph_json_ld::GraphValue::Selector(name) => Ok(Some((key.as_str(), name))),
+        fluree_graph_json_ld::GraphValue::Content(_) => Err(ParseError::InvalidWhere(
+            "a node with `@graph` content (a JSON-LD named graph) is not a where pattern; \
+             use [\"graph\", <name>, <pattern>]"
+                .to_string(),
+        )),
+        fluree_graph_json_ld::GraphValue::Invalid(why) => {
+            Err(ParseError::InvalidWhere(why.to_string()))
+        }
+    }
 }
 
 /// Parse the subject (@id value)

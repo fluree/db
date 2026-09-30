@@ -586,4 +586,58 @@ async fn annotation_under_the_ledger_address_lands_in_the_default_graph() {
         Some("Engineer"),
         "the annotation is with its edge in the default graph"
     );
+
+/// D-B6: a node-level `@graph` in `where` scopes the pattern to the graph, as
+/// `["graph", g, …]` and SPARQL `GRAPH <g>` do. A query returns the graph's
+/// rows, and an update's WHERE matches: it used to match nothing, so the
+/// update committed nothing and the target survived.
+#[tokio::test]
+async fn node_level_graph_in_where_scopes_the_pattern() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = sparql_update(
+        &fluree,
+        genesis_ledger(&fluree, "it/scope-where-graph:main"),
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA {{ GRAPH <{G}> {{ ex:s ex:p \"in-g\" }} ex:s ex:p \"in-default\" }}"
+        ),
+    )
+    .await;
+
+    let rows = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": "?o",
+            "where": {"@id": "ex:s", "@graph": G, "ex:p": "?o"}
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("jsonld");
+    assert_eq!(
+        rows,
+        json!(["in-g"]),
+        "the pattern matched in the graph only"
+    );
+
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "where": {"@id": "?s", "@graph": G, "ex:p": "?o"},
+                "delete": {"@id": "?s", "@graph": G, "ex:p": "?o"}
+            }),
+        )
+        .await
+        .expect("update")
+        .ledger;
+    assert!(
+        values(&fluree, &ledger, Some(G), "p").await.is_empty(),
+        "deleted in the graph"
+    );
+    assert_eq!(values(&fluree, &ledger, None, "p").await, ["in-default"]);
 }
