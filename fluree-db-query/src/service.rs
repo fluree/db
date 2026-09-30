@@ -32,7 +32,7 @@ use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::DatatypeConstraint;
-use fluree_db_core::{format_ledger_id, split_ledger_id, FlakeValue};
+use fluree_db_core::{FlakeValue, LedgerRef};
 use std::sync::Arc;
 
 /// Fluree ledger SERVICE endpoint prefix
@@ -111,20 +111,20 @@ impl ServiceOperator {
 
     /// Parse a Fluree ledger reference from an endpoint IRI
     ///
-    /// Format: `fluree:ledger:<name>` or `fluree:ledger:<name>:<branch>`
+    /// Format: `fluree:ledger:<address>`, where the address is a ledger's
+    /// `name[:branch]`, optionally `urn:fluree:`-prefixed. A SERVICE endpoint
+    /// names a whole ledger, whose time and graphs come from the dataset, so an
+    /// address that pins a time or names a graph is malformed here.
     ///
-    /// Returns the full ledger ID string that matches dataset storage format.
+    /// Returns the canonical ledger ID that matches dataset storage format.
     /// - `fluree:ledger:orders` → `"orders:main"` (defaults to :main branch)
     /// - `fluree:ledger:orders:main` → `"orders:main"`
     /// - `fluree:ledger:orders:dev` → `"orders:dev"`
+    /// - `fluree:ledger:urn:fluree:orders:dev` → `"orders:dev"`
     fn parse_fluree_ledger_ref(endpoint: &str) -> Option<String> {
         let rest = endpoint.strip_prefix(FLUREE_LEDGER_PREFIX)?;
-        if rest.is_empty() {
-            return None;
-        }
-
-        let (name, branch) = split_ledger_id(rest).ok()?;
-        Some(format_ledger_id(&name, &branch))
+        let address = LedgerRef::parse(rest).ok()?;
+        address.is_bare().then(|| address.into_id().to_string())
     }
 
     /// Check if an endpoint is a local Fluree ledger reference
@@ -156,9 +156,22 @@ impl ServiceOperator {
         bind_endpoint_var: Option<VarId>,
         endpoint_iri: &str,
     ) -> Result<()> {
-        // Look up the ledger in the dataset
+        // Look up the ledger in the dataset. An endpoint that is not a member is
+        // not the current dataset (which would answer for another ledger with
+        // this dataset's data) and is never loaded here (a SERVICE endpoint is
+        // not authorized the way a dataset member is): it is a caller error, or
+        // no rows under SILENT.
         let graph_ref = if let Some(ds) = &ctx.dataset {
-            ds.find_by_ledger_id(full_ledger_ref)
+            match ds.find_by_ledger_id(full_ledger_ref) {
+                Some(graph_ref) => Some(graph_ref),
+                None if self.service.silent => return Ok(()),
+                None => {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "SERVICE endpoint names ledger '{full_ledger_ref}', which is not in this \
+                         query's dataset; add it with FROM NAMED to query it"
+                    )))
+                }
+            }
         } else {
             // No dataset - check if alias matches the current db
             if ctx.active_snapshot.ledger_id != full_ledger_ref {
@@ -518,7 +531,7 @@ impl Operator for ServiceOperator {
                                 );
                             } else {
                                 return Err(QueryError::InvalidQuery(format!(
-                                    "Invalid fluree:ledger endpoint format: '{iri}'. Expected 'fluree:ledger:<alias>' or 'fluree:ledger:<alias>:<branch>'"
+                                    "Invalid fluree:ledger endpoint format: '{iri}'. Expected 'fluree:ledger:<alias>' or 'fluree:ledger:<alias>:<branch>', with no time or graph"
                                 )));
                             }
                         } else if is_fluree_remote_endpoint(iri) {
@@ -746,6 +759,30 @@ mod tests {
             ServiceOperator::parse_fluree_ledger_ref("fluree:ledger::main"),
             None
         );
+
+        // Valid: the `urn:fluree:` spelling of the same address
+        assert_eq!(
+            ServiceOperator::parse_fluree_ledger_ref("fluree:ledger:urn:fluree:orders:dev"),
+            Some("orders:dev".to_string())
+        );
+        assert_eq!(
+            ServiceOperator::parse_fluree_ledger_ref("fluree:ledger:urn:fluree:orders"),
+            Some("orders:main".to_string())
+        );
+
+        // Invalid: an endpoint names a whole ledger; its time and graphs come
+        // from the dataset
+        for endpoint in [
+            "fluree:ledger:orders@t:3",
+            "fluree:ledger:orders:main#txn-meta",
+            "fluree:ledger:orders#http://example.org/g",
+        ] {
+            assert_eq!(
+                ServiceOperator::parse_fluree_ledger_ref(endpoint),
+                None,
+                "{endpoint}"
+            );
+        }
     }
 
     #[test]
