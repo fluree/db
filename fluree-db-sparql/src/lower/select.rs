@@ -14,8 +14,8 @@ use crate::span::SourceSpan;
 use fluree_db_query::ir::pattern::produced_vars_of;
 use fluree_db_query::ir::AggregateSpec;
 use fluree_db_query::ir::{
-    having_as_filter, sample_ungrouped_reads, Expression, FlakeValue, Grouping, Pattern,
-    SelectExprPlacement, SelectExprPlacer, SubqueryPattern,
+    having_as_filter, read_as_unbound, sample_ungrouped_reads, Expression, FlakeValue, Grouping,
+    Pattern, SelectExprPlacement, SelectExprPlacer, SubqueryPattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::sort::{SortDirection, SortSpec};
@@ -167,16 +167,19 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// the SELECT expressions. Shared by the top level and sub-SELECTs.
     ///
     /// `patterns` are the level's WHERE patterns; the WHERE-side additions are
-    /// appended to them. A trailing VALUES clause is not among them: it joins
-    /// after HAVING (§18.2.4), so its variables are not bound before grouping.
+    /// appended to them. `having_unbound` are the variables of the level's
+    /// trailing VALUES clause that its WHERE does not bind: the clause joins
+    /// after HAVING (§18.2.4), so HAVING reads them as unbound.
     pub(super) fn lower_select_level(
         &mut self,
         select: &SelectClause,
         modifiers: &SolutionModifiers,
         patterns: &mut Vec<Pattern>,
+        having_unbound: &HashSet<VarId>,
     ) -> Result<LoweredSelectLevel> {
         let mut where_vars = produced_vars_of(patterns);
-        let mut lowered = self.lower_solution_modifiers(modifiers, select, &where_vars)?;
+        let mut lowered =
+            self.lower_solution_modifiers(modifiers, select, &where_vars, having_unbound)?;
         // One definition of "groups": validation (V4) reads it off the AST,
         // lowering off the lowered keys and aggregates.
         debug_assert_eq!(
@@ -311,13 +314,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     /// Lower solution modifiers (DISTINCT, LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING)
     ///
-    /// `where_vars` are the variables the level's WHERE (and a trailing VALUES,
-    /// which Fluree joins before grouping) binds.
+    /// `where_vars` are the variables the level binds before grouping: its
+    /// WHERE, and a sub-SELECT's trailing VALUES, which joins there.
+    /// `having_unbound` are the trailing VALUES variables its WHERE does not
+    /// bind (see [`Self::lower_select_level`]).
     pub(super) fn lower_solution_modifiers(
         &mut self,
         modifiers: &SolutionModifiers,
         select: &SelectClause,
         where_vars: &HashSet<VarId>,
+        having_unbound: &HashSet<VarId>,
     ) -> Result<LoweredModifiers> {
         let distinct = select.modifier == Some(SelectModifier::Distinct);
         let mut group_by: Vec<VarId> = Vec::new();
@@ -451,6 +457,25 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // Per SPARQL semantics, all non-aggregated SELECT variables must be in GROUP BY
         if !aggregates.is_empty() && group_by.is_empty() {
             group_by = self.collect_non_aggregate_select_vars(select);
+        }
+
+        // A trailing VALUES clause joins after HAVING (§18.2.4), so HAVING reads
+        // its variables as unbound unless the level binds them first: in the
+        // WHERE (the caller left those out), as a key or as an aggregate. This
+        // runs before the SAMPLE rewrite below, which a sub-SELECT's VALUES
+        // variables would otherwise reach (its VALUES joins before grouping).
+        if let Some(having) = having.as_mut() {
+            let unbound: HashSet<VarId> = having_unbound
+                .iter()
+                .copied()
+                .filter(|v| {
+                    !group_by.contains(v) && !aggregates.iter().any(|spec| spec.output_var == *v)
+                })
+                .collect();
+            let vars = &mut self.vars;
+            read_as_unbound(having, &unbound, &mut |_| {
+                vars.get_or_insert(&format!("?__having_unbound_{}", vars.len()))
+            });
         }
 
         // In a grouping level, a HAVING / ORDER BY read of a non-key variable
@@ -752,11 +777,20 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // modifier-free subquery this is exactly the spec's
         // `M := Join(M, ToMultiSet(data))` insertion point (§18.2.4.3, which
         // applies VALUES before Project); with GROUP BY it approximates the
-        // spec by joining before grouping rather than after HAVING. Appended
-        // before the `SELECT *` var computation below so VALUES-introduced
-        // variables are in scope of `*`.
+        // spec by joining before grouping rather than after HAVING. HAVING
+        // still reads the VALUES variables the WHERE does not bind as unbound,
+        // as it would after HAVING (`lower_select_level`). Appended before the
+        // `SELECT *` var computation below so VALUES-introduced variables are
+        // in scope of `*`.
+        let mut having_unbound: HashSet<VarId> = HashSet::new();
         if let Some(values) = &subselect.values {
-            patterns.extend(self.lower_graph_pattern(values)?);
+            let values = self.lower_graph_pattern(values)?;
+            let where_vars = produced_vars_of(&patterns);
+            having_unbound = produced_vars_of(&values)
+                .into_iter()
+                .filter(|v| !where_vars.contains(v))
+                .collect();
+            patterns.extend(values);
         }
 
         // Build a SelectClause so the shared SELECT/modifier lowering applies.
@@ -806,7 +840,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         // Solution modifiers, SELECT expressions and HAVING through the same
         // path as a top-level SELECT.
-        let level = self.lower_select_level(&select_clause, &subselect.modifiers, &mut patterns)?;
+        let level = self.lower_select_level(
+            &select_clause,
+            &subselect.modifiers,
+            &mut patterns,
+            &having_unbound,
+        )?;
 
         // `SELECT *` of a grouping level projects its keys; implicit grouping
         // has none, so the sub-SELECT exports nothing and keeps its row count.
