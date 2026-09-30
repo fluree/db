@@ -178,6 +178,15 @@ pub struct Txn {
     /// registers any that are new.
     pub write_graphs: BTreeSet<String>,
 
+    /// The update's template default graph: the IRI of SPARQL `WITH <iri>` or
+    /// of a JSON-LD update's top-level `graph`. Lowering writes every template
+    /// that names no graph itself to it (marking the template
+    /// [`TripleTemplate::graph_from_template_default`]) and lists it in
+    /// [`Txn::write_graphs`]. When it is this ledger's own address (see
+    /// `names_ledger`), staging writes those templates to the ledger's
+    /// default graph instead, the graph the WHERE reads for that IRI.
+    pub template_default_graph: Option<String>,
+
     /// Namespace allocations made during lowering that the staging path must
     /// merge into its own registry before flake generation.
     ///
@@ -301,6 +310,7 @@ impl Txn {
             vars: VarRegistry::new(),
             txn_meta: Vec::new(),
             write_graphs: BTreeSet::new(),
+            template_default_graph: None,
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
             sync_graph: None,
@@ -511,6 +521,12 @@ pub struct TripleTemplate {
 
     /// The graph this template writes to.
     pub graph: TemplateGraph,
+
+    /// Whether [`graph`](Self::graph) is the update's template default graph
+    /// ([`Txn::template_default_graph`]) rather than a graph the template
+    /// names itself (`GRAPH <iri>`, `@graph`, `["graph", …]`, a data quad, a
+    /// TriG block).
+    pub graph_from_template_default: bool,
 }
 
 impl TripleTemplate {
@@ -523,6 +539,7 @@ impl TripleTemplate {
             dtc: None,
             list_index: None,
             graph: TemplateGraph::Default,
+            graph_from_template_default: false,
         }
     }
 
@@ -542,12 +559,22 @@ impl TripleTemplate {
     /// [`Txn::write_graphs`].
     pub fn in_graph(mut self, iri: impl Into<Arc<str>>) -> Self {
         self.graph = TemplateGraph::Iri(iri.into());
+        self.graph_from_template_default = false;
+        self
+    }
+
+    /// Write to the update's template default graph `iri` (SPARQL `WITH`,
+    /// JSON-LD top-level `graph`; see [`Txn::template_default_graph`]).
+    pub fn in_template_default_graph(mut self, iri: impl Into<Arc<str>>) -> Self {
+        self.graph = TemplateGraph::Iri(iri.into());
+        self.graph_from_template_default = true;
         self
     }
 
     /// Write to the graph named by `var`'s binding in each WHERE solution.
     pub fn with_graph_var(mut self, var: VarId) -> Self {
         self.graph = TemplateGraph::Var(var);
+        self.graph_from_template_default = false;
         self
     }
 }
@@ -563,6 +590,30 @@ pub enum TemplateGraph {
     /// `GRAPH ?g`: the graph named by this variable's binding in each WHERE
     /// solution, resolved at staging time.
     Var(VarId),
+}
+
+/// Whether the graph IRI `iri` is the address of the ledger `ledger_id`: any
+/// spelling [`LedgerRef::parse`](fluree_db_core::LedgerRef::parse) accepts
+/// (`name`, `name:branch`, `urn:fluree:…`), with no time pin and no graph
+/// fragment.
+///
+/// Only an update's default-graph positions consult it, and they read such an
+/// IRI as the ledger's default graph (the within-ledger convention, D-3): the
+/// WHERE's default graph (`USING`, `WITH`, JSON-LD `from` and top-level
+/// `graph`) and the template default graph (`WITH`, JSON-LD top-level
+/// `graph`). Every other graph position resolves the IRI through the graph
+/// registry like any other IRI: `GRAPH <iri>` in a template or in the WHERE,
+/// `GRAPH ?g`, `USING NAMED`, JSON-LD `fromNamed`, `@graph` and
+/// `["graph", …]`, data quads and TriG blocks.
+pub(crate) fn names_ledger(ledger_id: &fluree_db_core::LedgerId, iri: &str) -> bool {
+    // Every spelling starts with the ledger name, so most IRIs are rejected
+    // without parsing (a parse allocates the canonical id).
+    let body = iri
+        .strip_prefix(fluree_db_core::ledger_id::LEDGER_URN_PREFIX)
+        .unwrap_or(iri);
+    body.starts_with(ledger_id.name())
+        && fluree_db_core::LedgerRef::parse(iri)
+            .is_ok_and(|r| r.at.is_none() && r.fragment.is_none() && r.id == *ledger_id)
 }
 
 /// A term in a triple template

@@ -495,6 +495,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
                 .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
+        ctx.default_graph_is_template_default = template_default_graph.is_some();
         let templates = parse_update_templates_with_ctx(delete_val, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
         // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
@@ -541,6 +542,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
                 .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
+        ctx.default_graph_is_template_default = template_default_graph.is_some();
         let templates = parse_update_templates_with_ctx(insert_val, &mut ctx)?;
         if templates.is_empty() {
             return Err(TransactError::Parse(
@@ -561,6 +563,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_opts(opts)
         .with_txn_meta(txn_meta);
     txn.write_graphs = write_graphs.iris();
+    txn.template_default_graph = template_default_graph.map(|(_, iri)| iri);
     txn.update_where_default_graph_iris = Some(where_default_graph_iris);
     txn.update_where_named_graphs = where_named_graphs;
 
@@ -856,6 +859,10 @@ struct TemplateParseCtx<'a> {
     strict_compact_iri: bool,
     write_graphs: &'a mut WriteGraphs,
     default_graph: Option<Arc<str>>,
+    /// Whether `default_graph` is the update's top-level `graph` (the
+    /// template default, [`Txn::template_default_graph`]) rather than the
+    /// graph of an enclosing `["graph", <iri>, …]` wrapper.
+    default_graph_is_template_default: bool,
     from_named_aliases: &'a HashMap<String, String>,
     blank_counter: usize,
 }
@@ -880,6 +887,7 @@ impl<'a> TemplateParseCtx<'a> {
             strict_compact_iri,
             write_graphs,
             default_graph,
+            default_graph_is_template_default: false,
             from_named_aliases,
             blank_counter: 0,
         }
@@ -966,8 +974,12 @@ fn parse_update_templates_with_ctx(
                     })?;
                     let expanded = ctx.expand_document(&arr[2])?;
                     let prev_default = ctx.default_graph.replace(graph.0);
+                    // The wrapper names its graph: not the template default.
+                    let prev_is_template_default =
+                        std::mem::replace(&mut ctx.default_graph_is_template_default, false);
                     let templates = parse_expanded_triples_with_ctx(&expanded, ctx)?;
                     ctx.default_graph = prev_default;
+                    ctx.default_graph_is_template_default = prev_is_template_default;
                     out.extend(templates);
                     continue;
                 }
@@ -1378,7 +1390,19 @@ fn parse_expanded_object_with_ctx(
             Ok(ctx.write_graphs.get_or_assign(&resolved))
         })
         .transpose()?;
+    // A node with no `@graph` of its own takes the default: the update's
+    // template default (top-level `graph`) or an enclosing wrapper's graph.
+    let graph_from_template_default = node_graph.is_none()
+        && ctx.default_graph.is_some()
+        && ctx.default_graph_is_template_default;
     let node_graph = node_graph.or_else(|| ctx.default_graph.clone());
+    let place = |t: TripleTemplate| match &node_graph {
+        Some(graph) if graph_from_template_default => {
+            t.in_template_default_graph(Arc::clone(graph))
+        }
+        Some(graph) => t.in_graph(Arc::clone(graph)),
+        None => t,
+    };
 
     // Get subject from @id (already expanded IRI or variable)
     let subject = if let Some(id) = obj.get("@id") {
@@ -1415,10 +1439,11 @@ fn parse_expanded_object_with_ctx(
                     } else {
                         TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(type_iri))
                     };
-                    let mut t = TripleTemplate::new(subject.clone(), predicate.clone(), object);
-                    if let Some(graph) = &node_graph {
-                        t = t.in_graph(Arc::clone(graph));
-                    }
+                    let t = place(TripleTemplate::new(
+                        subject.clone(),
+                        predicate.clone(),
+                        object,
+                    ));
                     templates.push(t);
                 } else {
                     return Err(TransactError::Parse(format!(
@@ -1446,11 +1471,11 @@ fn parse_expanded_object_with_ctx(
         let parsed_values = parse_expanded_objects_with_ctx(value, ctx, &mut templates)?;
 
         for parsed_value in parsed_values {
-            let mut template =
-                TripleTemplate::new(subject.clone(), predicate.clone(), parsed_value.term);
-            if let Some(graph) = &node_graph {
-                template = template.in_graph(Arc::clone(graph));
-            }
+            let mut template = place(TripleTemplate::new(
+                subject.clone(),
+                predicate.clone(),
+                parsed_value.term,
+            ));
             if let Some(dtc) = parsed_value.dtc {
                 template = template.with_dtc(dtc);
             }

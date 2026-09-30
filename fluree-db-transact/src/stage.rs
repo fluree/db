@@ -12,7 +12,8 @@ use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
 use crate::ir::InlineValues;
 use crate::ir::{
-    GraphMgmtOp, GraphSel, GraphTarget, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnType,
+    names_ledger, GraphMgmtOp, GraphSel, GraphTarget, TemplateGraph, TemplateTerm, TripleTemplate,
+    Txn, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::comparator::IndexType;
@@ -753,6 +754,10 @@ pub async fn stage_with_graph_delta(
             .clone()
             .unwrap_or_else(generate_txn_id);
 
+        // A `WITH`/`graph` template default that is this ledger's own address
+        // writes the ledger's default graph, the graph the WHERE reads for it.
+        template_default_address_to_default_graph(&mut txn, &ledger.snapshot.ledger_id);
+
         // B2 (data writes): `#txn-meta` is never a write target (see
         // `refuse_txn_meta_write`). `txn.write_graphs` holds the fixed write
         // targets — a `GRAPH <iri>` block, a `WITH <iri>` default, a sync
@@ -1161,6 +1166,39 @@ fn refuse_txn_meta_write(ledger: &LedgerState, iri: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// SPARQL `WITH <iri>` and a JSON-LD update's top-level `graph` name the
+/// update's template default graph ([`Txn::template_default_graph`]). With no
+/// `USING`/`from`, the WHERE reads the same IRI as its default graph
+/// (`resolve_where_default_graph`), and when the IRI is this ledger's own
+/// address ([`names_ledger`]) that is the ledger's default graph. Make the
+/// write half agree: the templates that took the default write the default
+/// graph, and the IRI is not registered as a named graph unless a template
+/// names it itself. Templates that name their graph are left alone.
+fn template_default_address_to_default_graph(txn: &mut Txn, ledger_id: &fluree_db_core::LedgerId) {
+    let Some(iri) = txn.template_default_graph.clone() else {
+        return;
+    };
+    if !names_ledger(ledger_id, &iri) {
+        return;
+    }
+    let mut named_by_a_template = false;
+    for template in txn
+        .insert_templates
+        .iter_mut()
+        .chain(txn.delete_templates.iter_mut())
+    {
+        if template.graph_from_template_default {
+            template.graph = TemplateGraph::Default;
+            template.graph_from_template_default = false;
+        } else if matches!(&template.graph, TemplateGraph::Iri(g) if **g == *iri) {
+            named_by_a_template = true;
+        }
+    }
+    if !named_by_a_template {
+        txn.write_graphs.remove(&iri);
+    }
 }
 
 /// Ledger graph id → IRI for the named graphs `iris`. Unregistered graphs get
@@ -2722,14 +2760,11 @@ async fn stream_where_into_accumulator(
     };
 
     // A WHERE default graph named by `USING`, `WITH` or JSON-LD `from`/`graph`:
-    // this ledger's own address names its default graph (the within-ledger
-    // `FROM` convention, D-3), a registered IRI names that graph, and anything
-    // else names a graph that does not exist here, so `None`.
+    // this ledger's own address names its default graph (see `names_ledger`),
+    // a registered IRI names that graph, and anything else names a graph that
+    // does not exist here, so `None`.
     let resolve_where_default_graph = |iri: &str| -> Option<GraphId> {
-        let names_this_ledger = fluree_db_core::LedgerRef::parse(iri).is_ok_and(|r| {
-            r.at.is_none() && r.fragment.is_none() && r.id == ledger.snapshot.ledger_id
-        });
-        if names_this_ledger {
+        if names_ledger(&ledger.snapshot.ledger_id, iri) {
             return Some(0);
         }
         resolve_graph_id(iri)
