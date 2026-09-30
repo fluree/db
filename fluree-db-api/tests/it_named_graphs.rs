@@ -4385,3 +4385,188 @@ async fn a_missing_ledger_reads_as_not_found_at_every_entry_point() {
         .expect("refresh")
         .is_none());
 }
+
+const W_G1: &str = "http://example.org/w/g1";
+const W_NEWG: &str = "http://example.org/w/newg";
+
+/// Default graph `ex:a ex:v "d1" . ex:b ex:v "d2"`; `<g1>` holds `ex:c ex:v "g1"`.
+fn where_dataset_seed() -> String {
+    format!(
+        r#"PREFIX ex: <http://example.org/>
+           INSERT DATA {{
+               ex:a ex:v "d1" . ex:b ex:v "d2" .
+               GRAPH <{W_G1}> {{ ex:c ex:v "g1" }}
+           }}"#
+    )
+}
+
+/// What one update case should leave behind.
+enum WhereExpect {
+    /// Triples in (the default graph, `<g1>`, `<newg>`).
+    Counts([usize; 3]),
+    /// The update is refused, with this in the message, and nothing changes.
+    Refused(&'static str),
+}
+
+/// Run one update case on a fresh seeded ledger. `LEDGER`, `SHORT` and `URN`
+/// in the update stand for the ledger's id, its name without the branch, and
+/// its `urn:fluree:` spelling.
+async fn run_where_dataset_case(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    update: WhereUpdate<'_>,
+) -> std::result::Result<[usize; 3], String> {
+    let short = ledger_id.strip_suffix(":main").expect(":main ledger id");
+    let fill = |text: &str| {
+        text.replace("URN", &format!("urn:fluree:{ledger_id}"))
+            .replace("LEDGER", ledger_id)
+            .replace("SHORT", short)
+    };
+    let ledger = run_sparql_update(
+        fluree,
+        genesis_ledger(fluree, ledger_id),
+        &where_dataset_seed(),
+    )
+    .await
+    .ledger;
+    let outcome = match update {
+        WhereUpdate::Sparql(text) => try_sparql_update(fluree, ledger, &fill(text)).await,
+        WhereUpdate::JsonLd(json) => {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&fill(&json.to_string())).expect("update json");
+            json["@context"] = json!({"ex": "http://example.org/"});
+            fluree.update(ledger, &json).await
+        }
+    };
+    let ledger = outcome.map_err(|e| e.to_string())?.ledger;
+    Ok([
+        count_in_default(fluree, &ledger).await,
+        count_in_graph(fluree, &ledger, W_G1).await,
+        count_in_graph(fluree, &ledger, W_NEWG).await,
+    ])
+}
+
+enum WhereUpdate<'a> {
+    Sparql(&'a str),
+    JsonLd(&'a serde_json::Value),
+}
+
+/// An update's WHERE-dataset references (`USING`, `USING NAMED`, `WITH`,
+/// JSON-LD `from` / `graph`) resolve in the transaction's ledger through the
+/// table a query's FROM uses. The ledger's own address names its default graph
+/// in every spelling and in both branches, `L#config` names the config graph,
+/// and a graph the ledger does not have names an empty graph, so the WHERE
+/// binds nothing (SPARQL 1.1 Update §3.1.3, Query §13.2). An unknown graph
+/// used to read the real default graph, so a DELETE emptied it; a
+/// multi-`USING` dropped the ledger's address; JSON-LD refused
+/// `"from": "L:main"` as an undefined prefix. Another ledger, or a
+/// pinned address, is refused.
+#[tokio::test]
+async fn update_where_dataset_references_resolve_in_the_transactions_ledger() {
+    use WhereExpect::{Counts, Refused};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ex = "PREFIX ex: <http://example.org/> ";
+    let (g1, newg) = (W_G1, W_NEWG);
+    let delete_using =
+        |using: &str| format!("{ex}DELETE {{ ?s ex:v ?o }} {using} WHERE {{ ?s ex:v ?o }}");
+    let sparql: Vec<(&str, String, WhereExpect)> = vec![
+        ("USING an unknown graph", delete_using("USING <http://example.org/typo>"), Counts([2, 1, 0])),
+        (
+            "WITH a new graph",
+            format!("{ex}WITH <{newg}> INSERT {{ ?s ex:copy ?o }} WHERE {{ ?s ex:v ?o }}"),
+            Counts([2, 1, 0]),
+        ),
+        ("USING the ledger's id", delete_using("USING <LEDGER>"), Counts([0, 1, 0])),
+        (
+            "USING two unknown graphs",
+            delete_using("USING <http://example.org/t1> USING <http://example.org/t2>"),
+            Counts([2, 1, 0]),
+        ),
+        ("USING <g1>, default-graph template", delete_using(&format!("USING <{g1}>")), Counts([2, 1, 0])),
+        (
+            "USING <g1>, GRAPH <g1> template",
+            format!("{ex}DELETE {{ GRAPH <{g1}> {{ ?s ex:v ?o }} }} USING <{g1}> WHERE {{ ?s ex:v ?o }}"),
+            Counts([2, 0, 0]),
+        ),
+        ("USING the ledger's id and <g1>", delete_using(&format!("USING <LEDGER> USING <{g1}>")), Counts([0, 1, 0])),
+        ("USING the ledger's name", delete_using("USING <SHORT>"), Counts([0, 1, 0])),
+        ("USING the ledger's URN", delete_using("USING <URN>"), Counts([0, 1, 0])),
+        ("USING <L#config>", delete_using("USING <LEDGER#config>"), Counts([2, 1, 0])),
+        ("USING the config URN", delete_using("USING <URN#config>"), Counts([2, 1, 0])),
+        ("another ledger", delete_using("USING <w-other-ledger:main>"), Refused("names ledger")),
+        ("a pinned address", delete_using("USING <LEDGER@t:1>"), Refused("pins a time")),
+        (
+            "USING NAMED another ledger",
+            delete_using("USING NAMED <w-other-ledger:main>"),
+            Refused("names ledger"),
+        ),
+    ];
+    let v = json!({"@id": "?s", "ex:v": "?o"});
+    let copy = json!({"@id": "?s", "ex:copy": "?o"});
+    let jsonld: Vec<(&str, serde_json::Value, WhereExpect)> = vec![
+        (
+            "from an unknown graph",
+            json!({"from": "http://example.org/typo2", "where": v, "delete": v}),
+            Counts([2, 1, 0]),
+        ),
+        (
+            "graph: a new graph",
+            json!({"graph": newg, "where": v, "insert": copy}),
+            Counts([2, 1, 0]),
+        ),
+        (
+            "from the ledger's id",
+            json!({"from": "LEDGER", "where": v, "delete": v}),
+            Counts([0, 1, 0]),
+        ),
+        (
+            "from the ledger's name",
+            json!({"from": "SHORT", "where": v, "delete": v}),
+            Counts([0, 1, 0]),
+        ),
+        (
+            "from the ledger's URN",
+            json!({"from": "URN", "where": v, "delete": v}),
+            Counts([0, 1, 0]),
+        ),
+        (
+            "from the ledger's id and <g1>",
+            json!({"from": ["LEDGER", g1], "where": v, "delete": v}),
+            Counts([0, 1, 0]),
+        ),
+        (
+            "from L#config",
+            json!({"from": "LEDGER#config", "where": v, "delete": v}),
+            Counts([2, 1, 0]),
+        ),
+        (
+            "another ledger",
+            json!({"from": "w-other-ledger:main", "where": v, "delete": v}),
+            Refused("names ledger"),
+        ),
+        (
+            "a pinned address",
+            json!({"from": "LEDGER@t:1", "where": v, "delete": v}),
+            Refused("pins a time"),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    let cases = sparql
+        .iter()
+        .map(|(case, text, expect)| (format!("SPARQL {case}"), WhereUpdate::Sparql(text), expect))
+        .chain(jsonld.iter().map(|(case, json, expect)| {
+            (format!("JSON-LD {case}"), WhereUpdate::JsonLd(json), expect)
+        }));
+    for (i, (case, update, expect)) in cases.enumerate() {
+        let ledger_id = format!("it/where-dataset-{i}:main");
+        let got = run_where_dataset_case(&fluree, &ledger_id, update).await;
+        match (expect, &got) {
+            (Counts(want), Ok(counts)) if counts == want => {}
+            (Refused(text), Err(e)) if e.contains(text) => {}
+            _ => failures.push(format!("{case}: got {got:?}")),
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
