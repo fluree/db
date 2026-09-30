@@ -25,3 +25,4 @@ mod it_namespace_new_after_index;
 mod it_ns_sync_conflict;
 #[path = "it_pack_validation.rs"]
 mod it_pack_validation;
+mod it_triple_term_links;

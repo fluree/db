@@ -245,6 +245,7 @@ mod tests {
             had_annotation_arena: annotation_index.is_some(),
             has_list_meta: None,
             annotation_index,
+            term_dict: None,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }

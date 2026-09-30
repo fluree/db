@@ -39,7 +39,7 @@ pub use format::index_root::IndexRoot;
 pub use format::run_record::{cmp_for_order, cmp_psot, cmp_spot, RunRecord, RunSortOrder};
 pub use format::wire_helpers::{
     BinaryGarbageRef, BinaryPrevIndexRef, DictPackRefs, DictRefs, DictTreeRefs, FulltextArenaRef,
-    GraphArenaRefs, PackBranchEntry, SpatialArenaRef, VectorDictRef,
+    GraphArenaRefs, PackBranchEntry, SpatialArenaRef, TermDictRefs, VectorDictRef,
 };
 
 // ── Arena ───────────────────────────────────────────────────────────────────

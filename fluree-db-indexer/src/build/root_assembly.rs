@@ -332,6 +332,9 @@ pub(crate) async fn encode_and_write_root_v6(
         sketch_ref: inputs.sketch_ref,
         has_annotations,
         annotation_index: None,
+        // Full rebuilds do not intern reification links yet; the term
+        // dictionary is produced by bulk import only.
+        term_dict: None,
         // Sticky bit flipped to `true` below if the rebuild path
         // seals an `Authoritative` arena. Rebuilds always start
         // from scratch with no prior root, so this is the only
@@ -636,6 +639,7 @@ mod tests {
             had_annotation_arena: false,
             has_list_meta: None,
             annotation_index: None,
+            term_dict: None,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }

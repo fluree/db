@@ -4115,6 +4115,7 @@ where
             let otype_registry = fluree_db_core::OTypeRegistry::new(&custom_datatype_iris);
             let r = fluree_db_indexer::run_index::spool::sort_remap_and_write_sorted_commit(
                 sr.records,
+                sr.terms,
                 sr.subjects,
                 sr.strings,
                 &vd.join(format!("chunk_{ci:05}.subjects.voc")),
@@ -5649,6 +5650,7 @@ where
                 fluree_db_core::OTypeRegistry::new(&meta_custom_datatype_iris);
             let meta_sorted_info = sort_remap_and_write_sorted_commit(
                 records,
+                Vec::new(),
                 meta_subjects,
                 meta_strings,
                 &subj_voc_path,
@@ -6321,7 +6323,14 @@ where
         );
 
         let mut v3_handle = tokio::task::spawn_blocking(
-            move || -> std::result::Result<(_, Option<BuildStatsOutput>), ImportError> {
+            move || -> std::result::Result<
+                (
+                    _,
+                    Option<BuildStatsOutput>,
+                    std::sync::Arc<std::sync::Mutex<fluree_db_binary_index::dict::TermDictBuilder>>,
+                ),
+                ImportError,
+            > {
                 let commits: Vec<fluree_db_indexer::CommitInput> = v3_sorted_commit_infos
                     .iter()
                     .enumerate()
@@ -6334,6 +6343,7 @@ where
                             string_remap_path: remap_dir.join(format!("strings_{i:05}.rmp")),
                             lang_remap: v3_lang_remaps.get(i).cloned().unwrap_or_default(),
                             types_map_path: info.types_map_path.clone(),
+                            term_table: info.term_table.clone(),
                         }
                     })
                     .collect();
@@ -6362,6 +6372,10 @@ where
                 // limit (post best-effort raise at startup/preflight).
                 let fd_budget = fluree_db_core::fd_limit::FdBudget::detect();
 
+                // Build-wide triple-term interner shared by every graph's build.
+                let term_builder = std::sync::Arc::new(std::sync::Mutex::new(
+                    fluree_db_binary_index::dict::TermDictBuilder::new(),
+                ));
                 let cfg_g0 = fluree_db_indexer::BuildConfig {
                     run_dir: v3_runs_g0,
                     index_dir: v3_index_dir.clone(),
@@ -6375,6 +6389,7 @@ where
                     remap_progress: Some(v3_remap_counter),
                     build_progress: Some(v3_build_counter),
                     stage_marker: Some(v3_stage_marker),
+                    term_builder: Some(std::sync::Arc::clone(&term_builder)),
                 };
                 std::fs::create_dir_all(&cfg_g0.run_dir).map_err(|e| index_build_error(&e))?;
 
@@ -6404,6 +6419,7 @@ where
                         remap_progress: None,
                         build_progress: None,
                         stage_marker: None,
+                        term_builder: Some(std::sync::Arc::clone(&term_builder)),
                     };
                     std::fs::create_dir_all(&cfg_g1.run_dir).map_err(|e| index_build_error(&e))?;
 
@@ -6441,6 +6457,7 @@ where
                         remap_progress: None,
                         build_progress: None,
                         stage_marker: None,
+                        term_builder: Some(std::sync::Arc::clone(&term_builder)),
                     };
                     std::fs::create_dir_all(&cfg_ng.run_dir).map_err(|e| index_build_error(&e))?;
 
@@ -6545,7 +6562,7 @@ where
                     "V3 index build complete"
                 );
 
-                Ok((result, stats_output))
+                Ok((result, stats_output, term_builder))
             },
         );
 
@@ -6600,7 +6617,7 @@ where
         let index_start = std::time::Instant::now();
         let mut current_stage = fluree_db_indexer::BUILD_STAGE_REMAP;
         let mut stage_start = index_start;
-        let (v3_result, stats_output) = loop {
+        let (v3_result, stats_output, term_dict_builder) = loop {
             tokio::select! {
                 result = &mut v3_handle => {
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);
@@ -6612,6 +6629,31 @@ where
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);
                     emit_index_progress(stage, &mut current_stage, &mut stage_start);
                 }
+            }
+        };
+
+        // Persist the triple-term dictionary the build interned, if any.
+        let term_dict_refs = {
+            let builder =
+                std::mem::take(&mut *term_dict_builder.lock().map_err(|_| {
+                    ImportError::IndexBuild("term dictionary lock poisoned".into())
+                })?);
+            if builder.is_empty() {
+                None
+            } else {
+                let term_count = builder.len();
+                let started = Instant::now();
+                let refs = builder
+                    .upload(content_store.as_ref())
+                    .await
+                    .map_err(|e| ImportError::Upload(format!("triple-term dictionary: {e}")))?;
+                tracing::info!(
+                    term_count,
+                    predicates = refs.forward_packs.len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "triple-term dictionary uploaded"
+                );
+                Some(refs)
             }
         };
 
@@ -6937,6 +6979,7 @@ where
             // dict moves into this struct literal.
             has_annotations: import_has_annotations,
             annotation_index: None,
+            term_dict: term_dict_refs,
             // Sticky-bit canonical contract lives on
             // `IndexRoot.had_annotation_arena` in
             // `fluree-db-binary-index/src/format/index_root.rs`.

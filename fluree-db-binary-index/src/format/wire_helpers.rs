@@ -122,6 +122,24 @@ pub struct DictRefs {
     pub string_reverse: DictTreeRefs,
 }
 
+/// Triple-term dictionary references (ledger-global).
+///
+/// Forward packs are grouped by inner predicate id and keyed by the
+/// per-predicate sequence (the low half of a handle); the reverse tree maps
+/// encoded `TermKey` bytes to the full handle. `watermarks` holds the highest
+/// sequence allocated per predicate so later allocation can continue above it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TermDictRefs {
+    /// `(inner p_id, packs sorted by first_id)`, sorted by p_id.
+    pub forward_packs: Vec<(u32, Vec<PackBranchEntry>)>,
+    /// Reverse tree: `TermKey` bytes → handle.
+    pub reverse: DictTreeRefs,
+    /// `(inner p_id, highest seq allocated)`, sorted by p_id.
+    pub watermarks: Vec<(u32, u32)>,
+    /// Distinct terms in the dictionary.
+    pub term_count: u64,
+}
+
 /// Per-graph specialty arena refs (numbig, vectors, spatial).
 ///
 /// One entry per graph that has any specialty arenas.
@@ -387,6 +405,90 @@ pub(crate) fn read_dict_pack_refs(data: &[u8], pos: &mut usize) -> io::Result<Di
     Ok(DictPackRefs {
         string_fwd_packs,
         subject_fwd_ns_packs,
+    })
+}
+
+/// Wire-format version of the term-dictionary section.
+const TERM_DICT_REFS_VERSION: u8 = 1;
+
+/// Write triple-term dictionary refs.
+///
+/// Wire format:
+/// ```text
+/// [version: u8 = 1]
+/// [p_count: u32 LE]
+///   For each: [p_id: u32] [pack_count: u16]
+///     For each: [first_id: u64] [last_id: u64] [pack_cid: len_prefixed]
+/// [reverse tree refs]
+/// [wm_count: u32 LE]  For each: [p_id: u32] [watermark: u32]
+/// [term_count: u64 LE]
+/// ```
+pub(crate) fn write_term_dict_refs(buf: &mut Vec<u8>, refs: &TermDictRefs) {
+    buf.push(TERM_DICT_REFS_VERSION);
+    let mut sorted = refs.forward_packs.clone();
+    sorted.sort_by_key(|(p_id, _)| *p_id);
+    buf.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+    for (p_id, packs) in &sorted {
+        buf.extend_from_slice(&p_id.to_le_bytes());
+        buf.extend_from_slice(&pack_count_u16(packs.len(), "term").to_le_bytes());
+        for entry in packs {
+            buf.extend_from_slice(&entry.first_id.to_le_bytes());
+            buf.extend_from_slice(&entry.last_id.to_le_bytes());
+            write_cid(buf, &entry.pack_cid);
+        }
+    }
+    write_dict_tree_refs(buf, &refs.reverse);
+    let mut wms = refs.watermarks.clone();
+    wms.sort_by_key(|(p_id, _)| *p_id);
+    buf.extend_from_slice(&(wms.len() as u32).to_le_bytes());
+    for (p_id, wm) in &wms {
+        buf.extend_from_slice(&p_id.to_le_bytes());
+        buf.extend_from_slice(&wm.to_le_bytes());
+    }
+    buf.extend_from_slice(&refs.term_count.to_le_bytes());
+}
+
+/// Read triple-term dictionary refs written by [`write_term_dict_refs`].
+pub(crate) fn read_term_dict_refs(data: &[u8], pos: &mut usize) -> io::Result<TermDictRefs> {
+    let version = read_u8_at(data, pos)?;
+    if version != TERM_DICT_REFS_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("term dict refs: unsupported version {version}"),
+        ));
+    }
+    let p_count = read_u32_at(data, pos)? as usize;
+    let mut forward_packs = Vec::with_capacity(p_count);
+    for _ in 0..p_count {
+        let p_id = read_u32_at(data, pos)?;
+        let pack_count = read_u16_at(data, pos)? as usize;
+        let mut packs = Vec::with_capacity(pack_count);
+        for _ in 0..pack_count {
+            let first_id = read_u64_at(data, pos)?;
+            let last_id = read_u64_at(data, pos)?;
+            let pack_cid = read_cid(data, pos)?;
+            packs.push(PackBranchEntry {
+                first_id,
+                last_id,
+                pack_cid,
+            });
+        }
+        forward_packs.push((p_id, packs));
+    }
+    let reverse = read_dict_tree_refs(data, pos)?;
+    let wm_count = read_u32_at(data, pos)? as usize;
+    let mut watermarks = Vec::with_capacity(wm_count);
+    for _ in 0..wm_count {
+        let p_id = read_u32_at(data, pos)?;
+        let wm = read_u32_at(data, pos)?;
+        watermarks.push((p_id, wm));
+    }
+    let term_count = read_u64_at(data, pos)?;
+    Ok(TermDictRefs {
+        forward_packs,
+        reverse,
+        watermarks,
+        term_count,
     })
 }
 

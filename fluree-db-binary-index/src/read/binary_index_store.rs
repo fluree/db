@@ -31,6 +31,7 @@ use parking_lot::RwLock;
 use crate::dict::forward_pack::{KIND_STRING_FWD, KIND_SUBJECT_FWD};
 use crate::dict::global_dict::{LanguageTagDict, PredicateDict};
 use crate::dict::pack_reader::ForwardPackReader;
+use crate::dict::term_dict::TermDictReader;
 use crate::dict::DictTreeReader;
 use crate::format::branch::{read_branch_from_bytes, BranchManifest};
 use crate::format::index_root::{IndexRoot, OTypeTableEntry};
@@ -61,6 +62,8 @@ pub(crate) struct DictionarySet {
     /// String forward pack reader (all string IDs in one stream).
     pub(crate) string_forward_packs: ForwardPackReader,
     pub(crate) string_reverse_tree: Option<Arc<DictTreeReader>>,
+    /// Triple-term dictionary; `None` when the root carries no term section.
+    pub(crate) term_dict: Option<TermDictReader>,
     // Kept for: DictOverlay watermark computation (query overlay resolution).
     // Use when: DictOverlay is wired into V3 query execution for overlay transactions.
     #[expect(dead_code)]
@@ -367,6 +370,7 @@ impl BinaryIndexStore {
                 subject_reverse_tree: None,
                 string_forward_packs: ForwardPackReader::empty(),
                 string_reverse_tree: None,
+                term_dict: None,
                 subject_count: 0,
                 string_count: 0,
                 namespace_codes: Arc::new(HashMap::new()),
@@ -1517,9 +1521,7 @@ impl BinaryIndexStore {
             DecodeKind::SpatialArena => Err(io::Error::other(
                 "spatial arena decode not yet implemented in V6",
             )),
-            DecodeKind::TripleTermDict => Err(io::Error::other(
-                "triple-term decode needs the term dictionary (not yet wired)",
-            )),
+            DecodeKind::TripleTermDict => self.decode_triple_term(o_key),
         }
     }
 
@@ -2236,6 +2238,87 @@ impl BinaryIndexStore {
             .write()
             .insert((g_id, p_id), proven);
         Some(proven)
+    }
+
+    /// True when the index carries a triple-term dictionary.
+    pub fn has_term_dict(&self) -> bool {
+        self.dicts.term_dict.is_some()
+    }
+
+    /// The triple-term dictionary, if the index carries one.
+    pub fn term_dict(&self) -> Option<&TermDictReader> {
+        self.dicts.term_dict.as_ref()
+    }
+
+    /// The `OType::TRIPLE_TERM` handle for an encoded base edge, if interned.
+    pub fn find_term_handle(
+        &self,
+        key: &fluree_db_core::triple_term::TermKey,
+    ) -> io::Result<Option<u64>> {
+        match &self.dicts.term_dict {
+            Some(td) => td.find_handle(key),
+            None => Ok(None),
+        }
+    }
+
+    /// The encoded base edge behind a triple-term handle.
+    pub fn resolve_term_key(
+        &self,
+        handle: u64,
+    ) -> io::Result<Option<fluree_db_core::triple_term::TermKey>> {
+        match &self.dicts.term_dict {
+            Some(td) => td.resolve(handle),
+            None => Ok(None),
+        }
+    }
+
+    /// Materialize a triple-term handle: the base edge's subject, predicate
+    /// and object as SIDs and a value, with the object's datatype and tag.
+    ///
+    /// Terms are graph-independent, so a per-graph object arena (NumBig) is
+    /// read through the default graph.
+    fn decode_triple_term(&self, handle: u64) -> io::Result<FlakeValue> {
+        let key = self.resolve_term_key(handle)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("triple-term handle {handle:#x} not in the term dictionary"),
+            )
+        })?;
+        let (ns, suffix) = self.resolve_subject_parts(key.s_id)?;
+        let p = self.predicate_sid(key.p_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "triple-term handle {handle:#x}: unknown predicate id {}",
+                    key.p_id
+                ),
+            )
+        })?;
+        let o_type = key.o_type.as_u16();
+        let o = self.decode_value_v3(
+            o_type,
+            key.o_key,
+            key.p_id,
+            fluree_db_core::DEFAULT_GRAPH_ID,
+        )?;
+        let dt = self
+            .resolve_datatype_sid_for_value(o_type, &o)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("triple-term handle {handle:#x}: no datatype for o_type {o_type:#06x}"),
+                )
+            })?;
+        let lang = self.resolve_lang_tag(o_type).map(str::to_string);
+        Ok(FlakeValue::TripleTerm(Box::new(
+            fluree_db_core::TripleTermValue {
+                s: Sid::new(ns, suffix),
+                p,
+                o,
+                dt,
+                lang,
+            },
+        )))
     }
 
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
@@ -3223,6 +3306,21 @@ async fn build_dictionary_set(
     let string_reverse_us = phase.elapsed().as_micros() as u64;
     let phase = Instant::now();
 
+    // Triple-term dictionary (optional section).
+    let term_dict = match &root.term_dict {
+        Some(refs) => Some(
+            TermDictReader::from_refs_reusing(
+                Arc::clone(&cs),
+                cache_dir,
+                refs,
+                leaflet_cache,
+                prev.and_then(|p| p.term_dict.as_ref()),
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
     // Namespace codes: shared with the previous store when it already holds
     // every entry of the root's table. Codes are never reassigned within a
     // ledger, and the previous store's extras (codes the snapshot augmented
@@ -3325,6 +3423,7 @@ async fn build_dictionary_set(
         subject_reverse_tree,
         string_forward_packs,
         string_reverse_tree,
+        term_dict,
         subject_count,
         string_count: root.string_watermark,
         namespace_codes,

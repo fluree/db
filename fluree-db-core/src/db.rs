@@ -722,7 +722,9 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     const FLAG_EXT_HAD_ANNOTATION_ARENA: u8 = 1 << 0;
     const FLAG_EXT_LIST_META_TRACKED: u8 = 1 << 1;
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
+    const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
     let flags_ext = bytes[6];
+    let has_term_dict_section = flags_ext & FLAG_EXT_HAS_TERM_DICT != 0;
     let had_annotation_arena = flags_ext & FLAG_EXT_HAD_ANNOTATION_ARENA != 0;
     let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
         None
@@ -838,6 +840,37 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         for _ in 0..leaf_count {
             skip_cid(bytes, pos)?;
         }
+        Ok(())
+    }
+
+    /// Skip the triple-term dictionary section. Matches
+    /// `write_term_dict_refs` in binary-index: version, per-predicate forward
+    /// packs, reverse tree refs, per-predicate watermarks, term count.
+    fn skip_term_dict_refs(bytes: &[u8], pos: &mut usize) -> std::io::Result<()> {
+        let version = read_u8(bytes, pos)?;
+        if version != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("FIR6: unsupported term dict section version {version}"),
+            ));
+        }
+        let p_count = read_u32(bytes, pos)? as usize;
+        for _ in 0..p_count {
+            let _p_id = read_u32(bytes, pos)?;
+            let pack_count = read_u16(bytes, pos)? as usize;
+            for _ in 0..pack_count {
+                let _first = read_u64(bytes, pos)?;
+                let _last = read_u64(bytes, pos)?;
+                skip_cid(bytes, pos)?;
+            }
+        }
+        skip_dict_tree_refs(bytes, pos)?;
+        let wm_count = read_u32(bytes, pos)? as usize;
+        for _ in 0..wm_count {
+            let _p_id = read_u32(bytes, pos)?;
+            let _wm = read_u32(bytes, pos)?;
+        }
+        let _term_count = read_u64(bytes, pos)?;
         Ok(())
     }
 
@@ -1052,6 +1085,12 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     } else {
         None
     };
+
+    // Optional triple-term dictionary section: the metadata view has no use
+    // for it, so it is skipped structurally.
+    if has_term_dict_section {
+        skip_term_dict_refs(bytes, &mut pos)?;
+    }
 
     // Trailing-byte sentinel: any unread bytes after the annotation
     // section indicate a future format extension or a writer bug.

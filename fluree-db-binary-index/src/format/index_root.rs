@@ -19,9 +19,10 @@ use super::run_record_v2::{RunRecordV2, RECORD_V2_WIRE_SIZE};
 use super::stats_wire;
 use super::wire_helpers::{
     ensure_bytes, io_err, read_cid, read_dict_pack_refs, read_dict_tree_refs, read_i64_at,
-    read_string, read_string_array, read_u16_at, read_u32_at, read_u64_at, read_u8_at, write_cid,
-    write_dict_pack_refs, write_dict_tree_refs, write_str, write_string_array, BinaryGarbageRef,
-    BinaryPrevIndexRef, DictRefs, FulltextArenaRef, GraphArenaRefs, SpatialArenaRef, VectorDictRef,
+    read_string, read_string_array, read_term_dict_refs, read_u16_at, read_u32_at, read_u64_at,
+    read_u8_at, write_cid, write_dict_pack_refs, write_dict_tree_refs, write_str,
+    write_string_array, write_term_dict_refs, BinaryGarbageRef, BinaryPrevIndexRef, DictRefs,
+    FulltextArenaRef, GraphArenaRefs, SpatialArenaRef, TermDictRefs, VectorDictRef,
 };
 use fluree_db_core::index_schema::IndexSchema;
 use fluree_db_core::index_stats::IndexStats;
@@ -66,6 +67,8 @@ pub enum DictFamily {
     NumBigArena = 4,
     /// Spatial arena (per-predicate)
     SpatialArena = 5,
+    /// Triple-term dictionary (ledger-global, partitioned by inner predicate)
+    TermDict = 6,
 }
 
 impl DictFamily {
@@ -77,6 +80,7 @@ impl DictFamily {
             3 => Some(Self::VectorArena),
             4 => Some(Self::NumBigArena),
             5 => Some(Self::SpatialArena),
+            6 => Some(Self::TermDict),
             _ => None,
         }
     }
@@ -224,6 +228,12 @@ pub struct IndexRoot {
     /// `FLAG_HAS_ANNOTATIONS` on the wire, so the cascade fast-path
     /// can never desynchronize from a populated arena.
     pub annotation_index: Option<fluree_db_core::AnnotationIndexRoot>,
+
+    /// Triple-term dictionary (`OType::TRIPLE_TERM` handles ↔ encoded base
+    /// edges). `None` until a build has interned reification links. Lives in
+    /// its own trailing section, flagged by `FLAG_EXT_HAS_TERM_DICT`, so its
+    /// lifecycle is independent of the annotation arena above.
+    pub term_dict: Option<TermDictRefs>,
 
     /// Sticky bit governing whether the api's
     /// `ApiAttachmentEventsProvider` is allowed to bootstrap an
@@ -521,6 +531,12 @@ impl IndexRoot {
                 None,
                 DictFamily::SpatialArena,
             ),
+            (
+                OType::TRIPLE_TERM.as_u16(),
+                DecodeKind::TripleTermDict,
+                Some(fluree::TRIPLE_TERM),
+                DictFamily::TermDict,
+            ),
         ];
 
         for &(o_type, decode_kind, dt_iri, dict_family) in fluree_types {
@@ -604,6 +620,9 @@ impl IndexRoot {
     /// Extended-flags bit: at least one indexed row carries a list index.
     /// Only meaningful when `FLAG_EXT_LIST_META_TRACKED` is set.
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
+    /// Root carries a triple-term dictionary section after the annotation
+    /// section.
+    const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
 
     /// Encode to the binary FIR6 wire format.
     ///
@@ -695,6 +714,9 @@ impl IndexRoot {
             }
             Some(false) => flags_ext |= Self::FLAG_EXT_LIST_META_TRACKED,
             None => {}
+        }
+        if self.term_dict.is_some() {
+            flags_ext |= Self::FLAG_EXT_HAS_TERM_DICT;
         }
         buf.push(flags_ext);
         buf.push(0); // reserved high pad byte
@@ -858,6 +880,11 @@ impl IndexRoot {
                 .expect("ciborium serialization to Vec<u8> is infallible");
             buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
             buf.extend_from_slice(&body);
+        }
+
+        // ---- Optional: triple-term dictionary ----
+        if let Some(ref td) = self.term_dict {
+            write_term_dict_refs(&mut buf, td);
         }
 
         buf
@@ -1100,6 +1127,12 @@ impl IndexRoot {
             None
         };
 
+        let term_dict = if flags_ext & Self::FLAG_EXT_HAS_TERM_DICT != 0 {
+            Some(read_term_dict_refs(data, &mut pos)?)
+        } else {
+            None
+        };
+
         // All optional sections consumed. `pos` should now equal the
         // input length — anything else means a future format added
         // bytes after the annotation section, or the writer emitted
@@ -1156,6 +1189,7 @@ impl IndexRoot {
             // losing the dropped arena's history.
             had_annotation_arena: had_annotation_arena || annotation_index.is_some(),
             annotation_index,
+            term_dict,
             has_list_meta,
         })
     }
@@ -1248,6 +1282,15 @@ impl IndexRoot {
         if let Some(ref ann) = self.annotation_index {
             ids.push(ann.forward_branch_cid.clone());
             ids.push(ann.reverse_branch_cid.clone());
+        }
+
+        // Triple-term dictionary: forward packs + reverse branch and leaves.
+        if let Some(ref td) = self.term_dict {
+            for (_, packs) in &td.forward_packs {
+                ids.extend(packs.iter().map(|e| e.pack_cid.clone()));
+            }
+            ids.push(td.reverse.branch.clone());
+            ids.extend(td.reverse.leaves.iter().cloned());
         }
 
         ids.sort();
@@ -1456,6 +1499,7 @@ mod tests {
             sketch_ref: None,
             has_annotations: false,
             annotation_index: None,
+            term_dict: None,
             had_annotation_arena: false,
             has_list_meta: None,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),

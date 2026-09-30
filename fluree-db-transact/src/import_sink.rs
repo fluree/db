@@ -117,6 +117,9 @@ mod inner {
         pub subjects: ChunkSubjectDict,
         /// Chunk-local string dictionary (chunk-local ID → string bytes).
         pub strings: ChunkStringDict,
+        /// Triple-term table: one pseudo-record per reified base edge, in
+        /// ordinal order (see [`SpoolContext::write_link_record`]).
+        pub terms: Vec<RunRecord>,
     }
 
     /// Result of finishing a [`SpoolContext`] via [`SpoolContext::finish_buffered`] —
@@ -133,6 +136,9 @@ mod inner {
         pub languages: rustc_hash::FxHashMap<String, u16>,
         /// Chunk index (for deterministic ordering in merge phase).
         pub chunk_idx: usize,
+        /// Triple-term table: one pseudo-record per reified base edge, in
+        /// ordinal order (see [`SpoolContext::write_link_record`]).
+        pub terms: Vec<RunRecord>,
     }
 
     /// Per-chunk context for writing spool records during parse (Phase B).
@@ -149,6 +155,13 @@ mod inner {
     pub struct SpoolContext {
         /// Buffered records (insertion-order, chunk-local IDs).
         records: Vec<RunRecord>,
+        /// Reified base edges as pseudo-records, indexed by the ordinal a
+        /// link record's `o_key` carries until the build interns them.
+        terms: Vec<RunRecord>,
+        /// Global predicate id of `rdf:reifies`, assigned on first link.
+        rdf_reifies_pid: Option<u32>,
+        /// Global datatype id of `f:tripleTerm`, assigned on first link.
+        triple_term_dt: Option<u16>,
         /// Path for writing spool file (used by `finish()` backward-compat path).
         spool_path: std::path::PathBuf,
         chunk_idx: usize,
@@ -193,6 +206,9 @@ mod inner {
         ) -> std::io::Result<Self> {
             Ok(Self {
                 records: Vec::new(),
+                terms: Vec::new(),
+                rdf_reifies_pid: None,
+                triple_term_dt: None,
                 spool_path: spool_path.into(),
                 chunk_idx,
                 subjects: ChunkSubjectDict::new(),
@@ -233,6 +249,7 @@ mod inner {
                 spool_info,
                 subjects: self.subjects,
                 strings: self.strings,
+                terms: self.terms,
             })
         }
 
@@ -249,6 +266,7 @@ mod inner {
                 strings: self.strings,
                 languages: self.languages,
                 chunk_idx: self.chunk_idx,
+                terms: self.terms,
             }
         }
 
@@ -552,6 +570,84 @@ mod inner {
             };
 
             self.records.push(record);
+            Ok(())
+        }
+
+        /// Spool the RDF 1.2 link `ann rdf:reifies <<( s p o )>>` for a reified
+        /// base edge.
+        ///
+        /// The base edge becomes a pseudo-record in the chunk's term table,
+        /// resolved exactly as the base triple's own record was (the object
+        /// under the inner predicate, so per-predicate arena handles agree).
+        /// The link record's `o_key` is that entry's ordinal; the build remaps
+        /// the entry to global ids and interns it, replacing the ordinal with
+        /// the term handle.
+        ///
+        /// `object` is the bundle's `f:reifiesObject` flake: its subject is
+        /// the reifier and its object, datatype and tag are the base edge's.
+        fn write_link_record(
+            &mut self,
+            s: &Sid,
+            p: &Sid,
+            object: &Flake,
+            t: i64,
+        ) -> Result<(), CommitCodecError> {
+            let ann = &object.s;
+            let s_id = self.assign_subject_id(s);
+            let p_id = self.assign_predicate_id(p);
+            let dt_id = self.assign_datatype_id(&object.dt)?;
+            let Some((o_kind, o_key)) = self.resolve_object_value(&object.o, p_id) else {
+                return Ok(());
+            };
+            let lang_id = object
+                .m
+                .as_ref()
+                .and_then(|m| m.lang.as_deref())
+                .map(|l| self.assign_lang_id(l))
+                .unwrap_or(0);
+            let ordinal = self.terms.len() as u64;
+            self.terms.push(RunRecord {
+                g_id: self.g_id,
+                s_id: SubjectId::from_u64(s_id),
+                p_id,
+                dt: dt_id,
+                o_kind,
+                op: 1,
+                o_key,
+                t: t as u32,
+                lang_id,
+                i: LIST_INDEX_NONE,
+            });
+
+            let link_p = match self.rdf_reifies_pid {
+                Some(p) => p,
+                None => {
+                    let p = self.assign_predicate_id(fluree_db_core::rdf_reifies_sid());
+                    self.rdf_reifies_pid = Some(p);
+                    p
+                }
+            };
+            let link_dt = match self.triple_term_dt {
+                Some(d) => d,
+                None => {
+                    let d = self.assign_datatype_id(fluree_db_core::triple_term_datatype_sid())?;
+                    self.triple_term_dt = Some(d);
+                    d
+                }
+            };
+            let ann_id = self.assign_subject_id(ann);
+            self.records.push(RunRecord {
+                g_id: self.g_id,
+                s_id: SubjectId::from_u64(ann_id),
+                p_id: link_p,
+                dt: link_dt,
+                o_kind: ObjKind::TRIPLE_TERM.as_u8(),
+                op: 1,
+                o_key: ordinal,
+                t: t as u32,
+                lang_id: 0,
+                i: LIST_INDEX_NONE,
+            });
             Ok(())
         }
 
@@ -989,8 +1085,8 @@ mod inner {
                     return Ok(());
                 }
             };
-            for flake in bundle {
-                if let Err(e) = self.writer.push_flake(&flake) {
+            for flake in &bundle {
+                if let Err(e) = self.writer.push_flake(flake) {
                     if self.encode_error.is_none() {
                         tracing::error!("ImportSink: reifier bundle flake encode failed: {}", e);
                         self.encode_error = Some(e);
@@ -1007,6 +1103,33 @@ mod inner {
                         list_index: None,
                         t: self.t,
                     });
+                    if let Err(e) = written {
+                        self.encode_error.get_or_insert(e);
+                    }
+                }
+            }
+            // The RDF 1.2 link form rides alongside the bundle: the bundle's
+            // object flake carries the base edge's value, datatype and tag.
+            if let Some(ctx) = &mut self.spool_ctx {
+                let obj = bundle
+                    .iter()
+                    .find(|f| fluree_db_core::is_reifies_object(&f.p));
+                let subj = bundle
+                    .iter()
+                    .find(|f| fluree_db_core::is_reifies_subject(&f.p))
+                    .and_then(|f| match &f.o {
+                        FlakeValue::Ref(sid) => Some(sid),
+                        _ => None,
+                    });
+                let pred = bundle
+                    .iter()
+                    .find(|f| fluree_db_core::is_reifies_predicate(&f.p))
+                    .and_then(|f| match &f.o {
+                        FlakeValue::Ref(sid) => Some(sid),
+                        _ => None,
+                    });
+                if let (Some(obj), Some(subj), Some(pred)) = (obj, subj, pred) {
+                    let written = ctx.write_link_record(subj, pred, obj, self.t);
                     if let Err(e) = written {
                         self.encode_error.get_or_insert(e);
                     }

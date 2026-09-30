@@ -617,6 +617,7 @@ where
                     string_count: string_dicts[ci].len() as u64,
                     types_map_path: Some(types_path),
                     duplicates_removed: 0,
+                    term_table: None,
                 });
             }
 
@@ -797,6 +798,7 @@ where
                     remap_progress: None,
                     build_progress: None,
                     stage_marker: None,
+                    term_builder: None,
                 };
 
                 let v3_result = crate::build_indexes_from_remapped_commits(

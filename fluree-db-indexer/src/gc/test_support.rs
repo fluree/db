@@ -85,6 +85,7 @@ pub(crate) fn fir6_with_named_graph_for(
         sketch_ref: None,
         has_annotations: false,
         annotation_index: None,
+        term_dict: None,
         had_annotation_arena: false,
         has_list_meta: None,
         o_type_table: IndexRoot::build_o_type_table(&[], &[]),
