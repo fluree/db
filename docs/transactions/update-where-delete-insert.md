@@ -118,6 +118,7 @@ Notes:
 - `urn:default` names the default graph in a top-level `graph`, in `from` and `fromNamed`, and in a `where` graph pattern (`["graph", "urn:default", …]`, or a node's `"@graph": "urn:default"`). In a template, a node's `@graph` or a `["graph", …]` naming `urn:default` is refused with a `400`, since the default graph is not a named graph.
 - A node's graph covers the nodes nested in it: every template a node and its nested nodes produce goes to the node's `@graph`, or the enclosing scope's graph when it has none. A nested node's own `@graph` wins for its subtree, so `"@graph": "default"` on a nested node sends that subtree to the default graph.
 - A graph name can be a WHERE variable, as with SPARQL `GRAPH ?g`: `"@graph": "?g"` (or `["graph", "?g", ...]`) writes into the graph `?g` is bound to for each solution. Variables are accepted only in update templates.
+- A node-level `@graph` in `where` (on a top-level or a nested node) resolves its name exactly as in `insert` and `delete`: a compact IRI expands against the `@context`, a `fromNamed` alias matches its graph, `"config"` and `"txn-meta"` name this ledger's graphs, and `"default"` matches the where's default graph. So `{"where": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"}, "delete": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"}}` deletes what an insert with the same `"@graph": "ex:g"` wrote. A `where` pattern cannot leave the graph an enclosing selector chose, so `"default"` inside one is refused.
 - Edge annotations (`@annotation`) inside a template follow their edge into its graph.
 - Named-graph reads are available after indexing completes (see `docs/query/datasets.md`)
 
@@ -185,7 +186,7 @@ Example: read from one graph, write to two graphs
 Use `fromNamed` to allow (and optionally alias) named graphs for `where` `["graph", ...]` patterns:
 
 Notes:
-- In `where` GRAPH patterns, you can reference the graph by **alias** (e.g. `"g2"`) or by the **graph IRI** (e.g. `"http://example.org/g2"`). Aliases are just convenience names for matching.
+- In `where` `["graph", …]` patterns, you can reference the graph by **alias** (e.g. `"g2"`) or by the **graph IRI** (e.g. `"http://example.org/g2"`); the name is taken as written. Aliases are just convenience names for matching. A node-level `@graph` in `where` also takes compact IRIs and the keywords, as templates do (see the notes above).
 - In `insert` / `delete` templates, graph selection is a **write target**. You can use:
   - the full graph IRI (`"http://example.org/g2"`)
   - a compact IRI/term that expands via `@context` (e.g. `"ex:g2"`)
