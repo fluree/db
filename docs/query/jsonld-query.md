@@ -1350,7 +1350,7 @@ Group results:
 }
 ```
 
-A selected variable that is neither a `groupBy` key nor an aggregate comes back as a **per-group list** of its values (SPARQL rejects this shape; the JSON-LD surface keeps it). Two limits apply: a subquery cannot return a per-group list (it is an error — aggregate the variable, e.g. with `collect`), and the SPARQL-results formats and the [streaming endpoint](../api/streaming-query.md) refuse one, since SPARQL results have no list type.
+A selected variable that is neither a `groupBy` key nor an aggregate comes back as a **per-group list** of its values (SPARQL rejects this shape; the JSON-LD surface keeps it). Two limits apply: a subquery cannot return a per-group list (it is an error — aggregate the variable, e.g. with `collect`), and SPARQL JSON and SPARQL XML results and the [streaming endpoint](../api/streaming-query.md) refuse one, since they have no list type (CSV and TSV join the values with `;`). On the streaming endpoint this includes `select "*"` under `groupBy` when the `where` binds a variable that is not a key.
 
 ### having
 

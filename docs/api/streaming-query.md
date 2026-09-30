@@ -158,7 +158,9 @@ error, not a `200` stream), and should use [`/query`](endpoints.md#post-query):
   per-group array). Stream rows are SPARQL-results bindings, which have no list
   type. Aggregate the variable instead (for example
   `(as (groupconcat ?x ", ") ?xs)`), or use `/query`. A JSON-LD `select "*"`
-  under `groupBy` streams the group keys and aggregates.
+  under `groupBy` is refused the same way when the `where` binds a variable
+  that is not a key (project the keys and aggregates instead), and a projected
+  variable that nothing binds is refused as unbound.
 
 ## Auth, policy, and dataset behavior
 

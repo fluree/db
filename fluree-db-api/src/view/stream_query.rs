@@ -590,16 +590,22 @@ fn row_compactor(
 /// so these client mistakes surface as a `4xx`.
 ///
 /// Stream rows are SPARQL-results bindings, which have no list type, so a
-/// JSON-LD query that projects a per-group list (a variable its grouping
-/// neither keys, aggregates nor binds) is refused here. It used to stream one
-/// row per list element — a cartesian product across list columns. The plan's
-/// output is then set to refuse per-group lists outright, so a wildcard
-/// projection streams the grouping's keys and aggregates rather than lists.
+/// JSON-LD query that projects a per-group list (a variable the WHERE binds
+/// that its grouping neither keys, aggregates nor binds) is refused here,
+/// explicitly or through `select *`. It used to stream one row per list
+/// element — a cartesian product across list columns. A projected variable
+/// nothing binds is refused as unbound. The plan's output is then set to
+/// refuse per-group lists outright.
 fn ensure_streamable(query: &mut fluree_db_query::ir::Query, vars: &VarRegistry) -> Result<()> {
     use fluree_db_query::ir::UngroupedProjection;
     let reject = |what: &str| {
         Err(ApiError::Query(fluree_db_query::QueryError::InvalidQuery(
             format!("{what} queries are not supported on the streaming endpoint; use /query"),
+        )))
+    };
+    let invalid = |message: String| {
+        Err(ApiError::Query(fluree_db_query::QueryError::InvalidQuery(
+            message,
         )))
     };
     let output = &query.output;
@@ -615,25 +621,56 @@ fn ensure_streamable(query: &mut fluree_db_query::ir::Query, vars: &VarRegistry)
     if output.has_hydration() {
         return reject("hydration");
     }
-    if let (Some(grouping), Some(projected), UngroupedProjection::PerGroupList) = (
-        &query.grouping,
-        output.projected_vars(),
-        output.ungrouped_projection(),
-    ) {
+    if let (Some(grouping), UngroupedProjection::PerGroupList) =
+        (&query.grouping, output.ungrouped_projection())
+    {
         let produced: std::collections::HashSet<fluree_db_query::VarId> = grouping
             .group_by_vars()
             .chain(grouping.aggregates().map(|spec| spec.output_var))
             .chain(grouping.binds().map(|(var, _)| *var))
             .collect();
-        if let Some(list) = projected.iter().find(|v| !produced.contains(v)) {
-            return Err(ApiError::Query(fluree_db_query::QueryError::InvalidQuery(
-                format!(
-                    "list-valued column {} cannot be streamed as SPARQL-results rows: it is \
-                     neither a groupBy key nor an aggregate; aggregate it (e.g. with \
-                     group-concat) or use /query",
-                    vars.name(*list)
-                ),
-            )));
+        let where_vars = fluree_db_query::ir::pattern::produced_vars_of(&query.patterns);
+        match output.projected_vars() {
+            Some(projected) => {
+                if let Some(var) = projected.iter().find(|v| !produced.contains(v)) {
+                    return if where_vars.contains(var) {
+                        invalid(format!(
+                            "list-valued column {} cannot be streamed as SPARQL-results \
+                             rows: it is neither a groupBy key nor an aggregate; aggregate it \
+                             (e.g. with group-concat) or use /query",
+                            vars.name(*var)
+                        ))
+                    } else {
+                        // The plan-time error `/query` returns for it.
+                        invalid(
+                            fluree_db_query::ir::UngroupedRead {
+                                var: *var,
+                                stage: fluree_db_query::ir::ReadStage::UnboundProjection,
+                            }
+                            .named_message(vars),
+                        )
+                    };
+                }
+            }
+            // `select *` under `groupBy` projects every variable the WHERE
+            // binds, the non-keys as per-group lists.
+            None => {
+                let mut lists: Vec<&str> = where_vars
+                    .iter()
+                    .filter(|v| !produced.contains(v))
+                    .map(|v| vars.name(*v))
+                    .filter(|name| !crate::format::is_internal_var_name(name))
+                    .collect();
+                if !lists.is_empty() {
+                    lists.sort_unstable();
+                    return invalid(format!(
+                        "select * under groupBy includes list-valued columns ({}), which cannot \
+                         be streamed as SPARQL-results rows; project the groupBy keys and \
+                         aggregates, or use /query",
+                        lists.join(", ")
+                    ));
+                }
+            }
         }
     }
     query

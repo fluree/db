@@ -3804,16 +3804,16 @@ pub(crate) fn apply_solution_modifiers(
         && select_vars
             .is_some_and(|vars| !vars.is_empty() && ordering.iter().all(|s| vars.contains(&s.var)));
 
-    // Validate SELECT vars (when present) exist in the post-group schema.
+    // Validate SELECT vars (when present) exist in the post-group schema. An
+    // ungrouped query padded its unbound SELECT vars above, so a miss here is
+    // a grouped projection of a variable nothing binds: a client error, typed
+    // so the API names the variable.
     if let Some(vars) = select_vars {
-        if !vars.is_empty() {
-            for var in vars {
-                if !post_group_schema.contains(var) {
-                    return Err(QueryError::VariableNotFound(format!(
-                        "Selected variable {var:?} not found in query schema"
-                    )));
-                }
-            }
+        if let Some(var) = vars.iter().find(|var| !post_group_schema.contains(var)) {
+            return Err(QueryError::UngroupedRead(crate::ir::UngroupedRead {
+                var: *var,
+                stage: crate::ir::ReadStage::UnboundProjection,
+            }));
         }
     }
 
