@@ -1514,7 +1514,7 @@ Content-Type: application/json
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `graph` (query) | No | Full **absolute** IRI of the target named graph; absent means the default graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address named graphs itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `graph` (query) | No | Full **absolute** IRI of the target named graph; absent means the default graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address any other graph itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
 | `default` (query) | No | Bare key: sync the default graph, said explicitly. Passing it with `graph` is a `400`. The CLI omits `graph` for the default graph. |
 | `dryRun` (query) | No | `true` → stage and report the delta; commit nothing. |
 | `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |

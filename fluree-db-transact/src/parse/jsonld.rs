@@ -178,6 +178,8 @@ fn parse_rooted(
         TxnType::Update => parse_update(&lowered, opts, ns_registry, ledger_id)?,
     };
     if annotated {
+        refuse_annotations_under_a_variable_graph(&txn.insert_templates)?;
+        refuse_annotations_under_a_variable_graph(&txn.delete_templates)?;
         check_reifiers_match_edges(&txn.insert_templates)?;
     }
     Ok(txn)
@@ -231,6 +233,25 @@ fn read_body_constraints(json: &Value, opts: &mut TxnOpts) -> Result<()> {
                 opts.unique_properties = Some(iris);
             }
         }
+    }
+    Ok(())
+}
+
+/// An edge annotation under a variable graph (`["graph", "?g", …]` or
+/// `"@graph": "?g"`) would anchor its reifier to the graph the WHERE binds,
+/// which flake generation cannot write as an object. Refused here, with a
+/// message saying why, instead of failing there.
+fn refuse_annotations_under_a_variable_graph(templates: &[TripleTemplate]) -> Result<()> {
+    let annotated_under_a_variable = templates.iter().any(|t| {
+        matches!(t.graph, TemplateGraph::Var(_))
+            && matches!(&t.predicate, TemplateTerm::Sid(p) if crate::ir::is_reifies_subject(p))
+    });
+    if annotated_under_a_variable {
+        return Err(TransactError::Parse(
+            "edge annotations are not supported under a variable graph; name the graph \
+             (an IRI, a compact IRI or a keyword) where an annotated edge is written"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -1183,7 +1204,8 @@ impl<'a> TemplateParseCtx<'a> {
         let scope = self.write_graphs.scope(name);
         match &self.fixed_root {
             Some(root) if *root != scope => Err(TransactError::Parse(
-                "payload must not address named graphs; the target graph is given by the request"
+                "payload must not address a graph other than the target; the target graph is \
+                 given by the request"
                     .to_string(),
             )),
             _ => Ok(scope),
@@ -3731,11 +3753,17 @@ mod tests {
         let same = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s", "@graph": "ex:g", "ex:p": 1});
         parse_graph_insert(&same, &target, TxnOpts::default(), &mut ns, TEST_LEDGER).unwrap();
 
-        let other = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s", "ex:c": {"@id": "ex:c", "@graph": "ex:g2", "ex:p": 1}});
-        let err = parse_graph_insert(&other, &target, TxnOpts::default(), &mut ns, TEST_LEDGER)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("must not address named graphs"), "{err}");
+        // Another named graph, or the default graph, is not the target.
+        for selector in ["ex:g2", "default"] {
+            let other = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s", "ex:c": {"@id": "ex:c", "@graph": selector, "ex:p": 1}});
+            let err = parse_graph_insert(&other, &target, TxnOpts::default(), &mut ns, TEST_LEDGER)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("must not address a graph other than the target"),
+                "{selector}: {err}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -4456,6 +4484,29 @@ mod tests {
         assert_eq!(edge, [in_graph(G)]);
         assert!(bundle.iter().all(|g| *g == in_graph(G)));
         assert_eq!(anchors, ["g"]);
+    }
+
+    /// An edge annotation under a variable graph is refused while parsing,
+    /// with a message that says so; flake generation used to fail on the
+    /// reifier's `f:reifiesGraph ?g` anchor instead.
+    #[test]
+    fn annotations_under_a_variable_graph_are_refused() {
+        let annotated = json!({"@id": "ex:o", "@annotation": {"ex:note": "x"}});
+        for insert in [
+            json!([["graph", "?g", {"@id": "?s", "ex:q": annotated}]]),
+            json!({"@id": "?s", "@graph": "?g", "ex:q": annotated}),
+        ] {
+            let doc = json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": [["graph", "?g", {"@id": "?s", "ex:p": "?o"}]],
+                "insert": insert
+            });
+            let err = parse_doc(&doc, TxnType::Update).unwrap_err().to_string();
+            assert!(
+                err.starts_with("Parse error: ") && err.contains("variable graph"),
+                "{doc}: {err}"
+            );
+        }
     }
 
     /// The fail-closed cross-check: a reifier bundle whose edge is not

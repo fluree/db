@@ -215,6 +215,8 @@ pub enum ConfigDiagnosticCode {
     StrandedFields,
     /// Shapes exist but no config enables SHACL, so they are not enforced.
     ShaclNotConfigured,
+    /// Several `f:GraphConfig` overrides target one graph; only one is used.
+    DuplicateGraphOverride,
 }
 
 /// The setting-group pointers of a config node, with the group each names.
@@ -356,6 +358,24 @@ pub async fn diagnose(
         }
     }
 
+    if let Some(config) = resolve_ledger_config(snapshot, overlay, to_t).await? {
+        let mut by_target: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for graph in &config.graph_overrides {
+            *by_target.entry(graph.target_graph.as_str()).or_default() += 1;
+        }
+        for (target, count) in by_target.into_iter().filter(|(_, n)| *n > 1) {
+            out.push(ConfigDiagnostic {
+                code: ConfigDiagnosticCode::DuplicateGraphOverride,
+                message: format!(
+                    "{count} f:GraphConfig overrides target {target}; only one of them is \
+                     used, so merge them into one"
+                ),
+                subjects: vec![target.to_string()],
+            });
+        }
+    }
+
     if let Some(diagnostic) = shapes_without_enforcement(snapshot, overlay, to_t).await? {
         out.push(diagnostic);
     }
@@ -403,9 +423,10 @@ async fn graphs_with_config_fields(
     Ok(found)
 }
 
-/// "Shapes present; SHACL enforcement not configured": the default graph's
-/// SHACL posture is off and its shapes source holds at least one
-/// `sh:NodeShape` or `sh:PropertyShape`.
+/// "Shapes present; SHACL enforcement not configured": SHACL is off for
+/// every graph (ledger-wide and each graph override) and the shapes source
+/// holds at least one `sh:NodeShape` or `sh:PropertyShape`. A config that
+/// enables SHACL for one graph only is configured.
 async fn shapes_without_enforcement(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
@@ -413,8 +434,16 @@ async fn shapes_without_enforcement(
 ) -> Result<Option<ConfigDiagnostic>> {
     let config = resolve_ledger_config(snapshot, overlay, to_t).await?;
     let enabled = config.as_ref().is_some_and(|c| {
-        merge_shacl_opts(&resolve_effective_config(c, None), None, None)
-            .is_some_and(|shacl| shacl.enabled)
+        std::iter::once(None)
+            .chain(
+                c.graph_overrides
+                    .iter()
+                    .map(|graph| Some(graph.target_graph.as_str())),
+            )
+            .any(|graph| {
+                merge_shacl_opts(&resolve_effective_config(c, graph), None, None)
+                    .is_some_and(|shacl| shacl.enabled)
+            })
     });
     if enabled {
         return Ok(None);

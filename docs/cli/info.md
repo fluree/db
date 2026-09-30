@@ -92,8 +92,11 @@ The codes are `shacl-not-configured`, `empty-group` (a setting group that sets
 nothing in the config graph), `stranded-fields` (its fields were written to
 another graph; see [Repairing a config split across
 graphs](../ledger-config/writing-config.md#repairing-a-config-split-across-graphs)),
-`ambiguous-pointer` (a setting group pointer with several values) and
-`multiple-ledger-configs`.
+`ambiguous-pointer` (a setting group pointer with several values),
+`multiple-ledger-configs` and `duplicate-graph-override` (several
+`f:GraphConfig` overrides for one graph, of which only one is used).
+`shacl-not-configured` means no graph enables SHACL: a config that enables it
+for one graph only is configured.
 
 Graph source (Iceberg):
 ```

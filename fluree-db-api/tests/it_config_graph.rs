@@ -170,6 +170,83 @@ async fn diagnostics_report_shapes_without_enforcement() {
     assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
 }
 
+/// SHACL enabled for one graph only is configured: the shapes are enforced
+/// there, so no "not configured" diagnostic is reported.
+#[tokio::test]
+async fn diagnostics_count_shacl_enabled_for_one_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-graph-shacl:main";
+    fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": {
+                    "f": "https://ns.flur.ee/db#",
+                    "sh": "http://www.w3.org/ns/shacl#",
+                    "ex": "http://example.org/"
+                },
+                "@graph": [
+                    {
+                        "@id": "ex:PersonShape",
+                        "@type": "sh:NodeShape",
+                        "sh:targetClass": {"@id": "ex:Person"}
+                    },
+                    {
+                        "@id": "urn:it:cfg:ledger",
+                        "@type": "f:LedgerConfig",
+                        "@graph": "config",
+                        "f:graphOverrides": {
+                            "@id": "urn:it:cfg:scratch",
+                            "@type": "f:GraphConfig",
+                            "f:targetGraph": {"@id": "http://example.org/scratch"},
+                            "f:shaclDefaults": {"f:shaclEnabled": true}
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
+}
+
+/// Two graph overrides for one graph: the reader uses one of them, and ledger
+/// info says so.
+#[tokio::test]
+async fn diagnostics_report_duplicate_graph_overrides() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-dup-override:main";
+    let cfg = config_graph_iri(ledger_id);
+    fluree
+        .stage_owned(genesis_ledger(&fluree, ledger_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{cfg}> {{
+                <urn:config:main> rdf:type f:LedgerConfig ;
+                    f:graphOverrides <urn:config:a>, <urn:config:b> .
+                <urn:config:a> rdf:type f:GraphConfig ;
+                    f:targetGraph <http://example.org/scratch> ;
+                    f:shaclDefaults <urn:config:a-shacl> .
+                <urn:config:a-shacl> f:shaclEnabled true .
+                <urn:config:b> rdf:type f:GraphConfig ;
+                    f:targetGraph <http://example.org/scratch> ;
+                    f:shaclDefaults <urn:config:b-shacl> .
+                <urn:config:b-shacl> f:shaclEnabled false .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("config write");
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["duplicate-graph-override"]
+    );
+}
+
 /// A clean config has no diagnostics (the field is omitted).
 #[tokio::test]
 async fn diagnostics_are_empty_for_a_clean_config() {
