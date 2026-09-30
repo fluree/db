@@ -6306,3 +6306,95 @@ fn doc_search_vector_uses_flatrank_without_an_index() {
         "expected clusters.md to outrank expenses.md:\n{out}"
     );
 }
+
+/// #1972: the local query router resolves the body's dataset in the target
+/// ledger. A JSON-LD `from` naming one of its graphs (string or object form),
+/// another branch, or a missing ledger used to run on the view path, which
+/// ignored it and answered from the default graph; SPARQL `FROM` of another
+/// branch failed on the view path. Each now reads what it names.
+#[test]
+fn local_query_reads_the_graph_or_branch_its_dataset_names() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "routedb");
+    fluree_cmd(&tmp)
+        .args([
+            "branch",
+            "create",
+            "feature-x",
+            "--ledger",
+            "routedb",
+            "--direct",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-l",
+            "routedb:feature-x",
+            "--direct",
+            "-e",
+            "<http://example.org/f> <http://example.org/p> \"on-feature\" .",
+        ])
+        .assert()
+        .success();
+
+    let jsonld = |from: &str| {
+        format!(
+            r#"{{"from": {from}, "select": "?o",
+                 "where": {{"@id": "?s", "http://example.org/p": "?o"}}}}"#
+        )
+    };
+    let query = |body: &str| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args(["query", "-l", "routedb", "--format", "json", "-e", body]);
+        cmd
+    };
+
+    // The default graph, as a control.
+    query(&jsonld(r#""routedb""#))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in-default"));
+    // A graph of the ledger, by address and by object form.
+    for from in [
+        r#""routedb:main#http://example.org/g1""#,
+        r#"{"@id": "routedb:main", "graph": "http://example.org/g1"}"#,
+    ] {
+        query(&jsonld(from))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("in-g1"))
+            .stdout(predicate::str::contains("in-default").not());
+    }
+    // The config graph holds none of these triples.
+    query(&jsonld(r#""routedb:main#config""#))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in-default").not());
+    // Another branch, in JSON-LD and SPARQL.
+    query(&jsonld(r#""routedb:feature-x""#))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("on-feature"));
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "-l",
+            "routedb",
+            "--sparql",
+            "--format",
+            "json",
+            "-e",
+            "SELECT ?o FROM <routedb:feature-x> WHERE { ?s <http://example.org/p> ?o }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("on-feature"));
+    // A ledger that does not exist is an error, not the default graph.
+    query(&jsonld(r#"{"@id": "nope:main"}"#))
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("in-default").not());
+}
