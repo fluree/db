@@ -9,8 +9,13 @@
 //!
 //! A template `T` is **witnessed** by a WHERE triple `W` when:
 //! - (a) `W` sits at the top level of the WHERE, or directly inside a
-//!   top-level `GRAPH`: never under OPTIONAL, UNION, MINUS, EXISTS, a
-//!   subquery, SERVICE or a property path;
+//!   top-level `GRAPH`; or it is the only pattern of an OPTIONAL there, or
+//!   of one branch of a top-level UNION (or of a UNION a top-level OPTIONAL
+//!   holds alone). Never under MINUS, EXISTS, a subquery, SERVICE or a
+//!   property path. An OPTIONAL or UNION row that binds `W`'s object is the
+//!   decode of the fact `W` matched; one that does not leaves the object
+//!   unbound (by (d) nothing else binds it), and a template with an unbound
+//!   variable emits no intent;
 //! - (b) `T`'s subject and predicate are `W`'s — the same variable or the
 //!   same Sid;
 //! - (c) `T`'s object is a variable `v` and `W`'s object is the same `v`,
@@ -23,41 +28,32 @@
 //!   term identity, so the row could carry the other fact's datatype or
 //!   language tag; a filter equating `v` with another variable could be
 //!   folded into exactly such a join;
-//! - (e) `T` writes to the graph `W` read: the default-graph template with
-//!   the ledger's own default graph as the WHERE default; `GRAPH <g>`
-//!   templates with a WHERE default of exactly `g` (WITH, or a single
-//!   USING / JSON-LD `graph`/`from`) or with `W` inside `GRAPH <g>`, `g`
-//!   a graph the ledger has; `GRAPH ?g` templates with `W` inside
-//!   `GRAPH ?g`. A `GRAPH <iri>` whose name the WHERE dataset aliases to
-//!   another graph is never a witness: it reads that graph, while a
-//!   template naming the same IRI writes to the IRI's own graph.
+//! - (e) `T` writes to the graph `W` read, compared as ledger graph ids: the
+//!   graph the WHERE resolved for `W` (its single default graph, or the
+//!   dataset's graph for `GRAPH <name>`) is the graph the ledger has under
+//!   the template's IRI (the default graph for a default-graph template).
+//!   A graph name read one way and written another — a dataset alias, or a
+//!   name the WHERE maps to the default graph — is therefore never a
+//!   witness. `GRAPH ?g` templates need `W` inside `GRAPH ?g`.
 //!
 //! Subject and predicate are always nodes, and joins compare nodes
 //! exactly, so (b) needs no condition like (d).
 
 use crate::ir::{TemplateGraph, TemplateTerm, TripleTemplate};
+use fluree_db_core::GraphId;
 use fluree_db_query::ir::GraphName;
 use fluree_db_query::{Pattern, Ref, Term, TriplePattern, VarId};
 
-/// The WHERE clause's default graph.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WhereDefault<'a> {
-    /// No USING, WITH or JSON-LD `graph`/`from`: the ledger's default graph.
-    Ledger,
-    /// Exactly one graph, named by this IRI.
-    Graph(&'a str),
-    /// Anything else: several graphs, or none (USING NAMED alone).
-    Other,
-}
-
-/// What the rule needs to know about the WHERE's dataset.
+/// What the rule needs to know about the WHERE's dataset, in ledger graph
+/// ids: the same resolution the WHERE reads through.
 pub(crate) struct WitnessContext<'a> {
-    pub(crate) default: WhereDefault<'a>,
-    /// Whether the WHERE dataset resolves this graph name to a different
-    /// graph (a dataset alias).
-    pub(crate) aliased: &'a dyn Fn(&str) -> bool,
-    /// Whether an IRI names a graph the ledger has.
-    pub(crate) registered: &'a dyn Fn(&str) -> bool,
+    /// The graph the WHERE's default graph reads, when it reads exactly one
+    /// (`None`: several, or none — USING NAMED alone).
+    pub(crate) default: Option<GraphId>,
+    /// The graph `GRAPH <name>` reads in the WHERE dataset.
+    pub(crate) read: &'a dyn Fn(&str) -> Option<GraphId>,
+    /// The graph a template's `GRAPH <iri>` writes, when the ledger has it.
+    pub(crate) written: &'a dyn Fn(&str) -> Option<GraphId>,
 }
 
 /// Where a candidate witness reads.
@@ -67,12 +63,46 @@ enum ReadGraph<'p> {
     Named(&'p GraphName),
 }
 
-/// A candidate witness and its position: top-level index, and index inside
-/// a top-level `GRAPH` when it sits in one.
+/// Where a candidate witness sits, so the (d) check can skip it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Site {
+    /// Top-level pattern `i`: the triple, or an OPTIONAL holding only it.
+    Top(usize),
+    /// Pattern `j` of the top-level `GRAPH` at `i`: the triple, or an
+    /// OPTIONAL holding only it.
+    InGraph(usize, usize),
+    /// Branch `b` of the UNION at top-level `i` (see [`union_branches`]),
+    /// which holds only the triple.
+    UnionBranch(usize, usize),
+}
+
+/// The branches of a top-level UNION, or of a UNION a top-level OPTIONAL
+/// holds alone.
+fn union_branches(p: &Pattern) -> Option<&[Vec<Pattern>]> {
+    match p {
+        Pattern::Union(branches) => Some(branches),
+        Pattern::Optional(group) => match group.as_slice() {
+            [Pattern::Union(branches)] => Some(branches),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A candidate witness.
 struct Candidate<'p> {
     triple: &'p TriplePattern,
     graph: ReadGraph<'p>,
-    at: (usize, Option<usize>),
+    at: Site,
+}
+
+/// The triple an OPTIONAL group or UNION branch holds, when it holds only
+/// that.
+fn sole_triple(group: &[Pattern]) -> Option<&TriplePattern> {
+    match group {
+        [Pattern::Triple(triple)] => Some(triple),
+        _ => None,
+    }
 }
 
 /// For each template, whether a WHERE triple witnesses it.
@@ -95,15 +125,40 @@ fn candidates(patterns: &[Pattern]) -> Vec<Candidate<'_>> {
             Pattern::Triple(triple) => out.push(Candidate {
                 triple,
                 graph: ReadGraph::Default,
-                at: (i, None),
+                at: Site::Top(i),
             }),
+            Pattern::Optional(group) if sole_triple(group).is_some() => {
+                if let Some(triple) = sole_triple(group) {
+                    out.push(Candidate {
+                        triple,
+                        graph: ReadGraph::Default,
+                        at: Site::Top(i),
+                    });
+                }
+            }
+            Pattern::Optional(_) | Pattern::Union(_) => {
+                for (b, branch) in union_branches(p).into_iter().flatten().enumerate() {
+                    if let Some(triple) = sole_triple(branch) {
+                        out.push(Candidate {
+                            triple,
+                            graph: ReadGraph::Default,
+                            at: Site::UnionBranch(i, b),
+                        });
+                    }
+                }
+            }
             Pattern::Graph { name, patterns } => {
                 for (j, inner) in patterns.iter().enumerate() {
-                    if let Pattern::Triple(triple) = inner {
+                    let triple = match inner {
+                        Pattern::Triple(triple) => Some(triple),
+                        Pattern::Optional(group) => sole_triple(group),
+                        _ => None,
+                    };
+                    if let Some(triple) = triple {
                         out.push(Candidate {
                             triple,
                             graph: ReadGraph::Named(name),
-                            at: (i, Some(j)),
+                            at: Site::InGraph(i, j),
                         });
                     }
                 }
@@ -133,12 +188,13 @@ fn witnesses(
     }
     // (e)
     let same_graph = match (w.graph, &t.graph) {
-        (ReadGraph::Default, TemplateGraph::Default) => cx.default == WhereDefault::Ledger,
+        (ReadGraph::Default, TemplateGraph::Default) => cx.default == Some(0),
         (ReadGraph::Default, TemplateGraph::Iri(g)) => {
-            cx.default == WhereDefault::Graph(g) && (cx.registered)(g)
+            cx.default.is_some() && cx.default == (cx.written)(g)
         }
         (ReadGraph::Named(GraphName::Iri(read)), TemplateGraph::Iri(g)) => {
-            read == g && !(cx.aliased)(g) && (cx.registered)(g)
+            let read = (cx.read)(read);
+            read.is_some() && read == (cx.written)(g)
         }
         (ReadGraph::Named(GraphName::Var(read)), TemplateGraph::Var(g)) => read == g,
         _ => false,
@@ -156,18 +212,23 @@ fn same_node(t: &TemplateTerm, r: &Ref) -> bool {
 }
 
 /// Whether anything but the witness at `skip` mentions `v`, other than a
-/// top-level FILTER reading `v` alone (see (d)).
-fn mentioned_elsewhere(v: VarId, patterns: &[Pattern], skip: (usize, Option<usize>)) -> bool {
+/// FILTER reading `v` alone (see (d)).
+fn mentioned_elsewhere(v: VarId, patterns: &[Pattern], skip: Site) -> bool {
     patterns.iter().enumerate().any(|(i, p)| match p {
-        Pattern::Triple(_) if skip == (i, None) => false,
+        _ if skip == Site::Top(i) => false,
         Pattern::Graph { name, patterns } => {
             matches!(name, GraphName::Var(g) if *g == v)
                 || patterns
                     .iter()
                     .enumerate()
-                    .any(|(j, inner)| skip != (i, Some(j)) && mentions(inner, v))
+                    .any(|(j, inner)| skip != Site::InGraph(i, j) && mentions(inner, v))
         }
-        other => mentions(other, v),
+        other => match union_branches(other) {
+            Some(branches) => branches.iter().enumerate().any(|(b, branch)| {
+                skip != Site::UnionBranch(i, b) && branch.iter().any(|inner| mentions(inner, v))
+            }),
+            None => mentions(other, v),
+        },
     })
 }
 
@@ -217,19 +278,20 @@ mod tests {
         )
     }
 
-    fn registered(iri: &str) -> bool {
-        iri == GRAPH_IRI
+    /// The ledger has one named graph, `GRAPH_IRI`, as graph id 1.
+    const G1: GraphId = 1;
+
+    fn written(iri: &str) -> Option<GraphId> {
+        (iri == GRAPH_IRI).then_some(G1)
     }
 
-    fn not_aliased(_: &str) -> bool {
-        false
-    }
-
-    fn cx(default: WhereDefault<'_>) -> WitnessContext<'_> {
+    /// A WHERE dataset that reads every name as the graph the ledger has
+    /// under it.
+    fn cx(default: Option<GraphId>) -> WitnessContext<'static> {
         WitnessContext {
             default,
-            aliased: &not_aliased,
-            registered: &registered,
+            read: &written,
+            written: &written,
         }
     }
 
@@ -239,7 +301,7 @@ mod tests {
 
     #[test]
     fn delete_where_and_same_shape_updates_are_witnessed() {
-        let ledger = cx(WhereDefault::Ledger);
+        let ledger = cx(Some(0));
         assert!(check(&[where_sp_o()], t_sp_o(), &ledger));
         // DELETE WHERE { ?s ?p ?o }
         let spo = triple(Ref::Var(S), Ref::Var(P), Term::Var(O));
@@ -272,7 +334,7 @@ mod tests {
 
     #[test]
     fn constants_and_constraints_are_not_witnessed() {
-        let ledger = cx(WhereDefault::Ledger);
+        let ledger = cx(Some(0));
         // DELETE DATA: no WHERE at all.
         assert!(!check(&[], t_sp_o(), &ledger));
         // A constant object.
@@ -303,7 +365,7 @@ mod tests {
 
     #[test]
     fn an_object_bound_twice_is_not_witnessed() {
-        let ledger = cx(WhereDefault::Ledger);
+        let ledger = cx(Some(0));
         // Cross-pattern: the object is joined with another predicate's value.
         let other = triple(Ref::Var(X), Ref::Sid(Sid::new(100, "q")), Term::Var(O));
         assert!(!check(&[where_sp_o(), other], t_sp_o(), &ledger));
@@ -334,12 +396,53 @@ mod tests {
     }
 
     #[test]
-    fn optional_union_and_minus_do_not_witness() {
-        let ledger = cx(WhereDefault::Ledger);
+    fn a_sole_optional_or_union_triple_witnesses() {
+        let ledger = cx(Some(0));
+        // `?s ex:q ?x OPTIONAL { ?s ex:p ?o }`: the Cypher SET shape.
+        let q = triple(Ref::Var(S), Ref::Sid(Sid::new(100, "q")), Term::Var(X));
         let optional = Pattern::Optional(vec![where_sp_o()]);
+        assert!(check(&[q.clone(), optional.clone()], t_sp_o(), &ledger));
+        assert!(check(&[optional], t_sp_o(), &ledger));
+        // One UNION branch, the object bound in no other.
+        let union = Pattern::Union(vec![vec![where_sp_o()], vec![q.clone()]]);
+        assert!(check(&[union], t_sp_o(), &ledger));
+        // A UNION an OPTIONAL holds alone: the Cypher DETACH DELETE shape,
+        // whose inbound branch binds the object elsewhere.
+        let s_p_n = triple(Ref::Var(X), Ref::Var(P), Term::Var(S));
+        let detach = Pattern::Optional(vec![Pattern::Union(vec![
+            vec![triple(Ref::Var(S), Ref::Var(P), Term::Var(O))],
+            vec![s_p_n],
+        ])]);
+        let out_t = TripleTemplate::new(
+            TemplateTerm::Var(S),
+            TemplateTerm::Var(P),
+            TemplateTerm::Var(O),
+        );
+        assert!(check(&[detach], out_t, &ledger));
+        // Inside a top-level GRAPH.
+        let in_graph = Pattern::Graph {
+            name: GraphName::Iri(Arc::from(GRAPH_IRI)),
+            patterns: vec![q, Pattern::Optional(vec![where_sp_o()])],
+        };
+        assert!(check(&[in_graph], t_sp_o().in_graph(GRAPH_IRI), &ledger));
+    }
+
+    #[test]
+    fn optional_union_and_minus_do_not_witness_otherwise() {
+        let ledger = cx(Some(0));
+        let q_o = triple(Ref::Var(S), Ref::Sid(Sid::new(100, "q")), Term::Var(O));
+        // An OPTIONAL holding more than the triple.
+        let optional = Pattern::Optional(vec![where_sp_o(), q_o.clone()]);
         assert!(!check(&[optional], t_sp_o(), &ledger));
-        let union = Pattern::Union(vec![vec![where_sp_o()], vec![]]);
+        // Another UNION branch binds the object from another predicate.
+        let union = Pattern::Union(vec![vec![where_sp_o()], vec![q_o.clone()]]);
         assert!(!check(&[union], t_sp_o(), &ledger));
+        // A UNION branch holding more than the triple.
+        let union = Pattern::Union(vec![vec![where_sp_o(), q_o], vec![]]);
+        assert!(!check(&[union], t_sp_o(), &ledger));
+        // A nested OPTIONAL.
+        let nested = Pattern::Optional(vec![Pattern::Optional(vec![where_sp_o()])]);
+        assert!(!check(&[nested], t_sp_o(), &ledger));
         // A top-level witness plus an OPTIONAL that mentions the object.
         let optional = Pattern::Optional(vec![triple(
             Ref::Var(S),
@@ -359,39 +462,27 @@ mod tests {
     fn graph_contexts_must_agree() {
         let in_graph = t_sp_o().in_graph(GRAPH_IRI);
         // WITH <g> / a single USING <g>.
-        assert!(check(
-            &[where_sp_o()],
-            in_graph.clone(),
-            &cx(WhereDefault::Graph(GRAPH_IRI))
-        ));
+        assert!(check(&[where_sp_o()], in_graph.clone(), &cx(Some(G1))));
         // ... but the ledger default read by a named-graph template is not.
-        assert!(!check(
-            &[where_sp_o()],
-            in_graph.clone(),
-            &cx(WhereDefault::Ledger)
-        ));
+        assert!(!check(&[where_sp_o()], in_graph.clone(), &cx(Some(0))));
         // USING <g> with a default-graph template.
-        assert!(!check(
-            &[where_sp_o()],
-            t_sp_o(),
-            &cx(WhereDefault::Graph(GRAPH_IRI))
-        ));
+        assert!(!check(&[where_sp_o()], t_sp_o(), &cx(Some(G1))));
         // Several USING graphs.
-        assert!(!check(&[where_sp_o()], t_sp_o(), &cx(WhereDefault::Other)));
-        // A graph the ledger does not have.
+        assert!(!check(&[where_sp_o()], t_sp_o(), &cx(None)));
+        // A graph the ledger does not have: the WHERE reads some graph, the
+        // template writes a new one.
         let unknown = t_sp_o().in_graph("http://example.org/nope");
-        assert!(!check(
-            &[where_sp_o()],
-            unknown,
-            &cx(WhereDefault::Graph("http://example.org/nope"))
-        ));
+        assert!(!check(&[where_sp_o()], unknown, &cx(Some(0))));
+        // One name, read as the default graph and written as a named graph
+        // the ledger has under it: not the same graph.
+        assert!(!check(&[where_sp_o()], in_graph.clone(), &cx(Some(0))));
 
         // GRAPH <g> { … }
         let graph_block = |name: GraphName| Pattern::Graph {
             name,
             patterns: vec![where_sp_o()],
         };
-        let ledger = cx(WhereDefault::Ledger);
+        let ledger = cx(Some(0));
         assert!(check(
             &[graph_block(GraphName::Iri(Arc::from(GRAPH_IRI)))],
             in_graph.clone(),
@@ -403,10 +494,10 @@ mod tests {
             &ledger
         ));
         // A name the dataset aliases to another graph reads that graph.
-        let alias_of_g1 = |iri: &str| iri == GRAPH_IRI;
+        let alias_of_g2 = |iri: &str| (iri == GRAPH_IRI).then_some(2);
         let aliased = WitnessContext {
-            aliased: &alias_of_g1,
-            ..cx(WhereDefault::Ledger)
+            read: &alias_of_g2,
+            ..cx(Some(0))
         };
         assert!(!check(
             &[graph_block(GraphName::Iri(Arc::from(GRAPH_IRI)))],

@@ -24,6 +24,8 @@ use fluree_db_api::policy_builder::build_policy_context_from_opts;
 use fluree_db_api::{
     Fluree, FlureeBuilder, GovernanceOptions, LedgerState, PolicyContext, TransactResult,
 };
+use fluree_db_core::comparator::IndexType;
+use fluree_db_core::{range_with_overlay, FlakeValue, RangeMatch, RangeOptions, RangeTest};
 use serde_json::{json, Value as JsonValue};
 
 const EX: &str = "http://example.org/ns/";
@@ -838,5 +840,108 @@ async fn a_permitted_delete_of_an_absent_value_commits_nothing() {
         .await
         .expect("permitted");
         assert_eq!(r.receipt.retract_count, 1, "indexed={indexed}");
+    }
+}
+
+// =============================================================================
+// A witness reads the graph its template writes
+// =============================================================================
+
+/// The strings stored as `ex:s ex:p` in the graph the ledger has under
+/// `iri` (`None`: the default graph), read at the flake level: a query's
+/// `GRAPH <iri>` may resolve the name another way.
+async fn graph_objects(ledger: &LedgerState, iri: Option<&str>) -> Vec<String> {
+    let g_id = match iri {
+        None => 0,
+        Some(iri) => ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .expect("graph"),
+    };
+    let s = ledger.snapshot.encode_iri(&format!("{EX}s")).expect("s");
+    let p = ledger.snapshot.encode_iri(&format!("{EX}p")).expect("p");
+    let flakes = range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject_predicate(s, p),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("range");
+    let mut out: Vec<String> = flakes
+        .iter()
+        .filter(|f| f.op)
+        .map(|f| match &f.o {
+            FlakeValue::String(v) => v.clone(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A ledger with a named graph registered under its own address, which a
+/// TriG block can create. `USING <address>` with `GRAPH <address>`
+/// templates: the templates write that graph, and a WHERE row witnesses a
+/// template only when the graph the WHERE read is the graph the template
+/// writes, compared as graph ids. The row's value is inserted into that
+/// graph whichever graph the WHERE reads for the address, and the default
+/// graph is left alone.
+#[tokio::test]
+async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
+    for indexed in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("file fluree");
+        let id = format!("legacyaddress{indexed}:main");
+        let ledger = fluree.create_ledger(&id).await.expect("create");
+        let trig = format!(
+            "@prefix ex: <{EX}> .\nex:s ex:p \"d\" .\nGRAPH <{id}> {{ ex:s ex:p \"l\" . }}\n"
+        );
+        let mut ledger = fluree
+            .insert_turtle(ledger, &trig)
+            .await
+            .expect("seed")
+            .ledger;
+        assert!(
+            ledger
+                .snapshot
+                .graph_registry
+                .graph_id_for_iri(&id)
+                .is_some(),
+            "the fixture registers a graph under the ledger's address"
+        );
+        if indexed {
+            drop(ledger);
+            support::rebuild_and_publish_index(&fluree, &id).await;
+            ledger = fluree.ledger(&id).await.expect("reload");
+        }
+        let r = sparql_update(
+            &fluree,
+            ledger,
+            &format!(
+                "DELETE {{ GRAPH <{id}> {{ ?s ex:p ?o }} }} \
+                 INSERT {{ GRAPH <{id}> {{ ?s ex:p \"d\" }} }} \
+                 USING <{id}> WHERE {{ ?s ex:p ?o }}"
+            ),
+        )
+        .await;
+        assert!(
+            graph_objects(&r.ledger, Some(&id))
+                .await
+                .contains(&"d".to_string()),
+            "indexed={indexed}: {:?}",
+            graph_objects(&r.ledger, Some(&id)).await
+        );
+        assert_eq!(
+            graph_objects(&r.ledger, None).await,
+            ["d"],
+            "indexed={indexed}"
+        );
     }
 }

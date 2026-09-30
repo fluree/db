@@ -114,3 +114,116 @@ async fn delete_witnessed_lane_fires_only_on_a_list_free_ledger() {
         "a list-bearing ledger must read list positions"
     );
 }
+
+/// A value bound by the sole triple of an OPTIONAL, or of one UNION branch,
+/// is the decode of that triple's fact, so its row takes the witnessed lane:
+/// the JSON-LD and SPARQL shapes, and Cypher `SET` and `DETACH DELETE`,
+/// which read the old value through an OPTIONAL. A UNION whose other branch
+/// binds the object from another predicate stays on the matched lane.
+#[tokio::test(flavor = "current_thread")]
+async fn optional_and_union_rows_take_the_witnessed_lane() {
+    let (store, _guard) = span_capture::init_test_tracing();
+    let site = fluree_db_transact::DELETE_WITNESSED_SITE;
+    let outcomes = |from: usize| -> Vec<String> {
+        store.find_events("fast-path outcome")[from..]
+            .iter()
+            .filter(|e| e.fields.get("site").map(String::as_str) == Some(site))
+            .filter_map(|e| e.fields.get("outcome").cloned())
+            .collect()
+    };
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("it/delete-witness-optional:main")
+        .await
+        .expect("create");
+    let mut ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:Node", "ex:tag": "x"},
+                    {"@id": "ex:b", "@type": "ex:Node", "ex:tag": "y"},
+                    {"@id": "ex:c", "@type": "ex:Node", "ex:tag": "z"},
+                    {"@id": "ex:d", "@type": "ex:Node", "ex:tag": "w", "ex:other": "v"},
+                    {"@id": "ex:e", "@type": "ex:Node", "ex:tag": "u"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let cases: Vec<(&str, JsonValue, &str)> = vec![
+        (
+            "JSON-LD OPTIONAL",
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "ex:a", "@type": "ex:Node"},
+                          ["optional", {"@id": "ex:a", "ex:tag": "?o"}]],
+                "delete": {"@id": "ex:a", "ex:tag": "?o"}
+            }),
+            "proceed",
+        ),
+        (
+            "JSON-LD UNION",
+            json!({
+                "@context": ctx(),
+                "where": [["union", {"@id": "ex:b", "ex:tag": "?o"}, {"@id": "ex:b", "@type": "?t"}]],
+                "delete": {"@id": "ex:b", "ex:tag": "?o"}
+            }),
+            "proceed",
+        ),
+    ];
+    for (what, txn, expected) in cases {
+        let before = store.find_events("fast-path outcome").len();
+        let r = fluree.update(ledger, &txn).await.expect(what);
+        assert_eq!(r.receipt.retract_count, 1, "{what}");
+        assert_eq!(outcomes(before), [expected], "{what}");
+        ledger = r.ledger;
+    }
+
+    // The other branch binds the object from another predicate: matched.
+    let before = store.find_events("fast-path outcome").len();
+    let r = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "where": [["union", {"@id": "ex:d", "ex:tag": "?o"}, {"@id": "ex:d", "ex:other": "?o"}]],
+                "delete": {"@id": "ex:d", "ex:tag": "?o"}
+            }),
+        )
+        .await
+        .expect("UNION binding the object twice");
+    assert_eq!(r.receipt.retract_count, 1, "the delete still retracts");
+    assert!(
+        outcomes(before).is_empty(),
+        "a UNION binding the object twice is not a witness"
+    );
+    ledger = r.ledger;
+
+    for (what, stmt) in [
+        (
+            "Cypher SET",
+            "MATCH (n:`http://example.org/ns/Node`) WHERE n.`http://example.org/ns/tag` = 'z' \
+             SET n.`http://example.org/ns/tag` = 'zz'",
+        ),
+        (
+            "Cypher DETACH DELETE",
+            "MATCH (n:`http://example.org/ns/Node`) WHERE n.`http://example.org/ns/tag` = 'u' \
+             DETACH DELETE n",
+        ),
+    ] {
+        let before = store.find_events("fast-path outcome").len();
+        let r = fluree.transact_cypher(ledger, stmt).await.expect(what);
+        assert!(r.receipt.retract_count >= 1, "{what}");
+        assert!(
+            outcomes(before).iter().any(|o| o == "proceed"),
+            "{what}: {:?}",
+            outcomes(before)
+        );
+        ledger = r.ledger;
+    }
+}

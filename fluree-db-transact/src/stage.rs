@@ -9,7 +9,7 @@
 //! staged view against SHACL shapes.
 
 use crate::current_facts::{CurrentFacts, ListFree, ResolveStats, Retraction, Slot, StoredFact};
-use crate::delete_witness::{witnessed_templates, WhereDefault, WitnessContext};
+use crate::delete_witness::{witnessed_templates, WitnessContext};
 use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
 use crate::ir::InlineValues;
@@ -2758,10 +2758,13 @@ async fn stream_where_into_accumulator(
     }
     let mut seen_named_keys: HashSet<Arc<str>> = HashSet::new();
     let mut graph_aliases: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+    // The graph each `GRAPH <name>` reads, for the witness rule.
+    let mut named_reads: HashMap<Arc<str>, GraphId> = HashMap::new();
     for (name, g_id, enumerable, canonical) in named {
         if !seen_named_keys.insert(name.clone()) {
             continue;
         }
+        named_reads.insert(name.clone(), g_id);
         runtime_dataset = if enumerable {
             runtime_dataset.with_named_graph(name, make_graph_ref(g_id))
         } else {
@@ -2774,24 +2777,33 @@ async fn stream_where_into_accumulator(
     // Which DELETE templates a WHERE triple witnesses, and whether the
     // ledger can hold a list position at all: together they decide which
     // retractions need no read (see `CurrentFacts::resolve_intents`).
+    //
+    // Graphs compare as the ledger graph ids the dataset above reads: its
+    // default graph when that is one ledger graph, and `named_reads` for
+    // `GRAPH <name>`. The default graph is the ledger's own with no
+    // `USING`/`WITH`/`from`, and otherwise the one graph those name resolves
+    // to (`resolve_where_default_graph`, where the ledger's own address is its
+    // default graph). An empty default graph (`USING NAMED` alone, or a graph
+    // that does not exist) or a union of several witnesses nothing.
     let where_default = if where_default_is_empty {
-        WhereDefault::Other
+        None
+    } else if desired_where_default_graph_iris.is_empty() {
+        Some(base_db.g_id)
     } else {
-        match desired_where_default_graph_iris.as_slice() {
-            [] => WhereDefault::Ledger,
-            [iri] => WhereDefault::Graph(iri),
-            _ => WhereDefault::Other,
+        match where_default_g_ids.as_slice() {
+            [Some(g_id)] => Some(*g_id),
+            _ => None,
         }
     };
-    let registered = |iri: &str| resolve_graph_id(iri).is_some();
-    let aliased = |iri: &str| graph_aliases.contains_key(iri);
+    let read = |iri: &str| named_reads.get(iri).copied();
+    let written = |iri: &str| resolve_graph_id(iri);
     let witnessed = witnessed_templates(
         &query_patterns,
         &txn.delete_templates,
         &WitnessContext {
             default: where_default,
-            aliased: &aliased,
-            registered: &registered,
+            read: &read,
+            written: &written,
         },
     );
     let list_free = ListFree::check(ledger);
