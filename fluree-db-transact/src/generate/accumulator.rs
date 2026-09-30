@@ -25,6 +25,7 @@
 //!   retractions survive (RDF set semantics: 4 retracts + 1 assert collapses
 //!   to 1 surviving retract, not 0).
 
+use crate::current_facts::Retraction;
 use fluree_db_core::{Flake, IndexType, Sid};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
@@ -114,10 +115,16 @@ impl FlakeAccumulator {
         self.input_count
     }
 
-    /// Push retractions from any source. Duplicates collapse to a single
-    /// representative survivor (RDF set semantics).
-    pub fn push_retractions<I: IntoIterator<Item = Flake>>(&mut self, flakes: I) {
+    /// Push retractions. Duplicates collapse to a single representative
+    /// survivor (RDF set semantics).
+    ///
+    /// Only a [`Retraction`] is accepted — a retraction of a stored fact (see
+    /// [`crate::current_facts`]). A retraction of a fact that is not stored
+    /// would cancel a same-transaction assertion of that fact, and the
+    /// assertion would never be written.
+    pub fn push_retractions<I: IntoIterator<Item = Retraction>>(&mut self, retractions: I) {
         let hint = self.capacity_hint;
+        let flakes = retractions.into_iter().map(Retraction::into_flake);
         match &mut self.inner {
             AccInner::PureRetract(graphs) => {
                 for f in flakes {
@@ -249,6 +256,10 @@ fn push_into_mixed(set_assertions: bool, map: &mut FxHashMap<Flake, FlakeBucket>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retractions(flakes: Vec<Flake>) -> Vec<Retraction> {
+        flakes.into_iter().map(Retraction::for_test).collect()
+    }
     use fluree_db_core::{FlakeValue, Sid};
 
     fn flake(s: u16, p: u16, o: i64, t: i64, op: bool) -> Flake {
@@ -268,11 +279,11 @@ mod tests {
     #[test]
     fn pure_delete_dedups_duplicates() {
         let mut acc = FlakeAccumulator::pure_delete(4);
-        acc.push_retractions(vec![
+        acc.push_retractions(retractions(vec![
             flake(1, 1, 100, 5, false),
             flake(1, 1, 100, 5, false),
             flake(1, 1, 100, 5, false),
-        ]);
+        ]));
         let out = acc.finalize();
         assert_eq!(out.len(), 1);
         assert!(!out[0].op);
@@ -281,11 +292,11 @@ mod tests {
     #[test]
     fn pure_delete_preserves_distinct_facts() {
         let mut acc = FlakeAccumulator::pure_delete(4);
-        acc.push_retractions(vec![
+        acc.push_retractions(retractions(vec![
             flake(1, 1, 100, 5, false),
             flake(2, 1, 100, 5, false),
             flake(3, 1, 100, 5, false),
-        ]);
+        ]));
         let out = acc.finalize();
         assert_eq!(out.len(), 3);
         // SPOT order: by subject namespace_code first
@@ -297,7 +308,10 @@ mod tests {
     #[test]
     fn pure_delete_input_count_tracks_total_pushes() {
         let mut acc = FlakeAccumulator::pure_delete(2);
-        acc.push_retractions(vec![flake(1, 1, 100, 5, false), flake(1, 1, 100, 5, false)]);
+        acc.push_retractions(retractions(vec![
+            flake(1, 1, 100, 5, false),
+            flake(1, 1, 100, 5, false),
+        ]));
         assert_eq!(acc.input_count(), 2);
         assert_eq!(acc.finalize().len(), 1);
     }
@@ -320,7 +334,7 @@ mod tests {
     #[test]
     fn mixed_cancels_one_to_one_pair() {
         let mut acc = FlakeAccumulator::mixed(2);
-        acc.push_retractions(vec![flake(1, 1, 100, 5, false)]);
+        acc.push_retractions(retractions(vec![flake(1, 1, 100, 5, false)]));
         acc.push_assertions(vec![flake(1, 1, 100, 5, true)]);
         assert!(acc.finalize().is_empty());
     }
@@ -328,7 +342,7 @@ mod tests {
     #[test]
     fn mixed_keeps_unmatched() {
         let mut acc = FlakeAccumulator::mixed(2);
-        acc.push_retractions(vec![flake(1, 1, 100, 5, false)]);
+        acc.push_retractions(retractions(vec![flake(1, 1, 100, 5, false)]));
         acc.push_assertions(vec![flake(1, 1, 200, 5, true)]); // different object
         let out = acc.finalize();
         assert_eq!(out.len(), 2);
@@ -337,12 +351,12 @@ mod tests {
     #[test]
     fn mixed_4_retracts_1_assert_yields_1_retract() {
         let mut acc = FlakeAccumulator::mixed(2);
-        acc.push_retractions(vec![
+        acc.push_retractions(retractions(vec![
             flake(1, 1, 100, 5, false),
             flake(1, 1, 100, 6, false),
             flake(1, 1, 100, 7, false),
             flake(1, 1, 100, 8, false),
-        ]);
+        ]));
         acc.push_assertions(vec![flake(1, 1, 100, 9, true)]);
         let out = acc.finalize();
         assert_eq!(out.len(), 1);
@@ -357,7 +371,7 @@ mod tests {
             flake(1, 1, 100, 6, true),
             flake(1, 1, 100, 7, true),
         ]);
-        acc.push_retractions(vec![flake(1, 1, 100, 8, false)]);
+        acc.push_retractions(retractions(vec![flake(1, 1, 100, 8, false)]));
         let out = acc.finalize();
         assert_eq!(out.len(), 1);
         assert!(out[0].op, "the survivor must be an assertion");
@@ -371,12 +385,12 @@ mod tests {
         // semantics the fact is unchanged and nothing survives.
         let mut counting = FlakeAccumulator::mixed(2);
         counting.push_assertions(vec![flake(1, 1, 100, 5, true), flake(1, 1, 100, 5, true)]);
-        counting.push_retractions(vec![flake(1, 1, 100, 5, false)]);
+        counting.push_retractions(retractions(vec![flake(1, 1, 100, 5, false)]));
         assert_eq!(counting.finalize().len(), 1);
 
         let mut set = FlakeAccumulator::mixed_set_assertions(2);
         set.push_assertions(vec![flake(1, 1, 100, 5, true), flake(1, 1, 100, 5, true)]);
-        set.push_retractions(vec![flake(1, 1, 100, 5, false)]);
+        set.push_retractions(retractions(vec![flake(1, 1, 100, 5, false)]));
         assert!(
             set.finalize().is_empty(),
             "unchanged fact must net to nothing"
@@ -386,7 +400,7 @@ mod tests {
         // is still retracted.
         let mut set = FlakeAccumulator::mixed_set_assertions(2);
         set.push_assertions(vec![flake(1, 1, 101, 5, true), flake(1, 1, 101, 5, true)]);
-        set.push_retractions(vec![flake(1, 1, 100, 5, false)]);
+        set.push_retractions(retractions(vec![flake(1, 1, 100, 5, false)]));
         let out = set.finalize();
         assert_eq!(out.len(), 2);
         assert_eq!(out.iter().filter(|f| f.op).count(), 1);
@@ -423,8 +437,8 @@ mod tests {
     #[test]
     fn mixed_multi_feed_retractions_merge_correctly() {
         let mut acc = FlakeAccumulator::mixed(2);
-        acc.push_retractions(vec![flake(1, 1, 100, 5, false)]);
-        acc.push_retractions(vec![flake(1, 1, 100, 6, false)]); // duplicate fact
+        acc.push_retractions(retractions(vec![flake(1, 1, 100, 5, false)]));
+        acc.push_retractions(retractions(vec![flake(1, 1, 100, 6, false)])); // duplicate fact
         acc.push_assertions(vec![flake(1, 1, 100, 7, true)]);
         // 2 retracts vs 1 assert → cancel = 1 → 1 retract survives.
         let out = acc.finalize();
@@ -467,10 +481,10 @@ mod tests {
         // Same fact retracted in the default graph AND a named graph must yield
         // two survivors (one per graph), not collapse to one.
         let mut acc = FlakeAccumulator::pure_delete(2);
-        acc.push_retractions(vec![
+        acc.push_retractions(retractions(vec![
             flake(1, 1, 100, 5, false),             // default graph (g = None)
             flake_in_graph(7, 1, 1, 100, 5, false), // named graph
-        ]);
+        ]));
         let out = acc.finalize();
         assert_eq!(out.len(), 2, "default and named retractions are distinct");
         assert!(out.iter().any(|f| f.g.is_none()));
@@ -497,7 +511,7 @@ mod tests {
         // default graph target different graphs and must NOT cancel.
         let mut acc = FlakeAccumulator::mixed(2);
         acc.push_assertions(vec![flake_in_graph(7, 1, 1, 100, 5, true)]);
-        acc.push_retractions(vec![flake(1, 1, 100, 6, false)]);
+        acc.push_retractions(retractions(vec![flake(1, 1, 100, 6, false)]));
         let out = acc.finalize();
         assert_eq!(out.len(), 2, "cross-graph assert/retract must not cancel");
         assert!(out.iter().any(|f| f.op && f.g.is_some()));
@@ -510,7 +524,7 @@ mod tests {
         // cancel 1:1 (unchanged set semantics, now graph-scoped).
         let mut acc = FlakeAccumulator::mixed(2);
         acc.push_assertions(vec![flake_in_graph(7, 1, 1, 100, 5, true)]);
-        acc.push_retractions(vec![flake_in_graph(7, 1, 1, 100, 6, false)]);
+        acc.push_retractions(retractions(vec![flake_in_graph(7, 1, 1, 100, 6, false)]));
         assert!(acc.finalize().is_empty());
     }
 }

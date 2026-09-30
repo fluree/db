@@ -8,7 +8,8 @@
 //! When the `shacl` feature is enabled, [`validate_view_with_shacl`] validates a
 //! staged view against SHACL shapes.
 
-use crate::current_facts::{CurrentFacts, Retraction, Slot, StoredFact};
+use crate::current_facts::{CurrentFacts, ListFree, ResolveStats, Retraction, Slot, StoredFact};
+use crate::delete_witness::{witnessed_templates, WhereDefault, WitnessContext};
 use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
 use crate::ir::InlineValues;
@@ -17,7 +18,6 @@ use crate::ir::{
     Txn, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
-use fluree_db_core::comparator::IndexType;
 use fluree_db_core::graph_registry::{FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
@@ -28,6 +28,7 @@ use fluree_db_policy::{
     is_schema_flake, lookup_subject_classes, PolicyContext, PolicyDecision, PolicyError,
     WriteFlakeInfo, WriteVerb,
 };
+use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use fluree_db_query::parse::{lower_unresolved_patterns, UnresolvedPattern};
 use fluree_db_query::{
     Batch, Binding, Pattern, QueryPolicyEnforcer, QueryPolicyExecutor, VarId, VarRegistry,
@@ -43,6 +44,12 @@ use tracing::Instrument;
 
 #[cfg(feature = "shacl")]
 use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
+
+/// Routing stamp site for a DELETE whose templates a WHERE triple
+/// witnesses: `proceed` when the witnessed rows retract with no read (the
+/// ledger holds no `@list` position), `fallback:gate_declined` when they read
+/// their slots for list positions.
+pub const DELETE_WITNESSED_SITE: &str = "delete_witnessed";
 
 /// Build a reverse lookup from graph Sid → GraphId.
 ///
@@ -903,7 +910,7 @@ pub async fn stage_with_graph_delta(
                 upsert_retraction_count = upsert_retractions.len(),
                 "upsert deletions generated"
             );
-            acc.push_retractions(upsert_retractions.into_iter().map(Retraction::into_flake));
+            acc.push_retractions(upsert_retractions);
         }
 
         // Graph-sync wave: retract every current fact of the target graph
@@ -939,7 +946,7 @@ pub async fn stage_with_graph_delta(
                 scanned = current.len(),
                 "graph-sync retractions generated"
             );
-            acc.push_retractions(current.into_iter().map(|f| f.retract(new_t).into_flake()));
+            acc.push_retractions(current.into_iter().map(|f| f.retract(new_t)));
         }
 
         let retraction_count = stream_stats.retraction_count;
@@ -2159,133 +2166,6 @@ pub async fn stage_flakes(
     .await
 }
 
-async fn hydrate_list_index_meta_for_retractions(
-    ledger: &LedgerState,
-    retractions: &mut [Flake],
-    reverse_graph: &HashMap<Sid, GraphId>,
-) -> Result<()> {
-    use std::collections::BTreeMap;
-
-    // Nothing to copy when neither the indexed base nor novelty holds a
-    // single `@list` position. `Some(false)` is an exact observation by the
-    // indexer; `None` (legacy root, bulk import) must fall through.
-    if ledger.snapshot.has_list_meta == Some(false) && !ledger.novelty.has_list_meta {
-        return Ok(());
-    }
-
-    // Group candidates by (graph, subject, predicate).
-    let mut groups: HashMap<(GraphId, Sid, Sid), Vec<usize>> = HashMap::new();
-    for (idx, flake) in retractions.iter().enumerate() {
-        // Only retractions lacking a list position are candidates. A
-        // language-tagged binding already carries `m = { lang, i: None }`
-        // and still needs its position filled in.
-        if flake.op || flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
-            continue;
-        }
-        let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
-        groups
-            .entry((g_id, flake.s.clone(), flake.p.clone()))
-            .or_default()
-            .push(idx);
-    }
-    if groups.is_empty() {
-        return Ok(());
-    }
-
-    let to_t = ledger.t();
-
-    // Novelty side: ONE SPOT walk per touched graph, keeping every op on a
-    // requested (subject, predicate) pair. `range_with_overlay` per group
-    // would instead translate (or walk) the graph's entire overlay once per
-    // group — O(groups × novelty), observed as a multi-minute-to-never
-    // filtered DELETE once both are in the tens of thousands.
-    let mut wanted: HashMap<GraphId, HashSet<(&Sid, &Sid)>> = HashMap::new();
-    for (g_id, s, p) in groups.keys() {
-        wanted.entry(*g_id).or_default().insert((s, p));
-    }
-    let mut overlay_by_key: HashMap<(GraphId, Sid, Sid), Vec<Flake>> = HashMap::new();
-    for (g_id, pairs) in &wanted {
-        ledger.novelty.for_each_overlay_flake(
-            *g_id,
-            IndexType::Spot,
-            None,
-            None,
-            true,
-            to_t,
-            &mut |f| {
-                if f.t <= to_t && pairs.contains(&(&f.s, &f.p)) {
-                    overlay_by_key
-                        .entry((*g_id, f.s.clone(), f.p.clone()))
-                        .or_default()
-                        .push(f.clone());
-                }
-            },
-        );
-    }
-
-    for ((g_id, s, p), members) in groups {
-        // Base side: subject + predicate bound against the persisted index
-        // only (`NoOverlay`) — a leaf seek, no overlay translation.
-        let rm = fluree_db_core::RangeMatch::new()
-            .with_subject(s.clone())
-            .with_predicate(p.clone());
-        let mut found = fluree_db_core::range_with_overlay(
-            &ledger.snapshot,
-            g_id,
-            &fluree_db_core::NoOverlay,
-            IndexType::Spot,
-            fluree_db_core::RangeTest::Eq,
-            rm,
-            fluree_db_core::RangeOptions::new().with_to_t(to_t),
-        )
-        .await?;
-        if let Some(ops) = overlay_by_key.remove(&(g_id, s, p)) {
-            found.extend(ops);
-        }
-        // Same lifecycle rule `range_with_overlay` applies to its merged
-        // result: newest op per fact key wins, retractions drop out.
-        let found = fluree_db_core::range::resolve_current_flakes(found, IndexType::Spot);
-
-        // Index asserted list-carrying metas per object value, in index
-        // order. Every matching retraction copies the FIRST dt-compatible
-        // meta: identical duplicates then collapse in the accumulator, so a
-        // value asserted at N list positions loses exactly one entry per
-        // distinct WHERE binding (pinned by the `object-probe-list-retract`
-        // case in `it_join_batched_overlay.rs`).
-        let mut metas: BTreeMap<FlakeValue, Vec<(Sid, fluree_db_core::FlakeMeta)>> =
-            BTreeMap::new();
-        for f in found {
-            if f.op {
-                if let Some(m) = f.m.filter(|m| m.i.is_some()) {
-                    metas.entry(f.o).or_default().push((f.dt, m));
-                }
-            }
-        }
-        if metas.is_empty() {
-            continue;
-        }
-
-        for idx in members {
-            let flake = &mut retractions[idx];
-            let Some(candidates) = metas.get(&flake.o) else {
-                continue;
-            };
-            // Same lexical value under different language tags are distinct
-            // facts: the candidate must match the retraction's tag (absent
-            // on both for plain literals) as well as its datatype.
-            let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
-            if let Some((_, m)) = candidates
-                .iter()
-                .find(|(dt, m)| &flake.dt == dt && m.lang.as_deref() == lang)
-            {
-                flake.m = Some(m.clone());
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Per-(graph, subject) write-time state computed once per transaction for
 /// policy enforcement: the class sets each policy flavor targets against and
 /// the subject's lifecycle verb.
@@ -2624,19 +2504,20 @@ struct WhereStreamStats {
 }
 
 /// Stream the WHERE result into `acc`, projecting → materializing encoded
-/// bindings in place → generating retractions → hydrating list-index meta →
-/// pushing into the accumulator, one batch at a time. Assertions are
-/// generated and pushed on the same batch when not in pure-delete mode.
+/// bindings in place → instantiating DELETE templates as retraction intents
+/// → resolving them to retractions of stored facts → pushing into the
+/// accumulator, one batch at a time. Assertions are generated and pushed on
+/// the same batch when not in pure-delete mode.
 ///
 /// `template_vars` is the union of variables referenced by INSERT/DELETE
 /// templates; WHERE-only helper columns are dropped before materialization
 /// to keep per-batch memory tied to template width, not WHERE width.
 ///
-/// **Hydration must run before push.** `Flake` identity includes `m`, so a
-/// raw retraction with `m = None` would collapse with its peers in the
-/// accumulator before hydrate had a chance to fill in the list-index — we'd
-/// end up retracting only one of N list entries. Hydrating per batch keeps
-/// `m` correct on every retraction before it reaches the dedup layer.
+/// **Resolution runs before push.** An intent that names no stored fact
+/// stages nothing, so it cannot cancel a same-transaction assertion of that
+/// fact; and `Flake` identity includes `m`, so each retraction must carry
+/// its stored list position before the accumulator dedups, or N list
+/// entries with the same `(s, p, o, dt)` would collapse to one.
 #[allow(clippy::too_many_arguments)]
 async fn stream_where_into_accumulator(
     ledger: &LedgerState,
@@ -2908,6 +2789,42 @@ async fn stream_where_into_accumulator(
             runtime_dataset.with_named_graph_alias(name, make_graph_ref(g_id))
         };
     }
+    // Which DELETE templates a WHERE triple witnesses, and whether the
+    // ledger can hold a list position at all: together they decide which
+    // retractions need no read (see `CurrentFacts::resolve_intents`).
+    let where_default = if where_default_is_empty {
+        WhereDefault::Other
+    } else {
+        match desired_where_default_graph_iris.as_slice() {
+            [] => WhereDefault::Ledger,
+            [iri] => WhereDefault::Graph(iri),
+            _ => WhereDefault::Other,
+        }
+    };
+    let registered = |iri: &str| resolve_graph_id(iri).is_some();
+    let aliased = |iri: &str| graph_aliases.contains_key(iri);
+    let witnessed = witnessed_templates(
+        &query_patterns,
+        &txn.delete_templates,
+        &WitnessContext {
+            default: where_default,
+            aliased: &aliased,
+            registered: &registered,
+        },
+    );
+    let list_free = ListFree::check(ledger);
+    if witnessed.iter().any(|w| *w) {
+        stamp_fast_path(
+            DELETE_WITNESSED_SITE,
+            if list_free.is_some() {
+                FastPathOutcome::Proceed
+            } else {
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+            },
+        );
+    }
+    let current_facts = CurrentFacts::new(ledger);
+    let mut resolve_stats = ResolveStats::default();
     generator.set_graph_aliases(graph_aliases);
 
     // Open the streaming WHERE cursor. For empty patterns it emits one
@@ -2947,27 +2864,28 @@ async fn stream_where_into_accumulator(
             template_count = txn.delete_templates.len(),
             retraction_count = tracing::field::Empty,
         );
-        let retractions = {
+        let intents = {
             let _g = delete_span.enter();
-            let mut r = generator.generate_retractions(&txn.delete_templates, &batch)?;
+            let intents =
+                generator.generate_retract_intents(&txn.delete_templates, &witnessed, &batch)?;
             route_var_graphs(
                 ledger,
                 generator.written_graphs(),
                 fixed_graph_iris,
                 reverse_graph,
             )?;
-
-            // Hydrate BEFORE push. `Flake::eq` includes `m`, so raw retractions
-            // with `m = None` must have their list-index filled in from the
-            // asserted flake before they reach the accumulator — otherwise
-            // N list entries with the same `(s,p,o,dt)` would collapse to one
-            // retraction survivor and only one list entry would actually be
-            // retracted from the index.
-            hydrate_list_index_meta_for_retractions(ledger, &mut r, reverse_graph).await?;
-
-            delete_span.record("retraction_count", r.len() as u64);
-            r
+            intents
         };
+        // Resolve BEFORE push (see the doc comment above).
+        let routing: &HashMap<Sid, GraphId> = reverse_graph;
+        let (retractions, stats) = current_facts
+            .resolve_intents(intents, list_free.as_ref(), |f| {
+                resolve_flake_graph_id(f, routing)
+            })
+            .instrument(delete_span.clone())
+            .await?;
+        delete_span.record("retraction_count", retractions.len() as u64);
+        resolve_stats.add(stats);
         retraction_count += retractions.len();
         acc.push_retractions(retractions);
 
@@ -2995,6 +2913,17 @@ async fn stream_where_into_accumulator(
         }
     }
     cursor.close();
+
+    if !txn.delete_templates.is_empty() {
+        tracing::debug!(
+            witnessed = resolve_stats.witnessed,
+            enriched = resolve_stats.enriched,
+            matched = resolve_stats.matched,
+            phantom_intents = resolve_stats.phantom_intents,
+            slot_reads = resolve_stats.slot_reads,
+            "delete intent resolution"
+        );
+    }
 
     Ok(WhereStreamStats {
         total_binding_rows,

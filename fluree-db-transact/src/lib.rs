@@ -36,6 +36,7 @@ pub mod commit;
 pub mod commit_flakes;
 pub mod current_facts;
 pub mod datatype_limit;
+mod delete_witness;
 pub mod error;
 pub mod flake_sink;
 pub mod generate;
@@ -66,7 +67,7 @@ pub use commit_flakes::generate_commit_flakes;
 pub use current_facts::{CurrentFacts, Origin, Retraction, Slot, StoredFact};
 pub use error::{Result, TransactError};
 pub use flake_sink::FlakeSink;
-pub use generate::{apply_cancellation, FlakeGenerator};
+pub use generate::FlakeGenerator;
 pub use ir::{
     GraphMgmtOp, GraphSel, GraphTarget, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate,
     Txn, TxnOpts, TxnType,
@@ -84,7 +85,10 @@ pub use parse::{
     RawTerm, RawTrigMeta, RawTriple, TrigPhase1Result, UnwrappedTrig,
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
-pub use stage::{generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions};
+pub use stage::{
+    generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions,
+    DELETE_WITNESSED_SITE,
+};
 pub use staged_dicts::{
     attach_binary_provider, attach_staged_dicts, detach_binary_provider, staged_dicts, StagedDicts,
 };

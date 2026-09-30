@@ -114,6 +114,133 @@ impl Retraction {
     pub fn into_flake(self) -> Flake {
         self.0
     }
+
+    /// Any flake, for unit tests of the retraction consumers.
+    #[cfg(test)]
+    pub(crate) fn for_test(flake: Flake) -> Self {
+        Retraction(flake)
+    }
+}
+
+/// What one DELETE template instantiation asks to retract: the instantiated
+/// `(g, s, p, o, dt, m)` at the transaction's `t`. Not a retraction —
+/// [`CurrentFacts::resolve_intents`] turns it into one only if it names a
+/// stored fact, or it is a WHERE row proven to be the decode of one.
+#[derive(Clone, Debug)]
+pub(crate) struct RetractIntent {
+    flake: Flake,
+    /// The template is witnessed by a WHERE triple (`delete_witness`), so
+    /// the row is the decode of a fact that WHERE matched at the same `t`.
+    witnessed: bool,
+}
+
+impl RetractIntent {
+    pub(crate) fn new(flake: Flake, witnessed: bool) -> Self {
+        debug_assert!(!flake.op, "a retraction intent is op = false");
+        Self { flake, witnessed }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flake(&self) -> &Flake {
+        &self.flake
+    }
+}
+
+/// Proof that no `@list` position is stored anywhere in the ledger: the
+/// persisted index recorded none (`Some(false)` is an exact observation by
+/// the indexer; `None`, a legacy root or a bulk import, proves nothing) and
+/// novelty holds none. Only [`ListFree::check`] makes one.
+pub(crate) struct ListFree(());
+
+impl ListFree {
+    pub(crate) fn check(ledger: &LedgerState) -> Option<ListFree> {
+        (ledger.snapshot.has_list_meta == Some(false) && !ledger.novelty.has_list_meta)
+            .then_some(ListFree(()))
+    }
+}
+
+/// What resolving a batch of DELETE intents did, for tracing.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ResolveStats {
+    /// Witnessed rows retracted as decoded, with no read.
+    pub(crate) witnessed: usize,
+    /// Witnessed rows on a list-bearing ledger, given the stored list
+    /// position of the first matching entry.
+    pub(crate) enriched: usize,
+    /// Intents matched to a stored fact.
+    pub(crate) matched: usize,
+    /// Intents that named no stored fact and staged nothing.
+    pub(crate) phantom_intents: usize,
+    /// `(graph, subject, predicate)` slots read.
+    pub(crate) slot_reads: usize,
+}
+
+impl ResolveStats {
+    pub(crate) fn add(&mut self, other: ResolveStats) {
+        self.witnessed += other.witnessed;
+        self.enriched += other.enriched;
+        self.matched += other.matched;
+        self.phantom_intents += other.phantom_intents;
+        self.slot_reads += other.slot_reads;
+    }
+}
+
+/// Datatype identity for a DELETE term: exact. A DELETE names a term, and
+/// RDF term identity includes the datatype, so `DELETE DATA { … 1 }` does
+/// not remove `"1"^^xsd:int`. The one place this rule lives.
+fn dt_matches(stored: &Sid, intent: &Sid) -> bool {
+    stored == intent
+}
+
+/// Language tags compare case-insensitively (RDF 1.1): the retraction then
+/// carries the stored tag verbatim, which is what a pre-normalization tag
+/// in the index needs.
+fn lang_matches(stored: Option<&str>, intent: Option<&str>) -> bool {
+    match (stored, intent) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+fn lang_of(f: &Flake) -> Option<&str> {
+    f.m.as_ref().and_then(|m| m.lang.as_deref())
+}
+
+fn list_index_of(f: &Flake) -> Option<i32> {
+    f.m.as_ref().and_then(|m| m.i)
+}
+
+/// The same RDF term: value, datatype and language tag.
+fn same_term(stored: &Flake, intent: &Flake) -> bool {
+    stored.o == intent.o
+        && dt_matches(&stored.dt, &intent.dt)
+        && lang_matches(lang_of(stored), lang_of(intent))
+}
+
+/// The stored fact an intent names, if any. An intent with a list position
+/// names that position. One without names the first list entry holding the
+/// term, in index order, else the plain value: the contract hydration had,
+/// under which a value asserted at N list positions loses exactly one entry
+/// per distinct DELETE row.
+fn match_stored<'f>(facts: &'f [StoredFact], intent: &Flake) -> Option<&'f StoredFact> {
+    let term = |f: &&StoredFact| same_term(&f.flake, intent);
+    match list_index_of(intent) {
+        Some(i) => facts
+            .iter()
+            .filter(|f| list_index_of(&f.flake) == Some(i))
+            .find(term),
+        None => facts
+            .iter()
+            .filter(|f| list_index_of(&f.flake).is_some())
+            .find(term)
+            .or_else(|| {
+                facts
+                    .iter()
+                    .filter(|f| list_index_of(&f.flake).is_none())
+                    .find(term)
+            }),
+    }
 }
 
 /// A `(graph, subject, predicate)` slot to read.
@@ -226,6 +353,88 @@ impl<'l> CurrentFacts<'l> {
             .into_iter()
             .map(|flake| stored(flake, g_sid, index_t))
             .collect())
+    }
+
+    /// Resolve DELETE intents to retractions.
+    ///
+    /// - A witnessed row on a list-free ledger (`list_free`) is retracted as
+    ///   decoded, with no read: the WHERE just matched that stored fact.
+    /// - A witnessed row on a list-bearing ledger reads its slot for the one
+    ///   thing a WHERE binding does not carry, the list position: it takes
+    ///   the position of the first stored list entry holding the same term,
+    ///   and otherwise stays as decoded.
+    /// - Every other intent — a template constant, `DELETE DATA`, a value
+    ///   bound by another pattern — is matched against the stored facts of
+    ///   its slot ([`match_stored`]). An intent that names no stored fact
+    ///   stages nothing.
+    ///
+    /// `graph_of` gives the ledger graph id of an intent's graph Sid.
+    pub(crate) async fn resolve_intents(
+        &self,
+        intents: Vec<RetractIntent>,
+        list_free: Option<&ListFree>,
+        graph_of: impl Fn(&Flake) -> Result<GraphId>,
+    ) -> Result<(Vec<Retraction>, ResolveStats)> {
+        let mut stats = ResolveStats::default();
+        let mut out = Vec::with_capacity(intents.len());
+        let mut pending = Vec::new();
+        for intent in intents {
+            if intent.witnessed && list_free.is_some() {
+                stats.witnessed += 1;
+                out.push(Retraction(intent.flake));
+            } else {
+                pending.push(intent);
+            }
+        }
+        if pending.is_empty() {
+            return Ok((out, stats));
+        }
+
+        let mut slot_of: HashMap<(GraphId, Sid, Sid), usize> = HashMap::new();
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut pending_slots = Vec::with_capacity(pending.len());
+        for intent in &pending {
+            let f = &intent.flake;
+            let g_id = graph_of(f)?;
+            let idx = *slot_of
+                .entry((g_id, f.s.clone(), f.p.clone()))
+                .or_insert_with(|| {
+                    slots.push(Slot {
+                        g_id,
+                        g_sid: f.g.clone(),
+                        s: f.s.clone(),
+                        p: f.p.clone(),
+                    });
+                    slots.len() - 1
+                });
+            pending_slots.push(idx);
+        }
+        stats.slot_reads = slots.len();
+        let facts = self.of_slots(&slots).await?;
+
+        for (intent, idx) in pending.into_iter().zip(pending_slots) {
+            let slot_facts = &facts[idx];
+            let t = intent.flake.t;
+            if intent.witnessed {
+                let mut flake = intent.flake;
+                if list_index_of(&flake).is_none() {
+                    if let Some(entry) = slot_facts
+                        .iter()
+                        .find(|f| list_index_of(&f.flake).is_some() && same_term(&f.flake, &flake))
+                    {
+                        flake.m = entry.flake.m.clone();
+                        stats.enriched += 1;
+                    }
+                }
+                out.push(Retraction(flake));
+            } else if let Some(stored) = match_stored(slot_facts, &intent.flake) {
+                stats.matched += 1;
+                out.push(stored.clone().retract(t));
+            } else {
+                stats.phantom_intents += 1;
+            }
+        }
+        Ok((out, stats))
     }
 
     /// Persisted-index rows matching `rm` in graph `g_id`, read through
@@ -449,7 +658,14 @@ mod tests {
                     flake("a", "items", "w", 1, true, Some(FlakeMeta::with_index(2))),
                     flake("a", "other", "o", 1, true, None),
                 ],
-                vec![flake("a", "items", "w", 2, false, Some(FlakeMeta::with_index(2)))],
+                vec![flake(
+                    "a",
+                    "items",
+                    "w",
+                    2,
+                    false,
+                    Some(FlakeMeta::with_index(2)),
+                )],
             ],
             &HashMap::new(),
         );
@@ -508,8 +724,22 @@ mod tests {
     async fn seek_and_walk_agree() {
         let mut commit = Vec::new();
         for i in 0..40 {
-            commit.push(flake(&format!("s{i:02}"), "p", &format!("v{i}"), 1, true, None));
-            commit.push(flake(&format!("s{i:02}"), "q", &format!("w{i}"), 1, true, None));
+            commit.push(flake(
+                &format!("s{i:02}"),
+                "p",
+                &format!("v{i}"),
+                1,
+                true,
+                None,
+            ));
+            commit.push(flake(
+                &format!("s{i:02}"),
+                "q",
+                &format!("w{i}"),
+                1,
+                true,
+                None,
+            ));
         }
         let retract = vec![flake("s07", "p", "v7", 2, false, None)];
         let ledger = ledger(vec![commit, retract], &HashMap::new());

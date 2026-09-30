@@ -2,14 +2,13 @@
 //!
 //! This module provides functionality for materializing triple templates
 //! into concrete flakes, handling variable substitution, blank node
-//! skolemization, and assertion/retraction cancellation.
+//! skolemization, and assertion/retraction cancellation
+//! ([`FlakeAccumulator`]).
 
 pub mod accumulator;
-pub mod cancellation;
 pub mod flakes;
 
 pub use accumulator::FlakeAccumulator;
-pub use cancellation::{apply_cancellation, dedup_retractions};
 #[cfg(feature = "import")]
 pub(crate) use flakes::DT_ID;
 pub use flakes::{infer_datatype, FlakeGenerator};

@@ -7,6 +7,8 @@ mod it_cached_handle_cow_cancel;
 mod it_cached_handle_cow_recovery;
 #[path = "it_concurrent_update_reconcile.rs"]
 mod it_concurrent_update_reconcile;
+#[path = "it_delete_stored_facts.rs"]
+mod it_delete_stored_facts;
 #[path = "it_enforce_unique_upsert_indexed.rs"]
 mod it_enforce_unique_upsert_indexed;
 #[path = "it_jsonld_empty_list.rs"]
