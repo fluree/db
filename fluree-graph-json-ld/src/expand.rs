@@ -619,8 +619,12 @@ fn expand_node_internal(
 
                 let (expanded_key, entry) = details_dispatch(k, &context_with_types, true, strict)?;
 
-                // Handle @graph
-                if expanded_key == "@graph" || k == "@graph" || k == "graph" {
+                // Handle @graph: the keyword, an alias of it, or the legacy bare
+                // `graph` key when the context does not define `graph` as a
+                // property (a defined term is ordinary data).
+                if expanded_key == "@graph"
+                    || crate::graph_shape::is_graph_key(k, &context_with_types)
+                {
                     let graph_expanded =
                         expand_node_internal(v, &context_with_types, &key_idx, strict)?;
                     result.insert("@graph".to_string(), graph_expanded);
@@ -699,40 +703,34 @@ pub(crate) fn node_impl(
         }
 
         JsonValue::Object(map) => {
-            // Check for @graph at top level
-            let graph_key = if map.contains_key("@graph") {
-                Some("@graph")
-            } else if map.contains_key("graph") {
-                Some("graph")
-            } else {
-                None
-            };
-
-            // Handle envelope form: when @graph is present at top level WITHOUT
-            // an @id, this is an envelope/default-graph wrapper. Expand only the
-            // @graph contents. Extra top-level keys (txn-meta properties) are
-            // handled separately by the transact parser's extract_txn_meta(),
-            // so we must not feed the whole envelope into expand_node_internal —
-            // that would treat the envelope as a single node and silently drop @graph.
+            // Envelope form: a top-level `@graph` holding node objects, with no
+            // `@id`, is a default-graph wrapper. Expand only the `@graph`
+            // contents. Extra top-level keys (txn-meta properties) are handled
+            // separately by the transact parser's extract_txn_meta(), so we
+            // must not feed the whole envelope into expand_node_internal — that
+            // would treat the envelope as a single node and silently drop
+            // @graph.
             //
-            // When @id IS present alongside @graph, this is a JSON-LD named graph
-            // (the @id names the graph) — fall through to normal expansion which
-            // preserves the @id, properties, and nested @graph.
-            if let Some(gk) = graph_key {
-                let has_id = map.contains_key("@id") || map.contains_key("id");
-                if !has_id {
-                    let local_context = get_context(map);
-                    let merged_context = if let Some(lc) = local_context {
-                        ParsedContext::parse(Some(context), lc)?
-                    } else {
-                        context.clone()
-                    };
-
-                    if let Some(graph) = map.get(gk) {
-                        let new_idx = vec![json!(gk)];
-                        return expand_node_internal(graph, &merged_context, &new_idx, strict);
+            // The value decides (`graph_shape::classify_graph_value`, shared
+            // with every other reader of `@graph`): with an `@id` the content is
+            // a JSON-LD named graph, and a graph *selector* marks a node, not a
+            // wrapper. Both expand as a node, which keeps the `@id`, the
+            // properties and the `@graph` entry.
+            let has_id = map.contains_key("@id") || map.contains_key("id");
+            if let Some(graph) = map.get("@graph") {
+                match crate::graph_shape::classify_graph_value(graph) {
+                    crate::graph_shape::GraphValue::Invalid(reason) => {
+                        return Err(JsonLdError::InvalidGraphValue { reason });
                     }
+                    crate::graph_shape::GraphValue::Content(_) if !has_id => {
+                        return expand_envelope(map, "@graph", graph, context, strict);
+                    }
+                    _ => {}
                 }
+            } else if let Some(graph) = map.get("graph").filter(|_| !has_id) {
+                // Legacy bare `graph` envelope key. The transaction paths strip
+                // it before expansion (it is a reserved routing key there).
+                return expand_envelope(map, "graph", graph, context, strict);
             }
 
             expand_node_internal(node_map, context, &idx, strict)
@@ -740,6 +738,23 @@ pub(crate) fn node_impl(
 
         _ => Ok(node_map.clone()),
     }
+}
+
+/// Expand the contents of an envelope's `@graph` under the envelope's own
+/// `@context`.
+fn expand_envelope(
+    map: &Map<String, JsonValue>,
+    graph_key: &str,
+    graph: &JsonValue,
+    context: &ParsedContext,
+    strict: bool,
+) -> Result<JsonValue> {
+    let merged_context = match get_context(map) {
+        Some(lc) => ParsedContext::parse(Some(context), lc)?,
+        None => context.clone(),
+    };
+    let new_idx = vec![json!(graph_key)];
+    expand_node_internal(graph, &merged_context, &new_idx, strict)
 }
 
 /// Expand a JSON-LD node (document).
@@ -1167,6 +1182,60 @@ mod tests {
         assert!(
             err.to_string().contains("recursion limit"),
             "expected serde_json recursion-limit error, got: {err}"
+        );
+    }
+
+    /// A context that defines `graph` as a property gets a property: the
+    /// legacy bare `graph` spelling of `@graph` applies only when the context
+    /// leaves the word undefined. It used to hijack the key at every level,
+    /// dropping the triple and routing the node into a graph named by the
+    /// value.
+    #[test]
+    fn graph_term_in_context_is_a_property_not_a_graph_key() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "graph": "ex:graphProp"},
+            "@id": "ex:s",
+            "ex:child": {"@id": "ex:c", "graph": "blue"}
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        let child = &expanded["http://example.org/child"][0];
+        assert!(child.get("@graph").is_none(), "{expanded}");
+        assert_eq!(child["http://example.org/graphProp"][0]["@value"], "blue");
+
+        // Undefined, the bare word still means `@graph`.
+        let legacy = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "ex:child": {"@id": "ex:c", "graph": "ex:g", "ex:p": 1}
+        });
+        let expanded = crate::expand(&legacy).unwrap();
+        assert_eq!(expanded["http://example.org/child"][0]["@graph"], "ex:g");
+    }
+
+    /// A top-level `@graph` is an envelope only when it holds node objects
+    /// and the object has no `@id`. A graph selector marks a node.
+    #[test]
+    fn top_level_graph_selector_is_a_node_not_an_envelope() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": "ex:g",
+            "ex:p": 1
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert_eq!(expanded["@graph"], "ex:g", "{expanded}");
+        assert_eq!(expanded["http://example.org/p"][0]["@value"], 1);
+
+        let envelope = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "ex:a", "ex:p": 1}, {"@id": "ex:b", "ex:p": 2}]
+        });
+        let expanded = crate::expand(&envelope).unwrap();
+        assert_eq!(expanded.as_array().map(Vec::len), Some(2), "{expanded}");
+
+        let err = crate::expand(&json!({"@graph": 3})).unwrap_err();
+        assert!(
+            matches!(err, JsonLdError::InvalidGraphValue { .. }),
+            "{err}"
         );
     }
 }
