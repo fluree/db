@@ -132,9 +132,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     pub(super) fn user_visible_vars(&self) -> Vec<VarId> {
         self.vars
             .iter()
-            .filter(|(name, _)| {
-                !name.starts_with("?__") && !name.starts_with("?#") && !name.starts_with("_:")
-            })
+            .filter(|(name, _)| !fluree_db_query::var_registry::is_internal_var_name(name))
             .map(|(_, id)| id)
             .collect()
     }
