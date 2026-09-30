@@ -26,6 +26,8 @@ mod it_ledger_lifecycle;
 mod it_merge;
 #[path = "it_merge_preview.rs"]
 mod it_merge_preview;
+#[path = "it_named_graph_conflict_retractions.rs"]
+mod it_named_graph_conflict_retractions;
 #[path = "it_profile_ledger.rs"]
 mod it_profile_ledger;
 #[path = "it_push_after_merge.rs"]

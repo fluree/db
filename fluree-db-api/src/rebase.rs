@@ -8,13 +8,14 @@ use crate::commit_data::{key_of, OwnChanges};
 use crate::error::{ApiError, Result};
 use fluree_db_core::LedgerId;
 use fluree_db_core::{
-    range_with_overlay, BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake,
-    IndexType, RangeMatch, RangeOptions, RangeTest, DEFAULT_GRAPH_ID,
+    BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake, DEFAULT_GRAPH_ID,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
 use fluree_db_novelty::{delta_keys_of, FactKey};
-use fluree_db_transact::{CommitOpts, NamespaceRegistry, StagedCommit};
+use fluree_db_transact::{
+    CommitOpts, CurrentFacts, NamespaceRegistry, Slot, StagedCommit, StoredFact,
+};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -828,12 +829,9 @@ impl crate::Fluree {
                 current_asserted_for_key(source_state, key)
                     .await?
                     .into_iter()
-                    .filter(|flake| !reasserted.contains(&FactKey::of(flake)))
-                    .map(|flake| Flake {
-                        op: false,
-                        t: 0, // restamped by StagedLedger::new
-                        ..flake
-                    }),
+                    .filter(|fact| !reasserted.contains(&FactKey::of(fact.flake())))
+                    // `t` is restamped by StagedLedger::new.
+                    .map(|fact| fact.retract(0).into_flake()),
             );
         }
 
@@ -931,10 +929,18 @@ fn find_conflicting_keys(
         .collect()
 }
 
+/// The facts `state` currently holds for a conflict key's `(subject,
+/// predicate, graph)`, graph stamped.
+///
+/// Read through [`CurrentFacts`], which stamps the key's graph on index
+/// rows. A range read returns an index-resident row with `g: None` whatever
+/// graph it lives in, so filtering on `g == key.g` dropped every indexed
+/// named-graph value: a take-source merge then left the target's value in
+/// place next to the source's.
 pub(crate) async fn current_asserted_for_key(
     state: &LedgerState,
     key: &ConflictKey,
-) -> Result<Vec<Flake>> {
+) -> Result<Vec<StoredFact>> {
     let g_id = match &key.g {
         None => DEFAULT_GRAPH_ID,
         Some(g_sid) => match state
@@ -946,26 +952,15 @@ pub(crate) async fn current_asserted_for_key(
             None => return Ok(Vec::new()),
         },
     };
-
-    let match_val = RangeMatch::subject_predicate(key.s.clone(), key.p.clone());
-    let opts = RangeOptions {
-        to_t: Some(state.t()),
-        ..Default::default()
-    };
-
-    let flakes = range_with_overlay(
-        &state.snapshot,
+    let slot = Slot {
         g_id,
-        state.novelty.as_ref(),
-        IndexType::Spot,
-        RangeTest::Eq,
-        match_val,
-        opts,
-    )
-    .await?;
-
-    Ok(flakes
-        .into_iter()
-        .filter(|flake| flake.op && flake.g == key.g)
-        .collect())
+        g_sid: key.g.clone(),
+        s: key.s.clone(),
+        p: key.p.clone(),
+    };
+    Ok(CurrentFacts::new(state)
+        .of_slots(std::slice::from_ref(&slot))
+        .await?
+        .pop()
+        .unwrap_or_default())
 }
