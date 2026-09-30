@@ -656,6 +656,8 @@ async fn trailing_values_joins_after_having() {
 async fn ask_and_construct_refuse_grouping() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_areas(&fluree, "grouped-projection/ask-construct:main").await;
+    // Every form is checked, and every one not refused is reported.
+    let mut not_refused = Vec::new();
     for (body, form) in [
         (
             format!(r#"ASK {W} HAVING (?a = "Nope")"#),
@@ -672,11 +674,13 @@ async fn ask_and_construct_refuse_grouping() {
         ),
     ] {
         let query = format!("{PREFIX}{body}");
-        let err = support::query_sparql(&fluree, &ledger, &query)
-            .await
-            .expect_err(&body);
-        assert!(err.to_string().contains(form), "{body}: {err}");
+        match support::query_sparql(&fluree, &ledger, &query).await {
+            Err(err) if err.to_string().contains(form) => {}
+            Err(err) => not_refused.push(format!("{body}: {err}")),
+            Ok(_) => not_refused.push(format!("{body}: answered")),
+        }
     }
+    assert!(not_refused.is_empty(), "{not_refused:#?}");
     // Without them, both still answer.
     let result = run(&fluree, &ledger, &format!("ASK {W}")).await;
     assert_eq!(

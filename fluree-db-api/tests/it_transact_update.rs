@@ -3427,3 +3427,69 @@ async fn sparql_update_template_reads_grouped_sub_select_expression() {
         "one value per entity, from its group: {jsonld}"
     );
 }
+
+/// The JSON-LD twin: an update template reads a grouped subquery's key-only
+/// select expression, which J3 evaluates once per group. It used to reach the
+/// template as a per-group list, like the SPARQL form.
+#[tokio::test]
+async fn jsonld_update_template_reads_grouped_subquery_expression() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = fluree
+        .create_ledger("it/update-grouped-subquery-jsonld:main")
+        .await
+        .expect("create ledger");
+    let ctx = json!({"ex": "http://example.org/"});
+    let seed = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:e1", "ex:area": "Net"}, {"@id": "ex:e2", "ex:area": "Net"},
+            {"@id": "ex:e3", "ex:area": "Net"}, {"@id": "ex:e4", "ex:area": "Local"},
+            {"@id": "ex:e5", "ex:area": "Local"}, {"@id": "ex:e6", "ex:area": "Remote"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &seed).await.expect("seed").ledger;
+    let update = json!({
+        "@context": ctx,
+        "where": [
+            ["query", {
+                "@context": ctx,
+                "select": [
+                    "?a",
+                    "(as (if (= ?a \"Net\") \"network\" \"other\") ?seg)",
+                    "(as (count ?x) ?n)"
+                ],
+                "where": {"@id": "?x", "ex:area": "?a"},
+                "groupBy": ["?a"]
+            }],
+            {"@id": "?e", "ex:area": "?a"}
+        ],
+        "insert": {"@id": "?e", "ex:segment": "?seg", "ex:groupSize": "?n"}
+    });
+    let ledger = fluree
+        .update(ledger, &update)
+        .await
+        .expect("update over a grouped subquery")
+        .ledger;
+
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?e ?seg ?n WHERE { ?e ex:segment ?seg ; ex:groupSize ?n }",
+    )
+    .await
+    .expect("query");
+    let jsonld = rows.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        support::normalize_rows(&jsonld),
+        support::normalize_rows(&json!([
+            ["ex:e1", "network", 3],
+            ["ex:e2", "network", 3],
+            ["ex:e3", "network", 3],
+            ["ex:e4", "other", 2],
+            ["ex:e5", "other", 2],
+            ["ex:e6", "other", 1]
+        ])),
+        "one value per entity, from its group: {jsonld}"
+    );
+}

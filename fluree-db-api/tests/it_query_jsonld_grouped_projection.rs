@@ -456,21 +456,21 @@ async fn jsonld_ask_refuses_grouping() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_areas(&fluree, "jsonld-grouped/ask:main").await;
     let ctx = json!({"ex": "http://example.org/"});
+    let mut not_refused = Vec::new();
     for (key, value) in [
         ("having", json!("(= ?a \"Nope\")")),
         ("groupBy", json!(["?a"])),
     ] {
         let mut query = json!({"@context": ctx, "ask": {"@id": "?e", "ex:area": "?a"}});
         query[key] = value;
-        let err = support::query_jsonld(&fluree, &ledger, &query)
-            .await
-            .expect_err("ask with a grouping option");
-        assert!(
-            err.to_string()
-                .contains(&format!("\"ask\" does not support \"{key}\"")),
-            "{err}"
-        );
+        let expected = format!("\"ask\" does not support \"{key}\"");
+        match support::query_jsonld(&fluree, &ledger, &query).await {
+            Err(err) if err.to_string().contains(&expected) => {}
+            Err(err) => not_refused.push(format!("{key}: {err}")),
+            Ok(_) => not_refused.push(format!("{key}: answered")),
+        }
     }
+    assert!(not_refused.is_empty(), "{not_refused:#?}");
 }
 
 /// JSON-LD `having` has no EXISTS form (unlike a `filter`): one is refused at
