@@ -106,6 +106,18 @@ impl TermDictReader {
         }
     }
 
+    /// [`Self::find_handle`] for many keys, reading each reverse-tree leaf once.
+    pub fn find_handles(&self, keys: &[TermKey]) -> io::Result<Vec<Option<u64>>> {
+        match &self.reverse {
+            Some(tree) => {
+                let bytes: Vec<[u8; TermKey::LEN]> =
+                    keys.iter().map(TermKey::to_be_bytes).collect();
+                tree.reverse_lookup_many(bytes.iter().map(|b| &b[..]))
+            }
+            None => Ok(vec![None; keys.len()]),
+        }
+    }
+
     /// The encoded base edge behind `handle`, or `None` for an unknown handle.
     pub fn resolve(&self, handle: u64) -> io::Result<Option<TermKey>> {
         let Some(reader) = self.forward.get(&term_handle_p_id(handle)) else {

@@ -724,7 +724,8 @@ pub async fn resolve_incremental_commits_v6(
         let mut builder =
             fluree_db_binary_index::dict::TermDictBuilder::above_watermarks(&base_wms);
         let triple_term = ObjKind::TRIPLE_TERM.as_u8();
-        for record in &mut v1_records {
+        let mut record_keys = Vec::new();
+        for (idx, record) in v1_records.iter().enumerate() {
             if record.o_kind != triple_term {
                 continue;
             }
@@ -744,39 +745,61 @@ pub async fn resolve_incremental_commits_v6(
                 ),
                 o_key: term.o_key,
             };
-            let existing = match (&base_reader, builder.get(&key)) {
-                (_, Some(h)) => Some(h),
-                (Some(reader), None) => reader.find_handle(&key)?,
-                (None, None) => None,
-            };
-            record.o_key = match existing {
-                Some(h) => h,
-                None => builder.get_or_insert(key)?,
-            };
+            record_keys.push((idx, key));
         }
-        if !attachments.is_empty() {
-            let link_ids = shared.link_synth.link_ids().ok_or_else(|| {
+        let prior = |g_id: u16, ann: u64| {
+            prior_attachments
+                .get(&(g_id, ann))
+                .copied()
+                .unwrap_or([None; 3])
+        };
+        let link_ids = if attachments.is_empty() {
+            None
+        } else {
+            Some(shared.link_synth.link_ids().ok_or_else(|| {
                 IncrementalResolveError::Io(io::Error::other("attachment ops without link ids"))
-            })?;
-            let mut handle_for = |key: fluree_db_core::triple_term::TermKey| -> io::Result<u64> {
-                if let Some(h) = builder.get(&key) {
-                    return Ok(h);
+            })?)
+        };
+        // Resolve every base handle in one batched pass: a reverse lookup per
+        // term reads a whole tree leaf, and a re-point needs one for the term
+        // it retracts. A dry replay names the terms the real one will ask for.
+        let mut base_handles = HashMap::new();
+        if let Some(reader) = &base_reader {
+            let mut wanted: Vec<_> = record_keys.iter().map(|&(_, key)| key).collect();
+            if let Some(link_ids) = link_ids {
+                crate::run_index::resolve::link_synth::replay_attachments(
+                    &mut attachments,
+                    prior,
+                    &o_type_registry,
+                    link_ids,
+                    &mut |key| {
+                        wanted.push(key);
+                        Ok(0)
+                    },
+                    &mut |_| Ok(()),
+                )?;
+            }
+            wanted.sort_unstable();
+            wanted.dedup();
+            for (key, handle) in wanted.iter().zip(reader.find_handles(&wanted)?) {
+                if let Some(handle) = handle {
+                    base_handles.insert(*key, handle);
                 }
-                if let Some(reader) = &base_reader {
-                    if let Some(h) = reader.find_handle(&key)? {
-                        return Ok(h);
-                    }
-                }
-                builder.get_or_insert(key)
-            };
+            }
+        }
+        let mut handle_for = |key: fluree_db_core::triple_term::TermKey| -> io::Result<u64> {
+            match base_handles.get(&key) {
+                Some(&handle) => Ok(handle),
+                None => builder.get_or_insert(key),
+            }
+        };
+        for (idx, key) in record_keys {
+            v1_records[idx].o_key = handle_for(key)?;
+        }
+        if let Some(link_ids) = link_ids {
             let emitted = crate::run_index::resolve::link_synth::replay_attachments(
                 &mut attachments,
-                |g_id, ann| {
-                    prior_attachments
-                        .get(&(g_id, ann))
-                        .copied()
-                        .unwrap_or([None; 3])
-                },
+                prior,
                 &o_type_registry,
                 link_ids,
                 &mut handle_for,
@@ -1254,7 +1277,7 @@ async fn seed_vector_fact_handles(
 }
 
 /// The attachment the base index holds for each `(g_id, reifier)`: its live
-/// `f:reifies*` rows, read with one SPOT point lookup per reifier. The
+/// `f:reifies*` rows, read in one batched SPOT pass per graph. The
 /// predicate slot's row refers to the predicate IRI as a subject; it maps
 /// back to the predicate id through the dictionary.
 async fn base_attachment_states(
@@ -1266,13 +1289,8 @@ async fn base_attachment_states(
     keys: &[(u16, u64)],
 ) -> io::Result<HashMap<(u16, u64), [Option<SlotValue>; 3]>> {
     use crate::run_index::resolve::link_synth::ObjectId;
-    use fluree_db_binary_index::format::run_record::RunSortOrder;
-    use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
-    use fluree_db_binary_index::read::binary_cursor::BinaryCursor;
     use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
-    use fluree_db_binary_index::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
     use fluree_db_core::o_type::OType;
-    use fluree_db_core::subject_id::SubjectId;
 
     let mut states = HashMap::new();
     if keys.is_empty() || slots.iter().all(Option::is_none) {
@@ -1284,79 +1302,57 @@ async fn base_attachment_states(
     let store = Arc::new(
         BinaryIndexStore::load_from_root_v6(Arc::clone(&cs), root, &cache_dir, None).await?,
     );
-    let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
-    for &(g_id, ann) in keys {
-        let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
-            continue;
-        };
-        let min_key = RunRecordV2 {
-            s_id: SubjectId(ann),
-            o_key: 0,
-            p_id: 0,
-            t: 0,
-            o_i: 0,
-            o_type: 0,
+    let iri_ref = OType::IRI_REF.as_u16();
+    // Attachments name few distinct predicates; resolve each sid once.
+    let mut predicate_ids: HashMap<u64, u32> = HashMap::new();
+    // `keys` is sorted, so each graph's reifiers are one contiguous run.
+    for run in keys.chunk_by(|a, b| a.0 == b.0) {
+        let g_id = run[0].0;
+        let anns: Vec<u64> = run.iter().map(|&(_, ann)| ann).collect();
+        let rows = fluree_db_binary_index::batched_lookup_subject_properties(
+            &store,
             g_id,
-        };
-        let max_key = RunRecordV2 {
-            s_id: SubjectId(ann),
-            o_key: u64::MAX,
-            p_id: u32::MAX,
-            t: u32::MAX,
-            o_i: u32::MAX,
-            o_type: u16::MAX,
-            g_id,
-        };
-        let filter = BinaryFilter {
-            s_id: Some(ann),
-            ..Default::default()
-        };
-        let mut cursor = BinaryCursor::new(
-            Arc::clone(&store),
-            RunSortOrder::Spot,
-            Arc::clone(branch),
-            &min_key,
-            &max_key,
-            filter,
-            projection,
-        );
-        let mut state: [Option<SlotValue>; 3] = [None; 3];
-        while let Some(batch) = cursor.next_batch()? {
-            for i in 0..batch.row_count {
-                if batch.s_id.get(i) != ann {
-                    continue;
-                }
-                let p_id = batch.p_id.get(i);
+            &anns,
+            root.index_t,
+        )?;
+        for ann in anns {
+            let mut state: [Option<SlotValue>; 3] = [None; 3];
+            for &(p_id, o_type, o_key) in rows.get(&ann).map_or(&[][..], Vec::as_slice) {
                 let Some(slot) = slots.iter().position(|s| *s == Some(p_id)) else {
                     continue;
                 };
-                let o_type = batch.o_type.get_or(i, 0);
-                let o_key = batch.o_key.get(i);
                 state[slot] = match slot {
-                    0 if o_type == OType::IRI_REF.as_u16() => Some(SlotValue::Subject(o_key)),
+                    0 if o_type == iri_ref => Some(SlotValue::Subject(o_key)),
                     // A read failure or a predicate the dictionary does not
                     // hold must fail the build: treated as "no predicate", an
                     // object-only re-point would replay from and to an
                     // incomplete attachment and leave the old link in place.
-                    1 if o_type == OType::IRI_REF.as_u16() => {
-                        let iri = store.resolve_subject_iri(o_key)?;
-                        let p_id = predicates.get(&iri).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "reifier {ann} is attached to predicate {iri}, which the \
-                                     dictionary does not hold"
-                                ),
-                            )
-                        })?;
+                    1 if o_type == iri_ref => {
+                        let p_id = match predicate_ids.get(&o_key) {
+                            Some(&p_id) => p_id,
+                            None => {
+                                let iri = store.resolve_subject_iri(o_key)?;
+                                let p_id = predicates.get(&iri).ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "reifier {ann} is attached to predicate {iri}, \
+                                             which the dictionary does not hold"
+                                        ),
+                                    )
+                                })?;
+                                predicate_ids.insert(o_key, p_id);
+                                p_id
+                            }
+                        };
                         Some(SlotValue::Predicate(p_id))
                     }
                     2 => Some(SlotValue::Object(ObjectId::Typed { o_type, o_key })),
                     _ => None,
                 };
             }
+            states.insert((g_id, ann), state);
         }
-        states.insert((g_id, ann), state);
     }
     Ok(states)
 }
