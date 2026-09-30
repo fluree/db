@@ -2,15 +2,13 @@
 //!
 //! It never interprets a term, so it cannot disagree with the parser about
 //! what the text means. It finds each block's label (as written) and extent,
-//! blanks the block syntax so every segment is plain Turtle at its original
-//! byte offsets, and names the construct it refuses: a nested block, a
-//! directive inside a block, a blank-node label, an unclosed block, a stray
-//! `}`.
+//! hands the parser each segment's tokens (the document is lexed once, here),
+//! and names the construct it refuses: a nested block, a directive inside a
+//! block, a blank-node label, an unclosed block, a stray `}`.
 
 use crate::error::{Result, TransactError};
 use crate::parse::trig_meta::might_contain_graph_block;
 use fluree_graph_turtle::{tokenize, Token, TokenKind, TurtleError};
-use std::borrow::Cow;
 use std::ops::Range;
 
 /// A stretch of the document the parser reads in one call.
@@ -28,17 +26,22 @@ pub(super) enum SegmentKind {
 #[derive(Clone, Debug)]
 pub(super) struct Segment {
     pub(super) kind: SegmentKind,
+    /// The segment's bytes. A statement the segment cuts short is reported
+    /// at its end.
     pub(super) range: Range<usize>,
+    /// The segment's tokens, in [`Located::tokens`].
+    pub(super) tokens: Range<usize>,
 }
 
 /// A located document.
 #[derive(Debug)]
 pub(super) struct Located<'a> {
-    /// The document with each block's header (`GRAPH <g> {`) blanked and its
-    /// `}` blanked, or turned into the `.` a block's last statement may
-    /// omit. Every edit keeps the length, so byte offsets are the
-    /// document's.
-    pub(super) text: Cow<'a, str>,
+    /// The document.
+    pub(super) text: &'a str,
+    /// The document's tokens. A block's header (`GRAPH <g> {`) and its `}`
+    /// are in no segment, except that the `}` of a block whose last statement
+    /// omits its `.` is that `.`.
+    pub(super) tokens: Vec<Token>,
     pub(super) segments: Vec<Segment>,
 }
 
@@ -87,11 +90,13 @@ fn is_directive(kind: &TokenKind) -> bool {
 
 /// Find a TriG document's segments by reading tokens only.
 pub(super) fn locate(input: &str) -> Result<Located<'_>> {
-    let tokens = tokenize(input)?;
+    let mut tokens = tokenize(input)?;
     let kind_at = |i: usize| tokens.get(i).map(|t: &Token| &t.kind);
     let mut segments = Vec::new();
-    let mut edits: Vec<(Range<usize>, Option<u8>)> = Vec::new();
+    // The `}` of each block whose last statement omits its `.`.
+    let mut dots: Vec<usize> = Vec::new();
     let mut default_start = 0usize;
+    let mut default_tokens = 0usize;
     let mut i = 0usize;
 
     while i < tokens.len() {
@@ -154,12 +159,17 @@ pub(super) fn locate(input: &str) -> Result<Located<'_>> {
                     segments.push(Segment {
                         kind: SegmentKind::Default,
                         range: default_start..start,
+                        tokens: default_tokens..i,
                     });
                 }
                 let content_start = tokens[brace].end as usize;
-                let (close, needs_dot, next) = scan_block(&tokens, brace + 1)?;
-                edits.push((start..content_start, None));
-                edits.push((close..close + 1, needs_dot.then_some(b'.')));
+                let (close_at, needs_dot) = scan_block(&tokens, brace + 1)?;
+                let close = tokens[close_at].start as usize;
+                let mut block_tokens = brace + 1..close_at;
+                if needs_dot {
+                    dots.push(close_at);
+                    block_tokens.end += 1;
+                }
                 let kind = match label_at {
                     Some(l) => SegmentKind::Named {
                         label: input[tokens[l].start as usize..tokens[l].end as usize].to_string(),
@@ -170,39 +180,34 @@ pub(super) fn locate(input: &str) -> Result<Located<'_>> {
                 segments.push(Segment {
                     kind,
                     range: content_start..close + 1,
+                    tokens: block_tokens,
                 });
                 default_start = close + 1;
-                i = next;
+                default_tokens = close_at + 1;
+                i = close_at + 1;
             }
         }
     }
     if default_start < input.len() {
+        let end = tokens
+            .iter()
+            .rposition(|t| !matches!(t.kind, TokenKind::Eof))
+            .map_or(0, |last| last + 1);
         segments.push(Segment {
             kind: SegmentKind::Default,
             range: default_start..input.len(),
+            tokens: default_tokens..end.max(default_tokens),
         });
     }
-
-    let text = if edits.is_empty() {
-        Cow::Borrowed(input)
-    } else {
-        let mut bytes = input.as_bytes().to_vec();
-        for (range, replacement) in edits {
-            match replacement {
-                Some(b) => bytes[range.start] = b,
-                None => {
-                    for b in &mut bytes[range] {
-                        if !matches!(*b, b'\n' | b'\r') {
-                            *b = b' ';
-                        }
-                    }
-                }
-            }
-        }
-        // Only ASCII bytes were replaced, by ASCII bytes.
-        Cow::Owned(String::from_utf8(bytes).expect("ASCII-for-ASCII edits keep UTF-8"))
-    };
-    Ok(Located { text, segments })
+    for at in dots {
+        let start = tokens[at].start;
+        tokens[at] = Token::new(TokenKind::Dot, start, start + 1);
+    }
+    Ok(Located {
+        text: input,
+        tokens,
+        segments,
+    })
 }
 
 /// Skip a top-level statement starting at `i`; returns the index after its
@@ -222,10 +227,9 @@ fn skip_statement(tokens: &[Token], mut i: usize) -> usize {
     i
 }
 
-/// Scan a block's contents from `i` (just past its `{`). Returns the byte
-/// offset of its `}`, whether its last statement omits the terminating dot,
-/// and the token index after the `}`.
-fn scan_block(tokens: &[Token], mut i: usize) -> Result<(usize, bool, usize)> {
+/// Scan a block's contents from `i` (just past its `{`). Returns the index
+/// of its `}` and whether its last statement omits the terminating dot.
+fn scan_block(tokens: &[Token], mut i: usize) -> Result<(usize, bool)> {
     let mut depth = 0i32;
     let mut last: Option<&TokenKind> = None;
     while i < tokens.len() {
@@ -234,7 +238,7 @@ fn scan_block(tokens: &[Token], mut i: usize) -> Result<(usize, bool, usize)> {
             TokenKind::Eof => break,
             TokenKind::RBrace if depth == 0 => {
                 let needs_dot = last.is_some_and(|k| !matches!(k, TokenKind::Dot));
-                return Ok((tok.start as usize, needs_dot, i + 1));
+                return Ok((i, needs_dot));
             }
             TokenKind::LBrace | TokenKind::KwGraph => {
                 return Err(locate_error(

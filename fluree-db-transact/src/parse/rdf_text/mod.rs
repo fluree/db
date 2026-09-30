@@ -23,7 +23,8 @@ use crate::namespace::NamespaceRegistry;
 use crate::parse::trig_meta::{might_contain_graph_block, TXN_META_GRAPH_IRI};
 use crate::template_sink::{RdfTextParts, Scope, TemplateSink};
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
-use fluree_graph_turtle::{ParserOptions, RelativeIris, TurtleError};
+use fluree_graph_turtle::{ParserOptions, RelativeIris, SegmentParser, TurtleError};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 mod locate;
@@ -182,6 +183,12 @@ fn default_scope(placement: Placement<'_>) -> Scope {
 /// <org/governance:main>`). What a graph name denotes is decided where
 /// staging resolves write graphs, not here. Default-graph statements resolve
 /// against the base as everywhere else, and are refused without one.
+///
+/// One parser runs over every segment, reading the tokens the locator
+/// lexed, so the document is lexed once, and declarations, the base and the
+/// parser's term caches carry from segment to segment with nothing copied
+/// per block. Each distinct label is resolved once per declaration epoch: a
+/// document of many small blocks costs what one parse does.
 fn parse_located(
     located: &Located<'_>,
     placement: Placement<'_>,
@@ -189,65 +196,67 @@ fn parse_located(
 ) -> Result<RdfText> {
     let mut sink = TemplateSink::new(ns);
     let default_scope = default_scope(placement);
-    let mut prefixes: Vec<(String, String)> = Vec::new();
-    let mut base: Option<String> = None;
     let mut default_statements = 0usize;
     let mut named_blocks = 0usize;
-    for segment in &located.segments {
-        let before = sink.statements();
-        match &segment.kind {
-            SegmentKind::Default | SegmentKind::DefaultBlock => {
-                sink.set_scope(default_scope.clone());
-            }
-            SegmentKind::Named { label, at } => {
-                let iri = resolve_label(label, *at, &prefixes, base.as_deref())?;
-                if iri == TXN_META_GRAPH_IRI {
-                    sink.set_scope(Scope::TxnMeta);
-                } else {
-                    named_blocks += 1;
-                    match placement {
-                        Placement::AsWritten => sink.set_scope(Scope::Named(Arc::from(iri))),
-                        Placement::Into(target) if target == Some(iri.as_str()) => {
-                            sink.set_scope(default_scope.clone());
+    // (label as written, declaration epoch) -> graph IRI.
+    let mut labels: HashMap<(&str, u64), Arc<str>> = HashMap::new();
+    {
+        let mut capture = Capture {
+            sink: &mut sink,
+            prefixes: Vec::new(),
+            base: None,
+            epoch: 0,
+        };
+        let mut parser = SegmentParser::new(located.text, &mut capture, ParserOptions::default())?;
+        for segment in &located.segments {
+            let cap = parser.sink_mut();
+            let before = cap.sink.statements();
+            match &segment.kind {
+                SegmentKind::Default | SegmentKind::DefaultBlock => {
+                    cap.sink.set_scope(default_scope.clone());
+                }
+                SegmentKind::Named { label, at } => {
+                    let iri = match labels.get(&(label.as_str(), cap.epoch)) {
+                        Some(iri) => Arc::clone(iri),
+                        None => {
+                            let iri: Arc<str> =
+                                resolve_label(label, *at, &cap.prefixes, cap.base.as_deref())?
+                                    .into();
+                            labels.insert((label.as_str(), cap.epoch), Arc::clone(&iri));
+                            iri
                         }
-                        Placement::Into(target) => {
-                            return Err(TransactError::PayloadGraphMismatch(format!(
-                                "the request targets one graph, {}; the body also has a \
-                                 GRAPH block for <{iri}>",
-                                describe_target(target)
-                            )));
+                    };
+                    if &*iri == TXN_META_GRAPH_IRI {
+                        cap.sink.set_scope(Scope::TxnMeta);
+                    } else {
+                        named_blocks += 1;
+                        match placement {
+                            Placement::AsWritten => cap.sink.set_scope(Scope::Named(iri)),
+                            Placement::Into(target) if target == Some(&*iri) => {
+                                cap.sink.set_scope(default_scope.clone());
+                            }
+                            Placement::Into(target) => {
+                                return Err(TransactError::PayloadGraphMismatch(format!(
+                                    "the request targets one graph, {}; the body also has a \
+                                     GRAPH block for <{iri}>",
+                                    describe_target(target)
+                                )));
+                            }
                         }
                     }
                 }
             }
-        }
-        let slice = &located.text[segment.range.clone()];
-        let seeded_prefixes = prefixes.clone();
-        let seeded_base = base.clone();
-        let options = match segment.kind {
-            SegmentKind::Named { .. } => {
-                ParserOptions::default().with_relative_iris(RelativeIris::Verbatim)
+            parser.set_relative_iris(match segment.kind {
+                SegmentKind::Named { .. } => RelativeIris::Verbatim,
+                SegmentKind::Default | SegmentKind::DefaultBlock => RelativeIris::Resolve,
+            });
+            parser.parse(&located.tokens[segment.tokens.clone()], segment.range.end)?;
+            if matches!(
+                segment.kind,
+                SegmentKind::Default | SegmentKind::DefaultBlock
+            ) {
+                default_statements += parser.sink_mut().sink.statements() - before;
             }
-            SegmentKind::Default | SegmentKind::DefaultBlock => ParserOptions::default(),
-        };
-        let mut capture = Capture {
-            sink: &mut sink,
-            prefixes: &mut prefixes,
-            base: &mut base,
-        };
-        fluree_graph_turtle::parse_with_prefixes_base_options(
-            slice,
-            &mut capture,
-            &seeded_prefixes,
-            seeded_base.as_deref(),
-            options,
-        )
-        .map_err(|e| shift(e, segment.range.start))?;
-        if matches!(
-            segment.kind,
-            SegmentKind::Default | SegmentKind::DefaultBlock
-        ) {
-            default_statements += sink.statements() - before;
         }
     }
     if let Placement::Into(target) = placement {
@@ -271,21 +280,6 @@ fn describe_target(target: Option<&str>) -> String {
         Some(iri) => format!("<{iri}>"),
         None => "the default graph".to_string(),
     }
-}
-
-/// Move a parser error's byte position from a segment into the document.
-fn shift(e: TurtleError, offset: usize) -> TransactError {
-    TransactError::Turtle(match e {
-        TurtleError::Parse { position, message } => TurtleError::Parse {
-            position: position + offset,
-            message,
-        },
-        TurtleError::Lexer { position, message } => TurtleError::Lexer {
-            position: position + offset,
-            message,
-        },
-        other => other,
-    })
 }
 
 /// Resolve a block label with the parser, under the declarations in force
@@ -357,17 +351,21 @@ impl GraphSink for LabelProbe {
     }
 }
 
-/// Forwards every event to the sink and records the prefix and base
-/// declarations a segment makes, so the next segment is seeded with them.
+/// Forwards every event to the sink and records the declarations in force,
+/// for resolving block labels.
 struct Capture<'s, 'n> {
     sink: &'s mut TemplateSink<'n>,
-    prefixes: &'s mut Vec<(String, String)>,
-    base: &'s mut Option<String>,
+    prefixes: Vec<(String, String)>,
+    base: Option<String>,
+    /// Bumped by every declaration, so a label resolved under one set of
+    /// declarations is not reused under another.
+    epoch: u64,
 }
 
 impl GraphSink for Capture<'_, '_> {
     fn on_base(&mut self, base_iri: &str) {
-        *self.base = Some(base_iri.to_string());
+        self.base = Some(base_iri.to_string());
+        self.epoch += 1;
         self.sink.on_base(base_iri);
     }
     fn on_prefix(&mut self, prefix: &str, namespace_iri: &str) {
@@ -377,6 +375,7 @@ impl GraphSink for Capture<'_, '_> {
                 .prefixes
                 .push((prefix.to_string(), namespace_iri.to_string())),
         }
+        self.epoch += 1;
         self.sink.on_prefix(prefix, namespace_iri);
     }
     fn term_iri(&mut self, iri: &str) -> TermId {
@@ -560,6 +559,36 @@ mod tests {
                 format!("<http://b.org/z> <http://b.org/p> \"3\"{XSD_STRING}"),
                 format!("[http://a.org/g1] <http://a.org/y> <http://a.org/p> \"2\"{XSD_STRING}"),
                 format!("[http://b.org/g2] <http://b.org/w> <http://b.org/p> \"4\"{XSD_STRING}"),
+            ]
+        );
+    }
+
+    /// A label is resolved once per declaration epoch: the same label under
+    /// a redefined prefix or base names another graph, and repeated blocks
+    /// under one epoch share one.
+    #[test]
+    fn a_block_label_follows_the_declarations_in_force() {
+        let doc = "@prefix g: <http://a.org/> .\n\
+                   g:x { <http://s> <http://p> 1 . }\n\
+                   g:x { <http://s> <http://p> 2 . }\n\
+                   @prefix g: <http://b.org/> .\n\
+                   g:x { <http://s> <http://p> 3 . }\n\
+                   @base <http://c.org/> .\n\
+                   <y> { <http://s> <http://p> 4 . }\n\
+                   @base <http://d.org/> .\n\
+                   <y> { <http://s> <http://p> 5 . }\n";
+        let graphs: Vec<String> = rendered(doc)
+            .iter()
+            .map(|t| t.split(']').next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            graphs,
+            [
+                "[http://a.org/x",
+                "[http://a.org/x",
+                "[http://b.org/x",
+                "[http://c.org/y",
+                "[http://d.org/y"
             ]
         );
     }
