@@ -795,17 +795,10 @@ async fn having_exists_is_evaluated_per_group() {
     .await;
 }
 
-/// Cypher parity. Cypher makes a non-aggregate RETURN expression a grouping
-/// key, so `RETURN CASE … AS seg, count(e)` groups by the label — SPARQL's
-/// `GROUP BY (IF(…) AS ?seg)`. Grouping by the area first and mapping it after
-/// (`WITH e.area AS a, count(e) AS n RETURN CASE … AS seg, n`) is what a
-/// SPARQL SELECT expression over `GROUP BY ?a` means. The mapping is
-/// non-injective (three areas, two labels), so the two readings differ.
-#[tokio::test]
-async fn grouped_select_expression_matches_cypher() {
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "grouped-projection/cypher:main");
-    let ledger = fluree
+/// The area fixture with `ex:E` types, for Cypher's label match.
+async fn seed_typed_areas(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree
         .insert(
             ledger0,
             &json!({
@@ -822,9 +815,49 @@ async fn grouped_select_expression_matches_cypher() {
         )
         .await
         .expect("seed")
-        .ledger;
-    let db = support::graphdb_from_ledger(&ledger)
-        .with_default_context(Some(json!({"@vocab": "http://example.org/"})));
+        .ledger
+}
+
+/// A view that resolves Cypher's bare names (`E`, `area`) in `ex:`.
+fn cypher_db(ledger: &MemoryLedger) -> fluree_db_api::GraphDb {
+    support::graphdb_from_ledger(ledger)
+        .with_default_context(Some(json!({"@vocab": "http://example.org/"})))
+}
+
+/// A grouped-read error does not print an internal variable. A Cypher
+/// property access (`e.area`) is a synthetic variable (`?#__prop_e_area`);
+/// ORDER BY reading it after an aggregating WITH used to be reported by that
+/// name.
+#[tokio::test]
+async fn cypher_grouped_read_error_names_no_internal_variable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_typed_areas(&fluree, "grouped-projection/cypher-internal:main").await;
+    let db = cypher_db(&ledger);
+    let query = "MATCH (e:E) WITH e, count(*) AS c ORDER BY e.area RETURN c";
+    let Err(err) = fluree.query_cypher(&db, query).await else {
+        panic!("ORDER BY a non-key property after an aggregating WITH must fail: {query}");
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("an ORDER BY key is neither a GROUP BY key nor an aggregate result"),
+        "{message}"
+    );
+    for internal in ["?#", "?__", "VarId("] {
+        assert!(!message.contains(internal), "{internal} in: {message}");
+    }
+}
+
+/// Cypher parity. Cypher makes a non-aggregate RETURN expression a grouping
+/// key, so `RETURN CASE … AS seg, count(e)` groups by the label — SPARQL's
+/// `GROUP BY (IF(…) AS ?seg)`. Grouping by the area first and mapping it after
+/// (`WITH e.area AS a, count(e) AS n RETURN CASE … AS seg, n`) is what a
+/// SPARQL SELECT expression over `GROUP BY ?a` means. The mapping is
+/// non-injective (three areas, two labels), so the two readings differ.
+#[tokio::test]
+async fn grouped_select_expression_matches_cypher() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_typed_areas(&fluree, "grouped-projection/cypher:main").await;
+    let db = cypher_db(&ledger);
     let cypher = |query: &'static str| {
         let (fluree, db) = (&fluree, &db);
         async move {

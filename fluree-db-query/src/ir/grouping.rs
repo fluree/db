@@ -572,37 +572,65 @@ impl UngroupedRead {
     /// do instead. Variables print as their ids: plan-time code has no
     /// variable names. [`Self::named_message`] names them.
     pub fn message(&self) -> String {
-        self.message_with(|var| format!("{var:?}"))
+        self.message_with(|var| Some(format!("{var:?}")))
     }
 
     /// [`Self::message`] with each variable named from `vars`, falling back to
-    /// its id for one the registry does not hold.
+    /// its id for one the registry does not hold. An internal variable (a
+    /// synthetic no user wrote, such as a Cypher property access) is not
+    /// named: the message says "a variable" instead.
     pub fn named_message(&self, vars: &VarRegistry) -> String {
-        self.message_with(|var| {
-            vars.try_name(var)
-                .map_or_else(|| format!("{var:?}"), str::to_string)
+        self.message_with(|var| match vars.try_name(var) {
+            Some(name) if crate::var_registry::is_internal_var_name(name) => None,
+            Some(name) => Some(name.to_string()),
+            None => Some(format!("{var:?}")),
         })
     }
 
-    fn message_with(&self, name: impl Fn(VarId) -> String) -> String {
-        let var = name(self.var);
+    fn message_with(&self, name: impl Fn(VarId) -> Option<String>) -> String {
         let neither = "neither a GROUP BY key nor an aggregate result";
+        let read = name(self.var);
         match self.stage {
-            ReadStage::Having => format!("HAVING reads variable {var}, which is {neither}"),
-            ReadStage::Bind(out) => format!(
-                "the SELECT expression for {} reads variable {var}, which is {neither}",
-                name(out)
-            ),
-            ReadStage::OrderBind(_) => {
-                format!("an ORDER BY expression reads variable {var}, which is {neither}")
+            ReadStage::Having => match read {
+                Some(var) => format!("HAVING reads variable {var}, which is {neither}"),
+                None => format!("HAVING reads a variable that is {neither}"),
+            },
+            ReadStage::Bind(out) => {
+                let expr = name(out).map_or_else(
+                    || "a SELECT expression".to_string(),
+                    |out| format!("the SELECT expression for {out}"),
+                );
+                match read {
+                    Some(var) => format!("{expr} reads variable {var}, which is {neither}"),
+                    None => format!("{expr} reads a variable that is {neither}"),
+                }
             }
-            ReadStage::OrderBy => format!("ORDER BY variable {var} is {neither}"),
-            ReadStage::Projection => format!(
-                "projected variable {var} is {neither}; aggregate it (e.g. with SAMPLE, \
-                 collect or group-concat)"
-            ),
+            ReadStage::OrderBind(_) => match read {
+                Some(var) => {
+                    format!("an ORDER BY expression reads variable {var}, which is {neither}")
+                }
+                None => format!("an ORDER BY expression reads a variable that is {neither}"),
+            },
+            ReadStage::OrderBy => match read {
+                Some(var) => format!("ORDER BY variable {var} is {neither}"),
+                None => format!("an ORDER BY key is {neither}"),
+            },
+            ReadStage::Projection => {
+                let var = read.map_or_else(
+                    || "a projected variable".to_string(),
+                    |var| format!("projected variable {var}"),
+                );
+                format!(
+                    "{var} is {neither}; aggregate it (e.g. with SAMPLE, collect or \
+                     group-concat)"
+                )
+            }
             ReadStage::UnboundProjection => {
-                format!("projected variable {var} is unbound: nothing in the query binds it")
+                let var = read.map_or_else(
+                    || "a projected variable".to_string(),
+                    |var| format!("projected variable {var}"),
+                );
+                format!("{var} is unbound: nothing in the query binds it")
             }
         }
     }
@@ -1148,6 +1176,26 @@ mod tests {
         assert_eq!(
             unbound.named_message(&vars),
             "projected variable ?x is unbound: nothing in the query binds it"
+        );
+        // An internal variable (here a Cypher property access) is not named.
+        let prop = vars.get_or_insert("?#__prop_e_area");
+        let internal = UngroupedRead {
+            var: prop,
+            stage: ReadStage::OrderBy,
+        };
+        assert_eq!(
+            internal.named_message(&vars),
+            "an ORDER BY key is neither a GROUP BY key nor an aggregate result"
+        );
+        let synthetic = vars.get_or_insert("?__sample_7");
+        let bind = UngroupedRead {
+            var: prop,
+            stage: ReadStage::Bind(synthetic),
+        };
+        assert_eq!(
+            bind.named_message(&vars),
+            "a SELECT expression reads a variable that is neither a GROUP BY key nor an \
+             aggregate result"
         );
         let err = crate::error::QueryError::UngroupedRead(read).name_variables(&vars);
         assert!(
