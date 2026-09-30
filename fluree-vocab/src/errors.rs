@@ -98,6 +98,9 @@ pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 /// Graph source not found
 pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
 
+/// A graph the target ledger does not have
+pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
+
 /// Graph source index stale
 pub const GRAPH_SOURCE_STALE: &str = "err:db/GraphSourceStale";
 

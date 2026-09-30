@@ -1245,9 +1245,14 @@ pub async fn query_ledger(
         }
     };
 
-    // Ledger-scoped endpoint: allow `from` as a named-graph selector, but reject
-    // attempts to target a different ledger than the URL.
-    normalize_ledger_scoped_from(&ledger_id, &mut query_json)?;
+    // Ledger-scoped endpoint: resolve `from` / `fromNamed` in the path's ledger,
+    // rejecting attempts to target a different ledger than the URL.
+    let registry = if names_jsonld_dataset(&query_json) {
+        scope_registry(&state, &path.id).await
+    } else {
+        None
+    };
+    normalize_ledger_scoped_from(&path.id, registry.as_ref(), &mut query_json)?;
     pin_jsonld_dataset(&path, &mut query_json)?;
 
     // Inject header values into query opts
@@ -1628,9 +1633,14 @@ pub async fn explain_ledger(
             }
         };
 
-        // Ledger-scoped endpoint: allow `from` as a named-graph selector, but reject
-        // attempts to target a different ledger than the URL.
-        normalize_ledger_scoped_from(&ledger_id, &mut query_json)?;
+        // Ledger-scoped endpoint: resolve `from` / `fromNamed` in the path's
+        // ledger, rejecting attempts to target a different ledger than the URL.
+        let registry = if names_jsonld_dataset(&query_json) {
+            scope_registry(&state, &path.id).await
+        } else {
+            None
+        };
+        normalize_ledger_scoped_from(&path.id, registry.as_ref(), &mut query_json)?;
         pin_jsonld_dataset(&path, &mut query_json)?;
 
         // Inject header values into query opts
@@ -1900,8 +1910,10 @@ fn sparql_json_response_format(
 
 /// The `<ledger...>` tail of a ledger-scoped query route, parsed once.
 pub(crate) struct PathLedger {
-    /// The ledger as the path spells it, minus any pin, so a pinned request
-    /// names its ledger downstream exactly as the unpinned one does.
+    /// The ledger's canonical id, plus the graph the path selects if any
+    /// (`books` → `books:main`, `urn:fluree:books:dev` → `books:dev`). Loading,
+    /// authorization and comparison all read this, never the spelling the path
+    /// used, and a pinned request names its ledger exactly as the unpinned one.
     pub(crate) ledger: String,
     pub(crate) id: fluree_db_api::LedgerId,
     /// Read the whole ledger, named graphs included, as of this point.
@@ -1939,25 +1951,26 @@ impl PathLedger {
         if fragment.is_some() && parsed.at().is_some() {
             return Err(combined());
         }
-        let Some(spec) = parsed.at().cloned() else {
-            return Ok(Self {
-                ledger: raw.to_string(),
-                id: parsed.into_id(),
-                pin: None,
-            });
+        let ledger = if parsed.graph().is_default() {
+            parsed.id().to_string()
+        } else {
+            format!("{}#{}", parsed.id(), parsed.graph())
         };
-        // Names cannot contain '@', so with no fragment the pin is everything
-        // after the first '@'.
-        let (ledger, at) = raw
-            .split_once('@')
-            .expect("a parsed pin follows an '@' in the path");
-        Ok(Self {
-            ledger: ledger.to_string(),
-            id: parsed.into_id(),
-            pin: Some(PathPin {
+        let pin = parsed.at().cloned().map(|spec| {
+            // Names cannot contain '@', so with no fragment the pin is
+            // everything after the first '@'.
+            let (_, at) = raw
+                .split_once('@')
+                .expect("a parsed pin follows an '@' in the path");
+            PathPin {
                 raw: at.to_string(),
                 spec,
-            }),
+            }
+        });
+        Ok(Self {
+            ledger,
+            id: parsed.into_id(),
+            pin,
         })
     }
 
@@ -2390,65 +2403,139 @@ pub(crate) fn collect_sparql_min_t_requirements(
     Ok(requirements)
 }
 
-fn looks_like_graph_selector_only(s: &str) -> bool {
-    // Ledger IDs typically look like `name:branch` and do NOT include `://`.
-    // Graph IRIs commonly include `://` or `urn:` and should be treated as selectors.
-    matches!(s, "default" | "txn-meta" | "config")
-        || s.contains("://")
-        || s.starts_with("urn:")
-        || (!s.contains(':') && !s.contains('@') && !s.contains('#'))
-}
-
-pub(crate) fn normalize_ledger_scoped_from(ledger_id: &str, query: &mut JsonValue) -> Result<()> {
+/// Resolve a ledger-scoped JSON-LD query's `from` / `fromNamed` in the path's
+/// ledger ([`resolve_scoped_reference`]): a graph of the ledger, named by
+/// keyword or IRI, becomes `{"@id": <ledger>, "graph": <graph>}` (a named one
+/// keeps its written text as its name), and the ledger's own address in any
+/// spelling stays as written. A single `from` must name this ledger (another
+/// ledger is a 400); a `from` array and `fromNamed` may also name other
+/// ledgers, which stay as written for the dataset to load.
+pub(crate) fn normalize_ledger_scoped_from(
+    target: &fluree_db_api::LedgerId,
+    registry: Option<&ScopeRegistry>,
+    query: &mut JsonValue,
+) -> Result<()> {
     let Some(obj) = query.as_object_mut() else {
         return Ok(());
     };
-    let Some(from_val) = obj.get("from").cloned() else {
-        return Ok(());
-    };
-
-    match from_val {
-        JsonValue::String(s) => {
-            // 1) If it's a pure graph selector (e.g. txn-meta / default / graph name),
-            // treat it as "graph within this ledger".
-            if looks_like_graph_selector_only(&s) {
-                let mut src = serde_json::Map::new();
-                src.insert("@id".to_string(), JsonValue::String(ledger_id.to_string()));
-                src.insert("graph".to_string(), JsonValue::String(s));
-                obj.insert("from".to_string(), JsonValue::Object(src));
-                return Ok(());
-            }
-
-            // 2) If it encodes ledger + optional time/fragment, require base ledger match.
-            let base = base_ledger_id(&s)?;
-            let base_path = base_ledger_id(ledger_id)?;
-            if base != base_path {
-                return Err(ServerError::bad_request(format!(
-                    "Ledger mismatch: endpoint ledger is '{ledger_id}' but query 'from' targets '{s}'"
-                )));
-            }
+    for (key, named) in [("from", false), ("fromNamed", true), ("from-named", true)] {
+        if let Some(value) = obj.get(key) {
+            let scope = match (named, value) {
+                (false, JsonValue::String(_) | JsonValue::Object(_)) => SourceScope::ThisLedger,
+                _ => SourceScope::AnyLedger,
+            };
+            let normalized = normalize_scoped_sources(target, registry, value, named, scope)?;
+            obj.insert(key.to_string(), normalized);
         }
-        JsonValue::Object(m) => {
-            // Object form must name this ledger in @id (time/graph selectors ok).
-            if let Some(id) = m.get("@id").and_then(|v| v.as_str()) {
-                let base = base_ledger_id(id)?;
-                let base_path = base_ledger_id(ledger_id)?;
-                if base != base_path {
+    }
+    Ok(())
+}
+
+/// Which ledgers a JSON-LD dataset position of a ledger-scoped route may name.
+#[derive(Clone, Copy)]
+enum SourceScope {
+    /// Only the path's ledger: another one is a 400.
+    ThisLedger,
+    /// Any ledger: one other than the path's stays as written.
+    AnyLedger,
+}
+
+/// Whether a JSON-LD body names a dataset the ledger-scoped routes resolve.
+pub(crate) fn names_jsonld_dataset(query: &JsonValue) -> bool {
+    ["from", "fromNamed", "from-named"]
+        .iter()
+        .any(|key| query.get(key).is_some())
+}
+
+/// Resolve one JSON-LD source, or `None` when it names another ledger that
+/// the position may name (it then stays as written).
+fn scoped_source(
+    target: &fluree_db_api::LedgerId,
+    registry: Option<&ScopeRegistry>,
+    written: &str,
+    scope: SourceScope,
+) -> Result<Option<ScopedReference>> {
+    if let SourceScope::AnyLedger = scope {
+        let registered = registry.is_some_and(|r| r.0.contains_key(written));
+        let other_ledger = fluree_db_core::MemberRef::parse(written)
+            .map(|m| m.address().is_some_and(|a| a.id() != target))
+            .unwrap_or(true);
+        if other_ledger && !registered {
+            return Ok(None);
+        }
+    }
+    resolve_scoped_reference(target, registry, written).map(Some)
+}
+
+fn normalize_scoped_sources(
+    target: &fluree_db_api::LedgerId,
+    registry: Option<&ScopeRegistry>,
+    value: &JsonValue,
+    named: bool,
+    scope: SourceScope,
+) -> Result<JsonValue> {
+    match value {
+        JsonValue::String(written) => {
+            let Some(scoped) = scoped_source(target, registry, written, scope)? else {
+                return Ok(value.clone());
+            };
+            if scoped.own_address {
+                return Ok(value.clone());
+            }
+            let mut src = serde_json::Map::new();
+            src.insert("@id".to_string(), JsonValue::String(target.to_string()));
+            src.insert(
+                "graph".to_string(),
+                JsonValue::String(scoped.graph.to_string()),
+            );
+            if named {
+                src.insert("alias".to_string(), JsonValue::String(written.clone()));
+            }
+            Ok(JsonValue::Object(src))
+        }
+        JsonValue::Array(items) => items
+            .iter()
+            .map(|item| normalize_scoped_sources(target, registry, item, named, scope))
+            .collect::<Result<Vec<_>>>()
+            .map(JsonValue::Array),
+        JsonValue::Object(obj) => match obj.get("@id").and_then(JsonValue::as_str) {
+            Some(id) => {
+                let Some(scoped) = scoped_source(target, registry, id, scope)? else {
+                    return Ok(value.clone());
+                };
+                if scoped.own_address {
+                    return Ok(value.clone());
+                }
+                // The object names a graph of this ledger by its `@id`.
+                if obj.contains_key("graph") {
                     return Err(ServerError::bad_request(format!(
-                        "Ledger mismatch: endpoint ledger is '{ledger_id}' but query 'from.@id' targets '{id}'"
+                        "'{id}' names a graph of this ledger, so it takes no \"graph\" of its own"
                     )));
                 }
+                let mut src = obj.clone();
+                src.insert("@id".to_string(), JsonValue::String(target.to_string()));
+                src.insert(
+                    "graph".to_string(),
+                    JsonValue::String(scoped.graph.to_string()),
+                );
+                if named && !src.contains_key("alias") {
+                    src.insert("alias".to_string(), JsonValue::String(id.to_string()));
+                }
+                Ok(JsonValue::Object(src))
             }
-        }
-        JsonValue::Array(_) => {
-            // Allow arrays only if caller explicitly provides ledger refs per-entry.
-            // (Graph-only entries are ambiguous in this endpoint.)
-            // Mismatch will be enforced by the connection parsing path if present.
-        }
-        _ => {}
+            // `fromNamed` object form: aliases mapped to sources.
+            None if named => obj
+                .iter()
+                .map(|(alias, source)| {
+                    normalize_scoped_sources(target, registry, source, named, scope)
+                        .map(|source| (alias.clone(), source))
+                })
+                .collect::<Result<serde_json::Map<_, _>>>()
+                .map(JsonValue::Object),
+            None => Ok(value.clone()),
+        },
+        other => Ok(other.clone()),
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2456,9 +2543,25 @@ mod ledger_scoped_from_tests {
     use super::{
         collect_jsonld_min_t_requirements, collect_sparql_min_t_requirements,
         normalize_ledger_scoped_from, refreshable_ledger_id, requires_dataset_features,
+        ScopeRegistry,
     };
     use crate::extract::FlureeHeaders;
     use serde_json::json;
+
+    fn id(s: &str) -> fluree_db_api::LedgerId {
+        fluree_db_api::LedgerId::parse(s).unwrap()
+    }
+
+    /// A loaded ledger's registry holding `graphs`.
+    fn registry(graphs: &[&str]) -> ScopeRegistry {
+        ScopeRegistry(
+            graphs
+                .iter()
+                .zip(3u16..)
+                .map(|(iri, g)| (iri.to_string(), g))
+                .collect(),
+        )
+    }
 
     #[test]
     fn refreshable_ledger_id_strips_time_and_graph_selectors() {
@@ -2493,7 +2596,8 @@ mod ledger_scoped_from_tests {
     fn bare_config_from_is_rewritten_as_a_graph_selector() {
         for selector in ["config", "txn-meta", "default"] {
             let mut q = json!({"from": selector, "select": ["?s"], "where": []});
-            normalize_ledger_scoped_from("books:main", &mut q).expect("normalize");
+            normalize_ledger_scoped_from(&id("books:main"), Some(&registry(&[])), &mut q)
+                .expect("normalize");
             assert_eq!(
                 q["from"],
                 json!({"@id": "books:main", "graph": selector}),
@@ -2572,7 +2676,7 @@ mod ledger_scoped_from_tests {
     #[test]
     fn normalize_from_txn_meta_string_rewrites_to_object() {
         let mut q = json!({"select": ["*"], "from": "txn-meta"});
-        normalize_ledger_scoped_from("myledger:main", &mut q).unwrap();
+        normalize_ledger_scoped_from(&id("myledger:main"), Some(&registry(&[])), &mut q).unwrap();
         assert_eq!(
             q.get("from").unwrap(),
             &json!({"@id": "myledger:main", "graph": "txn-meta"})
@@ -2583,8 +2687,68 @@ mod ledger_scoped_from_tests {
     #[test]
     fn normalize_from_different_ledger_errors() {
         let mut q = json!({"select": ["*"], "from": "other:main"});
-        let err = normalize_ledger_scoped_from("myledger:main", &mut q).unwrap_err();
+        let err = normalize_ledger_scoped_from(&id("myledger:main"), Some(&registry(&[])), &mut q)
+            .unwrap_err();
         assert!(err.to_string().contains("Ledger mismatch"));
+    }
+
+    /// Every spelling of the path's own ledger stays as written (the dataset
+    /// parsers read any spelling); a graph of the ledger, by keyword or IRI and
+    /// in `from` or `fromNamed`, names the ledger explicitly; another ledger is
+    /// refused whichever key names it (#1982).
+    #[test]
+    fn scoped_sources_resolve_in_the_paths_ledger() {
+        let target = id("b2x:main");
+        let reg = registry(&["http://ex.org/g", "urn:ex:doc:1", "urn:x"]);
+        for own in [
+            "b2x",
+            "b2x:main",
+            "urn:fluree:b2x:main",
+            "b2x@t:1",
+            "b2x:main#http://ex.org/g",
+            "urn:fluree:b2x:main#config",
+        ] {
+            let mut q = json!({"from": own});
+            normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap();
+            assert_eq!(q["from"], json!(own), "{own}");
+        }
+        for (graph, as_graph) in [
+            ("http://ex.org/g", "http://ex.org/g"),
+            ("urn:ex:doc:1", "urn:ex:doc:1"),
+            ("urn:x", "urn:x"),
+            ("config", "config"),
+            ("http://ex.org/not-yet", "http://ex.org/not-yet"),
+        ] {
+            let mut q = json!({"from": graph, "fromNamed": [graph]});
+            normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap();
+            assert_eq!(
+                q["from"],
+                json!({"@id": "b2x:main", "graph": as_graph}),
+                "{graph}"
+            );
+            assert_eq!(
+                q["fromNamed"],
+                json!([{"@id": "b2x:main", "graph": as_graph, "alias": graph}]),
+                "{graph}"
+            );
+        }
+        for other in ["other:main", "other", "urn:fluree:other:main#config"] {
+            // A single `from` must name this ledger...
+            let mut q = json!({ "from": other });
+            let err = normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap_err();
+            assert!(
+                err.to_string().contains("Ledger mismatch"),
+                "{other}: {err}"
+            );
+            // ...while a `from` array and `fromNamed` may name other ledgers too.
+            let mut q = json!({ "from": ["b2x", other], "fromNamed": [other] });
+            normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap();
+            assert_eq!(
+                q,
+                json!({ "from": ["b2x", other], "fromNamed": [other] }),
+                "{other}"
+            );
+        }
     }
 
     #[test]
@@ -2605,13 +2769,13 @@ mod path_pin_tests {
     #[test]
     fn path_keeps_its_spelling_minus_the_pin() {
         let path = PathLedger::parse("books@t:5").unwrap();
-        assert_eq!(path.ledger, "books");
+        assert_eq!(path.ledger, "books:main");
         assert_eq!(path.id.as_str(), "books:main");
         let pin = path.pin.unwrap();
         assert_eq!((pin.raw.as_str(), pin.spec), ("t:5", TimeSpec::AtT(5)));
 
         let path = PathLedger::parse("urn:fluree:books:dev@time:2024-01-01T00:00:00Z").unwrap();
-        assert_eq!(path.ledger, "urn:fluree:books:dev");
+        assert_eq!(path.ledger, "books:dev");
         assert_eq!(
             path.pin.unwrap().spec,
             TimeSpec::AtTime("2024-01-01T00:00:00Z".into())
@@ -2620,6 +2784,11 @@ mod path_pin_tests {
         let path = PathLedger::parse("books:dev").unwrap();
         assert_eq!(path.ledger, "books:dev");
         assert!(path.pin.is_none());
+
+        // A graph in the path stays with the canonical id.
+        let path = PathLedger::parse("urn:fluree:books#txn-meta").unwrap();
+        assert_eq!(path.ledger, "books:main#txn-meta");
+        assert_eq!(path.id.as_str(), "books:main");
 
         for bad in ["books@t:x", "books@", "books@t:1#txn-meta"] {
             assert!(PathLedger::parse(bad).is_err(), "{bad}");
@@ -2632,7 +2801,7 @@ mod path_pin_tests {
         let mut q = json!({"select": ["?s"], "where": [], "opts": {"from": "books:main"}});
         pin_jsonld_dataset(&path, &mut q).unwrap();
         assert_eq!(q["opts"]["from"], json!({"@id": "books:main", "t": 5}));
-        assert_eq!(q["from"], json!({"@id": "books", "t": 5}));
+        assert_eq!(q["from"], json!({"@id": "books:main", "t": 5}));
     }
 
     #[test]
@@ -2997,12 +3166,132 @@ async fn execute_query_proxy(
     Ok((HeaderMap::new(), Json(result)).into_response())
 }
 
+/// The graph registry of a ledger-scoped route's ledger, used to resolve the
+/// request's dataset references in the ledger they target, through the table
+/// the view path and updates use. A graph source or a missing ledger has an
+/// empty one. In proxy storage there is none to read: references then resolve
+/// by address alone, and loading reports a graph that does not exist.
+pub(crate) struct ScopeRegistry(std::collections::HashMap<String, fluree_db_core::GraphId>);
+
+/// The path ledger's [`ScopeRegistry`], read from its cached head.
+pub(crate) async fn scope_registry(
+    state: &AppState,
+    target: &fluree_db_api::LedgerId,
+) -> Option<ScopeRegistry> {
+    if state.config.is_proxy_storage_mode() {
+        return None;
+    }
+    let handle = match state.fluree.ledger_cached(target.as_str()).await {
+        Ok(handle) => handle,
+        // A graph source, or a ledger that does not exist: no named graphs.
+        Err(e) if e.is_not_found() => {
+            return Some(ScopeRegistry(std::collections::HashMap::new()));
+        }
+        Err(_) => return None,
+    };
+    let view = handle.snapshot().await;
+    let mut ids = std::collections::HashMap::new();
+    for (g_id, iri) in view.snapshot.graph_registry.iter_entries() {
+        ids.insert(iri.to_string(), g_id);
+    }
+    if let Some(store) = view.binary_store.as_ref() {
+        for (g_id, iri) in store.graph_entries() {
+            ids.entry(iri.to_string()).or_insert(g_id);
+        }
+    }
+    Some(ScopeRegistry(ids))
+}
+
+/// A dataset reference of a ledger-scoped request, resolved in the path's
+/// ledger.
+pub(crate) struct ScopedReference {
+    /// The graph of the path's ledger the reference names.
+    pub(crate) graph: GraphSel,
+    /// The time the reference pins, if it is an address with a pin.
+    pub(crate) at: Option<TimeSpec>,
+    /// Written as the ledger's own address (any spelling, with or without a
+    /// graph and a pin), which the dataset parsers read as is.
+    pub(crate) own_address: bool,
+}
+
+/// Resolve one dataset reference of a ledger-scoped request (a SPARQL `FROM` /
+/// `FROM NAMED` IRI after prefix and BASE expansion, or a JSON-LD `from` /
+/// `fromNamed` string) in the path's ledger. The ledger's own address in any
+/// spelling names its default graph, or the graph the address names; a graph
+/// keyword or a registered IRI names that graph; another ledger's address is a
+/// 400. An IRI the registry does not hold is left to loading, which reports a
+/// graph the ledger does not have (404).
+pub(crate) fn resolve_scoped_reference(
+    target: &fluree_db_api::LedgerId,
+    registry: Option<&ScopeRegistry>,
+    written: &str,
+) -> Result<ScopedReference> {
+    use fluree_db_core::{GraphIri, MemberRef, TargetError, TargetLedger};
+
+    let member = MemberRef::parse(written).map_err(|e| {
+        ServerError::bad_request(format!("<{written}> is not a graph of this ledger: {e}"))
+    })?;
+    let at = member.address().and_then(|a| a.at().cloned());
+    let own_address = member.address().is_some_and(|a| a.id() == target);
+    let lookup = |iri: &str| registry.and_then(|r| r.0.get(iri).copied());
+    let graph_iri = |iri: &str| {
+        GraphIri::parse(iri).map(GraphSel::Named).map_err(|e| {
+            ServerError::bad_request(format!("<{written}> is not a graph of this ledger: {e}"))
+        })
+    };
+    match TargetLedger::new(target, &lookup).resolve(written, &member, at.is_some()) {
+        Ok(graph) => Ok(ScopedReference {
+            graph: graph.graph,
+            at,
+            own_address,
+        }),
+        Err(TargetError::GraphNotFound(iri)) => Ok(ScopedReference {
+            graph: graph_iri(&iri)?,
+            at,
+            own_address,
+        }),
+        // With no registry to consult, an IRI that also reads as an address
+        // may still be a graph of this ledger: loading decides.
+        Err(TargetError::CrossLedger { also_iri: true, .. }) if registry.is_none() => {
+            Ok(ScopedReference {
+                graph: graph_iri(written)?,
+                at: None,
+                own_address: false,
+            })
+        }
+        Err(TargetError::CrossLedger {
+            named,
+            target,
+            also_iri,
+        }) => Err(ServerError::bad_request(format!(
+            "Ledger mismatch: endpoint ledger is '{target}' but <{written}> {}names ledger \
+             '{named}'",
+            if also_iri {
+                "is not a graph of this ledger, and as an address it "
+            } else {
+                ""
+            }
+        ))),
+    }
+}
+
+/// The query's dataset clause with its IRIs expanded against the prologue
+/// (prefixed names, BASE-relative references), as the embedded API reads it.
+pub(crate) fn resolved_sparql_dataset(
+    ast: Option<&fluree_db_sparql::SparqlAst>,
+) -> Result<Option<fluree_db_sparql::ResolvedDatasetClause>> {
+    match ast {
+        Some(ast) => fluree_db_sparql::resolve_dataset_clause(ast)
+            .map_err(|e| ServerError::bad_request(e.to_string())),
+        None => Ok(None),
+    }
+}
+
 /// Build a `DatasetSpec` from a ledger-scoped SPARQL `FROM`/`FROM NAMED` clause.
 ///
-/// FROM/FROM NAMED select named graphs *within this ledger*: a bare graph IRI
-/// is a graph selector, and a ledger-ref form (`name:branch`, `@t:`, `#frag`)
-/// must resolve to the same base ledger (else a mismatch error). Shared by
-/// `/query` and the streaming endpoint so both interpret FROM identically.
+/// FROM/FROM NAMED select graphs *within this ledger*, each resolved by
+/// [`resolve_scoped_reference`]. Shared by `/query` and the streaming endpoint
+/// so both interpret FROM identically.
 ///
 /// A dataset clause with `FROM NAMED` but no `FROM` yields an EMPTY default
 /// graph (SPARQL 1.1 §13.2), matching `build_within_ledger_dataset_from_ast` on
@@ -3013,22 +3302,14 @@ async fn execute_query_proxy(
 /// `pin` is a time pin from the ledger path: it applies to every source that
 /// names no time of its own, and one that does must agree with it.
 pub(crate) fn ledger_scoped_sparql_dataset_spec(
-    ledger_id: &str,
-    dc: &fluree_db_sparql::ast::DatasetClause,
+    target: &fluree_db_api::LedgerId,
+    clause: &fluree_db_sparql::ResolvedDatasetClause,
     pin: Option<&PathPin>,
+    registry: Option<&ScopeRegistry>,
 ) -> Result<DatasetSpec> {
-    let base_path = base_ledger_id(ledger_id)?;
-    // Every member reads a graph of the path's ledger.
-    let path_ledger = fluree_db_api::LedgerRef::parse(ledger_id)?;
-    let member = |graph: GraphSel| GraphSource::ledger(path_ledger.clone().with_graph(graph));
-    let selector = |raw: &str| {
-        GraphSel::parse(raw).map_err(|e| {
-            ServerError::bad_request(format!(
-                "SPARQL FROM/FROM NAMED <{raw}> is not a graph of this ledger: {e}"
-            ))
-        })
+    let member = |graph: GraphSel| {
+        GraphSource::ledger(fluree_db_api::LedgerRef::new(target.clone()).with_graph(graph))
     };
-    let mut spec = DatasetSpec::new();
     let timed = |src: GraphSource, own: Option<TimeSpec>, raw: &str| -> Result<GraphSource> {
         let time = match (own, pin) {
             (Some(own), Some(pin)) => {
@@ -3044,71 +3325,20 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
         })
     };
 
-    let mut add_default = |raw: &str| -> Result<()> {
-        if raw == ledger_id {
-            spec.default_graphs
-                .push(timed(member(GraphSel::Default), None, raw)?);
-            return Ok(());
-        }
-        let looks_like_ledger_ref = raw.contains('@')
-            || raw.contains('#')
-            || (raw.contains(':') && !raw.contains("://") && !raw.starts_with("urn:"));
-        if looks_like_ledger_ref {
-            let (no_frag, frag) = split_graph_fragment(raw);
-            let (base, time) = fluree_db_core::ledger_id::split_time_travel_suffix(no_frag)
-                .map_err(|e| {
-                    ServerError::bad_request(format!("Invalid time travel in FROM: {e}"))
-                })?;
-            if base != base_path {
-                return Err(ServerError::bad_request(format!(
-                    "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM targets '{raw}'"
-                )));
-            }
-            let graph = frag.map(selector).transpose()?.unwrap_or(GraphSel::Default);
-            spec.default_graphs
-                .push(timed(member(graph), time.map(TimeSpec::from), raw)?);
-            return Ok(());
-        }
+    let mut spec = DatasetSpec::new();
+    for raw in &clause.default_graphs {
+        let scoped = resolve_scoped_reference(target, registry, raw)?;
         spec.default_graphs
-            .push(timed(member(selector(raw)?), None, raw)?);
-        Ok(())
-    };
-
-    let mut add_named = |raw: &str| -> Result<()> {
-        let looks_like_ledger_ref = raw.contains('@')
-            || raw.contains('#')
-            || (raw.contains(':') && !raw.contains("://") && !raw.starts_with("urn:"));
-        if looks_like_ledger_ref {
-            let (no_frag, frag) = split_graph_fragment(raw);
-            let (base, time) = fluree_db_core::ledger_id::split_time_travel_suffix(no_frag)
-                .map_err(|e| {
-                    ServerError::bad_request(format!("Invalid time travel in FROM NAMED: {e}"))
-                })?;
-            if base != base_path {
-                return Err(ServerError::bad_request(format!(
-                    "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM NAMED targets '{raw}'"
-                )));
-            }
-            let graph = frag.map(selector).transpose()?.unwrap_or(GraphSel::Default);
-            spec.named_graphs.push(timed(
-                member(graph).with_alias(raw),
-                time.map(TimeSpec::from),
-                raw,
-            )?);
-            return Ok(());
-        }
-        spec.named_graphs
-            .push(timed(member(selector(raw)?).with_alias(raw), None, raw)?);
-        Ok(())
-    };
-
-    for iri in &dc.default_graphs {
-        add_default(&iri_to_string(iri))?;
+            .push(timed(member(scoped.graph), scoped.at, raw)?);
     }
-    for iri in &dc.named_graphs {
-        add_named(&iri_to_string(iri))?;
+    for raw in &clause.named_graphs {
+        let scoped = resolve_scoped_reference(target, registry, raw)?;
+        spec.named_graphs.push(timed(
+            member(scoped.graph).with_alias(raw.as_ref()),
+            scoped.at,
+            raw,
+        )?);
     }
-
     Ok(spec)
 }
 
@@ -3617,7 +3847,12 @@ async fn execute_sparql_ledger(
             }
 
             let spec = match (dc, pin) {
-                (Some(dc), _) => ledger_scoped_sparql_dataset_spec(ledger_id, dc, pin)?,
+                (Some(_), _) => {
+                    let clause = resolved_sparql_dataset(parsed.ast.as_ref())?
+                        .ok_or_else(|| ServerError::bad_request("Invalid SPARQL dataset clause"))?;
+                    let registry = scope_registry(state, &path.id).await;
+                    ledger_scoped_sparql_dataset_spec(&path.id, &clause, pin, registry.as_ref())?
+                }
                 (None, Some(pin)) => pinned_ledger_spec(&path.id, pin),
                 (None, None) => {
                     return Err(ServerError::bad_request("Invalid SPARQL dataset clause"));

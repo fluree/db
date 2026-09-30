@@ -265,12 +265,15 @@ async fn stream_query_inner(
 
     // The streaming dataset path does not enumerate a ledger's named graphs
     // under `GRAPH ?g`, so a pinned read here would silently drop them.
-    if PathLedger::parse(&ledger)?.pin.is_some() {
+    let path = PathLedger::parse(&ledger)?;
+    if path.pin.is_some() {
         return Err(ServerError::bad_request(
             "A time pin in the ledger path is not supported on the streaming endpoint; \
              use /v1/fluree/query/<ledger>@<pin>",
         ));
     }
+    // The typed id, not the path's spelling, drives loading and authorization.
+    let ledger = path.ledger.clone();
 
     // Resolve into one of two execution shapes, planned before the 200 stream
     // commits so parse errors / unsupported shapes return a clean 4xx:
@@ -334,7 +337,15 @@ async fn stream_query_inner(
                     dc,
                     parsed.ast.as_ref(),
                 );
-                crate::routes::query::ledger_scoped_sparql_dataset_spec(&ledger, dc, None)?
+                let clause = crate::routes::query::resolved_sparql_dataset(parsed.ast.as_ref())?
+                    .ok_or_else(|| ServerError::bad_request("Invalid SPARQL dataset clause"))?;
+                let registry = crate::routes::query::scope_registry(&state, &path.id).await;
+                crate::routes::query::ledger_scoped_sparql_dataset_spec(
+                    &path.id,
+                    &clause,
+                    None,
+                    registry.as_ref(),
+                )?
             } else {
                 fluree_db_api::DatasetSpec::new().with_default(fluree_db_api::GraphSource::ledger(
                     fluree_db_api::LedgerRef::parse(&ledger)?,
@@ -382,7 +393,12 @@ async fn stream_query_inner(
         // the path ledger, fold header opts in, enforce bearer scope over the
         // path ledger and every referenced graph, then apply auth-derived
         // identity + default policy class.
-        normalize_ledger_scoped_from(&ledger, &mut query_json)?;
+        let registry = if crate::routes::query::names_jsonld_dataset(&query_json) {
+            crate::routes::query::scope_registry(&state, &path.id).await
+        } else {
+            None
+        };
+        normalize_ledger_scoped_from(&path.id, registry.as_ref(), &mut query_json)?;
         inject_headers_into_query(&mut query_json, &headers);
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
