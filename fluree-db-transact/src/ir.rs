@@ -676,15 +676,34 @@ impl GraphScope {
     }
 
     /// Emit one template in this scope.
+    ///
+    /// This is the one template-level emitter of `f:reifiesGraph`: a
+    /// reifier's `f:reifiesSubject` statement emitted in a named scope is
+    /// accompanied by `(reifier, f:reifiesGraph, <the scope's graph>)` in the
+    /// same scope, so a reifier bundle always names the graph of the edge it
+    /// reifies, which is the graph the bundle itself is written to. Nothing
+    /// else writes the anchor into templates.
+    #[allow(clippy::too_many_arguments)]
     pub fn emit(
         &self,
         out: &mut Vec<TripleTemplate>,
+        ns: &mut crate::namespace::NamespaceRegistry,
         subject: TemplateTerm,
         predicate: TemplateTerm,
         object: TemplateTerm,
         dtc: Option<DatatypeConstraint>,
         list_index: Option<i32>,
     ) {
+        let anchor = match (&self.graph, &predicate) {
+            (TemplateGraph::Default, _) => None,
+            (graph, TemplateTerm::Sid(p)) if is_reifies_subject(p) => Some(match graph {
+                TemplateGraph::Iri(iri) => TemplateTerm::Sid(ns.sid_for_iri(iri)),
+                TemplateGraph::Var(var) => TemplateTerm::Var(*var),
+                TemplateGraph::Default => unreachable!("matched above"),
+            }),
+            _ => None,
+        };
+        let anchor_subject = anchor.as_ref().map(|_| subject.clone());
         out.push(TripleTemplate {
             subject,
             predicate,
@@ -694,7 +713,33 @@ impl GraphScope {
             graph: self.graph.clone(),
             graph_from_template_default: self.template_default,
         });
+        if let (Some(reifier), Some(graph)) = (anchor_subject, anchor) {
+            out.push(TripleTemplate {
+                subject: reifier,
+                predicate: TemplateTerm::Sid(Sid::new(
+                    fluree_vocab::namespaces::FLUREE_DB,
+                    fluree_vocab::db::REIFIES_GRAPH,
+                )),
+                object: graph,
+                dtc: None,
+                list_index: None,
+                graph: self.graph.clone(),
+                graph_from_template_default: self.template_default,
+            });
+        }
     }
+}
+
+/// Whether `p` is `f:reifiesSubject`, compared without allocating.
+pub(crate) fn is_reifies_subject(p: &Sid) -> bool {
+    p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+        && &*p.name == fluree_vocab::db::REIFIES_SUBJECT
+}
+
+/// Whether `p` is `f:reifiesPredicate`, compared without allocating.
+pub(crate) fn is_reifies_predicate(p: &Sid) -> bool {
+    p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+        && &*p.name == fluree_vocab::db::REIFIES_PREDICATE
 }
 
 /// The named graphs one transaction writes to, interned so every template of

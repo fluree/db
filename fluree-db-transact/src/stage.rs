@@ -756,7 +756,11 @@ pub async fn stage_with_graph_delta(
 
         // A `WITH`/`graph` template default that is this ledger's own address
         // writes the ledger's default graph, the graph the WHERE reads for it.
-        template_default_address_to_default_graph(&mut txn, &ledger.snapshot.ledger_id);
+        template_default_address_to_default_graph(
+            &mut txn,
+            &ledger.snapshot.ledger_id,
+            &ns_registry,
+        );
 
         // B2 (data writes): `#txn-meta` is never a write target (see
         // `refuse_txn_meta_write`). `txn.write_graphs` holds the fixed write
@@ -1176,13 +1180,30 @@ fn refuse_txn_meta_write(ledger: &LedgerState, iri: &str) -> Result<()> {
 /// write half agree: the templates that took the default write the default
 /// graph, and the IRI is not registered as a named graph unless a template
 /// names it itself. Templates that name their graph are left alone.
-fn template_default_address_to_default_graph(txn: &mut Txn, ledger_id: &fluree_db_core::LedgerId) {
+///
+/// An annotated edge written in the template default carries the reifier
+/// anchor `(reifier, f:reifiesGraph, <iri>)` (`GraphScope::emit`). Once the
+/// edge moves to the default graph the anchor would name a graph the edge is
+/// not in, so it is dropped: a default-graph bundle has no anchor.
+fn template_default_address_to_default_graph(
+    txn: &mut Txn,
+    ledger_id: &fluree_db_core::LedgerId,
+    ns: &NamespaceRegistry,
+) {
     let Some(iri) = txn.template_default_graph.clone() else {
         return;
     };
     if !names_ledger(ledger_id, &iri) {
         return;
     }
+    let address = ns.lookup_sid_for_iri(&iri);
+    let is_anchor_for_address = |template: &TripleTemplate| {
+        template.graph_from_template_default
+            && matches!(&template.predicate, TemplateTerm::Sid(p) if fluree_db_core::is_reifies_graph(p))
+            && matches!((&template.object, &address), (TemplateTerm::Sid(o), Some(a)) if o == a)
+    };
+    txn.insert_templates.retain(|t| !is_anchor_for_address(t));
+    txn.delete_templates.retain(|t| !is_anchor_for_address(t));
     let mut named_by_a_template = false;
     for template in txn
         .insert_templates

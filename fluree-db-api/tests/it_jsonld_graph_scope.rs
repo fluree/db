@@ -481,3 +481,109 @@ async fn anonymous_nodes_in_separate_graph_items_stay_distinct() {
     assert_eq!(distinct, Some(2), "two anonymous nodes: {rows:?}");
     assert_eq!(values(&fluree, &ledger, Some(G), "name").await, ["x", "y"]);
 }
+
+/// The `ex:role` of the annotation on `ex:alice ex:worksFor ex:acme` in
+/// `graph` (`None`: the default graph), through the SPARQL annotation tail.
+async fn annotation_role(
+    fluree: &Fluree,
+    ledger: &LedgerState,
+    graph: Option<&str>,
+) -> Option<String> {
+    let inner = "ex:alice ex:worksFor ex:acme {| ex:role ?role |}";
+    let sparql = match graph {
+        Some(g) => format!(
+            "PREFIX ex: <http://example.org/> SELECT ?role WHERE {{ GRAPH <{g}> {{ {inner} }} }}"
+        ),
+        None => format!("PREFIX ex: <http://example.org/> SELECT ?role WHERE {{ {inner} }}"),
+    };
+    let result = support::query_sparql(fluree, ledger, &sparql)
+        .await
+        .expect("annotation-tail query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    json["results"]["bindings"]
+        .as_array()
+        .and_then(|b| b.first())
+        .and_then(|row| row["role"]["value"].as_str())
+        .map(String::from)
+}
+
+/// A1, A2, A3 and named-graph content: an annotated edge written through the
+/// update `graph` key, a `["graph", …]` item, an array selector, or a
+/// named graph's content commits, and its annotation is found with the edge
+/// in that graph. A1 used to be refused; A2 and A3 committed the annotation
+/// to the default graph, where its edge is not, so it was reachable from
+/// neither graph.
+#[tokio::test]
+async fn annotations_follow_their_edge_into_the_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let edge = json!({"@id": "ex:alice", "ex:worksFor": {"@id": "ex:acme", "@annotation": {"ex:role": "Engineer"}}});
+    let mut selector = edge.clone();
+    selector["@graph"] = json!(["ex:g"]);
+    let cases = [
+        (
+            "A1",
+            true,
+            json!({"@context": ctx(), "graph": "ex:g", "insert": edge}),
+        ),
+        (
+            "A2",
+            true,
+            json!({"@context": ctx(), "insert": [["graph", "ex:g", edge]]}),
+        ),
+        (
+            "A3",
+            false,
+            json!({"@context": ctx(), "@graph": [selector]}),
+        ),
+        (
+            "named graph",
+            false,
+            json!({"@context": ctx(), "@id": "ex:g", "@graph": [edge]}),
+        ),
+    ];
+    for (i, (what, update, doc)) in cases.into_iter().enumerate() {
+        let ledger = genesis_ledger(&fluree, &format!("it/scope-annotation-{i}:main"));
+        let result = if update {
+            fluree.update(ledger, &doc).await
+        } else {
+            fluree.insert(ledger, &doc).await
+        };
+        let ledger = result.unwrap_or_else(|e| panic!("{what}: {e}")).ledger;
+        assert_eq!(
+            annotation_role(&fluree, &ledger, Some(G)).await.as_deref(),
+            Some("Engineer"),
+            "{what}: the annotation is with its edge in the graph"
+        );
+        assert_eq!(
+            annotation_role(&fluree, &ledger, None).await,
+            None,
+            "{what}: nothing in the default graph"
+        );
+    }
+}
+
+/// An update whose `graph` key names the ledger's own address writes the
+/// ledger's default graph, an annotated edge included: its annotation is
+/// found with the edge in the default graph, as for an update with no
+/// `graph` key.
+#[tokio::test]
+async fn annotation_under_the_ledger_address_lands_in_the_default_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/scope-annotation-address:main";
+    let edge = json!({"@id": "ex:alice", "ex:worksFor": {"@id": "ex:acme", "@annotation": {"ex:role": "Engineer"}}});
+    let ledger = fluree
+        .update(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({"@context": ctx(), "graph": format!("urn:fluree:{ledger_id}"), "insert": edge}),
+        )
+        .await
+        .expect("an annotated edge written under the ledger's address")
+        .ledger;
+    assert_eq!(
+        annotation_role(&fluree, &ledger, None).await.as_deref(),
+        Some("Engineer"),
+        "the annotation is with its edge in the default graph"
+    );
+}

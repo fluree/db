@@ -158,7 +158,8 @@ fn parse_rooted(
         std::borrow::Cow::Borrowed(json)
     };
 
-    match txn_type {
+    let annotated = matches!(lowered, std::borrow::Cow::Owned(_));
+    let txn = match txn_type {
         TxnType::Insert | TxnType::Upsert => parse_data(
             &lowered,
             txn_type,
@@ -166,9 +167,88 @@ fn parse_rooted(
             ns_registry,
             ledger_id,
             request_graph,
-        ),
-        TxnType::Update => parse_update(&lowered, opts, ns_registry, ledger_id),
+        )?,
+        TxnType::Update => parse_update(&lowered, opts, ns_registry, ledger_id)?,
+    };
+    if annotated {
+        check_reifiers_match_edges(&txn.insert_templates)?;
     }
+    Ok(txn)
+}
+
+/// Every reifier bundle the annotation lowering added must reify an edge this
+/// document asserts, in the bundle's own graph: a bundle written to graph `g`
+/// with `f:reifiesSubject s` and `f:reifiesPredicate p` needs an asserted
+/// `(s, p)` template in `g` (JSON-LD `@annotation` always asserts the edge it
+/// annotates). The lowering places each bundle beside its edge; if its graph
+/// scoping ever disagreed with the parser's, the annotation would commit in a
+/// graph that does not hold its edge. That is refused here instead.
+///
+/// A document whose templates all write the default graph has no scoping to
+/// disagree about, so the check runs once any template names a graph.
+fn check_reifiers_match_edges(templates: &[TripleTemplate]) -> Result<()> {
+    use rustc_hash::{FxHashMap, FxHashSet};
+
+    if templates.iter().all(|t| t.graph == TemplateGraph::Default) {
+        return Ok(());
+    }
+
+    /// A template term by reference: the check allocates nothing per
+    /// template.
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+    enum Key<'a> {
+        Sid(u16, &'a str),
+        Var(fluree_db_query::VarId),
+        Blank(&'a str),
+    }
+    fn key(term: &TemplateTerm) -> Option<Key<'_>> {
+        match term {
+            TemplateTerm::Sid(sid) => Some(Key::Sid(sid.namespace_code, &sid.name)),
+            TemplateTerm::Var(var) => Some(Key::Var(*var)),
+            TemplateTerm::BlankNode(label) => Some(Key::Blank(label)),
+            TemplateTerm::Value(_) => None,
+        }
+    }
+
+    let mut subjects: FxHashMap<(Key<'_>, &TemplateGraph), Key<'_>> = FxHashMap::default();
+    let mut predicates: FxHashMap<(Key<'_>, &TemplateGraph), Key<'_>> = FxHashMap::default();
+    let mut edges: FxHashSet<(Key<'_>, Key<'_>, &TemplateGraph)> =
+        FxHashSet::with_capacity_and_hasher(templates.len(), Default::default());
+    for t in templates {
+        let Some(subject) = key(&t.subject) else {
+            continue;
+        };
+        match (&t.predicate, key(&t.object)) {
+            (TemplateTerm::Sid(p), Some(object)) if crate::ir::is_reifies_subject(p) => {
+                subjects.insert((subject, &t.graph), object);
+            }
+            (TemplateTerm::Sid(p), Some(object)) if crate::ir::is_reifies_predicate(p) => {
+                predicates.insert((subject, &t.graph), object);
+            }
+            (predicate, _) => {
+                if let Some(p) = key(predicate) {
+                    edges.insert((subject, p, &t.graph));
+                }
+            }
+        }
+    }
+    for (&(reifier, graph), &s) in &subjects {
+        let asserted = predicates
+            .get(&(reifier, graph))
+            .is_some_and(|&p| edges.contains(&(s, p, graph)));
+        if !asserted {
+            return Err(TransactError::Parse(format!(
+                "an edge annotation would be written to {} without the edge it annotates; \
+                 an annotation and its edge must be in the same graph",
+                match graph {
+                    TemplateGraph::Default => "the default graph".to_string(),
+                    TemplateGraph::Iri(iri) => format!("graph <{iri}>"),
+                    TemplateGraph::Var(_) => "a variable graph".to_string(),
+                }
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
@@ -225,53 +305,23 @@ pub fn parse_graph_insert(
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty)
     });
-    let mut txn = if explicitly_empty {
+    if explicitly_empty {
         let mut txn = Txn::insert().with_opts(opts);
         if let GraphName::Iri(iri) = request_graph_name(graph)? {
             txn.write_graphs.insert(iri.into_string());
         }
-        txn
-    } else {
-        parse_rooted(
-            json,
-            TxnType::Insert,
-            opts,
-            ns_registry,
-            ledger_id,
-            Some(graph),
-        )?
-    };
-    let GraphSel::Graph(graph_iri) = graph else {
         return Ok(txn);
-    };
-    // Edge annotations were lowered against a payload with no graph identity,
-    // so their `f:reifies*` bundles carry no `f:reifiesGraph`. A bundle in the
-    // target graph without one has a flake-level graph that disagrees with
-    // the edge graph it encodes (`EdgeKey::from_reifies_facts` →
-    // `GraphMismatch`, refused at stage). Anchor every reifier to the target
-    // graph, exactly as the named-`@graph` lowering does for an annotated
-    // edge written inside a graph block.
-    let reifies_subject = fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_SUBJECT,
-    );
-    let reifies_graph = fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_GRAPH,
-    );
-    let anchors: Vec<TripleTemplate> = txn
-        .insert_templates
-        .iter()
-        .filter(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == reifies_subject))
-        .map(|t| {
-            let mut anchor = t.clone();
-            anchor.predicate = TemplateTerm::Sid(reifies_graph.clone());
-            anchor.object = TemplateTerm::Sid(ns_registry.sid_for_iri(graph_iri));
-            anchor
-        })
-        .collect();
-    txn.insert_templates.extend(anchors);
-    Ok(txn)
+    }
+    // Reifier bundles land in the request graph's root scope, which anchors
+    // them to it (`GraphScope::emit`).
+    parse_rooted(
+        json,
+        TxnType::Insert,
+        opts,
+        ns_registry,
+        ledger_id,
+        Some(graph),
+    )
 }
 
 /// The graph a graph insert / sync request names, as a write-side name.
@@ -1624,7 +1674,15 @@ fn parse_expanded_object_with_ctx(
                     } else {
                         TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(type_iri))
                     };
-                    scope.emit(out, subject.clone(), predicate.clone(), object, None, None);
+                    scope.emit(
+                        out,
+                        ctx.ns_registry,
+                        subject.clone(),
+                        predicate.clone(),
+                        object,
+                        None,
+                        None,
+                    );
                 } else {
                     return Err(TransactError::Parse(format!(
                         "Invalid @type value: expected IRI string, got: {type_val:?}"
@@ -1651,6 +1709,7 @@ fn parse_expanded_object_with_ctx(
         for parsed_value in parse_expanded_objects_with_ctx(value, scope, ctx, out)? {
             scope.emit(
                 out,
+                ctx.ns_registry,
                 subject.clone(),
                 predicate.clone(),
                 parsed_value.term,
@@ -1739,7 +1798,15 @@ fn parse_reverse_properties(
                     }
                     _ => parse_expanded_object_with_ctx(node, scope, ctx, out)?,
                 };
-                scope.emit(out, subject, predicate.clone(), owner.clone(), None, None);
+                scope.emit(
+                    out,
+                    ctx.ns_registry,
+                    subject,
+                    predicate.clone(),
+                    owner.clone(),
+                    None,
+                    None,
+                );
             }
         }
     }
@@ -4093,5 +4160,221 @@ mod tests {
             msg.starts_with("Parse error: "),
             "graph insert addressing a graph: {msg}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Edge annotations follow the scope (B1c); one place writes the anchor.
+    // ---------------------------------------------------------------------
+
+    fn is_pred(t: &TripleTemplate, local: &str) -> bool {
+        matches!(&t.predicate, TemplateTerm::Sid(s) if &*s.name == local)
+    }
+
+    /// The graphs of the edge `ex:worksFor`, of every `f:reifies*` statement,
+    /// and the `f:reifiesGraph` objects, from one parsed document.
+    fn annotation_graphs(txn: &Txn) -> (Vec<TemplateGraph>, Vec<TemplateGraph>, Vec<String>) {
+        let edge: Vec<TemplateGraph> = txn
+            .insert_templates
+            .iter()
+            .filter(|t| is_pred(t, "worksFor"))
+            .map(|t| t.graph.clone())
+            .collect();
+        let bundle: Vec<TemplateGraph> = txn
+            .insert_templates
+            .iter()
+            .filter(
+                |t| matches!(&t.predicate, TemplateTerm::Sid(s) if s.name.starts_with("reifies")),
+            )
+            .map(|t| t.graph.clone())
+            .collect();
+        let anchors: Vec<String> = txn
+            .insert_templates
+            .iter()
+            .filter(|t| is_pred(t, "reifiesGraph"))
+            .map(|t| sid_local(&t.object))
+            .collect();
+        (edge, bundle, anchors)
+    }
+
+    fn annotated_edge() -> Value {
+        json!({"@id": "ex:acme", "@annotation": {"ex:role": "Engineer"}})
+    }
+
+    /// A1, A2, A3, a node selector, and named-graph content: the edge, its
+    /// bundle, and the bundle's `f:reifiesGraph` all name the same graph. A1
+    /// used to be refused (the bundle carried no anchor); A2 and A3 wrote the
+    /// bundle to the default graph without one.
+    #[test]
+    fn annotation_bundle_lands_in_and_names_the_edge_graph() {
+        let ctx = json!({"ex": "http://example.org/"});
+        let cases: Vec<(&str, TxnType, Value)> = vec![
+            (
+                "node selector",
+                TxnType::Insert,
+                json!({"@context": ctx, "@graph": [{"@id": "ex:alice", "@graph": "ex:g", "ex:worksFor": annotated_edge()}]}),
+            ),
+            (
+                "A1: update graph key",
+                TxnType::Update,
+                json!({"@context": ctx, "graph": "ex:g", "insert": {"@id": "ex:alice", "ex:worksFor": annotated_edge()}}),
+            ),
+            (
+                "A2: graph item",
+                TxnType::Update,
+                json!({"@context": ctx, "insert": [["graph", "ex:g", {"@id": "ex:alice", "ex:worksFor": annotated_edge()}]]}),
+            ),
+            (
+                "A3: array selector",
+                TxnType::Insert,
+                json!({"@context": ctx, "@graph": [{"@id": "ex:alice", "@graph": ["ex:g"], "ex:worksFor": annotated_edge()}]}),
+            ),
+            (
+                "named-graph content",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:g", "@graph": [{"@id": "ex:alice", "ex:worksFor": annotated_edge()}]}),
+            ),
+            (
+                "P8a: nested node under a selector",
+                TxnType::Insert,
+                json!({"@context": ctx, "@graph": [{
+                    "@id": "ex:carol", "@graph": "ex:g",
+                    "ex:knows": {"@id": "ex:alice", "ex:worksFor": annotated_edge()}
+                }]}),
+            ),
+        ];
+        for (what, txn_type, doc) in cases {
+            let txn = parse_doc(&doc, txn_type).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let (edge, bundle, anchors) = annotation_graphs(&txn);
+            assert_eq!(edge, [in_graph(G)], "{what}: the edge");
+            assert!(
+                !bundle.is_empty() && bundle.iter().all(|g| *g == in_graph(G)),
+                "{what}: the bundle {bundle:?}"
+            );
+            assert_eq!(
+                anchors,
+                ["g"],
+                "{what}: exactly one anchor, naming the graph"
+            );
+        }
+    }
+
+    /// At an insert document's root a bare `graph` key is the transaction's
+    /// routing key, which the parser strips, not a graph selector: the
+    /// annotation lowering must not scope the edge's bundle by it either, or
+    /// the bundle would land in a graph its edge is not in.
+    #[test]
+    fn root_graph_routing_key_does_not_scope_annotations() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "graph": G,
+            "@id": "ex:alice",
+            "ex:worksFor": annotated_edge()
+        });
+        let txn = parse_doc(&doc, TxnType::Insert).expect("parse");
+        let (edge, bundle, anchors) = annotation_graphs(&txn);
+        assert_eq!(edge, [TemplateGraph::Default], "the edge");
+        assert!(
+            !bundle.is_empty() && bundle.iter().all(|g| *g == TemplateGraph::Default),
+            "the bundle {bundle:?}"
+        );
+        assert!(anchors.is_empty(), "no anchor: {anchors:?}");
+    }
+
+    /// A default-graph edge's bundle has no anchor (absence means default).
+    #[test]
+    fn default_graph_annotation_has_no_anchor() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:alice",
+            "ex:worksFor": annotated_edge()
+        });
+        let (edge, bundle, anchors) = annotation_graphs(&parse_doc(&doc, TxnType::Insert).unwrap());
+        assert_eq!(edge, [TemplateGraph::Default]);
+        assert!(bundle.iter().all(|g| *g == TemplateGraph::Default));
+        assert!(anchors.is_empty());
+    }
+
+    /// W8: an annotation on a named graph's own property stays with the
+    /// property in the enclosing graph; the sibling is not appended into the
+    /// named graph's content.
+    #[test]
+    fn annotation_on_a_named_graph_node_property_stays_in_the_enclosing_graph() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:NG",
+            "ex:worksFor": annotated_edge(),
+            "@graph": [{"@id": "ex:a", "ex:p": 1}]
+        });
+        let (edge, bundle, anchors) = annotation_graphs(&parse_doc(&doc, TxnType::Insert).unwrap());
+        assert_eq!(edge, [TemplateGraph::Default]);
+        assert!(
+            bundle.iter().all(|g| *g == TemplateGraph::Default),
+            "{bundle:?}"
+        );
+        assert!(anchors.is_empty());
+    }
+
+    /// Graph insert: the bundle lands in the request graph and names it.
+    #[test]
+    fn graph_insert_anchors_bundles_to_the_request_graph() {
+        let mut ns = test_registry();
+        let doc = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:alice", "ex:worksFor": annotated_edge()});
+        let txn = parse_graph_insert(
+            &doc,
+            &GraphSel::Graph(G.to_string()),
+            TxnOpts::default(),
+            &mut ns,
+            TEST_LEDGER,
+        )
+        .unwrap();
+        let (edge, bundle, anchors) = annotation_graphs(&txn);
+        assert_eq!(edge, [in_graph(G)]);
+        assert!(bundle.iter().all(|g| *g == in_graph(G)));
+        assert_eq!(anchors, ["g"]);
+    }
+
+    /// The fail-closed cross-check: a reifier bundle whose edge is not
+    /// asserted in the bundle's graph is refused.
+    #[test]
+    fn reifier_without_its_edge_in_the_same_graph_is_refused() {
+        let mut ns = test_registry();
+        let s = TemplateTerm::Sid(ns.sid_for_iri("http://example.org/alice"));
+        let p = TemplateTerm::Sid(ns.sid_for_iri("http://example.org/worksFor"));
+        let o = TemplateTerm::Sid(ns.sid_for_iri("http://example.org/acme"));
+        let ann = TemplateTerm::BlankNode("_:fluree_ann_0".to_string());
+        let reifies = |local: &str| {
+            TemplateTerm::Sid(fluree_db_core::Sid::new(
+                fluree_vocab::namespaces::FLUREE_DB,
+                local,
+            ))
+        };
+        let edge = TripleTemplate::new(s.clone(), p.clone(), o.clone());
+        let bundle = |graph: TemplateGraph| {
+            [
+                (reifies(fluree_vocab::db::REIFIES_SUBJECT), s.clone()),
+                (reifies(fluree_vocab::db::REIFIES_PREDICATE), p.clone()),
+            ]
+            .into_iter()
+            .map(|(pred, obj)| {
+                let mut t = TripleTemplate::new(ann.clone(), pred, obj);
+                t.graph = graph.clone();
+                t
+            })
+            .collect::<Vec<_>>()
+        };
+        let mut same = vec![edge.clone()];
+        same.extend(bundle(TemplateGraph::Default));
+        check_reifiers_match_edges(&same).unwrap();
+
+        let mut edge_in_g = edge.clone();
+        edge_in_g.graph = in_graph(G);
+        let mut same_named = vec![edge_in_g];
+        same_named.extend(bundle(in_graph(G)));
+        check_reifiers_match_edges(&same_named).unwrap();
+
+        let mut split = vec![edge];
+        split.extend(bundle(in_graph(G)));
+        let err = check_reifiers_match_edges(&split).unwrap_err().to_string();
+        assert!(err.starts_with("Parse error: ") && err.contains(G), "{err}");
     }
 }
