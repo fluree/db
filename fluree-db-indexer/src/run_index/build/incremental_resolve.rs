@@ -11,6 +11,7 @@
 //! 2. Output records: `Vec<RunRecordV2>` + `Vec<u8>` (parallel ops)
 //! 3. `OTypeRegistry` built from root's `datatype_iris` + `language_tags`
 
+use crate::run_index::resolve::link_synth::SlotValue;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -671,6 +672,30 @@ pub async fn resolve_incremental_commits_v6(
     for term in &mut chunk_terms {
         remap_record(term, &reconcile.subject_remap, &reconcile.string_remap)?;
     }
+    // Attachment ops replay per reifier from the attachment the base index
+    // holds, so a re-point that touched one slot still moves the link.
+    let mut attachments = chunk.attachments;
+    for op in &mut attachments {
+        op.remap(&reconcile.subject_remap, &reconcile.string_remap)
+            .map_err(|e| IncrementalResolveError::Io(io::Error::other(e)))?;
+    }
+    let prior_attachments = if attachments.is_empty() {
+        HashMap::new()
+    } else {
+        let mut keys: Vec<(u16, u64)> = attachments.iter().map(|a| (a.g_id, a.ann)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        base_attachment_states(
+            Arc::clone(&cs),
+            &root,
+            config.artifact_cache_dir.as_deref(),
+            &shared.predicates,
+            shared.link_synth.slots(),
+            &keys,
+        )
+        .await
+        .map_err(IncrementalResolveError::Io)?
+    };
     let (new_terms, term_watermarks) = {
         let base_refs = root.term_dict.as_ref();
         let base_reader = match base_refs {
@@ -728,6 +753,40 @@ pub async fn resolve_incremental_commits_v6(
                 Some(h) => h,
                 None => builder.get_or_insert(key)?,
             };
+        }
+        if !attachments.is_empty() {
+            let link_ids = shared.link_synth.link_ids().ok_or_else(|| {
+                IncrementalResolveError::Io(io::Error::other("attachment ops without link ids"))
+            })?;
+            let mut handle_for = |key: fluree_db_core::triple_term::TermKey| -> io::Result<u64> {
+                if let Some(h) = builder.get(&key) {
+                    return Ok(h);
+                }
+                if let Some(reader) = &base_reader {
+                    if let Some(h) = reader.find_handle(&key)? {
+                        return Ok(h);
+                    }
+                }
+                builder.get_or_insert(key)
+            };
+            let emitted = crate::run_index::resolve::link_synth::replay_attachments(
+                &mut attachments,
+                |g_id, ann| {
+                    prior_attachments
+                        .get(&(g_id, ann))
+                        .copied()
+                        .unwrap_or([None; 3])
+                },
+                &o_type_registry,
+                link_ids,
+                &mut handle_for,
+                &mut v1_records,
+            )?;
+            tracing::debug!(
+                links = emitted,
+                reifiers = prior_attachments.len(),
+                "V6 incremental resolve: links replayed"
+            );
         }
         let new_terms: Vec<(u32, u32, Vec<u8>)> = builder
             .entries_sorted()
@@ -1189,6 +1248,102 @@ async fn seed_vector_fact_handles(
         }
     }
     Ok(())
+}
+
+/// The attachment the base index holds for each `(g_id, reifier)`: its live
+/// `f:reifies*` rows, read with one SPOT point lookup per reifier. The
+/// predicate slot's row refers to the predicate IRI as a subject; it maps
+/// back to the predicate id through the dictionary.
+async fn base_attachment_states(
+    cs: Arc<dyn ContentStore>,
+    root: &IndexRoot,
+    cache_dir: Option<&Path>,
+    predicates: &crate::run_index::resolve::global_dict::PredicateDict,
+    slots: [Option<u32>; 3],
+    keys: &[(u16, u64)],
+) -> io::Result<HashMap<(u16, u64), [Option<SlotValue>; 3]>> {
+    use crate::run_index::resolve::link_synth::ObjectId;
+    use fluree_db_binary_index::format::run_record::RunSortOrder;
+    use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
+    use fluree_db_binary_index::read::binary_cursor::BinaryCursor;
+    use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
+    use fluree_db_binary_index::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
+    use fluree_db_core::o_type::OType;
+    use fluree_db_core::subject_id::SubjectId;
+
+    let mut states = HashMap::new();
+    if keys.is_empty() || slots.iter().all(Option::is_none) {
+        return Ok(states);
+    }
+    let cache_dir = cache_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let store = Arc::new(
+        BinaryIndexStore::load_from_root_v6(Arc::clone(&cs), root, &cache_dir, None).await?,
+    );
+    let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
+    for &(g_id, ann) in keys {
+        let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
+            continue;
+        };
+        let min_key = RunRecordV2 {
+            s_id: SubjectId(ann),
+            o_key: 0,
+            p_id: 0,
+            t: 0,
+            o_i: 0,
+            o_type: 0,
+            g_id,
+        };
+        let max_key = RunRecordV2 {
+            s_id: SubjectId(ann),
+            o_key: u64::MAX,
+            p_id: u32::MAX,
+            t: u32::MAX,
+            o_i: u32::MAX,
+            o_type: u16::MAX,
+            g_id,
+        };
+        let filter = BinaryFilter {
+            s_id: Some(ann),
+            ..Default::default()
+        };
+        let mut cursor = BinaryCursor::new(
+            Arc::clone(&store),
+            RunSortOrder::Spot,
+            Arc::clone(branch),
+            &min_key,
+            &max_key,
+            filter,
+            projection,
+        );
+        let mut state: [Option<SlotValue>; 3] = [None; 3];
+        while let Some(batch) = cursor.next_batch()? {
+            for i in 0..batch.row_count {
+                if batch.s_id.get(i) != ann {
+                    continue;
+                }
+                let p_id = batch.p_id.get(i);
+                let Some(slot) = slots.iter().position(|s| *s == Some(p_id)) else {
+                    continue;
+                };
+                let o_type = batch.o_type.get_or(i, 0);
+                let o_key = batch.o_key.get(i);
+                state[slot] = match slot {
+                    0 if o_type == OType::IRI_REF.as_u16() => Some(SlotValue::Subject(o_key)),
+                    1 if o_type == OType::IRI_REF.as_u16() => store
+                        .resolve_subject_iri(o_key)
+                        .ok()
+                        .and_then(|iri| predicates.get(&iri))
+                        .map(SlotValue::Predicate),
+                    2 => Some(SlotValue::Object(ObjectId::Typed { o_type, o_key })),
+                    _ => None,
+                };
+            }
+        }
+        states.insert((g_id, ann), state);
+    }
+    Ok(states)
 }
 
 /// Fetch one commit blob, honoring the optional artifact cache.

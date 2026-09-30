@@ -1502,9 +1502,6 @@ impl SharedResolverState {
             Ok(())
         })?;
 
-        self.link_synth
-            .flush(chunk, &mut self.predicates, &mut self.datatypes);
-
         // Emit txn-meta records into the same chunk.
         let meta_count = self.emit_txn_meta_chunk(
             commit_hash_hex,
@@ -2141,8 +2138,11 @@ pub struct RebuildChunk {
     /// Buffered RunRecords (with chunk-local subject/string IDs).
     pub records: Vec<RunRecord>,
     /// Reified base edges as pseudo-records, addressed by ordinal from the
-    /// link records' `o_key` (see `link_synth`).
+    /// link records' `o_key` (the bulk-import sink's form; see `link_synth`).
     pub terms: Vec<RunRecord>,
+    /// `f:reifies*` ops for the build to replay into link records once ids
+    /// are global (see `link_synth`).
+    pub attachments: Vec<super::link_synth::AttachmentOp>,
     /// Running count of flakes (records) in this chunk.
     pub flake_count: u64,
 }
@@ -2154,6 +2154,7 @@ impl RebuildChunk {
             strings: super::chunk_dict::ChunkStringDict::new(),
             records: Vec::new(),
             terms: Vec::new(),
+            attachments: Vec::new(),
             flake_count: 0,
         }
     }

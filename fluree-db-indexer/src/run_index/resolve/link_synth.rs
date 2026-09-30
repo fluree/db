@@ -1,29 +1,154 @@
-//! Synthesizes the RDF 1.2 link record for every `f:reifies*` bundle the
-//! resolver sees, so rebuilds carry the same `_:r rdf:reifies <term>` flakes
+//! Synthesizes the RDF 1.2 link record, `_:r rdf:reifies <term>`, for every
+//! reifier a rebuild or incremental build sees, so both carry the flakes
 //! bulk import writes.
 //!
-//! A bundle's three required slots arrive as consecutive records about the
-//! reifier subject (the writer emits them together, and a SPOT-sorted commit
-//! keeps one subject's records adjacent). The assembler keys a pending bundle
-//! on `(g_id, reifier, t, op)`, fills the subject, predicate and object slots
-//! as their records pass, and on completion appends the base edge as a
-//! pseudo-record to the chunk's term table and a link record, whose `o_key`
-//! is that entry's ordinal, to the chunk's records. The build remaps the
-//! entry to global ids and interns it, replacing the ordinal with the handle.
+//! A commit's `f:reifies*` ops are not a bundle. A re-point that changes one
+//! slot writes only that slot's retract and assert (sync and upsert cancel
+//! the unchanged slots), and a full re-point's six ops interleave under the
+//! per-commit sort, where predicate and object precede `op`. So the resolver
+//! only *collects* attachment ops ([`LinkSynth::observe`]), and the build
+//! replays them per reifier once ids are global ([`replay_attachments`]):
+//! the reifier's ops in `t` order, emitting a link retract and assert
+//! whenever its attachment changes from or to a complete edge. An
+//! incremental build seeds each reifier with the attachment the base index
+//! holds for it; a rebuild replays the whole history from nothing.
 //!
-//! Disabled unless a build path opts in: a path that has not learned to
-//! resolve the ordinals must not see link records.
+//! Disabled unless a build path opts in: a path that does not replay must
+//! not collect.
 
 use super::global_dict::PredicateDict;
 use super::resolver::RebuildChunk;
 use fluree_db_binary_index::format::run_record::{RunRecord, LIST_INDEX_NONE};
 use fluree_db_core::commit::codec::raw_reader::{RawObject, RawOp};
+use fluree_db_core::o_type::{DecodeKind, OType};
+use fluree_db_core::o_type_registry::OTypeRegistry;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::value_id::ObjKind;
+use fluree_db_core::triple_term::TermKey;
+use fluree_db_core::value_id::{ObjKey, ObjKind};
+use fluree_db_core::DatatypeDictId;
 use fluree_vocab::{db, fluree};
 use std::collections::HashMap;
+use std::io;
 
-/// Per-build state for link synthesis.
+/// The base edge's object, as the resolver saw it or as the base index
+/// stores it. The two compare through [`ObjectId::typed`].
+#[derive(Debug, Clone, Copy)]
+pub enum ObjectId {
+    /// Kind, key, datatype and tag of a resolved op; the `o_type` needs the
+    /// registry, which knows every custom datatype only after resolving.
+    Raw {
+        o_kind: u8,
+        o_key: u64,
+        dt: u16,
+        lang_id: u16,
+    },
+    /// An index row's `o_type` and key.
+    Typed { o_type: u16, o_key: u64 },
+}
+
+impl ObjectId {
+    fn typed(self, registry: &OTypeRegistry) -> (u16, u64) {
+        match self {
+            ObjectId::Raw {
+                o_kind,
+                o_key,
+                dt,
+                lang_id,
+            } => (
+                registry
+                    .resolve(
+                        ObjKind::from_u8(o_kind),
+                        DatatypeDictId::from_u16(dt),
+                        lang_id,
+                    )
+                    .as_u16(),
+                o_key,
+            ),
+            ObjectId::Typed { o_type, o_key } => (o_type, o_key),
+        }
+    }
+}
+
+/// One slot of an attachment.
+#[derive(Debug, Clone, Copy)]
+pub enum SlotValue {
+    /// `f:reifiesSubject`: the base edge's subject id.
+    Subject(u64),
+    /// `f:reifiesPredicate`: the base edge's predicate id.
+    Predicate(u32),
+    /// `f:reifiesObject`.
+    Object(ObjectId),
+}
+
+impl SlotValue {
+    fn slot(self) -> usize {
+        match self {
+            SlotValue::Subject(_) => 0,
+            SlotValue::Predicate(_) => 1,
+            SlotValue::Object(_) => 2,
+        }
+    }
+
+    fn same(self, other: SlotValue, registry: &OTypeRegistry) -> bool {
+        match (self, other) {
+            (SlotValue::Subject(a), SlotValue::Subject(b)) => a == b,
+            (SlotValue::Predicate(a), SlotValue::Predicate(b)) => a == b,
+            (SlotValue::Object(a), SlotValue::Object(b)) => a.typed(registry) == b.typed(registry),
+            _ => false,
+        }
+    }
+}
+
+/// An `f:reifies*` op as the resolver saw it. Subject and string ids are
+/// chunk-local until [`AttachmentOp::remap`]; predicate ids are global.
+#[derive(Debug, Clone, Copy)]
+pub struct AttachmentOp {
+    pub g_id: u16,
+    pub ann: u64,
+    pub t: u32,
+    pub op: u8,
+    pub value: SlotValue,
+}
+
+impl AttachmentOp {
+    /// Chunk-local subject and string ids → global, with the build's remap
+    /// tables.
+    pub fn remap(&mut self, s_remap: &[u64], str_remap: &[u32]) -> Result<(), String> {
+        let subject = |local: u64| -> Result<u64, String> {
+            s_remap
+                .get(local as usize)
+                .copied()
+                .ok_or_else(|| format!("attachment subject remap miss: local {local}"))
+        };
+        self.ann = subject(self.ann)?;
+        match &mut self.value {
+            SlotValue::Subject(s) => *s = subject(*s)?,
+            SlotValue::Predicate(_) | SlotValue::Object(ObjectId::Typed { .. }) => {}
+            SlotValue::Object(ObjectId::Raw { o_kind, o_key, .. }) => {
+                let kind = ObjKind::from_u8(*o_kind);
+                if kind == ObjKind::REF_ID {
+                    *o_key = subject(*o_key)?;
+                } else if kind == ObjKind::LEX_ID || kind == ObjKind::JSON_ID {
+                    let local = ObjKey::from_u64(*o_key).decode_u32_id() as usize;
+                    let global = *str_remap
+                        .get(local)
+                        .ok_or_else(|| format!("attachment string remap miss: local {local}"))?;
+                    *o_key = ObjKey::encode_u32_id(global).as_u64();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The link flake's predicate and datatype ids.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkIds {
+    pub p_id: u32,
+    pub dt: u16,
+}
+
+/// Per-build collector for attachment ops.
 #[derive(Debug, Default)]
 pub struct LinkSynth {
     enabled: bool,
@@ -35,35 +160,29 @@ pub struct LinkSynth {
     /// Predicate-dictionary length at the last slot lookup, so the lookup
     /// repeats only when new predicates appeared.
     slots_checked_at: u32,
-    rdf_reifies: Option<u32>,
-    triple_term_dt: Option<u16>,
-    pending: Option<Pending>,
-    /// Link records emitted so far.
-    pub links_emitted: u64,
-}
-
-#[derive(Debug)]
-struct Pending {
-    g_id: u16,
-    ann: u64,
-    t: u32,
-    op: u8,
-    s: Option<u64>,
-    p: Option<u32>,
-    /// `(o_kind, o_key, dt, lang_id)` of the base edge's object.
-    o: Option<(u8, u64, u16, u16)>,
+    link: Option<LinkIds>,
 }
 
 impl LinkSynth {
-    /// A disabled assembler; see [`Self::enable`].
+    /// A disabled collector; see [`Self::enable`].
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Turn synthesis on. Only a build path that resolves term ordinals may
-    /// do this.
+    /// Turn collection on. Only a build path that replays may do this.
     pub fn enable(&mut self) {
         self.enabled = true;
+    }
+
+    /// The reserved-slot predicate ids, in slot order.
+    pub fn slots(&self) -> [Option<u32>; 3] {
+        self.slots
+    }
+
+    /// The link's predicate and datatype ids, allocated on the first
+    /// attachment op seen so they enter the dictionaries with the commits.
+    pub fn link_ids(&self) -> Option<LinkIds> {
+        self.link
     }
 
     /// Refresh the reserved-slot predicate ids when the dictionary grew.
@@ -84,8 +203,8 @@ impl LinkSynth {
         }
     }
 
-    /// Feed one resolved record (with its raw op, for the predicate slot's
-    /// IRI). Must be called for every record in commit order.
+    /// Record one resolved op if it is an attachment slot (with its raw op,
+    /// for the predicate slot's IRI).
     pub fn observe(
         &mut self,
         raw: &RawOp<'_>,
@@ -102,112 +221,144 @@ impl LinkSynth {
         let Some(slot) = self.slots.iter().position(|s| *s == Some(record.p_id)) else {
             return;
         };
-
-        let key = (record.g_id, record.s_id.as_u64(), record.t, record.op);
-        let same = self
-            .pending
-            .as_ref()
-            .is_some_and(|p| (p.g_id, p.ann, p.t, p.op) == key);
-        if !same {
-            self.flush(chunk, predicates, datatypes);
-            self.pending = Some(Pending {
-                g_id: record.g_id,
-                ann: record.s_id.as_u64(),
-                t: record.t,
-                op: record.op,
-                s: None,
-                p: None,
-                o: None,
-            });
-        }
-        let pending = self.pending.as_mut().expect("pending bundle set above");
-        match slot {
+        let value = match slot {
             0 => {
-                if ObjKind::from_u8(record.o_kind) == ObjKind::REF_ID {
-                    pending.s = Some(record.o_key);
+                if ObjKind::from_u8(record.o_kind) != ObjKind::REF_ID {
+                    return;
                 }
+                SlotValue::Subject(record.o_key)
             }
             1 => {
-                if let RawObject::Ref { ns_code, name } = raw.o {
-                    let prefix = ns_prefixes
-                        .get(&ns_code)
-                        .map(std::string::String::as_str)
-                        .unwrap_or("");
-                    pending.p = Some(predicates.get_or_insert_parts(prefix, name));
-                }
-            }
-            _ => {
-                // Resolved under `f:reifiesObject`, which matches the base
-                // edge's encoding for every kind except the per-predicate
-                // arenas; those bundles are left to the bundle path.
-                let kind = ObjKind::from_u8(record.o_kind);
-                if kind != ObjKind::NUM_BIG && kind != ObjKind::VECTOR_ID {
-                    pending.o = Some((record.o_kind, record.o_key, record.dt, record.lang_id));
-                }
-            }
-        }
-    }
-
-    /// Emit the pending bundle if complete. Called on a key change and at
-    /// the end of each commit.
-    pub fn flush(
-        &mut self,
-        chunk: &mut RebuildChunk,
-        predicates: &mut PredicateDict,
-        datatypes: &mut PredicateDict,
-    ) {
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        let (Some(s), Some(p), Some((o_kind, o_key, dt, lang_id))) =
-            (pending.s, pending.p, pending.o)
-        else {
-            return;
-        };
-        let link_p = *self
-            .rdf_reifies
-            .get_or_insert_with(|| predicates.get_or_insert(fluree_vocab::rdf::REIFIES));
-        let link_dt = match self.triple_term_dt {
-            Some(d) => d,
-            None => {
-                let raw = datatypes.get_or_insert(fluree::TRIPLE_TERM);
-                let Ok(d) = u16::try_from(raw) else {
-                    tracing::warn!(
-                        dt_id = raw,
-                        "f:tripleTerm datatype id exceeds u16; link skipped"
-                    );
+                let RawObject::Ref { ns_code, name } = raw.o else {
                     return;
                 };
-                self.triple_term_dt = Some(d);
-                d
+                let prefix = ns_prefixes
+                    .get(&ns_code)
+                    .map(std::string::String::as_str)
+                    .unwrap_or("");
+                SlotValue::Predicate(predicates.get_or_insert_parts(prefix, name))
             }
+            _ => SlotValue::Object(ObjectId::Raw {
+                o_kind: record.o_kind,
+                o_key: record.o_key,
+                dt: record.dt,
+                lang_id: record.lang_id,
+            }),
         };
-        let ordinal = chunk.terms.len() as u64;
-        chunk.terms.push(RunRecord {
-            g_id: pending.g_id,
-            s_id: SubjectId::from_u64(s),
-            p_id: p,
-            dt,
-            o_kind,
-            op: 1,
-            o_key,
-            t: pending.t,
-            lang_id,
-            i: LIST_INDEX_NONE,
+        if self.link.is_none() {
+            let p_id = predicates.get_or_insert(fluree_vocab::rdf::REIFIES);
+            let raw_dt = datatypes.get_or_insert(fluree::TRIPLE_TERM);
+            let Ok(dt) = u16::try_from(raw_dt) else {
+                tracing::warn!(
+                    dt_id = raw_dt,
+                    "f:tripleTerm datatype id exceeds u16; links skipped"
+                );
+                return;
+            };
+            self.link = Some(LinkIds { p_id, dt });
+        }
+        chunk.attachments.push(AttachmentOp {
+            g_id: record.g_id,
+            ann: record.s_id.as_u64(),
+            t: record.t,
+            op: record.op,
+            value,
         });
-        chunk.records.push(RunRecord {
-            g_id: pending.g_id,
-            s_id: SubjectId::from_u64(pending.ann),
-            p_id: link_p,
-            dt: link_dt,
+    }
+}
+
+/// The term a complete attachment names, or `None` while a slot is missing.
+/// An object in a per-(graph, predicate) arena has no graph-independent
+/// identity and gets no term; import skips those edges too.
+fn term_of(state: &[Option<SlotValue>; 3], registry: &OTypeRegistry) -> Option<TermKey> {
+    let (
+        Some(SlotValue::Subject(s_id)),
+        Some(SlotValue::Predicate(p_id)),
+        Some(SlotValue::Object(o)),
+    ) = (state[0], state[1], state[2])
+    else {
+        return None;
+    };
+    let (o_type, o_key) = o.typed(registry);
+    let o_type = OType::from_u16(o_type);
+    if matches!(
+        o_type.decode_kind(),
+        DecodeKind::NumBigArena | DecodeKind::VectorArena
+    ) {
+        return None;
+    }
+    Some(TermKey {
+        s_id,
+        p_id,
+        o_type,
+        o_key,
+    })
+}
+
+/// Replay every reifier's attachment ops (ids global) and emit its link
+/// records: at each `t` where the attachment changes from or to a complete
+/// edge, a retract of the old term's link and an assert of the new one.
+/// `prior` is the attachment the base index holds for `(g_id, reifier)`
+/// before these ops; `handle_for` interns a term. Returns the number of
+/// link records emitted.
+pub fn replay_attachments(
+    ops: &mut [AttachmentOp],
+    mut prior: impl FnMut(u16, u64) -> [Option<SlotValue>; 3],
+    registry: &OTypeRegistry,
+    link: LinkIds,
+    handle_for: &mut dyn FnMut(TermKey) -> io::Result<u64>,
+    out: &mut Vec<RunRecord>,
+) -> io::Result<u64> {
+    // Within one `t`, retracts apply before asserts so a re-pointed slot
+    // passes through its old value on the way to the new one.
+    ops.sort_by_key(|o| (o.g_id, o.ann, o.t, o.op, o.value.slot()));
+    let mut emitted = 0u64;
+    let mut link_record = |g_id: u16, ann: u64, key: TermKey, t: u32, op: u8| -> io::Result<()> {
+        let handle = handle_for(key)?;
+        out.push(RunRecord {
+            g_id,
+            s_id: SubjectId::from_u64(ann),
+            p_id: link.p_id,
+            dt: link.dt,
             o_kind: ObjKind::TRIPLE_TERM.as_u8(),
-            op: pending.op,
-            o_key: ordinal,
-            t: pending.t,
+            op,
+            o_key: handle,
+            t,
             lang_id: 0,
             i: LIST_INDEX_NONE,
         });
-        chunk.flake_count += 1;
-        self.links_emitted += 1;
+        emitted += 1;
+        Ok(())
+    };
+    let mut i = 0;
+    while i < ops.len() {
+        let (g_id, ann) = (ops[i].g_id, ops[i].ann);
+        let mut state = prior(g_id, ann);
+        while i < ops.len() && ops[i].g_id == g_id && ops[i].ann == ann {
+            let t = ops[i].t;
+            let before = term_of(&state, registry);
+            while i < ops.len() && ops[i].g_id == g_id && ops[i].ann == ann && ops[i].t == t {
+                let op = ops[i];
+                let slot = op.value.slot();
+                if op.op == 0 {
+                    if state[slot].is_some_and(|v| v.same(op.value, registry)) {
+                        state[slot] = None;
+                    }
+                } else {
+                    state[slot] = Some(op.value);
+                }
+                i += 1;
+            }
+            let after = term_of(&state, registry);
+            if before != after {
+                if let Some(old) = before {
+                    link_record(g_id, ann, old, t, 0)?;
+                }
+                if let Some(new) = after {
+                    link_record(g_id, ann, new, t, 1)?;
+                }
+            }
+        }
     }
+    Ok(emitted)
 }

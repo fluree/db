@@ -517,3 +517,92 @@ async fn link_lowering_counts_without_decomposing_unread_positions() {
     .await;
     assert_eq!(got, vec![vec!["3".to_string()]], "{got:#?}");
 }
+
+/// A re-point that changes one slot writes only that slot's retract and
+/// assert (sync and upsert cancel the unchanged slots). A rebuild replays
+/// the reifier's whole history, so the link moves with it.
+#[tokio::test]
+async fn reindex_follows_a_partial_repoint() {
+    let alias = "it/triple-term-links:reindex-repoint";
+    let (fluree, ledger) = import(&[("claims.ttl", CLAIMS)], alias).await;
+    fluree
+        .upsert_turtle(
+            ledger,
+            "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\nex:carol ex:age 43 ~ ex:claim2 .\n",
+        )
+        .await
+        .expect("re-pointing the claim's object through upsert");
+    fluree
+        .reindex(alias, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex after the re-point");
+    let ledger = fluree.ledger(alias).await.expect("reload after reindex");
+    let got = links(&fluree, &ledger).await;
+    assert_eq!(got.len(), 4, "{got:#?}");
+    let t2 = &got
+        .iter()
+        .find(|r| r[0].ends_with("claim2"))
+        .unwrap_or_else(|| panic!("no link for claim2: {got:#?}"))[1];
+    assert!(
+        t2.contains("carol") && t2.contains("43") && !t2.contains("42"),
+        "claim2 must reify the re-pointed edge: {t2}"
+    );
+}
+
+/// The incremental twin: the base index holds the reifier's attachment, the
+/// next window carries only the changed slot, and the link must still move.
+#[tokio::test]
+async fn incremental_index_follows_a_partial_repoint() {
+    use fluree_db_indexer::IndexerConfig;
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/triple-term-links:incremental-repoint";
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let turtle =
+        |body: &str| format!("VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n{body}\n");
+
+    local
+        .run_until(async {
+            let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+            let first = fluree
+                .upsert_turtle(
+                    ledger0,
+                    &turtle("ex:alice ex:age 42 ~ ex:claim1 {| ex:source ex:hr |} ."),
+                )
+                .await
+                .expect("first claim");
+            support::trigger_index_and_wait(&handle, ledger_id, first.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, first.receipt.t).await;
+            let ledger1 = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after first index");
+            let got = links(&fluree, &ledger1).await;
+            assert_eq!(got.len(), 1, "{got:#?}");
+            assert!(got[0][1].contains("42"), "{got:#?}");
+
+            let second = fluree
+                .upsert_turtle(
+                    ledger1,
+                    &turtle("ex:alice ex:age 43 ~ ex:claim1 {| ex:source ex:hr |} ."),
+                )
+                .await
+                .expect("re-pointing the claim's object through upsert");
+            support::trigger_index_and_wait(&handle, ledger_id, second.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, second.receipt.t).await;
+            let ledger2 = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after incremental index");
+            let got = links(&fluree, &ledger2).await;
+            assert_eq!(got.len(), 1, "one live link after the re-point: {got:#?}");
+            assert!(
+                got[0][1].contains("43") && !got[0][1].contains("42"),
+                "the link must follow the re-point: {got:#?}"
+            );
+        })
+        .await;
+}

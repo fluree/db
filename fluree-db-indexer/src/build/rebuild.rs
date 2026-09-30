@@ -106,6 +106,7 @@ pub async fn rebuild_index_from_commits_with_store<C>(
 where
     C: ContentStore + Clone + Send + Sync + 'static,
 {
+    use crate::run_index::resolve::link_synth::AttachmentOp;
     use futures::stream::StreamExt;
     use run_index::resolver::{RebuildChunk, SharedResolverState};
     use run_index::spool::SortedCommitInfo;
@@ -446,13 +447,18 @@ where
             let mut string_dicts = Vec::with_capacity(chunks.len());
             let mut chunk_records: Vec<Vec<RunRecord>> = Vec::with_capacity(chunks.len());
             let mut chunk_terms: Vec<Vec<RunRecord>> = Vec::with_capacity(chunks.len());
+            let mut chunk_attachments: Vec<Vec<AttachmentOp>> = Vec::with_capacity(chunks.len());
 
             for chunk in chunks {
                 subject_dicts.push(chunk.subjects);
                 string_dicts.push(chunk.strings);
                 chunk_records.push(chunk.records);
                 chunk_terms.push(chunk.terms);
+                chunk_attachments.push(chunk.attachments);
             }
+            // Every chunk's attachment ops, global ids, for one replay after
+            // the loop: a reifier's ops span chunks.
+            let mut all_attachments: Vec<AttachmentOp> = Vec::new();
 
             // Triple-term interning happens here, once ids are global: the
             // registry gives each term entry its `o_type`, the builder its
@@ -618,6 +624,13 @@ where
                             fluree_db_core::value_id::ObjKey::encode_u32_id(global_str).as_u64();
                     }
                 }
+                let mut attachments = std::mem::take(&mut chunk_attachments[ci]);
+                for op in &mut attachments {
+                    op.remap(s_remap, str_remap)
+                        .map_err(|e| IndexerError::StorageWrite(format!("chunk {ci}: {e}")))?;
+                }
+                all_attachments.append(&mut attachments);
+
                 let triple_term = fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8();
                 for record in records.iter_mut() {
                     if record.o_kind != triple_term {
@@ -695,6 +708,52 @@ where
                     term_table: None,
                 });
             }
+
+            // Link records: replay every reifier's attachment history from
+            // nothing and write the result as one more sorted commit file.
+            let links_emitted = if all_attachments.is_empty() {
+                0
+            } else {
+                let link_ids = shared.link_synth.link_ids().ok_or_else(|| {
+                    IndexerError::StorageWrite("attachment ops without link ids".into())
+                })?;
+                let mut links: Vec<RunRecord> = Vec::new();
+                let emitted = crate::run_index::resolve::link_synth::replay_attachments(
+                    &mut all_attachments,
+                    |_, _| [None; 3],
+                    &term_registry,
+                    link_ids,
+                    &mut |key| term_builder.get_or_insert(key),
+                    &mut links,
+                )
+                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                drop(all_attachments);
+                links.sort_unstable_by(fluree_db_binary_index::format::run_record::cmp_g_spot);
+                let ci = chunk_records.len();
+                let fsc_path = commits_dir.join("links.fsc");
+                let mut spool_writer = run_index::spool::SpoolWriter::new(&fsc_path, ci)
+                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                for record in &links {
+                    spool_writer
+                        .push(record)
+                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                }
+                let spool_info = spool_writer
+                    .finish()
+                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                sorted_commit_infos.push(SortedCommitInfo {
+                    path: fsc_path,
+                    record_count: spool_info.record_count,
+                    byte_len: spool_info.byte_len,
+                    chunk_idx: ci,
+                    subject_count: 0,
+                    string_count: 0,
+                    types_map_path: None,
+                    duplicates_removed: 0,
+                    term_table: None,
+                });
+                emitted
+            };
 
             // Records are persisted to .fsc files on disk — free the in-memory
             // copies immediately. For large datasets (e.g. 60M flakes) this
@@ -1142,7 +1201,7 @@ where
                 tracing::info!(
                     term_count,
                     predicates = refs.forward_packs.len(),
-                    links = shared.link_synth.links_emitted,
+                    links = links_emitted,
                     "triple-term dictionary uploaded"
                 );
                 Some(refs)
