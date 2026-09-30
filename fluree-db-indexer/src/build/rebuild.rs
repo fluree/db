@@ -696,6 +696,14 @@ where
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
                 }
 
+                // The chunk is on disk; release its buffers now rather than
+                // after the loop, so the peak is one chunk plus the link
+                // replay, not every chunk.
+                records.clear();
+                records.shrink_to_fit();
+                terms.clear();
+                terms.shrink_to_fit();
+
                 sorted_commit_infos.push(SortedCommitInfo {
                     path: fsc_path,
                     record_count: spool_info.record_count,
@@ -710,48 +718,45 @@ where
             }
 
             // Link records: replay every reifier's attachment history from
-            // nothing and write the result as one more sorted commit file.
+            // nothing, streamed straight into one more sorted commit file.
             let links_emitted = if all_attachments.is_empty() {
                 0
             } else {
                 let link_ids = shared.link_synth.link_ids().ok_or_else(|| {
                     IndexerError::StorageWrite("attachment ops without link ids".into())
                 })?;
-                let mut links: Vec<RunRecord> = Vec::new();
+                let ci = chunk_records.len();
+                let fsc_path = commits_dir.join("links.fsc");
+                let mut spool_writer = run_index::spool::SpoolWriter::new(&fsc_path, ci)
+                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
                 let emitted = crate::run_index::resolve::link_synth::replay_attachments(
                     &mut all_attachments,
                     |_, _| [None; 3],
                     &term_registry,
                     link_ids,
                     &mut |key| term_builder.get_or_insert(key),
-                    &mut links,
+                    &mut |record| spool_writer.push(&record),
                 )
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
                 drop(all_attachments);
-                links.sort_unstable_by(fluree_db_binary_index::format::run_record::cmp_g_spot);
-                let ci = chunk_records.len();
-                let fsc_path = commits_dir.join("links.fsc");
-                let mut spool_writer = run_index::spool::SpoolWriter::new(&fsc_path, ci)
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                for record in &links {
-                    spool_writer
-                        .push(record)
-                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                }
                 let spool_info = spool_writer
                     .finish()
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                sorted_commit_infos.push(SortedCommitInfo {
-                    path: fsc_path,
-                    record_count: spool_info.record_count,
-                    byte_len: spool_info.byte_len,
-                    chunk_idx: ci,
-                    subject_count: 0,
-                    string_count: 0,
-                    types_map_path: None,
-                    duplicates_removed: 0,
-                    term_table: None,
-                });
+                if emitted > 0 {
+                    sorted_commit_infos.push(SortedCommitInfo {
+                        path: fsc_path,
+                        record_count: spool_info.record_count,
+                        byte_len: spool_info.byte_len,
+                        chunk_idx: ci,
+                        subject_count: 0,
+                        string_count: 0,
+                        types_map_path: None,
+                        duplicates_removed: 0,
+                        term_table: None,
+                    });
+                } else {
+                    let _ = std::fs::remove_file(&fsc_path);
+                }
                 emitted
             };
 

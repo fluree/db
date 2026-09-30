@@ -295,11 +295,13 @@ fn term_of(state: &[Option<SlotValue>; 3], registry: &OTypeRegistry) -> Option<T
     })
 }
 
-/// Replay every reifier's attachment ops (ids global) and emit its link
-/// records: at each `t` where the attachment changes from or to a complete
-/// edge, a retract of the old term's link and an assert of the new one.
-/// `prior` is the attachment the base index holds for `(g_id, reifier)`
-/// before these ops; `handle_for` interns a term. Returns the number of
+/// Replay every reifier's attachment ops (ids global) and hand its link
+/// records to `sink`: at each `t` where the attachment changes from or to a
+/// complete edge, a retract of the old term's link and an assert of the new
+/// one. `prior` is the attachment the base index holds for `(g_id, reifier)`
+/// before these ops; `handle_for` interns a term. Records reach the sink in
+/// `(g_id, SPOT)` order, one reifier at a time, so a rebuild can stream
+/// them to a sorted spool without holding them all. Returns the number of
 /// link records emitted.
 pub fn replay_attachments(
     ops: &mut [AttachmentOp],
@@ -307,29 +309,13 @@ pub fn replay_attachments(
     registry: &OTypeRegistry,
     link: LinkIds,
     handle_for: &mut dyn FnMut(TermKey) -> io::Result<u64>,
-    out: &mut Vec<RunRecord>,
+    sink: &mut dyn FnMut(RunRecord) -> io::Result<()>,
 ) -> io::Result<u64> {
     // Within one `t`, retracts apply before asserts so a re-pointed slot
     // passes through its old value on the way to the new one.
     ops.sort_by_key(|o| (o.g_id, o.ann, o.t, o.op, o.value.slot()));
     let mut emitted = 0u64;
-    let mut link_record = |g_id: u16, ann: u64, key: TermKey, t: u32, op: u8| -> io::Result<()> {
-        let handle = handle_for(key)?;
-        out.push(RunRecord {
-            g_id,
-            s_id: SubjectId::from_u64(ann),
-            p_id: link.p_id,
-            dt: link.dt,
-            o_kind: ObjKind::TRIPLE_TERM.as_u8(),
-            op,
-            o_key: handle,
-            t,
-            lang_id: 0,
-            i: LIST_INDEX_NONE,
-        });
-        emitted += 1;
-        Ok(())
-    };
+    let mut group: Vec<RunRecord> = Vec::new();
     let mut i = 0;
     while i < ops.len() {
         let (g_id, ann) = (ops[i].g_id, ops[i].ann);
@@ -352,13 +338,35 @@ pub fn replay_attachments(
             let after = term_of(&state, registry);
             if before != after {
                 if let Some(old) = before {
-                    link_record(g_id, ann, old, t, 0)?;
+                    group.push(link_record(g_id, ann, link, handle_for(old)?, t, 0));
                 }
                 if let Some(new) = after {
-                    link_record(g_id, ann, new, t, 1)?;
+                    group.push(link_record(g_id, ann, link, handle_for(new)?, t, 1));
                 }
             }
         }
+        // One reifier's records share `g_id` and subject; sorting them puts
+        // the stream as a whole in `(g_id, SPOT)` order.
+        group.sort_unstable_by(fluree_db_binary_index::format::run_record::cmp_g_spot);
+        emitted += group.len() as u64;
+        for record in group.drain(..) {
+            sink(record)?;
+        }
     }
     Ok(emitted)
+}
+
+fn link_record(g_id: u16, ann: u64, link: LinkIds, handle: u64, t: u32, op: u8) -> RunRecord {
+    RunRecord {
+        g_id,
+        s_id: SubjectId::from_u64(ann),
+        p_id: link.p_id,
+        dt: link.dt,
+        o_kind: ObjKind::TRIPLE_TERM.as_u8(),
+        op,
+        o_key: handle,
+        t,
+        lang_id: 0,
+        i: LIST_INDEX_NONE,
+    }
 }

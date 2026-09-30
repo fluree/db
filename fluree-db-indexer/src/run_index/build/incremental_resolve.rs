@@ -780,7 +780,10 @@ pub async fn resolve_incremental_commits_v6(
                 &o_type_registry,
                 link_ids,
                 &mut handle_for,
-                &mut v1_records,
+                &mut |record| {
+                    v1_records.push(record);
+                    Ok(())
+                },
             )?;
             tracing::debug!(
                 links = emitted,
@@ -1331,11 +1334,23 @@ async fn base_attachment_states(
                 let o_key = batch.o_key.get(i);
                 state[slot] = match slot {
                     0 if o_type == OType::IRI_REF.as_u16() => Some(SlotValue::Subject(o_key)),
-                    1 if o_type == OType::IRI_REF.as_u16() => store
-                        .resolve_subject_iri(o_key)
-                        .ok()
-                        .and_then(|iri| predicates.get(&iri))
-                        .map(SlotValue::Predicate),
+                    // A read failure or a predicate the dictionary does not
+                    // hold must fail the build: treated as "no predicate", an
+                    // object-only re-point would replay from and to an
+                    // incomplete attachment and leave the old link in place.
+                    1 if o_type == OType::IRI_REF.as_u16() => {
+                        let iri = store.resolve_subject_iri(o_key)?;
+                        let p_id = predicates.get(&iri).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "reifier {ann} is attached to predicate {iri}, which the \
+                                     dictionary does not hold"
+                                ),
+                            )
+                        })?;
+                        Some(SlotValue::Predicate(p_id))
+                    }
                     2 => Some(SlotValue::Object(ObjectId::Typed { o_type, o_key })),
                     _ => None,
                 };
