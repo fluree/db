@@ -201,7 +201,7 @@ async fn dataset_single_default_graph_basic_query() {
     let _ledger = seed_people_ledger(&fluree, "people:main").await;
 
     // Create dataset spec with single default graph
-    let spec = DatasetSpec::new().with_default(GraphSource::new("people:main"));
+    let spec = DatasetSpec::new().with_default(GraphSource::parse("people:main").unwrap());
 
     // Load the dataset
     let dataset = fluree
@@ -259,8 +259,8 @@ async fn dataset_multiple_default_graphs_union() {
 
     // Create dataset spec with both as default graphs
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("people1:main"))
-        .with_default(GraphSource::new("people2:main"));
+        .with_default(GraphSource::parse("people1:main").unwrap())
+        .with_default(GraphSource::parse("people2:main").unwrap());
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -430,8 +430,8 @@ async fn dataset_multiple_default_graphs_set_merged_across_ledgers() {
 
     // Create dataset with both as default graphs
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("dup1:main"))
-        .with_default(GraphSource::new("dup2:main"));
+        .with_default(GraphSource::parse("dup1:main").unwrap())
+        .with_default(GraphSource::parse("dup2:main").unwrap());
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -481,8 +481,8 @@ async fn dataset_named_graph_basic() {
 
     // Create dataset with one default and one named graph
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("default:main"))
-        .with_named(GraphSource::new("orgs:main"));
+        .with_default(GraphSource::parse("default:main").unwrap())
+        .with_named(GraphSource::parse("orgs:main").unwrap());
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -551,7 +551,14 @@ async fn dataset_from_json_single_string() {
     let spec = DatasetSpec::from_json(&query).expect("parse should succeed");
     assert_eq!(spec.num_graphs(), 1);
     assert_eq!(spec.default_graphs.len(), 1);
-    assert_eq!(spec.default_graphs[0].identifier, "test:main");
+    assert_eq!(
+        spec.default_graphs[0]
+            .address()
+            .expect("an address")
+            .id()
+            .as_str(),
+        "test:main"
+    );
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -646,7 +653,14 @@ async fn dataset_from_json_named() {
     let spec = DatasetSpec::from_json(&query).expect("parse should succeed");
     assert_eq!(spec.default_graphs.len(), 1);
     assert_eq!(spec.named_graphs.len(), 1);
-    assert_eq!(spec.named_graphs[0].identifier, "graph1:main");
+    assert_eq!(
+        spec.named_graphs[0]
+            .address()
+            .expect("an address")
+            .id()
+            .as_str(),
+        "graph1:main"
+    );
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -704,7 +718,7 @@ async fn dataset_ledger_not_found_fails() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Try to load a non-existent ledger
-    let spec = DatasetSpec::new().with_default(GraphSource::new("nonexistent:main"));
+    let spec = DatasetSpec::new().with_default(GraphSource::parse("nonexistent:main").unwrap());
 
     let result = fluree.build_dataset_view(&spec).await;
     assert!(result.is_err(), "loading nonexistent ledger should fail");
@@ -742,8 +756,8 @@ async fn dataset_cross_graph_join_in_union() {
 
     // Create dataset with both as default graphs (union)
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("employed:main"))
-        .with_default(GraphSource::new("companies:main"));
+        .with_default(GraphSource::parse("employed:main").unwrap())
+        .with_default(GraphSource::parse("companies:main").unwrap());
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -814,8 +828,8 @@ async fn sparql_graph_pattern_concrete_iri() {
 
     // Create dataset with default and named graphs
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("default:main"))
-        .with_named(GraphSource::new("people:main"));
+        .with_default(GraphSource::parse("default:main").unwrap())
+        .with_named(GraphSource::parse("people:main").unwrap());
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -861,8 +875,8 @@ async fn sparql_graph_pattern_variable_iteration() {
 
     // Create dataset with named graphs only (no default)
     let spec = DatasetSpec::new()
-        .with_named(GraphSource::new("people:main"))
-        .with_named(GraphSource::new("orgs:main"));
+        .with_named(GraphSource::parse("people:main").unwrap())
+        .with_named(GraphSource::parse("orgs:main").unwrap());
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -913,7 +927,7 @@ async fn sparql_graph_pattern_nonexistent_graph_returns_empty() {
     let _people_ledger = seed_people_ledger(&fluree, "people:main").await;
 
     // Dataset with only people:main as named
-    let spec = DatasetSpec::new().with_named(GraphSource::new("people:main"));
+    let spec = DatasetSpec::new().with_named(GraphSource::parse("people:main").unwrap());
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -956,8 +970,8 @@ async fn sparql_graph_pattern_default_vs_named() {
 
     // Dataset: default graph is people, named graph is orgs
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("default:main"))
-        .with_named(GraphSource::new("orgs:main"));
+        .with_default(GraphSource::parse("default:main").unwrap())
+        .with_named(GraphSource::parse("orgs:main").unwrap());
 
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -1040,8 +1054,8 @@ async fn fql_graph_pattern_basic() {
 
     // Create dataset
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("default:main"))
-        .with_named(GraphSource::new("people:main"));
+        .with_default(GraphSource::parse("default:main").unwrap())
+        .with_named(GraphSource::parse("people:main").unwrap());
     let dataset = fluree.build_dataset_view(&spec).await.unwrap();
 
     // Query using JSON-LD ["graph", "name", {...}] syntax
@@ -1084,8 +1098,12 @@ async fn fql_graph_pattern_with_alias() {
 
     // Create dataset with alias for named graph
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("default:main"))
-        .with_named(GraphSource::new("people:main").with_alias("folks"));
+        .with_default(GraphSource::parse("default:main").unwrap())
+        .with_named(
+            GraphSource::parse("people:main")
+                .unwrap()
+                .with_alias("folks"),
+        );
     let dataset = fluree.build_dataset_view(&spec).await.unwrap();
 
     // Query using JSON-LD ["graph", <alias>, {...}] syntax with the alias "folks"
@@ -1139,8 +1157,11 @@ async fn dataset_time_travel_at_t() {
     let _ledger2 = fluree.insert(ledger1, &insert2).await.unwrap().ledger;
 
     // Dataset pinned at t=1 should only see Alice.
-    let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("people:main").with_time(TimeSpec::AtT(1)));
+    let spec = DatasetSpec::new().with_default(
+        GraphSource::parse("people:main")
+            .unwrap()
+            .with_time(TimeSpec::AtT(1)),
+    );
     let dataset = fluree.build_dataset_view(&spec).await.unwrap();
 
     let query = json!({
@@ -1190,8 +1211,11 @@ async fn dataset_time_travel_at_time_iso() {
     let _tx2 = fluree.insert(tx1.ledger, &insert2).await.unwrap();
 
     // Dataset pinned at commit1 timestamp should only see Alice (t=1).
-    let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("people:main").with_time(TimeSpec::AtTime(time1)));
+    let spec = DatasetSpec::new().with_default(
+        GraphSource::parse("people:main")
+            .unwrap()
+            .with_time(TimeSpec::AtTime(time1)),
+    );
     let dataset = fluree.build_dataset_view(&spec).await.unwrap();
 
     let query = json!({
@@ -1224,8 +1248,11 @@ async fn dataset_time_travel_future_t_errors() {
     let _ledger1 = fluree.insert(ledger0, &insert1).await.unwrap().ledger;
 
     // Requesting future t should error.
-    let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("people:main").with_time(TimeSpec::AtT(999)));
+    let spec = DatasetSpec::new().with_default(
+        GraphSource::parse("people:main")
+            .unwrap()
+            .with_time(TimeSpec::AtT(999)),
+    );
     let result = fluree.build_dataset_view(&spec).await;
     assert!(result.is_err(), "future t should error");
 }
@@ -1262,8 +1289,12 @@ async fn dataset_time_travel_mixed_graphs() {
 
     // Dataset: people at t=1, orgs at head.
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("people:main").with_time(TimeSpec::AtT(1)))
-        .with_default(GraphSource::new("orgs:main"));
+        .with_default(
+            GraphSource::parse("people:main")
+                .unwrap()
+                .with_time(TimeSpec::AtT(1)),
+        )
+        .with_default(GraphSource::parse("orgs:main").unwrap());
     let dataset = fluree.build_dataset_view(&spec).await.unwrap();
 
     let query = json!({
@@ -1312,9 +1343,16 @@ async fn dataset_time_travel_alias_syntax_at_t() {
     });
 
     let spec = DatasetSpec::from_json(&query).unwrap();
-    assert_eq!(spec.default_graphs[0].identifier, "people:main");
+    assert_eq!(
+        spec.default_graphs[0]
+            .address()
+            .expect("an address")
+            .id()
+            .as_str(),
+        "people:main"
+    );
     assert!(matches!(
-        spec.default_graphs[0].time_spec,
+        spec.default_graphs[0].time_spec(),
         Some(TimeSpec::AtT(1))
     ));
 
@@ -1356,7 +1394,9 @@ async fn dataset_time_travel_at_commit() {
 
     // Dataset pinned at commit1 should only see Alice (t=1).
     let spec = DatasetSpec::new().with_default(
-        GraphSource::new("people:main").with_time(TimeSpec::AtCommit(commit_prefix.clone())),
+        GraphSource::parse("people:main")
+            .unwrap()
+            .with_time(TimeSpec::AtCommit(commit_prefix.clone())),
     );
     let dataset = fluree.build_dataset_view(&spec).await.unwrap();
 
@@ -1403,7 +1443,9 @@ async fn dataset_time_travel_at_commit_short_prefix() {
 
     // Dataset pinned at commit1 prefix should only see Alice (t=1).
     let spec = DatasetSpec::new().with_default(
-        GraphSource::new("people:main").with_time(TimeSpec::AtCommit(commit_prefix.to_string())),
+        GraphSource::parse("people:main")
+            .unwrap()
+            .with_time(TimeSpec::AtCommit(commit_prefix.to_string())),
     );
     let dataset = fluree.build_dataset_view(&spec).await.unwrap();
 
@@ -1456,9 +1498,16 @@ async fn dataset_time_travel_alias_syntax_commit() {
     });
 
     let spec = DatasetSpec::from_json(&query).unwrap();
-    assert_eq!(spec.default_graphs[0].identifier, "people:main");
+    assert_eq!(
+        spec.default_graphs[0]
+            .address()
+            .expect("an address")
+            .id()
+            .as_str(),
+        "people:main"
+    );
     assert!(matches!(
-        spec.default_graphs[0].time_spec,
+        spec.default_graphs[0].time_spec(),
         Some(TimeSpec::AtCommit(_))
     ));
 
@@ -1490,7 +1539,9 @@ async fn dataset_time_travel_commit_not_found_errors() {
 
     // Request a non-existent commit prefix - should error
     let spec = DatasetSpec::new().with_default(
-        GraphSource::new("people:main").with_time(TimeSpec::AtCommit("bxxxxxx".to_string())),
+        GraphSource::parse("people:main")
+            .unwrap()
+            .with_time(TimeSpec::AtCommit("bxxxxxx".to_string())),
     );
     let result = fluree.build_dataset_view(&spec).await;
     assert!(result.is_err(), "non-existent commit should error");
@@ -1516,7 +1567,9 @@ async fn dataset_time_travel_commit_too_short_errors() {
 
     // Commit prefix too short (less than 6 chars) - should error
     let spec = DatasetSpec::new().with_default(
-        GraphSource::new("people:main").with_time(TimeSpec::AtCommit("babc".to_string())),
+        GraphSource::parse("people:main")
+            .unwrap()
+            .with_time(TimeSpec::AtCommit("babc".to_string())),
     );
     let result = fluree.build_dataset_view(&spec).await;
     assert!(result.is_err(), "commit prefix too short should error");
@@ -2075,14 +2128,28 @@ async fn dataset_multi_ledger_time_travel_parsing() {
     assert_eq!(spec.num_graphs(), 2);
 
     // Verify time specs are parsed correctly for multiple ledgers
-    assert_eq!(spec.default_graphs[0].identifier, "ledger1:main");
+    assert_eq!(
+        spec.default_graphs[0]
+            .address()
+            .expect("an address")
+            .id()
+            .as_str(),
+        "ledger1:main"
+    );
     assert!(matches!(
-        spec.default_graphs[0].time_spec,
+        spec.default_graphs[0].time_spec(),
         Some(TimeSpec::AtT(1))
     ));
-    assert_eq!(spec.default_graphs[1].identifier, "ledger2:main");
+    assert_eq!(
+        spec.default_graphs[1]
+            .address()
+            .expect("an address")
+            .id()
+            .as_str(),
+        "ledger2:main"
+    );
     assert!(matches!(
-        spec.default_graphs[1].time_spec,
+        spec.default_graphs[1].time_spec(),
         Some(TimeSpec::AtT(2))
     ));
 }
@@ -2212,7 +2279,7 @@ async fn single_ledger_dataset_string_functions() {
     let fluree = FlureeBuilder::memory().build_memory();
     let _ledger = seed_people_ledger(&fluree, "strfn:main").await;
 
-    let spec = DatasetSpec::new().with_default(GraphSource::new("strfn:main"));
+    let spec = DatasetSpec::new().with_default(GraphSource::parse("strfn:main").unwrap());
     let dataset = fluree
         .build_dataset_view(&spec)
         .await
@@ -2516,33 +2583,6 @@ async fn sparql_within_ledger_from_alias_scopes_default_graph() {
     assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
 }
 
-/// P2 (negative): `resolve_within_ledger_graph` matches the alias by EXACT
-/// string (`iri == db.snapshot.ledger_id || iri == db.ledger_id`), so a
-/// mismatched spelling of the ledger id — here `wl`, the name without its
-/// `:main` branch — is not recognized as the default graph and falls through to
-/// the cross-ledger rejection. Documents (locks) the exact-match limitation:
-/// broadening the match is a deliberate DEFER, so this behavior must not
-/// silently change.
-#[tokio::test]
-async fn sparql_within_ledger_from_alias_spelling_mismatch_is_rejected() {
-    assert_index_defaults();
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
-
-    let sparql = r"
-        PREFIX schema: <http://schema.org/>
-        SELECT ?name FROM <wl> { ?s schema:name ?name }
-    ";
-    let err = support::query_sparql(&fluree, &ledger, sparql)
-        .await
-        .expect_err("a mismatched alias spelling must be rejected, not silently matched");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("not in this ledger"),
-        "expected the within-ledger cross-ledger rejection, got: {msg}"
-    );
-}
-
 /// Query-surface parity (D-3, Option A): the within-ledger SPARQL `FROM` /
 /// `FROM NAMED` dataset the buffered `query` path now builds is the same
 /// engine/view-level `DataSetDb` / `DatasetOperator` construction the JSON-LD
@@ -2805,14 +2845,16 @@ async fn sparql_reserved_graphs_stay_unreachable_when_not_named_in_full() {
     let config_iri = fluree_db_core::config_graph_iri("wl-reserved-neg:main");
     let txn_meta_iri = fluree_db_core::txn_meta_graph_iri("wl-reserved-neg:main");
 
-    // 1. Bare / relative / foreign spellings are refused by FROM.
+    // 1. Relative and foreign spellings are refused by FROM: a relative
+    //    `#config` is not an IRI at all, and another ledger's reserved IRI
+    //    names that other ledger. (The bare keywords `config` / `txn-meta` are
+    //    an explicit naming of this ledger's reserved graph, as on every
+    //    ledger-scoped surface.)
     let foreign_config = fluree_db_core::config_graph_iri("some-other:main");
-    for iri in [
-        "config",
-        "#config",
-        "txn-meta",
-        "#txn-meta",
-        foreign_config.as_str(),
+    for (iri, needle) in [
+        ("#config", "neither a ledger address"),
+        ("#txn-meta", "neither a ledger address"),
+        (foreign_config.as_str(), "not in this ledger"),
     ] {
         let sparql = format!(
             "PREFIX schema: <http://schema.org/> \
@@ -2821,8 +2863,9 @@ async fn sparql_reserved_graphs_stay_unreachable_when_not_named_in_full() {
         let err = support::query_sparql(&fluree, &ledger, &sparql)
             .await
             .expect_err(&format!("FROM <{iri}> must be rejected"));
+        assert_eq!(err.status_code(), 400, "FROM <{iri}>: {err}");
         assert!(
-            err.to_string().contains("not in this ledger"),
+            err.to_string().contains(needle),
             "expected the within-ledger rejection for FROM <{iri}>, got: {err}"
         );
     }
@@ -3334,7 +3377,7 @@ async fn dataset_membership_shape_set_merges_identical_graphs() {
         ]
     });
 
-    let one_spec = DatasetSpec::new().with_default(GraphSource::new("knows1:main"));
+    let one_spec = DatasetSpec::new().with_default(GraphSource::parse("knows1:main").unwrap());
     let one = fluree
         .build_dataset_view(&one_spec)
         .await
@@ -3350,8 +3393,8 @@ async fn dataset_membership_shape_set_merges_identical_graphs() {
     );
 
     let two_spec = DatasetSpec::new()
-        .with_default(GraphSource::new("knows1:main"))
-        .with_default(GraphSource::new("knows2:main"));
+        .with_default(GraphSource::parse("knows1:main").unwrap())
+        .with_default(GraphSource::parse("knows2:main").unwrap());
     let two = fluree
         .build_dataset_view(&two_spec)
         .await
@@ -3427,9 +3470,12 @@ fn http_from_named_only_spec(graphs: &[&str]) -> DatasetSpec {
     let mut spec = DatasetSpec::new();
     for g in graphs {
         spec = spec.with_named(
-            GraphSource::new(HTTP_DS_LEDGER)
-                .with_graph(fluree_db_api::dataset::GraphSelector::Iri((*g).to_string()))
-                .with_alias(*g),
+            GraphSource::ledger(
+                fluree_db_api::LedgerRef::parse(HTTP_DS_LEDGER)
+                    .unwrap()
+                    .with_graph(fluree_db_api::dataset::GraphSel::parse(g).unwrap()),
+            )
+            .with_alias(*g),
         );
     }
     spec
@@ -3632,16 +3678,16 @@ async fn http_dataset_explicit_from_default_keeps_default_graph() {
     let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
 
     let spec = DatasetSpec::new()
-        .with_default(
-            GraphSource::new(HTTP_DS_LEDGER)
-                .with_graph(fluree_db_api::dataset::GraphSelector::Default),
-        )
+        .with_default(GraphSource::ledger(
+            fluree_db_api::LedgerRef::parse(HTTP_DS_LEDGER).unwrap(),
+        ))
         .with_named(
-            GraphSource::new(HTTP_DS_LEDGER)
-                .with_graph(fluree_db_api::dataset::GraphSelector::Iri(
-                    HTTP_DS_G1.to_string(),
-                ))
-                .with_alias(HTTP_DS_G1),
+            GraphSource::ledger(
+                fluree_db_api::LedgerRef::parse(HTTP_DS_LEDGER)
+                    .unwrap()
+                    .with_graph(fluree_db_api::dataset::GraphSel::parse(HTTP_DS_G1).unwrap()),
+            )
+            .with_alias(HTTP_DS_G1),
         );
     let dataset = fluree
         .build_dataset_view(&spec)
@@ -3659,4 +3705,238 @@ async fn http_dataset_explicit_from_default_keeps_default_graph() {
     .await;
 
     assert_eq!(rows.len(), 1, "the default-graph triple, and only that");
+}
+
+// =============================================================================
+// Typed dataset references: one resolver for every spelling
+// =============================================================================
+
+/// The names a within-ledger query returns, sorted.
+async fn view_names(fluree: &MemoryFluree, ledger: &MemoryLedger, sparql: &str) -> Vec<JsonValue> {
+    let result = support::query_sparql(fluree, ledger, sparql)
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    normalize_rows(&result.to_jsonld(&ledger.snapshot).expect("to_jsonld"))
+}
+
+/// Every spelling of the ledger's own address names its default graph on a
+/// within-ledger dataset: the short name, `name:branch`, and `urn:fluree:`.
+/// The comparison is on the parsed id, not the text, so a short alias no
+/// longer falls through to the cross-ledger rejection (#1512).
+#[tokio::test]
+async fn sparql_within_ledger_from_accepts_every_spelling_of_the_ledger() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    for from in ["wl", "wl:main", "urn:fluree:wl", "urn:fluree:wl:main"] {
+        let sparql = format!(
+            "PREFIX schema: <http://schema.org/> \
+             SELECT ?name FROM <{from}> {{ ?s schema:name ?name }}"
+        );
+        assert_eq!(
+            view_names(&fluree, &ledger, &sparql).await,
+            normalize_rows(&json!([["Alice"]])),
+            "FROM <{from}>"
+        );
+    }
+}
+
+/// A graph named through the ledger's address (`L#<iri>`) resolves on the
+/// view path exactly as the bare IRI does; the CLI's local route answers
+/// through this path (#1512).
+#[tokio::test]
+async fn sparql_within_ledger_from_names_a_graph_through_the_address() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    for from in [
+        "wl:main#urn:g1",
+        "wl#urn:g1",
+        "urn:fluree:wl:main#urn:g1",
+        "urn:g1",
+    ] {
+        let sparql = format!(
+            "PREFIX schema: <http://schema.org/> \
+             SELECT ?name FROM <{from}> {{ ?s schema:name ?name }}"
+        );
+        assert_eq!(
+            view_names(&fluree, &ledger, &sparql).await,
+            normalize_rows(&json!([["Bob"]])),
+            "FROM <{from}>"
+        );
+    }
+}
+
+/// What a within-ledger clause cannot resolve is a typed caller error, never
+/// an internal one: another ledger is a 400 that names the fix, a graph the
+/// ledger does not have is a 404, and a pin (one view is one snapshot) is a
+/// 400.
+#[tokio::test]
+async fn sparql_within_ledger_from_rejections_are_typed() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    for (from, status, needle) in [
+        ("other:main", 400, "names ledger 'other:main'"),
+        ("wl:dev", 400, "names ledger 'wl:dev'"),
+        // Lexically both a graph IRI and an address: not a graph here, so the
+        // address reading (ledger `urn`, branch `nope`) is what it names.
+        ("urn:nope", 400, "is not a graph of this ledger"),
+        ("urn:ex:nope", 404, "names no graph"),
+        ("http://ex.org/nope", 404, "names no graph"),
+        ("wl:main#urn:ex:nope", 404, "names no graph"),
+        ("wl:main@t:1", 400, "pins a time"),
+    ] {
+        let sparql = format!("SELECT ?s FROM <{from}> WHERE {{ ?s ?p ?o }}");
+        let err = support::query_sparql(&fluree, &ledger, &sparql)
+            .await
+            .expect_err(&format!("FROM <{from}> must be refused"));
+        assert_eq!(err.status_code(), status, "FROM <{from}>: {err}");
+        assert!(err.to_string().contains(needle), "FROM <{from}>: {err}");
+    }
+}
+
+/// Seed `nm:main` over two commits: Alice at t=1, Dave added at t=2.
+async fn seed_two_commit_ledger(fluree: &MemoryFluree) {
+    let ledger = genesis_ledger(fluree, "nm:main");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@id": "http://example.org/ns/alice", "http://schema.org/name": "Alice"}),
+        )
+        .await
+        .expect("t=1")
+        .ledger;
+    fluree
+        .insert(
+            ledger,
+            &json!({"@id": "http://example.org/ns/dave", "http://schema.org/name": "Dave"}),
+        )
+        .await
+        .expect("t=2");
+}
+
+/// `(g, name)` pairs of a connection query, sorted.
+async fn connection_graph_names(fluree: &MemoryFluree, sparql: &str) -> Vec<(String, String)> {
+    let result = fluree
+        .query_from()
+        .sparql(sparql)
+        .format(fluree_db_api::FormatterConfig::sparql_json())
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut rows: Vec<(String, String)> = result["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| {
+            (
+                b["g"]["value"].as_str().unwrap_or_default().to_string(),
+                b["name"]["value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A pinned `FROM NAMED` member is named as written, pin included, so
+/// `GRAPH <L@t:1>` matches it and two pins of one ledger are two members
+/// with two `?g` bindings. Its old, time-stripped name still answers
+/// `GRAPH <L>` while exactly one member claims it.
+#[tokio::test]
+async fn pinned_from_named_members_are_named_as_written() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_two_commit_ledger(&fluree).await;
+    let q = |dataset: &str, graph: &str| {
+        format!(
+            "PREFIX schema: <http://schema.org/> SELECT ?g ?name {dataset} \
+             WHERE {{ BIND({graph} AS ?g) GRAPH {graph} {{ ?s schema:name ?name }} }}"
+        )
+    };
+    let pair = |g: &str, n: &str| (g.to_string(), n.to_string());
+
+    // Two pins, two members, each bound by its own name.
+    let sparql = "PREFIX schema: <http://schema.org/> SELECT ?g ?name \
+                  FROM NAMED <nm:main@t:1> FROM NAMED <nm:main@t:2> \
+                  WHERE { GRAPH ?g { ?s schema:name ?name } }";
+    assert_eq!(
+        connection_graph_names(&fluree, sparql).await,
+        vec![
+            pair("nm:main@t:1", "Alice"),
+            pair("nm:main@t:2", "Alice"),
+            pair("nm:main@t:2", "Dave"),
+        ]
+    );
+
+    // The written name addresses the member.
+    let sparql = q("FROM NAMED <nm:main@t:1>", "<nm:main@t:1>");
+    assert_eq!(
+        connection_graph_names(&fluree, &sparql).await,
+        vec![pair("nm:main@t:1", "Alice")]
+    );
+
+    // The time-stripped name still answers while one member claims it...
+    let sparql = q("FROM NAMED <nm:main@t:1>", "<nm:main>");
+    assert_eq!(
+        connection_graph_names(&fluree, &sparql).await,
+        vec![pair("nm:main", "Alice")]
+    );
+
+    // ...and names nothing once two do.
+    let sparql = q(
+        "FROM NAMED <nm:main@t:1> FROM NAMED <nm:main@t:2>",
+        "<nm:main>",
+    );
+    assert!(connection_graph_names(&fluree, &sparql).await.is_empty());
+}
+
+/// A bare graph IRI names a graph of some ledger, and a connection query has
+/// no ledger to find it in: a 400 naming the fix, not a nameservice lookup of
+/// the IRI as a ledger (which read `http://…` as ledger `http`).
+#[tokio::test]
+async fn a_connection_query_refuses_a_bare_graph_iri() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_two_commit_ledger(&fluree).await;
+
+    for iri in [
+        "http://ex.org/graphs/g",
+        "urn:ex:doc:1",
+        "http://ex.org/@alice/g",
+    ] {
+        let sparql = format!("SELECT ?s FROM <nm:main> FROM NAMED <{iri}> WHERE {{ ?s ?p ?o }}");
+        let err = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute()
+            .await
+            .expect_err(&format!("FROM NAMED <{iri}> must be refused"));
+        assert_eq!(err.status_code(), 400, "{iri}: {err}");
+        assert!(err.to_string().contains("no target"), "{iri}: {err}");
+    }
+}
+
+/// Prefixed and BASE-relative dataset IRIs expand against the prologue before
+/// they are read, on the connection route as on the view path.
+#[tokio::test]
+async fn connection_dataset_iris_expand_against_the_prologue() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_two_commit_ledger(&fluree).await;
+
+    let sparql = "PREFIX schema: <http://schema.org/> PREFIX db: <nm:> \
+                  SELECT ?name FROM db:main WHERE { ?s schema:name ?name }";
+    let rows = fluree
+        .query_from()
+        .sparql(sparql)
+        .format(fluree_db_api::FormatterConfig::sparql_json())
+        .execute_formatted()
+        .await
+        .expect("a prefixed FROM expands to the ledger address");
+    assert_eq!(rows["results"]["bindings"].as_array().unwrap().len(), 2);
 }

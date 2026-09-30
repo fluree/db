@@ -326,6 +326,14 @@ pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// A graph the addressed ledger does not have (404).
+    ///
+    /// Deliberately not [`ApiError::is_not_found`]: that condition means "no
+    /// such ledger" and sends a lookup on to graph sources, while here the
+    /// ledger exists and only the graph is missing.
+    #[error("Graph not found: {0}")]
+    GraphNotFound(String),
+
     /// Ledger already exists
     #[error("Ledger already exists: {0}")]
     LedgerExists(String),
@@ -623,7 +631,7 @@ impl ApiError {
             ApiError::InvalidLedgerId(_) => 400,
             ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
             ApiError::BranchConflict(_) => 409,
-            ApiError::NotFound(_) => 404,
+            ApiError::NotFound(_) | ApiError::GraphNotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
             ApiError::LedgerExists(_) => 409,
             ApiError::ReindexConflict { .. } => 409,
@@ -728,6 +736,20 @@ impl ApiError {
         ApiError::Http {
             status,
             message: message.into(),
+        }
+    }
+}
+
+/// A reference that does not name a graph of the ledger a surface reads: a
+/// caller mistake, never an internal error. Another ledger's address is a 400
+/// that names the fix; a graph the ledger does not have is a 404.
+impl From<fluree_db_core::TargetError> for ApiError {
+    fn from(e: fluree_db_core::TargetError) -> Self {
+        match e {
+            fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
+            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
+                ApiError::invalid_query(cross.to_string())
+            }
         }
     }
 }

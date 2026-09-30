@@ -659,23 +659,12 @@ pub(crate) fn parse_dataset_spec_as(
     Ok((spec, qc_opts))
 }
 
-/// Extract dataset spec from a SPARQL AST's dataset clause (FROM / FROM NAMED).
+/// Extract dataset spec from a SPARQL AST's dataset clause (FROM / FROM NAMED),
+/// its IRIs expanded against the prologue (prefixes applied, BASE resolved).
 pub(crate) fn extract_sparql_dataset_spec(
     ast: &fluree_db_sparql::SparqlAst,
 ) -> Result<DatasetSpec> {
-    let dataset_clause = match &ast.body {
-        fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Update(_) => None,
-    };
-
-    match dataset_clause {
-        Some(clause) => DatasetSpec::from_sparql_clause(clause)
-            .map_err(|e| ApiError::invalid_query(e.to_string())),
-        None => Ok(DatasetSpec::default()),
-    }
+    DatasetSpec::from_sparql_ast(ast).map_err(|e| ApiError::invalid_query(e.to_string()))
 }
 
 #[cfg(test)]

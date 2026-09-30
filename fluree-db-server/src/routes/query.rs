@@ -22,7 +22,7 @@ use axum::extract::{OriginalUri, Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use fluree_db_api::dataset::GraphSelector;
+use fluree_db_api::dataset::GraphSel;
 use fluree_db_api::{
     ApiError, DatasetSpec, FreshnessCheck, FreshnessSource, GraphDb, GraphSource, LedgerState,
     QueryExecutionOptions, RefreshOpts, TimeSpec, TrackingTally,
@@ -539,9 +539,12 @@ pub(crate) fn enforce_bearer_dataset_scope(
     // take precedence over the corresponding top-level fields.
     let (spec, _) = DatasetSpec::from_query_json(query_json)
         .map_err(|e| ServerError::bad_request(e.to_string()))?;
-    for source in spec.default_graphs.iter().chain(spec.named_graphs.iter()) {
-        let base = base_ledger_id(&source.identifier)?;
-        if !principal.can_read(&crate::error::scope_id(&base)?) {
+    // Every ledger the dataset names by address. A bare graph IRI or graph
+    // keyword names no ledger, and no surface loads one for it: a connection
+    // query refuses it, and a ledger-scoped one reads it from the path's
+    // ledger, which the caller authorized separately.
+    for ledger in spec.ledgers() {
+        if !principal.can_read(&ledger) {
             set_span_error_code(span, "error:Forbidden");
             return Err(ServerError::not_found("Ledger not found"));
         }
@@ -1707,21 +1710,14 @@ pub async fn explain_ledger(
 /// every `FROM` must carry the same pin.
 fn explain_from_carries_pin(sparql: &str, pin: &PathPin) -> Result<()> {
     let parsed = fluree_db_sparql::parse_sparql(sparql);
-    let clause = parsed.ast.as_ref().and_then(|ast| match &ast.body {
-        fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Update(_) => None,
-    });
-    let Some(clause) = clause else {
+    let Some(ast) = parsed.ast.as_ref() else {
         return Ok(());
     };
-    let spec = DatasetSpec::from_sparql_clause(clause)
-        .map_err(|e| ServerError::bad_request(e.to_string()))?;
-    for source in spec.default_graphs.iter().chain(&spec.named_graphs) {
-        let from = &source.identifier;
-        let Some(own) = &source.time_spec else {
+    let spec =
+        DatasetSpec::from_sparql_ast(ast).map_err(|e| ServerError::bad_request(e.to_string()))?;
+    for source in spec.sources() {
+        let from = source.written();
+        let Some(own) = source.time_spec() else {
             return Err(ServerError::bad_request(format!(
                 "SPARQL FROM <{from}> names no time on a ledger path pinned at '@{}'; \
                  repeat the pin on the FROM, or drop the FROM",
@@ -2003,11 +1999,11 @@ impl PathPin {
 /// The path ledger at its pin, as a dataset: the pinned twin of a query with no
 /// dataset clause. A lone default graph keeps `GRAPH ?g` enumerating the
 /// ledger's own named graphs (the single-ledger dataset path).
-fn pinned_ledger_spec(ledger: &str, pin: &PathPin) -> DatasetSpec {
-    let mut spec = DatasetSpec::new();
-    spec.default_graphs
-        .push(GraphSource::new(ledger).with_time(pin.spec.clone()));
-    spec
+fn pinned_ledger_spec(ledger: &fluree_db_api::LedgerId, pin: &PathPin) -> DatasetSpec {
+    DatasetSpec::new().with_default(
+        GraphSource::ledger(fluree_db_api::LedgerRef::new(ledger.clone()))
+            .with_time(pin.spec.clone()),
+    )
 }
 
 /// Pin every JSON-LD dataset source that names the path's ledger, so the body
@@ -3022,6 +3018,16 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
     pin: Option<&PathPin>,
 ) -> Result<DatasetSpec> {
     let base_path = base_ledger_id(ledger_id)?;
+    // Every member reads a graph of the path's ledger.
+    let path_ledger = fluree_db_api::LedgerRef::parse(ledger_id)?;
+    let member = |graph: GraphSel| GraphSource::ledger(path_ledger.clone().with_graph(graph));
+    let selector = |raw: &str| {
+        GraphSel::parse(raw).map_err(|e| {
+            ServerError::bad_request(format!(
+                "SPARQL FROM/FROM NAMED <{raw}> is not a graph of this ledger: {e}"
+            ))
+        })
+    };
     let mut spec = DatasetSpec::new();
     let timed = |src: GraphSource, own: Option<TimeSpec>, raw: &str| -> Result<GraphSource> {
         let time = match (own, pin) {
@@ -3040,11 +3046,8 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
 
     let mut add_default = |raw: &str| -> Result<()> {
         if raw == ledger_id {
-            spec.default_graphs.push(timed(
-                GraphSource::new(ledger_id).with_graph(GraphSelector::Default),
-                None,
-                raw,
-            )?);
+            spec.default_graphs
+                .push(timed(member(GraphSel::Default), None, raw)?);
             return Ok(());
         }
         let looks_like_ledger_ref = raw.contains('@')
@@ -3061,20 +3064,13 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
                     "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM targets '{raw}'"
                 )));
             }
-            let selector = frag
-                .map(GraphSelector::from_str)
-                .unwrap_or(GraphSelector::Default);
-            let src = GraphSource::new(ledger_id).with_graph(selector);
+            let graph = frag.map(selector).transpose()?.unwrap_or(GraphSel::Default);
             spec.default_graphs
-                .push(timed(src, time.map(TimeSpec::from), raw)?);
+                .push(timed(member(graph), time.map(TimeSpec::from), raw)?);
             return Ok(());
         }
-        let selector = GraphSelector::from_str(raw);
-        spec.default_graphs.push(timed(
-            GraphSource::new(ledger_id).with_graph(selector),
-            None,
-            raw,
-        )?);
+        spec.default_graphs
+            .push(timed(member(selector(raw)?), None, raw)?);
         Ok(())
     };
 
@@ -3093,24 +3089,16 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
                     "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM NAMED targets '{raw}'"
                 )));
             }
-            let selector = frag
-                .map(GraphSelector::from_str)
-                .unwrap_or(GraphSelector::Default);
-            let src = GraphSource::new(ledger_id)
-                .with_graph(selector)
-                .with_alias(raw);
-            spec.named_graphs
-                .push(timed(src, time.map(TimeSpec::from), raw)?);
+            let graph = frag.map(selector).transpose()?.unwrap_or(GraphSel::Default);
+            spec.named_graphs.push(timed(
+                member(graph).with_alias(raw),
+                time.map(TimeSpec::from),
+                raw,
+            )?);
             return Ok(());
         }
-        let selector = GraphSelector::from_str(raw);
-        spec.named_graphs.push(timed(
-            GraphSource::new(ledger_id)
-                .with_graph(selector)
-                .with_alias(raw),
-            None,
-            raw,
-        )?);
+        spec.named_graphs
+            .push(timed(member(selector(raw)?).with_alias(raw), None, raw)?);
         Ok(())
     };
 
@@ -3630,7 +3618,7 @@ async fn execute_sparql_ledger(
 
             let spec = match (dc, pin) {
                 (Some(dc), _) => ledger_scoped_sparql_dataset_spec(ledger_id, dc, pin)?,
-                (None, Some(pin)) => pinned_ledger_spec(ledger_id, pin),
+                (None, Some(pin)) => pinned_ledger_spec(&path.id, pin),
                 (None, None) => {
                     return Err(ServerError::bad_request("Invalid SPARQL dataset clause"));
                 }

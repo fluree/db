@@ -1151,7 +1151,7 @@ impl Fluree {
         // Prefix-expanded, BASE-resolved FROM / FROM NAMED IRIs (shared
         // resolution with constant IRIs; shipped by pr-base).
         let Some(clause) = fluree_db_sparql::resolve_dataset_clause(ast)
-            .map_err(|e| ApiError::query(e.to_string()))?
+            .map_err(|e| ApiError::invalid_query(e.to_string()))?
         else {
             return Ok(None);
         };
@@ -1175,36 +1175,36 @@ impl Fluree {
         // scan time by the `DatasetOperator`.
         let mut seen_default_g_ids = std::collections::HashSet::new();
         for iri in &clause.default_graphs {
-            let graph = self
-                .resolve_within_ledger_graph(db, iri)?
-                .ok_or_else(cross_ledger_dataset_error)?;
+            let graph = self.resolve_within_ledger_graph(db, iri)?;
             if seen_default_g_ids.insert(graph.graph_id) {
                 dataset = dataset.with_default(graph);
             }
         }
         for iri in &clause.named_graphs {
-            let graph = self
-                .resolve_within_ledger_graph(db, iri)?
-                .ok_or_else(cross_ledger_dataset_error)?;
+            let graph = self.resolve_within_ledger_graph(db, iri)?;
             dataset = dataset.with_named(std::sync::Arc::clone(iri), graph);
         }
         Ok(Some(dataset))
     }
 
-    /// Resolve one `FROM` / `FROM NAMED` IRI to a graph *within this ledger*,
-    /// or `None` when the IRI does not name a graph in this ledger.
+    /// Resolve one `FROM` / `FROM NAMED` IRI to a graph *within this ledger*
+    /// ([`fluree_db_core::TargetLedger::resolve`], the one table every
+    /// ledger-scoped surface shares):
     ///
-    /// - the ledger alias → the default graph (g_id 0), mirroring
+    /// - the ledger's own address in any spelling (`L`, `L:main`,
+    ///   `urn:fluree:L:main`) → the default graph (g_id 0), mirroring
     ///   `ExecutionContext::single_db_user_graph_id`, which reserves the alias
     ///   for the default graph;
-    /// - a registered named-graph IRI → that graph's g_id;
-    /// - this ledger's own reserved-graph IRI, written out in full → that
-    ///   reserved graph.
+    /// - an IRI the registry holds exactly → that graph, reserved slots
+    ///   included (a branch inherits its source's `urn:fluree:<source>#config`);
+    /// - a graph keyword (`default`, `txn-meta`, `config`), or this ledger's
+    ///   address with a graph (`L#config`, `L#<iri>`) → that graph;
+    /// - another ledger's address → a 400 naming the fix; a graph IRI the
+    ///   ledger does not have → a 404.
     ///
-    /// Reuses [`apply_graph_selector`](Self::apply_graph_selector) — the same
-    /// within-ledger selection primitive behind `fluree.db("ledger:main#graph")`
-    /// and the JSON-LD `@graph` dataset source — so all three surfaces resolve
-    /// and re-scope a graph identically.
+    /// Re-scopes through the same selection primitive behind
+    /// `fluree.db("ledger:main#graph")` and the JSON-LD `@graph` dataset
+    /// source, so all three surfaces resolve and re-scope a graph identically.
     ///
     /// # The reserved-graph access contract
     ///
@@ -1247,74 +1247,63 @@ impl Fluree {
     /// a source through `db()` → `parse_graph_ref` and has always accepted
     /// `#config`/`#txn-meta`.
     ///
-    /// "In full" is load-bearing: only this ledger's exact
-    /// `urn:fluree:{ledger}#config` / `#txn-meta` is admitted. A bare
-    /// `config`, a relative `#config`, and another ledger's reserved IRI all
-    /// still fall through to the "not in this ledger" rejection.
+    /// "Explicitly" is load-bearing: this ledger's `urn:fluree:{ledger}#config`
+    /// / `#txn-meta`, its address with that fragment, or the keyword are
+    /// admitted. A relative `#config` is not an IRI at all, and another
+    /// ledger's reserved IRI names another ledger, so both are refused.
     ///
     /// Note on the transaction row: both reserved graphs are writable through
     /// `GRAPH <iri>` in an ordinary `INSERT DATA` today — verified, not
     /// designed. Writing `#config` is the documented way to configure a
     /// ledger; `#txn-meta` being writable is an open question this function
     /// does not decide.
-    fn resolve_within_ledger_graph(&self, db: &GraphDb, iri: &str) -> Result<Option<GraphDb>> {
-        use crate::dataset::GraphSelector;
-        use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+    fn resolve_within_ledger_graph(&self, db: &GraphDb, written: &str) -> Result<GraphDb> {
+        use fluree_db_core::{MemberRef, TargetError, TargetLedger};
 
-        if iri == db.snapshot.ledger_id.as_str() || iri == db.ledger_id.as_ref() {
-            return Ok(Some(Self::apply_graph_selector(
-                db.clone(),
-                &GraphSelector::Default,
-            )?));
+        let member = MemberRef::parse(written).map_err(|e| {
+            ApiError::invalid_query(format!("SPARQL FROM/FROM NAMED <{written}>: {e}"))
+        })?;
+        // One view is one snapshot: a member pinned to a time of its own
+        // cannot be read from it.
+        if member.address().is_some_and(|a| a.at().is_some()) {
+            return Err(ApiError::invalid_query(format!(
+                "SPARQL FROM/FROM NAMED <{written}> pins a time, but this query reads one \
+                 snapshot of the ledger. Load the view at that time, or use query_from() \
+                 for a dataset whose members name their own times"
+            )));
         }
-
-        // A reserved graph of THIS ledger, spelled in full. Compared against
-        // the canonical IRI builders rather than matched by fragment or
-        // suffix, so `http://evil.example/x#config` is an ordinary user graph
-        // and another ledger's `#config` is not in this ledger at all. Both
-        // spellings of the ledger id are accepted because the caller may hold
-        // either (`db.ledger_id` is the requested alias, `snapshot.ledger_id`
-        // the canonical one) and the registry is seeded from the canonical.
-        let reserved_selector = [db.snapshot.ledger_id.as_str(), db.ledger_id.as_ref()]
-            .into_iter()
-            .find_map(|lid| {
-                if iri == fluree_db_core::config_graph_iri(lid) {
-                    Some(GraphSelector::Config)
-                } else if iri == fluree_db_core::txn_meta_graph_iri(lid) {
-                    Some(GraphSelector::TxnMeta)
-                } else {
-                    None
-                }
-            });
-        if let Some(selector) = reserved_selector {
-            // Reserved slots always exist, so this does not consult the
-            // registry — exactly as the ledger-address surface does not.
-            return Ok(Some(Self::apply_graph_selector(db.clone(), &selector)?));
-        }
-
-        // Registered USER named graph in this ledger (registry, with the same
-        // binary-store fallback `select_graph` uses). The `>= FIRST_USER_GRAPH_ID`
-        // filter still stands here: it is what stops a NON-canonical spelling
-        // that happens to resolve to a reserved slot from reaching one.
-        let is_user_graph = |g: fluree_db_core::GraphId| g >= FIRST_USER_GRAPH_ID;
-        let known = db
-            .snapshot
-            .graph_registry
-            .graph_id_for_iri(iri)
-            .is_some_and(is_user_graph)
-            || db
-                .binary_store
-                .as_ref()
-                .and_then(|s| s.graph_id_for_iri(iri))
-                .is_some_and(is_user_graph);
-        if known {
-            return Ok(Some(Self::apply_graph_selector(
-                db.clone(),
-                &GraphSelector::Iri(iri.to_string()),
-            )?));
-        }
-
-        Ok(None)
+        let target = db.snapshot.ledger_id.clone();
+        let registry = &db.snapshot.graph_registry;
+        let store = db.binary_store.as_ref();
+        let lookup = |iri: &str| {
+            registry
+                .graph_id_for_iri(iri)
+                .or_else(|| store.and_then(|s| s.graph_id_for_iri(iri)))
+        };
+        let graph = TargetLedger::new(&target, &lookup)
+            .resolve(written, &member, false)
+            .map_err(|e| match e {
+                TargetError::CrossLedger {
+                    named,
+                    target,
+                    also_iri,
+                } => ApiError::invalid_query(format!(
+                    "SPARQL FROM/FROM NAMED <{written}> {}names ledger '{named}', which is not \
+                     in this ledger ('{target}'). A within-ledger dataset names this ledger's \
+                     graphs; for a graph in ANOTHER ledger, use query_from() (a cross-ledger \
+                     dataset)",
+                    if also_iri {
+                        "is not a graph of this ledger, and as an address it "
+                    } else {
+                        ""
+                    }
+                )),
+                TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(format!(
+                    "SPARQL FROM/FROM NAMED <{iri}> names no graph in ledger '{target}'; \
+                     check the IRI against the ledger's registered graphs"
+                )),
+            })?;
+        Self::select_graph_id(db.clone(), graph.g_id)
     }
 
     /// Validate that SPARQL doesn't have dataset clauses (FROM/FROM NAMED).
@@ -1906,31 +1895,16 @@ fn query_error_to_status(err: &fluree_db_query::QueryError) -> u16 {
 /// (streaming views, R2RML-provider queries). One definition so the message
 /// cannot drift between its call sites.
 fn single_ledger_dataset_clause_error() -> ApiError {
-    ApiError::query(
+    ApiError::invalid_query(
         "SPARQL FROM/FROM NAMED clauses are not supported on a single-ledger GraphDb. \
          Use query_connection_sparql for multi-ledger queries.",
     )
 }
 
-/// Rejection for a `FROM` / `FROM NAMED` clause that references a graph outside
-/// this ledger (or the `FROM..TO` history extension). The message mentions
-/// `FROM` so callers and tests can recognize the dataset-clause rejection.
-fn cross_ledger_dataset_error() -> ApiError {
-    ApiError::query(
-        "SPARQL FROM/FROM NAMED references a graph that is not in this ledger. \
-         A within-ledger dataset names this ledger's graphs (its default graph \
-         via the ledger alias, or a registered named graph) — check the IRI \
-         for typos against the ledger's registered graphs; for a graph in \
-         ANOTHER ledger, use query_connection_sparql (cross-ledger datasets).",
-    )
-}
-
 /// Error for a `FROM <from> TO <to>` history-range clause on the within-ledger
-/// path. Distinct from [`cross_ledger_dataset_error`] because the clause names
-/// a time range, not a cross-ledger graph — reusing the graph-membership
-/// message there would misdescribe the rejection.
+/// path: the clause names a time range, not a graph of this ledger.
 fn history_range_dataset_error() -> ApiError {
-    ApiError::query(
+    ApiError::invalid_query(
         "SPARQL `FROM <from> TO <to>` is the Fluree history-range extension, not \
          a within-ledger dataset clause; issue it through the connection/history \
          query path.",

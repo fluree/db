@@ -336,12 +336,9 @@ async fn stream_query_inner(
                 );
                 crate::routes::query::ledger_scoped_sparql_dataset_spec(&ledger, dc, None)?
             } else {
-                let mut spec = fluree_db_api::DatasetSpec::new();
-                spec.default_graphs.push(
-                    fluree_db_api::GraphSource::new(&ledger)
-                        .with_graph(fluree_db_api::dataset::GraphSelector::Default),
-                );
-                spec
+                fluree_db_api::DatasetSpec::new().with_default(fluree_db_api::GraphSource::ledger(
+                    fluree_db_api::LedgerRef::parse(&ledger)?,
+                ))
             };
             // Ensure the head is fresh before view loading (shared storage).
             if !state.config.is_proxy_storage_mode() {

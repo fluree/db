@@ -590,10 +590,7 @@ pub async fn run(
                 let timer = Instant::now();
                 let bytes = match at {
                     Some(at_str) => {
-                        if fluree_db_api::sparql_dataset_ledger_ids(&content)
-                            .map(|v| !v.is_empty())
-                            .unwrap_or(false)
-                        {
+                        if fluree_db_api::sparql_has_dataset_clause(&content) {
                             return Err(CliError::Usage(
                                 "SPARQL query already contains FROM/FROM NAMED; \
                                  for remote time travel, encode time travel in the FROM IRI \
@@ -646,10 +643,7 @@ pub async fn run(
                     // same-ledger FROM with time travel (see the
                     // explain-time-travel fix). Queries with their own
                     // FROM/FROM NAMED must encode time travel there.
-                    if fluree_db_api::sparql_dataset_ledger_ids(&content)
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false)
-                    {
+                    if fluree_db_api::sparql_has_dataset_clause(&content) {
                         return Err(CliError::Usage(
                             "SPARQL query already contains FROM/FROM NAMED; \
                              for remote time travel, encode time travel in the FROM IRI \
@@ -703,10 +697,7 @@ pub async fn run(
                     // resolution. We inject a single FROM before WHERE for
                     // the common SELECT shape; queries with their own
                     // FROM/FROM NAMED must encode time travel there.
-                    if fluree_db_api::sparql_dataset_ledger_ids(&content)
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false)
-                    {
+                    if fluree_db_api::sparql_has_dataset_clause(&content) {
                         return Err(CliError::Usage(
                             "SPARQL query already contains FROM/FROM NAMED; \
                              for remote time travel, encode time travel in the FROM IRI \
@@ -1190,10 +1181,7 @@ fn inject_remote_time_travel_sparql(
     remote_alias: &str,
     at_str: &str,
 ) -> CliResult<String> {
-    if fluree_db_api::sparql_dataset_ledger_ids(sparql)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
+    if fluree_db_api::sparql_has_dataset_clause(sparql) {
         return Err(CliError::Usage(
             "SPARQL query already contains FROM/FROM NAMED; \
              for remote time travel, encode time travel in the FROM IRI \
@@ -1312,11 +1300,7 @@ async fn run_local_ndjson_stream_dataset(
             // that already carry their own FROM/FROM NAMED — the dataset
             // spec we'd build would conflict with the in-query clauses, and
             // the remote `--at` path makes the same call.
-            if at.is_some()
-                && fluree_db_api::sparql_dataset_ledger_ids(content)
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-            {
+            if at.is_some() && fluree_db_api::sparql_has_dataset_clause(content) {
                 return Err(CliError::Usage(
                     "SPARQL query already contains FROM/FROM NAMED; \
                      for time travel, encode it in the FROM IRI \
@@ -1324,7 +1308,8 @@ async fn run_local_ndjson_stream_dataset(
                         .to_string(),
                 ));
             }
-            let mut source = fluree_db_api::GraphSource::new(alias);
+            let mut source = fluree_db_api::GraphSource::parse(alias)
+                .map_err(|e| CliError::Usage(e.to_string()))?;
             if let Some(spec) = time_spec {
                 source = source.with_time(spec);
             }

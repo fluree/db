@@ -307,7 +307,7 @@ impl Fluree {
             options.server_identity.as_ref(),
         )?;
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing ledger specification in connection query",
             ));
         }
@@ -337,7 +337,7 @@ impl Fluree {
         let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
         let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
             ));
         }

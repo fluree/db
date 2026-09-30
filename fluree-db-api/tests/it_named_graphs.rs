@@ -1561,12 +1561,18 @@ async fn test_unknown_named_graph_error() {
                 "where": {"@id": "?s", "ex:name": "?name"}
             });
 
-            let result = fluree.query_connection(&query).await;
-            assert!(result.is_err(), "should error on unknown named graph");
-            let err_msg = format!("{}", result.unwrap_err());
+            let err = fluree
+                .query_connection(&query)
+                .await
+                .expect_err("should error on unknown named graph");
+            // A graph the ledger does not have is the caller's to fix: a 404
+            // naming the graph, not an internal error.
+            assert_eq!(err.status_code(), 404, "{err}");
+            let err_msg = err.to_string();
             assert!(
-                err_msg.contains("Unknown named graph"),
-                "error should mention unknown graph: {err_msg}"
+                err_msg.contains("Graph not found")
+                    && err_msg.contains("http://example.org/nonexistent"),
+                "error should name the unknown graph: {err_msg}"
             );
         })
         .await;
