@@ -118,6 +118,13 @@ JSON-LD update reuses the **same dataset keys as JSON-LD query** to control wher
 - **`from`**: scopes the default graph used for `where` evaluation (equivalent to SPARQL UPDATE `USING <iri>`)
 - **`fromNamed`**: restricts which named graphs are visible to `where` `["graph", ...]` patterns (equivalent to SPARQL UPDATE `USING NAMED <iri>`)
 
+Their values resolve in the ledger being updated, as SPARQL `USING` does: the
+ledger's own address (`"mydb:main"`, `"urn:fluree:mydb:main"`) names its default
+graph, `"mydb:main#config"` the config graph, and a registered graph IRI (a
+prefix the `@context` defines expands) that graph. A graph the ledger does not
+have contributes nothing, so the `where` binds nothing. Another ledger, or an
+address with a time pin, is refused with a 400.
+
 This is why JSON-LD update uses `from` rather than introducing new keywords: it matches the existing JSON-LD query language vocabulary and keeps dataset configuration consistent across read-only queries and updates.
 
 ### `from` (WHERE default graph)

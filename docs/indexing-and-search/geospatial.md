@@ -319,7 +319,7 @@ PREFIX ex: <http://example.org/>
 PREFIX fluree: <https://ns.flur.ee/ledger#>
 
 SELECT ?place ?loc
-FROM <ledger:places:main?t=100>
+FROM <places:main@t:100>
 WHERE {
   ?place ex:location ?loc .
 }

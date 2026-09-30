@@ -804,20 +804,28 @@ For local Fluree ledger queries, use the `fluree:ledger:` scheme:
 |--------|-------------|----------------------|
 | `fluree:ledger:<name>` | Query ledger with default branch (main) | `<name>:main` |
 | `fluree:ledger:<name>:<branch>` | Query specific branch | `<name>:<branch>` |
+| `fluree:ledger:urn:fluree:<name>:<branch>` | The same, in the URN spelling | `<name>:<branch>` |
 
 Where:
 - `<name>` is the ledger name **without** the branch (e.g., `orders`, `acme/people`)
 - `<branch>` is the branch name (e.g., `main`, `dev`)
 - The full dataset ledger ID is always `<name>:<branch>` (e.g., `orders:main`, `acme/people:dev`)
 
-The endpoint is resolved by matching against the full `ledger_id` in the dataset.
+The endpoint must name a ledger that is **in the query's dataset** (a `FROM` or
+`FROM NAMED` member), or, for a query with no dataset clause, the ledger the
+query runs on. An endpoint naming any other ledger is refused with a 400
+("… not in this query's dataset; add it with FROM NAMED to query it"), and under
+`SERVICE SILENT` it contributes no rows. A SERVICE endpoint never loads a ledger
+on its own. The endpoint names a whole ledger, so it takes no time pin
+(`@t:…`) and no graph (`#…`): the member's time and graphs come from the
+dataset.
 
 **Examples:**
 
 ```sparql
-SERVICE <fluree:ledger:orders> { ... }         -- matches orders:main
-SERVICE <fluree:ledger:orders:main> { ... }    -- matches orders:main (explicit)
-SERVICE <fluree:ledger:orders:dev> { ... }     -- matches orders:dev
+SERVICE <fluree:ledger:orders> { ... }         # matches orders:main
+SERVICE <fluree:ledger:orders:main> { ... }    # matches orders:main (explicit)
+SERVICE <fluree:ledger:orders:dev> { ... }     # matches orders:dev
 ```
 
 ### SERVICE SILENT
@@ -836,7 +844,7 @@ WHERE {
 }
 ```
 
-If the `orders` ledger is not in the dataset or encounters an error, the query returns results with unbound `?order` values instead of failing.
+If the `orders` ledger is not in the dataset or encounters an error, the SERVICE block contributes no rows instead of failing the query.
 
 ### Variable Endpoints
 
@@ -1203,6 +1211,14 @@ SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
 - **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs. With `USING NAMED` and no `USING`, the `WHERE`’s default graph is empty.
 
 The ledger’s own address (`mydb`, `mydb:main` or `urn:fluree:mydb:main`, with no `#fragment` and no time pin) names the ledger’s default graph in `USING` and `WITH`. `WITH <mydb:main>` therefore reads and writes the default graph and never creates a named graph called `mydb:main`. Only these two clauses treat the address this way: a `GRAPH <iri>` block in a template or in the `WHERE`, `USING NAMED`, and an `INSERT DATA`/`DELETE DATA` quad resolve it like any other graph IRI. The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
+
+Each `USING`, `USING NAMED` or `WITH` IRI resolves in the ledger being updated,
+the same way a query's `FROM` does: the ledger's own address (`mydb`,
+`mydb:main`, `urn:fluree:mydb:main`) names its default graph, `mydb:main#config`
+or its URN names the config graph, and a registered graph IRI names that graph.
+A graph the ledger does not have contributes nothing, so `WHERE` over it binds
+nothing and the update changes nothing (SPARQL 1.1 Update §3.1.3). Another
+ledger's address, or an address with a time pin, is refused with a 400.
 
 ### Graph variables in templates
 
