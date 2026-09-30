@@ -65,8 +65,7 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     let binds = query
         .grouping
         .as_ref()
-        .and_then(Grouping::aggregation)
-        .map(|agg| agg.binds.as_slice())
+        .map(Grouping::bind_list)
         .unwrap_or(&[]);
     let mut required_bind_vars: Vec<Vec<VarId>> = Vec::with_capacity(binds.len());
     for (var, expr) in binds.iter().rev() {
@@ -254,9 +253,9 @@ mod tests {
                     output_var: VarId(3),
                 }])
                 .unwrap(),
-                binds: Vec::new(),
             }),
             having: None,
+            binds: Vec::new(),
         });
 
         let deps = compute_variable_deps(&query).unwrap();
@@ -281,15 +280,15 @@ mod tests {
                     output_var: VarId(2),
                 }])
                 .unwrap(),
-                binds: vec![(
-                    VarId(3),
-                    Expression::Call {
-                        func: crate::ir::Function::Ceil,
-                        args: vec![Expression::Var(VarId(2))],
-                    },
-                )],
             }),
             having: None,
+            binds: vec![(
+                VarId(3),
+                Expression::Call {
+                    func: crate::ir::Function::Ceil,
+                    args: vec![Expression::Var(VarId(2))],
+                },
+            )],
         });
 
         let deps = compute_variable_deps(&query).unwrap();
@@ -310,6 +309,7 @@ mod tests {
                 Expression::Var(VarId(1)),
                 Expression::Const(FlakeValue::Long(10)),
             )),
+            binds: Vec::new(),
         });
 
         let deps = compute_variable_deps(&query).unwrap();
@@ -485,9 +485,9 @@ mod tests {
                     output_var: VarId(2),
                 }])
                 .unwrap(),
-                binds: Vec::new(),
             }),
             having: None,
+            binds: Vec::new(),
         });
 
         let deps = compute_variable_deps(&query).unwrap();
@@ -521,15 +521,15 @@ mod tests {
                     output_var: VarId(2),
                 }])
                 .unwrap(),
-                binds: vec![(
-                    VarId(3),
-                    Expression::Call {
-                        func: crate::ir::Function::Ceil,
-                        args: vec![Expression::Var(VarId(2))],
-                    },
-                )],
             }),
             having: None,
+            binds: vec![(
+                VarId(3),
+                Expression::Call {
+                    func: crate::ir::Function::Ceil,
+                    args: vec![Expression::Var(VarId(2))],
+                },
+            )],
         });
         query.ordering = vec![SortSpec::asc(VarId(3))];
 
@@ -565,12 +565,12 @@ mod tests {
                     output_var: VarId(2),
                 }])
                 .unwrap(),
-                binds: Vec::new(),
             }),
             having: Some(Expression::gt(
                 Expression::Var(VarId(2)),
                 Expression::Const(FlakeValue::Long(5)),
             )),
+            binds: Vec::new(),
         });
 
         let deps = compute_variable_deps(&query).unwrap();

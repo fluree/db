@@ -3287,9 +3287,9 @@ mod tests {
                         function: AggregateFn::Avg(input, InputSemantics::List),
                         output_var: average,
                     }),
-                    binds: vec![],
                 }),
                 having: None,
+                binds: vec![],
             }),
         );
         let pipeline = Pattern::Subquery(

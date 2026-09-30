@@ -23,18 +23,16 @@ use std::sync::Arc;
 fn aggregation(aggregates: Vec<AggregateSpec>) -> Aggregation {
     Aggregation {
         aggregates: NonEmpty::try_from_vec(aggregates).expect("non-empty aggregates"),
-        binds: Vec::new(),
     }
 }
 
 fn explicit_grouping(by: Vec<VarId>, aggregates: Vec<AggregateSpec>) -> Grouping {
     Grouping::Explicit {
         group_by: NonEmpty::try_from_vec(by).expect("non-empty group_by"),
-        aggregation: NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
-            aggregates,
-            binds: Vec::new(),
-        }),
+        aggregation: NonEmpty::try_from_vec(aggregates)
+            .map(|aggregates| Aggregation { aggregates }),
         having: None,
+        binds: Vec::new(),
     }
 }
 
@@ -45,11 +43,10 @@ fn explicit_grouping_having(
 ) -> Grouping {
     Grouping::Explicit {
         group_by: NonEmpty::try_from_vec(by).expect("non-empty group_by"),
-        aggregation: NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
-            aggregates,
-            binds: Vec::new(),
-        }),
+        aggregation: NonEmpty::try_from_vec(aggregates)
+            .map(|aggregates| Aggregation { aggregates }),
         having: Some(having),
+        binds: Vec::new(),
     }
 }
 
@@ -57,6 +54,7 @@ fn implicit_grouping(aggregates: Vec<AggregateSpec>) -> Grouping {
     Grouping::Implicit {
         aggregation: aggregation(aggregates),
         having: None,
+        binds: Vec::new(),
     }
 }
 

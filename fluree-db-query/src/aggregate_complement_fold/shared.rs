@@ -41,11 +41,12 @@ fn average(sq: &SubqueryPattern) -> Option<Average<'_>> {
         group_by,
         aggregation: Some(agg),
         having: None,
+        binds: group_binds,
     }) = &sq.grouping
     else {
         return None;
     };
-    if group_by.len() != 1 || agg.aggregates.len() != 1 || !agg.binds.is_empty() {
+    if group_by.len() != 1 || agg.aggregates.len() != 1 || !group_binds.is_empty() {
         return None;
     }
     let key = *group_by.iter().next()?;
@@ -355,9 +356,9 @@ pub(super) fn fold(query: &mut Query) -> bool {
                         output_var: u_cnt,
                     },
                 ]),
-                binds: vec![],
             },
             having: None,
+            binds: vec![],
         });
     let without = b.output;
     let mut result = Vec::new();
@@ -438,9 +439,9 @@ mod tests {
                             function: AggregateFn::Avg(input, InputSemantics::List),
                             output_var: output,
                         }]),
-                        binds: vec![],
                     }),
                     having: None,
+                    binds: vec![],
                 })
         };
         let mut present = universe.clone();

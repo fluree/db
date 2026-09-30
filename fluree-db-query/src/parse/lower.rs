@@ -1225,9 +1225,8 @@ enum SelectExprPlacement {
 ///   - `Pre` otherwise.
 ///
 /// Both `lower_query` and `lower_subquery` call this and route the result by
-/// placement: `Pre` binds append to WHERE, `Post` binds ride inside the
-/// grouping's aggregation stage (applied by the shared `apply_solution_modifiers`
-/// tail).
+/// placement: `Pre` binds append to WHERE, `Post` binds ride in the grouping
+/// phase's `binds` (applied by the shared `apply_solution_modifiers` tail).
 fn lower_select_expr_bind<E: IriEncoder>(
     expr: &UnresolvedExpression,
     alias: &Arc<str>,
@@ -1349,7 +1348,7 @@ fn lower_subquery<E: IriEncoder>(
 
     // SELECT-expression binds split into pre-aggregation (appended to WHERE)
     // and post-aggregation (referencing an aggregate output or an earlier
-    // post-bind). Post-binds ride inside the grouping's aggregation stage and
+    // post-bind). Post-binds ride in the grouping phase's `binds` and
     // are applied by the shared `apply_solution_modifiers` tail — the same
     // channel the top-level SELECT uses, so subquery post-aggregation binds
     // now work identically.
@@ -1410,8 +1409,8 @@ fn lower_subquery<E: IriEncoder>(
     }
 
     // GROUP BY / aggregates / HAVING / post-aggregation binds (needed for
-    // subqueries used in filters/unions). Post-binds collected above ride inside
-    // the grouping's aggregation stage.
+    // subqueries used in filters/unions). Post-binds collected above ride in
+    // the grouping phase's `binds`.
     sq.grouping = lower_grouping(&subquery.options, vars, post_binds)?;
 
     Ok(sq)
@@ -2047,7 +2046,8 @@ fn lower_ordering(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Vec<SortS
 /// post-aggregation binds).
 ///
 /// `post_binds` are derived bindings that fire after every aggregate has
-/// been computed; they ride inside the resulting `Aggregation`. Both top-level
+/// been computed and HAVING has filtered the groups; they ride in the
+/// resulting `Grouping`'s `binds`. Both top-level
 /// and subquery callers populate them from post-aggregation SELECT expressions.
 fn lower_grouping(
     opts: &UnresolvedOptions,

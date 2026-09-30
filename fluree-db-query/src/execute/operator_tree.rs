@@ -595,8 +595,9 @@ fn extract_regex_const_pattern(
 /// inspect the spec's function/distinct/input_var fields.
 fn implicit_single_aggregate(query: &Query) -> Option<&AggregateSpec> {
     let Some(Grouping::Implicit {
-        aggregation: Aggregation { aggregates, binds },
+        aggregation: Aggregation { aggregates },
         having: None,
+        binds,
     }) = &query.grouping
     else {
         return None;
@@ -728,8 +729,9 @@ fn detect_predicate_group_by_object_count_topk(
     // GROUP BY ?object with exactly one aggregate, no HAVING.
     let Some(Grouping::Explicit {
         group_by,
-        aggregation: Some(Aggregation { aggregates, binds }),
+        aggregation: Some(Aggregation { aggregates }),
         having: None,
+        binds,
     }) = &query.grouping
     else {
         return None;
@@ -789,8 +791,9 @@ fn detect_group_by_object_star_topk(
     let select_vars: Arc<[VarId]> = Arc::from(query.output.projected_vars()?.into_boxed_slice());
     let Some(Grouping::Explicit {
         group_by,
-        aggregation: Some(Aggregation { aggregates, binds }),
+        aggregation: Some(Aggregation { aggregates }),
         having: None,
+        binds,
     }) = &query.grouping
     else {
         return None;
@@ -993,12 +996,11 @@ fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<st
     // shape that the outer SUM(STRLEN(?cat)) fast-path is keyed against.
     let Some(Grouping::Explicit {
         group_by: sq_group_by,
-        aggregation:
-            Some(Aggregation {
-                aggregates: sq_aggregates,
-                binds: sq_binds,
-            }),
+        aggregation: Some(Aggregation {
+            aggregates: sq_aggregates,
+        }),
         having: None,
+        binds: sq_binds,
     }) = &sq.grouping
     else {
         return None;
@@ -1744,8 +1746,9 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
     // aggregate, no HAVING.
     let Some(Grouping::Explicit {
         group_by,
-        aggregation: Some(Aggregation { aggregates, binds }),
+        aggregation: Some(Aggregation { aggregates }),
         having: None,
+        binds,
     }) = &query.grouping
     else {
         return None;
@@ -4633,9 +4636,9 @@ mod tests {
                         },
                     ])
                     .unwrap(),
-                    binds: Vec::new(),
                 },
                 having: None,
+                binds: Vec::new(),
             })
         };
         let counted_first = Query {
@@ -4738,9 +4741,9 @@ mod tests {
                         },
                     ])
                     .unwrap(),
-                    binds: Vec::new(),
                 },
                 having: None,
+                binds: Vec::new(),
             }),
             ordering: Vec::new(),
             order_binds: Vec::new(),
@@ -4814,9 +4817,9 @@ mod tests {
                         },
                     ])
                     .unwrap(),
-                    binds: Vec::new(),
                 },
                 having: None,
+                binds: Vec::new(),
             }),
             ordering: Vec::new(),
             order_binds: Vec::new(),
@@ -4873,9 +4876,9 @@ mod tests {
                         },
                     ])
                     .unwrap(),
-                    binds: Vec::new(),
                 },
                 having: None,
+                binds: Vec::new(),
             }),
             ordering: Vec::new(),
             order_binds: Vec::new(),

@@ -81,8 +81,9 @@ pub enum AggregateFn {
     Sample(VarId),
     /// `collect(?x)` / `collect(DISTINCT ?x)` (Cypher) — gather every
     /// non-Unbound value of a variable into a list. Produces a
-    /// `Binding::Grouped` (the list carrier the JSON-LD formatter already
-    /// renders as a JSON array). No SPARQL surface; lowered only from Cypher.
+    /// `Binding::List` (a real list value, not the internal per-group
+    /// `Binding::Grouped` carrier). No SPARQL surface; lowered only from
+    /// Cypher.
     Collect(VarId, InputSemantics),
 }
 
@@ -202,28 +203,25 @@ pub struct AggregateSpec {
     pub output_var: VarId,
 }
 
-/// The aggregation stage of a grouping phase: aggregate functions computed
-/// per group, plus any derived bindings that depend on the aggregate outputs.
-///
-/// `binds` may reference aggregate output variables; they fire after every
-/// aggregate has been computed and before HAVING is evaluated. Empty `binds`
-/// means no derived bindings; `aggregates` is `NonEmpty` because an
-/// aggregation stage with nothing to compute would be meaningless.
+/// The aggregation stage of a grouping phase: the aggregate functions
+/// computed per group. `aggregates` is `NonEmpty` because an aggregation
+/// stage with nothing to compute would be meaningless.
 #[derive(Debug, Clone)]
 pub struct Aggregation {
     /// Aggregate specs computed per group.
     pub aggregates: NonEmpty<AggregateSpec>,
-    /// Derived bindings computed from aggregate outputs.
-    pub binds: Vec<(VarId, Expression)>,
 }
 
 /// The grouping phase of a query: how solutions partition into groups, what
-/// aggregates compute over each group, and whether to filter the resulting
-/// groups.
+/// aggregates compute over each group, which groups survive, and what each
+/// surviving group row binds afterwards.
 ///
 /// `Query.grouping` is `Option<Grouping>`; `None` means the query has no
 /// grouping phase. The two variants distinguish whether the partition
 /// criterion was stated by the user.
+///
+/// Stage order, as the executor runs it (SPARQL 1.1 §18.2.4): group, compute
+/// the aggregates, filter by `having`, then evaluate `binds` in order.
 ///
 /// # Invariants
 ///
@@ -234,8 +232,11 @@ pub struct Aggregation {
 /// - `Explicit::aggregation` is `Option<Aggregation>` — `None` represents
 ///   a deduplicating GROUP BY (`SELECT ?g WHERE { ... } GROUP BY ?g`
 ///   produces distinct values of `?g` with no per-group computations).
-/// - `Aggregation::binds` only exist when an aggregation stage is present,
-///   so they cannot accidentally accompany a dedup-only Explicit grouping.
+/// - `binds` are the per-group `Extend`s (§18.2.4.4): they run after
+///   `having` and read only group keys, aggregate outputs and the outputs of
+///   earlier binds. They belong to the grouping phase whether or not an
+///   aggregation stage exists — a dedup-only `GROUP BY ?a` projecting
+///   `(IF(?a …) AS ?seg)` needs one.
 /// - `having` contains no aggregate-function calls. Aggregates that
 ///   appeared inside the surface HAVING expression have been lifted into
 ///   `aggregation.aggregates` with synthetic output variables, and the
@@ -250,6 +251,8 @@ pub enum Grouping {
     Implicit {
         aggregation: Aggregation,
         having: Option<Expression>,
+        /// Per-group `Extend`s, run after `having` (see the type docs).
+        binds: Vec<(VarId, Expression)>,
     },
     /// Solutions partitioned by the values of `group_by`. Carries an
     /// optional `aggregation` stage; with no aggregation, partitioning
@@ -258,6 +261,8 @@ pub enum Grouping {
         group_by: NonEmpty<VarId>,
         aggregation: Option<Aggregation>,
         having: Option<Expression>,
+        /// Per-group `Extend`s, run after `having` (see the type docs).
+        binds: Vec<(VarId, Expression)>,
     },
 }
 
@@ -265,8 +270,8 @@ impl Grouping {
     /// Assemble a grouping phase from the loose pieces produced by lowering.
     ///
     /// Returns `None` when there is no grouping phase to build (no `GROUP BY`,
-    /// no aggregates, no post-aggregation binds). Otherwise selects the variant
-    /// that satisfies the type-level invariants:
+    /// no aggregates). Otherwise selects the variant that satisfies the
+    /// type-level invariants:
     ///   - `Explicit` when `group_by` is non-empty (regardless of whether an
     ///     aggregation stage is present — `GROUP BY` alone deduplicates by key).
     ///   - `Implicit` when there's no `GROUP BY` but at least one aggregate.
@@ -280,17 +285,19 @@ impl Grouping {
         having: Option<Expression>,
     ) -> Option<Self> {
         let aggregation =
-            NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation { aggregates, binds });
+            NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation { aggregates });
         if let Some(group_by) = NonEmpty::try_from_vec(group_by) {
             Some(Self::Explicit {
                 group_by,
                 aggregation,
                 having,
+                binds,
             })
         } else {
             aggregation.map(|aggregation| Self::Implicit {
                 aggregation,
                 having,
+                binds,
             })
         }
     }
@@ -330,13 +337,18 @@ impl Grouping {
             .flat_map(|agg| agg.aggregates.iter())
     }
 
-    /// Iterate over the post-aggregation bind expressions for this grouping
-    /// phase (`(VarId, Expression)` pairs). Empty when there's no
-    /// aggregation stage.
+    /// The per-group `Extend`s of this grouping phase, in evaluation order
+    /// (`(VarId, Expression)` pairs). They run after HAVING, with or without
+    /// an aggregation stage.
     pub fn binds(&self) -> impl Iterator<Item = &(VarId, Expression)> {
-        self.aggregation()
-            .into_iter()
-            .flat_map(|agg| agg.binds.iter())
+        self.bind_list().iter()
+    }
+
+    /// The per-group `Extend`s as a slice (see [`Self::binds`]).
+    pub fn bind_list(&self) -> &[(VarId, Expression)] {
+        match self {
+            Self::Implicit { binds, .. } | Self::Explicit { binds, .. } => binds,
+        }
     }
 
     /// Rename every occurrence of variable `old` to `new` across GROUP BY keys,
@@ -348,20 +360,22 @@ impl Grouping {
                 *v = new;
             }
         };
-        let (aggregation, having) = match self {
+        let (aggregation, having, binds) = match self {
             Self::Implicit {
                 aggregation,
                 having,
-            } => (Some(aggregation), having),
+                binds,
+            } => (Some(aggregation), having, binds),
             Self::Explicit {
                 group_by,
                 aggregation,
                 having,
+                binds,
             } => {
                 for v in group_by.iter_mut() {
                     rename(v);
                 }
-                (aggregation.as_mut(), having)
+                (aggregation.as_mut(), having, binds)
             }
         };
         if let Some(agg) = aggregation {
@@ -369,10 +383,10 @@ impl Grouping {
                 spec.function.substitute_var(old, new);
                 rename(&mut spec.output_var);
             }
-            for (var, expr) in &mut agg.binds {
-                rename(var);
-                expr.substitute_var(old, new);
-            }
+        }
+        for (var, expr) in binds {
+            rename(var);
+            expr.substitute_var(old, new);
         }
         if let Some(expr) = having {
             expr.substitute_var(old, new);
