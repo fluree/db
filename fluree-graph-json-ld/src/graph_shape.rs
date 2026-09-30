@@ -113,10 +113,38 @@ pub fn doc_shape(obj: &Map<String, Value>) -> Result<DocShape> {
     let Some(graph) = obj.get("@graph") else {
         return Ok(DocShape::Node);
     };
+    let has_id = obj.contains_key("@id");
+    if is_envelope_graph(graph, has_id)? {
+        return Ok(DocShape::Envelope);
+    }
     match classify_graph_value(graph) {
-        GraphValue::Content(_) if obj.contains_key("@id") => Ok(DocShape::NamedGraph),
-        GraphValue::Content(_) => Ok(DocShape::Envelope),
+        GraphValue::Content(_) => Ok(DocShape::NamedGraph),
         GraphValue::Selector(_) => Ok(DocShape::Node),
+        GraphValue::Invalid(reason) => Err(JsonLdError::InvalidGraphValue { reason }),
+    }
+}
+
+/// Whether a top-level object with this `@graph` value is an envelope (a
+/// default-graph wrapper): it has no `@id`, and the value is node content. At
+/// the top level any array of node objects is content, a one-element array
+/// of a bare `{"@id"}` included: every reader has always taken
+/// `{"@graph": [...]}` to be an envelope. (Below the top level that
+/// one-element form is a graph selector.)
+pub fn is_envelope_graph(graph: &Value, has_id: bool) -> Result<bool> {
+    if has_id {
+        return Ok(false);
+    }
+    if let Value::Array(items) = graph {
+        if items
+            .iter()
+            .all(|item| matches!(item, Value::Object(map) if !is_value_like(map)))
+        {
+            return Ok(true);
+        }
+    }
+    match classify_graph_value(graph) {
+        GraphValue::Content(_) => Ok(true),
+        GraphValue::Selector(_) => Ok(false),
         GraphValue::Invalid(reason) => Err(JsonLdError::InvalidGraphValue { reason }),
     }
 }
@@ -195,6 +223,22 @@ mod tests {
         assert_eq!(
             shape(json!({"@id": "ex:G", "@graph": [{"@id": "ex:a", "ex:p": 1}]})),
             DocShape::NamedGraph
+        );
+        // At the top level a one-element array of a bare node is still an
+        // envelope; with an `@id` the same value is a selector.
+        assert_eq!(
+            shape(json!({"@graph": [{"@id": "ex:a"}], "ex:m": 1})),
+            DocShape::Envelope
+        );
+        assert_eq!(
+            shape(json!({"@id": "ex:s", "@graph": [{"@id": "ex:g"}]})),
+            DocShape::Node
+        );
+        // A single property-bearing object without an `@id` is an envelope
+        // (solo's MCP single-node form carries txn-meta beside it).
+        assert_eq!(
+            shape(json!({"@graph": {"@id": "ex:a", "ex:p": 1}, "f:message": "m"})),
+            DocShape::Envelope
         );
         // A single object with a string selector is a node, never an envelope.
         assert_eq!(

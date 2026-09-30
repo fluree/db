@@ -4,9 +4,12 @@
 //! Both produce the same `Vec<TxnMetaEntry>` and are merged by
 //! [`extract_txn_meta`].
 //!
-//! # 1. Envelope form (`@graph` present)
+//! # 1. Envelope form (`@graph` holding node objects, no top-level `@id`)
 //!
-//! Top-level non-reserved keys are metadata; `@graph` contents are data.
+//! Top-level non-reserved keys are metadata; `@graph` contents are data. A
+//! single node with a graph selector (`"@graph": "<iri>"`) and a JSON-LD
+//! named graph (`{"@id": G, "@graph": [...]}`) are not envelopes: their other
+//! keys are data (see `fluree_graph_json_ld::doc_shape`).
 //!
 //! ```json
 //! {
@@ -101,8 +104,9 @@ const RESERVED_KEYS: &[&str] = &[
 ///    metadata. Works for any transaction shape (insert/upsert/update). The
 ///    block may carry its own `@context`; otherwise it inherits the outer
 ///    context.
-/// 2. **Envelope form**: when `@graph` is present, top-level non-reserved
-///    keys are also treated as metadata.
+/// 2. **Envelope form**: when the document is an envelope (`@graph` holding
+///    node objects, no top-level `@id`), top-level non-reserved keys are also
+///    treated as metadata.
 ///
 /// Both forms run through the same predicate validation (Fluree-namespace
 /// allowlist — only `f:message` and `f:author` permitted in `f:`).
@@ -157,8 +161,11 @@ pub fn extract_txn_meta(
         }
     }
 
-    // Envelope form: top-level non-reserved keys when @graph is present.
-    if obj.contains_key("@graph") {
+    // Envelope form: top-level non-reserved keys, only when the document is
+    // an envelope (`@graph` node content, no `@id`). The keys beside a graph
+    // selector on a single node, or beside a JSON-LD named graph's content,
+    // are that node's data, not metadata.
+    if fluree_graph_json_ld::doc_shape(obj)? == fluree_graph_json_ld::DocShape::Envelope {
         for (key, value) in obj {
             if key.starts_with('@') || RESERVED_KEYS.contains(&key.as_str()) {
                 continue;
@@ -488,10 +495,12 @@ mod tests {
         let mut ns = test_registry();
         let ctx = empty_context();
 
+        // (An `@id` beside `@graph` content makes the document a JSON-LD
+        // named graph, not an envelope; see
+        // `named_graph_object_keys_are_data_not_txn_meta`.)
         let json = json!({
             "@context": {},
             "@graph": [],
-            "@id": "ignored",
             "@type": "ignored",
             "@base": "ignored",
             "@vocab": "ignored",
@@ -501,6 +510,63 @@ mod tests {
         let result = extract_txn_meta(&json, &ctx, &mut ns, true).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].predicate_name, "keep");
+    }
+
+    /// P10e: a single node carrying a graph selector is not an envelope. Its
+    /// other keys are its data; they used to be written as data and ALSO as
+    /// transaction metadata.
+    #[test]
+    fn single_object_with_graph_selector_has_no_txn_meta() {
+        let mut ns = test_registry();
+        for selector in [
+            json!("http://example.org/g"),
+            json!({"@id": "http://example.org/g"}),
+        ] {
+            let json = json!({
+                "@id": "http://example.org/s",
+                "@graph": selector,
+                "http://example.org/p": 1
+            });
+            let result = extract_txn_meta(&json, &empty_context(), &mut ns, true).unwrap();
+            assert!(result.is_empty(), "{json}: {result:?}");
+        }
+    }
+
+    /// A JSON-LD 1.1 named graph's other keys are properties of the graph
+    /// node (data), not transaction metadata.
+    #[test]
+    fn named_graph_object_keys_are_data_not_txn_meta() {
+        let mut ns = test_registry();
+        let json = json!({
+            "@id": "http://example.org/G",
+            "@graph": [{"@id": "http://example.org/a", "http://example.org/p": 1}],
+            "http://example.org/label": "w"
+        });
+        let result = extract_txn_meta(&json, &empty_context(), &mut ns, true).unwrap();
+        assert!(result.is_empty(), "{result:?}");
+    }
+
+    /// solo's MCP write sends one property-bearing node as the `@graph` value
+    /// (an object, not an array) with the commit metadata beside it. That is
+    /// an envelope: the siblings stay transaction metadata.
+    #[test]
+    fn single_node_envelope_keeps_its_txn_meta() {
+        let mut ns = test_registry();
+        let ctx = fluree_graph_json_ld::parse_context(&json!({
+            "f": "https://ns.flur.ee/db#",
+            "ex": "http://example.org/"
+        }))
+        .unwrap();
+        let json = json!({
+            "@graph": {"@id": "ex:a", "ex:p": 1},
+            "f:message": "from the assistant",
+            "f:author": "did:example:agent",
+            "ex:batch": 7
+        });
+        let result = extract_txn_meta(&json, &ctx, &mut ns, true).unwrap();
+        let mut names: Vec<&str> = result.iter().map(|e| e.predicate_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["author", "batch", "message"]);
     }
 
     #[test]

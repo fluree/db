@@ -214,10 +214,17 @@ pub fn parse_graph_insert(
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
 ) -> Result<Txn> {
-    let explicitly_empty = json
-        .get("@graph")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty);
+    // `{"@graph": []}`: an envelope with no nodes. (With an `@id` the same
+    // value is an empty JSON-LD named graph, which a graph write refuses.)
+    let explicitly_empty = json.as_object().is_some_and(|obj| {
+        matches!(
+            fluree_graph_json_ld::doc_shape(obj),
+            Ok(fluree_graph_json_ld::DocShape::Envelope)
+        ) && obj
+            .get("@graph")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    });
     let mut txn = if explicitly_empty {
         let mut txn = Txn::insert().with_opts(opts);
         if let GraphName::Iri(iri) = request_graph_name(graph)? {
@@ -892,6 +899,35 @@ impl<'a> TemplateParseCtx<'a> {
         }
     }
 
+    /// The scope of a JSON-LD named graph's content: the graph the owning
+    /// node's (expanded) `@id` names. The name must be an IRI: Fluree has no
+    /// blank-node graph names, a variable cannot name one, and a graph object
+    /// without an `@id` is only meaningful as the top-level envelope. The
+    /// name is checked even for empty content; `None` then, so an empty graph
+    /// is not registered as a write target.
+    fn named_graph_scope(&mut self, id: Option<&Value>, empty: bool) -> Result<Option<GraphScope>> {
+        let Some(Value::String(iri)) = id else {
+            return Err(TransactError::Parse(
+                "a node object with `@graph` content is a JSON-LD named graph and needs an `@id` \
+                 naming the graph; only the top-level envelope may omit it"
+                    .to_string(),
+            ));
+        };
+        if iri.starts_with("_:") || iri.starts_with('?') {
+            return Err(TransactError::Parse(format!(
+                "a JSON-LD named graph must be named by an IRI, not {iri:?}"
+            )));
+        }
+        if self.fixed_root.is_some() {
+            return Err(TransactError::Parse(
+                "payload must not address named graphs; the target graph is given by the request"
+                    .to_string(),
+            ));
+        }
+        let name = named_graph(iri, iri)?;
+        Ok((!empty).then(|| self.write_graphs.scope(name)))
+    }
+
     /// The scope a graph selector written in this clause opens.
     fn selector_scope(&mut self, raw: &str) -> Result<GraphScope> {
         let name = self.resolve_graph_name(raw, self.role)?;
@@ -1022,7 +1058,12 @@ fn strip_opts_for_expansion<'a>(
     use super::RESERVED_TXN_KEYS;
     match json.as_object() {
         Some(obj) if RESERVED_TXN_KEYS.iter().any(|k| obj.contains_key(*k)) => {
-            let is_envelope = obj.contains_key("@graph");
+            // Only an envelope's top-level keys are metadata; a single node
+            // (graph selector or not) and a named graph hold data there.
+            let is_envelope = matches!(
+                fluree_graph_json_ld::doc_shape(obj),
+                Ok(fluree_graph_json_ld::DocShape::Envelope)
+            );
             if !is_envelope {
                 if let Some(k) = RESERVED_TXN_KEYS
                     .iter()
@@ -1365,6 +1406,10 @@ fn parse_expanded_object_with_ctx(
         .as_object()
         .ok_or_else(|| TransactError::Parse("Expected expanded object".to_string()))?;
 
+    // A JSON-LD 1.1 named graph (`{"@id": G, "@graph": [nodes]}`): the node's
+    // own properties stay in the enclosing scope, and the content nodes are
+    // written to the graph its `@id` names (after the properties, below).
+    let mut named_graph_content: Option<&[Value]> = None;
     let own_scope: GraphScope;
     let scope: &GraphScope = match obj.get("@graph").map(classify_graph_value) {
         None => scope,
@@ -1373,20 +1418,8 @@ fn parse_expanded_object_with_ctx(
             &own_scope
         }
         Some(GraphValue::Content(nodes)) => {
-            // Named-graph content is not parsed yet: as before, the first
-            // content node's `@id` is read as this node's graph selector and
-            // the content itself is not written.
-            match nodes
-                .first()
-                .and_then(|n| n.get("@id"))
-                .and_then(Value::as_str)
-            {
-                Some(raw) => {
-                    own_scope = ctx.selector_scope(raw)?;
-                    &own_scope
-                }
-                None => scope,
-            }
+            named_graph_content = Some(nodes);
+            scope
         }
         Some(GraphValue::Invalid(why)) => return Err(TransactError::Parse(why.to_string())),
     };
@@ -1458,6 +1491,14 @@ fn parse_expanded_object_with_ctx(
                 parsed_value.dtc,
                 parsed_value.list_index,
             );
+        }
+    }
+
+    if let Some(nodes) = named_graph_content {
+        if let Some(graph) = ctx.named_graph_scope(obj.get("@id"), nodes.is_empty())? {
+            for node in nodes {
+                parse_expanded_object_with_ctx(node, &graph, ctx, out)?;
+            }
         }
     }
 
@@ -3314,5 +3355,169 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("must not address named graphs"), "{err}");
+    }
+
+    // ---------------------------------------------------------------------
+    // JSON-LD 1.1 named-graph objects: `{"@id": G, "@graph": [nodes]}`.
+    // ---------------------------------------------------------------------
+
+    const NG: &str = "http://example.org/NG";
+
+    /// The graph of the template whose predicate ends with `local`.
+    fn graph_of_pred(txn: &Txn, local: &str) -> TemplateGraph {
+        let hits: Vec<&TripleTemplate> = txn
+            .insert_templates
+            .iter()
+            .filter(|t| matches!(&t.predicate, TemplateTerm::Sid(s) if &*s.name == local))
+            .collect();
+        assert_eq!(hits.len(), 1, "one ex:{local} template: {hits:?}");
+        hits[0].graph.clone()
+    }
+
+    /// P6a: the owner's own properties stay in the enclosing graph; the
+    /// content goes to the graph the owner names.
+    #[test]
+    fn named_graph_object_single() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:NG",
+            "ex:label": "w",
+            "@graph": [{"@id": "ex:a", "ex:p": 1}, {"ex:q": 2}]
+        });
+        let txn = parse_doc(&doc, TxnType::Insert).unwrap();
+        assert_eq!(graph_of_pred(&txn, "label"), TemplateGraph::Default);
+        assert_eq!(graph_of_pred(&txn, "p"), in_graph(NG));
+        assert_eq!(graph_of_pred(&txn, "q"), in_graph(NG));
+        assert!(txn.txn_meta.is_empty(), "a named graph's keys are data");
+        assert_eq!(txn.write_graphs.iter().collect::<Vec<_>>(), vec![NG]);
+    }
+
+    /// P6b: a named graph inside an envelope. Its content used to be read as
+    /// the owner's graph *selector* (the first content node's `@id`) and
+    /// dropped.
+    #[test]
+    fn named_graph_object_in_envelope() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "ex:plain", "ex:r": 0},
+                {"@id": "ex:NG", "@graph": [{"@id": "ex:a", "ex:p": 1}]}
+            ]
+        });
+        let txn = parse_doc(&doc, TxnType::Insert).unwrap();
+        assert_eq!(graph_of_pred(&txn, "r"), TemplateGraph::Default);
+        assert_eq!(graph_of_pred(&txn, "p"), in_graph(NG));
+    }
+
+    /// Named graphs nest: each node's content goes to the innermost graph
+    /// that names it, and the dataset stays flat.
+    #[test]
+    fn named_graph_object_nested() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{
+                "@id": "ex:NG",
+                "@graph": [
+                    {"@id": "ex:NG2", "ex:label": "inner", "@graph": [{"@id": "ex:b", "ex:q": 2}]},
+                    {"@id": "ex:a", "ex:p": 1}
+                ]
+            }]
+        });
+        let txn = parse_doc(&doc, TxnType::Insert).unwrap();
+        assert_eq!(graph_of_pred(&txn, "p"), in_graph(NG));
+        assert_eq!(
+            graph_of_pred(&txn, "label"),
+            in_graph(NG),
+            "NG2's own data is in NG"
+        );
+        assert_eq!(graph_of_pred(&txn, "q"), in_graph("http://example.org/NG2"));
+    }
+
+    /// A named graph as a property value: the link is in the current scope,
+    /// the content in the named graph.
+    #[test]
+    fn named_graph_object_as_property_value() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "ex:source": {"@id": "ex:NG", "@graph": [{"@id": "ex:a", "ex:p": 1}]}
+        });
+        let txn = parse_doc(&doc, TxnType::Insert).unwrap();
+        assert_eq!(graph_of_pred(&txn, "source"), TemplateGraph::Default);
+        assert_eq!(graph_of_pred(&txn, "p"), in_graph(NG));
+    }
+
+    /// The object form with properties is content too: `ex:g9`'s statement
+    /// is in the graph `ex:o` names, and `ex:o`'s own statement is in the
+    /// enclosing graph. It used to write `ex:o ex:q 2` into `ex:g9` and drop
+    /// `ex:g9 ex:p 1`.
+    #[test]
+    fn object_form_graph_with_properties_is_content() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "ex:o", "@graph": {"@id": "ex:g9", "ex:p": 1}, "ex:q": 2}]
+        });
+        let txn = parse_doc(&doc, TxnType::Insert).unwrap();
+        assert_eq!(graph_of_pred(&txn, "q"), TemplateGraph::Default);
+        assert_eq!(graph_of_pred(&txn, "p"), in_graph("http://example.org/o"));
+    }
+
+    #[test]
+    fn named_graph_object_blank_or_anonymous_name_rejected() {
+        for doc in [
+            // blank-node graph name
+            json!({"@id": "_:g", "@graph": [{"@id": "http://example.org/a", "http://example.org/p": 1}]}),
+            // a graph object without `@id` below the top level
+            json!({"@id": "http://example.org/s", "http://example.org/p": {"@graph": [{"@id": "http://example.org/a", "http://example.org/q": 1}]}}),
+        ] {
+            let err = parse_doc(&doc, TxnType::Insert).unwrap_err().to_string();
+            assert!(err.starts_with("Parse error: "), "{doc}: {err}");
+        }
+        // A variable cannot name one either, even in update templates.
+        let update = json!({
+            "where": [{"@id": "?s", "http://example.org/p": "?o"}],
+            "insert": {"@id": "?g", "@graph": [{"@id": "?s", "http://example.org/q": 1}]}
+        });
+        let err = parse_doc(&update, TxnType::Update).unwrap_err().to_string();
+        assert!(err.starts_with("Parse error: "), "{err}");
+    }
+
+    /// Graph insert / sync: the request names the graph; a named-graph object
+    /// in the payload is refused, even one naming the request's own graph.
+    #[test]
+    fn graph_insert_refuses_named_graph_objects() {
+        let target = GraphSel::Graph(NG.to_string());
+        let mut ns = test_registry();
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:NG",
+            "@graph": [{"@id": "ex:a", "ex:p": 1}]
+        });
+        let err = parse_graph_insert(&doc, &target, TxnOpts::default(), &mut ns, TEST_LEDGER)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not address named graphs"), "{err}");
+
+        // `{"@id": G, "@graph": []}` is an empty named graph, not the
+        // explicitly empty envelope a sync may clear a graph with.
+        let empty_named = json!({"@id": NG, "@graph": []});
+        assert!(parse_graph_insert(
+            &empty_named,
+            &target,
+            TxnOpts::default(),
+            &mut ns,
+            TEST_LEDGER
+        )
+        .is_err());
+        let empty_envelope = json!({"@graph": []});
+        let txn = parse_graph_insert(
+            &empty_envelope,
+            &target,
+            TxnOpts::default(),
+            &mut ns,
+            TEST_LEDGER,
+        )
+        .unwrap();
+        assert!(txn.insert_templates.is_empty());
     }
 }
