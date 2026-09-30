@@ -863,6 +863,9 @@ fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
 /// write. Replay takes it too: a writer in per-write mode on the same root
 /// may be publishing the same head, and a replayed transition must not land
 /// on top of a newer one.
+///
+/// The lock is a separate `.lock` file because writes replace the data file by rename.
+/// A rename gives the data file a new inode, and a lock on the old inode would not cover it.
 pub(super) fn key_lock(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2321,8 +2324,9 @@ mod tests {
         }
         let before = log.fsyncs_issued();
         let oversized = vec![b'x'; MAX_RECORD_BYTES + 1];
+        let published = oversized.clone();
         storage
-            .compare_and_swap(head, |_| Ok(CasAction::Write::<()>(oversized.clone())))
+            .compare_and_swap(head, move |_| Ok(CasAction::Write::<()>(published.clone())))
             .await
             .unwrap();
         assert!(
