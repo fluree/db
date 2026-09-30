@@ -374,6 +374,39 @@ impl<'a> DataSet<'a> {
         false
     }
 
+    /// The member a SERVICE naming `ledger_id` reads, chosen the same way on
+    /// every run: the ledger's first default graph, else its named member
+    /// first in name order (named members are held in a map, whose order is
+    /// not). When the dataset holds the ledger at more than one time the
+    /// endpoint does not say which to read: `Err` carries two of the times.
+    pub fn service_member(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<Option<&GraphRef<'a>>, (i64, i64)> {
+        let of_ledger = |graph: &&GraphRef<'a>| graph.ledger_id.as_ref() == ledger_id;
+        let mut times: Option<(i64, i64)> = None;
+        for graph in self
+            .default_graphs
+            .iter()
+            .chain(self.named_graphs.values())
+            .filter(of_ledger)
+        {
+            let (low, high) = times.get_or_insert((graph.to_t, graph.to_t));
+            *low = (*low).min(graph.to_t);
+            *high = (*high).max(graph.to_t);
+        }
+        if let Some((low, high)) = times.filter(|(low, high)| low != high) {
+            return Err((low, high));
+        }
+        Ok(self.default_graphs.iter().find(of_ledger).or_else(|| {
+            self.named_graphs
+                .iter()
+                .filter(|(_, graph)| of_ledger(graph))
+                .min_by(|a, b| a.0.cmp(b.0))
+                .map(|(_, graph)| graph)
+        }))
+    }
+
     /// Find a graph by ledger ID (searching both default and named graphs)
     ///
     /// Returns the first graph whose `ledger_id` matches the given address.
@@ -389,6 +422,7 @@ impl<'a> DataSet<'a> {
     ///
     /// The dataset construction code should ensure uniqueness, or the caller
     /// should be aware that duplicate addresses may cause ambiguous behavior.
+    /// A SERVICE reads [`DataSet::service_member`] instead.
     pub fn find_by_ledger_id(&self, ledger_id: &str) -> Option<&GraphRef<'a>> {
         // Check default graphs first
         self.default_graphs

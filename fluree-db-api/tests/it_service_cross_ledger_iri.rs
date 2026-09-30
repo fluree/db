@@ -1008,6 +1008,79 @@ async fn service_to_a_non_member_is_refused_not_answered_by_the_dataset() {
     }
 }
 
+/// A dataset may hold one ledger at two times (two pins are two members). A
+/// SERVICE naming that ledger does not say which time to read, so it is
+/// refused (no rows under SILENT) instead of answered by whichever member a
+/// map yielded first. A ledger held at one time is read the same way on every
+/// run, whichever of its members the dataset holds.
+#[tokio::test]
+async fn a_service_to_a_ledger_held_at_two_times_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let alpha = "xl-alpha-twotimes:main";
+    seed(
+        &fluree,
+        alpha,
+        json!([{"@id": format!("{ALPHA}a1"), format!("{ALPHA}tag"): "shared"}]),
+    )
+    .await;
+    let beta = "xl-beta-twotimes:main";
+    let beta_1 = seed(
+        &fluree,
+        beta,
+        json!([{"@id": format!("{BETA}b1"), format!("{BETA}tag"): "first"}]),
+    )
+    .await;
+    fluree
+        .insert(
+            beta_1,
+            &json!({"@graph": [{"@id": format!("{BETA}b2"), format!("{BETA}tag"): "second"}]}),
+        )
+        .await
+        .expect("second commit");
+    let service = |silent: &str| {
+        format!(
+            "SELECT ?s WHERE {{ SERVICE {silent} <fluree:ledger:{beta}> {{ ?s <{BETA}tag> ?t }} }}"
+        )
+    };
+
+    let two_times = DatasetSpec::new()
+        .with_default(GraphSource::parse(alpha).unwrap())
+        .with_named(GraphSource::parse(&format!("{beta}@t:1")).unwrap())
+        .with_named(GraphSource::parse(beta).unwrap());
+    let dataset = fluree
+        .build_dataset_view(&two_times)
+        .await
+        .expect("build_dataset_view");
+    let err = fluree
+        .query_dataset(&dataset, &service(""))
+        .await
+        .expect_err("the endpoint does not say which time to read");
+    assert_eq!(err.status_code(), 400, "{err}");
+    assert!(err.to_string().contains("more than one time"), "{err}");
+    assert_eq!(
+        rows(&fluree, &dataset, &service("SILENT")).await,
+        Vec::<JsonValue>::new()
+    );
+
+    // One time, two members (its default graph and its txn-meta graph): each
+    // freshly built dataset reads the ledger's default graph.
+    let one_time = DatasetSpec::new()
+        .with_default(GraphSource::parse(alpha).unwrap())
+        .with_named(GraphSource::parse(&format!("{beta}#txn-meta")).unwrap())
+        .with_named(GraphSource::parse(beta).unwrap());
+    for run in 0..8 {
+        let dataset = fluree
+            .build_dataset_view(&one_time)
+            .await
+            .expect("build_dataset_view");
+        assert_eq!(
+            rows(&fluree, &dataset, &service("")).await,
+            vec![json!([format!("{BETA}b1")]), json!([format!("{BETA}b2")])],
+            "run {run}"
+        );
+    }
+}
+
 /// Naming a ledger as a SERVICE endpoint never loads it: SERVICE endpoints are
 /// not authorized the way dataset members are, so a load would be a way around
 /// that. The refusal (and the empty SILENT answer) comes without the

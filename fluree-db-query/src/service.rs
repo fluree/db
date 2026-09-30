@@ -162,13 +162,20 @@ impl ServiceOperator {
         // not authorized the way a dataset member is): it is a caller error, or
         // no rows under SILENT.
         let graph_ref = if let Some(ds) = &ctx.dataset {
-            match ds.find_by_ledger_id(full_ledger_ref) {
-                Some(graph_ref) => Some(graph_ref),
-                None if self.service.silent => return Ok(()),
-                None => {
+            match ds.service_member(full_ledger_ref) {
+                Ok(Some(graph_ref)) => Some(graph_ref),
+                Ok(None) | Err(_) if self.service.silent => return Ok(()),
+                Ok(None) => {
                     return Err(QueryError::InvalidQuery(format!(
                         "SERVICE endpoint names ledger '{full_ledger_ref}', which is not in this \
                          query's dataset; add it with FROM NAMED to query it"
+                    )))
+                }
+                Err((a, b)) => {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "SERVICE endpoint names ledger '{full_ledger_ref}', which this query's \
+                         dataset holds at more than one time (t={a} and t={b}), so the endpoint \
+                         does not say which to read; keep one of them in the dataset"
                     )))
                 }
             }
