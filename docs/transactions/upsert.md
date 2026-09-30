@@ -8,7 +8,7 @@ Upsert operations provide idempotent transactions by **replacing the values of t
 - If the entity exists: for each predicate present in your payload, retract existing values for that predicate and assert the new value(s)
 - If the entity doesn’t exist: create it with the supplied triples
 
-This makes upserts safe to retry: sending the same upsert repeatedly produces the same current-state values for those predicates.
+This makes upserts safe to retry: sending the same upsert repeatedly produces the same current-state values for those predicates, with one exception for values stored with less detail than they were written (see [Idempotency](#idempotency)).
 
 ## HTTP Endpoint
 
@@ -150,7 +150,15 @@ Result: nothing is committed. Each value's retraction and re-assertion cancel,
 so the transaction stages no flakes and the ledger stays at t=1. This holds
 for language-tagged values, lists, and the payload's blank nodes too.
 
-This makes upserts safe to retry.
+This makes upserts safe to retry, with one exception. A value stored with
+less detail than it was written is not re-upserted as a no-op: an integer too
+large for 64 bits written with an XSD subtype such as `xsd:nonNegativeInteger`
+(the index keeps no subtype), or a `dateTime` or `time` with digits past the
+microsecond (storage keeps six). Re-upserting such a value as written commits
+a retraction and an assertion of the same stored fact, and the value can be
+lost. Write these values at the precision they are stored with: `xsd:integer`
+for big integers, and at most six fractional digits for temporals. Graph sync
+behaves the same way.
 
 ## Comparison: Insert vs Update vs Upsert
 

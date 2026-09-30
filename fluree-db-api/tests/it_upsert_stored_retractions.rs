@@ -559,3 +559,22 @@ async fn an_identical_reupsert_keeps_an_indexed_big_integer_subtype() {
     h.upsert(&doc).await;
     assert_eq!(h.facts(None, "s").await.len(), 1, "the value survives");
 }
+
+/// The same class for temporals: storage keeps a `dateTime` to the
+/// microsecond, so a value written with more digits decodes differently from
+/// the term that is re-upserted, and the retraction of the decode and the
+/// assertion of the written term share one storage key.
+#[tokio::test]
+#[ignore = "U5: storage keeps temporals to the microsecond (filing held, AJ-4)"]
+async fn an_identical_reupsert_keeps_a_sub_microsecond_datetime() {
+    let mut h = Harness::new("u5-datetime").await;
+    let doc = jsonld(json!({
+        "@context": {"ex": EX, "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "@id": "ex:s",
+        "ex:d": {"@value": "2020-01-01T00:00:00.123456789Z", "@type": "xsd:dateTime"}
+    }));
+    h.upsert(&doc).await;
+    h.reindex().await;
+    h.upsert(&doc).await;
+    assert_eq!(h.facts(None, "s").await.len(), 1, "the value survives");
+}

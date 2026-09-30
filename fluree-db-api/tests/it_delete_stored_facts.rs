@@ -264,9 +264,8 @@ async fn delete_data_names_terms_exactly() {
             &format!("xsd:integer vs stored xsd:int (indexed={indexed})"),
         );
         assert_eq!(facts(&fluree, &r.ledger).await, ["n=1"]);
-        // The same term deletes it. (Spelled in JSON-LD: SPARQL UPDATE lowers
-        // `"1"^^xsd:int` to a string value, a separate gap that deletes
-        // nothing before or after this change.)
+        // The same term deletes it (spelled in JSON-LD here;
+        // `delete_data_of_typed_literals_deletes_them` covers SPARQL).
         let r = jsonld_update(
             &fluree,
             r.ledger,

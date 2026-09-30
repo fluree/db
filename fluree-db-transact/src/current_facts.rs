@@ -344,9 +344,9 @@ impl<'l> CurrentFacts<'l> {
     /// The current facts of every slot, in slot order: one `Vec` per slot,
     /// each in SPOT order.
     ///
-    /// Duplicate slots are answered once and cloned. Slots of one graph
-    /// share one decision between per-slot novelty seeks and a single
-    /// filtered novelty walk.
+    /// Each slot is read on its own (callers pass distinct slots). Slots of
+    /// one graph share one decision between per-slot novelty seeks and a
+    /// single filtered novelty walk.
     pub async fn of_slots(&self, slots: &[Slot]) -> Result<Vec<Vec<StoredFact>>> {
         let novelty = NoveltyPlan::for_slots(self.ledger, slots, self.to_t);
         let mut out = Vec::with_capacity(slots.len());
