@@ -39,7 +39,7 @@ fn replace_name(id: &str, name: &str) -> serde_json::Value {
 }
 
 /// `sh:targetNode ex:alice` with `sh:maxCount 1` (and optionally
-/// `sh:minCount 1`) on `ex:name`.
+/// `sh:minCount 1`) on `ex:name`, written with the config that enables SHACL.
 fn alice_name_shape(min_count: Option<u32>) -> serde_json::Value {
     let mut property = json!({
         "@id": "ex:AliceNameShape",
@@ -51,12 +51,15 @@ fn alice_name_shape(min_count: Option<u32>) -> serde_json::Value {
     }
     json!({
         "@context": ctx(),
-        "@graph": [{
-            "@id": "ex:AliceShape",
-            "@type": "sh:NodeShape",
-            "sh:targetNode": {"@id": "ex:alice"},
-            "sh:property": property
-        }]
+        "@graph": [
+            {
+                "@id": "ex:AliceShape",
+                "@type": "sh:NodeShape",
+                "sh:targetNode": {"@id": "ex:alice"},
+                "sh:property": property
+            },
+            support::shacl_enabled_config_node()
+        ]
     })
 }
 
