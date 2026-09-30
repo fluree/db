@@ -200,7 +200,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                 .to_string();
 
             if let Some((r2rml, _)) = &self.core.r2rml {
-                if r2rml.has_r2rml_mapping(&gs_id).await {
+                if r2rml.has_r2rml_mapping(&gs_id).await? {
                     // The shared resolver builds the genesis view, carries (or
                     // refuses) the handle's pin, and resolves the model config a
                     // governed source presents to `wrap_policy`. A `None` here

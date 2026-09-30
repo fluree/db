@@ -228,9 +228,9 @@ impl EphemeralR2rmlProvider {
 
 #[async_trait]
 impl R2rmlProvider for EphemeralR2rmlProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
         // The provisional mapping is always present — that is the whole point.
-        true
+        Ok(true)
     }
 
     async fn compiled_mapping(
@@ -315,6 +315,7 @@ impl crate::Fluree {
             fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
         let mut view = GraphDb::from_ledger_state(&state);
         view.graph_source_id = Some(PROVISIONAL_GS_ID.into());
+        view.over_graph_source = true;
 
         // Run the probe through the same R2RML-aware execution path a persisted
         // graph-source query uses. The genesis view carries no reasoning, so the
@@ -363,8 +364,8 @@ mod tests {
 
     #[async_trait]
     impl R2rmlProvider for StubEphemeralProvider {
-        async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-            true
+        async fn has_r2rml_mapping(&self, _gs: &str) -> fluree_db_query::Result<bool> {
+            Ok(true)
         }
         async fn compiled_mapping(
             &self,

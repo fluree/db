@@ -197,8 +197,13 @@ pub trait R2rmlProvider: Debug + Send + Sync {
     ///
     /// # Returns
     ///
-    /// `true` if the graph source exists and has an R2RML mapping, `false` otherwise.
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool;
+    /// `Ok(true)` if the graph source exists and has an R2RML mapping,
+    /// `Ok(false)` if the id names no mapped graph source (including an IRI
+    /// that is no graph-source id at all). An error when the answer cannot be
+    /// determined, for example because the nameservice is unavailable: the
+    /// caller fails the query rather than reading a graph source as an empty
+    /// native graph.
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> Result<bool>;
 
     /// Get the compiled R2RML mapping for a graph source alias.
     ///
@@ -428,9 +433,9 @@ impl NoOpR2rmlProvider {
 
 #[async_trait]
 impl R2rmlProvider for NoOpR2rmlProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> Result<bool> {
         // Always return false - no R2RML mappings available
-        false
+        Ok(false)
     }
 
     async fn compiled_mapping(

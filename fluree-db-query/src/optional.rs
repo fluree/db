@@ -3303,8 +3303,8 @@ mod tests {
         struct MapProvider(Arc<CompiledR2rmlMapping>);
         #[async_trait]
         impl R2rmlProvider for MapProvider {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -3523,8 +3523,8 @@ mod tests {
         struct MapProvider(Arc<CompiledR2rmlMapping>);
         #[async_trait]
         impl R2rmlProvider for MapProvider {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,

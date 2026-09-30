@@ -84,6 +84,7 @@ impl Fluree {
             ContextConfig {
                 tracker: Some(&tracker),
                 r2rml: Some((&r2rml_provider, &r2rml_provider)),
+                primary_kind: fluree_db_query::MemberKind::Native,
                 ..Default::default()
             },
         )
@@ -119,6 +120,7 @@ impl Fluree {
             ContextConfig {
                 tracker: Some(&tracker),
                 r2rml: Some((&r2rml_provider, &r2rml_provider)),
+                primary_kind: fluree_db_query::MemberKind::Native,
                 ..Default::default()
             },
         )

@@ -753,6 +753,7 @@ impl Fluree {
         db.resolved_config = Self::graph_source_model_config(&record);
         db.graph_source_id = Some(gs_id.to_string().into());
         db.graph_source_time = graph_source_time;
+        db.over_graph_source = true;
         Self::select_graph(db, address.graph()).map(Some)
     }
 }
