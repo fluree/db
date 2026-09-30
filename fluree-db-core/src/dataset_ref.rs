@@ -517,7 +517,9 @@ impl DatasetRef {
     ///
     /// 1. `urn:fluree:…` that parses as an address: `Address` when pinned,
     ///    else `Ambiguous` (a ledger's registry may hold such an IRI verbatim).
-    ///    One that does not parse (`#resolution-config`) is a `GraphIri`.
+    ///    One that does not parse (`#resolution-config`) is a `GraphIri`,
+    ///    except a known pin tag with a bad value or an address with nothing
+    ///    after its `#`, which are the address's errors (as in 3 and 5).
     /// 2. An authority form (`scheme://`) or two or more `:` before any `#`
     ///    or `@`: a `GraphIri`, never an address.
     /// 3. Parses as a pinned address: `Address`.
@@ -529,16 +531,20 @@ impl DatasetRef {
     pub fn parse(s: &str) -> Result<Self, RefError> {
         let pre_graph = s.split('#').next().unwrap_or(s);
         if s.starts_with(LEDGER_URN_PREFIX) {
-            // Text that is no address, an unknown `@` tag included, is
-            // read as an IRI.
-            return Ok(match LedgerRef::parse(s) {
-                Ok(address) if address.at.is_some() => Self::Address(address),
-                Ok(address) => Self::Ambiguous {
+            return match LedgerRef::parse(s) {
+                Ok(address) if address.at.is_some() => Ok(Self::Address(address)),
+                Ok(address) => Ok(Self::Ambiguous {
                     address,
                     iri: GraphIri::parse(s)?,
-                },
-                Err(_) => Self::GraphIri(GraphIri::parse(s)?),
-            });
+                }),
+                // A pin with a known tag and a bad value is still a pin, and an
+                // address with nothing after its `#` is still an address:
+                // report it.
+                Err(e) if Self::has_known_pin(pre_graph) || Self::lacks_its_graph(s) => Err(e),
+                // Text that is no address, an unknown `@` tag included,
+                // is read as an IRI.
+                Err(_) => Ok(Self::GraphIri(GraphIri::parse(s)?)),
+            };
         }
         // The part an address's name and branch would occupy: before any
         // graph and any pin (a pin's tag has its own ':').
@@ -553,8 +559,10 @@ impl DatasetRef {
                 Err(_) => Self::Address(address),
             }),
             Ok(address) => Ok(Self::Address(address)),
-            // A pin with a known tag and a bad value is still a pin: report it.
-            Err(e) if Self::has_known_pin(pre_graph) => Err(e),
+            // A pin with a known tag and a bad value is still a pin, and an
+            // address with nothing after its `#` (`mydb:main#`) is still an
+            // address, not an IRI with an empty fragment: report it.
+            Err(e) if Self::has_known_pin(pre_graph) || Self::lacks_its_graph(s) => Err(e),
             // Text that is no address, an unknown `@` tag included, is
             // read as an IRI.
             Err(not_an_address) => Self::graph_iri(s).map_err(|neither| {
@@ -582,6 +590,11 @@ impl DatasetRef {
         pre_graph
             .split_once('@')
             .is_some_and(|(_, spec)| TIME_TRAVEL_TAGS.iter().any(|tag| spec.starts_with(tag)))
+    }
+
+    /// An address followed by a `#` with nothing after it.
+    fn lacks_its_graph(s: &str) -> bool {
+        matches!(s.split_once('#'), Some((address, "")) if LedgerRef::parse(address).is_ok())
     }
 
     /// The address reading, when there is one.
@@ -1027,12 +1040,29 @@ mod tests {
         assert!(err.contains("neither a ledger address"), "{err}");
     }
 
-    /// A known tag with a bad value is a malformed pin, not a graph IRI.
+    /// A known tag with a bad value is a malformed pin, not a graph IRI, in
+    /// either spelling of the address.
     #[test]
     fn a_known_tag_with_a_bad_value_is_an_error() {
-        let err = DatasetRef::parse("mydb@t:abc").unwrap_err().to_string();
-        assert!(err.contains("Invalid integer"), "{err}");
+        for bad in ["mydb@t:abc", "urn:fluree:mydb:main@t:abc"] {
+            let err = DatasetRef::parse(bad).unwrap_err().to_string();
+            assert!(err.contains("Invalid integer"), "{bad}: {err}");
+        }
         assert!(DatasetRef::parse("mydb@commit:ab").is_err());
+        assert!(DatasetRef::parse("urn:fluree:mydb@commit:ab").is_err());
+    }
+
+    /// An address with nothing after its `#` is a malformed address, in either
+    /// spelling; an IRI that is no address keeps its empty fragment.
+    #[test]
+    fn an_address_missing_its_graph_is_an_error() {
+        for bad in ["dsx:main#", "mydb@t:1#", "urn:fluree:dsx:main#"] {
+            let err = DatasetRef::parse(bad).unwrap_err().to_string();
+            assert!(err.contains("missing graph after '#'"), "{bad}: {err}");
+        }
+        for iri in ["http://ex.org/ns#", "urn:ex:ns#"] {
+            assert_eq!(graph_iri(iri).as_str(), iri);
+        }
     }
 
     #[test]
