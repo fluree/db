@@ -377,11 +377,16 @@ impl LowerCtx {
     }
 
     fn mint_blank(&mut self) -> String {
-        let id = format!("_:fluree_ann_{}", self.next_anon_id);
+        let id = format!("{ANN_BLANK_PREFIX}{}", self.next_anon_id);
         self.next_anon_id += 1;
         id
     }
 }
+
+/// Label prefix of the blank nodes the lowering mints for anonymous
+/// annotation subjects and objects. Reserved: the firewall refuses user
+/// labels that start with it.
+const ANN_BLANK_PREFIX: &str = "_:fluree_ann_";
 
 /// Reject any user-authored `f:reifies*` IRI before lowering runs, so
 /// the firewall doesn't fire on the IRIs that this module
@@ -431,6 +436,17 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
                 }
                 if opaque && k == "@value" {
                     continue;
+                }
+                // The lowering labels anonymous annotation nodes with a
+                // reserved prefix; a user node with such a label would merge
+                // with one of them.
+                if k == "@id" || *k == effective.id_key {
+                    if let Some(label) = v.as_str().filter(|s| s.starts_with(ANN_BLANK_PREFIX)) {
+                        return Err(TransactError::Parse(format!(
+                            "blank-node label {label:?} uses the prefix {ANN_BLANK_PREFIX:?}, \
+                             which is reserved for edge-annotation nodes; choose another label"
+                        )));
+                    }
                 }
                 let expanded_key = if k.starts_with('@') {
                     k.clone()
@@ -3123,6 +3139,25 @@ mod tests {
         });
         let err = lower(doc).unwrap_err();
         assert!(err.to_string().contains("system-controlled"));
+    }
+
+    /// W9: the lowering's anonymous annotation nodes are `_:fluree_ann_N`; a
+    /// user node labelled that way would merge with one of them.
+    #[test]
+    fn rejects_user_label_in_the_annotation_prefix() {
+        for doc in [
+            json!({"@id": "_:fluree_ann_0", "ex:p": 1}),
+            json!({"@id": "ex:a", "ex:knows": {"@id": "_:fluree_ann_3"}}),
+            json!({"@context": {"id": "@id"}, "id": "_:fluree_ann_1", "ex:p": 1}),
+        ] {
+            let err = lower(doc.clone()).unwrap_err().to_string();
+            assert!(
+                err.starts_with("Parse error: ") && err.contains("_:fluree_ann_"),
+                "{doc}: {err}"
+            );
+        }
+        // Other labels are untouched.
+        lower(json!({"@id": "_:fluree_annotation", "ex:p": 1})).unwrap();
     }
 
     #[test]
