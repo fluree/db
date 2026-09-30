@@ -595,6 +595,50 @@ mod tests {
         assert_ne!(anon[0], anon[1], "`[]` in two blocks is two nodes");
     }
 
+    /// A stable Fluree blank-node id (`_:fdb-…`) in a block addresses the
+    /// stored node; any other label stays a blank node, minted at staging.
+    #[test]
+    fn a_stable_blank_node_id_in_a_block_addresses_the_stored_node() {
+        let (parsed, ns) = parse_ok(
+            "GRAPH <http://g/1> { _:fdb-1234-0-b0 <http://example.org/knows> _:other . }",
+            Placement::AsWritten,
+        );
+        let [template] = &parsed.parts.templates[..] else {
+            panic!("one template: {:?}", parsed.parts.templates);
+        };
+        assert!(
+            matches!(&template.subject, TemplateTerm::Sid(sid) if *sid == ns.blank_node_sid("1234-0-b0")),
+            "{:?}",
+            template.subject
+        );
+        assert!(
+            matches!(&template.object, TemplateTerm::BlankNode(label) if label == "other"),
+            "{:?}",
+            template.object
+        );
+    }
+
+    /// A hand-written `f:reifies*` statement is refused in a block as in the
+    /// default graph: annotation bundles come only from the annotation syntax.
+    #[test]
+    fn a_reserved_reifies_predicate_is_refused_in_a_block() {
+        for doc in [
+            "GRAPH <http://g/1> { <http://example.org/claim> \
+             <https://ns.flur.ee/db#reifiesSubject> <http://example.org/evil> . }",
+            "<http://example.org/claim> <https://ns.flur.ee/db#reifiesSubject> \
+             <http://example.org/evil> .",
+        ] {
+            let mut ns = NamespaceRegistry::new();
+            let e =
+                parse_rdf_text(doc, Placement::AsWritten, &mut ns).expect_err("reserved predicate");
+            assert!(
+                matches!(e, TransactError::UnsupportedFeature(_))
+                    && e.to_string().contains("system-controlled predicate"),
+                "{doc}: {e}"
+            );
+        }
+    }
+
     #[test]
     fn literals_convert_as_insert_converts_them() {
         // An ill-typed lexical form is kept, with its declared datatype, as

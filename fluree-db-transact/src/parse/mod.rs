@@ -54,8 +54,7 @@ pub use rdf_text::{
     has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, Placement, RdfText, RdfTextSummary,
 };
 pub use trig_meta::{
-    extract_trig_txn_meta, might_contain_graph_block, parse_trig_phase1, resolve_trig_meta,
-    unwrap_trig_graph_blocks, NamedGraphBlock, RawObject, RawTerm, RawTrigMeta, RawTriple,
-    TrigMetaResult, TrigPhase1Result, UnwrappedTrig, TXN_META_GRAPH_IRI,
+    might_contain_graph_block, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject,
+    RawTerm, RawTrigMeta, RawTriple, TrigPhase1Result, TXN_META_GRAPH_IRI,
 };
 pub use txn_meta::extract_txn_meta;

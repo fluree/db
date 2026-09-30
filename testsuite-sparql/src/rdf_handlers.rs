@@ -5,10 +5,10 @@
 //! positive-syntax actions must parse, negative-syntax actions must not,
 //! and evaluation tests parse an action `.ttl` and compare the resulting
 //! graph with an expected `.nt` up to blank-node isomorphism. Everything
-//! runs through [`GraphCollectorSink`] — the same sink behind
-//! `parse_to_json`, i.e. the Turtle → JSON-LD conversion used by upsert,
-//! graph sync and memory import — so a suite regression here is a
-//! regression on a shipped ingest path.
+//! runs through [`GraphCollectorSink`], the sink behind `parse_to_json`
+//! (the Turtle → JSON-LD conversion memory import uses). The parser is the
+//! one every RDF-text write path reads with (insert, upsert, graph sync),
+//! so a suite regression here is a regression on a shipped ingest path.
 //!
 //! N-Triples tests are dispatched to the same parser: N-Triples is a
 //! syntactic subset of Turtle, so every positive N-Triples document is a

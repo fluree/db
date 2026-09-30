@@ -85,8 +85,8 @@ pub use parse::{
 };
 pub use parse::{
     might_contain_graph_block, parse_graph_insert, parse_sync_transaction, parse_transaction,
-    parse_trig_phase1, resolve_trig_meta, unwrap_trig_graph_blocks, NamedGraphBlock, RawObject,
-    RawTerm, RawTrigMeta, RawTriple, TrigPhase1Result, UnwrappedTrig,
+    parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm, RawTrigMeta,
+    RawTriple, TrigPhase1Result,
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{

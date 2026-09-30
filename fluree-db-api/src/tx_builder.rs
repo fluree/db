@@ -33,8 +33,8 @@ use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
 use fluree_db_transact::GraphSel;
 use fluree_db_transact::{
-    lower_sparql_update_request, CommitOpts, NamedGraphBlock, NamespaceRegistry, RawTrigMeta,
-    TransactError, Txn, TxnOpts, TxnType,
+    lower_sparql_update_request, CommitOpts, NamespaceRegistry, TransactError, Txn, TxnOpts,
+    TxnType,
 };
 use rustc_hash::FxHashSet;
 use std::collections::HashMap;
@@ -405,14 +405,6 @@ impl GraphOp<'_> {
     }
 }
 
-/// Result of parsing a transaction operation to JSON.
-/// For Turtle inputs with TriG GRAPH blocks, also includes raw txn-meta and named graphs.
-pub(crate) struct ParsedOperation {
-    pub json: JsonValue,
-    pub trig_meta: Option<RawTrigMeta>,
-    pub named_graphs: Vec<NamedGraphBlock>,
-}
-
 impl TransactOperation<'_> {
     /// Get the `TxnType` for this operation.
     pub(crate) fn txn_type(&self) -> TxnType {
@@ -426,32 +418,13 @@ impl TransactOperation<'_> {
         }
     }
 
-    /// Parse the operation to JSON, extracting TriG txn-meta and named graphs from Turtle inputs.
-    ///
-    /// For Turtle inputs with `GRAPH <...> { ... }` blocks, this extracts:
-    /// - Metadata from txn-meta graph
-    /// - Named graph blocks for user-defined graphs
-    ///
-    /// The metadata can be resolved to `TxnMetaEntry` using `resolve_trig_meta()` once a
-    /// `NamespaceRegistry` is available. Named graphs are converted to
-    /// `TripleTemplate`s with appropriate graph_id during staging.
-    pub(crate) fn to_json_with_trig_meta(&self) -> Result<ParsedOperation> {
+    /// The operation's JSON-LD body. RDF text and graph operations are
+    /// staged by their own lanes and never read as JSON-LD.
+    pub(crate) fn to_json(&self) -> Result<JsonValue> {
         match self {
-            TransactOperation::InsertJson(j) => Ok(ParsedOperation {
-                json: (*j).clone(),
-                trig_meta: None,
-                named_graphs: Vec::new(),
-            }),
-            TransactOperation::UpsertJson(j) => Ok(ParsedOperation {
-                json: (*j).clone(),
-                trig_meta: None,
-                named_graphs: Vec::new(),
-            }),
-            TransactOperation::UpdateJson(j) => Ok(ParsedOperation {
-                json: (*j).clone(),
-                trig_meta: None,
-                named_graphs: Vec::new(),
-            }),
+            TransactOperation::InsertJson(j)
+            | TransactOperation::UpsertJson(j)
+            | TransactOperation::UpdateJson(j) => Ok((*j).clone()),
             // Every staging path dispatches graph ops first; parsing one as a
             // plain insert would drop its graph scope (and a sync's
             // retraction wave).
@@ -1182,16 +1155,13 @@ enum OpPlan<'a> {
     JsonLike {
         txn_type: TxnType,
         txn_json: JsonValue,
-        trig_meta: Option<RawTrigMeta>,
-        named_graphs: Vec<NamedGraphBlock>,
     },
     /// A write scoped to one graph (see [`GraphOp`]).
     Graph(GraphOp<'a>),
 }
 
 impl<'a> OpPlan<'a> {
-    /// Pre-parse a [`TransactOperation`] into an [`OpPlan`], extracting TriG
-    /// metadata and named graphs for Turtle inputs.
+    /// Pre-parse a [`TransactOperation`] into an [`OpPlan`].
     fn from_op(op: TransactOperation<'a>) -> Result<Self> {
         match op {
             TransactOperation::InsertTurtle(turtle) => Ok(OpPlan::InsertTurtle(turtle)),
@@ -1202,12 +1172,9 @@ impl<'a> OpPlan<'a> {
             TransactOperation::Graph(op) => Ok(OpPlan::Graph(op)),
             _ => {
                 let txn_type = op.txn_type();
-                let parsed = op.to_json_with_trig_meta()?;
                 Ok(OpPlan::JsonLike {
                     txn_type,
-                    txn_json: parsed.json,
-                    trig_meta: parsed.trig_meta,
-                    named_graphs: parsed.named_graphs,
+                    txn_json: op.to_json()?,
                 })
             }
         }
@@ -1521,12 +1488,9 @@ impl Fluree {
             return Ok((stage_result, op.txn_type(), commit_opts, None));
         }
 
-        // JSON-like operation: parse, extracting TriG metadata + named graphs.
+        // JSON-LD operation.
         let txn_type = op.txn_type();
-        let parsed = op.to_json_with_trig_meta()?;
-        let txn_json = parsed.json;
-        let trig_meta = parsed.trig_meta;
-        let named_graphs = parsed.named_graphs;
+        let txn_json = op.to_json()?;
 
         let commit_opts = self.maybe_spawn_txn_upload(
             core.commit_opts,
@@ -1535,14 +1499,12 @@ impl Fluree {
             store_raw_txn,
         );
         let stage_result = self
-            .stage_transaction_with_named_graphs_tracked(
+            .stage_transaction_tracked(
                 ledger_state,
                 txn_type,
                 &txn_json,
                 core.txn_opts,
                 Some(index_config),
-                trig_meta.as_ref(),
-                &named_graphs,
                 tracker_ref,
                 core.policy.as_ref(),
             )
@@ -1623,12 +1585,7 @@ impl Fluree {
                     .await?;
                 Ok((stage_result, *txn_type, commit_opts))
             }
-            OpPlan::JsonLike {
-                txn_type,
-                txn_json,
-                trig_meta,
-                named_graphs,
-            } => {
+            OpPlan::JsonLike { txn_type, txn_json } => {
                 let commit_opts = self.maybe_spawn_txn_upload(
                     commit_opts_base.clone(),
                     &ledger_id,
@@ -1636,14 +1593,12 @@ impl Fluree {
                     store_raw_txn,
                 );
                 let stage_result = self
-                    .stage_transaction_with_named_graphs_tracked(
+                    .stage_transaction_tracked(
                         ledger_state,
                         *txn_type,
                         txn_json,
                         txn_opts,
                         Some(index_config),
-                        trig_meta.as_ref(),
-                        named_graphs,
                         tracker_ref,
                         None,
                     )

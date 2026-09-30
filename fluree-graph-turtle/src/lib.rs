@@ -57,6 +57,14 @@ use serde_json::Value as JsonValue;
 ///
 /// The resulting JSON is in expanded JSON-LD format, suitable for
 /// `fluree_db_transact::parse_transaction()`.
+///
+/// The conversion is lossy. A collection becomes its entries as plain
+/// values, without order or repeats; an `rdf:type` object that is not an IRI
+/// is refused or read as one; and expanding the JSON applies JSON-LD's
+/// compact-IRI rules, which refuse an absolute IRI whose scheme reads as an
+/// undefined prefix (`tag:`, `kb:`). Transactions stage RDF text from one
+/// parse (`fluree_db_transact::parse_rdf_text`); the crates that stage them
+/// disallow this function in their `clippy.toml`.
 pub fn parse_to_json(input: &str) -> Result<JsonValue> {
     let mut sink = GraphCollectorSink::new();
     parse(input, &mut sink)?;

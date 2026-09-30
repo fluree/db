@@ -819,3 +819,41 @@ async fn a_malformed_document_fails_as_a_turtle_parse_error() {
         .expect_err("nested");
     assert!(err.to_string().contains("nested graph block"), "{err}");
 }
+
+/// What a block's contents are refused for is the user's mistake, reported
+/// as one: an undefined prefix is a Turtle parse error, a hand-written
+/// `f:reifies*` statement a transaction error. Neither reads as an engine
+/// fault.
+#[tokio::test]
+async fn refusals_inside_a_block_are_the_user_s_errors() {
+    let fluree = memory();
+    let undefined = "GRAPH <http://example.org/g1> { nope:a <http://example.org/p> 1 . }";
+    let err = fluree
+        .upsert_turtle(
+            genesis_ledger(&fluree, "it/rdf-block-errors:main"),
+            undefined,
+        )
+        .await
+        .map(|_| ())
+        .expect_err("undefined prefix");
+    assert!(
+        matches!(err, fluree_db_api::ApiError::Turtle(_)) && err.to_string().contains("nope"),
+        "{err:?}"
+    );
+
+    let reserved = "GRAPH <http://example.org/g1> { <http://example.org/claim> \
+                    <https://ns.flur.ee/db#reifiesSubject> <http://example.org/evil> . }";
+    let err = fluree
+        .upsert_turtle(
+            genesis_ledger(&fluree, "it/rdf-block-errors-2:main"),
+            reserved,
+        )
+        .await
+        .map(|_| ())
+        .expect_err("reserved predicate");
+    assert!(
+        matches!(err, fluree_db_api::ApiError::Transact(_))
+            && err.to_string().contains("system-controlled predicate"),
+        "{err:?}"
+    );
+}

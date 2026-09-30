@@ -13,6 +13,11 @@
 //! and that the upsert semantics (replace the body, keep the edge) hold for
 //! annotated edges.
 
+// The JSON-LD conversion is exercised on purpose: it is what the memory
+// importer uses and what `fluree sync` falls back to for a server that does
+// not take RDF bodies.
+#![allow(clippy::disallowed_methods)]
+
 use crate::support::{self, genesis_ledger};
 use fluree_db_api::{FlureeBuilder, SyncGraphOpts};
 use serde_json::{json, Value as JsonValue};
