@@ -195,7 +195,9 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         {
             let ledger_id = &self.graph.ledger_id;
             // The id may carry a `#graph` fragment; the source is the id before it.
-            let gs_id = fluree_db_core::LedgerRef::parse(ledger_id)?.id.to_string();
+            let gs_id = fluree_db_core::LedgerRef::parse(ledger_id)?
+                .into_id()
+                .to_string();
 
             if let Some((r2rml, _)) = &self.core.r2rml {
                 if r2rml.has_r2rml_mapping(&gs_id).await {
