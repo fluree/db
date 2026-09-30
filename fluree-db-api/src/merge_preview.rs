@@ -509,9 +509,16 @@ impl crate::Fluree {
         let need_conflicts = opts.include_conflicts && !fast_forward && diff.is_some();
         let need_changes = opts.include_changes;
         // Validation stages the resolved change set on the target, so it
-        // needs the netted source delta too. A fast-forward adopts commits
-        // already validated when they were authored, so it is skipped.
+        // needs the netted source delta too. A fast-forward is validated on
+        // its own path below, and only into a target whose configuration
+        // governs writes (as the merge does).
         let need_validation = opts.include_validation && !fast_forward && diff.is_some();
+        let fast_forward_base = if opts.include_validation && fast_forward && diff.is_some() {
+            self.governed_fast_forward_base(&target_id, &target_branched, &target_record)
+                .await?
+        } else {
+            None
+        };
 
         // The change set folds every commit on the source's line, because a
         // merge the source made carries how it resolved that merge. A merge
@@ -694,7 +701,8 @@ impl crate::Fluree {
             None
         };
 
-        // ---- Validation (default on; skipped on fast-forward). -------------
+        // ---- Validation (default on; a fast-forward only into a governed --
+        // ---- target). -------------------------------------------------------
         // The same staging and validation the merge performs, minus the
         // commit: resolve the netted source delta under the strategy, stage
         // it on a clone of the target state, and run the branch-operation
@@ -716,6 +724,16 @@ impl crate::Fluree {
                         &ns_delta,
                         &graph_iris,
                     )
+                    .await?;
+                Some(ValidationSummary {
+                    conforms: outcome.conforms(),
+                    report: outcome.report(),
+                })
+            } else if let (Some(base), Some(diff)) = (fast_forward_base, diff.as_ref()) {
+                // A fast-forward into a governed target: the validation the
+                // merge runs before adopting the commits.
+                let outcome = self
+                    .validate_fast_forward(base, &source_store, diff)
                     .await?;
                 Some(ValidationSummary {
                     conforms: outcome.conforms(),
