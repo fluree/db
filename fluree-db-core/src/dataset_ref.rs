@@ -371,15 +371,6 @@ pub struct LedgerRef {
     graph: GraphSel,
 }
 
-/// How an address parser treats an `@` whose tag it does not know.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum UnknownPin {
-    /// A ledger position: the text is an address, so this is a bad pin.
-    Error,
-    /// A dataset position: the text is not an address.
-    NotAnAddress,
-}
-
 impl LedgerRef {
     /// Parse `[urn:fluree:]name[:branch][@<tag>:<value>][#<graph>]`, for a
     /// ledger position.
@@ -388,16 +379,11 @@ impl LedgerRef {
     /// the graph and the first `@` before it starts the pin. The graph is a
     /// keyword or an absolute IRI ([`GraphSel::parse`]); the pin is the
     /// address grammar of [`TimeSpec::parse_address_suffix`].
+    ///
+    /// An `@` whose tag is not a known one is a bad pin here. A dataset
+    /// position reads the same text as "not an address"
+    /// ([`DatasetRef::parse`]).
     pub fn parse(input: &str) -> Result<Self, RefError> {
-        match Self::parse_as(input, UnknownPin::Error)? {
-            Some(r) => Ok(r),
-            None => unreachable!("a ledger position never reports 'not an address'"),
-        }
-    }
-
-    /// The address grammar, with the unknown-tag rule the caller chose. `Ok(None)`
-    /// only for [`UnknownPin::NotAnAddress`].
-    fn parse_as(input: &str, unknown_pin: UnknownPin) -> Result<Option<Self>, RefError> {
         let body = input.strip_prefix(LEDGER_URN_PREFIX).unwrap_or(input);
         let (before_graph, graph) = match body.split_once('#') {
             Some((_, "")) => {
@@ -424,21 +410,17 @@ impl LedgerRef {
                 )))
             }
             Some((base, spec)) => {
-                let known_tag = TIME_TRAVEL_TAGS.iter().any(|tag| spec.starts_with(tag));
-                if !known_tag && unknown_pin == UnknownPin::NotAnAddress {
-                    return Ok(None);
-                }
                 let at = TimeSpec::parse_address_suffix(spec)
                     .map_err(|e| RefError::new(format!("Invalid ledger address '{input}': {e}")))?;
                 (base, Some(at))
             }
             None => (before_graph, None),
         };
-        Ok(Some(Self {
+        Ok(Self {
             id: LedgerId::parse(base)?,
             at,
             graph,
-        }))
+        })
     }
 
     /// The whole default graph of `id`, at head.
@@ -547,13 +529,15 @@ impl DatasetRef {
     pub fn parse(s: &str) -> Result<Self, RefError> {
         let pre_graph = s.split('#').next().unwrap_or(s);
         if s.starts_with(LEDGER_URN_PREFIX) {
-            return Ok(match LedgerRef::parse_as(s, UnknownPin::NotAnAddress) {
-                Ok(Some(address)) if address.at.is_some() => Self::Address(address),
-                Ok(Some(address)) => Self::Ambiguous {
+            // Text that is no address, an unknown `@` tag included, is
+            // read as an IRI.
+            return Ok(match LedgerRef::parse(s) {
+                Ok(address) if address.at.is_some() => Self::Address(address),
+                Ok(address) => Self::Ambiguous {
                     address,
                     iri: GraphIri::parse(s)?,
                 },
-                Ok(None) | Err(_) => Self::GraphIri(GraphIri::parse(s)?),
+                Err(_) => Self::GraphIri(GraphIri::parse(s)?),
             });
         }
         // The part an address's name and branch would occupy: before any
@@ -562,21 +546,24 @@ impl DatasetRef {
         if base.contains("://") || base.matches(':').count() >= 2 {
             return Self::graph_iri(s);
         }
-        match LedgerRef::parse_as(s, UnknownPin::NotAnAddress) {
-            Ok(Some(address)) if address.at.is_some() => Ok(Self::Address(address)),
-            Ok(Some(address)) if pre_graph.contains(':') => Ok(match GraphIri::parse(s) {
+        match LedgerRef::parse(s) {
+            Ok(address) if address.at.is_some() => Ok(Self::Address(address)),
+            Ok(address) if pre_graph.contains(':') => Ok(match GraphIri::parse(s) {
                 Ok(iri) => Self::Ambiguous { address, iri },
                 Err(_) => Self::Address(address),
             }),
-            Ok(Some(address)) => Ok(Self::Address(address)),
+            Ok(address) => Ok(Self::Address(address)),
             // A pin with a known tag and a bad value is still a pin: report it.
             Err(e) if Self::has_known_pin(pre_graph) => Err(e),
-            Ok(None) | Err(_) => Self::graph_iri(s).map_err(|neither| {
-                // Text that is no IRI but reads as an address with an unknown
-                // pin (`mydb@foo`) is most likely a mistyped pin: say that.
-                match LedgerRef::parse(s) {
-                    Err(pin) if base.len() < pre_graph.len() => pin,
-                    _ => neither,
+            // Text that is no address, an unknown `@` tag included, is
+            // read as an IRI.
+            Err(not_an_address) => Self::graph_iri(s).map_err(|neither| {
+                // Text that is no IRI either but has an `@` (`mydb@foo`) is
+                // most likely a mistyped pin: say that.
+                if base.len() < pre_graph.len() {
+                    not_an_address
+                } else {
+                    neither
                 }
             }),
         }
