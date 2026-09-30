@@ -557,6 +557,24 @@ fn reject_user_authored_reifies(
 
     for tp in triples {
         check_predicate(&tp.predicate, prologue)?;
+        // `rdf:reifies` names a triple term; the reified-triple object forms
+        // lower to the bundle, so any other object is a data error the link
+        // lowering would read as a link.
+        if let PredicateTerm::Iri(iri) = &tp.predicate {
+            if expand_iri(iri, prologue)? == fluree_vocab::rdf::REIFIES
+                && !matches!(
+                    tp.object,
+                    fluree_db_sparql::ast::Term::QuotedTriple(_)
+                        | fluree_db_sparql::ast::Term::TripleTerm(_)
+                )
+            {
+                return Err(LowerError::UnsupportedFeature {
+                    feature: "rdf:reifies with an ordinary object in SPARQL UPDATE (it takes \
+                              a triple term — write `<< s p o >>` or `~ <reifier>`)",
+                    span: iri.span,
+                });
+            }
+        }
         if let Some(ann) = &tp.annotation {
             for unit in &ann.units {
                 if let Some(block) = &unit.block {

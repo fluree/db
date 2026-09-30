@@ -672,3 +672,60 @@ async fn link_lowering_keeps_object_types_through_accessors_and_novelty() {
         .expect("unrelated insert");
     assert_object_types_survive(&fluree, &after.ledger).await;
 }
+
+/// `rdf:reifies` names a triple term. An ordinary object is refused on the
+/// transactional path and on import, so every `rdf:reifies` row is a link
+/// and a scan of the predicate never has to second-guess its object.
+#[tokio::test]
+async fn rdf_reifies_with_an_ordinary_object_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "it/triple-term-links:reifies-firewall");
+    let bad = "@prefix ex: <http://example.org/> .\n\
+               @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+               ex:r rdf:reifies ex:x ; ex:source ex:hr .\n";
+    let err = fluree
+        .upsert_turtle(ledger0, bad)
+        .await
+        .expect_err("rdf:reifies with an IRI object must be refused");
+    assert!(format!("{err}").contains("reifies"), "{err}");
+
+    fluree
+        .create_ledger("it/triple-term-links:reifies-firewall-sparql")
+        .await
+        .expect("create ledger");
+    let handle = fluree
+        .ledger_cached("it/triple-term-links:reifies-firewall-sparql")
+        .await
+        .expect("ledger handle");
+    let err = fluree
+        .stage(&handle)
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+             INSERT DATA { ex:r rdf:reifies ex:x ; ex:source ex:hr . }",
+        )
+        .execute()
+        .await
+        .expect_err("SPARQL UPDATE of rdf:reifies with an IRI object must be refused");
+    assert!(format!("{err}").contains("reifies"), "{err}");
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    std::fs::write(data_dir.path().join("bad.ttl"), bad).expect("write fixture");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    let result = fluree
+        .create("it/triple-term-links:reifies-firewall-import")
+        .import(data_dir.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await;
+    let err = match result {
+        Ok(_) => panic!("import of rdf:reifies with an IRI object must fail"),
+        Err(e) => e,
+    };
+    assert!(format!("{err}").contains("reifies"), "{err}");
+}

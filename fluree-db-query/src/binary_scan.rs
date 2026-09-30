@@ -232,6 +232,12 @@ pub struct BinaryScanOperator {
     /// object and the store encodes them: every emitted term handle's
     /// dictionary key must match, checked without decoding the term.
     term_key_filter: Option<TermKeyFilter>,
+    /// An `rdf:reifies` scan with a variable object yields only triple-term
+    /// rows: the predicate is the link, and the write path admits no other
+    /// object, so this only ever drops rows written before that rule.
+    /// Checked on the encoded object type; it also narrows a POST seek to
+    /// the term segment.
+    term_only: bool,
     /// Bound object value, if the triple pattern's object is a constant.
     bound_o: Option<FlakeValue>,
     /// `bound_o` as its persisted `(o_type, o_key)` when it is an IRI the
@@ -765,6 +771,7 @@ impl BinaryScanOperator {
             object_bounds,
             term_o_key_range: None,
             term_key_filter: None,
+            term_only: false,
             bound_o: None,
             bound_o_encoded: None,
             check_s_eq_o,
@@ -869,6 +876,10 @@ impl BinaryScanOperator {
                     FlakeValue::Ref(o) if *o == flake.p => {}
                     _ => continue,
                 }
+            }
+
+            if self.term_only && !matches!(flake.o, FlakeValue::TripleTerm(_)) {
+                continue;
             }
 
             // Datatype / language constraint checks (range fallback path).
@@ -1458,6 +1469,9 @@ impl BinaryScanOperator {
                 if (o_type, o_key) != encoded {
                     continue;
                 }
+            }
+            if self.term_only && o_type != OType::TRIPLE_TERM.as_u16() {
+                continue;
             }
             if let Some((lo, hi)) = self.term_o_key_range {
                 if o_key < lo || o_key > hi {
@@ -2150,6 +2164,8 @@ impl Operator for BinaryScanOperator {
             Self::extract_bound_terms_snapshot(ctx.active_snapshot, &self.pattern);
         self.bound_o = o_val;
         self.bound_o_encoded = None;
+        self.term_only =
+            self.bound_o.is_none() && p_sid.as_ref().is_some_and(fluree_db_core::is_rdf_reifies);
         let mut filter = Self::build_filter_from_snapshot_sids(
             ctx.active_snapshot,
             &self.pattern,
@@ -2492,6 +2508,9 @@ impl Operator for BinaryScanOperator {
         let mut range_o_type: Option<u16> = None;
         let mut term_o_key_range: Option<(u64, u64)> = None;
         if order == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
+            if self.term_only && filter.o_type.is_none() {
+                filter.o_type = Some(OType::TRIPLE_TERM.as_u16());
+            }
             if let Some(bounds) = self.object_bounds.as_ref() {
                 // A term-predicate bound is one contiguous handle interval:
                 // handles are `(inner p_id << 32) | seq`.

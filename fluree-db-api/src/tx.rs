@@ -2504,6 +2504,24 @@ fn convert_named_graphs_to_templates(
 
             for obj in &triple.objects {
                 let (object_term, dtc) = convert_object(obj, &block.prefixes, ns_registry)?;
+                // `rdf:reifies` names a triple term; the reified forms come
+                // through `block.reified` below, so an ordinary object here
+                // is a data error the link lowering would read as a link.
+                if matches!(&predicate_term, TemplateTerm::Sid(p) if fluree_db_core::is_rdf_reifies(p))
+                    && !matches!(
+                        &object_term,
+                        TemplateTerm::Value(fluree_db_core::FlakeValue::TripleTerm(_))
+                    )
+                {
+                    return Err(ApiError::Transact(
+                        fluree_db_transact::TransactError::UnsupportedFeature(
+                            "'rdf:reifies' takes a triple term as its object; write the \
+                             reified-triple form (`<< s p o >>` or `~ <reifier>`) rather \
+                             than an ordinary object"
+                                .to_string(),
+                        ),
+                    ));
+                }
                 let mut template =
                     TripleTemplate::new(subject_term.clone(), predicate_term.clone(), object_term);
                 template = template.in_graph(std::sync::Arc::clone(&graph));

@@ -437,7 +437,9 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
                 } else {
                     expand_iri(k, effective)
                 };
-                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
+                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key)
+                    || expanded_key == fluree_vocab::rdf::REIFIES
+                {
                     return Err(TransactError::UnsupportedFeature(format!(
                         "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
                          use @annotation or @reifies instead"
@@ -2054,7 +2056,7 @@ fn intercept_annotations_for_predicate(
                 ReifiedObjectShape::Iri(object_id)
             };
 
-            if reifies_iris::ALL.contains(&predicate) {
+            if reifies_iris::ALL.contains(&predicate) || predicate == fluree_vocab::rdf::REIFIES {
                 return Err(TransactError::UnsupportedFeature(format!(
                     "'{predicate}' is a system-controlled predicate; use @annotation instead"
                 )));

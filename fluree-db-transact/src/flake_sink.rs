@@ -180,6 +180,23 @@ impl<'a> FlakeSink<'a> {
 
         let (o, dtc) = self.resolve_object(object)?;
 
+        // `rdf:reifies` names a triple term; any other object is a data
+        // error, and one the link lowering would read as a reifier of
+        // nothing. The reified-triple forms never reach here: the parser
+        // hands them to `emit_reified_triple`.
+        if fluree_db_core::is_rdf_reifies(&p) && !matches!(o, FlakeValue::TripleTerm(_)) {
+            let e = TransactError::UnsupportedFeature(
+                "'rdf:reifies' takes a triple term as its object; write the reified-triple \
+                 form (`<< s p o >>` or `~ <reifier>`) rather than an ordinary object"
+                    .to_string(),
+            );
+            tracing::error!("FlakeSink: rdf:reifies with a non-term object, aborting — {e}");
+            if self.invariant_error.is_none() {
+                self.invariant_error = Some(e);
+            }
+            return None;
+        }
+
         let dt = dtc.datatype().clone();
         let lang = dtc.lang_tag().map(std::string::ToString::to_string);
 

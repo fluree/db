@@ -881,6 +881,22 @@ mod inner {
                 return;
             };
 
+            // `rdf:reifies` names a triple term; the reified-triple forms
+            // arrive through `emit_reified_triple`, so an ordinary object
+            // here is a data error the link lowering would read as a
+            // reifier of nothing. Same rule as the transactional sink.
+            if fluree_db_core::is_rdf_reifies(&p) && !matches!(o, FlakeValue::TripleTerm(_)) {
+                if self.encode_error.is_none() {
+                    let msg = "'rdf:reifies' takes a triple term as its object; write the \
+                               reified-triple form (`<< s p o >>` or `~ <reifier>`) rather \
+                               than an ordinary object"
+                        .to_string();
+                    tracing::error!("ImportSink: {msg}");
+                    self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                }
+                return;
+            }
+
             let dt = dtc.datatype().clone();
             let lang = dtc.lang_tag().map(std::string::ToString::to_string);
 
