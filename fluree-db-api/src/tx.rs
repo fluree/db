@@ -26,8 +26,8 @@ use fluree_db_transact::stage_with_graph_delta as stage_txn;
 use fluree_db_transact::validate_view_with_shacl;
 use fluree_db_transact::{
     commit as commit_txn, parse_transaction, resolve_trig_meta, CommitOpts, CommitReceipt,
-    GraphSel, NamedGraphBlock, NamespaceRegistry, RawTrigMeta, StageOptions, TemplateTerm,
-    TripleTemplate, Txn, TxnOpts, TxnType,
+    GraphSel, NamedGraphBlock, NamespaceRegistry, Placement, RawTrigMeta, StageOptions,
+    TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType,
 };
 use fluree_vocab::config_iris;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -339,6 +339,16 @@ impl<'a> TrackedTransactionInput<'a> {
             txn_opts,
             policy,
         }
+    }
+}
+
+/// A document that does not parse is a Turtle parse error (HTTP 400,
+/// `TURTLE_PARSE`), whichever part of it failed; anything else the document
+/// raised stays the transaction error it is.
+fn rdf_text_error(e: fluree_db_transact::TransactError) -> ApiError {
+    match e {
+        fluree_db_transact::TransactError::Turtle(e) => ApiError::Turtle(e),
+        other => other.into(),
     }
 }
 
@@ -2994,6 +3004,55 @@ impl crate::Fluree {
         .await
     }
 
+    /// Stage RDF text (Turtle or TriG) as a `txn_type` transaction.
+    ///
+    /// The text is parsed once, by the Turtle parser, into templates
+    /// ([`fluree_db_transact::parse_rdf_text_txn`]); nothing is re-encoded
+    /// as JSON-LD. Statements land where the document puts them: the default
+    /// graph's in the default graph, each block's in its graph, and a
+    /// `<#txn-meta>` block's in the commit metadata. An upsert scopes its
+    /// blank nodes to the document's content, so the same document upserted
+    /// again addresses the same nodes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_rdf_text_tracked(
+        &self,
+        ledger: LedgerState,
+        txn_type: TxnType,
+        text: &str,
+        txn_opts: TxnOpts,
+        index_config: Option<&IndexConfig>,
+        external_tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+    ) -> Result<StageResult> {
+        let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let (txn, _) = {
+            let parse_span =
+                tracing::debug_span!("txn_parse", txn_type = ?txn_type, rdf_bytes = text.len());
+            let _guard = parse_span.enter();
+            fluree_db_transact::parse_rdf_text_txn(
+                text,
+                txn_type,
+                Placement::AsWritten,
+                false,
+                txn_opts,
+                &mut ns_registry,
+            )
+            .map_err(rdf_text_error)?
+        };
+        // RDF text has no JSON body: no `opts.maxFuel` to read and no
+        // `@context` to compact violation messages with.
+        self.stage_built_txn_tracked(
+            ledger,
+            txn,
+            ns_registry,
+            &JsonValue::Null,
+            index_config,
+            external_tracker,
+            policy,
+        )
+        .await
+    }
+
     /// Shared staging tail for a fully-built JSON-LD [`Txn`]: uniqueness /
     /// SHACL / reasoning validation and [`StageResult`] assembly.
     #[allow(clippy::too_many_arguments)]
@@ -4058,16 +4117,18 @@ impl crate::Fluree {
         .await
     }
 
-    /// Upsert data from Turtle format
+    /// Upsert data from Turtle or TriG
     ///
-    /// Parses the Turtle input and upserts it into the ledger.
-    /// For each (subject, predicate) pair, existing values are retracted
-    /// before new values are asserted.
+    /// Parses the document once and upserts it into the ledger: for each
+    /// (graph, subject, predicate) it names, the current values are
+    /// retracted and the document's values asserted. A TriG document's
+    /// blocks upsert into their graphs, and a `<#txn-meta>` block becomes
+    /// commit metadata.
     ///
     /// # Arguments
     ///
     /// * `ledger` - The ledger state (consumed)
-    /// * `turtle` - Turtle (TTL) format data
+    /// * `turtle` - Turtle or TriG text
     ///
     /// # Example
     ///
@@ -4078,11 +4139,18 @@ impl crate::Fluree {
     /// "#).await?;
     /// ```
     pub async fn upsert_turtle(&self, ledger: LedgerState, turtle: &str) -> Result<TransactResult> {
-        let data = fluree_graph_turtle::parse_to_json(turtle)?;
-        self.upsert(ledger, &data).await
+        let index_config = self.default_index_config();
+        self.upsert_turtle_with_opts(
+            ledger,
+            turtle,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &index_config,
+        )
+        .await
     }
 
-    /// Upsert data from Turtle format with options
+    /// Upsert data from Turtle or TriG with options
     ///
     /// Same as `upsert_turtle` but allows custom transaction and commit options.
     /// Prefer using the builder API: `fluree.transact(ledger).upsert_turtle(ttl).txn_opts(...).execute()`.
@@ -4095,8 +4163,28 @@ impl crate::Fluree {
         commit_opts: CommitOpts,
         index_config: &IndexConfig,
     ) -> Result<TransactResult> {
-        let data = fluree_graph_turtle::parse_to_json(turtle)?;
-        self.upsert_with_opts(ledger, &data, txn_opts, commit_opts, index_config)
+        let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
+
+        // The raw transaction is the text, as for a Turtle insert.
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
+            let content_store = self.content_store(ledger.ledger_id());
+            commit_opts.with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
+        } else {
+            commit_opts
+        };
+
+        let staged = self
+            .stage_rdf_text_tracked(
+                ledger,
+                TxnType::Upsert,
+                turtle,
+                txn_opts,
+                Some(index_config),
+                None,
+                None,
+            )
+            .await?;
+        self.commit_stage_result(staged, TxnType::Upsert, commit_opts, index_config)
             .await
     }
 

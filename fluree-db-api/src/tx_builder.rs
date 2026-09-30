@@ -33,8 +33,8 @@ use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
 use fluree_db_transact::GraphSel;
 use fluree_db_transact::{
-    lower_sparql_update_request, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
-    RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
+    lower_sparql_update_request, CommitOpts, NamedGraphBlock, NamespaceRegistry, RawTrigMeta,
+    TransactError, Txn, TxnOpts, TxnType,
 };
 use rustc_hash::FxHashSet;
 use std::collections::HashMap;
@@ -458,19 +458,12 @@ impl TransactOperation<'_> {
             TransactOperation::Graph(_) => Err(ApiError::internal(
                 "graph operations must be staged through stage_graph_op_tracked",
             )),
-            TransactOperation::InsertTurtle(ttl) | TransactOperation::UpsertTurtle(ttl) => {
-                // Phase 1: Extract TriG GRAPH block (if present)
-                let phase1 = parse_trig_phase1(ttl)?;
-
-                // Parse cleaned Turtle to JSON
-                let json = fluree_graph_turtle::parse_to_json(&phase1.turtle)?;
-
-                Ok(ParsedOperation {
-                    json,
-                    trig_meta: phase1.raw_meta,
-                    named_graphs: phase1.named_graphs,
-                })
-            }
+            // RDF text is parsed once, into templates, by the staging path
+            // (`stage_turtle_insert_with_opts`, `stage_rdf_text_tracked`);
+            // reading it here would re-encode it as JSON-LD.
+            TransactOperation::InsertTurtle(_) | TransactOperation::UpsertTurtle(_) => Err(
+                ApiError::internal("RDF text must be staged through its own lane, not as JSON-LD"),
+            ),
         }
     }
 }
@@ -1175,6 +1168,13 @@ fn remap_sid(sid: &mut Sid, remap: &HashMap<u16, u16>) {
 
 enum OpPlan<'a> {
     InsertTurtle(&'a str),
+    /// RDF text staged as templates (an upsert), parsed against whichever
+    /// state it is staged on: parsing allocates namespace codes relative to
+    /// that state's table.
+    Rdf {
+        txn_type: TxnType,
+        text: &'a str,
+    },
     /// A SPARQL UPDATE request, parsed and lowered against whichever state
     /// it is staged on — lowering allocates namespace codes relative to
     /// that state's table.
@@ -1195,6 +1195,10 @@ impl<'a> OpPlan<'a> {
     fn from_op(op: TransactOperation<'a>) -> Result<Self> {
         match op {
             TransactOperation::InsertTurtle(turtle) => Ok(OpPlan::InsertTurtle(turtle)),
+            TransactOperation::UpsertTurtle(text) => Ok(OpPlan::Rdf {
+                txn_type: TxnType::Upsert,
+                text,
+            }),
             TransactOperation::Graph(op) => Ok(OpPlan::Graph(op)),
             _ => {
                 let txn_type = op.txn_type();
@@ -1472,6 +1476,28 @@ impl Fluree {
             return Ok((stage_result, TxnType::Insert, commit_opts, None));
         }
 
+        // RDF text upsert: parsed once into templates.
+        if let TransactOperation::UpsertTurtle(text) = op {
+            let commit_opts = self.maybe_spawn_txn_upload(
+                core.commit_opts,
+                &ledger_id,
+                serde_json::Value::String(text.to_string()),
+                store_raw_txn,
+            );
+            let stage_result = self
+                .stage_rdf_text_tracked(
+                    ledger_state,
+                    TxnType::Upsert,
+                    text,
+                    core.txn_opts,
+                    Some(index_config),
+                    tracker_ref,
+                    core.policy.as_ref(),
+                )
+                .await?;
+            return Ok((stage_result, TxnType::Upsert, commit_opts, None));
+        }
+
         // Graph ops: dedicated staging (graph scope, sync retraction wave).
         // Must be dispatched before the JSON-like fallthrough, which would
         // otherwise stage the payload as a plain default-graph insert.
@@ -1576,6 +1602,26 @@ impl Fluree {
                     )
                     .await?;
                 Ok((stage_result, TxnType::Insert, commit_opts))
+            }
+            OpPlan::Rdf { txn_type, text } => {
+                let commit_opts = self.maybe_spawn_txn_upload(
+                    commit_opts_base.clone(),
+                    &ledger_id,
+                    serde_json::Value::String((*text).to_string()),
+                    store_raw_txn,
+                );
+                let stage_result = self
+                    .stage_rdf_text_tracked(
+                        ledger_state,
+                        *txn_type,
+                        text,
+                        txn_opts,
+                        Some(index_config),
+                        tracker_ref,
+                        None,
+                    )
+                    .await?;
+                Ok((stage_result, *txn_type, commit_opts))
             }
             OpPlan::JsonLike {
                 txn_type,
