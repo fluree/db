@@ -118,6 +118,18 @@ impl IncrementalRootBuilder {
     }
 
     /// Update subject and string watermarks.
+    /// Replace the triple-term dictionary refs, recording the old reverse
+    /// tree's CIDs that the update superseded as garbage. Packs only append,
+    /// so none are replaced here.
+    pub fn set_term_dict(
+        &mut self,
+        refs: Option<fluree_db_binary_index::TermDictRefs>,
+        replaced: Vec<ContentId>,
+    ) {
+        self.root.term_dict = refs;
+        self.replaced_cids.extend(replaced);
+    }
+
     pub fn set_watermarks(&mut self, subject_watermarks: Vec<u64>, string_watermark: u32) {
         self.root.subject_watermarks = subject_watermarks;
         self.root.string_watermark = string_watermark;

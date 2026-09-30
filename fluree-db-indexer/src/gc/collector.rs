@@ -2337,6 +2337,7 @@ mod tests {
             sketch_ref: None,
             attachment_events: None,
             prev_index,
+            term_dict: None,
         }
     }
 

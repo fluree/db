@@ -202,6 +202,12 @@ pub struct IncrementalNovelty {
     pub base_numbig_counts: HashMap<(u16, u32), usize>,
     /// String text bytes for fulltext assertion entries.
     pub fulltext_string_bytes: HashMap<u32, Vec<u8>>,
+    /// Triple terms first interned by this window as `(p_id, seq, key bytes)`,
+    /// ascending by `(p_id, seq)`; their handles continue above the base
+    /// root's per-predicate watermarks.
+    pub new_terms: Vec<(u32, u32, Vec<u8>)>,
+    /// Per-predicate term watermarks after this window (base merged with new).
+    pub term_watermarks: Vec<(u32, u32)>,
 }
 
 // ============================================================================
@@ -280,6 +286,8 @@ pub async fn resolve_incremental_commits_v6(
 
     // 4. Seed SharedResolverState from V6 root.
     let mut shared = SharedResolverState::from_index_root(&root)?;
+    // Incremental builds resolve term ordinals in step 9a, so links are synthesized.
+    shared.link_synth.enable();
 
     // Enable spatial hook for non-POINT geometry detection.
     shared.spatial_hook = Some(crate::spatial_hook::SpatialHook::new());
@@ -568,6 +576,7 @@ pub async fn resolve_incremental_commits_v6(
             commit_count,
             "V6 incremental resolve: timings (no records)"
         );
+        let base_term_watermarks = root_term_watermarks(&root);
         return Ok(IncrementalNovelty {
             records: Vec::new(),
             ops: Vec::new(),
@@ -586,6 +595,8 @@ pub async fn resolve_incremental_commits_v6(
             base_vector_counts,
             base_numbig_counts,
             fulltext_string_bytes: HashMap::new(),
+            new_terms: Vec::new(),
+            term_watermarks: base_term_watermarks,
         });
     }
 
@@ -652,6 +663,90 @@ pub async fn resolve_incremental_commits_v6(
         remap_record(record, &reconcile.subject_remap, &reconcile.string_remap)?;
     }
     let t_remap_records_ms = t0.elapsed().as_millis() as u64;
+
+    // 9a. Triple terms: remap the chunk's term table the same way, then give
+    //     every link record its global handle — an existing one from the base
+    //     dictionary, or a fresh one above the base watermarks.
+    let mut chunk_terms = chunk.terms;
+    for term in &mut chunk_terms {
+        remap_record(term, &reconcile.subject_remap, &reconcile.string_remap)?;
+    }
+    let (new_terms, term_watermarks) = {
+        let base_refs = root.term_dict.as_ref();
+        let base_reader = match base_refs {
+            Some(refs) => {
+                let cache_dir = config
+                    .artifact_cache_dir
+                    .clone()
+                    .unwrap_or_else(std::env::temp_dir);
+                Some(
+                    fluree_db_binary_index::dict::TermDictReader::from_refs_reusing(
+                        Arc::clone(&cs),
+                        &cache_dir,
+                        refs,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        IncrementalResolveError::DictTreeLoad(format!("term dictionary: {e}"))
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let base_wms: Vec<(u32, u32)> = base_refs.map(|r| r.watermarks.clone()).unwrap_or_default();
+        let mut builder =
+            fluree_db_binary_index::dict::TermDictBuilder::above_watermarks(&base_wms);
+        let triple_term = ObjKind::TRIPLE_TERM.as_u8();
+        for record in &mut v1_records {
+            if record.o_kind != triple_term {
+                continue;
+            }
+            let term = chunk_terms.get(record.o_key as usize).ok_or_else(|| {
+                IncrementalResolveError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("term ordinal {} out of range", record.o_key),
+                ))
+            })?;
+            let key = fluree_db_core::triple_term::TermKey {
+                s_id: term.s_id.as_u64(),
+                p_id: term.p_id,
+                o_type: o_type_registry.resolve(
+                    ObjKind::from_u8(term.o_kind),
+                    fluree_db_core::DatatypeDictId::from_u16(term.dt),
+                    term.lang_id,
+                ),
+                o_key: term.o_key,
+            };
+            let existing = match (&base_reader, builder.get(&key)) {
+                (_, Some(h)) => Some(h),
+                (Some(reader), None) => reader.find_handle(&key)?,
+                (None, None) => None,
+            };
+            record.o_key = match existing {
+                Some(h) => h,
+                None => builder.get_or_insert(key)?,
+            };
+        }
+        let new_terms: Vec<(u32, u32, Vec<u8>)> = builder
+            .entries_sorted()
+            .into_iter()
+            .map(|(h, key)| {
+                (
+                    fluree_db_core::triple_term::term_handle_p_id(h),
+                    fluree_db_core::triple_term::term_handle_seq(h),
+                    key.to_be_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let mut wms: std::collections::BTreeMap<u32, u32> = base_wms.into_iter().collect();
+        for (p_id, wm) in builder.watermarks() {
+            wms.insert(p_id, wm);
+        }
+        (new_terms, wms.into_iter().collect::<Vec<_>>())
+    };
+    drop(chunk_terms);
 
     // VECTOR_ID handles are already globally-correct: chunk inserts
     // appended to the pre-loaded base arena (step 4b) so they return
@@ -766,7 +861,17 @@ pub async fn resolve_incremental_commits_v6(
         base_vector_counts,
         base_numbig_counts,
         fulltext_string_bytes,
+        new_terms,
+        term_watermarks,
     })
+}
+
+/// The base root's per-predicate term watermarks, or none.
+fn root_term_watermarks(root: &IndexRoot) -> Vec<(u32, u32)> {
+    root.term_dict
+        .as_ref()
+        .map(|r| r.watermarks.clone())
+        .unwrap_or_default()
 }
 
 // ============================================================================

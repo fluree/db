@@ -28,7 +28,7 @@ use std::sync::Arc;
 /// The pack header's `ns_code` slot is 16 bits; the low half of the inner
 /// predicate id goes there as a read-time consistency check.
 #[inline]
-fn pack_ns_code(p_id: u32) -> u16 {
+pub fn pack_ns_code(p_id: u32) -> u16 {
     (p_id & 0xFFFF) as u16
 }
 
@@ -191,6 +191,14 @@ impl TermDictBuilder {
     /// True when nothing has been interned.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// Every interned term as `(handle, key)`, ascending by handle, which is
+    /// `(p_id, seq)` order: what an incremental pack append consumes.
+    pub fn entries_sorted(&self) -> Vec<(u64, TermKey)> {
+        let mut v: Vec<(u64, TermKey)> = self.map.iter().map(|(k, h)| (*h, *k)).collect();
+        v.sort_unstable_by_key(|(h, _)| *h);
+        v
     }
 
     /// `(p_id, highest seq allocated)` per predicate with at least one term.

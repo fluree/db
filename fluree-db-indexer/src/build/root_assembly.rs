@@ -240,6 +240,9 @@ pub(crate) struct Fir6Inputs {
     /// prior root — without it a full rebuild under `Augment` coverage
     /// silently drops a previously-sealed arena.
     pub prev_index: Option<BinaryPrevIndexRef>,
+    /// Triple-term dictionary interned by this build, if any reification
+    /// links were synthesized.
+    pub term_dict: Option<fluree_db_binary_index::TermDictRefs>,
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -332,9 +335,7 @@ pub(crate) async fn encode_and_write_root_v6(
         sketch_ref: inputs.sketch_ref,
         has_annotations,
         annotation_index: None,
-        // Full rebuilds do not intern reification links yet; the term
-        // dictionary is produced by bulk import only.
-        term_dict: None,
+        term_dict: inputs.term_dict,
         // Sticky bit flipped to `true` below if the rebuild path
         // seals an `Authoritative` arena. Rebuilds always start
         // from scratch with no prior root, so this is the only

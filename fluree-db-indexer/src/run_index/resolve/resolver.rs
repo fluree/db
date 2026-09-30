@@ -1088,6 +1088,9 @@ pub struct SharedResolverState {
     pub graphs: super::global_dict::PredicateDict,
     /// Global language tag dict (shared across all chunks — no per-chunk remap needed).
     pub languages: super::global_dict::LanguageTagDict,
+    /// RDF 1.2 link synthesis for `f:reifies*` bundles; off until a build
+    /// path that resolves term ordinals enables it.
+    pub link_synth: super::link_synth::LinkSynth,
     /// Per-graph, per-predicate overflow numeric arenas (BigInt/BigDecimal).
     /// Outer key = g_id, inner key = p_id.
     pub numbigs:
@@ -1174,6 +1177,7 @@ impl SharedResolverState {
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
             schema_hook: None,
             saw_list_meta: false,
+            link_synth: super::link_synth::LinkSynth::new(),
         }
     }
 
@@ -1302,6 +1306,7 @@ impl SharedResolverState {
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
             schema_hook: None,
             saw_list_meta: false,
+            link_synth: super::link_synth::LinkSynth::new(),
         })
     }
 
@@ -1446,6 +1451,15 @@ impl SharedResolverState {
                 return Ok(());
             };
 
+            self.link_synth.observe(
+                &raw_op,
+                &record,
+                &mut self.predicates,
+                &mut self.datatypes,
+                &self.ns_prefixes,
+                chunk,
+            );
+
             // Feed raw op to spatial hook (needs raw WKT string + resolved IDs).
             // Note: record.s_id is chunk-local here; subject IDs in spatial entries
             // must be remapped after dict merge (Phase C).
@@ -1487,6 +1501,9 @@ impl SharedResolverState {
             }
             Ok(())
         })?;
+
+        self.link_synth
+            .flush(chunk, &mut self.predicates, &mut self.datatypes);
 
         // Emit txn-meta records into the same chunk.
         let meta_count = self.emit_txn_meta_chunk(
@@ -2123,6 +2140,9 @@ pub struct RebuildChunk {
     pub strings: super::chunk_dict::ChunkStringDict,
     /// Buffered RunRecords (with chunk-local subject/string IDs).
     pub records: Vec<RunRecord>,
+    /// Reified base edges as pseudo-records, addressed by ordinal from the
+    /// link records' `o_key` (see `link_synth`).
+    pub terms: Vec<RunRecord>,
     /// Running count of flakes (records) in this chunk.
     pub flake_count: u64,
 }
@@ -2133,6 +2153,7 @@ impl RebuildChunk {
             subjects: super::chunk_dict::ChunkSubjectDict::new(),
             strings: super::chunk_dict::ChunkStringDict::new(),
             records: Vec::new(),
+            terms: Vec::new(),
             flake_count: 0,
         }
     }

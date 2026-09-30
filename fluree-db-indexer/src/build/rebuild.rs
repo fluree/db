@@ -272,6 +272,8 @@ where
             _span_b.record("fetch_concurrency", fetch_concurrency);
 
             let mut shared = SharedResolverState::new_for_ledger(&ledger_id);
+            // Rebuilds resolve the term ordinals in Phase C, so links are synthesized.
+            shared.link_synth.enable();
 
             // Pre-insert rdf:type into predicate dictionary so class tracking
             // works from the very first commit.
@@ -443,12 +445,26 @@ where
             let mut subject_dicts = Vec::with_capacity(chunks.len());
             let mut string_dicts = Vec::with_capacity(chunks.len());
             let mut chunk_records: Vec<Vec<RunRecord>> = Vec::with_capacity(chunks.len());
+            let mut chunk_terms: Vec<Vec<RunRecord>> = Vec::with_capacity(chunks.len());
 
             for chunk in chunks {
                 subject_dicts.push(chunk.subjects);
                 string_dicts.push(chunk.strings);
                 chunk_records.push(chunk.records);
+                chunk_terms.push(chunk.terms);
             }
+
+            // Triple-term interning happens here, once ids are global: the
+            // registry gives each term entry its `o_type`, the builder its
+            // handle. Custom datatypes are all known after Phase B.
+            let term_registry = {
+                let reserved = fluree_db_core::DatatypeDictId::RESERVED_COUNT as usize;
+                let custom: Vec<String> = (reserved..shared.datatypes.len() as usize)
+                    .filter_map(|i| shared.datatypes.resolve(i as u32).map(str::to_string))
+                    .collect();
+                fluree_db_core::o_type_registry::OTypeRegistry::new(&custom)
+            };
+            let mut term_builder = fluree_db_binary_index::dict::TermDictBuilder::new();
 
             let (subject_merge, subject_remaps) =
                 run_index::dict_merge::merge_subject_dicts(&subject_dicts);
@@ -569,6 +585,65 @@ where
                     // else: inline types, no remap needed
                 }
 
+                // Term entries get the same remap; link records then trade
+                // their ordinal for the global handle.
+                let terms = &mut chunk_terms[ci];
+                for term in terms.iter_mut() {
+                    let local_s = term.s_id.as_u64() as usize;
+                    let global_s = *s_remap.get(local_s).ok_or_else(|| {
+                        IndexerError::StorageWrite(format!(
+                            "term subject remap miss: chunk {ci}, local_s={local_s}"
+                        ))
+                    })?;
+                    term.s_id = fluree_db_core::subject_id::SubjectId::from_u64(global_s);
+                    let kind = fluree_db_core::value_id::ObjKind::from_u8(term.o_kind);
+                    if kind == fluree_db_core::value_id::ObjKind::REF_ID {
+                        let local_o = term.o_key as usize;
+                        term.o_key = *s_remap.get(local_o).ok_or_else(|| {
+                            IndexerError::StorageWrite(format!(
+                                "term object remap miss: chunk {ci}, local_o={local_o}"
+                            ))
+                        })?;
+                    } else if kind == fluree_db_core::value_id::ObjKind::LEX_ID
+                        || kind == fluree_db_core::value_id::ObjKind::JSON_ID
+                    {
+                        let local_str = fluree_db_core::value_id::ObjKey::from_u64(term.o_key)
+                            .decode_u32_id() as usize;
+                        let global_str = *str_remap.get(local_str).ok_or_else(|| {
+                            IndexerError::StorageWrite(format!(
+                                "term string remap miss: chunk {ci}, local_str={local_str}"
+                            ))
+                        })?;
+                        term.o_key =
+                            fluree_db_core::value_id::ObjKey::encode_u32_id(global_str).as_u64();
+                    }
+                }
+                let triple_term = fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8();
+                for record in records.iter_mut() {
+                    if record.o_kind != triple_term {
+                        continue;
+                    }
+                    let term = terms.get(record.o_key as usize).ok_or_else(|| {
+                        IndexerError::StorageWrite(format!(
+                            "term ordinal {} out of range in chunk {ci}",
+                            record.o_key
+                        ))
+                    })?;
+                    let key = fluree_db_core::triple_term::TermKey {
+                        s_id: term.s_id.as_u64(),
+                        p_id: term.p_id,
+                        o_type: term_registry.resolve(
+                            fluree_db_core::value_id::ObjKind::from_u8(term.o_kind),
+                            fluree_db_core::DatatypeDictId::from_u16(term.dt),
+                            term.lang_id,
+                        ),
+                        o_key: term.o_key,
+                    };
+                    record.o_key = term_builder
+                        .get_or_insert(key)
+                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                }
+
                 // Sort by (g_id, SPOT).
                 records.sort_unstable_by(fluree_db_binary_index::format::run_record::cmp_g_spot);
 
@@ -625,6 +700,7 @@ where
             // copies immediately. For large datasets (e.g. 60M flakes) this
             // reclaims ~2-6 GB of heap before the index build phase.
             drop(chunk_records);
+            drop(chunk_terms);
             drop(subject_remaps);
             drop(string_remaps);
             drop(subject_dicts);
@@ -1055,6 +1131,23 @@ where
                     .instrument(tracing::debug_span!("upload_dicts_v3"))
                     .await?;
 
+            let term_dict = if term_builder.is_empty() {
+                None
+            } else {
+                let term_count = term_builder.len();
+                let refs = term_builder
+                    .upload(&content_store)
+                    .await
+                    .map_err(|e| IndexerError::StorageWrite(format!("term dictionary: {e}")))?;
+                tracing::info!(
+                    term_count,
+                    predicates = refs.forward_packs.len(),
+                    links = shared.link_synth.links_emitted,
+                    "triple-term dictionary uploaded"
+                );
+                Some(refs)
+            };
+
             // Build namespace codes BTreeMap from shared.ns_prefixes.
             let ns_codes: std::collections::BTreeMap<u16, String> = shared
                 .ns_prefixes
@@ -1186,6 +1279,7 @@ where
                 sketch_ref,
                 attachment_events: config.attachment_events.clone(),
                 prev_index: prev_index.clone(),
+                term_dict,
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(

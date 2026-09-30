@@ -226,8 +226,10 @@ async fn cascade_attachment_retracts(
                 // reifies it live, pointing at a triple that no longer exists.
                 let mut all_ann_flakes = all_ann_flakes;
                 stamp_graph(&mut all_ann_flakes, flake.g.as_ref());
+                // The index-side `rdf:reifies` link is neither bundle nor body.
                 let (bundle, metadata): (Vec<Flake>, Vec<Flake>) = all_ann_flakes
                     .into_iter()
+                    .filter(|f| !fluree_db_core::is_rdf_reifies(&f.p))
                     .partition(|f| is_reserved_reifies_predicate(&f.p));
                 if bundle.is_empty() {
                     continue;
@@ -352,6 +354,7 @@ async fn cascade_attachment_retracts(
             );
             let (bundle, current_metadata): (Vec<Flake>, Vec<Flake>) = all_flakes
                 .into_iter()
+                .filter(|f| !fluree_db_core::is_rdf_reifies(&f.p))
                 .partition(|f| is_reserved_reifies_predicate(&f.p));
             if bundle.is_empty() {
                 continue; // not an annotation subject
@@ -500,7 +503,11 @@ async fn cascade_attachment_retracts(
             )
             .await?;
             for asserted in all_flakes {
-                if is_reserved_reifies_predicate(&asserted.p) {
+                // Bundle flakes are retracted by the caller; the index-side
+                // link is retired by the next index pass, not by a commit.
+                if is_reserved_reifies_predicate(&asserted.p)
+                    || fluree_db_core::is_rdf_reifies(&asserted.p)
+                {
                     continue;
                 }
                 let mut retract = asserted.clone();

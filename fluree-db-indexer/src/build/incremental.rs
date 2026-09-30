@@ -1272,6 +1272,113 @@ pub async fn incremental_index(
 
     root_builder.set_dict_refs(new_dict_refs);
 
+    // Triple-term dictionary: append this window's new terms. Packs are
+    // per inner predicate and only ever append; the reverse tree is updated
+    // copy-on-write like the subject tree.
+    if !novelty.new_terms.is_empty() {
+        use fluree_db_binary_index::dict::forward_pack::KIND_TERM_FWD;
+        use fluree_db_binary_index::dict::incremental::build_incremental_packs_for_stream;
+        use fluree_db_binary_index::dict::term_dict::pack_ns_code;
+        use fluree_db_binary_index::format::wire_helpers::PackBranchEntry;
+        let base = novelty.base_root.term_dict.clone();
+        let mut forward_packs: Vec<(u32, Vec<PackBranchEntry>)> = base
+            .as_ref()
+            .map(|b| b.forward_packs.clone())
+            .unwrap_or_default();
+        let mut by_pred: std::collections::BTreeMap<u32, Vec<(u64, &[u8])>> =
+            std::collections::BTreeMap::new();
+        for (p_id, seq, key) in &novelty.new_terms {
+            by_pred
+                .entry(*p_id)
+                .or_default()
+                .push((*seq as u64, key.as_slice()));
+        }
+        for (p_id, entries) in &by_pred {
+            let existing: Vec<PackBranchEntry> = forward_packs
+                .iter()
+                .find(|(p, _)| p == p_id)
+                .map(|(_, refs)| refs.clone())
+                .unwrap_or_default();
+            let pack_result = build_incremental_packs_for_stream(
+                KIND_TERM_FWD,
+                pack_ns_code(*p_id),
+                &existing,
+                entries,
+            )
+            .map_err(|e| {
+                IndexerError::StorageWrite(format!("term fwd pack build p_id={p_id}: {e}"))
+            })?;
+            let kind = ContentKind::DictBlob {
+                dict: fluree_db_core::DictKind::TermForward { p_id: *p_id },
+            };
+            let mut updated = existing;
+            for pack in &pack_result.new_packs {
+                let pack_cid = content_store
+                    .put(kind, &pack.bytes)
+                    .await
+                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                updated.push(PackBranchEntry {
+                    first_id: pack.first_id,
+                    last_id: pack.last_id,
+                    pack_cid,
+                });
+            }
+            if let Some(entry) = forward_packs.iter_mut().find(|(p, _)| p == p_id) {
+                entry.1 = updated;
+            } else {
+                forward_packs.push((*p_id, updated));
+            }
+        }
+        forward_packs.sort_by_key(|(p, _)| *p);
+
+        let empty_tree = fluree_db_binary_index::DictTreeRefs {
+            branch: fluree_db_core::ContentId::from_hex_digest(
+                fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
+                &fluree_db_core::sha256_hex(b""),
+            )
+            .expect("valid digest"),
+            leaves: Vec::new(),
+        };
+        let (base_reverse, base_count) = match &base {
+            Some(b) => (b.reverse.clone(), b.term_count),
+            None => (empty_tree, 0),
+        };
+        let updated_tree = if base.is_some() {
+            super::dicts::upload_incremental_reverse_tree_async_terms(
+                content_store.as_ref(),
+                &base_reverse,
+                &novelty.new_terms,
+                warm_cache.as_deref(),
+            )
+            .await?
+        } else {
+            // No base dictionary: build the tree from scratch through the
+            // same core, against an empty existing tree.
+            super::dicts::upload_incremental_reverse_tree_async_terms(
+                content_store.as_ref(),
+                &fluree_db_binary_index::DictTreeRefs {
+                    branch: base_reverse.branch.clone(),
+                    leaves: Vec::new(),
+                },
+                &novelty.new_terms,
+                warm_cache.as_deref(),
+            )
+            .await?
+        };
+        let refs = fluree_db_binary_index::TermDictRefs {
+            forward_packs,
+            reverse: updated_tree.tree_refs,
+            watermarks: novelty.term_watermarks.clone(),
+            term_count: base_count + novelty.new_terms.len() as u64,
+        };
+        tracing::debug!(
+            new_terms = novelty.new_terms.len(),
+            term_count = refs.term_count,
+            "V6 Phase 3: triple-term dictionary updated"
+        );
+        root_builder.set_term_dict(Some(refs), updated_tree.replaced_cids);
+    }
+
     // Update metadata from resolver state.
     let new_ns_codes: std::collections::BTreeMap<u16, String> = novelty
         .shared

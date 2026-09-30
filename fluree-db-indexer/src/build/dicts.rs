@@ -61,6 +61,35 @@ pub(crate) async fn upload_incremental_reverse_tree_async_strings(
 
 /// Core async reverse tree upload: pre-fetch affected leaves, spawn_blocking
 /// for CoW update, async-upload new artifacts.
+/// Triple-term reverse tree append: entries are `(encoded TermKey, handle)`.
+pub(crate) async fn upload_incremental_reverse_tree_async_terms(
+    content_store: &dyn ContentStore,
+    existing_refs: &DictTreeRefs,
+    new_terms: &[(u32, u32, Vec<u8>)],
+    warm_cache: Option<&LeafletCache>,
+) -> Result<UpdatedReverseTree> {
+    use fluree_db_binary_index::dict::reverse_leaf::ReverseEntry;
+    use fluree_db_core::triple_term::term_handle;
+
+    let mut entries: Vec<ReverseEntry> = new_terms
+        .iter()
+        .map(|(p_id, seq, key)| ReverseEntry {
+            key: key.clone(),
+            id: term_handle(*p_id, *seq),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+
+    upload_incremental_reverse_tree_core(
+        content_store,
+        fluree_db_core::DictKind::TermReverse,
+        existing_refs,
+        entries,
+        warm_cache,
+    )
+    .await
+}
+
 async fn upload_incremental_reverse_tree_core(
     content_store: &dyn ContentStore,
     dict: fluree_db_core::DictKind,

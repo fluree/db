@@ -11,7 +11,7 @@
 
 use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState};
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 
 const CLAIMS: &str = r#"VERSION "1.2"
 @prefix ex: <http://example.org/> .
@@ -120,4 +120,137 @@ async fn imported_reifiers_carry_a_decodable_triple_term_link() {
         preds.iter().any(|p| p.ends_with("confidence")),
         "the claim body stays visible: {preds:?}"
     );
+}
+
+/// A full rebuild from commits re-synthesizes the links and re-interns the
+/// dictionary: the commits carry only the `f:reifies*` bundles, so this is
+/// the resolver-side assembler, not the import-side term table, at work.
+#[tokio::test]
+async fn reindex_rebuilds_the_links_and_the_dictionary() {
+    let alias = "it/triple-term-links:reindex";
+    let (fluree, _ledger) = import(&[("claims.ttl", CLAIMS)], alias).await;
+    fluree
+        .reindex(alias, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex of an imported annotated ledger");
+    let ledger = fluree.ledger(alias).await.expect("reload after reindex");
+
+    let sparql = "PREFIX ex: <http://example.org/>\n\
+                  PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                  SELECT ?r ?t WHERE { ?r rdf:reifies ?t } ORDER BY ?r";
+    let result = support::query_sparql_formatted(&fluree, &ledger, sparql)
+        .await
+        .expect("link query after reindex");
+    let got = rows(&result);
+    assert_eq!(got.len(), 4, "{got:#?}");
+    let t1 = &got
+        .iter()
+        .find(|r| r[0].ends_with("claim1"))
+        .unwrap_or_else(|| panic!("no link for claim1 after reindex: {got:#?}"))[1];
+    assert!(
+        t1.contains("alice") && t1.contains("knows") && t1.contains("bob"),
+        "claim1 must still reify alice knows bob: {t1}"
+    );
+}
+
+async fn links(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) -> Vec<Vec<String>> {
+    let sparql = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                  SELECT ?r ?t WHERE { ?r rdf:reifies ?t } ORDER BY ?r";
+    let result = support::query_sparql_formatted(fluree, ledger, sparql)
+        .await
+        .expect("link query");
+    rows(&result)
+}
+
+/// The incremental path. The first index of the ledger interns its reifier;
+/// the next window adds a second reifier on the same edge, whose handle must
+/// come from the base dictionary, and a reifier on a new edge, whose handle
+/// is allocated above the base watermark. Both are answered from the index
+/// after the incremental build appends to the dictionary.
+#[tokio::test]
+async fn incremental_index_appends_new_terms_and_reuses_existing_handles() {
+    use fluree_db_indexer::IndexerConfig;
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/triple-term-links:incremental";
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let ctx = json!({ "ex": "http://example.org/" });
+
+    local
+        .run_until(async {
+            let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+            let first = fluree
+                .insert(
+                    ledger0,
+                    &json!({
+                        "@context": ctx,
+                        "@id": "ex:alice",
+                        "ex:knows": {
+                            "@id": "ex:bob",
+                            "@annotation": { "@id": "ex:claim1", "ex:source": { "@id": "ex:hr" } }
+                        }
+                    }),
+                )
+                .await
+                .expect("first annotated insert");
+            support::trigger_index_and_wait(&handle, ledger_id, first.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, first.receipt.t).await;
+            let ledger1 = fluree.ledger(ledger_id).await.expect("reload after first index");
+            let got = links(&fluree, &ledger1).await;
+            assert_eq!(got.len(), 1, "first index must intern the first reifier: {got:#?}");
+
+            let second = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": ctx,
+                        "@graph": [
+                            {
+                                "@id": "ex:alice",
+                                "ex:knows": {
+                                    "@id": "ex:bob",
+                                    "@annotation": { "@id": "ex:claim2", "ex:source": { "@id": "ex:crm" } }
+                                }
+                            },
+                            {
+                                "@id": "ex:carol",
+                                "ex:knows": {
+                                    "@id": "ex:dave",
+                                    "@annotation": { "@id": "ex:claim3", "ex:source": { "@id": "ex:hr" } }
+                                }
+                            }
+                        ]
+                    }),
+                )
+                .await
+                .expect("second annotated insert");
+            support::trigger_index_and_wait(&handle, ledger_id, second.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, second.receipt.t).await;
+            let ledger2 = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after incremental index");
+            let got = links(&fluree, &ledger2).await;
+            assert_eq!(got.len(), 3, "{got:#?}");
+            let term = |reifier: &str| -> String {
+                got.iter()
+                    .find(|r| r[0].ends_with(reifier))
+                    .unwrap_or_else(|| panic!("no link for {reifier}: {got:#?}"))[1]
+                    .clone()
+            };
+            assert_eq!(
+                term("claim1"),
+                term("claim2"),
+                "two reifiers of one edge must share its term"
+            );
+            let t3 = term("claim3");
+            assert!(
+                t3.contains("carol") && t3.contains("dave"),
+                "the new edge gets its own term: {t3}"
+            );
+        })
+        .await;
 }
