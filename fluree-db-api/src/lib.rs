@@ -151,8 +151,9 @@ pub use commit_transfer::{
     PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult, StagedPush,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, sparql_has_dataset_clause, DatasetParseError, DatasetSpec,
-    GovernanceOptions, GraphSource, TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS,
+    sparql_dataset_ledger_ids, sparql_dataset_ledgers, sparql_has_dataset_clause,
+    DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource, TimeSpec,
+    ACCEPTED_TIME_SPEC_SPELLINGS,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;

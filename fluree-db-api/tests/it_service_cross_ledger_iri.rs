@@ -16,6 +16,7 @@
 //! stamping changes the binding representation, and these pin that it did not
 //! disturb them.
 
+use crate::support::recording_ns::RecordingLookups;
 use crate::support::{build_and_publish_index, genesis_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::{DataSetDb, DatasetSpec, FlureeBuilder, GraphSource};
 use serde_json::{json, Value as JsonValue};
@@ -1007,96 +1008,6 @@ async fn service_to_a_non_member_is_refused_not_answered_by_the_dataset() {
     }
 }
 
-/// A read-only nameservice that records every id it is asked about and
-/// delegates to the real one.
-#[derive(Debug)]
-struct RecordingLookups {
-    inner: std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher>,
-    asked: std::sync::Mutex<Vec<String>>,
-}
-
-impl RecordingLookups {
-    fn asked_about(&self, needle: &str) -> bool {
-        self.asked
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|id| id.contains(needle))
-    }
-
-    fn record(&self, id: &str) {
-        self.asked.lock().unwrap().push(id.to_string());
-    }
-}
-
-mod recording_lookups {
-    use super::RecordingLookups;
-    use async_trait::async_trait;
-    use fluree_db_nameservice::{
-        ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord, LedgerHeads,
-        NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup, RefValue, Result,
-        StatusLookup, StatusValue,
-    };
-
-    #[async_trait]
-    impl GraphSourceLookup for RecordingLookups {
-        async fn lookup_graph_source(&self, id: &str) -> Result<Option<GraphSourceRecord>> {
-            self.record(id);
-            self.inner.lookup_graph_source(id).await
-        }
-        async fn lookup_any(&self, id: &str) -> Result<NsLookupResult> {
-            self.record(id);
-            self.inner.lookup_any(id).await
-        }
-        async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
-            self.inner.all_graph_source_records().await
-        }
-    }
-
-    #[async_trait]
-    impl RefLookup for RecordingLookups {
-        async fn get_ref(&self, id: &str, kind: RefKind) -> Result<Option<RefValue>> {
-            self.record(id);
-            self.inner.get_ref(id, kind).await
-        }
-    }
-
-    #[async_trait]
-    impl StatusLookup for RecordingLookups {
-        async fn get_status(&self, id: &str) -> Result<Option<StatusValue>> {
-            self.record(id);
-            self.inner.get_status(id).await
-        }
-    }
-
-    #[async_trait]
-    impl ConfigLookup for RecordingLookups {
-        async fn get_config(&self, id: &str) -> Result<Option<ConfigValue>> {
-            self.record(id);
-            self.inner.get_config(id).await
-        }
-    }
-
-    #[async_trait]
-    impl NameServiceLookup for RecordingLookups {
-        async fn lookup(&self, id: &str) -> Result<Option<NsRecord>> {
-            self.record(id);
-            self.inner.lookup(id).await
-        }
-        async fn all_records(&self) -> Result<Vec<NsRecord>> {
-            self.inner.all_records().await
-        }
-        async fn list_branches(&self, name: &str) -> Result<Vec<NsRecord>> {
-            self.record(name);
-            self.inner.list_branches(name).await
-        }
-        async fn heads(&self, id: &str) -> Result<Option<LedgerHeads>> {
-            self.record(id);
-            self.inner.heads(id).await
-        }
-    }
-}
-
 /// Naming a ledger as a SERVICE endpoint never loads it: SERVICE endpoints are
 /// not authorized the way dataset members are, so a load would be a way around
 /// that. The refusal (and the empty SILENT answer) comes without the
@@ -1113,13 +1024,12 @@ async fn a_service_endpoint_is_never_loaded() {
         json!([{"@id": format!("{BETA}g1"), format!("{BETA}tag"): "gamma"}]),
     )
     .await;
-    let recording = std::sync::Arc::new(RecordingLookups {
-        inner: fluree
+    let recording = std::sync::Arc::new(RecordingLookups::new(
+        fluree
             .nameservice_mode()
             .publisher_arc()
             .expect("read-write nameservice"),
-        asked: std::sync::Mutex::new(Vec::new()),
-    });
+    ));
     let observed = fluree_db_api::Fluree::from_backend(
         fluree.config().clone(),
         fluree.backend().clone(),
@@ -1154,6 +1064,6 @@ async fn a_service_endpoint_is_never_loaded() {
     assert!(
         !recording.asked_about("xl-beta-noload"),
         "the SERVICE endpoint's ledger was looked up: {:?}",
-        recording.asked.lock().unwrap()
+        recording.asked()
     );
 }
