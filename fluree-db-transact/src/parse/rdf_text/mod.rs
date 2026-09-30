@@ -175,12 +175,13 @@ fn default_scope(placement: Placement<'_>) -> Scope {
 
 /// Parse a located document segment by segment, in document order.
 ///
-/// A labeled block's contents keep a relative IRI reference exactly as
-/// written when no `@base` is in force ([`RelativeIris::Verbatim`]): ledger
-/// configuration names a ledger by its id, and an id such as
-/// `org/governance:main` is a relative reference (`f:ledger
-/// <org/governance:main>`). Default-graph statements resolve against the
-/// base as everywhere else, and are refused without one.
+/// A labeled block keeps a relative IRI reference exactly as written when no
+/// `@base` is in force ([`RelativeIris::Verbatim`]), in its label and in its
+/// contents: ledger configuration names a ledger by its id, and an id such
+/// as `org/governance:main` is a relative reference (`f:ledger
+/// <org/governance:main>`). What a graph name denotes is decided where
+/// staging resolves write graphs, not here. Default-graph statements resolve
+/// against the base as everywhere else, and are refused without one.
 fn parse_located(
     located: &Located<'_>,
     placement: Placement<'_>,
@@ -288,8 +289,9 @@ fn shift(e: TurtleError, offset: usize) -> TransactError {
 }
 
 /// Resolve a block label with the parser, under the declarations in force
-/// where the block appears: exactly the expansion a subject IRI gets there
-/// (prefixed-name unescaping, relative references against the base).
+/// where the block appears: exactly the expansion an IRI in the block's
+/// contents gets (prefixed-name unescaping, relative references against the
+/// base, kept as written with no base).
 ///
 /// `<#txn-meta>` with no base in force is the txn-meta block, as it always
 /// was; under a base it resolves like any relative reference.
@@ -309,7 +311,7 @@ fn resolve_label(
         &mut sink,
         prefixes,
         base,
-        ParserOptions::default(),
+        ParserOptions::default().with_relative_iris(RelativeIris::Verbatim),
     )
     .map_err(|e| {
         let message = match e {
@@ -563,39 +565,37 @@ mod tests {
     }
 
     #[test]
-    fn relative_references_need_a_base_outside_block_contents() {
-        // A block label and a default-graph statement resolve against the
-        // base, and are refused without one.
-        let e = err(
-            "GRAPH <g> { <http://s> <http://p> 1 . }",
-            Placement::AsWritten,
-        );
-        assert!(e.contains("graph label"), "{e}");
-        let e = err("<s> <http://p> 1 .", Placement::AsWritten);
-        assert!(e.contains("relative"), "{e}");
+    fn relative_references_need_a_base_in_the_default_graph() {
+        // Before a block, after one, and in an anonymous default block.
+        for doc in [
+            "<s> <http://p> 1 .",
+            "GRAPH <http://g> { <http://s> <http://p> 1 . }\n<s> <http://p> 1 .",
+            "{ <s> <http://p> 1 . }",
+        ] {
+            let e = err(doc, Placement::AsWritten);
+            assert!(e.contains("relative"), "{doc}: {e}");
+        }
     }
 
-    /// Inside a block, with no base in force, a relative reference is kept
-    /// as written: ledger configuration names ledgers by id this way. A base,
-    /// when in force, still resolves it.
+    /// In a block, with no base in force, a relative reference is kept as
+    /// written, as the block's label and in its contents: ledger
+    /// configuration names ledgers by id this way. A base, when in force,
+    /// still resolves both.
     #[test]
     fn a_ledger_id_in_a_block_is_kept_as_written() {
         let doc = "@prefix f: <https://ns.flur.ee/db#> .\n\
-                   GRAPH <urn:cfg> { <urn:cfg:src> f:ledger <org/governance:main> . }\n";
-        assert!(
-            rendered(doc)
-                .iter()
-                .any(|t| t.ends_with("<org/governance:main>")),
-            "{:?}",
-            rendered(doc)
+                   GRAPH <cfg/local> { <urn:cfg:src> f:ledger <org/governance:main> . }\n";
+        assert_eq!(
+            rendered(doc),
+            ["[cfg/local] <urn:cfg:src> <https://ns.flur.ee/db#ledger> <org/governance:main>"]
         );
         let based = format!("@base <http://b.org/> .\n{doc}");
-        assert!(
-            rendered(&based)
-                .iter()
-                .any(|t| t.ends_with("<http://b.org/org/governance:main>")),
-            "{:?}",
-            rendered(&based)
+        assert_eq!(
+            rendered(&based),
+            [
+                "[http://b.org/cfg/local] <urn:cfg:src> <https://ns.flur.ee/db#ledger> \
+              <http://b.org/org/governance:main>"
+            ]
         );
     }
 

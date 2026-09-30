@@ -645,39 +645,45 @@ async fn the_config_recipe_upserts_as_written() {
 /// A ledger id used as an IRI reference inside a GRAPH block, with no `@base`
 /// in force, is stored exactly as written on upsert, TriG insert and sync:
 /// cross-ledger configuration names its model ledger this way
-/// (`f:ledger <org/governance:main>`, a relative reference). The same
-/// statement in the default graph still needs a base, and a base in force
-/// still resolves the reference.
+/// (`f:ledger <org/governance:main>`, a relative reference). A relative block
+/// label is kept as written too (a sync target must be an absolute IRI, so
+/// that case runs on upsert and insert). The same statement in the default
+/// graph still needs a base, and a base in force still resolves both.
 #[tokio::test]
 async fn a_ledger_id_in_a_graph_block_is_stored_as_written() {
     let fluree = memory();
-    let g = "http://example.org/cfg";
     let statement = "<urn:cfg:src> <https://ns.flur.ee/db#ledger> <org/governance:main> .";
-    let block = format!("GRAPH <{g}> {{ {statement} }}\n");
-    for lane in ["upsert", "insert", "sync"] {
-        let ledger = genesis_ledger(&fluree, &format!("it/rdf-ledger-id-{lane}:main"));
-        let result = match lane {
-            "upsert" => fluree.upsert_turtle(ledger, &block).await.map(|r| r.ledger),
-            "insert" => fluree.insert_turtle(ledger, &block).await.map(|r| r.ledger),
-            _ => fluree
-                .stage_owned(ledger)
-                .sync_graph_payload(
-                    GraphSel::Graph(g.to_string()),
-                    GraphPayload::Rdf(&block),
-                    false,
-                )
-                .execute()
-                .await
-                .map(|r| r.ledger),
+    let cases: [(&str, &[&str]); 2] = [
+        ("http://example.org/cfg", &["upsert", "insert", "sync"]),
+        ("cfg/local", &["upsert", "insert"]),
+    ];
+    for (i, (g, lanes)) in cases.into_iter().enumerate() {
+        let block = format!("GRAPH <{g}> {{ {statement} }}\n");
+        for &lane in lanes {
+            let ledger = genesis_ledger(&fluree, &format!("it/rdf-ledger-id-{lane}-{i}:main"));
+            let result = match lane {
+                "upsert" => fluree.upsert_turtle(ledger, &block).await.map(|r| r.ledger),
+                "insert" => fluree.insert_turtle(ledger, &block).await.map(|r| r.ledger),
+                _ => fluree
+                    .stage_owned(ledger)
+                    .sync_graph_payload(
+                        GraphSel::Graph(g.to_string()),
+                        GraphPayload::Rdf(&block),
+                        false,
+                    )
+                    .execute()
+                    .await
+                    .map(|r| r.ledger),
+            }
+            .unwrap_or_else(|e| panic!("{lane} <{g}>: {e}"));
+            let stored = facts(&result, Some(g)).await;
+            assert!(
+                stored
+                    .iter()
+                    .any(|f| f.contains("#ledger org/governance:main ")),
+                "{lane} <{g}>: {stored:#?}"
+            );
         }
-        .unwrap_or_else(|e| panic!("{lane}: {e}"));
-        let stored = facts(&result, Some(g)).await;
-        assert!(
-            stored
-                .iter()
-                .any(|f| f.contains("#ledger org/governance:main ")),
-            "{lane}: {stored:#?}"
-        );
     }
 
     let err = fluree
@@ -696,12 +702,12 @@ async fn a_ledger_id_in_a_graph_block_is_stored_as_written() {
     let based = fluree
         .upsert_turtle(
             genesis_ledger(&fluree, "it/rdf-ledger-id-based:main"),
-            &format!("@base <http://b.org/> .\n{block}"),
+            &format!("@base <http://b.org/> .\nGRAPH <cfg/local> {{ {statement} }}\n"),
         )
         .await
         .expect("upsert under a base")
         .ledger;
-    let stored = facts(&based, Some(g)).await;
+    let stored = facts(&based, Some("http://b.org/cfg/local")).await;
     assert!(
         stored
             .iter()
