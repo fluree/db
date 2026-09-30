@@ -178,7 +178,13 @@ Each row is `[age, expanded_person, expanded_org]`. When every column is an IRI-
 }
 ```
 
-Scalar select expressions desugar to a `bind` in the WHERE pattern list. If the expression references an aggregate's output variable (e.g. `(as (+ ?count 1) ?adjusted)`) the bind runs after aggregation; otherwise it runs before, so the alias is also a valid `groupBy` key.
+In a query that does not group, a scalar select expression desugars to a `bind` in the WHERE pattern list. In a query that groups (a `groupBy`, or an aggregate anywhere in `select`, `having` or `orderBy`), where it runs depends on what it reads — the same rule SPARQL uses:
+
+- An expression over `groupBy` keys, aggregate outputs and earlier such aliases — or a constant — runs **once per group**, after aggregation and `having`: its alias is a single value per group. `(as (+ ?count 1) ?adjusted)` and `(as (strlen ?category) ?len)` under `"groupBy": ["?category"]` both give one value per row.
+- An expression over a variable that is neither a `groupBy` key nor an aggregate runs **before grouping**, once per solution, so its alias is a per-group list like any other ungrouped variable (see [groupBy](#groupby)).
+- An alias that is itself a `groupBy` key, or that an aggregate reads, is computed before grouping — so an alias is a valid `groupBy` key.
+
+A per-group expression cannot reuse the name of a variable the `where` clause binds.
 
 The same expression language is shared with `bind` and `filter`. The one exception is `in` / `not-in`, which require the bracketed-list form and are not accepted in select expressions — rewrite as `(or (= ?x 1) (= ?x 2) …)` instead.
 
@@ -1344,6 +1350,8 @@ Group results:
 }
 ```
 
+A selected variable that is neither a `groupBy` key nor an aggregate comes back as a **per-group list** of its values (SPARQL rejects this shape; the JSON-LD surface keeps it). Two limits apply: a subquery cannot return a per-group list (it is an error — aggregate the variable, e.g. with `collect`), and the SPARQL-results formats and the [streaming endpoint](../api/streaming-query.md) refuse one, since SPARQL results have no list type.
+
 ### having
 
 Filter grouped results:
@@ -1352,12 +1360,14 @@ Filter grouped results:
 {
   "select": ["?category", "(count ?product)"],
   "groupBy": ["?category"],
-  "having": [["filter", "(> (count ?product) 10)"]],
+  "having": "(> (count ?product) 10)",
   "where": [
     { "@id": "?product", "ex:category": "?category" }
   ]
 }
 ```
+
+`having` and `orderBy` in a grouped query follow SPARQL 1.1: a variable they read that is neither a `groupBy` key nor an aggregate means `(sample ?v)` — an arbitrary value from the group. A select expression's alias is not visible to `having` (it is computed after), unless it is an aggregate's alias. On a query that does not group, `having` filters the solutions, like a `filter`.
 
 ## Aggregation Functions
 

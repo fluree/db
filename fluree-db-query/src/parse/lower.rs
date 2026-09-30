@@ -94,51 +94,16 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns.extend(lowered);
     }
 
-    // Resolve aggregate output VarIds up front so we can classify each
-    // SELECT-clause computation as pre- or post-aggregation. Mirrors
-    // `fluree_db_sparql::lower::select::lower_select_expression_binds` so
-    // SPARQL and JSON-LD queries produce the same IR shape.
-    let aggregate_output_vars: std::collections::HashSet<VarId> = ast
-        .options
-        .aggregates
-        .iter()
-        .map(|spec| vars.get_or_insert(&spec.output_var))
-        .collect();
-
-    // Desugar SELECT-clause scalar expressions to BIND patterns. Pre/Post
-    // placement is decided per-column by `lower_select_expr_bind`; we
-    // accumulate post-bind aliases as we go so chained derivations
-    // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) land in `post_binds`
-    // in source order.
-    let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
-    let mut select_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
-    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
-    for column in ast.select.columns() {
-        if let UnresolvedColumn::Computation { expr, alias } = column {
-            let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
-                expr,
-                alias,
-                encoder,
-                vars,
-                &mut pp_counter,
-                &aggregate_output_vars,
-                &post_bind_aliases,
-            )?;
-            select_aliases.insert(alias_var);
-            match placement {
-                SelectExprPlacement::Post => {
-                    post_bind_aliases.insert(alias_var);
-                    post_binds.push((alias_var, lowered_expr));
-                }
-                SelectExprPlacement::Pre => {
-                    patterns.push(Pattern::Bind {
-                        var: alias_var,
-                        expr: lowered_expr,
-                    });
-                }
-            }
-        }
-    }
+    // Desugar SELECT-clause scalar expressions: WHERE binds before grouping,
+    // or per-group binds after it, by the rule SPARQL uses too.
+    let (post_binds, select_aliases) = lower_select_computations(
+        ast.select.columns(),
+        &ast.options,
+        encoder,
+        vars,
+        &mut pp_counter,
+        &mut patterns,
+    )?;
 
     // Lower the reasoning config, ordering, and grouping (each is its own axis).
     // Post-aggregation binds collected above ride inside the grouping phase.
@@ -1219,49 +1184,81 @@ fn path_expr_name(expr: &UnresolvedPathExpr) -> &'static str {
     }
 }
 
-/// Where a SELECT-clause scalar expression must run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectExprPlacement {
-    /// Pre-aggregation: append to the WHERE pattern list as `Pattern::Bind`.
-    Pre,
-    /// Post-aggregation: append to `options.post_binds`.
-    Post,
-}
+/// What [`lower_select_computations`] returns: the per-group binds (for the
+/// grouping phase) and every select-expression alias.
+type SelectComputations = (Vec<(VarId, Expression)>, std::collections::HashSet<VarId>);
 
-/// Lower a single `UnresolvedColumn::Computation` to its placement plus
-/// resolved (alias VarId, Expression).
+/// Lower a query level's SELECT-clause computations (`(as <expr> ?alias)`), in
+/// SELECT order, by the placement rule SPARQL shares
+/// ([`crate::ir::SelectExprPlacer`]).
 ///
-/// The decision is purely about which pipeline stage the BIND belongs to:
+/// In a query that groups (a `groupBy`, or an aggregate anywhere), an
+/// expression that reads only group keys, aggregate outputs and earlier
+/// per-group aliases — or nothing, a constant — is evaluated once per group,
+/// after `having`: it returns the post-group binds for the grouping phase. An
+/// expression over a variable that is neither a key nor an aggregate is a
+/// WHERE bind appended to `patterns`, so its alias is a per-group list (the
+/// documented JSON-LD behavior), and so is an expression whose alias is a
+/// `groupBy` key or an aggregate input. In a query that does not group, every
+/// expression is a WHERE bind.
 ///
-///   - `Post` if the lowered expression references any aggregate output
-///     variable, **or** any earlier-in-this-SELECT post-bind alias (passed
-///     in via `post_bind_aliases` so the caller can chain dependencies).
-///   - `Pre` otherwise.
-///
-/// Both `lower_query` and `lower_subquery` call this and route the result by
-/// placement: `Pre` binds append to WHERE, `Post` binds ride in the grouping
-/// phase's `binds` (applied by the shared `apply_solution_modifiers` tail).
-fn lower_select_expr_bind<E: IriEncoder>(
-    expr: &UnresolvedExpression,
-    alias: &Arc<str>,
+/// Also returns every alias, for the HAVING-as-filter rename.
+fn lower_select_computations<'a, E: IriEncoder>(
+    columns: impl IntoIterator<Item = &'a UnresolvedColumn>,
+    opts: &UnresolvedOptions,
     encoder: &E,
     vars: &mut VarRegistry,
     pp_counter: &mut u32,
-    aggregate_output_vars: &std::collections::HashSet<VarId>,
-    post_bind_aliases: &std::collections::HashSet<VarId>,
-) -> Result<(SelectExprPlacement, VarId, Expression)> {
-    let alias_var = vars.get_or_insert(alias);
-    let lowered = lower_filter_expr_with_encoder(expr, vars, encoder, pp_counter)?;
-    let placement = if lowered
-        .referenced_vars()
+    patterns: &mut Vec<Pattern>,
+) -> Result<SelectComputations> {
+    let where_vars: std::collections::HashSet<VarId> =
+        patterns.iter().flat_map(Pattern::produced_vars).collect();
+    let keys: Vec<VarId> = opts
+        .group_by
         .iter()
-        .any(|v| aggregate_output_vars.contains(v) || post_bind_aliases.contains(v))
-    {
-        SelectExprPlacement::Post
+        .map(|v| vars.get_or_insert(v))
+        .collect();
+    let aggregates: Vec<AggregateSpec> = opts
+        .aggregates
+        .iter()
+        .map(|a| lower_aggregate_spec(a, vars))
+        .collect();
+    let mut placer = if keys.is_empty() && aggregates.is_empty() {
+        crate::ir::SelectExprPlacer::ungrouped()
     } else {
-        SelectExprPlacement::Pre
+        crate::ir::SelectExprPlacer::grouped(keys, &aggregates, where_vars.clone())
     };
-    Ok((placement, alias_var, lowered))
+
+    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
+    let mut aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    for column in columns {
+        let UnresolvedColumn::Computation { expr, alias } = column else {
+            continue;
+        };
+        let alias_var = vars.get_or_insert(alias);
+        let lowered = lower_filter_expr_with_encoder(expr, vars, encoder, pp_counter)?;
+        aliases.insert(alias_var);
+        match placer.place(alias_var, &lowered) {
+            crate::ir::SelectExprPlacement::PostGroup => {
+                // A per-group bind onto a variable the WHERE binds would
+                // replace that variable's value — a group key's included —
+                // after grouping. SPARQL rejects the same alias (V6).
+                if where_vars.contains(&alias_var) {
+                    return Err(ParseError::InvalidSelect(format!(
+                        "select alias {alias} is already bound by the where clause; a \
+                         select expression evaluated per group would silently replace \
+                         its value. Alias to a fresh variable."
+                    )));
+                }
+                post_binds.push((alias_var, lowered));
+            }
+            crate::ir::SelectExprPlacement::PreGroup => patterns.push(Pattern::Bind {
+                var: alias_var,
+                expr: lowered,
+            }),
+        }
+    }
+    Ok((post_binds, aliases))
 }
 
 /// Expect a path expression to be a simple IRI. Returns the Arc'd IRI string.
@@ -1360,47 +1357,17 @@ fn lower_subquery<E: IriEncoder>(
     // Lower WHERE patterns, then append select-expression BINDs.
     let mut patterns = lower_unresolved_patterns(&subquery.patterns, encoder, vars, pp_counter)?;
 
-    // SELECT-expression binds split into pre-aggregation (appended to WHERE)
-    // and post-aggregation (referencing an aggregate output or an earlier
-    // post-bind). Post-binds ride in the grouping phase's `binds` and
-    // are applied by the shared `apply_solution_modifiers` tail — the same
-    // channel the top-level SELECT uses, so subquery post-aggregation binds
-    // now work identically.
-    let aggregate_output_vars: std::collections::HashSet<VarId> = subquery
-        .options
-        .aggregates
-        .iter()
-        .map(|spec| vars.get_or_insert(&spec.output_var))
-        .collect();
-    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
-    let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
-    let mut select_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
-    for column in columns {
-        if let UnresolvedColumn::Computation { expr, alias } = column {
-            let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
-                expr,
-                alias,
-                encoder,
-                vars,
-                pp_counter,
-                &aggregate_output_vars,
-                &post_bind_aliases,
-            )?;
-            select_aliases.insert(alias_var);
-            match placement {
-                SelectExprPlacement::Post => {
-                    post_binds.push((alias_var, lowered_expr));
-                    post_bind_aliases.insert(alias_var);
-                }
-                SelectExprPlacement::Pre => {
-                    patterns.push(Pattern::Bind {
-                        var: alias_var,
-                        expr: lowered_expr,
-                    });
-                }
-            }
-        }
-    }
+    // SELECT-expression binds: WHERE binds before grouping, or per-group
+    // binds after it (applied by the shared `apply_solution_modifiers` tail,
+    // the same channel the top-level SELECT uses).
+    let (post_binds, select_aliases) = lower_select_computations(
+        columns,
+        &subquery.options,
+        encoder,
+        vars,
+        pp_counter,
+        &mut patterns,
+    )?;
 
     // GROUP BY / aggregates / HAVING / post-aggregation binds (needed for
     // subqueries used in filters/unions). Post-binds collected above ride in
