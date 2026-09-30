@@ -128,9 +128,9 @@ cannot justify, and guessing at them would put words in your mouth. It is also
 lossy in one direction: several XSD types map to `String`, so a `rdf:langString`
 property comes back as `xsd:string`.
 
-Nothing is written. **Shapes activate SHACL validation for their class**, so
-applying them is a decision to make deliberately, after reading what you are
-about to apply.
+Nothing is written. **Shapes drive SHACL validation for their class** once the
+ledger config enables SHACL, so applying them is a decision to make
+deliberately, after reading what you are about to apply.
 
 ### What the derived schema does and does not claim
 
