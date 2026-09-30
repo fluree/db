@@ -77,6 +77,7 @@ this table, so it is the one that rots. Add a row when you add a bench file.
 | `fluree-db-api` | `fulltext_query.rs` | Full-text query through novelty + index |
 | `fluree-db-api` | `import_bulk.rs` | Bulk Turtle import via `fluree.create(id).import(path).execute()`; single- vs default-threaded |
 | `fluree-db-api` | `transact_commit.rs` | Single-commit latency on a fresh and a populated ledger (`iter_batched` setup) |
+| `fluree-db-api` | `transact_upsert_replace.rs` | Upsert that replaces existing values: default/named graph × novelty/indexed, lang + `@list`, 16-predicate subjects, novelty-heavy base, and the new-subject control |
 | `fluree-db-api` | `query_cold_reload.rs` | File-backed cold reload (load only, and load + first query) |
 | `fluree-db-api` | `reindex_full.rs` | `Fluree::reindex(...)` end-to-end against a single-txn populated ledger |
 | `fluree-db-api` | `reindex_incremental.rs` | Orchestrator's incremental path via `Fluree::trigger_index(...)` over delta novelty |

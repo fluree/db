@@ -591,6 +591,10 @@ name = "transact_filtered_delete"
 harness = false
 
 [[bench]]
+name = "transact_upsert_replace"
+harness = false
+
+[[bench]]
 name = "query_overlay_only_range"
 harness = false
 

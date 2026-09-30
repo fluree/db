@@ -33,6 +33,11 @@
         "small": 5.0,
         "medium": 5.0
       },
+      "transact_upsert_replace": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
       "query_overlay_only_range": {
         "tiny": 10.0,
         "small": 5.0,
