@@ -33,7 +33,7 @@ GRAPH <urn:fluree:mydb:main#config> {
 
 ## Writing from the CLI
 
-`fluree insert` and `fluree upsert` read TriG, but the recipe above writes its settings as anonymous blank nodes (`[ … ]`) inside the `GRAPH` block, which those commands do not read yet ([#1930](https://github.com/fluree/db/issues/1930)). Write the config graph with SPARQL UPDATE through `fluree update` instead:
+`fluree insert` and `fluree upsert` read the TriG recipe above as written, anonymous blank nodes (`[ … ]`) inside the `GRAPH` block included. The same settings can also be written with SPARQL UPDATE through `fluree update`:
 
 ```bash
 fluree update -l mydb:main --format sparql -e '

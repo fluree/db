@@ -42,15 +42,19 @@ produce no flakes, and an identical payload produces **no commit**. History
 is preserved. See [Sync (graph synchronization)](../transactions/sync.md)
 for the full semantics, safety rails, and blank-node behavior.
 
-Turtle input is converted to JSON-LD client-side before submission, so a
-Turtle export works against any server that implements the `/sync`
-endpoint, including servers from before it accepted Turtle bodies. A `.nt`
-file is read as Turtle, of which N-Triples is a subset.
+Turtle input is sent as written and parsed where it is staged, the way
+every write reads RDF text (see
+[How RDF text is read](../transactions/turtle.md#how-rdf-text-is-read)).
+A `.nt` file is read as Turtle, of which N-Triples is a subset. With
+`--remote`, a server from before `/sync` accepted Turtle bodies answers
+415; for that server the CLI converts the Turtle to JSON-LD and sends it
+again. The conversion loses collection order and refuses some IRI schemes
+(`tag:`, `kb:`), so upgrading the server is the better fix.
 
-TriG is sent as TriG rather than converted. It is recognized by a `.trig`
-name or `--format trig`, and also when a body read as Turtle turns out to
-hold graph blocks, as when it is piped in. Its blocks must name the
-`--graph` target, and cannot sit beside default-graph triples (see
+TriG is sent as TriG. It is recognized by a `.trig` name or
+`--format trig`, and also when a body read as Turtle turns out to hold
+graph blocks, as when it is piped in. Its blocks must name the `--graph`
+target, and cannot sit beside default-graph triples (see
 [payload formats](../transactions/sync.md#payload-formats)):
 
 ```bash

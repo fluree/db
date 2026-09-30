@@ -519,6 +519,9 @@ mod tests {
             Placement::AsWritten,
         );
         assert!(e.contains("graph label"), "{e}");
+        // Outside a block, the same rule.
+        let e = err("<s> <http://p> 1 .", Placement::AsWritten);
+        assert!(e.contains("relative"), "{e}");
     }
 
     // ---- Block contents: the full grammar -------------------------------

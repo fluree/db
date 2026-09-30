@@ -127,7 +127,10 @@ current value is retracted exactly as it is stored.
   re-upsert of a document with blank nodes commits nothing. A changed
   document mints new blank nodes; the old ones stay (see
   [Stable blank-node ids](update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids)
-  for editing a stored blank node in place).
+  for editing a stored blank node in place). For Turtle and TriG the
+  identity comes from the parsed statements, not their order or spelling;
+  see [How RDF text is read](turtle.md#how-rdf-text-is-read) for the details
+  and a query that lists blank nodes nothing references.
 - **Named graphs.** The graph is part of the unit: an upsert into a named
   graph replaces that graph's values and leaves the same predicate's values
   in other graphs alone.

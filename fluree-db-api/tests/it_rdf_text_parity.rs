@@ -605,6 +605,34 @@ async fn a_turtle_list_upsert_replaces_the_list_in_order() {
     );
 }
 
+/// The ledger-config recipe (`docs/ledger-config/writing-config.md`)
+/// upserts as written: its settings are anonymous blank nodes inside the
+/// config graph's block, which the TriG block reader refused (#1511).
+#[tokio::test]
+async fn the_config_recipe_upserts_as_written() {
+    let fluree = memory();
+    let id = "it/rdf-config:main";
+    let config = format!("urn:fluree:{id}#config");
+    let recipe = format!(
+        "@prefix f: <https://ns.flur.ee/db#> .\n\
+         GRAPH <{config}> {{\n\
+           <urn:fluree:{id}:config:ledger> a f:LedgerConfig ;\n\
+             f:reasoningDefaults [ f:reasoningModes f:RDFS ] .\n\
+         }}\n"
+    );
+    let result = fluree
+        .upsert_turtle(genesis_ledger(&fluree, id), &recipe)
+        .await
+        .expect("the recipe upserts");
+    let stored = facts(&result.ledger, Some(&config)).await;
+    assert!(
+        stored
+            .iter()
+            .any(|f| f.contains("reasoningModes https://ns.flur.ee/db#RDFS")),
+        "{stored:#?}"
+    );
+}
+
 // =============================================================================
 // Identity: the same document addresses the same blank nodes
 // =============================================================================
@@ -672,6 +700,37 @@ async fn upserting_the_same_document_again_commits_nothing() {
         .await
         .iter()
         .any(|f| f.contains("note String(\"edited\")")));
+}
+
+/// The query `turtle.md` documents for blank nodes nothing references
+/// finds the node an edited document left behind, and not the one that
+/// replaced it.
+#[tokio::test]
+async fn the_documented_query_lists_the_blank_nodes_an_edit_left_behind() {
+    let fluree = memory();
+    let v1 = "@prefix ex: <http://example.org/> .\nex:A ex:part [ ex:k \"v1\" ] .\n";
+    let first = fluree
+        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-orphans:main"), v1)
+        .await
+        .expect("v1");
+    let v2 = v1.replace("\"v1\"", "\"v2\"");
+    let second = fluree.upsert_turtle(first.ledger, &v2).await.expect("v2");
+    let orphans = select(
+        &fluree,
+        &second.ledger,
+        "SELECT DISTINCT ?b WHERE {\n  ?b ?p ?o .\n  FILTER(isBlank(?b))\n  \
+         FILTER NOT EXISTS { ?s ?q ?b }\n}",
+    )
+    .await;
+    assert_eq!(orphans.len(), 1, "{orphans:?}");
+    let values = select(
+        &fluree,
+        &second.ledger,
+        "SELECT ?v WHERE { ?b <http://example.org/k> ?v FILTER(isBlank(?b)) \
+         FILTER NOT EXISTS { ?s ?q ?b } }",
+    )
+    .await;
+    assert_eq!(values, vec![row(&["v1"])], "the orphan is v1's node");
 }
 
 // =============================================================================

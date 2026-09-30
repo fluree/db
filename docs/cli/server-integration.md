@@ -349,9 +349,11 @@ MATCH (n:Person {id: 7}) RETURN n
 
 Makes one named graph's contents exactly the payload, committing only the
 delta. Data-bearer auth (same bracket as `/insert` / `/upsert`), not admin.
-The CLI converts Turtle to JSON-LD client-side and sends it as
-`application/json`; TriG, which that conversion cannot carry, is sent as
-`application/trig`. A dry run answers with a delta report and
+The CLI sends RDF text as written: Turtle as `text/turtle`, TriG as
+`application/trig`, JSON-LD as `application/json`. A server that answers
+`415 Unsupported Media Type` to a Turtle body (one from before `/sync` read
+RDF bodies) gets it again converted to JSON-LD client-side; TriG is never
+converted. A dry run answers with a delta report and
 must commit nothing; a real run answers with the standard transact response.
 Designed so the CLI's source of desired contents (today RDF text; later
 R2RML-mapped Iceberg / CSV / spreadsheet data) is invisible to the server —

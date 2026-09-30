@@ -204,9 +204,8 @@ User queries against the config graph go through **policy enforcement**. If `f:d
 The config graph is written and queried through normal CLI transaction and query commands:
 
 ```bash
-# Write config via SPARQL UPDATE. TriG through `fluree insert` works too, but
-# not with the anonymous blank nodes (`[ … ]`) config settings are usually
-# written as (#1930); see "Writing from the CLI" in writing-config.md.
+# Write config via SPARQL UPDATE. TriG through `fluree insert` or
+# `fluree upsert` works too; see "Writing from the CLI" in writing-config.md.
 fluree update --ledger mydb:main --format sparql -e '
 PREFIX f: <https://ns.flur.ee/db#>
 INSERT DATA {
