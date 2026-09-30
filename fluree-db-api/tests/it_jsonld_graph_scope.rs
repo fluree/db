@@ -444,3 +444,40 @@ async fn sync_refuses_a_named_graph_object() {
         "{err}"
     );
 }
+
+/// N4: anonymous nodes in different `["graph", …]` items stay different
+/// nodes through the commit. The label counter used to restart for every
+/// item, so they shared one label and merged into one node.
+#[tokio::test]
+async fn anonymous_nodes_in_separate_graph_items_stay_distinct() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .update(
+            genesis_ledger(&fluree, "it/scope-anon-items:main"),
+            &json!({
+                "@context": ctx(),
+                "insert": [
+                    ["graph", "ex:g", {"@id": "ex:a", "ex:p": {"ex:name": "x"}}],
+                    ["graph", "ex:g", {"@id": "ex:b", "ex:p": {"ex:name": "y"}}]
+                ]
+            }),
+        )
+        .await
+        .expect("update")
+        .ledger;
+    let rows = sparql_rows(
+        &fluree,
+        &ledger,
+        &format!(
+            "SELECT (COUNT(DISTINCT ?n) AS ?c) WHERE {{ GRAPH <{G}> {{ ?s <http://example.org/p> ?n }} }}"
+        ),
+    )
+    .await;
+    let distinct = rows
+        .first()
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(Value::as_i64);
+    assert_eq!(distinct, Some(2), "two anonymous nodes: {rows:?}");
+    assert_eq!(values(&fluree, &ledger, Some(G), "name").await, ["x", "y"]);
+}

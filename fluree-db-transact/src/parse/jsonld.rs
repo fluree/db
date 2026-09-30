@@ -310,9 +310,6 @@ fn parse_data(
     ledger_id: &str,
     request_graph: Option<&GraphSel>,
 ) -> Result<Txn> {
-    let mut vars = VarRegistry::new();
-    let mut write_graphs = WriteGraphs::new();
-
     let context = extract_context(json)?;
     let strict = strict_compact_iri(&opts, json);
 
@@ -323,26 +320,35 @@ fn parse_data(
     let json_for_expand = strip_opts_for_expansion(json, &context)?;
     let expanded = expand_with_context_policy(&json_for_expand, &context, strict)?;
 
-    let root = match request_graph {
-        Some(graph) => write_graphs.scope(request_graph_name(graph)?),
-        None => GraphScope::default_graph(),
-    };
     let no_aliases = HashMap::new();
-    let mut ctx = TemplateParseCtx::new(
-        &context,
-        &mut vars,
-        ns_registry,
-        false,
-        strict,
-        &mut write_graphs,
-        &no_aliases,
-        ledger_id,
-        GraphRole::Data,
-    );
-    if request_graph.is_some() {
-        ctx.fixed_root = Some(root.clone());
-    }
-    let templates = parse_expanded_triples_with_ctx(&expanded, &root, &mut ctx)?;
+    let mut blanks = BlankIssuer::default();
+    let (templates, vars, write_graphs) = loop {
+        let mut vars = VarRegistry::new();
+        let mut write_graphs = WriteGraphs::new();
+        let root = match request_graph {
+            Some(graph) => write_graphs.scope(request_graph_name(graph)?),
+            None => GraphScope::default_graph(),
+        };
+        let mut ctx = TemplateParseCtx::new(
+            &context,
+            &mut vars,
+            ns_registry,
+            false,
+            strict,
+            &mut write_graphs,
+            &no_aliases,
+            ledger_id,
+            GraphRole::Data,
+            &mut blanks,
+        );
+        if request_graph.is_some() {
+            ctx.fixed_root = Some(root.clone());
+        }
+        let templates = parse_expanded_triples_with_ctx(&expanded, &root, &mut ctx)?;
+        if !blanks.needs_reparse()? {
+            break (templates, vars, write_graphs);
+        }
+    };
     if templates.is_empty() {
         let (verb, noun) = match txn_type {
             TxnType::Upsert => ("Upsert", "upsert"),
@@ -394,9 +400,6 @@ fn parse_update(
         ));
     }
 
-    let mut vars = VarRegistry::new();
-    let mut write_graphs = WriteGraphs::new();
-
     // Parse context from the outer document
     let context = extract_context(json)?;
 
@@ -422,48 +425,6 @@ fn parse_update(
                 .collect()
         })
         .unwrap_or_default();
-
-    // Optional transaction-level default graph (SPARQL `WITH`): the root scope
-    // of both template clauses, and the WHERE's default graph unless `from`
-    // names one.
-    let template_root = match obj.get("graph") {
-        None => GraphScope::default_graph(),
-        Some(graph_val) => {
-            let GraphValue::Selector(raw) = classify_graph_value(graph_val) else {
-                return Err(TransactError::Parse(
-                    "graph must be a graph IRI (string, or {\"@id\": ...})".to_string(),
-                ));
-            };
-            let name = {
-                let mut ctx = TemplateParseCtx::new(
-                    &context,
-                    &mut vars,
-                    ns_registry,
-                    false,
-                    strict,
-                    &mut write_graphs,
-                    &from_named_aliases,
-                    ledger_id,
-                    GraphRole::UpdateTemplate,
-                );
-                ctx.resolve_graph_name(raw, GraphRole::UpdateDefault)?
-            };
-            // The template default graph: staging writes it to the ledger's
-            // default graph when it names the ledger's own address.
-            write_graphs.scope(name).as_template_default()
-        }
-    };
-
-    let where_default_graph_iris = parse_update_where_default_graph_iris(
-        obj.get("from"),
-        &context,
-        &from_named_aliases,
-        strict,
-    )?
-    .unwrap_or_else(|| match template_root.graph() {
-        TemplateGraph::Iri(iri) => vec![iri.to_string()],
-        _ => Vec::new(),
-    });
 
     let has_where = obj.get("where").is_some();
     let has_values = obj.get("values").is_some();
@@ -497,19 +458,126 @@ fn parse_update(
         Vec::new()
     };
 
+    // The template clauses and VALUES share one blank-node issuer; they are
+    // parsed a second time only when a user `_:bN` label collided with an
+    // anonymous node's (see `BlankIssuer`).
+    let mut blanks = BlankIssuer::default();
+    let clauses = loop {
+        let clauses = parse_update_clauses(
+            obj,
+            &context,
+            strict,
+            object_var_parsing,
+            &from_named_aliases,
+            ns_registry,
+            ledger_id,
+            &mut blanks,
+        )?;
+        if !blanks.needs_reparse()? {
+            break clauses;
+        }
+    };
+
+    let where_default_graph_iris = parse_update_where_default_graph_iris(
+        obj.get("from"),
+        &context,
+        &from_named_aliases,
+        strict,
+    )?
+    .unwrap_or_else(|| clauses.template_root_iri.iter().cloned().collect());
+
+    let mut txn = Txn::update()
+        .with_wheres(where_patterns)
+        .with_deletes(clauses.delete)
+        .with_inserts(clauses.insert)
+        .with_vars(clauses.vars)
+        .with_opts(opts)
+        .with_txn_meta(txn_meta);
+    txn.write_graphs = clauses.write_graphs.into_iris();
+    txn.template_default_graph = clauses.template_root_iri;
+    txn.update_where_default_graph_iris = Some(where_default_graph_iris);
+    txn.update_where_named_graphs = where_named_graphs;
+    if let Some(values) = clauses.values {
+        txn = txn.with_values(values);
+    }
+    Ok(txn)
+}
+
+/// The parts of an update that name blank nodes: the `graph` key's scope,
+/// the delete and insert templates, and VALUES.
+struct UpdateClauses {
+    vars: VarRegistry,
+    write_graphs: WriteGraphs,
+    /// The `graph` key's IRI, the WHERE's default graph unless `from` names
+    /// one (SPARQL `WITH`).
+    template_root_iri: Option<String>,
+    delete: Vec<TripleTemplate>,
+    insert: Vec<TripleTemplate>,
+    values: Option<InlineValues>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_update_clauses(
+    obj: &serde_json::Map<String, Value>,
+    context: &ParsedContext,
+    strict: bool,
+    object_var_parsing: bool,
+    from_named_aliases: &HashMap<String, String>,
+    ns_registry: &mut NamespaceRegistry,
+    ledger_id: &str,
+    blanks: &mut BlankIssuer,
+) -> Result<UpdateClauses> {
+    let mut vars = VarRegistry::new();
+    let mut write_graphs = WriteGraphs::new();
+
+    // Optional transaction-level default graph (SPARQL `WITH`): the root scope
+    // of both template clauses, and the WHERE's default graph unless `from`
+    // names one.
+    let template_root = match obj.get("graph") {
+        None => GraphScope::default_graph(),
+        Some(graph_val) => {
+            let GraphValue::Selector(raw) = classify_graph_value(graph_val) else {
+                return Err(TransactError::Parse(
+                    "graph must be a graph IRI (string, or {\"@id\": ...})".to_string(),
+                ));
+            };
+            let name = TemplateParseCtx::new(
+                context,
+                &mut vars,
+                ns_registry,
+                false,
+                strict,
+                &mut write_graphs,
+                from_named_aliases,
+                ledger_id,
+                GraphRole::UpdateTemplate,
+                blanks,
+            )
+            .resolve_graph_name(raw, GraphRole::UpdateDefault)?;
+            // The template default graph: staging writes it to the ledger's
+            // default graph when it names the ledger's own address.
+            write_graphs.scope(name).as_template_default()
+        }
+    };
+    let template_root_iri = match template_root.graph() {
+        TemplateGraph::Iri(iri) => Some(iri.to_string()),
+        _ => None,
+    };
+
     // Parse DELETE clause
-    let delete_templates = if let Some(delete_val) = obj.get("delete") {
+    let delete = if let Some(delete_val) = obj.get("delete") {
         validate_type_fields(delete_val)?;
         let mut ctx = TemplateParseCtx::new(
-            &context,
+            context,
             &mut vars,
             ns_registry,
             object_var_parsing,
             strict,
             &mut write_graphs,
-            &from_named_aliases,
+            from_named_aliases,
             ledger_id,
             GraphRole::UpdateTemplate,
+            blanks,
         );
         let templates = parse_update_templates_with_ctx(delete_val, &template_root, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
@@ -543,18 +611,19 @@ fn parse_update(
     };
 
     // Parse INSERT clause
-    let insert_templates = if let Some(insert_val) = obj.get("insert") {
+    let insert = if let Some(insert_val) = obj.get("insert") {
         validate_type_fields(insert_val)?;
         let mut ctx = TemplateParseCtx::new(
-            &context,
+            context,
             &mut vars,
             ns_registry,
             object_var_parsing,
             strict,
             &mut write_graphs,
-            &from_named_aliases,
+            from_named_aliases,
             ledger_id,
             GraphRole::UpdateTemplate,
+            blanks,
         );
         let templates = parse_update_templates_with_ctx(insert_val, &template_root, &mut ctx)?;
         if templates.is_empty() {
@@ -568,27 +637,26 @@ fn parse_update(
         Vec::new()
     };
 
-    let mut txn = Txn::update()
-        .with_wheres(where_patterns)
-        .with_deletes(delete_templates)
-        .with_inserts(insert_templates)
-        .with_vars(vars)
-        .with_opts(opts)
-        .with_txn_meta(txn_meta);
-    txn.write_graphs = write_graphs.into_iris();
-    txn.template_default_graph = match template_root.graph() {
-        TemplateGraph::Iri(iri) => Some(iri.to_string()),
-        _ => None,
+    let values = match obj.get("values") {
+        Some(values_val) => Some(parse_inline_values(
+            values_val,
+            context,
+            &mut vars,
+            ns_registry,
+            strict,
+            blanks,
+        )?),
+        None => None,
     };
-    txn.update_where_default_graph_iris = Some(where_default_graph_iris);
-    txn.update_where_named_graphs = where_named_graphs;
 
-    if let Some(values_val) = obj.get("values") {
-        let values = parse_inline_values(values_val, &context, &mut txn.vars, ns_registry, strict)?;
-        txn = txn.with_values(values);
-    }
-
-    Ok(txn)
+    Ok(UpdateClauses {
+        vars,
+        write_graphs,
+        template_root_iri,
+        delete,
+        insert,
+        values,
+    })
 }
 
 fn parse_update_where_default_graph_iris(
@@ -778,6 +846,77 @@ fn expand_update_graph_iri(v: &Value, context: &ParsedContext, strict: bool) -> 
     Ok(iri)
 }
 
+/// Labels for one document's anonymous nodes: `_:b0`, `_:b1`, … in document
+/// order, one sequence for the whole transaction body (every clause, every
+/// `["graph", …]` item). It is never reset mid-document: two anonymous nodes
+/// never share a label.
+///
+/// The positional labels are part of a stored blank node's identity (upsert
+/// and sync skolemize under a payload-scoped id), so their spelling is kept.
+/// A user-written label of the same form (`_:b3`) would merge with the
+/// anonymous node given that number; the parse notes every such label, and
+/// when one was also issued the document is parsed once more with the
+/// issuer skipping those numbers. Only documents that were being corrupted
+/// see different labels.
+#[derive(Debug, Default)]
+struct BlankIssuer {
+    next: usize,
+    /// Numbers of user `_:bN` labels to skip (the re-parse).
+    skip: std::collections::HashSet<usize>,
+    /// Numbers of the user `_:bN` labels seen in this parse.
+    user: std::collections::HashSet<usize>,
+    reparsed: bool,
+}
+
+impl BlankIssuer {
+    fn issue(&mut self) -> TemplateTerm {
+        while self.skip.contains(&self.next) {
+            self.next += 1;
+        }
+        let label = format!("_:b{}", self.next);
+        self.next += 1;
+        TemplateTerm::BlankNode(label)
+    }
+
+    /// Record a user-written blank-node label.
+    fn note_user_label(&mut self, label: &str) {
+        let Some(digits) = label.strip_prefix("_:b") else {
+            return;
+        };
+        // Only the canonical spelling `issue` produces can collide.
+        let canonical = !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && (digits == "0" || !digits.starts_with('0'));
+        if let (true, Ok(n)) = (canonical, digits.parse::<usize>()) {
+            self.user.insert(n);
+        }
+    }
+
+    /// Whether a user label collided with an issued one. If so, reset for the
+    /// one re-parse that skips every user number; a collision after the
+    /// re-parse cannot happen and is refused rather than committed.
+    fn needs_reparse(&mut self) -> Result<bool> {
+        let collided = self
+            .user
+            .iter()
+            .any(|n| *n < self.next && !self.skip.contains(n));
+        if !collided {
+            return Ok(false);
+        }
+        if self.reparsed {
+            return Err(TransactError::Parse(
+                "blank-node labels still collide after re-labelling anonymous nodes".to_string(),
+            ));
+        }
+        *self = BlankIssuer {
+            skip: std::mem::take(&mut self.user),
+            reparsed: true,
+            ..BlankIssuer::default()
+        };
+        Ok(true)
+    }
+}
+
 /// Which graph names a selector may use, by where it was written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GraphRole {
@@ -806,7 +945,8 @@ struct TemplateParseCtx<'a> {
     /// Graph insert / sync: the request names the one graph the payload
     /// writes; every scope must be this one.
     fixed_root: Option<GraphScope>,
-    blank_counter: usize,
+    /// The document's anonymous-node labels.
+    blanks: &'a mut BlankIssuer,
 }
 
 impl<'a> TemplateParseCtx<'a> {
@@ -821,6 +961,7 @@ impl<'a> TemplateParseCtx<'a> {
         from_named_aliases: &'a HashMap<String, String>,
         ledger_id: &'a str,
         role: GraphRole,
+        blanks: &'a mut BlankIssuer,
     ) -> Self {
         Self {
             context,
@@ -833,7 +974,7 @@ impl<'a> TemplateParseCtx<'a> {
             ledger_id,
             role,
             fixed_root: None,
-            blank_counter: 0,
+            blanks,
         }
     }
 
@@ -1189,6 +1330,7 @@ fn parse_inline_values(
     vars: &mut VarRegistry,
     ns_registry: &mut NamespaceRegistry,
     strict: bool,
+    blanks: &mut BlankIssuer,
 ) -> Result<InlineValues> {
     let arr = value.as_array().ok_or_else(|| {
         TransactError::Parse("values must be a 2-element array: [vars, rows]".to_string())
@@ -1253,7 +1395,13 @@ fn parse_inline_values(
 
         let mut out_row = Vec::with_capacity(var_count);
         for cell in cells {
-            out_row.push(parse_values_cell(cell, context, ns_registry, strict)?);
+            out_row.push(parse_values_cell(
+                cell,
+                context,
+                ns_registry,
+                strict,
+                blanks,
+            )?);
         }
         rows.push(out_row);
     }
@@ -1266,6 +1414,7 @@ fn parse_values_cell(
     context: &ParsedContext,
     ns_registry: &mut NamespaceRegistry,
     strict: bool,
+    blanks: &mut BlankIssuer,
 ) -> Result<TemplateTerm> {
     match cell {
         Value::Null => Err(TransactError::Parse(
@@ -1297,6 +1446,7 @@ fn parse_values_cell(
                     if let Some(sid) = crate::namespace::stable_blank_node_sid(&expanded) {
                         return Ok(TemplateTerm::Sid(sid));
                     }
+                    blanks.note_user_label(&expanded);
                     return Ok(TemplateTerm::BlankNode(expanded.to_string()));
                 }
                 return Ok(TemplateTerm::Sid(ns_registry.sid_for_iri(&expanded)));
@@ -1366,7 +1516,6 @@ fn parse_expanded_nodes(
     ctx: &mut TemplateParseCtx<'_>,
     out: &mut Vec<TripleTemplate>,
 ) -> Result<()> {
-    ctx.blank_counter = 0;
     match expanded {
         Value::Array(arr) => {
             for item in arr {
@@ -1424,14 +1573,11 @@ fn parse_expanded_object_with_ctx(
         Some(GraphValue::Invalid(why)) => return Err(TransactError::Parse(why.to_string())),
     };
 
-    // Get subject from @id (already expanded IRI or variable)
-    let subject = if let Some(id) = obj.get("@id") {
-        parse_expanded_id_with_ctx(id, ctx)?
-    } else {
-        // Generate a blank node if no @id
-        let n = ctx.blank_counter;
-        ctx.blank_counter += 1;
-        TemplateTerm::BlankNode(format!("_:b{n}"))
+    // Get subject from @id (already expanded IRI or variable); a node
+    // without one is a fresh blank node.
+    let subject = match obj.get("@id") {
+        Some(id) => parse_expanded_id_with_ctx(id, ctx)?,
+        None => ctx.blanks.issue(),
     };
 
     // Parse each predicate-object pair
@@ -1522,6 +1668,7 @@ fn parse_expanded_id_with_ctx(
                 if let Some(sid) = crate::namespace::stable_blank_node_sid(s) {
                     return Ok(TemplateTerm::Sid(sid));
                 }
+                ctx.blanks.note_user_label(s);
                 Ok(TemplateTerm::BlankNode(s.clone()))
             } else {
                 // Expanded IRI - encode as SID
@@ -1548,6 +1695,7 @@ fn parse_expanded_id(
     let context = ParsedContext::new();
     let mut write_graphs = WriteGraphs::new();
     let empty_aliases: HashMap<String, String> = HashMap::new();
+    let mut blanks = BlankIssuer::default();
     let mut ctx = TemplateParseCtx::new(
         &context,
         vars,
@@ -1558,6 +1706,7 @@ fn parse_expanded_id(
         &empty_aliases,
         TEST_LEDGER,
         GraphRole::UpdateTemplate,
+        &mut blanks,
     );
     parse_expanded_id_with_ctx(value, &mut ctx)
 }
@@ -1758,6 +1907,7 @@ fn parse_expanded_value(
 ) -> Result<ParsedValue> {
     let mut write_graphs = WriteGraphs::new();
     let no_aliases = HashMap::new();
+    let mut blanks = BlankIssuer::default();
     let mut ctx = TemplateParseCtx::new(
         context,
         vars,
@@ -1768,6 +1918,7 @@ fn parse_expanded_value(
         &no_aliases,
         TEST_LEDGER,
         GraphRole::UpdateTemplate,
+        &mut blanks,
     );
     parse_expanded_value_with_ctx(value, &GraphScope::default_graph(), &mut ctx, templates)
 }
@@ -2035,6 +2186,7 @@ fn parse_list_values(
 ) -> Result<Vec<ParsedValue>> {
     let mut write_graphs = WriteGraphs::new();
     let no_aliases = HashMap::new();
+    let mut blanks = BlankIssuer::default();
     let mut ctx = TemplateParseCtx::new(
         context,
         vars,
@@ -2045,6 +2197,7 @@ fn parse_list_values(
         &no_aliases,
         TEST_LEDGER,
         GraphRole::UpdateTemplate,
+        &mut blanks,
     );
     parse_list_values_with_ctx(list_val, &GraphScope::default_graph(), &mut ctx, templates)
 }
@@ -2690,6 +2843,7 @@ mod tests {
         let mut vars = VarRegistry::new();
         let mut write_graphs = WriteGraphs::new();
         let empty_aliases = HashMap::new();
+        let mut blanks = BlankIssuer::default();
         let mut parse_ctx = TemplateParseCtx::new(
             &ctx,
             &mut vars,
@@ -2700,6 +2854,7 @@ mod tests {
             &empty_aliases,
             TEST_LEDGER,
             GraphRole::UpdateTemplate,
+            &mut blanks,
         );
         let templates =
             parse_expanded_triples_with_ctx(&json, &GraphScope::default_graph(), &mut parse_ctx)
@@ -2746,6 +2901,7 @@ mod tests {
         }]);
 
         let empty_aliases = HashMap::new();
+        let mut blanks = BlankIssuer::default();
         let mut parse_ctx = TemplateParseCtx::new(
             &ctx,
             &mut vars,
@@ -2756,6 +2912,7 @@ mod tests {
             &empty_aliases,
             TEST_LEDGER,
             GraphRole::UpdateTemplate,
+            &mut blanks,
         );
         let templates = parse_expanded_triples_with_ctx(
             &expanded,
@@ -2818,6 +2975,7 @@ mod tests {
         }]);
 
         let empty_aliases = HashMap::new();
+        let mut blanks = BlankIssuer::default();
         let mut parse_ctx = TemplateParseCtx::new(
             &ctx,
             &mut vars,
@@ -2828,6 +2986,7 @@ mod tests {
             &empty_aliases,
             TEST_LEDGER,
             GraphRole::UpdateTemplate,
+            &mut blanks,
         );
         let templates = parse_expanded_triples_with_ctx(
             &expanded,
@@ -2876,6 +3035,7 @@ mod tests {
         }]);
 
         let empty_aliases = HashMap::new();
+        let mut blanks = BlankIssuer::default();
         let mut parse_ctx = TemplateParseCtx::new(
             &ctx,
             &mut vars,
@@ -2886,6 +3046,7 @@ mod tests {
             &empty_aliases,
             TEST_LEDGER,
             GraphRole::UpdateTemplate,
+            &mut blanks,
         );
         let templates = parse_expanded_triples_with_ctx(
             &expanded,
@@ -3519,5 +3680,88 @@ mod tests {
         )
         .unwrap();
         assert!(txn.insert_templates.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Document-scoped blank-node labels (D-B5).
+    // ---------------------------------------------------------------------
+
+    fn blank_labels(templates: &[TripleTemplate]) -> std::collections::BTreeSet<String> {
+        templates
+            .iter()
+            .flat_map(|t| [&t.subject, &t.object])
+            .filter_map(|term| match term {
+                TemplateTerm::BlankNode(label) => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// N4: anonymous nodes in different `["graph", …]` items are different
+    /// nodes. The label counter used to restart for every item, so all of
+    /// them became `_:b0` and merged.
+    #[test]
+    fn blank_issuer_is_document_scoped_across_sugar_items() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "insert": [
+                ["graph", "ex:g", {"@id": "ex:a", "ex:p": {"ex:v": 1}}],
+                ["graph", "ex:g", {"@id": "ex:b", "ex:p": {"ex:v": 2}}],
+                {"@id": "ex:c", "ex:p": {"ex:v": 3}}
+            ]
+        });
+        let txn = parse_doc(&doc, TxnType::Update).unwrap();
+        assert_eq!(
+            blank_labels(&txn.insert_templates).len(),
+            3,
+            "three anonymous nodes, three labels: {:?}",
+            blank_labels(&txn.insert_templates)
+        );
+    }
+
+    /// A user label of the issuer's own form stays that one node, and an
+    /// anonymous node never shares it, whichever comes first.
+    #[test]
+    fn user_b_label_never_collides_with_anonymous() {
+        let user_first = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "_:b0", "ex:p": 1},
+                {"@id": "ex:s", "ex:q": {"ex:v": 2}}
+            ]
+        });
+        let anon_first = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "ex:s", "ex:q": {"ex:v": 2}},
+                {"@id": "_:b0", "ex:p": 1},
+                {"@id": "_:b1", "ex:p": 3}
+            ]
+        });
+        for doc in [user_first, anon_first] {
+            let txn = parse_doc(&doc, TxnType::Insert).unwrap();
+            let labels = blank_labels(&txn.insert_templates);
+            let users = doc["@graph"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["@id"].as_str().is_some_and(|id| id.starts_with("_:")))
+                .count();
+            assert_eq!(labels.len(), users + 1, "{doc}: {labels:?}");
+            assert!(
+                labels.contains("_:b0"),
+                "the user's label is kept: {labels:?}"
+            );
+        }
+        // Without a collision nothing is re-labelled.
+        let plain = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "_:mine", "ex:p": 1}, {"@id": "ex:s", "ex:q": {"ex:v": 2}}]
+        });
+        let labels = blank_labels(&parse_doc(&plain, TxnType::Insert).unwrap().insert_templates);
+        assert!(
+            labels.contains("_:b0") && labels.contains("_:mine"),
+            "{labels:?}"
+        );
     }
 }
