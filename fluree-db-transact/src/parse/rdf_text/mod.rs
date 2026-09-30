@@ -23,7 +23,7 @@ use crate::namespace::NamespaceRegistry;
 use crate::parse::trig_meta::{might_contain_graph_block, TXN_META_GRAPH_IRI};
 use crate::template_sink::{RdfTextParts, Scope, TemplateSink};
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
-use fluree_graph_turtle::{ParserOptions, TurtleError};
+use fluree_graph_turtle::{ParserOptions, RelativeIris, TurtleError};
 use std::sync::Arc;
 
 mod locate;
@@ -174,6 +174,13 @@ fn default_scope(placement: Placement<'_>) -> Scope {
 }
 
 /// Parse a located document segment by segment, in document order.
+///
+/// A labeled block's contents keep a relative IRI reference exactly as
+/// written when no `@base` is in force ([`RelativeIris::Verbatim`]): ledger
+/// configuration names a ledger by its id, and an id such as
+/// `org/governance:main` is a relative reference (`f:ledger
+/// <org/governance:main>`). Default-graph statements resolve against the
+/// base as everywhere else, and are refused without one.
 fn parse_located(
     located: &Located<'_>,
     placement: Placement<'_>,
@@ -216,6 +223,12 @@ fn parse_located(
         let slice = &located.text[segment.range.clone()];
         let seeded_prefixes = prefixes.clone();
         let seeded_base = base.clone();
+        let options = match segment.kind {
+            SegmentKind::Named { .. } => {
+                ParserOptions::default().with_relative_iris(RelativeIris::Verbatim)
+            }
+            SegmentKind::Default | SegmentKind::DefaultBlock => ParserOptions::default(),
+        };
         let mut capture = Capture {
             sink: &mut sink,
             prefixes: &mut prefixes,
@@ -226,7 +239,7 @@ fn parse_located(
             &mut capture,
             &seeded_prefixes,
             seeded_base.as_deref(),
-            ParserOptions::default(),
+            options,
         )
         .map_err(|e| shift(e, segment.range.start))?;
         if matches!(
@@ -550,20 +563,40 @@ mod tests {
     }
 
     #[test]
-    fn relative_references_need_a_base() {
-        let e = err(
-            "GRAPH <http://g> { <s> <http://p> 1 . }",
-            Placement::AsWritten,
-        );
-        assert!(e.contains("relative"), "{e}");
+    fn relative_references_need_a_base_outside_block_contents() {
+        // A block label and a default-graph statement resolve against the
+        // base, and are refused without one.
         let e = err(
             "GRAPH <g> { <http://s> <http://p> 1 . }",
             Placement::AsWritten,
         );
         assert!(e.contains("graph label"), "{e}");
-        // Outside a block, the same rule.
         let e = err("<s> <http://p> 1 .", Placement::AsWritten);
         assert!(e.contains("relative"), "{e}");
+    }
+
+    /// Inside a block, with no base in force, a relative reference is kept
+    /// as written: ledger configuration names ledgers by id this way. A base,
+    /// when in force, still resolves it.
+    #[test]
+    fn a_ledger_id_in_a_block_is_kept_as_written() {
+        let doc = "@prefix f: <https://ns.flur.ee/db#> .\n\
+                   GRAPH <urn:cfg> { <urn:cfg:src> f:ledger <org/governance:main> . }\n";
+        assert!(
+            rendered(doc)
+                .iter()
+                .any(|t| t.ends_with("<org/governance:main>")),
+            "{:?}",
+            rendered(doc)
+        );
+        let based = format!("@base <http://b.org/> .\n{doc}");
+        assert!(
+            rendered(&based)
+                .iter()
+                .any(|t| t.ends_with("<http://b.org/org/governance:main>")),
+            "{:?}",
+            rendered(&based)
+        );
     }
 
     // ---- Block contents: the full grammar -------------------------------

@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 
 use crate::error::{Result, TurtleError};
 use crate::lex::{StreamingLexer, Token, TokenKind};
-use crate::options::{CollectionStyle, NumericStyle, ParserOptions};
+use crate::options::{CollectionStyle, NumericStyle, ParserOptions, RelativeIris};
 
 /// RDF well-known IRIs (imported from vocab crate)
 const RDF_TYPE: &str = rdf::TYPE;
@@ -1644,6 +1644,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         let base = match &self.base {
             Some(b) => b,
+            // A ledger id used as an IRI reference (see `RelativeIris`).
+            None if self.options.relative_iris == RelativeIris::Verbatim => {
+                return Ok(reference.to_string());
+            }
             None => {
                 // RFC 3986 §5.1: a relative reference needs a base. Keeping it
                 // verbatim, as this used to, writes a relative IRI into the

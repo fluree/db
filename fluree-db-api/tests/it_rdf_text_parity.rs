@@ -537,11 +537,12 @@ ex:s ex:knows ex:o ~ ex:r {| ex:src "wiki" |} .
 ex:s a ex:T {| ex:conf 0.9 |} .
 "#;
 
-/// One document, inserted by the streaming parser and upserted into a
-/// fresh ledger, stores the same facts: same values, datatypes, language
-/// tags, list positions and annotation bundles, blank nodes by label.
+/// One document, inserted by the streaming parser, upserted, and synced
+/// into the default graph of fresh ledgers, stores the same facts: same
+/// values, datatypes, language tags, list positions and annotation
+/// bundles, blank nodes by label.
 #[tokio::test]
-async fn upsert_stores_what_insert_stores() {
+async fn upsert_and_sync_store_what_insert_stores() {
     let fluree = memory();
     let inserted = fluree
         .insert_turtle(
@@ -559,6 +560,13 @@ async fn upsert_stores_what_insert_stores() {
         .await
         .expect("upsert")
         .ledger;
+    let synced = fluree
+        .stage_owned(genesis_ledger(&fluree, "it/rdf-parity-sync:main"))
+        .sync_graph_payload(GraphSel::Default, GraphPayload::Rdf(PARITY_DOC), false)
+        .execute()
+        .await
+        .expect("sync")
+        .ledger;
     let expected = facts(&inserted, None).await;
     assert!(
         expected
@@ -566,7 +574,8 @@ async fn upsert_stores_what_insert_stores() {
             .any(|f| f.contains("list") && f.ends_with("#2")),
         "the fixture must hold a list: {expected:#?}"
     );
-    assert_eq!(facts(&upserted, None).await, expected);
+    assert_eq!(facts(&upserted, None).await, expected, "upsert");
+    assert_eq!(facts(&synced, None).await, expected, "sync");
 }
 
 /// A collection upserted over another replaces it entry by entry, in order.
@@ -629,6 +638,74 @@ async fn the_config_recipe_upserts_as_written() {
         stored
             .iter()
             .any(|f| f.contains("reasoningModes https://ns.flur.ee/db#RDFS")),
+        "{stored:#?}"
+    );
+}
+
+/// A ledger id used as an IRI reference inside a GRAPH block, with no `@base`
+/// in force, is stored exactly as written on upsert, TriG insert and sync:
+/// cross-ledger configuration names its model ledger this way
+/// (`f:ledger <org/governance:main>`, a relative reference). The same
+/// statement in the default graph still needs a base, and a base in force
+/// still resolves the reference.
+#[tokio::test]
+async fn a_ledger_id_in_a_graph_block_is_stored_as_written() {
+    let fluree = memory();
+    let g = "http://example.org/cfg";
+    let statement = "<urn:cfg:src> <https://ns.flur.ee/db#ledger> <org/governance:main> .";
+    let block = format!("GRAPH <{g}> {{ {statement} }}\n");
+    for lane in ["upsert", "insert", "sync"] {
+        let ledger = genesis_ledger(&fluree, &format!("it/rdf-ledger-id-{lane}:main"));
+        let result = match lane {
+            "upsert" => fluree.upsert_turtle(ledger, &block).await.map(|r| r.ledger),
+            "insert" => fluree.insert_turtle(ledger, &block).await.map(|r| r.ledger),
+            _ => fluree
+                .stage_owned(ledger)
+                .sync_graph_payload(
+                    GraphSel::Graph(g.to_string()),
+                    GraphPayload::Rdf(&block),
+                    false,
+                )
+                .execute()
+                .await
+                .map(|r| r.ledger),
+        }
+        .unwrap_or_else(|e| panic!("{lane}: {e}"));
+        let stored = facts(&result, Some(g)).await;
+        assert!(
+            stored
+                .iter()
+                .any(|f| f.contains("#ledger org/governance:main ")),
+            "{lane}: {stored:#?}"
+        );
+    }
+
+    let err = fluree
+        .upsert_turtle(
+            genesis_ledger(&fluree, "it/rdf-ledger-id-default:main"),
+            statement,
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a default-graph relative reference needs a base");
+    assert!(
+        matches!(err, fluree_db_api::ApiError::Turtle(_)) && err.to_string().contains("relative"),
+        "{err:?}"
+    );
+
+    let based = fluree
+        .upsert_turtle(
+            genesis_ledger(&fluree, "it/rdf-ledger-id-based:main"),
+            &format!("@base <http://b.org/> .\n{block}"),
+        )
+        .await
+        .expect("upsert under a base")
+        .ledger;
+    let stored = facts(&based, Some(g)).await;
+    assert!(
+        stored
+            .iter()
+            .any(|f| f.contains("#ledger http://b.org/org/governance:main ")),
         "{stored:#?}"
     );
 }

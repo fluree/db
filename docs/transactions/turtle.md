@@ -628,7 +628,7 @@ A `GRAPH` block's contents are Turtle like the rest of the document: anonymous b
 Every transaction endpoint reads Turtle and TriG with the same parser, once, and stores what it reads; nothing is converted to JSON-LD on the way. So the same document stores the same facts through `/insert`, `/upsert`, `/sync` and the Graph Store routes:
 
 - **Directives apply in document order.** A `@prefix` or `@base` applies to what follows it, in the default graph and in blocks alike; redefining a prefix later does not change the IRIs before it. A block label is resolved under the declarations in force where the block appears.
-- **Relative IRIs need a base.** `<x>` resolves against the `@base` in force; with no base it is a parse error, inside a block or outside one. `<#txn-meta>` with no base in force names the commit-metadata block, as always.
+- **Relative IRIs resolve against the base.** `<x>` resolves against the `@base` in force. With no base, a relative reference in the default graph (or as a block label) is a parse error, while one inside a `GRAPH` block's contents is kept exactly as written: ledger configuration names a ledger by its id, and an id such as `org/governance:main` is a relative reference (`f:ledger <org/governance:main>`). `<#txn-meta>` with no base in force names the commit-metadata block, as always.
 - **Literals are stored as written.** A lexical form that does not fit its datatype (`"abc"^^xsd:integer`) is kept, with its declared datatype, on every endpoint, as insert always did.
 - **Any IRI scheme works.** `tag:`, `kb:` and other schemes are stored verbatim, however they are spelled.
 - **Collections keep their order and repeats**, and `rdf:type` takes a blank node or a literal like any other predicate.
