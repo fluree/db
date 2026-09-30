@@ -648,6 +648,43 @@ async fn trailing_values_joins_after_having() {
     .await;
 }
 
+/// ASK and CONSTRUCT have no grouping stage in this lowering. GROUP BY, HAVING
+/// and an aggregate ORDER BY used to be dropped, which changed the answer
+/// (`ASK { … } HAVING (?a = "Nope")` was true; the CONSTRUCT below built all
+/// six triples). They are now refused, as they were for DESCRIBE.
+#[tokio::test]
+async fn ask_and_construct_refuse_grouping() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/ask-construct:main").await;
+    for (body, form) in [
+        (
+            format!(r#"ASK {W} HAVING (?a = "Nope")"#),
+            "ASK with GROUP BY/HAVING",
+        ),
+        (format!("ASK {W} GROUP BY ?a"), "ASK with GROUP BY/HAVING"),
+        (
+            format!("ASK {W} ORDER BY COUNT(?e)"),
+            "aggregate ORDER BY in ASK",
+        ),
+        (
+            format!(r#"CONSTRUCT {{ ?e ex:area ?a }} {W} GROUP BY ?a HAVING (?a = "Remote")"#),
+            "CONSTRUCT with GROUP BY/HAVING",
+        ),
+    ] {
+        let query = format!("{PREFIX}{body}");
+        let err = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .expect_err(&body);
+        assert!(err.to_string().contains(form), "{body}: {err}");
+    }
+    // Without them, both still answer.
+    let result = run(&fluree, &ledger, &format!("ASK {W}")).await;
+    assert_eq!(
+        result.to_sparql_json(&ledger.snapshot).expect("json")["boolean"],
+        true
+    );
+}
+
 /// Cypher parity. Cypher makes a non-aggregate RETURN expression a grouping
 /// key, so `RETURN CASE … AS seg, count(e)` groups by the label — SPARQL's
 /// `GROUP BY (IF(…) AS ?seg)`. Grouping by the area first and mapping it after
