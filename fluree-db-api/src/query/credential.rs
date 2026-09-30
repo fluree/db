@@ -48,23 +48,12 @@ impl Fluree {
         // Parse SPARQL to extract dataset spec
         let ast = parse_and_validate_sparql(sparql)?;
 
-        // Extract dataset clause
-        let dataset_clause = match &ast.body {
-            fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
-            fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
-            fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
-            fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
-            fluree_db_sparql::ast::QueryBody::Update(_) => None,
-        };
-
-        let spec = match dataset_clause {
-            Some(clause) => DatasetSpec::from_sparql_clause(clause)
-                .map_err(|e| ApiError::query(e.to_string()))?,
-            None => DatasetSpec::default(),
-        };
+        // The dataset clause, with its IRIs expanded against the prologue.
+        let spec = DatasetSpec::from_sparql_ast(&ast)
+            .map_err(|e| ApiError::invalid_query(e.to_string()))?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing dataset specification in SPARQL query (no FROM / FROM NAMED)",
             ));
         }

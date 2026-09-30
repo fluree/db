@@ -571,7 +571,14 @@ impl DatasetRef {
             Ok(Some(address)) => Ok(Self::Address(address)),
             // A pin with a known tag and a bad value is still a pin: report it.
             Err(e) if Self::has_known_pin(pre_graph) => Err(e),
-            Ok(None) | Err(_) => Self::graph_iri(s),
+            Ok(None) | Err(_) => Self::graph_iri(s).map_err(|neither| {
+                // Text that is no IRI but reads as an address with an unknown
+                // pin (`mydb@foo`) is most likely a mistyped pin: say that.
+                match LedgerRef::parse(s) {
+                    Err(pin) if base.len() < pre_graph.len() => pin,
+                    _ => neither,
+                }
+            }),
         }
     }
 
@@ -603,6 +610,212 @@ impl DatasetRef {
         match self {
             Self::GraphIri(iri) | Self::Ambiguous { iri, .. } => Some(iri),
             Self::Address(_) => None,
+        }
+    }
+}
+
+// ============================================================================
+// MemberRef
+// ============================================================================
+
+/// One dataset member as the edge parsed it: a dataset-position reference, or
+/// a graph keyword (`default` / `txn-meta` / `config`) that names a graph of
+/// the target ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberRef {
+    /// `default`, `txn-meta` or `config`: a graph of whatever ledger the
+    /// surface targets. There is no such ledger on a connection surface.
+    Keyword(GraphSel),
+    /// Anything else in a dataset position.
+    Dataset(DatasetRef),
+}
+
+impl MemberRef {
+    /// Parse a dataset-position string: a graph keyword, or
+    /// [`DatasetRef::parse`].
+    pub fn parse(s: &str) -> Result<Self, RefError> {
+        match GraphSel::keyword(s) {
+            Some(sel) => Ok(Self::Keyword(sel)),
+            None => DatasetRef::parse(s).map(Self::Dataset),
+        }
+    }
+
+    /// The address reading, when there is one.
+    pub fn address(&self) -> Option<&LedgerRef> {
+        match self {
+            Self::Dataset(r) => r.address(),
+            Self::Keyword(_) => None,
+        }
+    }
+}
+
+// ============================================================================
+// Resolution in a target ledger
+// ============================================================================
+
+/// A graph of the target ledger that a reference resolved to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetGraph {
+    /// The graph's id in the target ledger.
+    pub g_id: GraphId,
+    /// The same graph as a selector: a keyword for a reserved slot, else the
+    /// registered IRI.
+    pub graph: GraphSel,
+}
+
+/// Why a reference does not name a graph of the target ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TargetError {
+    /// The reference names another ledger (or graph source).
+    CrossLedger {
+        /// What the reference names.
+        named: LedgerId,
+        /// The ledger the surface reads.
+        target: LedgerId,
+        /// The text was also an absolute IRI (`urn:x`, `mydb:dev`), which the
+        /// target's registry does not hold either.
+        also_iri: bool,
+    },
+    /// The reference is a graph IRI the target ledger has no graph for.
+    GraphNotFound(String),
+}
+
+impl fmt::Display for TargetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CrossLedger {
+                named,
+                target,
+                also_iri: false,
+            } => write!(
+                f,
+                "'{named}' names another ledger; this endpoint reads '{target}'. \
+                 Query both through the connection endpoint (/query) instead"
+            ),
+            Self::CrossLedger {
+                named,
+                target,
+                also_iri: true,
+            } => write!(
+                f,
+                "'{named}' is not a graph of '{target}', and as a ledger address it names \
+                 another ledger. Query both through the connection endpoint (/query) instead"
+            ),
+            Self::GraphNotFound(iri) => write!(f, "Graph not found: '{iri}'"),
+        }
+    }
+}
+
+impl std::error::Error for TargetError {}
+
+/// The ledger a ledger-scoped surface reads, as the one context a dataset
+/// reference is resolved in: the HTTP ledger routes, the view API, the CLI's
+/// local target, and an update's WHERE.
+///
+/// `lookup` is the ledger's graph registry: exact IRI to graph id.
+pub struct TargetLedger<'a> {
+    id: &'a LedgerId,
+    lookup: &'a dyn Fn(&str) -> Option<GraphId>,
+}
+
+impl<'a> TargetLedger<'a> {
+    pub fn new(id: &'a LedgerId, lookup: &'a dyn Fn(&str) -> Option<GraphId>) -> Self {
+        Self { id, lookup }
+    }
+
+    pub fn id(&self) -> &LedgerId {
+        self.id
+    }
+
+    /// Resolve one dataset member, as written and as parsed, to a graph of
+    /// this ledger. `pinned` says whether the member carries a time of its own
+    /// (the caller reconciles or refuses it).
+    ///
+    /// In order:
+    ///
+    /// 0. This ledger's own address ([`LedgerRef::is_own_address`]: any
+    ///    spelling, no pin, the default graph): the default graph. The
+    ///    ledger's name stays reserved for its default graph even if a
+    ///    registered graph shares the IRI.
+    /// 1. The written text as an exact registry IRI, reserved slots included:
+    ///    a branch inherits its source's `urn:fluree:<source>#config`
+    ///    registration, and a user graph may itself be named `urn:fluree:…`.
+    /// 2. Otherwise by what the text parsed as: a keyword is that graph; an
+    ///    address of this ledger selects its graph; an address of another
+    ///    ledger is [`TargetError::CrossLedger`]; a graph IRI the registry does
+    ///    not hold is [`TargetError::GraphNotFound`].
+    pub fn resolve(
+        &self,
+        written: &str,
+        member: &MemberRef,
+        pinned: bool,
+    ) -> Result<TargetGraph, TargetError> {
+        if let Some(address) = member.address() {
+            if !pinned && address.is_own_address(self.id) {
+                return Ok(self.reserved(GraphSel::Default));
+            }
+        }
+        if let Some(found) = self.registered(written) {
+            return Ok(found);
+        }
+        match member {
+            MemberRef::Keyword(sel) => self.graph(sel),
+            MemberRef::Dataset(DatasetRef::GraphIri(iri)) => {
+                Err(TargetError::GraphNotFound(iri.to_string()))
+            }
+            MemberRef::Dataset(
+                reference @ (DatasetRef::Address(address) | DatasetRef::Ambiguous { address, .. }),
+            ) => {
+                if address.id() == self.id {
+                    self.graph(address.graph())
+                } else {
+                    Err(TargetError::CrossLedger {
+                        named: address.id().clone(),
+                        target: self.id.clone(),
+                        also_iri: matches!(reference, DatasetRef::Ambiguous { .. }),
+                    })
+                }
+            }
+        }
+    }
+
+    /// A graph of this ledger, named by a selector: a keyword is its reserved
+    /// slot; an IRI is an exact registry entry (reserved slots included) or
+    /// this ledger's own `urn:fluree:<id>#config` / `#txn-meta`.
+    pub fn graph(&self, sel: &GraphSel) -> Result<TargetGraph, TargetError> {
+        match sel {
+            GraphSel::Named(iri) => self.registered(iri).map(Ok).unwrap_or_else(|| {
+                if **iri == crate::graph_registry::config_graph_iri(self.id) {
+                    Ok(self.reserved(GraphSel::Config))
+                } else if **iri == crate::graph_registry::txn_meta_graph_iri(self.id) {
+                    Ok(self.reserved(GraphSel::TxnMeta))
+                } else {
+                    Err(TargetError::GraphNotFound(iri.to_string()))
+                }
+            }),
+            reserved => Ok(self.reserved(reserved.clone())),
+        }
+    }
+
+    fn registered(&self, iri: &str) -> Option<TargetGraph> {
+        let g_id = (self.lookup)(iri)?;
+        Some(match g_id {
+            DEFAULT_GRAPH_ID => self.reserved(GraphSel::Default),
+            TXN_META_GRAPH_ID => self.reserved(GraphSel::TxnMeta),
+            CONFIG_GRAPH_ID => self.reserved(GraphSel::Config),
+            g_id => TargetGraph {
+                g_id,
+                graph: GraphSel::Named(GraphIri(iri.into())),
+            },
+        })
+    }
+
+    fn reserved(&self, graph: GraphSel) -> TargetGraph {
+        TargetGraph {
+            g_id: graph
+                .reserved_g_id()
+                .expect("a keyword names a reserved slot"),
+            graph,
         }
     }
 }
@@ -819,7 +1032,11 @@ mod tests {
     #[test]
     fn an_unknown_pin_tag_is_not_an_address() {
         assert_eq!(graph_iri("mailto:a@b").as_str(), "mailto:a@b");
+        // No IRI either: the likeliest reading is a mistyped pin, so the
+        // error is the pin's.
         let err = DatasetRef::parse("mydb@foo").unwrap_err().to_string();
+        assert!(err.contains("Invalid time travel format"), "{err}");
+        let err = DatasetRef::parse("products#x").unwrap_err().to_string();
         assert!(err.contains("neither a ledger address"), "{err}");
     }
 
@@ -858,6 +1075,92 @@ mod tests {
         assert!(r.address().is_some() && r.graph_iri_reading().is_none());
         let r = DatasetRef::parse("http://ex.org/g").unwrap();
         assert!(r.address().is_none() && r.graph_iri_reading().is_some());
+    }
+
+    // --- Resolution in a target ledger ---
+
+    /// A branch `L:feature` whose registry, like every branch's, carries its
+    /// source's reserved IRIs verbatim, plus user graphs, one of which is
+    /// named with the branch's own address.
+    fn feature_registry(iri: &str) -> Option<GraphId> {
+        match iri {
+            "urn:fluree:L:main#config" => Some(CONFIG_GRAPH_ID),
+            "urn:fluree:L:main#txn-meta" => Some(TXN_META_GRAPH_ID),
+            "http://ex.org/g" => Some(3),
+            "urn:fluree:L:main#resolution-config" => Some(4),
+            "L:feature" => Some(5),
+            _ => None,
+        }
+    }
+
+    fn resolve(written: &str) -> Result<TargetGraph, TargetError> {
+        let id = LedgerId::parse("L:feature").unwrap();
+        let target = TargetLedger::new(&id, &feature_registry);
+        let member = MemberRef::parse(written).unwrap();
+        let pinned = member.address().is_some_and(|a| a.at().is_some());
+        target.resolve(written, &member, pinned)
+    }
+
+    fn g_id(written: &str) -> GraphId {
+        resolve(written)
+            .unwrap_or_else(|e| panic!("{written:?}: {e}"))
+            .g_id
+    }
+
+    /// Every spelling of the target's own address is its default graph, even
+    /// where a registered graph shares the text (`L:feature` is also a user
+    /// graph's IRI here): the name stays reserved for the default graph.
+    #[test]
+    fn the_targets_own_address_is_its_default_graph() {
+        for own in ["L:feature", "urn:fluree:L:feature", "L:feature@t:3"] {
+            assert_eq!(g_id(own), DEFAULT_GRAPH_ID, "{own}");
+        }
+        assert_eq!(g_id("default"), DEFAULT_GRAPH_ID);
+    }
+
+    #[test]
+    fn reserved_graphs_resolve_by_keyword_fragment_or_either_urn() {
+        for config in [
+            "config",
+            "L:feature#config",
+            "urn:fluree:L:feature#config",
+            // The main branch's URN, which the branch inherited verbatim.
+            "urn:fluree:L:main#config",
+        ] {
+            assert_eq!(g_id(config), CONFIG_GRAPH_ID, "{config}");
+        }
+        assert_eq!(g_id("txn-meta"), TXN_META_GRAPH_ID);
+        assert_eq!(g_id("urn:fluree:L:feature#txn-meta"), TXN_META_GRAPH_ID);
+    }
+
+    /// A registered IRI resolves exactly, whatever it looks like: a user graph
+    /// named `urn:fluree:…` is not re-read as an address.
+    #[test]
+    fn registered_iris_resolve_exactly() {
+        assert_eq!(g_id("http://ex.org/g"), 3);
+        assert_eq!(g_id("L:feature#http://ex.org/g"), 3);
+        assert_eq!(g_id("urn:fluree:L:main#resolution-config"), 4);
+    }
+
+    #[test]
+    fn other_ledgers_and_unknown_graphs_are_typed_errors() {
+        assert!(matches!(
+            resolve("other:main"),
+            Err(TargetError::CrossLedger { ref named, .. }) if named == "other:main"
+        ));
+        // The same name on another branch is another ledger.
+        assert!(matches!(
+            resolve("L:main"),
+            Err(TargetError::CrossLedger { .. })
+        ));
+        assert!(matches!(
+            resolve("http://ex.org/nope"),
+            Err(TargetError::GraphNotFound(ref iri)) if iri == "http://ex.org/nope"
+        ));
+        assert!(matches!(
+            resolve("L:feature#http://ex.org/nope"),
+            Err(TargetError::GraphNotFound(_))
+        ));
     }
 
     // --- TimeSpec grammar (moved with the type from fluree-db-api) ---

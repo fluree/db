@@ -858,8 +858,8 @@ async fn test_sparql_graph_pattern_txn_meta() {
             // Build dataset spec with txn-meta as a named graph
             let txn_meta_graph = format!("{ledger_id}#txn-meta");
             let spec = DatasetSpec::new()
-                .with_default(GraphSource::new(ledger_id))
-                .with_named(GraphSource::new(&txn_meta_graph));
+                .with_default(GraphSource::parse(ledger_id).unwrap())
+                .with_named(GraphSource::parse(&txn_meta_graph).unwrap());
 
             let dataset = fluree
                 .build_dataset_view(&spec)

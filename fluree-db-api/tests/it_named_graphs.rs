@@ -1569,6 +1569,14 @@ async fn test_unknown_named_graph_error() {
                 matches!(err, fluree_db_api::ApiError::GraphNotFound(_)),
                 "error should be GraphNotFound: {err}"
             );
+            // A graph the ledger does not have is the caller's to fix: a 404
+            // naming the graph, not an internal error.
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains("Graph not found")
+                    && err_msg.contains("http://example.org/nonexistent"),
+                "error should name the unknown graph: {err_msg}"
+            );
             assert_eq!(err.status_code(), 404, "{err}");
         })
         .await;

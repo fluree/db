@@ -81,8 +81,8 @@ fn members(kind: &str, n: usize) -> Vec<String> {
 
 fn spec(kind: &str, n: usize) -> DatasetSpec {
     members(kind, n).into_iter().fold(
-        DatasetSpec::new().with_default(GraphSource::new(LEDGER)),
-        |spec, iri| spec.with_named(GraphSource::new(iri)),
+        DatasetSpec::new().with_default(GraphSource::parse(LEDGER).unwrap()),
+        |spec, iri| spec.with_named(GraphSource::parse(&iri).unwrap()),
     )
 }
 

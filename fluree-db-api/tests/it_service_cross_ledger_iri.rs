@@ -58,8 +58,8 @@ async fn seed_pair(fluree: &MemoryFluree, suffix: &str) -> (String, String) {
 
 async fn dataset_for(fluree: &MemoryFluree, alpha: &str, beta: &str) -> DataSetDb {
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new(alpha))
-        .with_named(GraphSource::new(beta));
+        .with_default(GraphSource::parse(alpha).unwrap())
+        .with_named(GraphSource::parse(beta).unwrap());
     fluree
         .build_dataset_view(&spec)
         .await

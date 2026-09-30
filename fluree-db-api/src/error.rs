@@ -750,6 +750,20 @@ impl ApiError {
     }
 }
 
+/// A reference that does not name a graph of the ledger a surface reads: a
+/// caller mistake, never an internal error. Another ledger's address is a 400
+/// that names the fix; a graph the ledger does not have is a 404.
+impl From<fluree_db_core::TargetError> for ApiError {
+    fn from(e: fluree_db_core::TargetError) -> Self {
+        match e {
+            fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
+            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
+                ApiError::invalid_query(cross.to_string())
+            }
+        }
+    }
+}
+
 /// Result type alias for API operations
 pub type Result<T> = std::result::Result<T, ApiError>;
 

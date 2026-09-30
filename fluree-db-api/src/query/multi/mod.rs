@@ -581,8 +581,8 @@ fn validate_sparql_subquery(
         .iter()
         .chain(&spec.named_graphs)
         .map(|source| SubqueryLedger {
-            ledger: snapshot::bare_ledger_id(&source.identifier),
-            at: source.time_spec.clone(),
+            ledger: snapshot::bare_ledger_id(source.written()),
+            at: source.time_spec().cloned(),
         })
         .collect();
 
