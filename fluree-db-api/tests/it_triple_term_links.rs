@@ -606,3 +606,69 @@ async fn incremental_index_follows_a_partial_repoint() {
         })
         .await;
 }
+
+async fn assert_object_types_survive(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) {
+    let got = run_link_query(
+        fluree,
+        ledger,
+        "SELECT (DATATYPE(OBJECT(?t)) AS ?dt) WHERE { ?r rdf:reifies ?t . \
+         FILTER(PREDICATE(?t) = ex:size) } ORDER BY ?dt"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(got.len(), 2, "{got:#?}");
+    assert!(
+        got[0][0].ends_with("int") && got[1][0].ends_with("integer"),
+        "{got:#?}"
+    );
+    let got = run_link_query(
+        fluree,
+        ledger,
+        "SELECT (LANG(OBJECT(?t)) AS ?l) WHERE { ?r rdf:reifies ?t . \
+         FILTER(PREDICATE(?t) = ex:title) } ORDER BY ?l"
+            .to_string(),
+    )
+    .await;
+    let langs: Vec<&str> = got.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(langs, ["", "en", "fr"], "{got:#?}");
+    let got = run_link_query(
+        fluree,
+        ledger,
+        "SELECT (DATATYPE(?o) AS ?dt) WHERE { ?r rdf:reifies <<( ex:doc ex:size ?o )>> } \
+         ORDER BY ?dt"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(got.len(), 2, "{got:#?}");
+    assert!(
+        got[0][0].ends_with("int") && got[1][0].ends_with("integer"),
+        "{got:#?}"
+    );
+}
+
+/// `DATATYPE` and `LANG` over an accessor read the component the way a
+/// bound variable is read: on the indexed path, and on the materialized
+/// path once an unrelated unindexed commit turns late materialization off.
+#[tokio::test]
+async fn link_lowering_keeps_object_types_through_accessors_and_novelty() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let (fluree, ledger) = import(
+        &[("literals.ttl", LITERAL_CLAIMS)],
+        "it/triple-term-links:accessor-types",
+    )
+    .await;
+    assert_object_types_survive(&fluree, &ledger).await;
+
+    let after = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:other",
+                "ex:note": "unrelated"
+            }),
+        )
+        .await
+        .expect("unrelated insert");
+    assert_object_types_survive(&fluree, &after.ledger).await;
+}

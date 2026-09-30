@@ -300,7 +300,7 @@ impl Expression {
             args,
         } = self
         {
-            if let Some(binding) = rdf::encoded_term_component(func, args, row, ctx)? {
+            if let Some(binding) = rdf::term_component_binding(func, args, row, ctx)? {
                 return Ok(binding);
             }
         }
