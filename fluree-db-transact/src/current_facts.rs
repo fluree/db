@@ -19,6 +19,11 @@
 //! [`FlakeAccumulator::push_retractions`](crate::generate::FlakeAccumulator::push_retractions)
 //! accepts.
 //!
+//! An intent names a stored fact when it holds the same term: value, exact
+//! datatype, and language tag compared case-insensitively. A fact read from
+//! the persisted index is also named by its index key, which keeps less
+//! than some terms carry (see [`IndexKeys`]).
+//!
 //! ## The read
 //!
 //! Per `(graph, subject, predicate)` slot (or subject): one seek into the
@@ -43,6 +48,7 @@ use fluree_db_core::{
     RangeTest, Sid, Tracker,
 };
 use fluree_db_ledger::LedgerState;
+use fluree_db_query::BinaryRangeProvider;
 use std::collections::{HashMap, HashSet};
 
 /// Seek-versus-walk break-even for a graph's novelty. Slots are answered by
@@ -56,9 +62,9 @@ pub const NOVELTY_WALK_RATIO: usize = 16;
 /// Where a stored fact's surviving op was read from.
 ///
 /// Index rows are decodes, and some decodes are lossy — a big integer's
-/// declared XSD subtype is not stored, so it decodes as `xsd:integer` or
-/// `xsd:decimal`. Recording the origin keeps any value-only identity rule
-/// for those rows in this one type.
+/// declared XSD subtype is not stored, so it decodes as `xsd:integer` (and
+/// as `xsd:decimal` in a query row). The origin tells the resolver which
+/// facts it may name by index key ([`IndexKeys`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
     /// The persisted index.
@@ -218,28 +224,92 @@ fn same_term(stored: &Flake, intent: &Flake) -> bool {
         && lang_matches(lang_of(stored), lang_of(intent))
 }
 
-/// The stored fact an intent names, if any. An intent with a list position
-/// names that position. One without names the first list entry holding the
-/// term, in index order, else the plain value: the contract hydration had,
-/// under which a value asserted at N list positions loses exactly one entry
-/// per distinct DELETE row.
-fn match_stored<'f>(facts: &'f [StoredFact], intent: &Flake) -> Option<&'f StoredFact> {
-    let term = |f: &&StoredFact| same_term(&f.flake, intent);
+/// The stored fact an intent names, if any, where `names(n, fact)` says
+/// whether `facts[n]` holds the intent's term. An intent with a list
+/// position names that position. One without names the first list entry
+/// holding the term, in index order, else the plain value: the contract
+/// hydration had, under which a value asserted at N list positions loses
+/// exactly one entry per distinct DELETE row.
+fn match_stored<'f>(
+    facts: &'f [StoredFact],
+    intent: &Flake,
+    names: impl Fn(usize, &StoredFact) -> bool,
+) -> Option<&'f StoredFact> {
+    let first = |position: &dyn Fn(Option<i32>) -> bool| {
+        facts
+            .iter()
+            .enumerate()
+            .find(|(n, f)| position(list_index_of(&f.flake)) && names(*n, f))
+            .map(|(_, f)| f)
+    };
     match list_index_of(intent) {
-        Some(i) => facts
-            .iter()
-            .filter(|f| list_index_of(&f.flake) == Some(i))
-            .find(term),
-        None => facts
-            .iter()
-            .filter(|f| list_index_of(&f.flake).is_some())
-            .find(term)
-            .or_else(|| {
-                facts
-                    .iter()
-                    .filter(|f| list_index_of(&f.flake).is_none())
-                    .find(term)
-            }),
+        Some(i) => first(&|p| p == Some(i)),
+        None => first(&|p| p.is_some()).or_else(|| first(&|p| p.is_none())),
+    }
+}
+
+/// The stored fact an intent names by term identity.
+fn match_term<'f>(facts: &'f [StoredFact], intent: &Flake) -> Option<&'f StoredFact> {
+    match_stored(facts, intent, |_, f| same_term(&f.flake, intent))
+}
+
+/// Names facts read from the persisted index by their index key.
+///
+/// The index keeps less than some terms carry: a big integer keeps no XSD
+/// subtype, a `dateTime` or `time` keeps microseconds. An indexed fact's
+/// decode can therefore differ from the term that was written, and from
+/// the term a query row carries for it. Terms with one index key are one
+/// stored fact to the index, which merges every retraction by that key; so
+/// an intent whose key is an indexed fact's key names that fact, and the
+/// resolver retracts the fact as read.
+struct IndexKeys<'l> {
+    provider: Option<&'l BinaryRangeProvider>,
+    /// Per slot, computed on first use.
+    slot_keys: Vec<Option<SlotKeys>>,
+}
+
+/// The index key `(o_type, o_key)` of each fact of a slot that was read
+/// from the index; `None` for a novelty fact, or one the index cannot key.
+type SlotKeys = Vec<Option<(u16, u64)>>;
+
+impl<'l> IndexKeys<'l> {
+    fn new(ledger: &'l LedgerState, slots: usize) -> Self {
+        Self {
+            provider: ledger
+                .snapshot
+                .range_provider
+                .as_ref()
+                .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>()),
+            slot_keys: vec![None; slots],
+        }
+    }
+
+    /// Per fact of slot `slot` (in graph `g_id`), whether it was read from
+    /// the index and has `intent`'s key. `None` when no fact can: no index,
+    /// no indexed fact in the slot, or no key for the intent (its value is
+    /// in no persisted dictionary, so no indexed row holds it).
+    fn hits(
+        &mut self,
+        slot: usize,
+        g_id: GraphId,
+        facts: &[StoredFact],
+        intent: &Flake,
+    ) -> Option<Vec<bool>> {
+        let provider = self.provider?;
+        if !facts.iter().any(|f| f.origin == Origin::Index) {
+            return None;
+        }
+        let key = provider.persisted_object_key(g_id, intent)?;
+        let keys = self.slot_keys[slot].get_or_insert_with(|| {
+            facts
+                .iter()
+                .map(|f| match f.origin {
+                    Origin::Index => provider.persisted_object_key(g_id, &f.flake),
+                    Origin::Novelty => None,
+                })
+                .collect()
+        });
+        Some(keys.iter().map(|k| *k == Some(key)).collect())
     }
 }
 
@@ -361,12 +431,14 @@ impl<'l> CurrentFacts<'l> {
     ///   decoded, with no read: the WHERE just matched that stored fact.
     /// - A witnessed row on a list-bearing ledger reads its slot for the one
     ///   thing a WHERE binding does not carry, the list position: it takes
-    ///   the position of the first stored list entry holding the same term,
-    ///   and otherwise stays as decoded.
+    ///   the position of the first stored list entry holding the same term
+    ///   (or, for an indexed entry, the same index key), and otherwise stays
+    ///   as decoded.
     /// - Every other intent — a template constant, `DELETE DATA`, a value
     ///   bound by another pattern — is matched against the stored facts of
-    ///   its slot ([`match_stored`]). An intent that names no stored fact
-    ///   stages nothing.
+    ///   its slot ([`match_stored`]): by term, else, for a fact read from
+    ///   the index, by index key ([`IndexKeys`]). The fact is retracted as
+    ///   read. An intent that names no stored fact stages nothing.
     ///
     /// `graph_of` gives the ledger graph id of an intent's graph Sid.
     pub(crate) async fn resolve_intents(
@@ -411,23 +483,41 @@ impl<'l> CurrentFacts<'l> {
         }
         stats.slot_reads = slots.len();
         let facts = self.of_slots(&slots).await?;
+        let mut keys = IndexKeys::new(self.ledger, slots.len());
 
         for (intent, idx) in pending.into_iter().zip(pending_slots) {
             let slot_facts = &facts[idx];
+            let g_id = slots[idx].g_id;
             let t = intent.flake.t;
             if intent.witnessed {
                 let mut flake = intent.flake;
                 if list_index_of(&flake).is_none() {
-                    if let Some(entry) = slot_facts
+                    let is_entry = |f: &StoredFact| list_index_of(&f.flake).is_some();
+                    let entry = slot_facts
                         .iter()
-                        .find(|f| list_index_of(&f.flake).is_some() && same_term(&f.flake, &flake))
-                    {
+                        .find(|f| is_entry(f) && same_term(&f.flake, &flake))
+                        .or_else(|| {
+                            // Most witnessed rows are not list entries: no
+                            // key encoding unless an indexed entry could match.
+                            slot_facts
+                                .iter()
+                                .any(|f| is_entry(f) && f.origin == Origin::Index)
+                                .then_some(())?;
+                            let hits = keys.hits(idx, g_id, slot_facts, &flake)?;
+                            let n = (0..slot_facts.len())
+                                .find(|&n| hits[n] && is_entry(&slot_facts[n]))?;
+                            Some(&slot_facts[n])
+                        });
+                    if let Some(entry) = entry {
                         flake.m = entry.flake.m.clone();
                         stats.enriched += 1;
                     }
                 }
                 out.push(Retraction(flake));
-            } else if let Some(stored) = match_stored(slot_facts, &intent.flake) {
+            } else if let Some(stored) = match_term(slot_facts, &intent.flake).or_else(|| {
+                let hits = keys.hits(idx, g_id, slot_facts, &intent.flake)?;
+                match_stored(slot_facts, &intent.flake, |n, _| hits[n])
+            }) {
                 stats.matched += 1;
                 out.push(stored.clone().retract(t));
             } else {

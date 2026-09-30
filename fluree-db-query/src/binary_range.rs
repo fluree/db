@@ -320,6 +320,34 @@ impl BinaryRangeProvider {
     pub fn runtime_small_dicts(&self) -> &Arc<RuntimeSmallDicts> {
         &self.runtime_small_dicts
     }
+
+    /// The key a persisted row holding `flake`'s object carries in graph
+    /// `g_id` under the flake's predicate: `(o_type, o_key)`, the index's
+    /// identity for the object, as overlay retractions are matched against
+    /// it.
+    ///
+    /// The index keeps less than some values carry — a big integer keeps no
+    /// XSD subtype, a `dateTime` or `time` keeps microseconds — so distinct
+    /// terms can share a key. Terms that share one are one stored fact.
+    ///
+    /// `None` when no persisted row can hold the object: its predicate,
+    /// string, subject, language tag, datatype or big number is not in the
+    /// persisted dictionaries, or it is a vector (keyed by fact, not by
+    /// value).
+    pub fn persisted_object_key(&self, g_id: GraphId, flake: &Flake) -> Option<(u16, u64)> {
+        let p_id = self.store.sid_to_p_id(&flake.p)?;
+        let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
+        crate::binary_scan::value_to_otype_okey(
+            &flake.o,
+            &flake.dt,
+            lang,
+            &self.store,
+            None,
+            Some((g_id, p_id)),
+        )
+        .ok()
+        .map(|(o_type, o_key)| (o_type.as_u16(), o_key))
+    }
 }
 
 impl RangeProvider for BinaryRangeProvider {

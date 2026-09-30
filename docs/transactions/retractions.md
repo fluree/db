@@ -327,6 +327,12 @@ DELETE { ex:alice schema:age 30 } INSERT { ex:alice schema:age 30 } WHERE {}
 stores `ex:alice schema:age 30` if it was absent, and commits nothing if it
 was present.
 
+Once a fact is indexed, a DELETE is matched against what the index stores,
+which is less than was written for two kinds of value: an integer too large
+for 64 bits keeps no XSD subtype, and a `dateTime` or `time` keeps six
+fractional digits. A DELETE naming the same big integer under another integer
+datatype, or the same instant to the microsecond, retracts such a fact.
+
 ### No Cascading by Default
 
 Retracting an entity doesn't automatically retract references to it:

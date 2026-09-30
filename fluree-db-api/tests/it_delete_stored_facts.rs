@@ -14,6 +14,10 @@
 //! nothing. Each case has SPARQL and JSON-LD twins (Cypher where its
 //! lowering produces the shape), on a novelty-only ledger and an indexed
 //! one.
+//!
+//! On an indexed ledger an intent also names a fact by its index key, which
+//! keeps less than some terms carry: a big integer's XSD subtype, a
+//! `dateTime`'s digits past the microsecond.
 
 use crate::support;
 use fluree_db_api::{Fluree, FlureeBuilder, LedgerState, TransactResult};
@@ -406,5 +410,267 @@ async fn witnessed_delete_of_an_indexed_big_integer_in_a_named_graph() {
                 "{surface}, with_list={with_list}"
             );
         }
+    }
+}
+
+// =============================================================================
+// Indexed facts are named by their index key
+// =============================================================================
+
+/// A big integer past the range of `i64`. The persisted index keys such a
+/// value by the value alone: its XSD subtype is not stored.
+const BIG: &str = "123456789012345678901234567890";
+
+/// The subtypes the big-integer cells cover, each with a big value it can
+/// hold.
+fn big_subtypes() -> [(&'static str, String); 4] {
+    [
+        ("nonNegativeInteger", BIG.to_string()),
+        ("positiveInteger", BIG.to_string()),
+        ("negativeInteger", format!("-{BIG}")),
+        ("unsignedLong", "18446744073709551615".to_string()),
+    ]
+}
+
+fn node_seed() -> JsonValue {
+    json!({"@id": "ex:s", "@type": "ex:Node"})
+}
+
+const NODE_ONLY: [&str; 1] = ["type=http://example.org/ns/Node"];
+
+/// A DELETE that names a big integer under its declared subtype deletes it,
+/// on a novelty-only ledger and on an indexed one, where the index decodes
+/// the value as `xsd:integer`: `DELETE DATA`, a JSON-LD delete, and a
+/// constant `DELETE` template alike.
+#[tokio::test]
+async fn constant_deletes_name_big_integers_under_their_subtype() {
+    let mut seed = node_seed();
+    let mut del = json!({"@id": "ex:s"});
+    let mut triples = Vec::new();
+    for (dt, v) in big_subtypes() {
+        let term = json!({"@value": v, "@type": format!("xsd:{dt}")});
+        seed[format!("ex:{dt}")] = term.clone();
+        del[format!("ex:{dt}")] = term;
+        triples.push(format!("ex:s ex:{dt} \"{v}\"^^xsd:{dt}"));
+    }
+    let triples = triples.join(" . ");
+    for indexed in [false, true] {
+        for form in ["data", "jsonld", "template"] {
+            let (_d, fluree, ledger) = seeded(&format!("big-{form}"), seed.clone(), indexed).await;
+            let r = match form {
+                "data" => {
+                    sparql_update(&fluree, ledger, &format!("DELETE DATA {{ {triples} }}")).await
+                }
+                "template" => {
+                    sparql_update(
+                        &fluree,
+                        ledger,
+                        &format!("DELETE {{ {triples} }} WHERE {{ ex:s a ex:Node }}"),
+                    )
+                    .await
+                }
+                _ => jsonld_update(&fluree, ledger, json!({"delete": del.clone()})).await,
+            };
+            assert_eq!(
+                facts(&fluree, &r.ledger).await,
+                NODE_ONLY,
+                "{form}, indexed={indexed}"
+            );
+            assert_eq!(r.receipt.retract_count, 4, "{form}, indexed={indexed}");
+        }
+    }
+}
+
+/// A value bound by OPTIONAL, UNION or BIND is not a witness, so its DELETE
+/// row is matched against the stored facts of its slot. The row carries the
+/// query's decode of the value; on an indexed ledger that decode and the
+/// stored fact's differ in datatype, and the row still names the fact.
+///
+/// Not covered: BIND on a novelty-only ledger with a subtype. BIND gives a
+/// big integer `xsd:integer` whatever its declared subtype, so there the row
+/// names a term that is not stored. That is a query-side gap, on `main` too.
+#[tokio::test]
+async fn where_bound_rows_name_big_integers() {
+    for indexed in [false, true] {
+        for dt in ["integer", "nonNegativeInteger"] {
+            let mut seed = node_seed();
+            seed["ex:n"] = json!({"@value": BIG, "@type": format!("xsd:{dt}")});
+            for (shape, body) in [
+                (
+                    "optional",
+                    "DELETE { ex:s ex:n ?o } WHERE { ex:s a ex:Node OPTIONAL { ex:s ex:n ?o } }",
+                ),
+                (
+                    "union",
+                    "DELETE { ex:s ex:n ?o } WHERE { { ex:s ex:n ?o } UNION { ex:s ex:none ?o } }",
+                ),
+                (
+                    "bind",
+                    "DELETE { ex:s ex:n ?o } WHERE { ex:s ex:n ?v BIND(?v AS ?o) }",
+                ),
+            ] {
+                if shape == "bind" && dt != "integer" && !indexed {
+                    continue;
+                }
+                let (_d, fluree, ledger) =
+                    seeded(&format!("big-{shape}-{dt}"), seed.clone(), indexed).await;
+                let r = sparql_update(&fluree, ledger, body).await;
+                assert_eq!(
+                    facts(&fluree, &r.ledger).await,
+                    NODE_ONLY,
+                    "{shape}, xsd:{dt}, indexed={indexed}"
+                );
+            }
+            let (_d, fluree, ledger) =
+                seeded(&format!("big-optional-jsonld-{dt}"), seed.clone(), indexed).await;
+            let r = jsonld_update(
+                &fluree,
+                ledger,
+                json!({
+                    "where": [{"@id": "ex:s", "@type": "ex:Node"}, ["optional", {"@id": "ex:s", "ex:n": "?o"}]],
+                    "delete": {"@id": "ex:s", "ex:n": "?o"}
+                }),
+            )
+            .await;
+            assert_eq!(
+                facts(&fluree, &r.ledger).await,
+                NODE_ONLY,
+                "JSON-LD optional, xsd:{dt}, indexed={indexed}"
+            );
+        }
+    }
+}
+
+/// Cypher `SET` replaces a big-integer property and `DETACH DELETE` removes
+/// it with its node, on both lanes: both read the old value through an
+/// OPTIONAL row.
+#[tokio::test]
+async fn cypher_set_and_detach_delete_reach_big_integers() {
+    for indexed in [false, true] {
+        let mut seed = node_seed();
+        seed["ex:big"] = json!({"@value": BIG, "@type": "xsd:integer"});
+
+        let (_d, fluree, ledger) = seeded("big-cypher-set", seed.clone(), indexed).await;
+        let r = fluree
+            .transact_cypher(
+                ledger,
+                "MATCH (n:`http://example.org/ns/Node`) SET n.`http://example.org/ns/big` = 5",
+            )
+            .await
+            .expect("cypher SET");
+        assert_eq!(
+            facts(&fluree, &r.ledger).await,
+            ["big=5", "type=http://example.org/ns/Node"],
+            "SET, indexed={indexed}"
+        );
+
+        let (_d, fluree, ledger) = seeded("big-cypher-detach", seed, indexed).await;
+        let r = fluree
+            .transact_cypher(
+                ledger,
+                "MATCH (n:`http://example.org/ns/Node`) DETACH DELETE n",
+            )
+            .await
+            .expect("cypher DETACH DELETE");
+        assert!(
+            facts(&fluree, &r.ledger).await.is_empty(),
+            "DETACH DELETE, indexed={indexed}: {:?}",
+            facts(&fluree, &r.ledger).await
+        );
+    }
+}
+
+/// A `dateTime` or `time` written past the microsecond is deleted by the
+/// same literal on both lanes; the index keeps microseconds.
+#[tokio::test]
+async fn delete_data_names_sub_microsecond_temporals() {
+    let seed = json!({
+        "@id": "ex:s",
+        "ex:d": {"@value": "2020-01-01T00:00:00.123456789Z", "@type": "xsd:dateTime"},
+        "ex:t": {"@value": "12:00:00.123456789", "@type": "xsd:time"}
+    });
+    for indexed in [false, true] {
+        let (_d, fluree, ledger) = seeded("sub-us-sparql", seed.clone(), indexed).await;
+        let r = sparql_update(
+            &fluree,
+            ledger,
+            "DELETE DATA { ex:s ex:d \"2020-01-01T00:00:00.123456789Z\"^^xsd:dateTime . \
+             ex:s ex:t \"12:00:00.123456789\"^^xsd:time }",
+        )
+        .await;
+        assert_eq!(r.receipt.retract_count, 2, "SPARQL, indexed={indexed}");
+        assert!(
+            facts(&fluree, &r.ledger).await.is_empty(),
+            "SPARQL, indexed={indexed}"
+        );
+
+        let (_d, fluree, ledger) = seeded("sub-us-jsonld", seed.clone(), indexed).await;
+        let mut del = seed.clone();
+        del["@id"] = json!("ex:s");
+        let r = jsonld_update(&fluree, ledger, json!({"delete": del})).await;
+        assert_eq!(r.receipt.retract_count, 2, "JSON-LD, indexed={indexed}");
+        assert!(
+            facts(&fluree, &r.ledger).await.is_empty(),
+            "JSON-LD, indexed={indexed}"
+        );
+    }
+}
+
+/// The index key names one value: a DELETE of another big integer under
+/// the same subtype, or of the same digits as a decimal, names nothing and
+/// commits nothing.
+#[tokio::test]
+async fn a_different_big_value_is_not_deleted() {
+    let mut seed = node_seed();
+    seed["ex:n"] = json!({"@value": BIG, "@type": "xsd:nonNegativeInteger"});
+    for indexed in [false, true] {
+        let (_d, fluree, ledger) = seeded("big-other", seed.clone(), indexed).await;
+        let t = ledger.t();
+        let r = sparql_update(
+            &fluree,
+            ledger,
+            &format!(
+                "DELETE DATA {{ ex:s ex:n \"{BIG}1\"^^xsd:nonNegativeInteger . \
+                 ex:s ex:n \"{BIG}.0\"^^xsd:decimal }}"
+            ),
+        )
+        .await;
+        no_commit(&r, t, &format!("indexed={indexed}"));
+        assert_eq!(
+            facts(&fluree, &r.ledger).await,
+            [
+                format!("n={BIG}"),
+                "type=http://example.org/ns/Node".to_string()
+            ],
+            "indexed={indexed}"
+        );
+    }
+}
+
+/// The index keys a big integer per graph and predicate, so a named graph's
+/// fact is named by its own graph's key.
+#[tokio::test]
+async fn a_delete_names_a_big_integer_in_a_named_graph() {
+    let seed = json!({"@graph": [{
+        "@id": "ex:s", "@graph": G1,
+        "ex:n": {"@value": BIG, "@type": "xsd:nonNegativeInteger"}
+    }]});
+    for indexed in [false, true] {
+        let (_d, fluree, ledger) = seeded("big-graph", seed.clone(), indexed).await;
+        assert_eq!(numbig_rows(&fluree, &ledger).await, 1, "precondition");
+        let r = sparql_update(
+            &fluree,
+            ledger,
+            &format!(
+                "DELETE DATA {{ GRAPH <{G1}> {{ ex:s ex:n \"{BIG}\"^^xsd:nonNegativeInteger }} }}"
+            ),
+        )
+        .await;
+        assert_eq!(r.receipt.retract_count, 1, "indexed={indexed}");
+        assert_eq!(
+            numbig_rows(&fluree, &r.ledger).await,
+            0,
+            "indexed={indexed}"
+        );
     }
 }
