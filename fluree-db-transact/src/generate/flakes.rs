@@ -491,6 +491,16 @@ impl<'a> FlakeGenerator<'a> {
         }
     }
 
+    /// The Sid an upsert's blank node `label` skolemizes to.
+    ///
+    /// Upsert has no WHERE, so its templates are instantiated for exactly one
+    /// solution — index 0 — and this is the Sid that solution's assertions
+    /// carry. The upsert wave uses it to find the stored values of a blank
+    /// subject whose skolem scope is deterministic.
+    pub(crate) fn upsert_blank_subject(&mut self, label: &str) -> Sid {
+        self.skolemize_blank_node(label, 0)
+    }
+
     /// Skolemize a blank node to a Sid.
     ///
     /// Creates a unique Sid for a blank node label within this transaction and

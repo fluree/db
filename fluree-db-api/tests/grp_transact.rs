@@ -51,3 +51,5 @@ mod it_txn_meta;
 mod it_update_wildcard_delete_indexed;
 #[path = "it_upsert_duplicate_ids_repro.rs"]
 mod it_upsert_duplicate_ids_repro;
+#[path = "it_upsert_stored_retractions.rs"]
+mod it_upsert_stored_retractions;
