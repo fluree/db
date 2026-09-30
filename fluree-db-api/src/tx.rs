@@ -3598,19 +3598,28 @@ impl crate::Fluree {
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
         // Most rejected documents are plain Turtle with a typo; the locator
-        // rules TriG out from tokens alone.
-        if !fluree_db_transact::has_graph_blocks(trig).map_err(rdf_text_error)? {
+        // rules TriG out from tokens alone, and a TriG document is located
+        // once.
+        let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let parsed = {
+            let parse_span =
+                tracing::debug_span!("txn_parse", txn_type = "insert", rdf_bytes = trig.len());
+            let _guard = parse_span.enter();
+            fluree_db_transact::parse_trig_txn(trig, TxnType::Insert, txn_opts, &mut ns_registry)
+                .map_err(rdf_text_error)?
+        };
+        let Some((txn, _)) = parsed else {
             return Err(turtle_err);
-        }
+        };
         stamp_fast_path(
             TURTLE_INSERT_SITE,
             FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
         );
-        self.stage_rdf_text_tracked(
+        self.stage_built_txn_tracked(
             ledger,
-            TxnType::Insert,
-            trig,
-            txn_opts,
+            txn,
+            ns_registry,
+            &JsonValue::Null,
             index_config,
             tracker,
             policy,

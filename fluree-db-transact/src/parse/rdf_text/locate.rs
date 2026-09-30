@@ -264,10 +264,17 @@ pub fn has_graph_blocks(text: &str) -> Result<bool> {
     if !might_contain_graph_block(text) {
         return Ok(false);
     }
-    Ok(locate(text)?
-        .segments
-        .iter()
-        .any(|s| !matches!(s.kind, SegmentKind::Default)))
+    Ok(locate(text)?.has_blocks())
+}
+
+impl Located<'_> {
+    /// Whether the document holds a graph block (`<#txn-meta>` and
+    /// anonymous `{ … }` blocks included).
+    pub(super) fn has_blocks(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| !matches!(s.kind, SegmentKind::Default))
+    }
 }
 
 #[cfg(test)]

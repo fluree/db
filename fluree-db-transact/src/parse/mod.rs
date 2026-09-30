@@ -51,7 +51,8 @@ pub(crate) const CLAUSE_KEYS: &[&str] = &["where", "delete", "insert", "upsert",
 pub use jsonld::{parse_graph_insert, parse_sync_transaction, parse_transaction};
 pub use nquads::nquads_to_trig;
 pub use rdf_text::{
-    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, Placement, RdfText, RdfTextSummary,
+    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, parse_trig_txn, Placement, RdfText,
+    RdfTextSummary,
 };
 pub use trig_meta::{
     might_contain_graph_block, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject,

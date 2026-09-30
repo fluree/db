@@ -29,7 +29,7 @@ use std::sync::Arc;
 mod locate;
 
 pub use locate::has_graph_blocks;
-use locate::{locate, SegmentKind};
+use locate::{locate, Located, SegmentKind};
 
 /// Where a document's statements land.
 #[derive(Clone, Copy, Debug)]
@@ -74,10 +74,43 @@ pub fn parse_rdf_text_txn(
     txn_type: TxnType,
     placement: Placement<'_>,
     sync: bool,
-    mut opts: TxnOpts,
+    opts: TxnOpts,
     ns: &mut NamespaceRegistry,
 ) -> Result<(Txn, RdfTextSummary)> {
-    let RdfText { parts, statements } = parse_rdf_text(text, placement, ns)?;
+    let parsed = parse_rdf_text(text, placement, ns)?;
+    into_txn(parsed, txn_type, placement, sync, opts)
+}
+
+/// [`parse_rdf_text_txn`] for text the streaming Turtle parser stopped on:
+/// `Ok(None)` when the locator finds no graph block (`<#txn-meta>`
+/// included), so the text is not TriG and the caller's Turtle error stands.
+/// The document is located once.
+pub fn parse_trig_txn(
+    text: &str,
+    txn_type: TxnType,
+    opts: TxnOpts,
+    ns: &mut NamespaceRegistry,
+) -> Result<Option<(Txn, RdfTextSummary)>> {
+    if !might_contain_graph_block(text) {
+        return Ok(None);
+    }
+    let located = locate(text)?;
+    if !located.has_blocks() {
+        return Ok(None);
+    }
+    let parsed = parse_located(&located, Placement::AsWritten, ns)?;
+    into_txn(parsed, txn_type, Placement::AsWritten, false, opts).map(Some)
+}
+
+/// Build the transaction for a parsed document.
+fn into_txn(
+    parsed: RdfText,
+    txn_type: TxnType,
+    placement: Placement<'_>,
+    sync: bool,
+    mut opts: TxnOpts,
+) -> Result<(Txn, RdfTextSummary)> {
+    let RdfText { parts, statements } = parsed;
     let summary = RdfTextSummary {
         content_id: parts.content_id,
         statements,
@@ -118,18 +151,9 @@ pub fn parse_rdf_text(
     placement: Placement<'_>,
     ns: &mut NamespaceRegistry,
 ) -> Result<RdfText> {
-    let mut sink = TemplateSink::new(ns);
-    let target_scope = |sink_target: Option<&str>| match sink_target {
-        Some(iri) => Scope::Named(Arc::from(iri)),
-        None => Scope::Default,
-    };
-    let default_scope = match placement {
-        Placement::AsWritten => Scope::Default,
-        Placement::Into(target) => target_scope(target),
-    };
-
     if !might_contain_graph_block(text) {
-        sink.set_scope(default_scope);
+        let mut sink = TemplateSink::new(ns);
+        sink.set_scope(default_scope(placement));
         fluree_graph_turtle::parse(text, &mut sink)?;
         let statements = sink.statements();
         return Ok(RdfText {
@@ -137,8 +161,26 @@ pub fn parse_rdf_text(
             statements,
         });
     }
-
     let located = locate(text)?;
+    parse_located(&located, placement, ns)
+}
+
+/// The scope a document's default-graph statements land in.
+fn default_scope(placement: Placement<'_>) -> Scope {
+    match placement {
+        Placement::AsWritten | Placement::Into(None) => Scope::Default,
+        Placement::Into(Some(iri)) => Scope::Named(Arc::from(iri)),
+    }
+}
+
+/// Parse a located document segment by segment, in document order.
+fn parse_located(
+    located: &Located<'_>,
+    placement: Placement<'_>,
+    ns: &mut NamespaceRegistry,
+) -> Result<RdfText> {
+    let mut sink = TemplateSink::new(ns);
+    let default_scope = default_scope(placement);
     let mut prefixes: Vec<(String, String)> = Vec::new();
     let mut base: Option<String> = None;
     let mut default_statements = 0usize;
