@@ -2316,7 +2316,7 @@ fn values_cell_as_ref_term(binding: &crate::binding::Binding) -> Option<Term> {
 /// projection. A variable the seed binds keeps its BIND, which is then the
 /// equality check on that position. The `f:reifies*` twin of this rule is
 /// `elide_redundant_chain`.
-fn elide_unread_term_binds(
+pub(crate) fn elide_unread_term_binds(
     patterns: &[Pattern],
     needed_vars: &HashSet<VarId>,
     required_where_vars: Option<&[VarId]>,
