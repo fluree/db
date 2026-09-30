@@ -537,6 +537,30 @@ pub enum Pattern {
     },
 }
 
+/// Columns of a VALUES table that bind their variable on every row: those with
+/// no UNDEF cell. A table with no rows binds every column vacuously.
+pub fn values_bound_in_every_row<'a>(
+    vars: &'a [VarId],
+    rows: &'a [Vec<Binding>],
+) -> impl Iterator<Item = VarId> + 'a {
+    vars.iter()
+        .enumerate()
+        .filter(|(col, _)| {
+            rows.iter()
+                .all(|row| row.get(*col).is_some_and(Binding::is_bound))
+        })
+        .map(|(_, var)| *var)
+}
+
+/// Whether column `col` of a VALUES table is UNDEF on every row. A table with
+/// no rows has no such column: it emits no solution, not one of any value.
+pub fn values_column_all_undef(rows: &[Vec<Binding>], col: usize) -> bool {
+    !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| matches!(row.get(col), Some(Binding::Unbound)))
+}
+
 impl Pattern {
     /// Apply `f` once to every immediate nested pattern list inside this
     /// pattern, reconstructing the surrounding container around the result.

@@ -19,6 +19,8 @@ mod it_issue_1721_repro;
 mod it_issue_1723_sameterm_fold;
 #[path = "it_issue_1738_scan_narrowing.rs"]
 mod it_issue_1738_scan_narrowing;
+#[path = "it_property_join_filters.rs"]
+mod it_property_join_filters;
 #[path = "it_query_ask.rs"]
 mod it_query_ask;
 #[path = "it_query_bi_q4.rs"]
@@ -57,6 +59,8 @@ mod it_query_ti3;
 mod it_query_unwind;
 #[path = "it_query_values.rs"]
 mod it_query_values;
+#[path = "it_values_undef_placement.rs"]
+mod it_values_undef_placement;
 #[path = "it_w3c_result_formats.rs"]
 mod it_w3c_result_formats;
 
