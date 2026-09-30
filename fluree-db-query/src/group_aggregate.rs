@@ -38,7 +38,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::{AggregateFn, InputSemantics};
+use crate::ir::AggregateFn;
 // Note: JoinKey and Materializer would be used for multi-ledger/dataset mode
 // but for now we use GroupKeyOwned for single-ledger simplicity
 use crate::operator::{
@@ -805,32 +805,10 @@ impl GroupAggregateOperator {
         self
     }
 
-    /// Check if all aggregates are streamable (for planner optimization decisions).
-    ///
-    /// `DISTINCT SUM`/`AVG` aren't streamable because the dedup pass must collect
-    /// every value before reducing. `Median`/`Variance`/`Stddev`/`GroupConcat`
-    /// are non-streamable regardless of DISTINCT — they likewise need every
-    /// value in hand. `COUNT(DISTINCT)` is streamable because its state machine
-    /// is a `HashSet` (the dedup IS the streaming state), and `Min`/`Max`/`Sample`
-    /// don't carry a DISTINCT flag at all.
+    /// Check if all aggregates are streamable (for planner optimization
+    /// decisions); see [`AggregateFn::is_streamable`].
     pub fn all_streamable(specs: &[StreamingAggSpec]) -> bool {
-        specs.iter().all(|spec| match &spec.function {
-            AggregateFn::Count(_)
-            | AggregateFn::CountAll
-            | AggregateFn::CountDistinct(_)
-            | AggregateFn::CountDistinctAll(_)
-            | AggregateFn::Min(_)
-            | AggregateFn::Max(_)
-            | AggregateFn::Sample(_) => true,
-            AggregateFn::Sum(_, semantics) | AggregateFn::Avg(_, semantics) => {
-                matches!(semantics, InputSemantics::List)
-            }
-            AggregateFn::Median { .. }
-            | AggregateFn::Variance { .. }
-            | AggregateFn::Stddev { .. }
-            | AggregateFn::GroupConcat { .. }
-            | AggregateFn::Collect(..) => false,
-        })
+        specs.iter().all(|spec| spec.function.is_streamable())
     }
 
     /// Write a row's composite group key into `key`, reusing its allocation.
@@ -1323,6 +1301,7 @@ fn extract_numeric_with_gv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::InputSemantics;
     use fluree_db_core::LedgerSnapshot;
     use std::collections::HashMap;
 

@@ -90,6 +90,35 @@ pub enum AggregateFn {
 }
 
 impl AggregateFn {
+    /// Whether the streaming `GroupAggregateOperator` can compute this
+    /// aggregate, folding one row at a time.
+    ///
+    /// `DISTINCT SUM`/`AVG` aren't streamable because the dedup pass must collect
+    /// every value before reducing. `Median`/`Variance`/`Stddev`/`GroupConcat`
+    /// are non-streamable regardless of DISTINCT — they likewise need every
+    /// value in hand. `COUNT(DISTINCT)` is streamable because its state machine
+    /// is a `HashSet` (the dedup IS the streaming state), and `Min`/`Max`/`Sample`
+    /// don't carry a DISTINCT flag at all.
+    pub fn is_streamable(&self) -> bool {
+        match self {
+            Self::Count(_)
+            | Self::CountAll
+            | Self::CountDistinct(_)
+            | Self::CountDistinctAll(_)
+            | Self::Min(_)
+            | Self::Max(_)
+            | Self::Sample(_) => true,
+            Self::Sum(_, semantics) | Self::Avg(_, semantics) => {
+                matches!(semantics, InputSemantics::List)
+            }
+            Self::Median { .. }
+            | Self::Variance { .. }
+            | Self::Stddev { .. }
+            | Self::GroupConcat { .. }
+            | Self::Collect(..) => false,
+        }
+    }
+
     /// Variable this aggregate reads from each row, if any. Returns `None`
     /// only for [`Self::CountAll`].
     pub fn input_var(&self) -> Option<VarId> {
@@ -439,6 +468,18 @@ impl Grouping {
         self.aggregation()
             .into_iter()
             .flat_map(|agg| agg.aggregates.iter())
+    }
+
+    /// Whether this grouping has aggregates and every one is streamable
+    /// ([`AggregateFn::is_streamable`]). Unless its projection reads a per-group
+    /// list, such a grouping runs on the streaming `GroupAggregateOperator`,
+    /// which outputs only the keys and aggregate outputs. Otherwise it runs on
+    /// the `GroupByOperator` lane, which also carries the level's other WHERE
+    /// columns: as per-group lists under `UngroupedProjection::PerGroupList`,
+    /// so a JSON-LD `select *` returns them.
+    pub fn aggregates_stream(&self) -> bool {
+        let mut aggregates = self.aggregates().peekable();
+        aggregates.peek().is_some() && aggregates.all(|spec| spec.function.is_streamable())
     }
 
     /// The per-group `Extend`s of this grouping phase, in evaluation order

@@ -591,11 +591,12 @@ fn row_compactor(
 ///
 /// Stream rows are SPARQL-results bindings, which have no list type, so a
 /// JSON-LD query that projects a per-group list (a variable the WHERE binds
-/// that its grouping neither keys, aggregates nor binds) is refused here,
-/// explicitly or through `select *`. It used to stream one row per list
-/// element — a cartesian product across list columns. A projected variable
-/// nothing binds is refused as unbound. The plan's output is then set to
-/// refuse per-group lists outright.
+/// that its grouping neither keys, aggregates nor binds) is refused here:
+/// explicitly, or through `select *` when `/query` would return one (the
+/// grouping does not run on the streaming lane). It used to stream one row per
+/// list element — a cartesian product across list columns. A projected
+/// variable nothing binds is refused as unbound. The plan's output is then set
+/// to refuse per-group lists outright.
 fn ensure_streamable(query: &mut fluree_db_query::ir::Query, vars: &VarRegistry) -> Result<()> {
     use fluree_db_query::ir::UngroupedProjection;
     let reject = |what: &str| {
@@ -652,8 +653,11 @@ fn ensure_streamable(query: &mut fluree_db_query::ir::Query, vars: &VarRegistry)
                     };
                 }
             }
-            // `select *` under `groupBy` projects every variable the WHERE
-            // binds, the non-keys as per-group lists.
+            // `select *` under `groupBy` on `/query`: the streaming lane
+            // returns the keys and aggregates only, and streams the same. The
+            // `GroupByOperator` lane also returns every other variable the
+            // WHERE binds, as a per-group list.
+            None if grouping.aggregates_stream() => {}
             None => {
                 let mut lists: Vec<&str> = where_vars
                     .iter()
