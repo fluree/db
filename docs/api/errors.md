@@ -392,6 +392,10 @@ An unexpected error occurred on the server.
 - Unhandled exception
 - Database error
 - Internal logic error
+- A nameservice lookup a query needed failed, for instance while checking
+  whether a `GRAPH <iri>` names a graph source (`err:system/NameServiceError`).
+  The query fails rather than read a possible graph source as an empty graph;
+  the request itself was fine, so retry it.
 
 **Example:**
 ```json

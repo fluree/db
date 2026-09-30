@@ -292,7 +292,7 @@ impl FlureeIndexProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
 
         let Some(record) = gs_record else {
             // Graph source not found - return default embedded mode
@@ -466,7 +466,7 @@ impl VectorIndexProvider for FlureeIndexProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
 
         Ok(record.is_some() && record.map(|r| !r.retracted).unwrap_or(false))
     }
@@ -480,7 +480,7 @@ impl VectorIndexProvider for FlureeIndexProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
         else {
             return Ok(None);
         };
@@ -527,7 +527,7 @@ impl FlureeIndexProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
 
         let record = record.ok_or_else(|| {
             QueryError::InvalidQuery(format!("Graph source not found: {graph_source_id}"))
@@ -565,7 +565,7 @@ impl FlureeIndexProvider<'_> {
                         .nameservice()
                         .lookup_graph_source(graph_source_id)
                         .await
-                        .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+                        .map_err(|e| QueryError::Nameservice(e.to_string()))?
                         .ok_or_else(|| {
                             QueryError::Internal(format!(
                                 "Graph source disappeared after sync: {graph_source_id}"

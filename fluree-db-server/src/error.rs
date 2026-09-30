@@ -184,6 +184,12 @@ impl ServerError {
             ServerError::Api(ApiError::Query(
                 fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. },
             )) => errors::R2RML_UNSUPPORTED_PATTERN,
+            // A nameservice lookup the query needed failed: the backend's
+            // fault, typed as `ApiError::NameService` is. MUST precede the
+            // generic `ApiError::Query(_)` arm below.
+            ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Nameservice(_))) => {
+                errors::NAMESERVICE
+            }
 
             ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
@@ -355,6 +361,13 @@ impl ServerError {
                     | fluree_db_query::QueryError::CatalogAccessDenied { .. },
                 ),
             ) => StatusCode::FORBIDDEN,
+
+            // 500 - a nameservice lookup the query needed failed (the
+            // backend's fault, as `ApiError::NameService` is). MUST precede
+            // the generic `ApiError::Query(_)` arm below.
+            ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Nameservice(_))) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
 
             // 400 - Bad Request (client errors)
             ServerError::Api(ApiError::Parse(_)) => StatusCode::BAD_REQUEST,
@@ -718,6 +731,18 @@ mod tests {
             assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
             assert_eq!(se.error_type(), errors::STORAGE_ACCESS_DENIED);
         }
+    }
+
+    /// A nameservice lookup that fails inside a query (a graph-source probe)
+    /// is the backend's fault: typed and answered as the nameservice failure
+    /// it is, a 500, not the generic query 400.
+    #[test]
+    fn a_failed_nameservice_lookup_in_a_query_is_a_500() {
+        let se = ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Nameservice(
+            "storage unavailable".into(),
+        )));
+        assert_eq!(se.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(se.error_type(), errors::NAMESERVICE);
     }
 
     #[test]

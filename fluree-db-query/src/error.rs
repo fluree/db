@@ -190,6 +190,12 @@ pub enum QueryError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// A nameservice lookup the query depends on failed: a backend fault, not
+    /// the caller's, so it is reported as a server error the client may retry
+    /// (never as a 400).
+    #[error("Nameservice error: {0}")]
+    Nameservice(String),
+
     /// Policy evaluation error
     #[error("Policy error: {0}")]
     Policy(String),

@@ -669,6 +669,10 @@ impl ApiError {
             // A malformed ledger config graph is the operator's to fix, and no
             // change to the request can clear it.
             ApiError::LedgerConfig(_) => 500,
+            // A nameservice lookup the query needed failed (a graph-source
+            // probe or lookup): a backend fault, as `ApiError::NameService` is.
+            // MUST precede the generic `ApiError::Query(_) => 400` below.
+            ApiError::Query(fluree_db_query::QueryError::Nameservice(_)) => 500,
             // Most errors are client errors (bad input)
             ApiError::Parse(_)
             | ApiError::Query(_)
@@ -809,6 +813,16 @@ mod tests {
         assert_eq!(
             ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
             400
+        );
+    }
+
+    /// A nameservice lookup that fails while a query runs is the backend's
+    /// fault: a 500 like `ApiError::NameService`, never the generic 400.
+    #[test]
+    fn a_failed_nameservice_lookup_in_a_query_is_500() {
+        assert_eq!(
+            ApiError::Query(fluree_db_query::QueryError::Nameservice("down".into())).status_code(),
+            500
         );
     }
 
