@@ -3496,6 +3496,188 @@ async fn test_jsonld_update_from_an_unknown_graph_reads_an_empty_default_graph()
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
+/// The `ex:v` values in one graph of `ledger_id`, sorted: its default graph,
+/// or the named graph registered under exactly `graph`. The dataset `from`
+/// selects a named graph by registry lookup, so it reaches a graph registered
+/// under the ledger's own id, which a query's `GRAPH <iri>` does not.
+async fn ex_v_values(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    graph: Option<&str>,
+) -> Vec<String> {
+    let from = match graph {
+        Some(graph) => json!({"@id": ledger_id, "graph": graph}),
+        None => json!(ledger_id),
+    };
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": from,
+        "select": ["?o"],
+        "where": [{"@id": "?s", "ex:v": "?o"}]
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("query {from}: {e}"));
+    let mut values: Vec<String> = rows
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_array().and_then(|r| r.first()).or(Some(row)))
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    values.sort();
+    values
+}
+
+/// A graph registered under the ledger's own address (a TriG block names it,
+/// the way `sparql_single_db_graph_alias_wins_over_colliding_named_graph`
+/// builds its colliding graph) is an ordinary named graph to every position
+/// except the update's default-graph ones:
+/// - `GRAPH ?g` and `GRAPH <address>`, in the WHERE and in the templates,
+///   read and delete that graph and leave the default graph alone, as before
+///   `WITH`/`graph` mapped the address;
+/// - `WITH <address>` and JSON-LD top-level `graph` read and delete the
+///   default graph, and leave that graph alone.
+///
+/// Both spellings of the address. Each case runs on its own ledger, and the
+/// fixture is checked first so a case cannot pass on a missing graph.
+#[tokio::test]
+async fn test_updates_on_a_graph_registered_under_the_ledger_address() {
+    enum Update {
+        Sparql(String),
+        JsonLd(serde_json::Value),
+    }
+    /// `ADDR` in `update` stands for the address; `default_after` and
+    /// `address_after` are the default-graph and address-graph `ex:v` values
+    /// the update must leave.
+    struct Case {
+        name: &'static str,
+        spelling: &'static str,
+        update: Update,
+        default_after: &'static [&'static str],
+        address_after: &'static [&'static str],
+    }
+    const DEFAULT_VALUES: &[&str] = &["default only", "same"];
+    const ADDRESS_VALUES: &[&str] = &["legacy only", "same"];
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ex = "PREFIX ex: <http://example.org/> ";
+    let v = json!({"@id": "?s", "ex:v": "?o"});
+    let mut cases = Vec::new();
+    for spelling in ["", "urn:fluree:"] {
+        cases.push(Case {
+            name: "DELETE { GRAPH ?g {..} } WHERE { GRAPH ?g {..} }",
+            spelling,
+            update: Update::Sparql(format!(
+                "{ex}DELETE {{ GRAPH ?g {{ ?s ex:v ?o }} }} WHERE {{ GRAPH ?g {{ ?s ex:v ?o }} }}"
+            )),
+            default_after: DEFAULT_VALUES,
+            address_after: &[],
+        });
+        cases.push(Case {
+            name: "DELETE { GRAPH <ADDR> {..} } WHERE { GRAPH <ADDR> {..} }",
+            spelling,
+            update: Update::Sparql(format!(
+                "{ex}DELETE {{ GRAPH <ADDR> {{ ?s ex:v ?o }} }} \
+                 WHERE {{ GRAPH <ADDR> {{ ?s ex:v ?o }} }}"
+            )),
+            default_after: DEFAULT_VALUES,
+            address_after: &[],
+        });
+        cases.push(Case {
+            name: "WITH <ADDR> DELETE {..} WHERE {..}",
+            spelling,
+            update: Update::Sparql(format!(
+                "{ex}WITH <ADDR> DELETE {{ ?s ex:v ?o }} WHERE {{ ?s ex:v ?o }}"
+            )),
+            default_after: &[],
+            address_after: ADDRESS_VALUES,
+        });
+    }
+    cases.push(Case {
+        name: "JSON-LD [\"graph\", ADDR, ..] in where and delete",
+        spelling: "urn:fluree:",
+        update: Update::JsonLd(json!({
+            "where": [["graph", "ADDR", v]],
+            "delete": [["graph", "ADDR", v]]
+        })),
+        default_after: DEFAULT_VALUES,
+        address_after: &[],
+    });
+    cases.push(Case {
+        name: "JSON-LD top-level graph ADDR",
+        spelling: "urn:fluree:",
+        update: Update::JsonLd(json!({"graph": "ADDR", "where": v, "delete": v})),
+        default_after: &[],
+        address_after: ADDRESS_VALUES,
+    });
+
+    let mut failures = Vec::new();
+    for (i, case) in cases.into_iter().enumerate() {
+        let ledger_id = format!("legacy-address-{i}:main");
+        let address = format!("{}{ledger_id}", case.spelling);
+        let name = format!("{} [{address}]", case.name);
+        let fixture = format!(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:v \"same\" .\n\
+             ex:b ex:v \"default only\" .\n\
+             GRAPH <{address}> {{ ex:a ex:v \"same\" . ex:c ex:v \"legacy only\" . }}\n"
+        );
+        let ledger = fluree
+            .stage_owned(genesis_ledger(&fluree, &ledger_id))
+            .upsert_turtle(&fixture)
+            .execute()
+            .await
+            .expect("fixture upsert")
+            .ledger;
+        let before = (
+            ex_v_values(&fluree, &ledger_id, None).await,
+            ex_v_values(&fluree, &ledger_id, Some(&address)).await,
+        );
+        if before != (strings(DEFAULT_VALUES), strings(ADDRESS_VALUES)) {
+            failures.push(format!("{name}: fixture is {before:?}"));
+            continue;
+        }
+        let result = match case.update {
+            Update::Sparql(sparql) => {
+                run_sparql_update_result(&fluree, ledger, &sparql.replace("ADDR", &address))
+                    .await
+                    .map(|_| ())
+            }
+            Update::JsonLd(update) => {
+                let mut update: serde_json::Value =
+                    serde_json::from_str(&update.to_string().replace("ADDR", &address))
+                        .expect("update json");
+                update["@context"] = json!({"ex": "http://example.org/"});
+                fluree.update(ledger, &update).await.map(|_| ())
+            }
+        };
+        if let Err(e) = result {
+            failures.push(format!("{name}: update failed: {e}"));
+            continue;
+        }
+        let after = (
+            ex_v_values(&fluree, &ledger_id, None).await,
+            ex_v_values(&fluree, &ledger_id, Some(&address)).await,
+        );
+        let expected = (strings(case.default_after), strings(case.address_after));
+        if after != expected {
+            failures.push(format!(
+                "{name}: (default graph, address graph) = {after:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|v| (*v).to_string()).collect()
+}
+
 /// Builder↔SPARQL parity for the two transfer verbs the builder previously
 /// lacked: `Txn::move_graph` ≡ `MOVE <from> TO <to>` (source retracted) and
 /// `Txn::add_graph` ≡ `ADD <from> TO <to>` (destination contents kept).
