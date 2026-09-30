@@ -34,6 +34,7 @@
 pub mod address;
 pub mod commit;
 pub mod commit_flakes;
+pub mod current_facts;
 pub mod datatype_limit;
 pub mod error;
 pub mod flake_sink;
@@ -62,6 +63,7 @@ pub use commit::{
     build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
+pub use current_facts::{CurrentFacts, Origin, Retraction, Slot, StoredFact};
 pub use error::{Result, TransactError};
 pub use flake_sink::FlakeSink;
 pub use generate::{apply_cancellation, FlakeGenerator};
