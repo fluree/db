@@ -130,9 +130,16 @@ impl OTypeRegistry {
         let idx = dt.as_u16() as usize;
         if idx < self.dt_otypes.len() {
             self.dt_otypes[idx]
-        } else {
-            // dt value beyond what we know — treat as customer datatype.
+        } else if dt.as_u16() <= OType::MAX_PAYLOAD {
+            // treat dt as customer datatype because its value is beyond what we
+            // know
             OType::customer_datatype(dt.as_u16())
+        } else {
+            // return `OType::RESERVED` because dt is past the payload width.
+            // No valid index holds such a dt, so it comes from a damaged or
+            // future-format row. `OType::RESERVED` decodes as an unknown
+            // value.
+            OType::RESERVED
         }
     }
 }
@@ -477,6 +484,25 @@ mod tests {
         let ot = reg.resolve(ObjKind::NUM_INT, DatatypeDictId::from_u16(100), 0);
         assert!(ot.is_customer_datatype());
         assert_eq!(ot.payload(), 100);
+    }
+
+    #[test]
+    fn dt_past_payload_width_resolves_to_reserved() {
+        let reg = OTypeRegistry::builtin_only();
+        let at_max = reg.resolve(
+            ObjKind::LEX_ID,
+            DatatypeDictId::from_u16(OType::MAX_PAYLOAD),
+            0,
+        );
+        assert!(at_max.is_customer_datatype());
+        assert_eq!(at_max.payload(), OType::MAX_PAYLOAD);
+
+        for dt in [OType::MAX_PAYLOAD + 1, u16::MAX] {
+            for kind in [ObjKind::LEX_ID, ObjKind::NUM_INT, ObjKind::NUM_F64] {
+                let ot = reg.resolve(kind, DatatypeDictId::from_u16(dt), 0);
+                assert_eq!(ot, OType::RESERVED, "dt {dt} with {kind:?}");
+            }
+        }
     }
 
     #[test]

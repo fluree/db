@@ -34,6 +34,7 @@
 pub mod address;
 pub mod commit;
 pub mod commit_flakes;
+pub mod datatype_limit;
 pub mod error;
 pub mod flake_sink;
 pub mod generate;

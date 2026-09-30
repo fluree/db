@@ -125,7 +125,9 @@ At a high level the root contains:
 
 - **Inline small dictionaries** (embedded in the binary root):
   - `graph_iris[]` (dict_index → graph IRI; `g_id = dict_index + 1`)
-  - `datatype_iris[]` (dt_id → datatype IRI)
+  - `datatype_iris[]` (dt_id → datatype IRI). Positions 0–14 hold the reserved datatypes
+    (`DatatypeDictId::RESERVED_IRIS`). A custom datatype's `o_type` carries its `dt_id` as a
+    14-bit payload, so `dt_id` is at most 16,383. Writes that would need a larger one are refused.
   - `language_tags[]` (lang_id-1 → tag string; `lang_id = index + 1`, 0 = "no tag")
 - **Dictionary ContentIds** (CAS artifacts):
   - tree blobs: subject/string reverse (`DTB1` branch + `DLR1` leaves)
