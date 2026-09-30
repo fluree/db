@@ -847,7 +847,7 @@ fn parse_select_string(
         // `(as (- (max ?u) (min ?u)) ?spread)`). Each one is hoisted into
         // `aggregates` with a synthetic output var and the call is rewritten
         // to reference that var; the surrounding expression then lowers as a
-        // post-aggregation bind via `lower_select_expr_bind`.
+        // post-aggregation bind (`lower::lower_select_computations`).
         let mut inner_tok = list[1].clone();
         hoist_inline_aggregates(&mut inner_tok, aggregates)?;
         let expr = filter_sexpr::expr_from_sexpr_token(&inner_tok)?;

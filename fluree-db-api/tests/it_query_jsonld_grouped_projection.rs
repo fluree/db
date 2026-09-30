@@ -141,6 +141,187 @@ async fn jsonld_per_group_list_is_refused_by_sparql_results_formats() {
     assert!(rows.iter().all(|r| r[1].is_array()), "{rows:?}");
 }
 
+/// J3: a select expression that reads only `groupBy` keys, aggregate outputs
+/// or earlier per-group aliases — or nothing — is evaluated once per group,
+/// as in SPARQL. It used to be a per-group list of the same value repeated
+/// (`["network", "network", "network"]`).
+#[tokio::test]
+async fn jsonld_key_only_select_expression_is_one_value_per_group() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/j3-scalar:main").await;
+
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({
+            "select": [
+                "(as (if (= ?a \"Net\") \"network\" \"other\") ?seg)",
+                "(as (count ?e) ?n)"
+            ],
+            "groupBy": ["?a"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        normalize_rows(&found),
+        normalize_rows(&json!([["network", 3], ["other", 2], ["other", 1]]))
+    );
+
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({"select": ["(as (strlen ?a) ?len)", "(as (count ?e) ?n)"], "groupBy": ["?a"]}),
+    )
+    .await;
+    assert_eq!(
+        normalize_rows(&found),
+        normalize_rows(&json!([[3, 3], [5, 2], [6, 1]]))
+    );
+
+    // A constant under implicit grouping — including over no solutions, where
+    // the one implicit group still has a row.
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({"select": ["(as (str \"x\") ?c)", "(as (count ?e) ?n)"]}),
+    )
+    .await;
+    assert_eq!(found, json!([["x", 6]]));
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["(as (str \"x\") ?c)", "(as (count ?e) ?n)"],
+        "where": {"@id": "?e", "ex:nope": "?a"}
+    });
+    let found = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(found, json!([["x", 0]]));
+}
+
+/// What J3 leaves alone: an expression over a non-key variable keeps the
+/// documented per-group list (so does a chain over it), and so does an alias an
+/// aggregate reads; an alias that is itself a `groupBy` key is one value per
+/// group.
+#[tokio::test]
+async fn jsonld_non_key_select_expression_stays_a_per_group_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/j3-lists:main").await;
+    let net = |found: &JsonValue| -> JsonValue {
+        found
+            .as_array()
+            .expect("rows")
+            .iter()
+            .find(|r| r[0] == "Net")
+            .cloned()
+            .unwrap_or_else(|| panic!("a Net row: {found}"))
+    };
+
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({
+            "select": ["?a", "(as (str ?e) ?es)", "(as (strlen ?es) ?len)"],
+            "groupBy": ["?a"]
+        }),
+    )
+    .await;
+    let row = net(&found);
+    let mut es: Vec<&str> = row[1]
+        .as_array()
+        .unwrap_or_else(|| panic!("?es is a list: {found}"))
+        .iter()
+        .map(|v| v.as_str().expect("string"))
+        .collect();
+    es.sort_unstable();
+    assert_eq!(
+        es,
+        vec![
+            "http://example.org/e1",
+            "http://example.org/e2",
+            "http://example.org/e3"
+        ]
+    );
+    assert_eq!(row[2], json!([21, 21, 21]), "{found}");
+
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({"select": ["?a", "(as (str ?a) ?s)", "(as (count ?s) ?c)"], "groupBy": ["?a"]}),
+    )
+    .await;
+    assert_eq!(net(&found), json!(["Net", ["Net", "Net", "Net"], 3]));
+
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({"select": ["(as (str ?a) ?k)", "(as (count ?e) ?n)"], "groupBy": ["?k"]}),
+    )
+    .await;
+    assert_eq!(
+        normalize_rows(&found),
+        normalize_rows(&json!([["Net", 3], ["Local", 2], ["Remote", 1]]))
+    );
+}
+
+/// A select expression evaluated per group cannot take the name of a variable
+/// the WHERE binds: it would silently replace that variable's value after
+/// grouping (here, the `groupBy` key itself). SPARQL rejects the same alias.
+#[tokio::test]
+async fn jsonld_select_alias_cannot_shadow_a_where_variable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/alias-shadow:main").await;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["(as (count ?e) ?n)", "(as (str ?n) ?a)"],
+        "where": {"@id": "?e", "ex:area": "?a"},
+        "groupBy": ["?a"]
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect_err("a per-group alias onto a WHERE variable");
+    assert!(
+        err.to_string()
+            .contains("select alias ?a is already bound by the where clause"),
+        "{err}"
+    );
+}
+
+/// A bare aggregate column keeps its implicit name (`(count ?e)` → `?count`),
+/// which downstream code reads by name.
+#[tokio::test]
+async fn jsonld_bare_aggregate_keeps_its_implicit_name() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/count-name:main").await;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "(count ?e)"],
+        "where": {"@id": "?e", "ex:area": "?a"},
+        "groupBy": ["?a"]
+    });
+    let typed = support::query_jsonld_format(
+        &fluree,
+        &ledger,
+        &query,
+        &fluree_db_api::FormatterConfig::typed_json(),
+    )
+    .await
+    .expect("typed json");
+    let rows = typed.as_array().expect("rows");
+    assert_eq!(rows.len(), 3, "{typed}");
+    for row in rows {
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap_or_else(|| panic!("typed-json row object: {typed}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["?a", "?count"], "{typed}");
+    }
+}
+
 /// A subquery cannot return a per-group list: its projection is plain
 /// variables, so projecting a variable its grouping does not produce is a plan
 /// error. The list used to cross into the enclosing query — rendered as lists
