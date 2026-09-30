@@ -4202,3 +4202,249 @@ async fn a_named_only_dataset_advises_when_the_query_reads_its_empty_default_gra
     }
     assert!(QueryAdvisory::EmptyDefaultGraph.message().contains("FROM"));
 }
+
+/// On a branch, the main branch's config URN (which the branch inherited)
+/// reads what main wrote under it, the branch's own URN and the `config`
+/// keyword read the branch's config graph, and a user graph named
+/// `urn:fluree:…#…` is a graph, never an address. On the branch's own view
+/// (SPARQL `FROM`, and `FROM NAMED` + `GRAPH`) and through `query_from()` (the
+/// JSON-LD `from` object form).
+#[tokio::test]
+async fn a_branch_reads_config_by_the_main_urn_and_urn_named_graphs_stay_graphs() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("so1").await.unwrap();
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/ns/> .
+               ex:a ex:setting "in-default" .
+               GRAPH <urn:fluree:so1:main#config> { ex:cfg ex:setting "in-config" . }
+               GRAPH <urn:fluree:so1:main#resolution-config> { ex:r ex:setting "in-user-graph" . }"#,
+        )
+        .execute()
+        .await
+        .expect("seed");
+    fluree
+        .create_branch("so1", "feature", None, None)
+        .await
+        .unwrap();
+    let branch = fluree.ledger("so1:feature").await.unwrap();
+    let branch = fluree
+        .stage_owned(branch)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/ns/> .
+               GRAPH <urn:fluree:so1:feature#config> { ex:bcfg ex:setting "in-branch-config" . }"#,
+        )
+        .execute()
+        .await
+        .expect("the branch's own config")
+        .ledger;
+
+    for (graph, want) in [
+        ("urn:fluree:so1:main#config", "in-config"),
+        ("urn:fluree:so1:feature#config", "in-branch-config"),
+        ("config", "in-branch-config"),
+        ("urn:fluree:so1:main#resolution-config", "in-user-graph"),
+    ] {
+        let sparql =
+            format!("SELECT ?v FROM <{graph}> WHERE {{ ?s <http://example.org/ns/setting> ?v }}");
+        let rows = view_names(&fluree, &branch, &sparql).await;
+        assert!(
+            rows.contains(&json!([want])) && !rows.contains(&json!(["in-default"])),
+            "the branch's view, FROM <{graph}>: {rows:?}"
+        );
+        let query = json!({
+            "from": {"@id": "so1:feature", "graph": graph},
+            "select": "?v",
+            "where": {"@id": "?s", "http://example.org/ns/setting": "?v"}
+        });
+        let result = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("query_from(), graph {graph}: {e}"));
+        let values = result.as_array().cloned().unwrap_or_default();
+        assert!(
+            values.contains(&json!(want)) && !values.contains(&json!("in-default")),
+            "query_from(), graph {graph}: {result}"
+        );
+    }
+    for (graph, want) in [
+        ("urn:fluree:so1:main#config", "in-config"),
+        ("urn:fluree:so1:main#resolution-config", "in-user-graph"),
+    ] {
+        let sparql = format!(
+            "SELECT ?v FROM NAMED <{graph}> \
+             WHERE {{ GRAPH <{graph}> {{ ?s <http://example.org/ns/setting> ?v }} }}"
+        );
+        let rows = view_names(&fluree, &branch, &sparql).await;
+        assert!(
+            rows.contains(&json!([want])),
+            "the branch's view, FROM NAMED <{graph}>: {rows:?}"
+        );
+    }
+}
+
+/// The JSON-LD dataset shapes solo sends through `query_from()` still answer: a
+/// pinned object reading `txn-meta` by `t` and by `at`, an object naming a
+/// user graph, the bare and the branch-qualified ledger, and a history range.
+#[tokio::test]
+async fn solo_jsonld_dataset_shapes_still_answer() {
+    async fn run(fluree: &MemoryFluree, query: JsonValue) -> Vec<JsonValue> {
+        let result = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let mut rows = result
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("{query}: {result}"));
+        rows.sort_by_key(ToString::to_string);
+        rows
+    }
+    fn ts(rows: &[JsonValue]) -> Vec<i64> {
+        rows.iter()
+            .map(|v| v.as_i64().or_else(|| v["@value"].as_i64()).unwrap())
+            .collect()
+    }
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("so7").await.unwrap();
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/ns/> .
+               ex:a ex:name "A" .
+               GRAPH <http://example.org/ns/g> { ex:g ex:name "G" . }"#,
+        )
+        .execute()
+        .await
+        .expect("t=1")
+        .ledger;
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(r#"@prefix ex: <http://example.org/ns/> . ex:b ex:name "B" ."#)
+        .execute()
+        .await
+        .expect("t=2");
+
+    let names = |from: JsonValue| {
+        json!({"from": from, "select": "?n",
+               "where": {"@id": "?s", "http://example.org/ns/name": "?n"}})
+    };
+    let commits = |from: JsonValue| {
+        json!({"from": from, "select": "?t",
+               "where": {"@id": "?c", "https://ns.flur.ee/db#t": "?t"}})
+    };
+
+    let at_1 = json!({"@id": "so7:main", "t": 1, "graph": "txn-meta"});
+    assert_eq!(ts(&run(&fluree, commits(at_1)).await), [1]);
+    let at_time = json!({"@id": "so7:main", "at": "2999-01-01T00:00:00Z", "graph": "txn-meta"});
+    assert_eq!(ts(&run(&fluree, commits(at_time)).await), [1, 2]);
+    let user_graph = json!({"@id": "so7:main", "graph": "http://example.org/ns/g"});
+    assert_eq!(run(&fluree, names(user_graph)).await, [json!("G")]);
+    for ledger in ["so7", "so7:main"] {
+        assert_eq!(
+            run(&fluree, names(json!(ledger))).await,
+            [json!("A"), json!("B")],
+            "from {ledger}"
+        );
+    }
+    let history = json!({
+        "from": "so7:main@t:1", "to": "so7:main@t:latest", "select": "?n",
+        "where": [{"@id": "?s", "http://example.org/ns/name": {"@value": "?n", "@t": "?t"}}]
+    });
+    assert_eq!(run(&fluree, history).await, [json!("A"), json!("B")]);
+}
+
+/// The embedder surface this change keeps source-compatible, named the way an
+/// embedder names it: struct literals, field names, paths and entry points. It
+/// only has to compile; a change to any of them fails the build here first.
+#[test]
+fn the_embedder_surface_on_the_hard_keep_list_still_compiles() {
+    use fluree_db_api::dataset::GovernanceOptions;
+    use fluree_db_api::query::multi::{MultiQueryRequest, MultiQuerySubquery, SubqueryLanguage};
+    use fluree_db_api::{AgentJsonContext, Fluree, OwnedStreamQuery};
+    use fluree_db_core::LedgerIdTimeSpec;
+
+    // Multi-query envelopes are built as struct literals.
+    let mut queries = indexmap::IndexMap::new();
+    queries.insert(
+        "q".to_string(),
+        MultiQuerySubquery {
+            language: SubqueryLanguage::Sparql,
+            query: json!("SELECT * WHERE { ?s ?p ?o }"),
+            opts: None,
+        },
+    );
+    let _ = MultiQueryRequest {
+        context: None,
+        as_of: None,
+        opts: None,
+        queries,
+    };
+
+    // The agent-JSON context's fields.
+    let _ = AgentJsonContext {
+        sparql_text: None,
+        from_count: 1,
+        iso_timestamp: None,
+        resume_limit: 100,
+    };
+
+    // Paths, including the stats graph selector (a different type from
+    // `dataset::GraphSelector`).
+    let _: Option<GovernanceOptions> = None;
+    fluree_db_core::validate_branch_name("main").unwrap();
+    let _ = fluree_db_api::ledger_info::GraphSelector::ByIri("http://ex.org/g".to_string());
+
+    // The streaming entry points.
+    let _ = Fluree::build_stream_dataset;
+    let _ = Fluree::build_stream_dataset_for_sparql;
+    let _ = Fluree::plan_stream_query_dataset;
+    let _ = Fluree::run_stream_query_dataset;
+    let _ = Fluree::run_stream_query;
+    let _: Option<OwnedStreamQuery> = None;
+
+    // The SPARQL dataset clause, the time-travel split and the TimeSpec
+    // conversion.
+    let ast = fluree_db_sparql::parse_sparql(
+        "SELECT * FROM <mydb:main@t:1> FROM NAMED <http://ex.org/g> WHERE { ?s ?p ?o }",
+    )
+    .ast
+    .expect("parses");
+    let fluree_db_sparql::ResolvedDatasetClause {
+        default_graphs,
+        named_graphs,
+        to_graph,
+    } = fluree_db_sparql::resolve_dataset_clause(&ast)
+        .unwrap()
+        .expect("a dataset clause");
+    assert_eq!(
+        (default_graphs.len(), named_graphs.len(), to_graph),
+        (1, 1, None)
+    );
+    let (base, spec) = fluree_db_core::split_time_travel_suffix("mydb:main@t:1").unwrap();
+    assert_eq!(base, "mydb:main");
+    assert_eq!(TimeSpec::from(spec.unwrap()), TimeSpec::AtT(1));
+    assert_eq!(TimeSpec::from(LedgerIdTimeSpec::AtT(2)), TimeSpec::AtT(2));
+
+    // The dataset parsers an authorizer reads.
+    let (spec, _): (DatasetSpec, GovernanceOptions) =
+        DatasetSpec::from_query_json(&json!({"from": "mydb:main@t:1"})).unwrap();
+    let GraphSource {
+        identifier,
+        policy_override,
+        ..
+    } = &spec.default_graphs[0];
+    assert_eq!(
+        (identifier.as_str(), policy_override.is_none()),
+        ("mydb:main", true)
+    );
+    let ids: Vec<String> =
+        fluree_db_api::sparql_dataset_ledger_ids("SELECT * FROM <mydb:main> WHERE { ?s ?p ?o }")
+            .unwrap();
+    assert_eq!(ids, ["mydb:main"]);
+}
