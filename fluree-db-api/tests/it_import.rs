@@ -3805,3 +3805,72 @@ GRAPH <#txn-meta> {
         "envelope-supplied commit metadata must survive the load-side drop; got {rows}"
     );
 }
+
+/// Bulk JSON-LD import cannot write graph-scoped statements yet: a node's
+/// graph selector, or a JSON-LD named graph's content, refuses the import
+/// instead of folding the statements into the default graph (the selector
+/// used to be dropped) or dropping them (named-graph content was). The same
+/// data as TriG imports into its graph.
+#[tokio::test]
+async fn import_jsonld_graph_scoping_is_refused_not_folded() {
+    for (i, doc) in [
+        r#"{"@context": {"ex": "http://example.org/ns/"},
+            "@graph": [{"@id": "ex:a", "@graph": "ex:g", "ex:p": 1}]}"#,
+        r#"{"@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:g", "@graph": [{"@id": "ex:a", "ex:p": 1}]}"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let db_dir = tempfile::tempdir().expect("db tmpdir");
+        let data_dir = tempfile::tempdir().expect("data tmpdir");
+        let file_path = data_dir.path().join("scoped.jsonld");
+        std::fs::write(&file_path, doc).unwrap();
+        let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("build file-backed Fluree");
+        let err = fluree
+            .create(&format!("test/import-jsonld-scoped-{i}:main"))
+            .import(&file_path)
+            .cleanup(false)
+            .execute()
+            .await
+            .expect_err("graph-scoped JSON-LD is refused by bulk import");
+        assert!(
+            err.to_string()
+                .contains("graph scoping is not supported by bulk import"),
+            "{err}"
+        );
+    }
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig_path = data_dir.path().join("scoped.trig");
+    std::fs::write(
+        &trig_path,
+        "GRAPH <http://example.org/ns/g> { <http://example.org/ns/a> <http://example.org/ns/p> 1 . }\n",
+    )
+    .unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create("test/import-trig-scoped:main")
+        .import(&trig_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("the TriG spelling imports");
+    let ledger = fluree
+        .ledger("test/import-trig-scoped:main")
+        .await
+        .expect("load");
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "SELECT ?o WHERE { GRAPH <http://example.org/ns/g> { ?s <http://example.org/ns/p> ?o } }",
+    )
+    .await
+    .expect("query");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+}
