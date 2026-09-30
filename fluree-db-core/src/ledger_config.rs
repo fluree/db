@@ -238,6 +238,87 @@ pub struct TransactDefaults {
 }
 
 // ============================================================================
+// Empty setting groups
+// ============================================================================
+//
+// A group node that sets nothing (no field, and the default override
+// control) reads the same as no group at all: every consumer treats an unset
+// field as the system default. The config reader normalizes such a group to
+// absent, which keeps the choice among several group pointers deterministic
+// (an empty group never wins over a populated one).
+
+impl PolicyDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.default_allow.is_none()
+            && self.policy_source.is_none()
+            && self.policy_class.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl ShaclDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.shapes_source.is_none()
+            && self.validation_mode.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl ReasoningDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.modes.is_none()
+            && self.schema_source.is_none()
+            && self.follow_owl_imports.is_none()
+            && self.ontology_import_map.is_empty()
+            && self.max_facts.is_none()
+            && self.max_seconds.is_none()
+            && self.max_memory_mb.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl DatalogDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.rules_source.is_none()
+            && self.allow_query_time_rules.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl ServingDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.serve_query.is_none()
+            && self.serve_blocks.is_none()
+            && self.public_visibility.is_none()
+    }
+}
+
+impl FullTextDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.default_language.is_none()
+            && self.properties.is_empty()
+            && self.override_control.is_default()
+    }
+}
+
+impl TransactDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.unique_enabled.is_none()
+            && self.constraints_sources.is_empty()
+            && self.override_control.is_default()
+    }
+}
+
+// ============================================================================
 // Per-graph overrides
 // ============================================================================
 
@@ -289,6 +370,11 @@ pub enum OverrideControl {
 }
 
 impl OverrideControl {
+    /// The control an absent `f:overrideControl` means (`AllowAll`).
+    pub fn is_default(&self) -> bool {
+        matches!(self, OverrideControl::AllowAll)
+    }
+
     /// Permissiveness level for ordering comparisons.
     /// `None` (0) < `IdentityRestricted` (1) < `AllowAll` (2).
     fn permissiveness(&self) -> u8 {

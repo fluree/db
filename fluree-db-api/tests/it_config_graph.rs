@@ -16,6 +16,181 @@ fn config_graph_iri(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}#config")
 }
 
+/// Commit a JSON-LD insert without the API's post-staging checks (SHACL,
+/// uniqueness, the config guard): the way history written before those
+/// checks existed reaches a ledger. Seeds degenerate config state.
+async fn commit_unchecked(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    doc: &serde_json::Value,
+) -> fluree_db_api::LedgerState {
+    let ledger_id = ledger.snapshot.ledger_id.to_string();
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::parse_transaction(
+        doc,
+        fluree_db_transact::TxnType::Insert,
+        fluree_db_transact::TxnOpts::default(),
+        &mut ns,
+        &ledger_id,
+    )
+    .expect("parse");
+    let (view, ns) =
+        fluree_db_transact::stage(ledger, txn, ns, fluree_db_transact::StageOptions::new())
+            .await
+            .expect("stage");
+    fluree
+        .commit_staged(
+            view,
+            ns,
+            &fluree.default_index_config(),
+            fluree_db_api::CommitOpts::default(),
+        )
+        .await
+        .expect("commit")
+        .1
+}
+
+/// The codes of a ledger's `configDiagnostics` (ledger info), sorted.
+async fn config_diagnostic_codes(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Vec<String> {
+    let info = fluree
+        .ledger_info(ledger_id)
+        .execute()
+        .await
+        .expect("ledger info");
+    let mut codes: Vec<String> = info
+        .get("configDiagnostics")
+        .and_then(serde_json::Value::as_array)
+        .map(|d| {
+            d.iter()
+                .filter_map(|d| d["code"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    codes.sort();
+    codes
+}
+
+/// A config with two `f:shaclDefaults` values: the group whose IRI sorts first
+/// is empty in `#config` (its field was written to the default graph, the
+/// #1979 shape), the other is the corrected group. Written without the config
+/// guard, as a config re-inserted before the guard existed would be.
+async fn seed_double_shacl_pointer(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+) -> fluree_db_api::LedgerState {
+    commit_unchecked(
+        fluree,
+        ledger,
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {
+                    "@id": "urn:it:cfg:ledger",
+                    "@type": "f:LedgerConfig",
+                    "@graph": "config",
+                    "f:shaclDefaults": [
+                        {"@id": "urn:it:cfg:a-empty"},
+                        {"@id": "urn:it:cfg:b-full", "f:shaclEnabled": true}
+                    ]
+                },
+                {"@id": "urn:it:cfg:a-empty", "f:shaclEnabled": true}
+            ]
+        }),
+    )
+    .await
+}
+
+/// A double group pointer resolves deterministically to the non-empty group
+/// (lowest IRI among the non-empty ones). The first binding used to win,
+/// which here is the empty group: SHACL read as disabled.
+#[tokio::test]
+async fn reader_picks_the_non_empty_group_of_a_double_pointer() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-double-pointer:main";
+    seed_double_shacl_pointer(&fluree, genesis_ledger(&fluree, ledger_id)).await;
+    let view = fluree.db(ledger_id).await.unwrap();
+    let shacl = view
+        .ledger_config()
+        .and_then(|c| c.shacl.clone())
+        .expect("a SHACL group is read");
+    assert_eq!(shacl.enabled, Some(true), "the populated group wins");
+}
+
+/// Ledger info reports the degenerate state: the ambiguous pointer, the
+/// empty group, and the fields stranded in the default graph.
+#[tokio::test]
+async fn diagnostics_report_empty_stranded_and_ambiguous_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics:main";
+    seed_double_shacl_pointer(&fluree, genesis_ledger(&fluree, ledger_id)).await;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["ambiguous-pointer", "empty-group", "stranded-fields"]
+    );
+}
+
+/// Shapes with no config enabling SHACL are reported ("shapes present; SHACL
+/// enforcement not configured"); enabling SHACL on the existing config
+/// subject clears it.
+#[tokio::test]
+async fn diagnostics_report_shapes_without_enforcement() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-shapes:main";
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["shacl-not-configured"]
+    );
+
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:it:cfg:ledger",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:shaclDefaults": {"f:shaclEnabled": true}
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
+}
+
+/// A clean config has no diagnostics (the field is omitted).
+#[tokio::test]
+async fn diagnostics_are_empty_for_a_clean_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-clean:main";
+    fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:it:cfg:ledger",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:policyDefaults": {"f:defaultAllow": true}
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
+}
+
 // =============================================================================
 // Test 1: config graph reserved at g_id=2
 // =============================================================================

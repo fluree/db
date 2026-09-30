@@ -141,6 +141,27 @@ pub async fn run(
                     Some(id) => println!("Index ID:       {id}"),
                     None => println!("Index ID:       (none)"),
                 }
+                // Degenerate config-graph state (ledger info's
+                // `configDiagnostics`); printed only when there is some.
+                if let Ok(info) = fluree.ledger_info(&ledger_id).execute().await {
+                    if let Some(diagnostics) = info
+                        .get("configDiagnostics")
+                        .and_then(serde_json::Value::as_array)
+                        .filter(|d| !d.is_empty())
+                    {
+                        println!();
+                        println!("Config diagnostics:");
+                        for diagnostic in diagnostics {
+                            println!(
+                                "  - {}",
+                                diagnostic
+                                    .get("message")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                            );
+                        }
+                    }
+                }
             } else if let Some(gs) = fluree.nameservice().lookup_graph_source(&ledger_id).await? {
                 if graph.is_some() {
                     return Err(CliError::Usage(
