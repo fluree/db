@@ -171,6 +171,14 @@ fn inline_ops_need_t(ops: &[InlineOperator]) -> bool {
 // BinaryScanOperator
 // ============================================================================
 
+/// Encoded form of the inner-subject and inner-object bounds on a term
+/// variable (see `ObjectBounds::term_subject` / `term_object`).
+#[derive(Debug, Clone, Copy)]
+struct TermKeyFilter {
+    s_id: Option<u64>,
+    o: Option<(u16, u64)>,
+}
+
 /// Scan operator: streams leaflets from `BinaryCursor`, eagerly decoding
 /// `ColumnBatch` rows into `Binding::Sid` / `Binding::Lit` values.
 pub struct BinaryScanOperator {
@@ -220,6 +228,10 @@ pub struct BinaryScanOperator {
     /// seek keys only narrow the leaflets read, so rows are checked against
     /// it in encoded form, without a decode.
     term_o_key_range: Option<(u64, u64)>,
+    /// Set at open when the bounds constrain a term's inner subject or
+    /// object and the store encodes them: every emitted term handle's
+    /// dictionary key must match, checked without decoding the term.
+    term_key_filter: Option<TermKeyFilter>,
     /// Bound object value, if the triple pattern's object is a constant.
     bound_o: Option<FlakeValue>,
     /// `bound_o` as its persisted `(o_type, o_key)` when it is an IRI the
@@ -752,6 +764,7 @@ impl BinaryScanOperator {
             index_hint,
             object_bounds,
             term_o_key_range: None,
+            term_key_filter: None,
             bound_o: None,
             bound_o_encoded: None,
             check_s_eq_o,
@@ -1451,9 +1464,28 @@ impl BinaryScanOperator {
                     continue;
                 }
             }
+            if let Some(f) = self.term_key_filter {
+                // Only a term can satisfy a term-component bound.
+                if o_type != OType::TRIPLE_TERM.as_u16() {
+                    continue;
+                }
+                let Some(key) = store_arc
+                    .resolve_term_key(o_key)
+                    .map_err(|e| QueryError::from_io("resolve_term_key", e))?
+                else {
+                    continue;
+                };
+                if f.s_id.is_some_and(|s| s != key.s_id)
+                    || f.o
+                        .is_some_and(|(ot, ok)| ot != key.o_type.as_u16() || ok != key.o_key)
+                {
+                    continue;
+                }
+            }
             let bounds_need_value = self.object_bounds.as_ref().is_some_and(|b| {
                 b.has_value_bounds()
                     || (b.term_predicate.is_some() && self.term_o_key_range.is_none())
+                    || (b.has_term_component_bounds() && self.term_key_filter.is_none())
             });
             let needs_o_decode = (self.bound_o.is_some() && self.bound_o_encoded.is_none())
                 || bounds_need_value
@@ -2560,6 +2592,26 @@ impl Operator for BinaryScanOperator {
         // temporal object-key range (POST + bounds), construct a narrow min/max key range
         // so we can seek into the branch manifest rather than scanning all leaves.
         self.term_o_key_range = term_o_key_range;
+
+        // Inner-subject / inner-object bounds on a term variable: encode
+        // them once here and compare each handle's dictionary key in the
+        // row loop. A component the dictionaries do not hold names no
+        // interned term, so no base row can match; only novelty remains.
+        self.term_key_filter = None;
+        if let Some(bounds) = self
+            .object_bounds
+            .as_ref()
+            .filter(|b| b.has_term_component_bounds())
+        {
+            match encode_term_key_filter(bounds, store_ref, ctx.dict_novelty.as_ref()) {
+                Ok(f) => self.term_key_filter = Some(f),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
+                }
+                // Unencodable: the row loop decodes and checks the term.
+                Err(_) => {}
+            }
+        }
 
         let use_range = |filter: &BinaryFilter| {
             filter.s_id.is_some()
@@ -3967,42 +4019,7 @@ fn value_to_otype_okey(
             find_numbig_okey(val, store, numbig_ctx)
         }
         FlakeValue::Decimal(_) => find_numbig_okey(val, store, numbig_ctx),
-        // A constant triple term composes to its handle through the term
-        // dictionary; a term that was never interned matches nothing, which
-        // the caller's decode-and-compare fallback preserves.
-        FlakeValue::TripleTerm(term) => {
-            let s_id = resolve_subject_v3(&term.s, store, dict_novelty)?;
-            let p_id = store
-                .sid_to_iri(&term.p)
-                .and_then(|iri| store.find_predicate_id(&iri))
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "triple term predicate is not a known predicate",
-                    )
-                })?;
-            let (o_type, o_key) = value_to_otype_okey(
-                &term.o,
-                &term.dt,
-                term.lang.as_deref(),
-                store,
-                dict_novelty,
-                None,
-            )?;
-            let key = fluree_db_core::triple_term::TermKey {
-                s_id,
-                p_id,
-                o_type,
-                o_key,
-            };
-            match store.find_term_handle(&key)? {
-                Some(handle) => Ok((OType::TRIPLE_TERM, handle)),
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "triple term is not interned",
-                )),
-            }
-        }
+        FlakeValue::TripleTerm(term) => compose_term_handle(term, store, dict_novelty),
         // Not handled: Vector (arena + HNSW identity; raw-merge is the
         // intended lane).
         _ => Err(std::io::Error::new(
@@ -4452,6 +4469,73 @@ fn otype_from_dt_sid(dt_sid: &Sid, store: &BinaryIndexStore) -> Option<OType> {
     Some(OType::customer_datatype(dt_id))
 }
 
+/// The inner-subject / inner-object bounds of a term variable in encoded
+/// form. `NotFound` when a component is absent from the dictionaries (no
+/// interned term can carry it); any other error leaves the bounds to the
+/// decoded check.
+fn encode_term_key_filter(
+    bounds: &fluree_db_core::ObjectBounds,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<TermKeyFilter> {
+    let s_id = match bounds.term_subject.as_ref() {
+        Some(sid) => Some(resolve_subject_v3(sid, store, dict_novelty)?),
+        None => None,
+    };
+    let o = match bounds.term_object.as_ref() {
+        Some((value, dtc)) => {
+            let (dt, lang) = match dtc {
+                DatatypeConstraint::Explicit(dt) => (dt.clone(), None),
+                DatatypeConstraint::LangTag(tag) => (
+                    Sid::new(namespaces::RDF, rdf_names::LANG_STRING),
+                    Some(tag.as_ref()),
+                ),
+            };
+            let (ot, key) = value_to_otype_okey(value, &dt, lang, store, dict_novelty, None)?;
+            Some((ot.as_u16(), key))
+        }
+        None => None,
+    };
+    Ok(TermKeyFilter { s_id, o })
+}
+
+/// A constant triple term's handle, composed through the term dictionary.
+/// A subject, predicate, object or term the dictionary does not hold is
+/// `NotFound`: the link index only ever carries interned handles, so the
+/// pattern cannot match a base row and the caller may skip to novelty.
+pub(crate) fn compose_term_handle(
+    term: &fluree_db_core::TripleTermValue,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<(OType, u64)> {
+    use std::io::{Error, ErrorKind};
+    let s_id = resolve_subject_v3(&term.s, store, dict_novelty)?;
+    let p_id = store
+        .sid_to_p_id(&term.p)
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "triple term predicate is not known"))?;
+    let (o_type, o_key) = value_to_otype_okey(
+        &term.o,
+        &term.dt,
+        term.lang.as_deref(),
+        store,
+        dict_novelty,
+        None,
+    )?;
+    let key = fluree_db_core::triple_term::TermKey {
+        s_id,
+        p_id,
+        o_type,
+        o_key,
+    };
+    match store.find_term_handle(&key)? {
+        Some(handle) => Ok((OType::TRIPLE_TERM, handle)),
+        None => Err(Error::new(
+            ErrorKind::NotFound,
+            "triple term is not interned",
+        )),
+    }
+}
+
 /// Simplified FlakeValue → (OType, o_key) translation for fast-path operators.
 ///
 /// Uses default OType for each value variant (no dt_sid/lang context needed).
@@ -4468,6 +4552,7 @@ pub(crate) fn value_to_otype_okey_simple(
         FlakeValue::Null => Ok((OType::NULL, 0)),
         FlakeValue::Boolean(b) => Ok((OType::XSD_BOOLEAN, *b as u64)),
         FlakeValue::Long(n) => Ok((OType::XSD_INTEGER, ObjKey::encode_i64(*n).as_u64())),
+        FlakeValue::TripleTerm(term) => compose_term_handle(term, store, None),
         FlakeValue::Double(d) => {
             // Encoding failures are NOT NotFound: the value could still exist in
             // the base index under a representation we can't compute, so callers

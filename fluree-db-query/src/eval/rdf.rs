@@ -5,7 +5,8 @@
 use crate::binding::{Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::Expression;
+use crate::ir::{Expression, Function};
+use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::{DatatypeDictId, Sid};
 use std::sync::Arc;
@@ -467,11 +468,135 @@ fn triple_term_arg<R: RowAccess>(
     })
 }
 
+/// The encoded base edge behind an argument bound to a late-materialized
+/// triple-term handle, with the link's `t` and the context to read it
+/// through. One forward-dictionary lookup, where materializing the term
+/// costs three dictionary reads and a boxed value per accessor per row.
+/// `None` for any other argument, including a materialized term, which
+/// takes the value path.
+fn encoded_term<'c, R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&'c ExecutionContext<'_>>,
+) -> Result<
+    Option<(
+        fluree_db_core::triple_term::TermKey,
+        i64,
+        &'c ExecutionContext<'c>,
+    )>,
+> {
+    let [Expression::Var(v)] = args else {
+        return Ok(None);
+    };
+    let Some(Binding::EncodedLit {
+        o_kind, o_key, t, ..
+    }) = row.get(*v)
+    else {
+        return Ok(None);
+    };
+    if *o_kind != fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8() {
+        return Ok(None);
+    }
+    let Some(ctx) = ctx else {
+        return Ok(None);
+    };
+    let Some(store) = ctx.binary_store.as_deref() else {
+        return Ok(None);
+    };
+    let key = store
+        .resolve_term_key(*o_key)
+        .map_err(|e| QueryError::from_io("resolve_term_key", e))?
+        .ok_or_else(|| {
+            QueryError::Internal(format!(
+                "triple-term handle {o_key:#x} has no dictionary entry"
+            ))
+        })?;
+    Ok(Some((key, *t, ctx)))
+}
+
+/// The base edge's object as a binding, in the encoded form a scan would
+/// bind it when the kind allows, else materialized with its datatype or
+/// language tag.
+fn term_object_binding(
+    key: &fluree_db_core::triple_term::TermKey,
+    t: i64,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Binding> {
+    let o_type = key.o_type.as_u16();
+    if let Some(b) =
+        late_materialized_object_binding(o_type, key.o_key, key.p_id, t, u32::MAX, None)
+    {
+        return Ok(b);
+    }
+    let store = ctx
+        .binary_store
+        .as_deref()
+        .ok_or_else(|| QueryError::Internal("term object decode without a store".into()))?;
+    let val = store
+        .decode_value_v3(o_type, key.o_key, key.p_id, ctx.binary_g_id)
+        .map_err(|e| QueryError::from_io("decode_value_v3", e))?;
+    Ok(materialized_object_binding(
+        store,
+        o_type,
+        key.p_id,
+        val,
+        Some(t),
+        None,
+    ))
+}
+
+/// `BIND(SUBJECT|PREDICATE|OBJECT(?term) AS ?v)` on an encoded handle: the
+/// component in the encoded form a scan would bind it, so the BIND is one
+/// dictionary lookup and no materialization. `None` takes the value path.
+pub(crate) fn encoded_term_component<R: RowAccess>(
+    func: &Function,
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<Binding>> {
+    let Some((key, t, ctx)) = encoded_term(args, row, ctx)? else {
+        return Ok(None);
+    };
+    let binding = match func {
+        Function::TripleSubject => Binding::encoded_sid(key.s_id),
+        Function::TriplePredicate => Binding::EncodedPid { p_id: key.p_id },
+        Function::TripleObject => term_object_binding(&key, t, ctx)?,
+        _ => return Ok(None),
+    };
+    Ok(Some(binding))
+}
+
+/// A materialized term's object with its datatype or language tag, which
+/// `OBJECT()` must keep: `"chat"@fr` is not `"chat"`.
+fn term_object_comparable(
+    term: &fluree_db_core::TripleTermValue,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<ComparableValue> {
+    if let fluree_db_core::FlakeValue::Ref(sid) = &term.o {
+        return Some(ComparableValue::Sid(sid.clone()));
+    }
+    let dtc = match &term.lang {
+        Some(lang) => fluree_db_core::DatatypeConstraint::LangTag(Arc::from(lang.as_str())),
+        None => fluree_db_core::DatatypeConstraint::Explicit(term.dt.clone()),
+    };
+    super::lit_to_comparable(&term.o, &dtc, ctx)
+}
+
 pub fn eval_triple_subject<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
+    if let Some((key, _, ctx)) = encoded_term(args, row, ctx)? {
+        let store = ctx
+            .binary_store
+            .as_deref()
+            .expect("encoded term has a store");
+        let iri = store
+            .resolve_subject_iri(key.s_id)
+            .map_err(|e| QueryError::from_io("resolve_subject_iri", e))?;
+        return Ok(Some(ComparableValue::Sid(store.encode_iri(&iri))));
+    }
     Ok(triple_term_arg(args, row, ctx, "SUBJECT")?.map(|t| ComparableValue::Sid(t.s)))
 }
 
@@ -480,6 +605,20 @@ pub fn eval_triple_predicate<R: RowAccess>(
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
+    if let Some((key, _, ctx)) = encoded_term(args, row, ctx)? {
+        let store = ctx
+            .binary_store
+            .as_deref()
+            .expect("encoded term has a store");
+        let sid = store
+            .p_sid_table()
+            .get(key.p_id as usize)
+            .cloned()
+            .ok_or_else(|| {
+                QueryError::Internal(format!("triple-term predicate {} is not known", key.p_id))
+            })?;
+        return Ok(Some(ComparableValue::Sid(sid)));
+    }
     Ok(triple_term_arg(args, row, ctx, "PREDICATE")?.map(|t| ComparableValue::Sid(t.p)))
 }
 
@@ -488,8 +627,11 @@ pub fn eval_triple_object<R: RowAccess>(
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
-    Ok(triple_term_arg(args, row, ctx, "OBJECT")?
-        .and_then(|t| ComparableValue::try_from(&t.o).ok()))
+    if let Some((key, t, ctx)) = encoded_term(args, row, ctx)? {
+        let object = term_object_binding(&key, t, ctx)?;
+        return super::binding_to_comparable(Some(&object), Some(ctx));
+    }
+    Ok(triple_term_arg(args, row, ctx, "OBJECT")?.and_then(|t| term_object_comparable(&t, ctx)))
 }
 
 pub fn eval_is_triple<R: RowAccess>(

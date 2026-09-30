@@ -342,3 +342,178 @@ async fn link_lowering_answers_reified_triple_shapes() {
         "bob knows dave via alice knows bob: {got:#?}"
     );
 }
+
+const LITERAL_CLAIMS: &str = r#"VERSION "1.2"
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:doc ex:title "chat"@fr {| ex:source ex:fr |} .
+ex:doc ex:title "chat"@en {| ex:source ex:en |} .
+ex:doc ex:title "chat" {| ex:source ex:plain |} .
+ex:doc ex:size "5"^^xsd:int {| ex:source ex:int |} .
+ex:doc ex:size 5 {| ex:source ex:integer |} .
+"#;
+
+async fn run_link_query(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+    body: String,
+) -> Vec<Vec<String>> {
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/>\n\
+         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+         PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n{body}"
+    );
+    let result = support::query_sparql_formatted(fluree, ledger, &sparql)
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    rows(&result)
+}
+
+/// A reified pattern's literal object is a term: its language tag or
+/// datatype is part of the match, both when the whole edge composes to a
+/// constant term and when only the object is constant. Decomposing a term
+/// keeps the tag and datatype too.
+#[tokio::test]
+async fn link_lowering_matches_literal_objects_by_term() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let (fluree, ledger) = import(
+        &[("literals.ttl", LITERAL_CLAIMS)],
+        "it/triple-term-links:literals",
+    )
+    .await;
+    let run = |body: &str| run_link_query(&fluree, &ledger, body.to_string());
+
+    for (object, source) in [
+        ("\"chat\"@fr", "fr"),
+        ("\"chat\"@en", "en"),
+        ("\"chat\"", "plain"),
+    ] {
+        for subject in ["ex:doc", "?s"] {
+            let got = run(&format!(
+                "SELECT ?src WHERE {{ << {subject} ex:title {object} >> ex:source ?src }}"
+            ))
+            .await;
+            assert_eq!(got.len(), 1, "{subject} {object}: {got:#?}");
+            assert!(got[0][0].ends_with(source), "{subject} {object}: {got:#?}");
+        }
+    }
+    for (object, source) in [("\"5\"^^xsd:int", "int"), ("5", "integer")] {
+        for subject in ["ex:doc", "?s"] {
+            let got = run(&format!(
+                "SELECT ?src WHERE {{ << {subject} ex:size {object} >> ex:source ?src }}"
+            ))
+            .await;
+            assert_eq!(got.len(), 1, "{subject} {object}: {got:#?}");
+            assert!(got[0][0].ends_with(source), "{subject} {object}: {got:#?}");
+        }
+    }
+
+    let got = run("SELECT ?o (LANG(?o) AS ?l) WHERE { ?r rdf:reifies <<( ex:doc ex:title ?o )>> } ORDER BY ?l").await;
+    assert_eq!(got.len(), 3, "{got:#?}");
+    let langs: Vec<&str> = got.iter().map(|r| r[1].as_str()).collect();
+    assert_eq!(langs, ["", "en", "fr"], "{got:#?}");
+
+    let got = run("SELECT (DATATYPE(?o) AS ?dt) WHERE { ?r rdf:reifies <<( ex:doc ex:size ?o )>> } ORDER BY ?dt").await;
+    assert_eq!(got.len(), 2, "{got:#?}");
+    assert!(got[0][0].ends_with("int"), "{got:#?}");
+    assert!(got[1][0].ends_with("integer"), "{got:#?}");
+}
+
+/// A component variable is always bound with `BIND`, whose agreement check
+/// is the join: the same variable in two UNION branches is fresh in each,
+/// a VALUES row or the reifier itself constrains it, and the value the row
+/// already holds may be in any representation.
+#[tokio::test]
+async fn link_lowering_joins_component_variables_in_every_scope() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let (fluree, ledger) = import(&[("claims.ttl", CLAIMS)], "it/triple-term-links:scopes").await;
+    let run = |body: &str| run_link_query(&fluree, &ledger, body.to_string());
+
+    let got = run(
+        "SELECT ?o WHERE { { << ex:alice ex:knows ?o >> ex:source ex:hr } \
+         UNION { << ex:bob ex:knows ?o >> ex:source ex:crm } } ORDER BY ?o",
+    )
+    .await;
+    assert_eq!(got.len(), 2, "{got:#?}");
+    assert!(
+        got[0][0].ends_with("bob") && got[1][0].ends_with("dave"),
+        "{got:#?}"
+    );
+
+    let got = run(
+        "SELECT ?s ?o WHERE { VALUES ?s { ex:alice ex:bob } << ?s ex:knows ?o >> ex:source ?src } \
+         ORDER BY ?s ?o",
+    )
+    .await;
+    assert_eq!(got.len(), 3, "{got:#?}");
+    assert!(
+        got[2][0].ends_with("bob") && got[2][1].ends_with("dave"),
+        "{got:#?}"
+    );
+
+    let got = run("SELECT ?x WHERE { ?x rdf:reifies <<( ?x ?p ?o )>> }").await;
+    assert!(
+        got.is_empty(),
+        "no reifier is its own edge's subject: {got:#?}"
+    );
+    let got = run("SELECT ?x WHERE { ?x rdf:reifies <<( ?y ?p ?o )>> }").await;
+    assert_eq!(got.len(), 4, "{got:#?}");
+
+    let got = run("SELECT ?s WHERE { ?s ex:age ?age . << ?s ?p ?o >> ex:source ?src }").await;
+    assert!(got.is_empty(), "carol's claim has no source: {got:#?}");
+    let got = run(
+        "SELECT ?s ?o WHERE { ?s ex:knows ?o . ?r rdf:reifies <<( ?s ex:knows ?o )>> } \
+         ORDER BY ?s ?o",
+    )
+    .await;
+    assert_eq!(got.len(), 3, "{got:#?}");
+    assert!(
+        got[2][0].ends_with("bob") && got[2][1].ends_with("dave"),
+        "{got:#?}"
+    );
+}
+
+/// Two inner-predicate constraints on one term that name different
+/// predicates admit no handle: the second filter stays in the plan.
+#[tokio::test]
+async fn link_lowering_keeps_contradictory_predicate_filters() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let (fluree, ledger) = import(
+        &[("claims.ttl", CLAIMS)],
+        "it/triple-term-links:contradiction",
+    )
+    .await;
+    let run = |body: &str| run_link_query(&fluree, &ledger, body.to_string());
+
+    let got = run("SELECT ?r WHERE { ?r rdf:reifies ?t . FILTER(PREDICATE(?t) = ex:knows) }").await;
+    assert_eq!(got.len(), 3, "{got:#?}");
+    let got = run(
+        "SELECT ?r WHERE { ?r rdf:reifies ?t . FILTER(PREDICATE(?t) = ex:knows) \
+         FILTER(PREDICATE(?t) = ex:age) }",
+    )
+    .await;
+    assert!(got.is_empty(), "{got:#?}");
+}
+
+/// Positions the query never reads are not decomposed at all; the count is
+/// still the count of matching links.
+#[tokio::test]
+async fn link_lowering_counts_without_decomposing_unread_positions() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let (fluree, ledger) = import(&[("claims.ttl", CLAIMS)], "it/triple-term-links:count").await;
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT (COUNT(*) AS ?n) WHERE { << ?s ?p ?o >> ex:source ?src }".to_string(),
+    )
+    .await;
+    assert_eq!(got, vec![vec!["3".to_string()]], "{got:#?}");
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT (COUNT(*) AS ?n) WHERE { << ?s ex:knows ?o >> ex:source ?src }".to_string(),
+    )
+    .await;
+    assert_eq!(got, vec![vec!["3".to_string()]], "{got:#?}");
+}

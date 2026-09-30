@@ -282,9 +282,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// `annotation rdf:reifies ?__term` triple whose object is a triple-term
     /// handle, then each component of the reified edge either bound from the
     /// term (`BIND(SUBJECT(?__term) AS ?s)`) or constrained against it
-    /// (`FILTER(PREDICATE(?__term) = <p>)`). A predicate constraint is what the
-    /// planner turns into one handle interval; a fully constant edge composes
-    /// to a constant term the scan looks up directly.
+    /// (`FILTER(sameTerm(PREDICATE(?__term), <p>))`). A variable is always a
+    /// `BIND`: when the variable is already bound, `BIND` keeps the row only
+    /// if the values agree, which is the join, and that holds in every scope
+    /// (a UNION branch, an OPTIONAL, a subquery seed) without the lowering
+    /// tracking who binds what. A predicate constraint is what the planner
+    /// turns into one handle interval; a fully constant edge composes to a
+    /// constant term the scan looks up directly.
     pub(super) fn lower_reified_link(
         &mut self,
         annotation_ref: Ref,
@@ -292,6 +296,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         out: &mut Vec<Pattern>,
     ) {
         use fluree_db_core::FlakeValue;
+        use fluree_db_query::binding::Binding;
         use fluree_db_query::ir::{Expression, Function};
 
         let reifies = self.encoder.encode_ref(fluree_vocab::rdf::REIFIES);
@@ -316,46 +321,64 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             o: IrTerm::Var(t),
             dtc: None,
         }));
-        self.link_bound_vars.insert(t);
 
         let accessor = |f: Function| Expression::call(f, vec![Expression::Var(t)]);
-        let mut component = |func: Function, term: IrTerm, out: &mut Vec<Pattern>| match term {
-            IrTerm::Var(v) => {
-                if self.link_bound_vars.insert(v) {
-                    out.push(Pattern::Bind {
-                        var: v,
-                        expr: accessor(func),
-                    });
-                } else {
-                    out.push(Pattern::Filter(Expression::call(
-                        Function::Eq,
-                        vec![accessor(func), Expression::Var(v)],
-                    )));
-                }
-            }
-            IrTerm::Sid(sid) => out.push(Pattern::Filter(Expression::call(
-                Function::Eq,
-                vec![accessor(func), Expression::Const(FlakeValue::Ref(sid))],
-            ))),
+        let same_term = |f: Function, constant: Expression| {
+            Pattern::Filter(Expression::call(
+                Function::SameTerm,
+                vec![accessor(f), constant],
+            ))
+        };
+        let IrTriplePattern { s, p, o, dtc } = edge;
+        let component = |func: Function, term: IrTerm, out: &mut Vec<Pattern>| match term {
+            IrTerm::Var(v) => out.push(Pattern::Bind {
+                var: v,
+                expr: accessor(func),
+            }),
+            IrTerm::Sid(sid) => out.push(same_term(func, Expression::Const(FlakeValue::Ref(sid)))),
             IrTerm::Iri(iri) => match self.encoder.encode_iri(&iri) {
-                Some(sid) => out.push(Pattern::Filter(Expression::call(
-                    Function::Eq,
-                    vec![accessor(func), Expression::Const(FlakeValue::Ref(sid))],
-                ))),
+                Some(sid) => out.push(same_term(func, Expression::Const(FlakeValue::Ref(sid)))),
                 // An IRI in no registered namespace names nothing in this
                 // ledger, so the pattern cannot match.
                 None => out.push(Pattern::Filter(Expression::Const(FlakeValue::Boolean(
                     false,
                 )))),
             },
-            IrTerm::Value(v) => out.push(Pattern::Filter(Expression::call(
-                Function::Eq,
-                vec![accessor(func), Expression::Const(v)],
-            ))),
+            // A literal matches by term identity: its datatype or language
+            // tag is part of what `<< ?s :p "chat"@fr >>` asks for.
+            IrTerm::Value(v) => match &dtc {
+                Some(dtc) => out.push(same_term(
+                    func,
+                    Expression::Resolved(Box::new(Binding::Lit {
+                        val: v,
+                        dtc: dtc.clone(),
+                        t: None,
+                        op: None,
+                        p_id: None,
+                    })),
+                )),
+                None => out.push(Pattern::Filter(Expression::call(
+                    Function::Eq,
+                    vec![accessor(func), Expression::Const(v)],
+                ))),
+            },
         };
-        component(Function::TripleSubject, edge.s.into(), out);
-        component(Function::TriplePredicate, edge.p.into(), out);
-        component(Function::TripleObject, edge.o, out);
+        // Constraints first, so the planner's filter lookahead over the link
+        // triple reaches every one of them before a BIND intervenes.
+        let mut binds = Vec::new();
+        for (func, term) in [
+            (Function::TripleSubject, IrTerm::from(s)),
+            (Function::TriplePredicate, IrTerm::from(p)),
+            (Function::TripleObject, o),
+        ] {
+            match term {
+                IrTerm::Var(_) => binds.push((func, term)),
+                constant => component(func, constant, out),
+            }
+        }
+        for (func, term) in binds {
+            component(func, term, out);
+        }
     }
 }
 

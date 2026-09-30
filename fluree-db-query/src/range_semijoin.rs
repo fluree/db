@@ -664,6 +664,8 @@ impl RangeSemiJoinOperator {
             lower: envelope.lower.clone().map(|v| (v, true)),
             upper: envelope.upper.clone().map(|v| (v, true)),
             term_predicate: None,
+            term_subject: None,
+            term_object: None,
         };
         let narrow = ColumnSet::single(ColumnId::SId).union(ColumnSet::single(ColumnId::OKey));
         let mixed = narrow

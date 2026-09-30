@@ -448,6 +448,47 @@ pub(crate) fn normalize_for_key_cow<'a>(
     }
 }
 
+/// Whether a BIND's computed value agrees with the value the row already
+/// holds for its variable. Plain equality is representation-bound: a scan
+/// binds `EncodedSid`, a VALUES row or a decoded term binds `Sid`, and the
+/// two never compare equal. Normalize both sides to their dictionary form
+/// first, as the join surfaces do, and compare a predicate id against a
+/// subject id through the shared SID.
+pub(crate) fn bind_unifies(
+    existing: &Binding,
+    computed: &Binding,
+    ctx: Option<&crate::context::ExecutionContext<'_>>,
+) -> bool {
+    if existing == computed {
+        return true;
+    }
+    let Some(ctx) = ctx else {
+        return false;
+    };
+    if ctx.is_multi_ledger() {
+        return false;
+    }
+    let Some(store) = ctx.binary_store.as_deref() else {
+        return false;
+    };
+    let as_sid = |b: &Binding| -> Option<Binding> {
+        match b {
+            Binding::EncodedPid { p_id } => store
+                .p_sid_table()
+                .get(*p_id as usize)
+                .cloned()
+                .map(Binding::sid),
+            _ => None,
+        }
+    };
+    let a = as_sid(existing);
+    let b = as_sid(computed);
+    let a = a.as_ref().unwrap_or(existing);
+    let b = b.as_ref().unwrap_or(computed);
+    normalize_for_key_cow(a, Some(store), None).as_ref()
+        == normalize_for_key_cow(b, Some(store), None).as_ref()
+}
+
 /// True if this is an arena-backed (NUM_BIG) encoded literal.
 pub(crate) fn is_numbig_encoded(binding: &Binding) -> bool {
     matches!(

@@ -84,7 +84,7 @@ pub fn apply_inline(
                     Some(pos) => match (&bindings[pos], &value) {
                         (Binding::Unbound, _) => bindings[pos] = value,
                         (_, Binding::Unbound) => continue,
-                        (a, b) if a == b => continue,
+                        (a, b) if crate::object_binding::bind_unifies(a, b, ctx) => continue,
                         _ => return Ok(false),
                     },
                 }

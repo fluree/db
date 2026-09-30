@@ -2311,6 +2311,51 @@ fn values_cell_as_ref_term(binding: &crate::binding::Binding) -> Option<Term> {
     }
 }
 
+/// Drop `BIND(SUBJECT|PREDICATE|OBJECT(?term) AS ?v)` when nothing reads
+/// `?v`: no other pattern, the seed, the post-WHERE pipeline or the
+/// projection. A variable the seed binds keeps its BIND, which is then the
+/// equality check on that position. The `f:reifies*` twin of this rule is
+/// `elide_redundant_chain`.
+fn elide_unread_term_binds(
+    patterns: &[Pattern],
+    needed_vars: &HashSet<VarId>,
+    required_where_vars: Option<&[VarId]>,
+    seed_schema: &HashSet<VarId>,
+) -> Option<Vec<Pattern>> {
+    fn is_term_accessor(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::Call {
+                func: Function::TripleSubject | Function::TriplePredicate | Function::TripleObject,
+                args,
+            } if matches!(args.as_slice(), [Expression::Var(_)])
+        )
+    }
+    if !patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::Bind { expr, .. } if is_term_accessor(expr)))
+    {
+        return None;
+    }
+    let mut counts: HashMap<VarId, usize> = HashMap::new();
+    let mut all_vars: HashSet<VarId> = HashSet::new();
+    collect_var_stats(patterns, &mut counts, &mut all_vars);
+    let unread = |var: VarId| {
+        counts.get(&var).copied().unwrap_or(0) <= 1
+            && !needed_vars.contains(&var)
+            && !required_where_vars.is_some_and(|r| r.contains(&var))
+            && !seed_schema.contains(&var)
+    };
+    let kept: Vec<Pattern> = patterns
+        .iter()
+        .filter(
+            |p| !matches!(p, Pattern::Bind { var, expr } if is_term_accessor(expr) && unread(*var)),
+        )
+        .cloned()
+        .collect();
+    (kept.len() != patterns.len()).then_some(kept)
+}
+
 /// Drop VALUES columns that are UNDEF in every row, and a VALUES left with no
 /// columns and exactly one row.
 ///
@@ -2591,13 +2636,24 @@ pub fn build_where_operators_seeded_with_needed(
     let inlined_storage = inline_singleton_values_objects(patterns);
     let patterns: &[Pattern] = inlined_storage.as_deref().unwrap_or(patterns);
 
+    let seed_vars = seed.as_deref().map(|op| seed_vars(op)).unwrap_or_default();
+
+    // A reified-edge position nobody reads costs a dictionary lookup per row
+    // and removes none; the link lowering binds every variable position.
+    let term_bind_storage = elide_unread_term_binds(
+        patterns,
+        needed_vars,
+        required_where_vars,
+        &seed_vars.schema,
+    );
+    let patterns: &[Pattern] = term_bind_storage.as_deref().unwrap_or(patterns);
+
     // Apply generalized pattern reordering upfront for all pattern lists.
     //
     // reorder_patterns determines optimal placement of all patterns
     // (triples, compound patterns like UNION/OPTIONAL/MINUS/EXISTS/Subquery)
     // using selectivity-based cost estimation. This subsumes the per-block
     // reorder_patterns_seeded calls that previously handled triple-only blocks.
-    let seed_vars = seed.as_deref().map(|op| seed_vars(op)).unwrap_or_default();
     let reordered_storage = reorder_patterns_with_seed(patterns, stats.as_deref(), &seed_vars);
     let patterns = &reordered_storage;
 
@@ -5449,6 +5505,8 @@ mod tests {
                 lower: Some((FlakeValue::String("2026-01-01".to_string()), true)),
                 upper: None,
                 term_predicate: None,
+                term_subject: None,
+                term_object: None,
             },
         );
 

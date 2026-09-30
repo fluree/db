@@ -31,6 +31,12 @@ pub fn extract_bounds_from_filters(
         let mut filter_vars_matched = 0;
         for &var in &object_vars {
             if let Some(new_bounds) = extract_object_bounds_for_var(expr, var) {
+                if bounds
+                    .get(&var)
+                    .is_some_and(|existing| term_predicates_conflict(existing, &new_bounds))
+                {
+                    continue;
+                }
                 filter_vars_matched += 1;
                 bounds
                     .entry(var)
@@ -90,6 +96,12 @@ pub fn extract_lookahead_bounds_with_consumption(
                 // Try to extract bounds for each object variable
                 for &var in &object_vars {
                     if let Some(new_bounds) = extract_object_bounds_for_var(expr, var) {
+                        if bounds
+                            .get(&var)
+                            .is_some_and(|existing| term_predicates_conflict(existing, &new_bounds))
+                        {
+                            continue;
+                        }
                         filter_vars_matched += 1;
                         // Merge with existing bounds for this var (intersection)
                         bounds
@@ -127,6 +139,19 @@ pub fn count_filter_vars(expr: &Expression) -> usize {
     vars.len()
 }
 
+/// Two constraints on the same component of one term variable that name
+/// different terms. Nothing satisfies both, and `merge_object_bounds` keeps
+/// only one, so the second filter must stay in the plan (and empties it)
+/// rather than be consumed.
+fn term_predicates_conflict(a: &ObjectBounds, b: &ObjectBounds) -> bool {
+    fn differ<T: PartialEq>(x: &Option<T>, y: &Option<T>) -> bool {
+        matches!((x, y), (Some(x), Some(y)) if x != y)
+    }
+    differ(&a.term_predicate, &b.term_predicate)
+        || differ(&a.term_subject, &b.term_subject)
+        || differ(&a.term_object, &b.term_object)
+}
+
 /// Merge two ObjectBounds, taking the tighter constraint for each bound
 ///
 /// For lower bounds, takes the higher value (more restrictive).
@@ -140,6 +165,8 @@ pub fn merge_object_bounds(a: &ObjectBounds, b: &ObjectBounds) -> ObjectBounds {
             .term_predicate
             .clone()
             .or_else(|| b.term_predicate.clone()),
+        term_subject: a.term_subject.clone().or_else(|| b.term_subject.clone()),
+        term_object: a.term_object.clone().or_else(|| b.term_object.clone()),
     }
 }
 
@@ -303,11 +330,15 @@ mod tests {
             lower: Some((FlakeValue::Long(10), false)),
             upper: Some((FlakeValue::Long(100), true)),
             term_predicate: None,
+            term_subject: None,
+            term_object: None,
         };
         let b = ObjectBounds {
             lower: Some((FlakeValue::Long(20), true)),
             upper: Some((FlakeValue::Long(80), false)),
             term_predicate: None,
+            term_subject: None,
+            term_object: None,
         };
 
         let merged = merge_object_bounds(&a, &b);

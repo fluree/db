@@ -137,6 +137,13 @@ pub struct ObjectBounds {
     /// SID. Handles are partitioned by inner predicate, so a scan turns this
     /// into one `o_key` interval; on materialized values it checks the term.
     pub term_predicate: Option<crate::sid::Sid>,
+    /// Restrict triple-term objects to terms whose inner subject is this
+    /// SID. A scan compares the handle's dictionary key without decoding.
+    pub term_subject: Option<crate::sid::Sid>,
+    /// Restrict triple-term objects to terms whose inner object is this
+    /// term: the value with its datatype or language tag, since
+    /// `<< ?s :p "chat"@fr >>` names a term, not a value.
+    pub term_object: Option<(FlakeValue, crate::DatatypeConstraint)>,
 }
 
 impl ObjectBounds {
@@ -165,10 +172,32 @@ impl ObjectBounds {
         }
     }
 
+    /// Bounds that only restrict a triple term's inner subject.
+    pub fn term_subject(sid: crate::sid::Sid) -> Self {
+        Self {
+            term_subject: Some(sid),
+            ..Self::default()
+        }
+    }
+
+    /// Bounds that only restrict a triple term's inner object.
+    pub fn term_object(value: FlakeValue, dtc: crate::DatatypeConstraint) -> Self {
+        Self {
+            term_object: Some((value, dtc)),
+            ..Self::default()
+        }
+    }
+
     /// True when a lower or upper value bound is set (as opposed to only a
     /// term-predicate restriction, which an index seek can enforce alone).
     pub fn has_value_bounds(&self) -> bool {
         self.lower.is_some() || self.upper.is_some()
+    }
+
+    /// True when the inner subject or object of a triple term is constrained;
+    /// a scan enforces these on the handle's dictionary key.
+    pub fn has_term_component_bounds(&self) -> bool {
+        self.term_subject.is_some() || self.term_object.is_some()
     }
 
     /// Check if a value satisfies the bounds
@@ -178,10 +207,26 @@ impl ObjectBounds {
     /// - Temporal types are only comparable within the same kind (Date vs Date, etc.)
     /// - Other types require exact type match
     pub fn matches(&self, value: &FlakeValue) -> bool {
-        if let Some(p) = &self.term_predicate {
-            match value {
-                FlakeValue::TripleTerm(t) if &t.p == p => {}
-                _ => return false,
+        if self.term_predicate.is_some() || self.has_term_component_bounds() {
+            let FlakeValue::TripleTerm(t) = value else {
+                return false;
+            };
+            if self.term_predicate.as_ref().is_some_and(|p| &t.p != p) {
+                return false;
+            }
+            if self.term_subject.as_ref().is_some_and(|s| &t.s != s) {
+                return false;
+            }
+            if let Some((o, dtc)) = &self.term_object {
+                let same_type = match dtc {
+                    crate::DatatypeConstraint::LangTag(tag) => {
+                        t.lang.as_deref() == Some(tag.as_ref())
+                    }
+                    crate::DatatypeConstraint::Explicit(dt) => t.lang.is_none() && &t.dt == dt,
+                };
+                if !same_type || &t.o != o {
+                    return false;
+                }
             }
         }
         // Check lower bound

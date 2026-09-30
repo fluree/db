@@ -599,6 +599,14 @@ mod inner {
             let Some((o_kind, o_key)) = self.resolve_object_value(&object.o, p_id) else {
                 return Ok(());
             };
+            // Per-(graph, predicate) arena handles are not a graph-independent
+            // object identity; rebuild skips these bundles too.
+            if matches!(
+                ObjKind::from_u8(o_kind),
+                ObjKind::NUM_BIG | ObjKind::VECTOR_ID
+            ) {
+                return Ok(());
+            }
             let lang_id = object
                 .m
                 .as_ref()

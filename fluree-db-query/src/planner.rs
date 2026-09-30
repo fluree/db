@@ -859,8 +859,8 @@ pub fn extract_object_bounds_for_var(
     filter: &Expression,
     object_var: VarId,
 ) -> Option<ObjectBounds> {
-    if let Some(sid) = term_predicate_constraint(filter, object_var) {
-        return Some(ObjectBounds::term_predicate(sid));
+    if let Some(bounds) = term_component_constraint(filter, object_var) {
+        return Some(bounds);
     }
     // Only proceed if filter is range-safe
     let constraints = extract_range_constraints(filter)?;
@@ -883,37 +883,63 @@ pub fn extract_object_bounds_for_var(
 // Generalized Selectivity Scoring for All Pattern Types
 // =============================================================================
 
-/// `PREDICATE(?t) = <p>` (either operand order) on the object variable of a
-/// triple-term scan: the one filter shape the scan can enforce as a handle
-/// interval, since handles are partitioned by inner predicate.
-fn term_predicate_constraint(
-    filter: &Expression,
-    object_var: VarId,
-) -> Option<fluree_db_core::Sid> {
-    let Expression::Call {
-        func: Function::Eq,
-        args,
-    } = filter
-    else {
+/// A constant on one component of a triple-term variable — `PREDICATE(?t) =
+/// <p>`, `sameTerm(SUBJECT(?t), <s>)`, `sameTerm(OBJECT(?t), "v"^^dt)` —
+/// in either operand order, as bounds the scan enforces on the handle: the
+/// predicate as one handle interval, the subject and object against the
+/// handle's dictionary key. An object literal must come as a resolved
+/// binding under `sameTerm`, which carries its datatype or tag; a plain
+/// `=` on a literal is value equality and stays a filter.
+fn term_component_constraint(filter: &Expression, object_var: VarId) -> Option<ObjectBounds> {
+    let Expression::Call { func, args } = filter else {
         return None;
+    };
+    let same_term = match func {
+        Function::SameTerm => true,
+        Function::Eq => false,
+        _ => return None,
     };
     if args.len() != 2 {
         return None;
     }
-    let is_pred_of = |e: &Expression| {
-        matches!(e, Expression::Call { func: Function::TriplePredicate, args }
-            if args.len() == 1 && args[0] == Expression::Var(object_var))
-    };
-    let const_sid = |e: &Expression| match e {
-        Expression::Const(FlakeValue::Ref(sid)) => Some(sid.clone()),
+    let accessor = |e: &Expression| match e {
+        Expression::Call { func, args }
+            if args.len() == 1 && args[0] == Expression::Var(object_var) =>
+        {
+            match func {
+                Function::TripleSubject | Function::TriplePredicate | Function::TripleObject => {
+                    Some(func.clone())
+                }
+                _ => None,
+            }
+        }
         _ => None,
     };
-    if is_pred_of(&args[0]) {
-        const_sid(&args[1])
-    } else if is_pred_of(&args[1]) {
-        const_sid(&args[0])
-    } else {
-        None
+    let (func, constant) = accessor(&args[0])
+        .map(|f| (f, &args[1]))
+        .or_else(|| accessor(&args[1]).map(|f| (f, &args[0])))?;
+    match (func, constant) {
+        (Function::TriplePredicate, Expression::Const(FlakeValue::Ref(sid))) => {
+            Some(ObjectBounds::term_predicate(sid.clone()))
+        }
+        (Function::TripleSubject, Expression::Const(FlakeValue::Ref(sid))) => {
+            Some(ObjectBounds::term_subject(sid.clone()))
+        }
+        (Function::TripleObject, Expression::Const(FlakeValue::Ref(sid))) => {
+            Some(ObjectBounds::term_object(
+                FlakeValue::Ref(sid.clone()),
+                fluree_db_core::DatatypeConstraint::Explicit(
+                    fluree_db_core::edge::id_datatype_sid(),
+                ),
+            ))
+        }
+        (Function::TripleObject, Expression::Resolved(b)) if same_term => match b.as_ref() {
+            crate::binding::Binding::Lit { val, dtc, .. } => {
+                Some(ObjectBounds::term_object(val.clone(), dtc.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
