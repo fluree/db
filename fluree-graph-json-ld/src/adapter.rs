@@ -20,7 +20,10 @@
 //!   [`fluree_graph_ir::GraphSink::emit_quad`]); until this adapter uses it,
 //!   the behavior stays as-is rather than being silently folded into the
 //!   default graph.
-//! - **`@reverse`**: Reverse properties are not yet supported
+//! - **`@reverse`** and **`@included`** are read as the transaction parser
+//!   reads them: a reverse property's values are the subjects of statements
+//!   pointing at the node, and included nodes are described alongside it with
+//!   no linking statement.
 //!
 //! # Example
 //!
@@ -164,9 +167,34 @@ fn process_node<S: GraphSink>(
 
     // Process each predicate-object pair
     for (key, value) in obj {
-        // Skip JSON-LD keywords except @type
-        if key.starts_with('@') && key != "@type" {
-            continue;
+        match key.as_str() {
+            // Nodes described alongside this one, with no linking statement.
+            "@included" => {
+                for node in node_items(value, "@included")? {
+                    process_node(node, sink, None)?;
+                }
+                continue;
+            }
+            // Statements whose object is this node.
+            "@reverse" => {
+                let Value::Object(properties) = value else {
+                    return Err(AdapterError::InvalidStructure(
+                        "@reverse must be a map of properties".to_string(),
+                    ));
+                };
+                for (property, values) in properties {
+                    let predicate_id = sink.term_iri(property);
+                    for node in node_items(values, "a reverse property's value")? {
+                        if let ProcessedValue::Single(node_id) = process_value(node, sink)? {
+                            sink.emit_triple(node_id, predicate_id, subject_id)?;
+                        }
+                    }
+                }
+                continue;
+            }
+            // Skip other JSON-LD keywords except @type
+            k if k.starts_with('@') && k != "@type" => continue,
+            _ => {}
         }
 
         // Handle @type specially (maps to rdf:type)
@@ -212,6 +240,24 @@ fn process_node<S: GraphSink>(
     }
 
     Ok(subject_id)
+}
+
+/// The node objects of a keyword value (one node or an array of them).
+fn node_items<'v>(value: &'v Value, what: &str) -> Result<Vec<&'v Value>> {
+    let items: Vec<&Value> = match value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    if items.iter().any(|item| {
+        !item
+            .as_object()
+            .is_some_and(|m| !m.contains_key("@value") && !m.contains_key("@list"))
+    }) {
+        return Err(AdapterError::InvalidStructure(format!(
+            "{what} must hold node objects"
+        )));
+    }
+    Ok(items)
 }
 
 /// Process a value and return the processed result
@@ -1185,5 +1231,38 @@ mod tests {
         }]);
         to_graph_events(&expanded, &mut sink).unwrap();
         assert_eq!(sink.graph().len(), 1);
+    }
+
+    /// Bulk import reads `@reverse` and `@included` as the transaction
+    /// parser does; they used to be dropped.
+    #[test]
+    fn reverse_and_included_are_read_like_the_transaction_parser() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "parent": {"@reverse": "ex:child", "@type": "@id"}
+            },
+            "@id": "ex:kid",
+            "parent": "ex:mom",
+            "@included": [{"@id": "ex:other", "ex:p": 1}]
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&expanded, &mut sink).unwrap();
+        let graph = sink.graph();
+        assert_eq!(graph.len(), 2, "{graph:?}");
+        let iri = |t: &Term| match t {
+            Term::Iri(iri) => iri.to_string(),
+            other => format!("{other:?}"),
+        };
+        let child = graph
+            .iter()
+            .find(|t| iri(&t.p) == "http://example.org/child")
+            .expect("the reverse statement");
+        assert_eq!(iri(&child.s), "http://example.org/mom");
+        assert_eq!(iri(&child.o), "http://example.org/kid");
+        assert!(graph
+            .iter()
+            .any(|t| iri(&t.s) == "http://example.org/other"));
     }
 }

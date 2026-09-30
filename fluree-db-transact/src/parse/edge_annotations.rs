@@ -1931,6 +1931,32 @@ fn lower_object_with_subject(
             )));
         }
 
+        // Keywords that hold nodes or properties but are not edges of this
+        // node (a context alias counts as its keyword).
+        match keyword_of(&key, effective_json_ld) {
+            Some("@index") => continue,
+            // Included nodes are nodes in their own right, in this scope.
+            Some("@included") => {
+                if let Some(v) = map.get_mut(&key) {
+                    lower_value_with_subject(v, None, &child_walk, ctx)?;
+                }
+                continue;
+            }
+            // A reverse property's edge points at this node, and a nested
+            // value's properties are this node's: an annotation inside either
+            // would be lowered against the wrong edge.
+            Some(keyword @ ("@reverse" | "@nest")) => {
+                if map.get(&key).is_some_and(value_subtree_carries_annotation) {
+                    return Err(TransactError::Parse(format!(
+                        "edge annotations inside {keyword} are not supported; state the edge \
+                         as an ordinary property of its subject"
+                    )));
+                }
+                continue;
+            }
+            _ => {}
+        }
+
         let predicate = key.clone();
 
         // Mint the parent @id lazily — only if this predicate's value
@@ -1965,6 +1991,16 @@ fn lower_object_with_subject(
         }
     }
     Ok(())
+}
+
+/// The JSON-LD keyword `key` spells, directly or as a context alias.
+fn keyword_of<'a>(key: &'a str, ctx: &'a ParsedContext) -> Option<&'a str> {
+    if key.starts_with('@') {
+        return Some(key);
+    }
+    ctx.get(key)
+        .and_then(|entry| entry.id.as_deref())
+        .filter(|id| id.starts_with('@'))
 }
 
 /// Read an already-present subject id from a node-map, honoring the
