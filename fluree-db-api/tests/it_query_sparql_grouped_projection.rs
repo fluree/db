@@ -534,6 +534,28 @@ async fn implicit_grouping_via_having_checks_the_projection() {
     }
 }
 
+/// The SPARQL twin of `jsonld_key_only_alias_read_per_solution_stays_a_list`
+/// stays an error: a SELECT expression of a grouped level reading a non-key
+/// variable is V4 (SPARQL has no per-group lists), whatever earlier alias it
+/// also reads.
+#[tokio::test]
+async fn select_expression_reading_a_non_key_variable_is_v4() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/v4-moved-alias:main").await;
+    let query = format!(
+        "{PREFIX}SELECT ?a (STRLEN(?a) AS ?len) ((?len + STRLEN(STR(?e))) AS ?x) \
+         {W} GROUP BY ?a"
+    );
+    let err = support::query_sparql(&fluree, &ledger, &query)
+        .await
+        .expect_err("a SELECT expression reading a non-key variable");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("?e is projected but is neither a GROUP BY key nor aggregated"),
+        "{msg}"
+    );
+}
+
 /// An aggregate over an alias of the same SELECT clause reads it before the
 /// SELECT's Extend binds it; per the spec `COUNT(?seg)` would be 0 for every
 /// group. It used to count solutions (and expand `?seg`); it is now a named
