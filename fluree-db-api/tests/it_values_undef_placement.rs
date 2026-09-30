@@ -321,3 +321,41 @@ async fn jsonld_bind_reads_the_value_its_triple_binds_after_an_undef_cell() {
     expected.sort_by_key(ToString::to_string);
     assert_eq!(found, expected);
 }
+
+#[tokio::test]
+async fn jsonld_unwind_reads_the_value_its_triple_binds_after_an_undef_cell() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree, false).await;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": LEDGER_ID,
+        "select": ["?c", "?x"],
+        "where": [
+            ["values", ["?payer", [null, {"@type": "@id", "@value": "ex:payer1"}]]],
+            {"@id": "?c", "ex:payer": "?payer", "ex:patientAge": "?a"},
+            ["filter", "(> ?a 0)"],
+            ["unwind", "?x", "(list (str ?payer))"]
+        ]
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_tracked()
+        .await
+        .expect("query should succeed");
+    let mut found: Vec<JsonValue> = result.result.as_array().expect("rows").clone();
+    found.sort_by_key(ToString::to_string);
+
+    let mut expected: Vec<JsonValue> = (0..5)
+        .chain([1, 3])
+        .map(|i| {
+            json!([
+                format!("ex:claim{i}"),
+                format!("http://example.org/ns/payer{}", i % 2)
+            ])
+        })
+        .collect();
+    expected.sort_by_key(ToString::to_string);
+    assert_eq!(found, expected);
+}

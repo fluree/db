@@ -1500,12 +1500,13 @@ impl VarBinders {
 }
 
 /// Fill [`DeferredPattern::binders`] for each deferred FILTER, EXISTS, NOT
-/// EXISTS and BIND: one [`VarBinders`] per variable it reads that another
-/// pattern in the group binds, by original index. SPARQL applies a FILTER to
-/// its group wherever it is written (§18.2.2.6), so binders written after it
-/// count too. A BIND is placed by its dependencies rather than where it is
-/// written, so it waits on the same binders; otherwise a VALUES UNDEF column
-/// lets it run before the triple that actually binds the variable.
+/// EXISTS, BIND and UNWIND: one [`VarBinders`] per variable it reads that
+/// another pattern in the group binds, by original index. SPARQL applies a
+/// FILTER to its group wherever it is written (§18.2.2.6), so binders written
+/// after it count too. BIND and UNWIND are placed by their dependencies rather
+/// than where they are written, so they wait on the same binders; otherwise a
+/// VALUES UNDEF column lets them run before the triple that actually binds the
+/// variable.
 ///
 /// `seed_bound_in_every_row` are the seed variables no pattern can change;
 /// any other seed variable may be unbound on some rows and gets binders too.
@@ -1517,7 +1518,11 @@ fn attach_filter_binders(
     let waits_for_binders = |p: &Pattern| {
         matches!(
             p,
-            Pattern::Filter(_) | Pattern::Exists(_) | Pattern::NotExists(_) | Pattern::Bind { .. }
+            Pattern::Filter(_)
+                | Pattern::Exists(_)
+                | Pattern::NotExists(_)
+                | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
         )
     };
     if !deferred.iter().any(|dp| waits_for_binders(&dp.pattern)) {
