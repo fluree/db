@@ -55,6 +55,7 @@ use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue, MAX_TXN_META_BYTES, MAX_TXN_
 use fluree_graph_turtle::{tokenize, Token, TokenKind};
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// IRI reference for the transaction metadata named graph.
 ///
@@ -91,8 +92,9 @@ pub struct NamedGraphBlock {
     /// base triple is also present in `triples` (Fluree asserts it), so
     /// consumers emit the `f:reifies*` bundle from here and nothing else.
     pub reified: Vec<RawReifiedTriple>,
-    /// Prefix mappings from the TriG document (for IRI expansion).
-    pub prefixes: FxHashMap<String, String>,
+    /// The document's prefix mappings where the block appears (for IRI
+    /// expansion). Blocks with no directive between them share one map.
+    pub prefixes: Arc<FxHashMap<String, String>>,
 }
 
 /// One RDF 1.2 reifier attachment parsed inside a GRAPH block: `reifier`
@@ -138,8 +140,8 @@ pub struct TrigPhase1Result<'a> {
 /// Use `resolve_trig_meta()` to convert to `TxnMetaEntry` with namespace codes.
 #[derive(Debug, Clone)]
 pub struct RawTrigMeta {
-    /// Prefix mappings from the TriG document.
-    pub prefixes: FxHashMap<String, String>,
+    /// The document's prefix mappings where the txn-meta block appears.
+    pub prefixes: Arc<FxHashMap<String, String>>,
     /// Parsed triples from the txn-meta GRAPH block.
     pub triples: Vec<RawTriple>,
 }
@@ -457,8 +459,9 @@ struct TrigMetaParser<'a> {
     input: &'a str,
     tokens: &'a [Token],
     pos: usize,
-    /// Prefix mappings: prefix -> namespace IRI
-    prefixes: FxHashMap<String, String>,
+    /// Prefix mappings: prefix -> namespace IRI. Shared with the blocks parsed
+    /// since the last directive; a directive copies it only if one is.
+    prefixes: Arc<FxHashMap<String, String>>,
     /// Base IRI
     base: Option<String>,
     /// Collected directives (for reconstructing Turtle output)
@@ -512,7 +515,7 @@ struct GraphBlock {
     /// The prefix map where the block appears. Its prefixed names expand with
     /// this map, not the document's final one: a later `@prefix` must not
     /// rewrite them. (Directives cannot occur inside a block.)
-    prefixes: FxHashMap<String, String>,
+    prefixes: Arc<FxHashMap<String, String>>,
 }
 
 /// A reifier attachment before namespace resolution (see [`RawReifiedTriple`]).
@@ -576,7 +579,7 @@ impl<'a> TrigMetaParser<'a> {
             input,
             tokens,
             pos: 0,
-            prefixes: FxHashMap::default(),
+            prefixes: Arc::default(),
             base: None,
             directives: Vec::new(),
             default_triples: Vec::new(),
@@ -731,8 +734,8 @@ impl<'a> TrigMetaParser<'a> {
         // Get namespace IRI
         let namespace = self.parse_iri()?;
 
-        // Register prefix
-        self.prefixes.insert(prefix, namespace);
+        // Register prefix, copying the map only if a block still holds it
+        Arc::make_mut(&mut self.prefixes).insert(prefix, namespace);
 
         // Consume trailing dot if not SPARQL style
         if !is_sparql && self.check(&TokenKind::Dot) {
@@ -908,7 +911,7 @@ impl<'a> TrigMetaParser<'a> {
             iri: graph_iri,
             triples,
             reified,
-            prefixes: self.prefixes.clone(),
+            prefixes: Arc::clone(&self.prefixes),
         });
 
         Ok(())
@@ -1492,14 +1495,14 @@ impl<'a> TrigMetaParser<'a> {
 
     /// Extract txn-meta entries, named graphs, and reconstruct Turtle content.
     fn extract(
-        self,
+        mut self,
         ns_registry: &mut NamespaceRegistry,
     ) -> Result<(String, Vec<TxnMetaEntry>, Vec<NamedGraphBlock>)> {
         let mut txn_meta = Vec::new();
         let mut named_graphs = Vec::new();
 
-        // Process GRAPH blocks
-        for block in &self.graph_blocks {
+        // Process GRAPH blocks, moving each one's prefix map out
+        for block in std::mem::take(&mut self.graph_blocks) {
             if block.iri == TXN_META_GRAPH_IRI {
                 // txn-meta graph: extract as TxnMetaEntry
                 for triple in &block.triples {
@@ -1554,10 +1557,10 @@ impl<'a> TrigMetaParser<'a> {
                 let raw_triples = self.convert_to_raw_triples(&block.triples)?;
                 let reified = self.convert_reified_to_raw(&block.reified)?;
                 named_graphs.push(NamedGraphBlock {
-                    iri: block.iri.clone(),
+                    iri: block.iri,
                     triples: raw_triples,
                     reified,
-                    prefixes: block.prefixes.clone(),
+                    prefixes: block.prefixes,
                 });
             }
         }
@@ -1751,14 +1754,14 @@ impl<'a> TrigMetaParser<'a> {
     }
 
     /// Phase 1 extraction: return raw triples without namespace resolution.
-    fn extract_phase1(self) -> Result<TrigPhase1Result<'static>> {
+    fn extract_phase1(mut self) -> Result<TrigPhase1Result<'static>> {
         let turtle = self.default_graph_turtle();
 
         let mut raw_meta: Option<RawTrigMeta> = None;
         let mut named_graphs: Vec<NamedGraphBlock> = Vec::new();
 
-        // Process all GRAPH blocks
-        for block in &self.graph_blocks {
+        // Process all GRAPH blocks, moving each one's prefix map out
+        for block in std::mem::take(&mut self.graph_blocks) {
             if block.iri == TXN_META_GRAPH_IRI {
                 // txn-meta graph: convert to RawTrigMeta
                 let mut triples = Vec::new();
@@ -1845,7 +1848,7 @@ impl<'a> TrigMetaParser<'a> {
                 }
 
                 raw_meta = Some(RawTrigMeta {
-                    prefixes: block.prefixes.clone(),
+                    prefixes: block.prefixes,
                     triples,
                 });
             } else {
@@ -1853,10 +1856,10 @@ impl<'a> TrigMetaParser<'a> {
                 let raw_triples = self.convert_to_raw_triples(&block.triples)?;
                 let reified = self.convert_reified_to_raw(&block.reified)?;
                 named_graphs.push(NamedGraphBlock {
-                    iri: block.iri.clone(),
+                    iri: block.iri,
                     triples: raw_triples,
                     reified,
-                    prefixes: block.prefixes.clone(),
+                    prefixes: block.prefixes,
                 });
             }
         }
