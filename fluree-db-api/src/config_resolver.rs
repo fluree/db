@@ -106,7 +106,7 @@ async fn resolve_config_sid(
 
 /// Every `f:LedgerConfig` subject in the config graph as-of `to_t`, ordered by
 /// decoded IRI (the first is the one the reader uses).
-async fn ledger_config_subjects(
+pub(crate) async fn ledger_config_subjects(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     to_t: i64,
