@@ -708,7 +708,9 @@ impl Fluree {
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no default graphs"))?;
 
-        let runtime_dataset = dataset.as_runtime_dataset();
+        let runtime_dataset = self
+            .runtime_dataset(dataset, executable.query.union_default_graph)
+            .await?;
 
         let db = primary.as_graph_db_ref();
 
@@ -731,7 +733,7 @@ impl Fluree {
         // the `DatasetOperator` deduplicates across members.
         prepare_config.planning = prepare_config
             .planning
-            .with_multi_default_graph(dataset.default.len() >= 2);
+            .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
         let prepared = prepare_execution_with_config(db, executable, &prepare_config)
             .await
             .map_err(query_error_to_api_error)?;
@@ -889,7 +891,10 @@ impl Fluree {
             fluree_db_query::QueryError::InvalidQuery("Dataset has no default graphs".into())
         })?;
 
-        let runtime_dataset = dataset.as_runtime_dataset();
+        let runtime_dataset = self
+            .runtime_dataset(dataset, executable.query.union_default_graph)
+            .await
+            .map_err(|e| fluree_db_query::QueryError::Internal(e.to_string()))?;
 
         let db = primary.as_graph_db_ref();
 
@@ -912,7 +917,7 @@ impl Fluree {
         // a set (SPARQL §13.2), so the planner enforces triple-identity dedup.
         prepare_config.planning = prepare_config
             .planning
-            .with_multi_default_graph(dataset.default.len() >= 2);
+            .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
         let prepared = prepare_execution_with_config(db, executable, &prepare_config).await?;
 
         let primary_ledger_id: &str = primary.ledger_id.as_ref();

@@ -19,6 +19,7 @@ const NAMES: &[(&str, Form)] = &[
     ("reasoning-max-seconds", Form::Query),
     ("reasoning-max-memory-mb", Form::Query),
     ("include-system-facts", Form::Query),
+    ("union-default-graph", Form::Query),
     ("min-t", Form::Query),
     ("meta", Form::Both),
     ("max-fuel", Form::Both),
@@ -117,6 +118,7 @@ impl Request<'_> {
             "reasoning-max-seconds" => pragmas.reasoning_max_seconds = Some(value.to_string()),
             "reasoning-max-memory-mb" => pragmas.reasoning_max_memory_mb = Some(value.to_string()),
             "include-system-facts" => pragmas.include_system_facts = Some(boolean(name, value)?),
+            "union-default-graph" => pragmas.union_default_graph = Some(boolean(name, value)?),
             "min-t" => {
                 pragmas.min_t = Some(
                     value

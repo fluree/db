@@ -379,6 +379,14 @@ pub struct Query {
     /// rejection is the contract-level boundary; this flag only
     /// relaxes the per-row scan filter for `?p`-shape patterns.
     pub include_system_facts: bool,
+    /// The request's own union default graph switch: `Some(true)` reads the
+    /// default graph as the union of the ledger's default graph and its named
+    /// graphs, `Some(false)` reads the default graph alone, and `None` defers
+    /// to the ledger's `f:unionDefaultGraph` setting. Surfaced via
+    /// `opts.unionDefaultGraph` on JSON-LD queries and
+    /// `# PRAGMA union-default-graph` on SPARQL. It governs only a default
+    /// graph the query does not narrow to named graphs of its own.
+    pub union_default_graph: Option<bool>,
     /// `@vocab` prefix of the ledger context a Cypher query was lowered
     /// against, if any. Read by `labels()`/`type()`/`keys()`/`properties()`
     /// evaluation so IRI compaction matches `db.labels()`: strip the vocab
@@ -407,6 +415,7 @@ impl Query {
             reasoning: ReasoningConfig::default(),
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: crate::binding::UnmatchedOptional::Unbound,
         }
@@ -430,6 +439,7 @@ impl Query {
             reasoning: self.reasoning.clone(),
             post_values: self.post_values.clone(),
             include_system_facts: self.include_system_facts,
+            union_default_graph: self.union_default_graph,
             cypher_vocab: self.cypher_vocab.clone(),
             unmatched_optional: self.unmatched_optional,
         }

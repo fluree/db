@@ -76,6 +76,11 @@ pub struct Pragmas {
     /// edge-annotation encoding in variable-predicate scans (JSON-LD
     /// `opts.includeSystemFacts`). Queries only.
     pub include_system_facts: Option<bool>,
+    /// `# PRAGMA union-default-graph: true | false` — read the default graph
+    /// as the union of the ledger's graphs, or not, whatever the ledger's
+    /// `f:unionDefaultGraph` says (JSON-LD `opts.unionDefaultGraph`). Queries
+    /// only.
+    pub union_default_graph: Option<bool>,
     /// `# PRAGMA meta: true | false | time, fuel, policy` — report tracking
     /// metadata (JSON-LD `opts.meta`).
     pub meta: Option<MetaPragma>,

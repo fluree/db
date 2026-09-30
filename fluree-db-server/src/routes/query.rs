@@ -1306,8 +1306,9 @@ pub async fn query_get(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
-    if let Some(description) = service_description(&uri, &params, &credential)? {
-        return Ok(description);
+    if wants_service_description(&params, &credential) {
+        // The connection endpoint's default graph is whatever `FROM` names.
+        return service_description(&uri, &credential, false);
     }
     query(State(state), params, headers, bearer, credential).await
 }
@@ -1322,8 +1323,9 @@ pub async fn query_ledger_get(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
-    if let Some(description) = service_description(&uri, &params, &credential)? {
-        return Ok(description);
+    if wants_service_description(&params, &credential) {
+        let union = ledger_union_default_graph(&state, &ledger, &bearer, &credential).await;
+        return service_description(&uri, &credential, union);
     }
     query_ledger(
         State(state),
@@ -1338,18 +1340,49 @@ pub async fn query_ledger_get(
 }
 
 /// SPARQL Service Description §2: a `GET` on a SPARQL endpoint with no query
-/// returns an RDF description of the service, in the graph format `Accept`
-/// asks for. `None` when the request carries a query. It describes the
-/// endpoint's capabilities, not data; it sits behind the same authentication
-/// as the endpoint, which the extractors apply before this runs.
+/// returns an RDF description of the service, which a `GET` carrying a query
+/// or a body does not ask for.
+fn wants_service_description(params: &SparqlParams, credential: &MaybeCredential) -> bool {
+    params.query.is_none() && credential.body.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Whether `ledger`'s endpoint claims `sd:UnionDefaultGraph`: its
+/// `f:unionDefaultGraph` setting. Off when the caller's token may not read the
+/// ledger or the ledger cannot be loaded, so a description never becomes an
+/// error, nor a probe of a ledger the caller cannot see.
+async fn ledger_union_default_graph(
+    state: &AppState,
+    ledger: &str,
+    bearer: &MaybeDataBearer,
+    credential: &MaybeCredential,
+) -> bool {
+    let Ok(path) = PathLedger::parse(ledger) else {
+        return false;
+    };
+    if let Some(p) = bearer.0.as_ref() {
+        let readable = crate::error::scope_id(&path.ledger).is_ok_and(|id| p.can_read(&id));
+        if !credential.is_signed() && !readable {
+            return false;
+        }
+    }
+    let Ok(view) = state.fluree.db(&path.ledger).await else {
+        return false;
+    };
+    view.ledger_config()
+        .and_then(|c| c.query.as_ref())
+        .and_then(|q| q.union_default_graph)
+        .unwrap_or(false)
+}
+
+/// The endpoint's SPARQL service description, in the graph format `Accept`
+/// asks for. It describes the endpoint's capabilities, not data; it sits
+/// behind the same authentication as the endpoint, which the extractors apply
+/// before this runs.
 fn service_description(
     uri: &axum::http::Uri,
-    params: &SparqlParams,
     credential: &MaybeCredential,
-) -> Result<Option<Response>> {
-    if params.query.is_some() || !credential.body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(None);
-    }
+    union_default_graph: bool,
+) -> Result<Response> {
     let header = |name: &str| {
         credential
             .headers
@@ -1371,15 +1404,17 @@ fn service_description(
         .or_else(|| header("host"))
         .unwrap_or("localhost");
     let endpoint = format!("{scheme}://{host}{}", uri.path());
-    let body = fluree_db_api::sparql_service_description(&endpoint, &format.formatter())
-        .map_err(|e| ServerError::internal(e.to_string()))?;
-    Ok(Some(
-        (
-            [(axum::http::header::CONTENT_TYPE, format.content_type())],
-            body,
-        )
-            .into_response(),
-    ))
+    let body = fluree_db_api::sparql_service_description(
+        &endpoint,
+        union_default_graph,
+        &format.formatter(),
+    )
+    .map_err(|e| ServerError::internal(e.to_string()))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, format.content_type())],
+        body,
+    )
+        .into_response())
 }
 
 pub async fn query_ledger_tail(

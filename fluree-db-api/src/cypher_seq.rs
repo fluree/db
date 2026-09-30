@@ -451,7 +451,8 @@ impl Fluree {
     }
 
     /// A queryable, default-context-attached (and policy-wrapped when the
-    /// governance carries policy inputs) view of the current virtual state.
+    /// governance carries policy inputs) view of the current virtual state's
+    /// default graph.
     async fn seq_probe_view(
         &self,
         state: &LedgerState,
@@ -459,10 +460,14 @@ impl Fluree {
         default_context: Option<&serde_json::Value>,
     ) -> Result<GraphDb> {
         let view = GraphDb::from_ledger_state(state).with_default_context(default_context.cloned());
-        match governance {
-            Some(g) if g.has_any_policy_inputs() => self.wrap_policy(view, g).await,
-            _ => Ok(view),
-        }
+        let view = match governance {
+            Some(g) if g.has_any_policy_inputs() => self.wrap_policy(view, g).await?,
+            _ => view,
+        };
+        // A write statement's reads see the default graph alone, whatever the
+        // ledger's union default graph: its writes stage against that graph,
+        // as a transaction's WHERE reads it.
+        Ok(view.with_union_default_graph(false))
     }
 
     /// A [`seq_probe_view`](Self::seq_probe_view) that reads asserted data

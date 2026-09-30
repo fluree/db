@@ -173,6 +173,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         }
@@ -192,6 +193,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         }
@@ -336,6 +338,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -364,6 +367,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         }

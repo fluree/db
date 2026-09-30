@@ -2915,6 +2915,7 @@ fn test_request_option_pragmas() {
          # PRAGMA policy-values: {\"?dept\": \"sales\"}\n\
          # PRAGMA default-allow: FALSE\n\
          # PRAGMA include-system-facts: true\n\
+         # PRAGMA union-default-graph: false\n\
          SELECT * WHERE { }",
     );
     let p = &ast.pragmas;
@@ -2942,6 +2943,7 @@ fn test_request_option_pragmas() {
     );
     assert_eq!(p.default_allow, Some(false));
     assert_eq!(p.include_system_facts, Some(true));
+    assert_eq!(p.union_default_graph, Some(false));
     assert!(p.has_policy_selection());
 
     let all = assert_parses("# PRAGMA meta: true\nSELECT * WHERE { }");
@@ -2969,6 +2971,7 @@ fn test_malformed_pragma_values_rejected() {
         ("meta:", "expects true, false"),
         ("default-allow: yes", "true or false"),
         ("include-system-facts:", "true or false"),
+        ("union-default-graph: yes", "true or false"),
         ("identity: did:a did:b", "one IRI"),
         ("identity:", "one IRI"),
         ("policy-class:", "at least one IRI"),
@@ -3070,7 +3073,12 @@ fn test_request_pragmas_helper() {
 /// to both forms.
 #[test]
 fn test_pragma_form_applicability() {
-    for pragma in ["min-t: 1", "reasoning: rdfs", "include-system-facts: true"] {
+    for pragma in [
+        "min-t: 1",
+        "reasoning: rdfs",
+        "include-system-facts: true",
+        "union-default-graph: true",
+    ] {
         let errors = pragma_errors(&format!(
             "# PRAGMA {pragma}\nINSERT DATA {{ <urn:s> <urn:p> 1 }}"
         ));

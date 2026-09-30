@@ -890,7 +890,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
 
     // Precompute which graphs in the dataset are R2RML-backed.
-    if let (Some(r2rml_provider), Some(dataset)) = (ctx.r2rml_provider, ctx.dataset) {
+    if let (Some(r2rml_provider), Some(dataset)) = (ctx.r2rml_provider, ctx.explicit_dataset()) {
         let mut r2rml_ids = std::collections::HashSet::new();
         for graph_ref in dataset.default_graphs() {
             let is_r2rml = r2rml_provider.has_r2rml_mapping(&graph_ref.ledger_id).await;
@@ -910,7 +910,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
     // Also check the primary snapshot's ledger_id (for single-source graph source queries)
     if let Some(provider) = ctx.r2rml_provider {
-        if ctx.dataset.is_none() {
+        if ctx.explicit_dataset().is_none() {
             let is_r2rml = provider.has_r2rml_mapping(&db.snapshot.ledger_id).await;
             if is_r2rml {
                 ctx.r2rml_graph_ids
@@ -935,6 +935,14 @@ pub async fn execute<'a>(
     query: &ExecutableQuery,
     config: ContextConfig<'a, '_>,
 ) -> Result<Vec<Batch>> {
-    let prepared = prepare_execution(db, query).await?;
+    // A `>= 2`-member default graph is a set (SPARQL §13.2); plan for it as
+    // the dataset paths do, so the members' scans deduplicate on full rows.
+    let mut prepare_config = PrepareConfig::default();
+    prepare_config.planning = prepare_config.planning.with_multi_default_graph(
+        config
+            .dataset
+            .is_some_and(|ds| ds.default_graphs().len() >= 2),
+    );
+    let prepared = prepare_execution_with_config(db, query, &prepare_config).await?;
     execute_prepared(db, vars, prepared, config).await
 }

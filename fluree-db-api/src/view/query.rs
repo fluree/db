@@ -1386,6 +1386,13 @@ impl Fluree {
         self.apply_reasoning_to_executable(db, &mut executable, !db.is_root(), server_identity)
             .await?;
 
+        // Settle the union default graph here, beside the other config
+        // defaults: execution reads only the settled switch.
+        executable.query.union_default_graph = Some(
+            self.reads_union_default_graph(db, parsed.union_default_graph)
+                .await?,
+        );
+
         Ok(executable)
     }
 
@@ -1765,15 +1772,21 @@ impl Fluree {
         options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let db_ref = db.as_graph_db_ref();
+        let union = super::union_default_dataset(db, executable);
         // Single-graph view: no dataset-level history detection — current state.
         // Single ledger + root policy ⇒ semantic stats rewrites (redundant
         // `rdf:type` elision) are sound; a non-root enforcer hides rows and must
-        // not allow it.
-        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
-        let prepare_config = PrepareConfig::current_with_semantic_elision(
+        // not allow it, and a union default graph reads past the default
+        // graph's stats.
+        let allow_semantic_elision =
+            union.is_none() && db.policy_enforcer().is_none_or(|p| p.is_root());
+        let mut prepare_config = PrepareConfig::current_with_semantic_elision(
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(union.is_some());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(query_error_to_api_error)?;
@@ -1791,6 +1804,7 @@ impl Fluree {
             options,
             Some((r2rml.provider, r2rml.table_provider)),
         );
+        config.dataset = union.as_ref();
 
         execute_prepared(db_ref, vars, prepared, config)
             .await
@@ -1838,13 +1852,19 @@ impl Fluree {
         tracker.record_policy_enforcement(db.policy_enforcement());
 
         let db_ref = db.as_graph_db_ref();
+        let union = super::union_default_dataset(db, executable);
         // Single-graph view: no dataset-level history detection — current state.
-        // Single ledger + root policy ⇒ semantic stats rewrites are sound.
-        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
-        let prepare_config = PrepareConfig::current_with_semantic_elision(
+        // Single ledger + root policy ⇒ semantic stats rewrites are sound,
+        // unless a union default graph reads past the default graph's stats.
+        let allow_semantic_elision =
+            union.is_none() && db.policy_enforcer().is_none_or(|p| p.is_root());
+        let mut prepare_config = PrepareConfig::current_with_semantic_elision(
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(union.is_some());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config).await?;
 
         crate::graph_source::pin_graph_source_times([db], r2rml.table_provider)?;
@@ -1858,6 +1878,7 @@ impl Fluree {
             options,
             Some((r2rml.provider, r2rml.table_provider)),
         );
+        config.dataset = union.as_ref();
 
         execute_prepared(db_ref, vars, prepared, config).await
     }
