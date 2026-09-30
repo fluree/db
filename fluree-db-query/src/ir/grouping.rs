@@ -1,6 +1,8 @@
 //! Grouping: how a query partitions its solution stream and what aggregate
 //! functions it computes per group.
 
+use std::collections::HashSet;
+
 use fluree_db_core::NonEmpty;
 
 use super::expression::Expression;
@@ -394,10 +396,189 @@ impl Grouping {
     }
 }
 
+/// Where a SELECT-clause expression `(expr AS ?alias)` of one query level is
+/// evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectExprPlacement {
+    /// A WHERE `BIND`, evaluated once per solution before grouping.
+    PreGroup,
+    /// A per-group `Extend` in [`Grouping`]'s `binds`, evaluated once per
+    /// group after HAVING (SPARQL 1.1 §18.2.4.4).
+    PostGroup,
+}
+
+/// Places the SELECT expressions of one query level, in SELECT order. The one
+/// placement rule for every surface (SPARQL and JSON-LD share it).
+///
+/// In a level that does not group, every expression is a WHERE bind. In a
+/// grouping level an expression runs once per group, after HAVING, unless one
+/// of these keeps it before grouping:
+///
+/// - its alias is a group key (the key has to exist before grouping: the
+///   `GROUP BY (LCASE(?a))` + `(LCASE(?a) AS ?k)` shortcut, a JSON-LD
+///   `groupBy` naming a computed alias);
+/// - an aggregate of the same level reads the alias (JSON-LD
+///   `(as (str ?a) ?s)` + `(count ?s)` counts per-solution values; SPARQL
+///   rejects the shape before lowering);
+/// - it reads a variable the pre-group pipeline binds that is not a group key,
+///   and no aggregate output or earlier per-group alias. That is JSON-LD's
+///   documented per-group list (`(as (str ?e) ?es)` under `groupBy ?a`).
+///   SPARQL's validator rejects the shape.
+///
+/// An expression that reads an aggregate output or an earlier per-group alias
+/// always runs per group. A variable nothing binds before grouping (a typo, or
+/// a variable internal to an `EXISTS`) is unbound either way, so it does not
+/// hold an expression back.
+#[derive(Debug)]
+pub struct SelectExprPlacer {
+    grouped: bool,
+    keys: HashSet<VarId>,
+    aggregate_outputs: HashSet<VarId>,
+    aggregate_inputs: HashSet<VarId>,
+    where_vars: HashSet<VarId>,
+    post_aliases: HashSet<VarId>,
+}
+
+impl SelectExprPlacer {
+    /// A placer for a level that does not group: everything is pre-group.
+    pub fn ungrouped() -> Self {
+        Self {
+            grouped: false,
+            keys: HashSet::new(),
+            aggregate_outputs: HashSet::new(),
+            aggregate_inputs: HashSet::new(),
+            where_vars: HashSet::new(),
+            post_aliases: HashSet::new(),
+        }
+    }
+
+    /// A placer for a grouping level. `where_vars` are the variables the
+    /// level's pre-group pipeline binds.
+    pub fn grouped<'a>(
+        keys: impl IntoIterator<Item = VarId>,
+        aggregates: impl IntoIterator<Item = &'a AggregateSpec>,
+        where_vars: HashSet<VarId>,
+    ) -> Self {
+        let mut aggregate_outputs = HashSet::new();
+        let mut aggregate_inputs = HashSet::new();
+        for spec in aggregates {
+            aggregate_outputs.insert(spec.output_var);
+            // `COUNT(DISTINCT *)` reads the solution, not a SELECT alias, so
+            // `input_var()` (None for it) is the right question.
+            aggregate_inputs.extend(spec.function.input_var());
+        }
+        Self {
+            grouped: true,
+            keys: keys.into_iter().collect(),
+            aggregate_outputs,
+            aggregate_inputs,
+            where_vars,
+            post_aliases: HashSet::new(),
+        }
+    }
+
+    /// Place `(expr AS ?alias)`, the next expression in SELECT order, and
+    /// record the decision for the expressions after it.
+    pub fn place(&mut self, alias: VarId, expr: &Expression) -> SelectExprPlacement {
+        let placement = self.placement(alias, expr);
+        match placement {
+            SelectExprPlacement::PostGroup => {
+                self.post_aliases.insert(alias);
+            }
+            SelectExprPlacement::PreGroup => {
+                self.where_vars.insert(alias);
+            }
+        }
+        placement
+    }
+
+    /// Record an expression that runs per group regardless of the rule: an
+    /// expression containing an aggregate.
+    pub fn record_post_group(&mut self, alias: VarId) {
+        self.post_aliases.insert(alias);
+    }
+
+    fn placement(&self, alias: VarId, expr: &Expression) -> SelectExprPlacement {
+        if !self.grouped {
+            return SelectExprPlacement::PreGroup;
+        }
+        let refs = expr.referenced_vars();
+        if refs
+            .iter()
+            .any(|v| self.aggregate_outputs.contains(v) || self.post_aliases.contains(v))
+        {
+            return SelectExprPlacement::PostGroup;
+        }
+        if self.keys.contains(&alias) || self.aggregate_inputs.contains(&alias) {
+            return SelectExprPlacement::PreGroup;
+        }
+        let reads_ungrouped = refs
+            .iter()
+            .any(|v| self.where_vars.contains(v) && !self.keys.contains(v));
+        if reads_ungrouped {
+            SelectExprPlacement::PreGroup
+        } else {
+            SelectExprPlacement::PostGroup
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::var_registry::VarId;
+    use fluree_db_core::FlakeValue;
+
+    #[test]
+    fn select_expr_placement_rule() {
+        use SelectExprPlacement::{PostGroup, PreGroup};
+        let (a, e, n, nosuch) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let count_e = AggregateSpec {
+            function: AggregateFn::Count(e),
+            output_var: n,
+        };
+        let where_vars: HashSet<VarId> = [a, e].into_iter().collect();
+        let var = Expression::Var;
+        let mut placer = SelectExprPlacer::grouped([a], [&count_e], where_vars.clone());
+
+        // Key-only and constant expressions run once per group.
+        assert_eq!(placer.place(VarId(10), &var(a)), PostGroup);
+        assert_eq!(
+            placer.place(VarId(11), &Expression::Const(FlakeValue::Long(1))),
+            PostGroup
+        );
+        // A variable nothing binds before grouping does not hold it back.
+        assert_eq!(placer.place(VarId(12), &var(nosuch)), PostGroup);
+        // An aggregate output or an earlier per-group alias: per group.
+        assert_eq!(placer.place(VarId(13), &var(n)), PostGroup);
+        assert_eq!(placer.place(VarId(14), &var(VarId(10))), PostGroup);
+        // A non-key WHERE variable: before grouping (JSON-LD's per-group list).
+        assert_eq!(placer.place(VarId(15), &var(e)), PreGroup);
+        // ...and so does an expression over that pre-group alias.
+        assert_eq!(placer.place(VarId(16), &var(VarId(15))), PreGroup);
+        // Reading an aggregate output wins over a non-key read: per group, where
+        // the plan-time check rejects the non-key read.
+        assert_eq!(
+            placer.place(VarId(17), &Expression::add(var(n), var(e))),
+            PostGroup
+        );
+
+        // The alias is a key: it has to exist before grouping.
+        let mut placer = SelectExprPlacer::grouped([a, VarId(20)], [&count_e], where_vars.clone());
+        assert_eq!(placer.place(VarId(20), &var(a)), PreGroup);
+
+        // The alias is an aggregate input: before grouping.
+        let count_alias = AggregateSpec {
+            function: AggregateFn::Count(VarId(21)),
+            output_var: VarId(22),
+        };
+        let mut placer = SelectExprPlacer::grouped([a], [&count_alias], where_vars);
+        assert_eq!(placer.place(VarId(21), &var(a)), PreGroup);
+
+        // A level that does not group: always a WHERE bind.
+        let mut placer = SelectExprPlacer::ungrouped();
+        assert_eq!(placer.place(VarId(30), &var(n)), PreGroup);
+    }
 
     #[test]
     fn duplicate_insensitive_partitions_aggregates() {
