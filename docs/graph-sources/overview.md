@@ -215,7 +215,7 @@ Iceberg graph sources are queried just like ledgers. No special syntax is needed
 
 **As a direct target:**
 ```sparql
--- Query the graph source directly
+# Query the graph source directly
 SELECT ?s ?p ?o FROM <execution-log:main> WHERE { ?s ?p ?o } LIMIT 10
 ```
 
@@ -277,13 +277,13 @@ For genuinely unbounded traversal, materialize the graph source into a native le
 Patterns reach a graph source only inside a `GRAPH <gs_id> { … }` block. Fluree adds that block automatically when you address a graph source directly — but **not** to a query that already contains a `GRAPH` block of its own, since that is taken as explicit scoping. In a query that mixes the two, any triple pattern left at the top level has nothing to route it, and it returns **HTTP 400 `err:db/InvalidQuery`**:
 
 ```sparql
--- Refused: `?order ex:total ?total` is outside every GRAPH block
+# Refused: `?order ex:total ?total` is outside every GRAPH block
 SELECT ?total ?item FROM <warehouse-orders:main> WHERE {
   ?order ex:total ?total .
   GRAPH <warehouse-items:main> { ?order ex:item ?item }
 }
 
--- Correct: every pattern is scoped
+# Correct: every pattern is scoped
 SELECT ?total ?item FROM <warehouse-orders:main> WHERE {
   GRAPH <warehouse-orders:main> { ?order ex:total ?total }
   GRAPH <warehouse-items:main> { ?order ex:item ?item }

@@ -77,7 +77,7 @@ The suffix forms are `@t:5`, `@t:latest`, `@time:2025-01-15T00:00:00Z`, `@record
 
 ### SPARQL with a time specifier
 
-The `@t:` suffix is parsed on ledger references inside a `FROM` clause, which means SPARQL time travel goes through the **connection-scoped** endpoint:
+The `@t:` suffix is parsed on ledger references inside a `FROM` clause. That works on the connection-scoped endpoint, and on a ledger-scoped endpoint when the `FROM` names the path's ledger. A `FROM` makes that graph the query's default graph; to read the whole ledger at a time, named graphs included, pin the ledger path instead (see [HTTP API](#http-api) below):
 
 ```sparql
 PREFIX schema: <http://schema.org/>
