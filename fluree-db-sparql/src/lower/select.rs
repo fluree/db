@@ -167,19 +167,31 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// the SELECT expressions. Shared by the top level and sub-SELECTs.
     ///
     /// `patterns` are the level's WHERE patterns; the WHERE-side additions are
-    /// appended to them. `having_unbound` are the variables of the level's
-    /// trailing VALUES clause that its WHERE does not bind: the clause joins
-    /// after HAVING (§18.2.4), so HAVING reads them as unbound.
+    /// appended to them. `trailing_values` is the level's trailing VALUES
+    /// clause, which the caller joins right after the WHERE, before grouping,
+    /// where it restricts the aggregates' input (a deliberate deviation from
+    /// §18.2.4.3, which joins it after HAVING). Its variables are therefore
+    /// bound before grouping, except to HAVING: HAVING reads the ones the
+    /// WHERE does not bind as unbound, as it would after HAVING.
     pub(super) fn lower_select_level(
         &mut self,
         select: &SelectClause,
         modifiers: &SolutionModifiers,
         patterns: &mut Vec<Pattern>,
-        having_unbound: &HashSet<VarId>,
+        trailing_values: Option<&Pattern>,
     ) -> Result<LoweredSelectLevel> {
         let mut where_vars = produced_vars_of(patterns);
+        let values_vars = trailing_values
+            .map(Pattern::produced_vars)
+            .unwrap_or_default();
+        let having_unbound: HashSet<VarId> = values_vars
+            .iter()
+            .copied()
+            .filter(|v| !where_vars.contains(v))
+            .collect();
+        where_vars.extend(values_vars);
         let mut lowered =
-            self.lower_solution_modifiers(modifiers, select, &where_vars, having_unbound)?;
+            self.lower_solution_modifiers(modifiers, select, &where_vars, &having_unbound)?;
         // One definition of "groups": validation (V4) reads it off the AST,
         // lowering off the lowered keys and aggregates.
         debug_assert_eq!(
@@ -315,9 +327,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Lower solution modifiers (DISTINCT, LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING)
     ///
     /// `where_vars` are the variables the level binds before grouping: its
-    /// WHERE, and a sub-SELECT's trailing VALUES, which joins there.
-    /// `having_unbound` are the trailing VALUES variables its WHERE does not
-    /// bind (see [`Self::lower_select_level`]).
+    /// WHERE and its trailing VALUES, which joins there. `having_unbound` are
+    /// the trailing VALUES variables its WHERE does not bind (see
+    /// [`Self::lower_select_level`]).
     pub(super) fn lower_solution_modifiers(
         &mut self,
         modifiers: &SolutionModifiers,
@@ -459,11 +471,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             group_by = self.collect_non_aggregate_select_vars(select);
         }
 
-        // A trailing VALUES clause joins after HAVING (§18.2.4), so HAVING reads
-        // its variables as unbound unless the level binds them first: in the
-        // WHERE (the caller left those out), as a key or as an aggregate. This
-        // runs before the SAMPLE rewrite below, which a sub-SELECT's VALUES
-        // variables would otherwise reach (its VALUES joins before grouping).
+        // In the spec a trailing VALUES clause joins after HAVING (§18.2.4), so
+        // HAVING reads its variables as unbound unless the level binds them
+        // itself: in the WHERE (the caller left those out), as a key or as an
+        // aggregate. This runs before the SAMPLE rewrite below, which they
+        // would otherwise reach: Fluree joins VALUES before grouping.
         if let Some(having) = having.as_mut() {
             let unbound: HashSet<VarId> = having_unbound
                 .iter()
@@ -771,27 +783,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let mut patterns = self.lower_graph_pattern(&subselect.pattern)?;
 
         // Trailing VALUES clause (`SubSelect ::= … SolutionModifier
-        // ValuesClause`): joined with the subquery's WHERE result by
-        // appending the VALUES table to the subquery's own pattern list —
-        // i.e. before this subquery's projection/modifiers. For a
+        // ValuesClause`): joined with the subquery's WHERE result by placing
+        // the VALUES table right after the WHERE patterns — i.e. before this
+        // subquery's projection/modifiers, as at the top level. For a
         // modifier-free subquery this is exactly the spec's
         // `M := Join(M, ToMultiSet(data))` insertion point (§18.2.4.3, which
-        // applies VALUES before Project); with GROUP BY it approximates the
-        // spec by joining before grouping rather than after HAVING. HAVING
-        // still reads the VALUES variables the WHERE does not bind as unbound,
-        // as it would after HAVING (`lower_select_level`). Appended before the
-        // `SELECT *` var computation below so VALUES-introduced variables are
-        // in scope of `*`.
-        let mut having_unbound: HashSet<VarId> = HashSet::new();
-        if let Some(values) = &subselect.values {
-            let values = self.lower_graph_pattern(values)?;
-            let where_vars = produced_vars_of(&patterns);
-            having_unbound = produced_vars_of(&values)
-                .into_iter()
-                .filter(|v| !where_vars.contains(v))
-                .collect();
-            patterns.extend(values);
-        }
+        // applies VALUES before Project); with GROUP BY it joins before
+        // grouping rather than after HAVING (see `lower_select_level`). Its
+        // variables are in scope of `SELECT *`.
+        let mut trailing_values: Vec<Pattern> = match &subselect.values {
+            Some(values) => self.lower_graph_pattern(values)?,
+            None => Vec::new(),
+        };
 
         // Build a SelectClause so the shared SELECT/modifier lowering applies.
         // REDUCED is treated as DISTINCT (handled when assembling the pattern).
@@ -817,7 +820,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SelectVariables::Star => {
                 let mut seen: HashSet<VarId> = HashSet::new();
                 let mut select: Vec<VarId> = Vec::new();
-                for p in &patterns {
+                for p in patterns.iter().chain(&trailing_values) {
                     for v in p.produced_vars() {
                         if seen.insert(v) {
                             select.push(v);
@@ -840,12 +843,22 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         // Solution modifiers, SELECT expressions and HAVING through the same
         // path as a top-level SELECT.
-        let level = self.lower_select_level(
-            &select_clause,
-            &subselect.modifiers,
-            &mut patterns,
-            &having_unbound,
-        )?;
+        let where_len = patterns.len();
+        let level = match trailing_values.as_slice() {
+            [values @ Pattern::Values { .. }] => self.lower_select_level(
+                &select_clause,
+                &subselect.modifiers,
+                &mut patterns,
+                Some(values),
+            )?,
+            _ => {
+                // Not a single VALUES table (never produced for a trailing
+                // VALUES clause): join it with the WHERE like any pattern.
+                patterns.append(&mut trailing_values);
+                self.lower_select_level(&select_clause, &subselect.modifiers, &mut patterns, None)?
+            }
+        };
+        patterns.splice(where_len..where_len, trailing_values);
 
         // `SELECT *` of a grouping level projects its keys; implicit grouping
         // has none, so the sub-SELECT exports nothing and keeps its row count.

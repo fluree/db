@@ -79,33 +79,8 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     // Reverse so indices match the forward (execution) order of binds.
     required_bind_vars.reverse();
 
-    // A grouped query joins its trailing VALUES clause right after HAVING
-    // (SPARQL 1.1 §18.2.4): HAVING's output must carry the variables it joins
-    // on. (Its other variables come from the VALUES rows.)
-    let grouped_post_values = match (&query.post_values, &query.grouping) {
-        (Some(Pattern::Values { vars, .. }), Some(_)) => Some(vars),
-        _ => None,
-    };
-    if let Some(vars) = grouped_post_values {
-        deps.extend(vars.iter().copied());
-    }
-
     // Record what HAVING's output must contain (before tracing HAVING backward).
     let required_having_vars: Vec<VarId> = deps.iter().copied().collect();
-
-    // Above that join, a VALUES variable the grouping does not produce comes
-    // from the VALUES rows alone.
-    if let (Some(vars), Some(grouping)) = (grouped_post_values, &query.grouping) {
-        let produced: HashSet<VarId> = grouping
-            .group_by_vars()
-            .chain(grouping.aggregates().map(|spec| spec.output_var))
-            .collect();
-        for var in vars {
-            if !produced.contains(var) {
-                deps.remove(var);
-            }
-        }
-    }
 
     // HAVING expression variables: needed in HAVING's input but not
     // necessarily in its output (HAVING evaluates before trimming).
@@ -143,10 +118,10 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
         deps.extend(group_by.iter().copied());
     }
 
-    // An ungrouped query joins its post-query VALUES against the WHERE output
-    // directly above the WHERE tree, so its vars must survive WHERE-level
-    // trimming (otherwise the join degenerates to a cross product).
-    if let (Some(Pattern::Values { vars, .. }), None) = (&query.post_values, &query.grouping) {
+    // Post-query VALUES joins its rows against the WHERE output directly
+    // above the WHERE tree, so its vars must survive WHERE-level trimming
+    // (otherwise the join degenerates to a cross product).
+    if let Some(Pattern::Values { vars, .. }) = &query.post_values {
         deps.extend(vars.iter().copied());
     }
 
