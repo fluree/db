@@ -109,6 +109,38 @@ async fn jsonld_having_without_grouping_filters() {
     assert_eq!(found, json!([]));
 }
 
+/// A JSON-LD per-group list has no SPARQL-results rendering: SPARQL JSON and
+/// XML refuse it (they used to expand it into one row per element, and drop the
+/// row of an empty list). The JSON-LD formats keep rendering it as an array.
+#[tokio::test]
+async fn jsonld_per_group_list_is_refused_by_sparql_results_formats() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/list-formats:main").await;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "?e"],
+        "where": {"@id": "?e", "ex:area": "?a"},
+        "groupBy": ["?a"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("JSON-LD grouped-list projection");
+
+    assert!(result.to_sparql_json(&ledger.snapshot).is_err());
+    assert!(fluree_db_api::format::format_results_string(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &fluree_db_api::FormatterConfig::sparql_xml(),
+    )
+    .is_err());
+
+    let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r[1].is_array()), "{rows:?}");
+}
+
 /// A subquery cannot return a per-group list: its projection is plain
 /// variables, so projecting a variable its grouping does not produce is a plan
 /// error. The list used to cross into the enclosing query — rendered as lists

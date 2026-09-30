@@ -253,11 +253,13 @@ impl QueryOutput {
         }
     }
 
-    /// Let a grouped SELECT project an ungrouped variable as a per-group list
-    /// (the JSON-LD query surface). No effect on other outputs.
-    pub fn allow_per_group_lists(&mut self) {
+    /// Set what a grouped SELECT may do with a projected variable it does not
+    /// group. [`UngroupedProjection::PerGroupList`] is the JSON-LD query
+    /// surface's; an output that cannot carry a list (SPARQL-results rows)
+    /// sets [`UngroupedProjection::Reject`]. No effect on other outputs.
+    pub fn set_ungrouped_projection(&mut self, policy: UngroupedProjection) {
         if let QueryOutput::Select { ungrouped, .. } = self {
-            *ungrouped = UngroupedProjection::PerGroupList;
+            *ungrouped = policy;
         }
     }
 

@@ -1468,7 +1468,9 @@ pub fn parse_query<E: IriEncoder>(
     // The JSON-LD query surface projects a variable its grouping does not
     // produce as a per-group list (documented in `docs/query/jsonld-query.md`).
     // Only the top-level output may: a subquery's projection cannot carry it.
-    query.output.allow_per_group_lists();
+    query
+        .output
+        .set_ungrouped_projection(crate::ir::UngroupedProjection::PerGroupList);
     Ok(query)
 }
 
