@@ -111,8 +111,9 @@ impl OTypeRegistry {
                 // literal (e.g. "1990-00-00"^^xsd:date). It keeps its string
                 // and its datatype; decoding the string id as that datatype's
                 // value would read a dictionary position as a date or number.
+                // RESERVED (a dt past the payload width) stays unknown.
                 let by_dt = self.resolve_by_dt(dt);
-                if by_dt.is_string_keyed() {
+                if by_dt.is_string_keyed() || by_dt == OType::RESERVED {
                     by_dt
                 } else {
                     OType::customer_datatype(dt.as_u16())
