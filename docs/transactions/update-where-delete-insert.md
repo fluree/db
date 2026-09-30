@@ -107,9 +107,21 @@ There are two ways to target graphs in `insert` / `delete` templates:
 ```
 
 Notes:
-- `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`)
+- `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`), a compact IRI your `@context` expands, or a `fromNamed` alias. Relative graph names are refused. Two keywords name built-in graphs: `"default"` (the default graph) and `"config"` (the ledger's config graph).
 - The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in a top-level `graph` and in `from`: the update reads and writes the default graph and never creates a named graph called by the address. A per-node `@graph` or a `["graph", …]` template resolves the address like any other graph IRI. `urn:fluree:mydb:main#config` is the config graph, not the address.
+- A node's graph covers the nodes nested in it: every template a node and its nested nodes produce goes to the node's `@graph`, or the enclosing scope's graph when it has none. A nested node's own `@graph` wins for its subtree, so `"@graph": "default"` on a nested node sends that subtree to the default graph.
+- A graph name can be a WHERE variable, as with SPARQL `GRAPH ?g`: `"@graph": "?g"` (or `["graph", "?g", ...]`) writes into the graph `?g` is bound to for each solution. Variables are accepted only in update templates.
+- Edge annotations (`@annotation`) inside a template follow their edge into its graph.
 - Named-graph reads are available after indexing completes (see `docs/query/datasets.md`)
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "where":  [["graph", "?g", { "@id": "ex:event1", "ex:status": "?old" }]],
+  "delete": [["graph", "?g", { "@id": "ex:event1", "ex:status": "?old" }]],
+  "insert": [["graph", "?g", { "@id": "ex:event1", "ex:status": "closed" }]]
+}
+```
 
 ## Dataset scoping for WHERE (`from` / `fromNamed`)
 

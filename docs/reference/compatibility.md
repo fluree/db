@@ -66,11 +66,14 @@ Fluree supports JSON-LD 1.1:
 - @context for namespace mappings
 - @id for resource identification
 - @type for type specification
-- @graph for multiple entities
+- @graph for multiple entities, and named graph objects (an object whose `@id` names the graph and whose `@graph` holds its nodes)
+- @reverse, @included and @nest
 - @value and @type for literals
 - @language for language tags
 - Nested objects
 - Arrays
+
+Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and every node nested in it, to that graph (`"default"` and `"config"` name the default graph and the ledger's config graph). `@index` is accepted and ignored. Other `@`-keywords on a node object are refused.
 - @json literals, stored in the canonical form the Object-to-RDF transformation requires (RFC 8785). Integers past 2^53 are kept exact rather than rounded through a double
 
 **Specification:** https://www.w3.org/TR/json-ld11/
@@ -333,7 +336,27 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 ### Behavior changes
 
-Response-shape changes within v1 that a client may need to account for.
+Changes within v1 that a client may need to account for.
+
+#### SHACL is enforced only where the ledger config enables it (breaking)
+
+Shapes no longer enable SHACL on their own. A ledger that holds shapes but has no config setting `f:shaclEnabled true` used to validate every write against them in reject mode; it now validates nothing until its config enables SHACL, ledger-wide or per graph. Ledgers whose config already enables SHACL are unchanged, and so are configs without a SHACL group, which were already unenforced. The same applies to shapes published through GraphQL or `fluree model entity define`, and to branch merge, rebase, revert and push.
+
+Ledger info reports an affected ledger as `shapes present; SHACL enforcement not configured` (`configDiagnostics`; `fluree info` prints it). To keep enforcing, enable SHACL in the config: [Enabling SHACL](../ledger-config/writing-config.md#enabling-shacl).
+
+Inline shapes sent with a transaction (`opts.shapes`) are now governed by the SHACL group's `f:overrideControl` rather than by `f:shaclEnabled`: they apply without config, and under `f:OverrideAll` even where `f:shaclEnabled false`; under `f:OverrideNone` (or `f:IdentityRestricted` without a matching verified identity) the transaction is refused with a 400. They validate only themselves. They are not supported in a policy-scoped request (one with an identity or policy inputs, or on a ledger whose config sets policy defaults, ledger-wide or for a graph, other than an unrestricted `f:defaultAllow true`), which is refused with a 400; support is a follow-up. See [Inline shapes](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
+
+#### Config writes are checked, and config-only writes are never blocked by validation
+
+A transaction that writes a setting group into the config graph with its fields in another graph, types an `f:LedgerConfig` / `f:GraphConfig` outside the config graph, or leaves a single-valued setting (or the ledger's `f:LedgerConfig` subject) with two values is refused with a `Parse error` (HTTP 400). Writing the same value again is still accepted. See [What a config write is checked for](../ledger-config/writing-config.md#what-a-config-write-is-checked-for).
+
+A transaction that writes only the config graph is no longer validated against SHACL shapes or uniqueness constraints, and no longer needs a shapes, schema or constraints source to be resolvable, so a config repair is never blocked by the source it repairs (a policy source still applies to config writes). Shapes that target nodes in the config graph are no longer checked. Where SHACL or uniqueness is enabled and its source cannot be resolved, data writes fail with an error naming it, and a config read failure now fails a write instead of letting it through without uniqueness checks.
+
+#### JSON-LD nested nodes are written to their enclosing node's graph
+
+A node nested under a node with an `@graph` selector is now written to that graph, as JSON-LD nesting implies; it used to land in the default graph. A client that relied on the old placement should give the nested node `"@graph": "default"`, or move it to the top level. JSON-LD named graph objects (`{"@id": "<graph>", "@graph": [...]}`), whose content used to be silently dropped, are now stored. This fixes configs written with nested setting groups (#1979), which read as empty before: [Repairing a config split across graphs](../ledger-config/writing-config.md#repairing-a-config-split-across-graphs) moves the fields an older write stranded.
+
+Related JSON-LD changes: graph names must be absolute IRIs (relative ones are refused); `"config"` names the ledger's config graph; a graph variable in an update template writes to the graph the WHERE clause binds; a node-level `@graph` in a `where` clause is a `GRAPH` pattern; `@reverse`, `@included` and `@nest` are supported and other unknown `@`-keywords on a node are refused; blank node labels are scoped to the whole document; a single object with a string `@graph` has no transaction metadata. Bulk JSON-LD import refuses `@graph` scoping instead of folding it into the default graph; use `fluree insert`, or import TriG or N-Quads.
 
 #### `fluree-track-policy` is now parsed by the server
 

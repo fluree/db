@@ -51,7 +51,7 @@ INSERT DATA {
 }'
 ```
 
-`fluree update -f config.ru --format sparql` reads the same statement from a file. The JSON-LD form below works with `fluree insert` unchanged.
+`fluree update -f config.ru --format sparql` reads the same statement from a file. `fluree insert` takes the JSON-LD form below.
 
 ## Writing via SPARQL UPDATE
 
@@ -76,7 +76,7 @@ INSERT DATA {
 
 ## Writing via JSON-LD
 
-Use the `@graph` key with a named graph wrapper:
+Give the config node an `@graph` naming the config graph:
 
 ```json
 {
@@ -94,6 +94,84 @@ Use the `@graph` key with a named graph wrapper:
   ]
 }
 ```
+
+A node's `@graph` scopes the node and everything nested in it, so the `f:shaclDefaults` group above lands in the config graph with its parent. (Before this release the nested group's fields landed in the default graph, where the config reader never looks; see [Repairing a config split across graphs](#repairing-a-config-split-across-graphs).)
+
+`"@graph": "config"` names the ledger's own config graph without spelling out its IRI:
+
+```json
+{
+  "@context": { "f": "https://ns.flur.ee/db#" },
+  "@id": "urn:fluree:mydb:main:config:ledger",
+  "@type": "f:LedgerConfig",
+  "@graph": "config",
+  "f:policyDefaults": { "f:defaultAllow": false }
+}
+```
+
+The JSON-LD 1.1 named-graph form works too: an object whose `@id` is the graph and whose `@graph` holds the nodes written to it.
+
+```json
+{
+  "@context": { "f": "https://ns.flur.ee/db#" },
+  "@id": "urn:fluree:mydb:main#config",
+  "@graph": [
+    {
+      "@id": "urn:fluree:mydb:main:config:ledger",
+      "@type": "f:LedgerConfig",
+      "f:reasoningDefaults": { "f:reasoningModes": { "@id": "f:rdfs" } }
+    }
+  ]
+}
+```
+
+In an update, the `graph` key scopes every template to one graph, and accepts the same `"config"` keyword:
+
+```json
+{
+  "@context": { "f": "https://ns.flur.ee/db#" },
+  "graph": "config",
+  "where": { "@id": "urn:fluree:mydb:main:config:ledger", "f:shaclDefaults": "?group" },
+  "delete": { "@id": "?group", "f:shaclEnabled": false },
+  "insert": { "@id": "?group", "f:shaclEnabled": true }
+}
+```
+
+## Enabling SHACL
+
+SHACL is enforced only where the ledger config sets `f:shaclEnabled true`, ledger-wide or for a graph. Shapes on their own never enable it. A ledger that holds shapes without that setting reports `shapes present; SHACL enforcement not configured` in ledger info (`configDiagnostics`, also printed by `fluree info`).
+
+Attach the setting to the ledger's existing config subject: a ledger has one `f:LedgerConfig` subject, and a second one is refused. When the ledger has a config, this attaches a SHACL group to it (and does nothing when there is none):
+
+```sparql
+PREFIX f: <https://ns.flur.ee/db#>
+
+INSERT {
+  GRAPH <urn:fluree:mydb:main#config> {
+    ?c f:shaclDefaults <urn:fluree:mydb:main:config:shacl> .
+    <urn:fluree:mydb:main:config:shacl> f:shaclEnabled true .
+  }
+}
+WHERE {
+  GRAPH <urn:fluree:mydb:main#config> { ?c a f:LedgerConfig }
+}
+```
+
+When the ledger has no config yet, write one:
+
+```sparql
+PREFIX f: <https://ns.flur.ee/db#>
+
+INSERT DATA {
+  GRAPH <urn:fluree:mydb:main#config> {
+    <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+      f:shaclDefaults <urn:fluree:mydb:main:config:shacl> .
+    <urn:fluree:mydb:main:config:shacl> f:shaclEnabled true .
+  }
+}
+```
+
+If the config already has an `f:shaclDefaults` group, flip its `f:shaclEnabled` with `DELETE`/`INSERT` (see [Updating config](#updating-config)) rather than adding a second group, which is refused.
 
 ## Updating config
 
@@ -140,6 +218,46 @@ GRAPH <urn:fluree:mydb:main#config> {
 With explicit IRIs, individual fields can be retracted by subject IRI without binding.
 
 Retracting a field returns the ledger to the system default for that setting (as if the field were absent).
+
+## What a config write is checked for
+
+A transaction that writes ledger config is checked before it commits, and refused (a `Parse error`, HTTP 400) when what it writes would not do what it says:
+
+| Refused | Why | Write it instead |
+|---|---|---|
+| A setting group linked from the config graph whose fields are written to another graph | The reader reads groups only from the config graph, so the group reads as empty | Put the group's fields in the config graph too (in JSON-LD, nest the group under the config node, or give it `"@graph": "config"`) |
+| An `f:LedgerConfig` or `f:GraphConfig` written outside the config graph | Config is read only from the config graph, so the write has no effect | Write it to `urn:fluree:{ledger_id}#config` (or `"@graph": "config"`) |
+| A second value for a single-valued setting (`f:shaclEnabled`, `f:defaultAllow`, a group pointer such as `f:shaclDefaults`, ...), or a second `f:LedgerConfig` subject | The reader would pick one of them | Upsert, or delete the old value in the same transaction; add settings to the existing config subject |
+| An unrecognized `f:reasoningModes` value | Query-time reasoning would skip it silently | Use a supported mode name |
+
+Writing the same value again is not refused. The checks read only the transaction and the current config graph.
+
+A transaction that writes only the config graph is never validated against SHACL shapes or uniqueness constraints, and never needs a shapes, schema or constraints source to be available: you can always turn SHACL or uniqueness off, or point a source somewhere else, even when the source it names is gone. Policy is the exception. A config write is still subject to the ledger's policy, including a policy source in another ledger, because policy decides who may change the config.
+
+## Repairing a config split across graphs
+
+Before this release, a JSON-LD config written with nested setting groups (the form in [Writing via JSON-LD](#writing-via-json-ld)) put the groups' fields in the default graph, where the config reader never looks. The group reads as empty, so the setting it held is off: for a policy group, `f:defaultAllow false` is lost and anonymous reads and writes are open; for a SHACL group, validation is off. Ledger info reports such configs as `empty-group` and `stranded-fields` diagnostics.
+
+This SPARQL moves the stranded fields into the config graph in one transaction, restoring exactly what was written. Run it with `SELECT ?n ?p ?o` in place of the `DELETE`/`INSERT` first to see what it will move. It covers fields in the default graph; for another graph, wrap the last two patterns in `GRAPH <g> { }`.
+
+```sparql
+PREFIX f: <https://ns.flur.ee/db#>
+
+DELETE { ?n ?p ?o }
+INSERT { GRAPH <urn:fluree:mydb:main#config> { ?n ?p ?o } }
+WHERE {
+  GRAPH <urn:fluree:mydb:main#config> { ?parent ?edge ?root }
+  VALUES ?edge { f:policyDefaults f:shaclDefaults f:reasoningDefaults f:datalogDefaults
+                 f:transactDefaults f:fullTextDefaults f:servingDefaults f:graphOverrides }
+  ?root (f:overrideControl|f:shapesSource|f:policySource|f:schemaSource|f:rulesSource|
+         f:constraintsSource|f:graphSource|f:trustPolicy|f:rollbackGuard|f:ontologyImportMap|
+         f:graphRef|f:property|f:shaclDefaults|f:policyDefaults|f:reasoningDefaults|
+         f:datalogDefaults|f:transactDefaults|f:fullTextDefaults)* ?n .
+  ?n ?p ?o .
+}
+```
+
+Upserting the corrected config also restores the settings, but leaves the stray fields behind in the default graph.
 
 ## Config mutation governance
 

@@ -48,9 +48,10 @@ Commit metadata lives in the `#txn-meta` named graph within each ledger. To quer
 ```json
 {
   "@context": { "f": "https://ns.flur.ee/db#" },
+  "from": "mydb:main#txn-meta",
   "select": ["?t", "?time", "?author"],
   "where": {
-    "@graph": "mydb:main#txn-meta",
+    "@id": "?commit",
     "f:t": "?t",
     "f:time": "?time",
     "f:author": "?author"

@@ -5713,3 +5713,222 @@ async fn datalog_override_identity_restricted_end_to_end() {
         "an anonymous request has its rule stripped"
     );
 }
+
+// =============================================================================
+// Documented config recipes and examples
+// =============================================================================
+
+/// The enable recipes (`docs/ledger-config/writing-config.md#enabling-shacl`):
+/// one attaches `f:shaclDefaults` to the ledger's existing config subject, the
+/// other writes the conventional one when there is none. Either way the shapes
+/// the ledger holds are enforced after it, under one `f:LedgerConfig` subject.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn enable_recipe_enables_shacl_with_or_without_an_existing_config() {
+    for existing in [true, false] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/enable-recipe-{existing}:main");
+        let mut ledger = fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &person_name_shape())
+            .await
+            .expect("shape insert")
+            .ledger;
+        if existing {
+            ledger = fluree
+                .insert(
+                    ledger,
+                    &json!({
+                        "@context": {"f": "https://ns.flur.ee/db#"},
+                        "@id": "urn:config:existing",
+                        "@type": "f:LedgerConfig",
+                        "@graph": "config",
+                        "f:policyDefaults": {"f:defaultAllow": true}
+                    }),
+                )
+                .await
+                .expect("existing config")
+                .ledger;
+        }
+        let cfg = config_graph_iri(&ledger_id);
+        let recipe = if existing {
+            format!(
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 INSERT {{
+                   GRAPH <{cfg}> {{
+                     ?c f:shaclDefaults <urn:fluree:{ledger_id}:config:shacl> .
+                     <urn:fluree:{ledger_id}:config:shacl> f:shaclEnabled true .
+                   }}
+                 }}
+                 WHERE {{
+                   GRAPH <{cfg}> {{ ?c a f:LedgerConfig }}
+                 }}"
+            )
+        } else {
+            format!(
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 INSERT DATA {{
+                   GRAPH <{cfg}> {{
+                     <urn:fluree:{ledger_id}:config:ledger> a f:LedgerConfig ;
+                       f:shaclDefaults <urn:fluree:{ledger_id}:config:shacl> .
+                     <urn:fluree:{ledger_id}:config:shacl> f:shaclEnabled true .
+                   }}
+                 }}"
+            )
+        };
+        let ledger = sparql_update(&fluree, ledger, &recipe)
+            .await
+            .unwrap_or_else(|e| panic!("existing={existing}: the enable recipe commits: {e}"))
+            .ledger;
+
+        let err = fluree
+            .insert(
+                ledger,
+                &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:alice", "@type": "ex:Person"}),
+            )
+            .await
+            .expect_err("SHACL is enabled");
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::ShaclViolation(_)
+                )
+            ),
+            "existing={existing}: {err:?}"
+        );
+        assert!(
+            config_diagnostic_codes(&fluree, &ledger_id)
+                .await
+                .is_empty(),
+            "existing={existing}: one config subject, SHACL configured"
+        );
+    }
+}
+
+/// Examples in `docs/ledger-config/writing-config.md` and
+/// `docs/concepts/reasoning.md`: the JSON-LD named-graph form, the
+/// `"graph": "config"` insert, and an update whose `graph` key scopes its
+/// WHERE clause and templates to the config graph.
+#[tokio::test]
+async fn documented_json_ld_config_forms_write_the_config_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-doc-forms:main";
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": { "f": "https://ns.flur.ee/db#" },
+                "@id": config_graph_iri(ledger_id),
+                "@graph": [
+                    {
+                        "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                        "@type": "f:LedgerConfig",
+                        "f:shaclDefaults": { "f:shaclEnabled": false }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("named-graph form")
+        .ledger;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "graph": "config",
+                "insert": {
+                    "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                    "f:reasoningDefaults": {
+                        "f:reasoningModes": {"@id": "f:RDFS"},
+                        "f:overrideControl": {"@id": "f:OverrideAll"}
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("the reasoning.md insert")
+        .ledger;
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": { "f": "https://ns.flur.ee/db#" },
+                "graph": "config",
+                "where": {
+                    "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                    "f:shaclDefaults": "?group"
+                },
+                "delete": { "@id": "?group", "f:shaclEnabled": false },
+                "insert": { "@id": "?group", "f:shaclEnabled": true }
+            }),
+        )
+        .await
+        .expect("the graph-key update");
+
+    let view = fluree.db(ledger_id).await.unwrap();
+    let config = view.ledger_config().expect("config read");
+    assert_eq!(
+        config.shacl.as_ref().and_then(|s| s.enabled),
+        Some(true),
+        "the update flipped the setting in the config graph"
+    );
+    assert!(
+        config
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.modes.as_ref())
+            .is_some_and(|m| !m.is_empty()),
+        "the reasoning defaults landed in the config graph"
+    );
+}
+
+/// The verification query in `docs/indexing-and-search/fulltext.md`: a
+/// node-level `@graph` in `where` scopes the pattern to the config graph.
+#[tokio::test]
+async fn fulltext_doc_verification_query_reads_the_config_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/fulltext-doc:main";
+    let cfg = config_graph_iri(ledger_id);
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": { "f": "https://ns.flur.ee/db#", "ex": "http://example.org/" },
+                "@graph": [
+                    {
+                        "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                        "@type": "f:LedgerConfig",
+                        "@graph": cfg,
+                        "f:fullTextDefaults": {
+                            "@type": "f:FullTextDefaults",
+                            "f:defaultLanguage": "en",
+                            "f:property": [
+                                { "@type": "f:FullTextProperty", "f:target": { "@id": "ex:title" } }
+                            ]
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("the fulltext.md config")
+        .ledger;
+    let rows = fluree
+        .query_connection(&json!({
+            "@context": { "f": "https://ns.flur.ee/db#" },
+            "from": ledger_id,
+            "from-named": [cfg],
+            "where": [{ "@graph": cfg, "@id": "?cfg", "f:fullTextDefaults": "?defaults" }],
+            "select": ["?cfg", "?defaults"]
+        }))
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "the config row: {rows}"
+    );
+}
