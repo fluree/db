@@ -23,7 +23,9 @@ use fluree_db_core::range::RangeMatch;
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
-use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
+use fluree_db_core::{
+    Flake, FlakeMeta, FlakeValue, GraphId, MemberRef, Sid, TargetError, TargetLedger,
+};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
     is_schema_flake, lookup_subject_classes, PolicyContext, PolicyDecision, PolicyError,
@@ -1181,12 +1183,13 @@ pub(crate) fn refuse_default_graph_name(iri: &str) -> Result<()> {
 
 /// SPARQL `WITH <iri>` and a JSON-LD update's top-level `graph` name the
 /// update's template default graph ([`Txn::template_default_graph`]). With no
-/// `USING`/`from`, the WHERE reads the same IRI as its default graph
-/// (`resolve_where_default_graph`), and when the IRI names this ledger's
-/// default graph ([`names_default_graph`]) that is the default graph. Make the
-/// write half agree: the templates that took the default write the default
-/// graph, and the IRI is not registered as a named graph unless a template
-/// names it itself. Templates that name their graph are left alone.
+/// `USING`/`from`, the WHERE reads the same IRI as its default graph (the
+/// WHERE-dataset resolution in `stream_where_into_accumulator`), and when the
+/// IRI names this ledger's default graph ([`names_default_graph`]) that is the
+/// default graph. Make the write half agree: the templates that took the
+/// default write the default graph, and the IRI is not registered as a named
+/// graph unless a template names it itself. Templates that name their graph
+/// are left alone.
 fn template_default_address_to_default_graph(txn: &mut Txn, ledger_id: &fluree_db_core::LedgerId) {
     let Some(iri) = txn.template_default_graph.clone() else {
         return;
@@ -2787,23 +2790,41 @@ async fn stream_where_into_accumulator(
             .or_else(|| binary_store.as_ref().and_then(|s| s.graph_id_for_iri(iri)))
     };
 
-    // A WHERE default graph named by `USING`, `WITH` or JSON-LD `from`/`graph`:
-    // `urn:default` and this ledger's own address name its default graph (see
-    // `names_default_graph`), a registered IRI names that graph, and anything
-    // else names a graph that does not exist here, so `None`.
-    let resolve_where_default_graph = |iri: &str| -> Option<GraphId> {
-        if names_default_graph(&ledger.snapshot.ledger_id, iri) {
-            return Some(0);
+    // A WHERE-dataset reference (`USING`, `USING NAMED`, `WITH`, JSON-LD
+    // `from` / `fromNamed` / `graph`) resolves in this ledger through the table
+    // a query's FROM uses: the ledger's own address in any spelling names its
+    // default graph, `L#config` or its URN the config graph, and a registered
+    // IRI its graph. A graph the ledger does not have is `None`: it contributes
+    // nothing (SPARQL 1.1 Update §3.1.3, Query §13.2), so a WHERE over it binds
+    // nothing. Another ledger, or a time pin, is a caller error: the WHERE
+    // reads this ledger as it stands.
+    let target_ledger = &ledger.snapshot.ledger_id;
+    let where_graph = |iri: &str| -> Result<Option<GraphId>> {
+        let member = MemberRef::parse(iri)
+            .map_err(|e| TransactError::Parse(format!("WHERE dataset graph <{iri}>: {e}")))?;
+        if member.address().is_some_and(|a| a.at().is_some()) {
+            return Err(TransactError::Parse(format!(
+                "WHERE dataset graph <{iri}> pins a time, but an update reads the ledger \
+                 as it stands; drop the pin"
+            )));
         }
-        resolve_graph_id(iri)
+        match TargetLedger::new(target_ledger, &resolve_graph_id).resolve(iri, &member, false) {
+            Ok(graph) => Ok(Some(graph.g_id)),
+            Err(TargetError::GraphNotFound(_)) => Ok(None),
+            Err(TargetError::CrossLedger { named, .. }) => Err(TransactError::Parse(format!(
+                "WHERE dataset graph <{iri}> names ledger '{named}', but an update's WHERE \
+                 reads only its own ledger ('{target_ledger}')"
+            ))),
+        }
     };
     let where_default_g_ids: Vec<Option<GraphId>> = desired_where_default_graph_iris
         .iter()
-        .map(|iri| resolve_where_default_graph(iri))
-        .collect();
+        .map(|iri| where_graph(iri))
+        .collect::<Result<_>>()?;
 
-    // Base GraphDbRef is used to provide snapshot/overlay/time; dataset controls active graphs.
-    // A single resolved default graph is the base; otherwise g_id=0 is the base reference.
+    // Base GraphDbRef is used to provide snapshot/overlay/time; dataset controls
+    // active graphs. A single resolved default graph is the base; otherwise
+    // g_id 0 is the base reference.
     let base_db = match where_default_g_ids.as_slice() {
         [Some(g_id)] => ledger.as_graph_db_ref(*g_id),
         _ => ledger.as_graph_db_ref(0),
@@ -2860,12 +2881,14 @@ async fn stream_where_into_accumulator(
         w.using_default_graph_iris.is_empty() && !w.using_named_graph_iris.is_empty()
     });
 
-    // With no `USING`/`WITH`/`from`, the WHERE reads the ledger's default graph.
-    // Otherwise each named graph that exists joins the default-graph union and
-    // one that does not contributes nothing (SPARQL 1.1 Update §3.1.3, Query
-    // §13.2), so a lone unknown IRI leaves the default graph EMPTY. Falling back
-    // to g_id 0 instead made `DELETE { ?s ?p ?o } USING <typo> WHERE { ?s ?p ?o }`
-    // delete the ledger's whole default graph.
+    // With no `USING`/`WITH`/`from`, the WHERE reads the ledger's default
+    // graph. Otherwise the default graph is the union of the named graphs that
+    // exist, so one that does not contributes nothing (SPARQL 1.1 Update
+    // §3.1.3, Query §13.2) and a lone one leaves the default graph EMPTY.
+    // Falling back to g_id 0 instead made `DELETE { ?s ?p ?o } USING <typo>
+    // WHERE { ?s ?p ?o }` delete the ledger's whole default graph. The ledger's
+    // own address is the default graph in either branch (a multi-USING used to
+    // drop it).
     let mut runtime_dataset = if where_default_is_empty {
         fluree_db_query::DataSet::new()
     } else if desired_where_default_graph_iris.is_empty() {
@@ -2930,12 +2953,7 @@ async fn stream_where_into_accumulator(
     let mut named: Vec<(Arc<str>, GraphId, bool, Arc<str>)> = Vec::new();
     if let Some(allowlist) = allowed_named_graphs {
         for (iri, alias) in allowlist {
-            let g_id = if iri == fluree_db_core::DEFAULT_GRAPH_IRI {
-                Some(0)
-            } else {
-                resolve_graph_id(&iri)
-            };
-            let Some(g_id) = g_id else {
+            let Some(g_id) = where_graph(&iri)? else {
                 continue;
             };
             // Explicitly listed, so enumerable even when reserved.

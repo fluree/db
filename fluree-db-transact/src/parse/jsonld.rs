@@ -412,7 +412,6 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
     let where_named_graphs = parse_update_where_named_graphs(
         obj.get("fromNamed").or_else(|| obj.get("from-named")),
         &context,
-        strict,
     )?;
     let from_named_aliases: HashMap<String, String> = where_named_graphs
         .as_ref()
@@ -435,18 +434,14 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         strict,
     )?;
 
-    let where_default_graph_iris = parse_update_where_default_graph_iris(
-        obj.get("from"),
-        &context,
-        &from_named_aliases,
-        strict,
-    )?
-    .unwrap_or_else(|| {
-        template_default_graph
-            .as_ref()
-            .map(|(_, iri)| vec![iri.clone()])
-            .unwrap_or_default()
-    });
+    let where_default_graph_iris =
+        parse_update_where_default_graph_iris(obj.get("from"), &context, &from_named_aliases)?
+            .unwrap_or_else(|| {
+                template_default_graph
+                    .as_ref()
+                    .map(|(_, iri)| vec![iri.clone()])
+                    .unwrap_or_default()
+            });
 
     let has_where = obj.get("where").is_some();
     let has_values = obj.get("values").is_some();
@@ -606,7 +601,6 @@ fn parse_update_where_default_graph_iris(
     from_val: Option<&Value>,
     context: &ParsedContext,
     from_named_aliases: &HashMap<String, String>,
-    strict: bool,
 ) -> Result<Option<Vec<String>>> {
     let Some(v) = from_val else {
         return Ok(None);
@@ -623,7 +617,10 @@ fn parse_update_where_default_graph_iris(
                 "from: \"txn-meta\" is not currently supported as a default graph selector in updates"
                     .to_string(),
             )),
-            _ => Ok(Some(expand_update_graph_iri(&resolved, context, strict)?)),
+            // A dataset reference, not a node id: a prefix the context defines
+            // expands, and anything else is kept as written for the update to
+            // resolve (`"from": "mydb:main"` names the ledger's default graph).
+            _ => Ok(Some(expand_update_graph_iri(&resolved, context, false)?)),
         }
     };
 
@@ -646,7 +643,7 @@ fn parse_update_where_default_graph_iris(
         // Object form: allow {"graph": ...} and ignore other dataset fields.
         Value::Object(obj) => {
             if let Some(graph) = obj.get("graph") {
-                parse_update_where_default_graph_iris(Some(graph), context, from_named_aliases, strict)
+                parse_update_where_default_graph_iris(Some(graph), context, from_named_aliases)
             } else {
                 Ok(None)
             }
@@ -674,7 +671,6 @@ fn resolve_graph_selector_value_for_update(
 fn parse_update_where_named_graphs(
     from_named_val: Option<&Value>,
     context: &ParsedContext,
-    strict: bool,
 ) -> Result<Option<Vec<crate::ir::UpdateNamedGraph>>> {
     let Some(v) = from_named_val else {
         return Ok(None);
@@ -705,7 +701,7 @@ fn parse_update_where_named_graphs(
                     // This makes `fromNamed: ["ex:g2"]` usable as `["graph", "ex:g2", ...]`
                     // in WHERE patterns even though GRAPH names are not expanded via @context.
                     let implicit_alias = graph_val.as_str().map(std::string::ToString::to_string);
-                    let iri = expand_update_graph_iri(graph_val, context, strict)?;
+                    let iri = expand_update_graph_iri(graph_val, context, false)?;
                     out.push(crate::ir::UpdateNamedGraph {
                         iri,
                         alias: explicit_alias.or(implicit_alias),
@@ -713,7 +709,7 @@ fn parse_update_where_named_graphs(
                 } else {
                     // String shorthand (or other selector shape): treat as graph IRI
                     let implicit_alias = item.as_str().map(std::string::ToString::to_string);
-                    let iri = expand_update_graph_iri(&item, context, strict)?;
+                    let iri = expand_update_graph_iri(&item, context, false)?;
                     out.push(crate::ir::UpdateNamedGraph {
                         iri,
                         alias: implicit_alias,
