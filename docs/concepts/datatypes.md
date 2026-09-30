@@ -402,6 +402,15 @@ When a filter compares values of incompatible types (e.g., a number and a string
 
 Numeric types (long, double, bigint, decimal) are mutually comparable via automatic promotion, so cross-numeric comparisons work as expected. Similarly, temporal types can be compared with string representations that parse to the same temporal type.
 
+### Text That Is Not a Value of Its Datatype
+
+A literal such as `"2024-02-30"^^xsd:date` or `"300"^^xsd:byte` names a
+built-in datatype but is not one of its values. JSON-LD transactions and
+SPARQL UPDATE reject it, naming the datatype in the error. Turtle
+transactions and bulk import keep it, as RDF allows: the literal is stored with
+its text and its datatype and reads back exactly as written, but it is not a
+date or a number, so it never equals one.
+
 ### Type Casting in Queries
 
 SPARQL provides functions for type conversion:
