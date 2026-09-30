@@ -300,6 +300,8 @@ pub enum RemoteLedgerError {
     Conflict(String),
     /// 422 Unprocessable Entity / validation error
     ValidationError(String),
+    /// 415 Unsupported Media Type: the server does not read this body format
+    UnsupportedMediaType(String),
     /// 5xx Server Error (includes server error message)
     ServerError(String),
     /// Request could not be serialized (client-side bug)
@@ -323,6 +325,9 @@ impl fmt::Display for RemoteLedgerError {
             RemoteLedgerError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             RemoteLedgerError::Conflict(msg) => write!(f, "conflict (409): {msg}"),
             RemoteLedgerError::ValidationError(msg) => write!(f, "validation error (422): {msg}"),
+            RemoteLedgerError::UnsupportedMediaType(msg) => {
+                write!(f, "unsupported media type (415): {msg}")
+            }
             RemoteLedgerError::ServerError(msg) => write!(f, "server error: {msg}"),
             RemoteLedgerError::InvalidRequest(msg) => write!(f, "invalid request: {msg}"),
             RemoteLedgerError::InvalidResponse(msg) => write!(f, "invalid response: {msg}"),
@@ -442,6 +447,13 @@ impl RemoteLedgerClient {
             StatusCode::UNPROCESSABLE_ENTITY => {
                 RemoteLedgerError::ValidationError(if message.is_empty() {
                     "validation error".to_string()
+                } else {
+                    message
+                })
+            }
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+                RemoteLedgerError::UnsupportedMediaType(if message.is_empty() {
+                    "unsupported media type".to_string()
                 } else {
                     message
                 })
@@ -1284,11 +1296,36 @@ impl RemoteLedgerClient {
         dry_run: bool,
         allow_empty: bool,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
+        self.sync_rdf(
+            ledger,
+            graph,
+            body,
+            "application/trig",
+            dry_run,
+            allow_empty,
+        )
+        .await
+    }
+
+    /// [`sync_jsonld`](Self::sync_jsonld) with an RDF text body sent as
+    /// `content_type` (`text/turtle`, `application/n-triples`,
+    /// `application/trig`). A server that does not read RDF bodies on
+    /// `/sync` answers 415 ([`RemoteLedgerError::UnsupportedMediaType`])
+    /// before staging anything, so the caller may retry in another format.
+    pub async fn sync_rdf(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        body: &str,
+        content_type: &str,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
         let url = self.sync_url(ledger, graph, dry_run, allow_empty);
         self.send_json(
             reqwest::Method::POST,
             &url,
-            "application/trig",
+            content_type,
             Some(RequestBody::Text(body)),
         )
         .await

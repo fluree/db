@@ -14,6 +14,7 @@ use crate::context::{self, LedgerMode};
 use crate::detect;
 use crate::error::{CliError, CliResult};
 use crate::input;
+use crate::remote_client::{RemoteLedgerClient, RemoteLedgerError};
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::{GraphPayload, GraphSel, SyncGraphOpts, SyncGraphReport, TxnOpts};
 use std::path::Path;
@@ -38,13 +39,14 @@ pub struct SyncArgs<'a> {
 
 /// Where the graph's desired contents come from.
 ///
-/// Today: RDF text. Designed as the seam for mapped sources — an R2RML
-/// mapping applied to an Iceberg table, CSV, or spreadsheet would be a new
-/// variant whose [`SyncSource::into_payload`] materializes the mapping's
+/// Today: RDF text or JSON-LD. Designed as the seam for mapped sources — an
+/// R2RML mapping applied to an Iceberg table, CSV, or spreadsheet would be a
+/// new variant whose [`SyncSource::into_payload`] materializes the mapping's
 /// output (locally, or via a server-side materialization when running
-/// `--remote`) into the same JSON-LD payload.
+/// `--remote`) into the same payload.
 pub enum SyncSource {
-    /// Turtle or JSON-LD text, already read from a file / expression / stdin.
+    /// Turtle, TriG or JSON-LD text, already read from a file / expression /
+    /// stdin.
     RdfText {
         content: String,
         format: detect::DataFormat,
@@ -54,34 +56,85 @@ pub enum SyncSource {
 /// The desired contents, as submitted.
 pub enum SyncPayload {
     JsonLd(serde_json::Value),
-    /// Sent as TriG: the Turtle-to-JSON-LD conversion has no graph blocks.
-    /// The API or server requires every block to name the target graph.
-    Trig(String),
+    /// RDF text as written: Turtle, N-Triples, or TriG (`trig`) whose graph
+    /// blocks must name the target graph. It is parsed once where it is
+    /// staged, as every write lane parses RDF text.
+    Rdf {
+        text: String,
+        trig: bool,
+    },
 }
 
 impl SyncSource {
-    /// Materialize the desired contents as one payload.
-    ///
-    /// Turtle is converted to JSON-LD client-side, so a Turtle export (the
-    /// common ontology-editor case) works against a server from before
-    /// `/sync` read RDF bodies. TriG is sent as-is.
+    /// Materialize the desired contents as one payload. RDF text is sent as
+    /// written; nothing converts it to JSON-LD on the way.
     pub fn into_payload(self) -> CliResult<SyncPayload> {
         match self {
             SyncSource::RdfText { content, format } => match format {
                 detect::DataFormat::JsonLd => {
                     Ok(SyncPayload::JsonLd(serde_json::from_str(&content)?))
                 }
-                // TriG always fails the Turtle parse, so a TriG body sniffed
-                // or named as Turtle is only looked for once that happens.
-                detect::DataFormat::Turtle => match fluree_graph_turtle::parse_to_json(&content) {
-                    Ok(json) => Ok(SyncPayload::JsonLd(json)),
-                    Err(_) if detect::is_trig_body(&content) => Ok(SyncPayload::Trig(content)),
-                    Err(e) => Err(CliError::Usage(format!("failed to parse Turtle: {e}"))),
-                },
-                detect::DataFormat::Trig => Ok(SyncPayload::Trig(content)),
+                detect::DataFormat::Turtle => {
+                    let trig = detect::is_trig_body(&content);
+                    Ok(SyncPayload::Rdf {
+                        text: content,
+                        trig,
+                    })
+                }
+                detect::DataFormat::Trig => Ok(SyncPayload::Rdf {
+                    text: content,
+                    trig: true,
+                }),
             },
         }
     }
+}
+
+/// Send `payload` to a remote `/sync`. RDF text goes as written; only a
+/// server from before `/sync` read RDF bodies answers 415, and for that one
+/// Turtle is converted to JSON-LD here and sent again (TriG has no JSON-LD
+/// form for its blocks, so it gets the 415).
+async fn sync_remote(
+    client: &RemoteLedgerClient,
+    ledger: &str,
+    graph: Option<&str>,
+    payload: &SyncPayload,
+    dry_run: bool,
+    allow_empty: bool,
+) -> CliResult<serde_json::Value> {
+    match payload {
+        SyncPayload::JsonLd(json) => Ok(client
+            .sync_jsonld(ledger, graph, json, dry_run, allow_empty)
+            .await?),
+        SyncPayload::Rdf { text, trig } => {
+            let content_type = if *trig {
+                "application/trig"
+            } else {
+                "text/turtle"
+            };
+            match client
+                .sync_rdf(ledger, graph, text, content_type, dry_run, allow_empty)
+                .await
+            {
+                Err(RemoteLedgerError::UnsupportedMediaType(_)) if !*trig => {
+                    let json = turtle_as_json_ld(text)?;
+                    Ok(client
+                        .sync_jsonld(ledger, graph, &json, dry_run, allow_empty)
+                        .await?)
+                }
+                other => Ok(other?),
+            }
+        }
+    }
+}
+
+/// The client-side conversion a server without RDF bodies on `/sync` needs.
+/// It is lossy (collection order, `rdf:type` objects that are not IRIs, IRIs
+/// whose scheme reads as a prefix); upgrading the server avoids it.
+#[allow(clippy::disallowed_methods)] // the one fallback that must convert
+fn turtle_as_json_ld(text: &str) -> CliResult<serde_json::Value> {
+    fluree_graph_turtle::parse_to_json(text)
+        .map_err(|e| CliError::Usage(format!("failed to parse Turtle: {e}")))
 }
 
 pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
@@ -110,7 +163,7 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
             .get("@graph")
             .and_then(serde_json::Value::as_array)
             .is_some_and(Vec::is_empty),
-        SyncPayload::Trig(_) => false,
+        SyncPayload::Rdf { .. } => false,
     };
     if explicitly_empty && !a.allow_empty {
         return Err(CliError::Usage(
@@ -139,18 +192,15 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
             ..
         } => {
             let client = client.with_policy(a.policy.clone());
-            let response = match &payload {
-                SyncPayload::JsonLd(json) => {
-                    client
-                        .sync_jsonld(&remote_alias, a.graph, json, a.dry_run, a.allow_empty)
-                        .await?
-                }
-                SyncPayload::Trig(trig) => {
-                    client
-                        .sync_trig(&remote_alias, a.graph, trig, a.dry_run, a.allow_empty)
-                        .await?
-                }
-            };
+            let response = sync_remote(
+                &client,
+                &remote_alias,
+                a.graph,
+                &payload,
+                a.dry_run,
+                a.allow_empty,
+            )
+            .await?;
             context::persist_refreshed_tokens(&client, &remote_name, a.dirs).await;
             if a.json {
                 println!(
@@ -170,7 +220,7 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
             };
             let graph_payload = match &payload {
                 SyncPayload::JsonLd(json) => GraphPayload::JsonLd(json),
-                SyncPayload::Trig(trig) => GraphPayload::Rdf(trig),
+                SyncPayload::Rdf { text, .. } => GraphPayload::Rdf(text),
             };
             let report = fluree
                 .sync_graph_with(
@@ -271,22 +321,19 @@ fn print_remote_response(graph: Option<&str>, value: &serde_json::Value, dry_run
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
 
+    /// The fallback conversion for a server without RDF bodies on `/sync`
+    /// keeps RDF 1.2 annotations, as `@annotation` blocks.
     #[test]
-    fn turtle_star_sync_source_converts_to_annotation_blocks() {
-        // `fluree graph sync` converts Turtle client-side; an ontology
-        // export carrying RDF 1.2 annotations must reach the sync endpoint
-        // as `@annotation` blocks instead of failing the conversion.
-        let source = SyncSource::RdfText {
-            content: "@prefix ex: <http://example.org/> .\n\
-                      ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} .\n"
-                .to_string(),
-            format: detect::DataFormat::Turtle,
-        };
-        let SyncPayload::JsonLd(payload) = source.into_payload().expect("Turtle-star converts")
-        else {
-            panic!("Turtle converts to JSON-LD");
-        };
+    fn the_fallback_conversion_keeps_annotations() {
+        let payload = turtle_as_json_ld(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} .\n",
+        )
+        .expect("Turtle-star converts");
         let alice = payload
             .as_array()
             .expect("node array")
@@ -307,33 +354,139 @@ mod tests {
         .into_payload()
     }
 
-    /// TriG goes out as TriG whether it was named as TriG or detected in a
-    /// body that sniffed as Turtle; Turtle with a `{` in a literal stays
-    /// Turtle, converted to JSON-LD.
+    /// RDF text goes out as written. TriG is marked whether it was named as
+    /// TriG or detected in a body that sniffed as Turtle; Turtle with a `{`
+    /// in a literal stays Turtle; malformed Turtle is left for the parser
+    /// that stages it to report.
     #[test]
-    fn trig_is_sent_as_trig_and_turtle_as_json_ld() {
+    fn rdf_text_is_sent_as_written() {
         let trig =
             "GRAPH <http://example.org/g> { <http://example.org/s> <http://example.org/p> 1 . }";
         for format in [detect::DataFormat::Trig, detect::DataFormat::Turtle] {
             assert!(matches!(
                 payload_of(trig, format),
-                Ok(SyncPayload::Trig(t)) if t == trig
+                Ok(SyncPayload::Rdf { text, trig: true }) if text == trig
             ));
         }
-        assert!(matches!(
-            payload_of(
-                "<http://example.org/s> <http://example.org/p> \"{v}\" .",
-                detect::DataFormat::Turtle
-            ),
-            Ok(SyncPayload::JsonLd(_))
-        ));
-        let err = payload_of(
+        for turtle in [
+            "<http://example.org/s> <http://example.org/p> \"{v}\" .",
             "<http://example.org/s> <http://example.org/p>",
-            detect::DataFormat::Turtle,
+        ] {
+            assert!(matches!(
+                payload_of(turtle, detect::DataFormat::Turtle),
+                Ok(SyncPayload::Rdf { text, trig: false }) if text == turtle
+            ));
+        }
+    }
+
+    /// A stub `/sync` answering its requests with `statuses` in turn,
+    /// recording each request's content type.
+    async fn stub(statuses: Vec<u16>) -> (RemoteLedgerClient, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            for status in statuses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break buf.len();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+                let header = |name: &str| {
+                    headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix(name))
+                        .map(|v| v.trim().to_string())
+                };
+                let length: usize = header("content-length:")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < header_end + length {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(header("content-type:").unwrap_or_default());
+                let body = if status == 200 {
+                    r#"{"ledger":"db:main","t":2}"#
+                } else {
+                    r#"{"error":"unsupported media type"}"#
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(reply.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+        (
+            RemoteLedgerClient::new(&format!("http://{addr}/v1/fluree"), None),
+            seen,
         )
-        .err()
-        .expect("malformed Turtle")
-        .to_string();
-        assert!(err.contains("failed to parse Turtle"), "{err}");
+    }
+
+    fn turtle() -> SyncPayload {
+        SyncPayload::Rdf {
+            text: "<http://example.org/s> <http://example.org/p> ( 1 2 ) .".to_string(),
+            trig: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_that_reads_rdf_gets_the_text() {
+        let (client, seen) = stub(vec![200]).await;
+        sync_remote(&client, "db:main", None, &turtle(), false, false)
+            .await
+            .expect("sync");
+        assert_eq!(*seen.lock().unwrap(), ["text/turtle"]);
+    }
+
+    #[tokio::test]
+    async fn turtle_falls_back_to_json_ld_only_on_a_415() {
+        let (client, seen) = stub(vec![415, 200]).await;
+        sync_remote(&client, "db:main", None, &turtle(), false, false)
+            .await
+            .expect("sync after the fallback");
+        assert_eq!(*seen.lock().unwrap(), ["text/turtle", "application/json"]);
+    }
+
+    #[tokio::test]
+    async fn trig_is_not_converted() {
+        let (client, seen) = stub(vec![415]).await;
+        let trig = SyncPayload::Rdf {
+            text:
+                "GRAPH <http://example.org/g> { <http://example.org/s> <http://example.org/p> 1 . }"
+                    .to_string(),
+            trig: true,
+        };
+        let err = sync_remote(
+            &client,
+            "db:main",
+            Some("http://example.org/g"),
+            &trig,
+            false,
+            false,
+        )
+        .await
+        .expect_err("no JSON-LD form for graph blocks");
+        assert!(err.to_string().contains("415"), "{err}");
+        assert_eq!(*seen.lock().unwrap(), ["application/trig"]);
     }
 }
