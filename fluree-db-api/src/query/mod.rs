@@ -52,6 +52,10 @@ pub struct QueryExecutionOptions {
     /// layer, never derived from the request body or headers.
     pub server_identity: Option<VerifiedIdentity>,
     lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
+    /// The view the query runs on was loaded from the query's own dataset (the
+    /// connection path's one-ledger shortcut), so the view does not read the
+    /// query's dataset keys again.
+    pub(crate) view_is_the_dataset: bool,
 }
 
 impl fmt::Debug for QueryExecutionOptions {
@@ -104,6 +108,13 @@ impl QueryExecutionOptions {
         G: Send + Sync + 'static,
     {
         self.lifecycle_guard = Some(Arc::new(guard));
+        self
+    }
+
+    /// Mark the view the query runs on as loaded from the query's own dataset
+    /// (see [`QueryExecutionOptions::view_is_the_dataset`]).
+    pub(crate) fn on_the_datasets_view(mut self) -> Self {
+        self.view_is_the_dataset = true;
         self
     }
 }
