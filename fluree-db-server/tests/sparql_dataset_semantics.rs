@@ -782,3 +782,276 @@ async fn connection_route_reads_a_named_graph_addressed_by_ledger_fragment() {
     names.sort_unstable();
     assert_eq!(names, ["A", "B"], "{json}");
 }
+
+// =============================================================================
+// One resolver for the ledger route's dataset references
+// =============================================================================
+
+const SCOPED_LEDGER: &str = "dscope:main";
+
+/// A default-graph name ("D") and two graphs whose IRIs carry the characters
+/// the old string classifiers read as ledger syntax: `#` and `@`.
+const SCOPED_TRIG: &str = r#"
+@prefix ex: <http://ex.org/> .
+
+ex:d1 ex:name "D" .
+
+<http://ex.org/vocab#products> {
+    ex:p1 ex:name "P" .
+}
+
+<http://ex.org/@alice/g> {
+    ex:a1 ex:name "A" .
+}
+"#;
+
+async fn scoped_app() -> (TempDir, axum::Router) {
+    let (tmp, state) = test_state().await;
+    let app = build_router(state);
+    let (status, _) = post(
+        &app,
+        "/v1/fluree/create",
+        "application/json",
+        serde_json::json!({ "ledger": SCOPED_LEDGER }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create ledger");
+    let (status, _) = post(
+        &app,
+        &format!("/v1/fluree/upsert/{SCOPED_LEDGER}"),
+        "application/trig",
+        SCOPED_TRIG.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "trig upsert");
+    (tmp, app)
+}
+
+async fn post(
+    app: &axum::Router,
+    uri: &str,
+    content_type: &str,
+    body: String,
+) -> (StatusCode, JsonValue) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
+    (status, json)
+}
+
+/// The `?n` values of a SPARQL-results or JSON-LD `select ?n` response, sorted.
+fn names(json: &JsonValue) -> Vec<String> {
+    let mut out: Vec<String> = match json.get("results") {
+        Some(results) => results["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no bindings in {json}"))
+            .iter()
+            .map(|row| binding_value(row, "n").to_string())
+            .collect(),
+        None => json
+            .as_array()
+            .unwrap_or_else(|| panic!("no rows in {json}"))
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect(),
+    };
+    out.sort();
+    out
+}
+
+/// Every dataset reference on the ledger route resolves in the path's ledger
+/// through one typed table: the ledger's own address in any spelling, on the
+/// path or in the body, names it (#1982); a graph IRI containing `#` or `@` is
+/// a graph, not ledger syntax; prefixed and BASE-relative clause IRIs expand
+/// first; JSON-LD `from` / `fromNamed` read the same way as their SPARQL
+/// twins. Another ledger is still refused.
+#[tokio::test]
+async fn ledger_route_dataset_references_resolve_in_the_paths_ledger() {
+    let (_tmp, app) = scoped_app().await;
+    let prefix = "PREFIX ex: <http://ex.org/> ";
+    let sparql_cases: Vec<(&str, &str, String, Vec<&str>)> = vec![
+        (
+            "a graph IRI with '#'",
+            SCOPED_LEDGER,
+            format!(
+                "{prefix}SELECT ?n FROM NAMED <http://ex.org/vocab#products> \
+                 WHERE {{ GRAPH <http://ex.org/vocab#products> {{ ?s ex:name ?n }} }}"
+            ),
+            vec!["P"],
+        ),
+        (
+            "a graph IRI with '@'",
+            SCOPED_LEDGER,
+            format!(
+                "{prefix}SELECT ?n FROM NAMED <http://ex.org/@alice/g> \
+                 WHERE {{ GRAPH <http://ex.org/@alice/g> {{ ?s ex:name ?n }} }}"
+            ),
+            vec!["A"],
+        ),
+        (
+            "the config graph by its URN",
+            SCOPED_LEDGER,
+            format!("{prefix}SELECT ?n FROM <urn:fluree:{SCOPED_LEDGER}#config> WHERE {{ ?s ex:name ?n }}"),
+            vec![],
+        ),
+        (
+            "#1982: short path, full FROM",
+            "dscope",
+            format!("{prefix}SELECT ?n FROM <{SCOPED_LEDGER}> WHERE {{ ?s ex:name ?n }}"),
+            vec!["D"],
+        ),
+        (
+            "#1982: URN path",
+            "urn:fluree:dscope:main",
+            format!(
+                "{prefix}SELECT ?n FROM <{SCOPED_LEDGER}> FROM NAMED <http://ex.org/vocab#products> \
+                 WHERE {{ {{ ?s ex:name ?n }} UNION {{ GRAPH <http://ex.org/vocab#products> {{ ?s ex:name ?n }} }} }}"
+            ),
+            vec!["D", "P"],
+        ),
+        (
+            "#1982: full path, short FROM",
+            SCOPED_LEDGER,
+            format!("{prefix}SELECT ?n FROM <dscope> WHERE {{ ?s ex:name ?n }}"),
+            vec!["D"],
+        ),
+        (
+            "a prefixed FROM NAMED",
+            SCOPED_LEDGER,
+            "PREFIX ex: <http://ex.org/> PREFIX al: <http://ex.org/@alice/> \
+             SELECT ?n FROM NAMED al:g WHERE { GRAPH al:g { ?s ex:name ?n } }"
+                .to_string(),
+            vec!["A"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, path, sparql, expected) in &sparql_cases {
+        let (status, json) = post(
+            &app,
+            &format!("/v1/fluree/query/{path}"),
+            "application/sparql-query",
+            sparql.clone(),
+        )
+        .await;
+        if status != StatusCode::OK || names(&json) != *expected {
+            failures.push(format!("SPARQL {case}: {status} {json}"));
+        }
+    }
+
+    let jsonld_cases: Vec<(&str, &str, JsonValue, Vec<&str>)> = vec![
+        (
+            "the short alias",
+            SCOPED_LEDGER,
+            serde_json::json!({"from": "dscope"}),
+            vec!["D"],
+        ),
+        (
+            "the URN",
+            SCOPED_LEDGER,
+            serde_json::json!({"from": "urn:fluree:dscope:main"}),
+            vec!["D"],
+        ),
+        (
+            "the address with a graph IRI",
+            SCOPED_LEDGER,
+            serde_json::json!({"from": "dscope:main#http://ex.org/vocab#products"}),
+            vec!["P"],
+        ),
+        (
+            "short path, full from",
+            "dscope",
+            serde_json::json!({"from": SCOPED_LEDGER}),
+            vec!["D"],
+        ),
+    ];
+    for (case, path, dataset, expected) in &jsonld_cases {
+        let mut body = serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "select": "?n",
+            "where": {"@id": "?s", "ex:name": "?n"}
+        });
+        for (k, v) in dataset.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, json) = post(
+            &app,
+            &format!("/v1/fluree/query/{path}"),
+            "application/json",
+            body.to_string(),
+        )
+        .await;
+        if status != StatusCode::OK || names(&json) != *expected {
+            failures.push(format!("JSON-LD {case}: {status} {json}"));
+        }
+    }
+
+    // A graph IRI in `fromNamed`, read by its graph pattern.
+    let body = serde_json::json!({
+        "@context": {"ex": "http://ex.org/"},
+        "fromNamed": ["http://ex.org/vocab#products"],
+        "select": "?n",
+        "where": [["graph", "http://ex.org/vocab#products", {"@id": "?s", "ex:name": "?n"}]]
+    });
+    let (status, json) = post(
+        &app,
+        &format!("/v1/fluree/query/{SCOPED_LEDGER}"),
+        "application/json",
+        body.to_string(),
+    )
+    .await;
+    if status != StatusCode::OK || names(&json) != ["P"] {
+        failures.push(format!("JSON-LD fromNamed graph IRI: {status} {json}"));
+    }
+
+    // A graph the ledger does not have is a typed 404.
+    let (status, json) = post(
+        &app,
+        &format!("/v1/fluree/query/{SCOPED_LEDGER}"),
+        "application/sparql-query",
+        format!(
+            "{prefix}SELECT ?n FROM NAMED <http://ex.org/nope> \
+             WHERE {{ GRAPH <http://ex.org/nope> {{ ?s ex:name ?n }} }}"
+        ),
+    )
+    .await;
+    if status != StatusCode::NOT_FOUND || json["@type"] != "err:db/GraphNotFound" {
+        failures.push(format!("SPARQL an unknown graph: {status} {json}"));
+    }
+
+    // Another ledger stays refused, in either language.
+    let (status, json) = post(
+        &app,
+        &format!("/v1/fluree/query/{SCOPED_LEDGER}"),
+        "application/sparql-query",
+        format!("{prefix}SELECT ?n FROM <other-ledger:main> WHERE {{ ?s ex:name ?n }}"),
+    )
+    .await;
+    if status != StatusCode::BAD_REQUEST || !json.to_string().contains("Ledger mismatch") {
+        failures.push(format!("SPARQL another ledger: {status} {json}"));
+    }
+    let (status, json) = post(
+        &app,
+        &format!("/v1/fluree/query/{SCOPED_LEDGER}"),
+        "application/json",
+        serde_json::json!({"from": "other-ledger", "select": "?s", "where": {"@id": "?s"}})
+            .to_string(),
+    )
+    .await;
+    if status != StatusCode::BAD_REQUEST || !json.to_string().contains("Ledger mismatch") {
+        failures.push(format!("JSON-LD another ledger: {status} {json}"));
+    }
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
