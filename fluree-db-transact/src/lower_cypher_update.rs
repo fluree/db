@@ -218,10 +218,10 @@ impl<'a> CypherLowering<'a> {
             vars: self.vars,
             txn_meta: Vec::new(),
             write_graphs: Default::default(),
-            template_default_graph: None,
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
             sync_graph: None,
+            address_graph_names: Default::default(),
         }
     }
 

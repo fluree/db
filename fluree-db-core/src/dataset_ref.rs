@@ -12,6 +12,7 @@
 //! | a ledger position: an HTTP ledger path, `Fluree::graph()` / `db()`, a CLI `--ledger`, an MCP `ledger` argument, `SERVICE <fluree:ledger:…>` | [`LedgerRef::parse`] | `mydb`, `mydb:dev@t:5`, `urn:fluree:mydb:main#txn-meta` |
 //! | a dataset position: SPARQL `FROM` / `FROM NAMED` / `TO` / `USING` / `WITH`, a JSON-LD `from` / `fromNamed` string | [`DatasetRef::parse`] | the above, or `http://ex.org/g` |
 //! | a graph of an already-named ledger: a `#fragment`, a JSON-LD `graph` value | [`GraphSel::parse`] | `txn-meta`, `config`, `http://ex.org/g` |
+//! | a graph position of a ledger: `GRAPH <iri>` in a query or an update's WHERE, a template's graph, a data quad, a TriG or import block | [`TargetLedger::graph_position`] | `mydb:main`, `mydb:main#http://ex.org/g`, `http://ex.org/g` |
 //!
 //! The address grammar is
 //!
@@ -40,6 +41,7 @@ use crate::ledger_id::{
     parse_time_travel_spec, LedgerId, LedgerIdParseError, LedgerIdTimeSpec, COMMIT_PREFIX_MIN_LEN,
     LEDGER_URN_PREFIX, TIME_TRAVEL_TAGS,
 };
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
@@ -680,6 +682,24 @@ pub enum TargetError {
     GraphNotFound(String),
 }
 
+/// What an IRI names in a graph position of a ledger
+/// ([`TargetLedger::graph_position`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphPosition {
+    /// The ledger's default graph: its own address.
+    Default,
+    /// A graph the ledger has registered, by the IRI it is registered under
+    /// (the text as written, or `<g>` for `L#<g>`) and its id.
+    Registered { g_id: GraphId, iri: Arc<str> },
+    /// No graph the ledger has. Nothing to read; a write creates the graph
+    /// under this IRI (the text as written, or `<g>` for `L#<g>`).
+    New(Arc<str>),
+    /// This ledger's address with a time, or `L#<g>` where `<g>` is itself an
+    /// address of this ledger and no graph is registered under it. Nothing to
+    /// read, and no name a write may create a graph under.
+    NotAGraph,
+}
+
 impl fmt::Display for TargetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -795,6 +815,92 @@ impl<'a> TargetLedger<'a> {
             }),
             reserved => Ok(self.reserved(reserved.clone())),
         }
+    }
+
+    /// What `iri` names in a graph position of this ledger: `GRAPH <iri>` in
+    /// a query or in an update's WHERE, a template's graph, a data quad, a
+    /// TriG block, a bulk-import block. Every IRI there names a graph, so none
+    /// names another ledger, and one table covers reads and writes:
+    ///
+    /// - this ledger's own address in any spelling
+    ///   ([`LedgerRef::is_own_address`]): its default graph;
+    /// - its address with an IRI graph (`L#<g>`): the graph `<g>`, which a
+    ///   write creates when the ledger does not have it;
+    /// - any other IRI: the graph the registry holds by it exactly, or none
+    ///   (a write creates it).
+    ///
+    /// A graph is never created under an address of this ledger: `L#<g>`
+    /// where `<g>` is one, and the ledger's address with a time, are
+    /// [`GraphPosition::NotAGraph`]. The address with a reserved keyword
+    /// (`L#config`, `L#txn-meta`) is read as an IRI, so a reserved graph keeps
+    /// the IRIs it is registered under.
+    ///
+    /// Only an IRI that starts with the ledger's name can be its address, so
+    /// the common case is one registry lookup with nothing parsed.
+    pub fn graph_position(&self, iri: &str) -> GraphPosition {
+        if let Some(address) = self.own_address_reading(iri) {
+            if address.at().is_some() {
+                return GraphPosition::NotAGraph;
+            }
+            match address.graph() {
+                GraphSel::Default => return GraphPosition::Default,
+                GraphSel::Named(graph) => {
+                    return match self.registered_under(graph) {
+                        Some(found) => found,
+                        None if self.own_address_reading(graph).is_some() => {
+                            GraphPosition::NotAGraph
+                        }
+                        None => GraphPosition::New(graph.as_arc().clone()),
+                    };
+                }
+                GraphSel::TxnMeta | GraphSel::Config => {}
+            }
+        }
+        self.registered_under(iri)
+            .unwrap_or_else(|| GraphPosition::New(iri.into()))
+    }
+
+    /// The graph registered under exactly `iri`, keeping that IRI.
+    fn registered_under(&self, iri: &str) -> Option<GraphPosition> {
+        let g_id = (self.lookup)(iri)?;
+        Some(GraphPosition::Registered {
+            g_id,
+            iri: iri.into(),
+        })
+    }
+
+    /// The name `GRAPH ?g` lists the registered graph `iri` (id `g_id`)
+    /// under, so a `?g` binding names that graph again in any graph position:
+    /// `iri` itself, or `<ledger>#<iri>` when [`graph_position`] reads `iri`
+    /// as another graph (a graph registered under this ledger's own address,
+    /// which a graph position reads as the ledger's default graph).
+    ///
+    /// [`graph_position`]: TargetLedger::graph_position
+    pub fn enumeration_name<'i>(&self, iri: &'i str, g_id: GraphId) -> Cow<'i, str> {
+        match self.graph_position(iri) {
+            GraphPosition::Registered { g_id: found, .. } if found == g_id => Cow::Borrowed(iri),
+            _ => Cow::Owned(format!("{}#{iri}", self.id)),
+        }
+    }
+
+    /// Whether `iri` is an address of this ledger, in any spelling, with or
+    /// without a time or a graph.
+    pub fn names_this_ledger(&self, iri: &str) -> bool {
+        self.own_address_reading(iri).is_some()
+    }
+
+    /// `iri` read as an address of this ledger, in any spelling, with or
+    /// without a time or a graph. Every such address starts with the ledger's
+    /// name after an optional `urn:fluree:`, so other text is rejected without
+    /// parsing.
+    fn own_address_reading(&self, iri: &str) -> Option<LedgerRef> {
+        let body = iri.strip_prefix(LEDGER_URN_PREFIX).unwrap_or(iri);
+        if !body.starts_with(self.id.name()) {
+            return None;
+        }
+        LedgerRef::parse(iri)
+            .ok()
+            .filter(|address| address.id() == self.id)
     }
 
     fn registered(&self, iri: &str) -> Option<TargetGraph> {
@@ -1157,6 +1263,92 @@ mod tests {
         assert_eq!(g_id("http://ex.org/g"), 3);
         assert_eq!(g_id("L:feature#http://ex.org/g"), 3);
         assert_eq!(g_id("urn:fluree:L:main#resolution-config"), 4);
+    }
+
+    fn position(iri: &str) -> GraphPosition {
+        let id = LedgerId::parse("L:feature").unwrap();
+        TargetLedger::new(&id, &feature_registry).graph_position(iri)
+    }
+
+    fn position_g_id(iri: &str) -> Option<GraphId> {
+        match position(iri) {
+            GraphPosition::Default => Some(DEFAULT_GRAPH_ID),
+            GraphPosition::Registered { g_id, .. } => Some(g_id),
+            _ => None,
+        }
+    }
+
+    /// A graph position reads the ledger's own address, in any spelling, as
+    /// its default graph, even where a graph is registered under that text
+    /// (`L:feature` here), and `L#<g>` as the graph `<g>`. Any other IRI is
+    /// exactly what the registry holds, another ledger's address included.
+    #[test]
+    fn a_graph_position_reads_the_address_as_the_default_graph() {
+        for own in ["L:feature", "urn:fluree:L:feature", "L:feature#default"] {
+            assert_eq!(position_g_id(own), Some(DEFAULT_GRAPH_ID), "{own}");
+        }
+        for graph in [
+            "http://ex.org/g",
+            "L:feature#http://ex.org/g",
+            "urn:fluree:L:feature#http://ex.org/g",
+        ] {
+            assert_eq!(position_g_id(graph), Some(3), "{graph}");
+        }
+        // The graph registered under the address is reached through it.
+        assert_eq!(position_g_id("L:feature#L:feature"), Some(5));
+        assert_eq!(
+            position_g_id("urn:fluree:L:main#config"),
+            Some(CONFIG_GRAPH_ID)
+        );
+        // A registered graph keeps the IRI it is registered under, a reserved
+        // one reached through `L#<iri>` included.
+        assert_eq!(
+            position("L:feature#urn:fluree:L:main#txn-meta"),
+            GraphPosition::Registered {
+                g_id: TXN_META_GRAPH_ID,
+                iri: "urn:fluree:L:main#txn-meta".into()
+            }
+        );
+        // No graph yet: a write creates it under the IRI the position names.
+        for (written, new) in [
+            ("L:feature#http://ex.org/new", "http://ex.org/new"),
+            ("http://ex.org/new", "http://ex.org/new"),
+            ("L:main", "L:main"),
+        ] {
+            assert_eq!(
+                position(written),
+                GraphPosition::New(new.into()),
+                "{written}"
+            );
+        }
+        // Never under an address of this ledger, and never at a time.
+        for refused in [
+            "L:feature@t:3",
+            "L:feature#urn:fluree:L:feature",
+            "urn:fluree:L:feature@t:1#http://ex.org/g",
+        ] {
+            assert_eq!(position(refused), GraphPosition::NotAGraph, "{refused}");
+        }
+    }
+
+    /// `GRAPH ?g` lists a registered graph under a name that reads it back:
+    /// its IRI, or `L#<iri>` for a graph registered under the address.
+    #[test]
+    fn a_graph_is_listed_under_a_name_that_reads_it_back() {
+        let id = LedgerId::parse("L:feature").unwrap();
+        let target = TargetLedger::new(&id, &feature_registry);
+        for (iri, g_id) in [
+            ("http://ex.org/g", 3),
+            ("urn:fluree:L:main#resolution-config", 4),
+        ] {
+            assert_eq!(target.enumeration_name(iri, g_id), iri);
+        }
+        let legacy = target.enumeration_name("L:feature", 5);
+        assert_eq!(legacy, "L:feature#L:feature");
+        assert!(matches!(
+            target.graph_position(&legacy),
+            GraphPosition::Registered { g_id: 5, .. }
+        ));
     }
 
     #[test]

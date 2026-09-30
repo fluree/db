@@ -23,14 +23,17 @@
 //! In single-db mode (no dataset) every graph of the ledger lives in one
 //! snapshot, partitioned by `g_id`. Named graphs resolve against the snapshot's
 //! graph registry (user graphs, `g_id >= FIRST_USER_GRAPH_ID`) without an
-//! explicit `FROM NAMED` (issue #1279); the ledger alias EXPLICITLY addresses
-//! the default graph, and reserved system graphs (txn-meta, config) stay private.
+//! explicit `FROM NAMED` (issue #1279), through the table every graph position
+//! of a ledger shares (`TargetLedger::graph_position`): the ledger's own
+//! address, in any spelling, EXPLICITLY addresses the default graph, `L#<g>`
+//! the graph `<g>`, and reserved system graphs (txn-meta, config) stay private.
 //! - `GRAPH <iri>` / bound `GRAPH ?g`: executes for a registered user graph,
-//!   the ledger alias, or an R2RML graph source; otherwise empty
-//! - unbound `GRAPH ?g`: binds ?g to each registered user graph. The ledger
-//!   alias (default graph) is NOT enumerated — W3C-conformant since issue
-//!   #1442 (decision D-2); the #1279 implicit default-graph enumeration was
-//!   dropped, while explicit alias addressing above is retained
+//!   the ledger's own address, or an R2RML graph source; otherwise empty
+//! - unbound `GRAPH ?g`: binds ?g to each registered user graph, under a name
+//!   that reads it back (`L#<iri>` for a graph registered under the ledger's
+//!   own address). The default graph is NOT enumerated — W3C-conformant since
+//!   issue #1442; the #1279 implicit default-graph enumeration
+//!   was dropped, while explicit addressing above is retained
 //!
 //! # Architecture
 //!
@@ -760,7 +763,7 @@ impl Operator for GraphOperator {
             if ctx.dataset.is_none() {
                 if let GraphName::Iri(iri) = &graph_name {
                     let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                    let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                    let is_alias = ctx.single_db_names_default_graph(iri);
                     let is_r2rml_gs = !is_user_graph
                         && !is_alias
                         && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
@@ -803,7 +806,7 @@ impl Operator for GraphOperator {
                             // Single-db: a registered user graph, the ledger
                             // alias (default graph), or an R2RML graph source.
                             let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                            let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                            let is_alias = ctx.single_db_names_default_graph(iri);
                             let is_r2rml_gs = !is_user_graph
                                 && !is_alias
                                 && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
@@ -849,8 +852,7 @@ impl Operator for GraphOperator {
                                     // Single-db: same resolution as the concrete arm.
                                     let is_user_graph =
                                         ctx.single_db_user_graph_id(&bound_iri).is_some();
-                                    let is_alias =
-                                        bound_iri.as_ref() == ctx.active_snapshot.ledger_id;
+                                    let is_alias = ctx.single_db_names_default_graph(&bound_iri);
                                     let is_r2rml_gs = !is_user_graph
                                         && !is_alias
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
@@ -889,13 +891,14 @@ impl Operator for GraphOperator {
                                 }
                             } else {
                                 // Single-db: bind ?g to each registered user
-                                // graph (empty graphs emit no rows). The ledger
-                                // alias (default graph) is NOT enumerated: per
-                                // SPARQL 1.1, `GRAPH ?g` ranges over named
-                                // graphs only (D-2 / issue #1442 dropped the
-                                // #1279 implicit enumeration). The default
-                                // graph remains explicitly addressable via
-                                // `GRAPH <alias>` in the arms above.
+                                // graph (empty graphs emit no rows), under a
+                                // name that reads it back. The default graph is
+                                // NOT enumerated: per SPARQL 1.1, `GRAPH ?g`
+                                // ranges over named graphs only (issue
+                                // #1442 dropped the #1279 implicit
+                                // enumeration). It remains explicitly
+                                // addressable by the ledger's own address in
+                                // the arms above.
                                 for iri in ctx.single_db_user_graph_iris() {
                                     self.execute_in_graph(
                                         ctx,

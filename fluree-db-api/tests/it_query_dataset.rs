@@ -1902,9 +1902,12 @@ async fn sparql_single_db_graph_variable_bound_user_graph_iri() {
     assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
 }
 
-/// The ledger alias addresses the **default** graph even when a user graph is
-/// registered with an IRI equal to the ledger ID: alias resolution must win so
-/// `GRAPH <ledger-id>` never gets shadowed by the colliding named graph.
+/// The ledger's own address addresses the **default** graph even when a user
+/// graph is registered under an IRI equal to it: `GRAPH <ledger-id>` is never
+/// shadowed by that graph, which stays reachable as
+/// `<ledger-id>#<ledger-id>`. No write registers such a graph any more, so the
+/// fixture builds it the one way still open: `main` writes a graph named by a
+/// branch's address, and the branch inherits it.
 #[tokio::test]
 async fn sparql_single_db_graph_alias_wins_over_colliding_named_graph() {
     assert_index_defaults();
@@ -1917,33 +1920,43 @@ async fn sparql_single_db_graph_alias_wins_over_colliding_named_graph() {
 
         ex:alice schema:name "Alice" .
 
-        GRAPH <ngquirk:main> {
+        GRAPH <ngquirk:dev> {
             ex:bob schema:name "Bob" .
         }
     "#;
-    let ledger = fluree
+    fluree
         .stage_owned(ledger0)
         .upsert_turtle(trig)
         .execute()
         .await
-        .expect("trig upsert should succeed")
-        .ledger;
-
-    // GRAPH <ngquirk:main> must read the default graph (Alice), never the
-    // colliding named graph (Bob).
-    let sparql = r"
-        PREFIX schema: <http://schema.org/>
-        SELECT ?name
-        WHERE {
-            GRAPH <ngquirk:main> { ?s schema:name ?name }
-        }
-    ";
-    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .expect("trig upsert should succeed");
+    fluree
+        .create_branch("ngquirk", "dev", None, None)
         .await
-        .expect("query should succeed");
-    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        .expect("create the branch");
+    let ledger = fluree.ledger("ngquirk:dev").await.expect("load the branch");
 
-    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
+    // GRAPH <ngquirk:dev> must read the default graph (Alice), never the
+    // colliding named graph (Bob), which `<ngquirk:dev#ngquirk:dev>` reads.
+    for (graph, expected) in [
+        ("ngquirk:dev", json!([["Alice"]])),
+        ("urn:fluree:ngquirk:dev", json!([["Alice"]])),
+        ("ngquirk:dev#ngquirk:dev", json!([["Bob"]])),
+    ] {
+        let sparql = format!(
+            "PREFIX schema: <http://schema.org/> \
+             SELECT ?name WHERE {{ GRAPH <{graph}> {{ ?s schema:name ?name }} }}"
+        );
+        let result = support::query_sparql(&fluree, &ledger, &sparql)
+            .await
+            .expect("query should succeed");
+        let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&jsonld),
+            normalize_rows(&expected),
+            "GRAPH <{graph}>"
+        );
+    }
 }
 
 /// JSON-LD parity: `["graph", "<iri>", {...}]` resolves a user named graph in

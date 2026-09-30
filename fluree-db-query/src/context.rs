@@ -1365,51 +1365,80 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    /// Resolve a `GRAPH <iri>` to a user-registered named graph's `g_id`, or
-    /// `None` when a dataset scopes the named set (`FROM NAMED`), the IRI is
-    /// unregistered, or it names a reserved system graph. The ledger alias is
-    /// reserved for the default graph and never resolves here, even if a
-    /// registered graph shares the ledger's IRI.
     /// Whether `iri` names a graph the caller loaded as a ledger graph: a
     /// dataset member (or member alias) of kind [`MemberKind::Native`], or,
-    /// with no dataset, a native primary's own id. Such a graph is never asked
-    /// about as a graph source.
+    /// with no dataset, a native primary's default graph by its own address.
+    /// Such a graph is never asked about as a graph source.
     pub fn graph_is_native(&self, iri: &str) -> bool {
         match self.dataset {
             Some(ds) => ds
                 .named_graph(iri)
                 .is_some_and(|graph| graph.kind == MemberKind::Native),
             None => {
-                self.primary_kind == MemberKind::Native
-                    && iri == self.active_snapshot.ledger_id.as_str()
+                self.primary_kind == MemberKind::Native && self.single_db_names_default_graph(iri)
             }
         }
     }
 
-    pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
-        if self.dataset.is_some() || iri == self.active_snapshot.ledger_id.as_str() {
+    /// What `GRAPH <iri>` names in this single-ledger view, through the table
+    /// every graph position of a ledger shares
+    /// ([`TargetLedger::graph_position`](fluree_db_core::TargetLedger::graph_position)):
+    /// the ledger's own address in any spelling is its default graph, `L#<g>`
+    /// the graph `<g>`, and any other IRI the graph registered by it. `None`
+    /// in dataset mode, where the dataset's members are the named graphs.
+    fn single_db_graph_position(&self, iri: &str) -> Option<fluree_db_core::GraphPosition> {
+        if self.dataset.is_some() {
             return None;
         }
-        self.active_snapshot
-            .graph_registry
-            .graph_id_for_iri(iri)
-            .filter(|g| *g >= FIRST_USER_GRAPH_ID)
+        let registry = &self.active_snapshot.graph_registry;
+        let lookup = |iri: &str| registry.graph_id_for_iri(iri);
+        Some(
+            fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, &lookup)
+                .graph_position(iri),
+        )
     }
 
-    /// User-registered named graph IRIs of the active snapshot, for `GRAPH ?g`
-    /// discovery. Excludes the default, reserved system graphs, and any graph
-    /// colliding with the ledger alias (which addresses the default graph);
-    /// empty in dataset mode.
+    /// Resolve a `GRAPH <iri>` to a user-registered named graph's `g_id`, or
+    /// `None` when a dataset scopes the named set (`FROM NAMED`), the IRI names
+    /// no graph, or it names a reserved system graph or the default graph (the
+    /// ledger's own address, even if a registered graph shares the text).
+    pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
+        match self.single_db_graph_position(iri)? {
+            fluree_db_core::GraphPosition::Registered { g_id, .. }
+                if g_id >= FIRST_USER_GRAPH_ID =>
+            {
+                Some(g_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `GRAPH <iri>` names this single-ledger view's default graph:
+    /// the ledger's own address, in any spelling.
+    pub fn single_db_names_default_graph(&self, iri: &str) -> bool {
+        matches!(
+            self.single_db_graph_position(iri),
+            Some(fluree_db_core::GraphPosition::Default)
+        )
+    }
+
+    /// User-registered named graphs of the active snapshot, for `GRAPH ?g`
+    /// discovery, each under the name that reads it back
+    /// ([`TargetLedger::enumeration_name`](fluree_db_core::TargetLedger::enumeration_name)):
+    /// its IRI, or `L#<iri>` for a graph registered under the ledger's own
+    /// address. Excludes the default and reserved system graphs; empty in
+    /// dataset mode.
     pub fn single_db_user_graph_iris(&self) -> Vec<Arc<str>> {
         if self.dataset.is_some() {
             return Vec::new();
         }
-        let alias = self.active_snapshot.ledger_id.as_str();
-        self.active_snapshot
-            .graph_registry
+        let registry = &self.active_snapshot.graph_registry;
+        let lookup = |iri: &str| registry.graph_id_for_iri(iri);
+        let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, &lookup);
+        registry
             .iter_entries()
-            .filter(|(g, iri)| *g >= FIRST_USER_GRAPH_ID && *iri != alias)
-            .map(|(_, iri)| Arc::from(iri))
+            .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)
+            .map(|(g, iri)| Arc::from(target.enumeration_name(iri, g).as_ref()))
             .collect()
     }
 
