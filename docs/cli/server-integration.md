@@ -977,14 +977,15 @@ These rules are not negotiable; the CLI and other clients depend on them:
 11. **Validation.** When `include_validation == true` (the default) and
    `!fast_forward`, stage the change set from rule 10, resolved under
    `strategy` against the **uncapped** conflict set, onto the target's
-   current state and run the same SHACL validation `POST /merge` runs for
-   that strategy. Report `validation: { conforms, report? }`, where
+   current state and run the same validation (SHACL and uniqueness)
+   `POST /merge` runs for that strategy. Report `validation: { conforms, report? }`, where
    `report` is present only when `conforms == false` and is the message
    the merge would fail with. `mergeable` is then
    `strategy-applies && validation.conforms`; with
    `include_validation=false` it is the strategy signal alone and
-   `validation` is absent. Fast-forward previews carry no `validation`:
-   the adopted commits were validated when authored. Under
+   `validation` is absent. A fast-forward preview carries `validation`
+   only when the target's config enables SHACL or uniqueness, as only
+   then does the merge validate the commits it adopts. Under
    `strategy=abort` with conflicts the merge never reaches validation, so
    `validation` is absent there too. This rule is what makes
    `mergeable=true` mean "neither the strategy nor the shapes reject it"

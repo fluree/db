@@ -594,12 +594,14 @@ async fn preview_conforms_where_merge_would_succeed() {
         .expect("merge succeeds as previewed");
 }
 
-/// A fast-forward adopts commits that were validated when they were
-/// authored, so the preview neither validates nor reports a verdict that
-/// depends on validation. Without this, the condition that skips validation
-/// on a fast-forward is unpinned: removing it changes no test.
+// =============================================================================
+// Fast-forward
+// =============================================================================
+
+/// A fast-forward preview into a governed target validates the adopted
+/// change as the merge will; a conforming change previews as mergeable.
 #[tokio::test]
-async fn preview_fast_forward_carries_no_validation() {
+async fn preview_fast_forward_into_a_governed_target_is_validated() {
     let fluree = FlureeBuilder::memory().build_memory();
     let _main = seed_alice_with_shape(&fluree).await;
 
@@ -615,11 +617,174 @@ async fn preview_fast_forward_carries_no_validation() {
         .await
         .expect("preview");
     assert!(preview.fast_forward);
+    let validation = preview
+        .validation
+        .expect("a fast-forward into a governed target is validated");
+    assert!(validation.conforms);
+    assert!(preview.mergeable);
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect("merges as previewed");
+    assert_eq!(names(&fluree, "mydb:main").await, ["B"]);
+}
+
+/// A fast-forward adopts the source's commits as they are. Into a target
+/// whose config enables SHACL, the adopted change is validated first, against
+/// that config as it is before the merge: a second name written on dev
+/// breaks main's maxCount-1 shape, so the preview says so, the fast-forward
+/// is refused, and main keeps its head. A general merge of the same write is
+/// refused too.
+#[tokio::test]
+async fn fast_forward_into_a_shacl_enabled_target_is_validated() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _main = seed_alice_with_shape(&fluree).await;
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(dev, &insert_name("ex:alice", "B"))
+        .await
+        .expect("dev takes the write");
+    let before = head_t(&fluree, "mydb:main").await;
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, MergePreviewOpts::default())
+        .await
+        .expect("preview");
+    assert!(preview.fast_forward);
+    let validation = preview.validation.expect("validated");
+    assert!(!validation.conforms);
+    assert!(validation.report.is_some());
+    assert!(!preview.mergeable);
+
+    let err = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect_err("the adopted change breaks main's shape");
+    assert_shacl_violation(err, "fast-forward");
+    assert_eq!(
+        head_t(&fluree, "mydb:main").await,
+        before,
+        "main keeps its head"
+    );
+    assert_eq!(names(&fluree, "mydb:main").await, ["A"]);
+
+    // Once main moves on, the same write merges through the general path,
+    // which validates it the same way.
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    fluree
+        .insert(main, &insert_name("ex:bob", "Bob"))
+        .await
+        .unwrap();
+    let err = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect_err("the general merge refuses it too");
+    assert_shacl_violation(err, "general merge");
+}
+
+/// Into a target whose config enables neither SHACL nor uniqueness, a
+/// fast-forward adopts the commits without validating them (its shapes
+/// alone enforce nothing), and the preview carries no validation.
+#[tokio::test]
+async fn fast_forward_into_an_ungoverned_target_is_not_validated() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let mut seed = alice_name_shape(None);
+    seed["@graph"].as_array_mut().unwrap().pop(); // no config: shapes only
+    seed["@graph"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"@id": "ex:alice", "ex:name": "A"}));
+    fluree.insert(ledger, &seed).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(dev, &insert_name("ex:alice", "B"))
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, MergePreviewOpts::default())
+        .await
+        .expect("preview");
+    assert!(preview.fast_forward);
     assert!(
         preview.validation.is_none(),
-        "a fast-forward adopts already-validated commits"
+        "an ungoverned target is not validated"
     );
     assert!(preview.mergeable);
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect("fast-forwards unvalidated");
+    assert!(report.fast_forward);
+    assert_eq!(names(&fluree, "mydb:main").await, ["A", "B"]);
+}
+
+/// The adopted commits are checked against the config the target has before
+/// the merge, whatever they do to it, as a transaction's own config writes do
+/// not apply to that transaction. A branch that switches SHACL off in its
+/// config and then writes what main's shapes reject is refused; one that
+/// writes that data and then switches SHACL on fast-forwards into an
+/// ungoverned main unvalidated (the setting governs the next write).
+#[tokio::test]
+async fn fast_forward_is_validated_against_the_config_it_merges_into() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _main = seed_alice_with_shape(&fluree).await;
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let dev = fluree
+        .upsert(
+            dev,
+            &json!({
+                "@id": "urn:config:shacl",
+                "@graph": "config",
+                "https://ns.flur.ee/db#shaclEnabled": false
+            }),
+        )
+        .await
+        .expect("dev's config write")
+        .ledger;
+    fluree
+        .insert(dev, &insert_name("ex:alice", "B"))
+        .await
+        .expect("dev takes the write");
+    let err = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect_err("main's pre-merge config enables SHACL");
+    assert_shacl_violation(err, "config switched off on the branch");
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let mut seed = alice_name_shape(None);
+    seed["@graph"].as_array_mut().unwrap().pop(); // no config: shapes only
+    seed["@graph"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"@id": "ex:alice", "ex:name": "A"}));
+    fluree.insert(ledger, &seed).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let dev = fluree
+        .insert(dev, &insert_name("ex:alice", "B"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .insert(dev, &support::shacl_enabled_config_node())
+        .await
+        .expect("dev switches SHACL on");
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect("main's pre-merge config governs nothing");
+    assert_eq!(names(&fluree, "mydb:main").await, ["A", "B"]);
 }
 
 /// Seed `mydb:main` with `ex:email f:enforceUnique true`, the config that
@@ -712,6 +877,41 @@ async fn merge_enforces_uniqueness_like_a_transaction() {
         .await
         .expect_err("the value is already taken on main");
     assert_unique_violation(&err, "general merge");
+    assert_eq!(
+        head_t(&fluree, "mydb:main").await,
+        before,
+        "main keeps its head"
+    );
+}
+
+/// A fast-forward into a target that enforces uniqueness is checked the same
+/// way: the value dev writes is already taken on main, so the preview reports
+/// it and the fast-forward is refused.
+#[tokio::test]
+async fn fast_forward_into_a_target_enforcing_uniqueness_is_validated() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_unique_email(&fluree).await;
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(dev, &email("ex:u2", "a@x"))
+        .await
+        .expect("dev takes the write");
+    let before = head_t(&fluree, "mydb:main").await;
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, MergePreviewOpts::default())
+        .await
+        .expect("preview");
+    assert!(preview.fast_forward);
+    let validation = preview.validation.expect("validated");
+    assert!(!validation.conforms);
+    assert!(!preview.mergeable);
+
+    let err = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect_err("the value is already taken on main");
+    assert_unique_violation(&err, "fast-forward");
     assert_eq!(
         head_t(&fluree, "mydb:main").await,
         before,

@@ -200,6 +200,66 @@ impl crate::Fluree {
             .map(Some)
     }
 
+    /// The target's state before a fast-forward, when its configuration
+    /// governs writes ([`governs_writes`]); `None` for an ungoverned target,
+    /// which fast-forwards without validation as before.
+    ///
+    /// A fast-forward adopts the source's commits as they are, so a governed
+    /// target validates them first, against its configuration as it is
+    /// before the merge, exactly as it would a transaction writing the same
+    /// change. The state comes from the ledger cache when it holds the target
+    /// at `record`'s head, else from storage.
+    pub(crate) async fn governed_fast_forward_base<C>(
+        &self,
+        target_id: &fluree_db_core::LedgerId,
+        target_store: &C,
+        record: &fluree_db_nameservice::NsRecord,
+    ) -> Result<Option<LedgerState>>
+    where
+        C: fluree_db_core::ContentStore + Clone + 'static,
+    {
+        let cached = match self.ledger_manager.as_ref() {
+            Some(manager) => manager.get_loaded_view(target_id).await.filter(|view| {
+                view.t == record.commit_t && view.head_commit_id == record.commit_head_id
+            }),
+            None => None,
+        };
+        let state = match cached {
+            Some(view) => view.to_ledger_state(),
+            None => {
+                self.load_queryable_state_with_store(target_store.clone(), record.clone())
+                    .await?
+            }
+        };
+        let config = crate::tx::load_transaction_config(&state).await?;
+        Ok(config.is_some_and(|c| governs_writes(&c)).then_some(state))
+    }
+
+    /// Validate a fast-forward onto `base` (from
+    /// [`Self::governed_fast_forward_base`]): stage the adopted commits' net
+    /// change (the source's line since the target's head) onto it and run the
+    /// transaction checks under its configuration.
+    pub(crate) async fn validate_fast_forward(
+        &self,
+        base: LedgerState,
+        source_store: &impl fluree_db_core::ContentStore,
+        diff: &fluree_db_core::BranchDiff,
+    ) -> Result<BranchOpValidation> {
+        let (data, _keys) =
+            crate::merge::collect_commit_data(source_store, &diff.source.commits, &diff.source.own)
+                .await?;
+        let (_view, outcome) = self
+            .stage_validated(
+                base,
+                data.flakes,
+                &data.namespace_delta,
+                &data.graph_iris,
+                "merge",
+            )
+            .await?;
+        Ok(outcome)
+    }
+
     /// Run the checks a transaction runs on its staged view
     /// ([`crate::tx::check_staged_write`]) against the target's
     /// configuration: SHACL and uniqueness, under the target's pre-operation
@@ -273,6 +333,30 @@ impl crate::Fluree {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Whether a ledger configuration governs writes: SHACL or uniqueness
+/// enabled, ledger-wide or for any graph. (Which graphs a write actually
+/// touches, and each one's effective setting, is decided by the checks
+/// themselves; this only says whether running them can matter.)
+pub(crate) fn governs_writes(config: &fluree_db_core::ledger_config::LedgerConfig) -> bool {
+    use fluree_db_core::ledger_config::{ShaclDefaults, TransactDefaults};
+    let shacl = |group: &Option<ShaclDefaults>| {
+        group
+            .as_ref()
+            .is_some_and(|shacl| shacl.enabled == Some(true))
+    };
+    let unique = |group: &Option<TransactDefaults>| {
+        group
+            .as_ref()
+            .is_some_and(|transact| transact.unique_enabled == Some(true))
+    };
+    shacl(&config.shacl)
+        || unique(&config.transact)
+        || config
+            .graph_overrides
+            .iter()
+            .any(|graph| shacl(&graph.shacl) || unique(&graph.transact))
 }
 
 /// Whether `error` is a validation rejection (the staged state breaks the

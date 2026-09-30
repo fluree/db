@@ -761,7 +761,7 @@ SHACL validation runs consistently on every write surface:
 - JSON-LD / SPARQL transactions (`fluree insert`, `fluree upsert`, `fluree update`)
 - Turtle / TriG ingest (`fluree insert-turtle`, `stage_turtle_insert`)
 - Commit replay (`push_commits_with_handle`, followers applying upstream commits)
-- Branch operations (`fluree branch merge`, `rebase`, `revert`): the merged, replayed, or inverted state is validated against the target branch's shapes before anything is written, and `fluree branch diff` reports the same outcome ahead of time
+- Branch operations (`fluree branch merge`, `rebase`, `revert`): the merged, replayed, or inverted state is validated against the target branch's shapes before anything is written, and `fluree branch diff` reports the same outcome ahead of time. A fast-forward merge is validated too when the target's config enables SHACL: the target checks the change it adopts as it would a transaction's
 
 All of these routes go through the same post-stage helper, so the ledger's configured SHACL posture (enable/disable, mode, per-graph, shapes source) applies uniformly, and none of them validates where config leaves SHACL off. A shapes source (including one in another ledger) is resolved only when a graph the write touches has SHACL enabled. A `take-both` merge whose "both values coexist" resolution would breach a `sh:maxCount`, or a revert that removes a value a `sh:minCount` requires, is rejected with the same report a transaction gets.
 
