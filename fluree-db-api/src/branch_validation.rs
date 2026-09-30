@@ -200,8 +200,7 @@ impl crate::Fluree {
         new_graph_iris: &HashMap<GraphId, String>,
     ) -> Result<BranchOpValidation> {
         use crate::tx::{
-            apply_shacl_policy_to_staged_view, open_cross_ledger_shapes_model,
-            resolve_cross_ledger_schema_for_tx, StagedShaclContext,
+            apply_shacl_policy_to_staged_view, enforcement_config, StagedShaclContext,
         };
         use fluree_db_transact::{NamespaceRegistry, TransactError};
 
@@ -212,26 +211,10 @@ impl crate::Fluree {
         let base = view.base();
         let ledger_id = base.snapshot.ledger_id.clone();
 
-        // Config from the target's pre-operation state, resolved once and
-        // shared by the cross-ledger resolvers and the policy pass.
-        let config = crate::config_resolver::resolve_ledger_config(
-            &base.snapshot,
-            base.novelty.as_ref(),
-            base.t(),
-        )
-        .await
-        .map_err(|e| {
-            ApiError::internal(format!(
-                "failed to load ledger config for branch-operation validation: {e}"
-            ))
-        })?;
-        let tx_config = config.clone().map(std::sync::Arc::new);
-
+        // Config from the target's pre-operation state. Shapes and schema
+        // sources resolve inside the SHACL pass, only where SHACL is enabled.
+        let config = enforcement_config(view).await?;
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, self);
-        let cross_ledger_shapes =
-            open_cross_ledger_shapes_model(config.as_ref(), &mut resolve_ctx).await?;
-        let cross_ledger_schema =
-            resolve_cross_ledger_schema_for_tx(base, config.as_ref(), &mut resolve_ctx).await?;
 
         // The staged namespace registry: the snapshot's codes plus the ones
         // this operation brings in.
@@ -248,14 +231,6 @@ impl crate::Fluree {
                     "the source branch's namespace allocations conflict with the target's: {e}"
                 ))
             })?;
-        let cross_ledger_data_ns_map = cross_ledger_shapes
-            .as_ref()
-            .map(|_| crate::tx::namespace_prefix_map(&staged_ns));
-        let cross_ledger_membership = cross_ledger_shapes
-            .as_ref()
-            .zip(cross_ledger_data_ns_map.as_ref())
-            .map(|(model, ns_map)| model.membership(ns_map));
-
         // Graph routing for the staged flakes: every named graph they touch,
         // with its IRI for per-graph config resolution. The default graph
         // always gets the ledger-wide policy.
@@ -275,13 +250,10 @@ impl crate::Fluree {
         let ctx = StagedShaclContext {
             graph_delta: Some(&graph_delta),
             tracker: None,
-            cross_ledger_shapes: cross_ledger_shapes.as_ref().and_then(|m| m.wire()),
             staged_ns: Some(&staged_ns),
             uncommitted_namespaces: Some(namespace_delta),
             txn_context: None,
             inline_shape_bundle: None,
-            cross_ledger_schema,
-            cross_ledger_membership,
             requested_validation_mode: None,
             request_identity: None,
             origin_validated_replay: false,
@@ -292,7 +264,14 @@ impl crate::Fluree {
         // operation only needs to know whether anything rejected it, and a
         // pass that was skipped (SHACL disabled, or no shapes) rejects
         // nothing.
-        match apply_shacl_policy_to_staged_view(view, ctx, tx_config).await {
+        match apply_shacl_policy_to_staged_view(
+            view,
+            ctx,
+            config.as_deref(),
+            Some(&mut resolve_ctx),
+        )
+        .await
+        {
             Ok(_ran) => Ok(BranchOpValidation::default()),
             Err(TransactError::ShaclViolation(report)) => Ok(BranchOpValidation {
                 report: Some(report),

@@ -2441,6 +2441,69 @@ async fn shacl_posture_is_explicit_only() {
     }
 }
 
+/// `f:shaclEnabled true` with a local `f:shapesSource` naming a graph the
+/// ledger does not have: data writes fail closed, and the config repair
+/// commits (a config-only write resolves no shapes source), after which data
+/// writes commit.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn unknown_local_shapes_source_fails_closed_and_the_config_repair_commits() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/shacl-unknown-shapes-graph:main";
+    let config_iri = config_graph_iri(ledger_id);
+    let ledger = fluree
+        .stage_owned(genesis_ledger(&fluree, ledger_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+                <urn:config:shacl> f:shaclEnabled true .
+                <urn:config:shacl> f:shapesSource <urn:config:shapes-ref> .
+                <urn:config:shapes-ref> rdf:type f:GraphRef ;
+                                        f:graphSource <urn:config:shapes-src> .
+                <urn:config:shapes-src> f:graphSelector <http://example.org/no-such-graph> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("config write")
+        .ledger;
+    let record = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:alice",
+        "ex:name": "Alice"
+    });
+
+    let err = fluree
+        .insert(ledger.clone(), &record)
+        .await
+        .expect_err("SHACL is on and its shapes graph does not exist: fail closed");
+    assert!(err.to_string().contains("no-such-graph"), "{err}");
+
+    let ledger = sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             DELETE {{ GRAPH <{config_iri}> {{ <urn:config:shacl> f:shaclEnabled ?on }} }} \
+             INSERT {{ GRAPH <{config_iri}> {{ <urn:config:shacl> f:shaclEnabled false }} }} \
+             WHERE {{ GRAPH <{config_iri}> {{ <urn:config:shacl> f:shaclEnabled ?on }} }}"
+        ),
+    )
+    .await
+    .expect("the config repair resolves no shapes source and commits")
+    .ledger;
+    fluree
+        .insert(ledger, &record)
+        .await
+        .expect("after the repair data writes commit");
+}
+
 /// A Turtle insert on a ledger that holds shapes but no config enabling SHACL
 /// is not validated (`shacl_turtle_insert_rejected_when_violating` is the
 /// enabled twin).
