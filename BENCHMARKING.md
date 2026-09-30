@@ -86,8 +86,10 @@ this table, so it is the one that rots. Add a row when you add a bench file.
 | `fluree-db-api` | `query_hot_property_path.rs` | Hot-cache SPARQL property paths, one scenario per execution mode of the operator (`*` closure, sequence, `?`, …) |
 | `fluree-db-api` | `query_hot_whole_graph_agg.rs` | Cypher aggregate folds from `fast_whole_graph_agg` (whole-graph + class scalars, histograms) against a linear-cost pipeline baseline |
 | `fluree-db-api` | `query_overlay_matrix.rs` | The same query shapes at four ledger conditions — base / overlay / cached / novelty — so the columnar+novelty merge lane and a cached handle's steady state after background indexing have coverage |
+| `fluree-db-api` | `dataset_build.rs` | Dataset resolution and build per member (`build_dataset_view`, and `FROM NAMED` × 1/4/16 through `query_from()`), graphs of one ledger vs separate ledgers, file-backed |
 | `fluree-db-api` | `annotation_hydration.rs` | `inject_annotations` hydration cost: index scan vs sealed annotation arena |
 | `fluree-db-api` | `annotation_planner.rs` | Planner direction for `f:reifies*` edge-annotation queries: arena-informed row counts vs HLL-only stats |
+| `fluree-db-server` | `dataset_http.rs` | Warm in-process HTTP requests with dataset clauses and `GRAPH` scopes on `/query`, `/query/{ledger}` and `/stream/query/{ledger}`, including a bearer-token case and a 2 KB `VALUES` body |
 | `fluree-db-query` | `vector_math.rs` | SIMD vs scalar dot/L2/cosine micro-bench |
 | `fluree-db-spatial` | `spatial_bench.rs` | S2 covering build + within/intersects/radius latency |
 

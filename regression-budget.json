@@ -130,10 +130,18 @@
       },
       "graphql_schema": {
         "small": 5.0
+      },
+      "dataset_build": {
+        "tiny": 10.0,
+        "small": 5.0
       }
     },
     "fluree-db-server": {
       "policy_http": {
+        "tiny": 10.0,
+        "small": 5.0
+      },
+      "dataset_http": {
         "tiny": 10.0,
         "small": 5.0
       }
