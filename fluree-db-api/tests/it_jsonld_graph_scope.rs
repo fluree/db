@@ -374,3 +374,73 @@ async fn config_keyword_writes_the_config_graph() {
         "the nested policy group landed in #config with its field"
     );
 }
+
+/// P6a/P6b: a JSON-LD 1.1 named graph's content lands in the graph its
+/// `@id` names, and the graph node's own properties land in the enclosing
+/// graph, exactly as the SPARQL spelling writes them. The content used to be
+/// dropped (and the first content node's `@id` read as a graph selector).
+#[tokio::test]
+async fn named_graph_object_content_lands_in_its_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ng = "http://example.org/NG";
+    let jsonld = insert(
+        &fluree,
+        genesis_ledger(&fluree, "it/scope-named-graph:main"),
+        &json!({
+            "@context": ctx(),
+            "@id": "ex:NG",
+            "ex:label": "w",
+            "@graph": [{"@id": "ex:a", "ex:name": "a"}, {"@id": "ex:b", "ex:name": "b"}]
+        }),
+    )
+    .await;
+    assert_eq!(values(&fluree, &jsonld, Some(ng), "name").await, ["a", "b"]);
+    assert_eq!(values(&fluree, &jsonld, None, "label").await, ["w"]);
+    assert!(values(&fluree, &jsonld, None, "name").await.is_empty());
+
+    let twin = sparql_update(
+        &fluree,
+        genesis_ledger(&fluree, "it/scope-named-graph-sparql:main"),
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA {{ ex:NG ex:label \"w\" .
+               GRAPH <{ng}> {{ ex:a ex:name \"a\" . ex:b ex:name \"b\" }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        count(&fluree, &jsonld, Some(ng)).await,
+        count(&fluree, &twin, Some(ng)).await
+    );
+    assert_eq!(
+        count(&fluree, &jsonld, None).await,
+        count(&fluree, &twin, None).await
+    );
+}
+
+/// A graph sync names its graph in the request: a named-graph object in the
+/// payload is refused rather than folded into the target graph.
+#[tokio::test]
+async fn sync_refuses_a_named_graph_object() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/scope-sync-named-graph:main";
+    insert(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id),
+        &json!({"@context": ctx(), "@id": "ex:seed", "ex:p": 1}),
+    )
+    .await;
+    let err = fluree
+        .sync_named_graph(
+            ledger_id,
+            G,
+            &json!({"@context": ctx(), "@id": "ex:g", "@graph": [{"@id": "ex:a", "ex:p": 1}]}),
+            fluree_db_api::SyncGraphOpts::default(),
+        )
+        .await
+        .expect_err("a payload that names a graph is refused");
+    assert!(
+        err.to_string().contains("must not address named graphs"),
+        "{err}"
+    );
+}

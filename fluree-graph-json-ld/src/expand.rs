@@ -711,21 +711,15 @@ pub(crate) fn node_impl(
             // would treat the envelope as a single node and silently drop
             // @graph.
             //
-            // The value decides (`graph_shape::classify_graph_value`, shared
-            // with every other reader of `@graph`): with an `@id` the content is
-            // a JSON-LD named graph, and a graph *selector* marks a node, not a
+            // The value decides (`graph_shape::is_envelope_graph`, shared with
+            // every other reader of `@graph`): with an `@id` the content is a
+            // JSON-LD named graph, and a graph *selector* marks a node, not a
             // wrapper. Both expand as a node, which keeps the `@id`, the
             // properties and the `@graph` entry.
             let has_id = map.contains_key("@id") || map.contains_key("id");
             if let Some(graph) = map.get("@graph") {
-                match crate::graph_shape::classify_graph_value(graph) {
-                    crate::graph_shape::GraphValue::Invalid(reason) => {
-                        return Err(JsonLdError::InvalidGraphValue { reason });
-                    }
-                    crate::graph_shape::GraphValue::Content(_) if !has_id => {
-                        return expand_envelope(map, "@graph", graph, context, strict);
-                    }
-                    _ => {}
+                if crate::graph_shape::is_envelope_graph(graph, has_id)? {
+                    return expand_envelope(map, "@graph", graph, context, strict);
                 }
             } else if let Some(graph) = map.get("graph").filter(|_| !has_id) {
                 // Legacy bare `graph` envelope key. The transaction paths strip
