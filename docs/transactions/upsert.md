@@ -76,8 +76,12 @@ ex:alice schema:email "alice@example.org"
 ```
 
 **Operations:**
-1. Retract ALL existing properties of ex:alice
-2. Assert new properties
+1. For each predicate in the payload (`rdf:type`, `schema:name`, `schema:email`,
+   `schema:age`), retract every value ex:alice currently holds for it
+2. Assert the payload's values
+
+A value the payload restates cancels its own retraction, so it does not
+appear in the commit.
 
 **Flakes:**
 ```
@@ -86,7 +90,6 @@ ex:alice schema:name "Alice" (retract)
 ex:alice schema:email "alice@example.org" (retract)
 
 # Assertions (t=2)
-ex:alice rdf:type schema:Person (assert)
 ex:alice schema:name "Alice Smith" (assert)
 ex:alice schema:email "alice.smith@example.org" (assert)
 ex:alice schema:age 30 (assert)
@@ -100,7 +103,34 @@ ex:alice schema:email "alice.smith@example.org"
 ex:alice schema:age 30
 ```
 
-Note: The `@type` is re-asserted (types are always included in replace).
+`rdf:type schema:Person` is unchanged: it is retracted and re-asserted in the
+same transaction, and the two cancel.
+
+### Language Tags, Lists, and Blank Nodes
+
+The unit of replacement is the whole `(graph, subject, predicate)`: every
+current value is retracted exactly as it is stored.
+
+- **Language tags.** All languages of a predicate are replaced together. An
+  upsert of `{"schema:name": {"@value": "Alicia", "@language": "es"}}` over
+  `"Alice"@en` and `"Alice"@fr` leaves only `"Alicia"@es`. To change one
+  language and keep the others, use
+  [WHERE/DELETE/INSERT](update-where-delete-insert.md) with a `FILTER` on
+  `lang(?v)`, or include every language in the payload.
+- **Lists.** A `@list` value is replaced as a whole: every stored position is
+  retracted, including repeated values, and positions the new list restates
+  cancel. Replacing a list with plain values (or the reverse) works the same
+  way.
+- **Blank nodes.** A blank node in an upsert payload is identified by the
+  payload itself, so upserting the same document again addresses the same
+  node, and its values are replaced like any other subject's. An identical
+  re-upsert of a document with blank nodes commits nothing. A changed
+  document mints new blank nodes; the old ones stay (see
+  [Stable blank-node ids](update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids)
+  for editing a stored blank node in place).
+- **Named graphs.** The graph is part of the unit: an upsert into a named
+  graph replaces that graph's values and leaves the same predicate's values
+  in other graphs alone.
 
 ## Idempotency
 
@@ -112,17 +142,13 @@ Replace mode is idempotent—repeated submissions produce the same result:
 ```
 Result: Entity created.
 
-**Second Submission (t=2):**
+**Second Submission:**
 ```json
 {"@id": "ex:alice", "schema:name": "Alice", "schema:age": 30}
 ```
-Result: No actual changes (retracts and re-asserts same values).
-
-**Third Submission (t=3):**
-```json
-{"@id": "ex:alice", "schema:name": "Alice", "schema:age": 30}
-```
-Result: No actual changes.
+Result: nothing is committed. Each value's retraction and re-assertion cancel,
+so the transaction stages no flakes and the ledger stays at t=1. This holds
+for language-tagged values, lists, and the payload's blank nodes too.
 
 This makes upserts safe to retry.
 
@@ -338,9 +364,9 @@ All types are replaced together.
 
 ## Edge Cases
 
-### Empty Replacement
+### Predicates Not in the Payload
 
-Replacing with minimal data removes other properties:
+Only the predicates the payload names are replaced:
 
 **Before (t=1):**
 ```json
@@ -348,17 +374,15 @@ Replacing with minimal data removes other properties:
   "@id": "ex:alice",
   "schema:name": "Alice",
   "schema:email": "alice@example.org",
-  "schema:age": 30,
-  "schema:telephone": "+1-555-0100"
+  "schema:age": 30
 }
 ```
 
-**Replace (t=2):**
+**Upsert (t=2):**
 ```json
 {
   "@id": "ex:alice",
-  "@type": "schema:Person",
-  "schema:name": "Alice"
+  "schema:name": "Alice Smith"
 }
 ```
 
@@ -366,18 +390,15 @@ Replacing with minimal data removes other properties:
 ```json
 {
   "@id": "ex:alice",
-  "@type": "schema:Person",
-  "schema:name": "Alice"
+  "schema:name": "Alice Smith",
+  "schema:email": "alice@example.org",
+  "schema:age": 30
 }
 ```
 
-Email, age, and telephone are removed.
-
-### Partial Updates Not Possible
-
-Replace mode replaces ALL properties—partial updates not supported.
-
-For partial updates, use [WHERE/DELETE/INSERT](update-where-delete-insert.md).
+To remove a predicate's values, retract them with
+[WHERE/DELETE/INSERT](update-where-delete-insert.md), or use
+[graph sync](sync.md) to make a whole graph equal a document.
 
 ## Error Handling
 
@@ -517,10 +538,10 @@ For partial updates, use WHERE/DELETE/INSERT:
 
 | Feature | Default Mode | Replace Mode |
 |---------|--------------|--------------|
-| **Behavior** | Additive | Replace all |
-| **Existing properties** | Preserved | Removed |
+| **Behavior** | Additive | Replaces each named predicate's values |
+| **Predicates not in the payload** | Preserved | Preserved |
 | **Idempotent** | No | Yes |
-| **Partial updates** | Yes (with WHERE/DELETE/INSERT) | No |
+| **Partial updates** | Yes (with WHERE/DELETE/INSERT) | Per predicate |
 | **Use case** | Adding data | Synchronization |
 | **Retry safety** | Requires care | Safe by default |
 | **Performance** | Fewer operations | More operations |

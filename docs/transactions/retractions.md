@@ -304,13 +304,28 @@ Remove entities with specific property:
 
 ### Idempotent
 
-Retracting a non-existent triple is a no-op:
+Retracting a triple that is not stored is a no-op, and a transaction that
+retracts nothing else commits nothing:
 
 ```text
 t=1: No triple exists
-t=2: DELETE { ex:alice schema:age 30 }
-     Result: No change (triple didn't exist)
+t=2: DELETE DATA { ex:alice schema:age 30 }
+     Result: nothing is committed; the ledger stays at t=1
 ```
+
+A DELETE names RDF terms exactly. The datatype must match the stored one
+(`30` is `xsd:integer`, so it does not retract `"30"^^xsd:int`); a language
+tag matches case-insensitively (`"a"@EN` retracts a stored `"a"@en`). A
+`DELETE`/`INSERT` of a triple that is not stored therefore inserts it — the
+retraction names nothing, so it cannot cancel the insertion (SPARQL 1.1
+Update's `(DS − D) ∪ I`):
+
+```sparql
+DELETE { ex:alice schema:age 30 } INSERT { ex:alice schema:age 30 } WHERE {}
+```
+
+stores `ex:alice schema:age 30` if it was absent, and commits nothing if it
+was present.
 
 ### No Cascading by Default
 
