@@ -924,3 +924,236 @@ async fn stamped_predicate_equality_against_primary_encodable_constant() {
         );
     }
 }
+
+/// A SERVICE endpoint names a member of the query's dataset. One that does not
+/// used to run its block against the dataset the query was written in, so
+/// `SERVICE <fluree:ledger:beta>` over a dataset without beta answered with
+/// alpha's rows, and so did an endpoint naming no ledger at all. It is a caller
+/// error now, and contributes no rows under SILENT; a member endpoint, in any
+/// spelling of its address, still answers.
+#[tokio::test]
+async fn service_to_a_non_member_is_refused_not_answered_by_the_dataset() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_pair(&fluree, "nonmember").await;
+    let gamma = "xl-gamma-nonmember:main";
+    seed(
+        &fluree,
+        gamma,
+        json!([{"@id": format!("{BETA}g1"), format!("{BETA}tag"): "gamma"}]),
+    )
+    .await;
+    // alpha as the default graph and gamma as a named graph: beta exists but
+    // is not a member.
+    let spec = DatasetSpec::new()
+        .with_default(GraphSource::parse(&alpha).unwrap())
+        .with_named(GraphSource::parse(gamma).unwrap());
+    let dataset = fluree
+        .build_dataset_view(&spec)
+        .await
+        .expect("build_dataset_view");
+
+    for endpoint in [
+        format!("fluree:ledger:{beta}"),
+        "fluree:ledger:xl-nosuch:main".to_string(),
+    ] {
+        let q = format!("SELECT ?s WHERE {{ SERVICE <{endpoint}> {{ ?s <{ALPHA}tag> ?t }} }}");
+        let err = fluree
+            .query_dataset(&dataset, &q)
+            .await
+            .expect_err("a non-member endpoint is not the current dataset");
+        assert_eq!(err.status_code(), 400, "{err}");
+        assert!(
+            err.to_string().contains("not in this query's dataset"),
+            "unexpected error: {err}"
+        );
+
+        let silent =
+            format!("SELECT ?s WHERE {{ SERVICE SILENT <{endpoint}> {{ ?s <{ALPHA}tag> ?t }} }}");
+        assert_eq!(
+            rows(&fluree, &dataset, &silent).await,
+            Vec::<JsonValue>::new(),
+            "SILENT contributes nothing for {endpoint}"
+        );
+    }
+
+    // The member answers, under each spelling of its address.
+    for endpoint in [
+        format!("fluree:ledger:{gamma}"),
+        "fluree:ledger:xl-gamma-nonmember".to_string(),
+        format!("fluree:ledger:urn:fluree:{gamma}"),
+    ] {
+        let q = format!("SELECT ?s WHERE {{ SERVICE <{endpoint}> {{ ?s <{BETA}tag> ?t }} }}");
+        assert_eq!(
+            rows(&fluree, &dataset, &q).await,
+            vec![json!([format!("{BETA}g1")])],
+            "{endpoint}"
+        );
+    }
+
+    // A SERVICE endpoint names a whole ledger; a pin or a graph is malformed.
+    for endpoint in [
+        format!("fluree:ledger:{gamma}@t:1"),
+        format!("fluree:ledger:{gamma}#txn-meta"),
+    ] {
+        let q = format!("SELECT ?s WHERE {{ SERVICE <{endpoint}> {{ ?s <{BETA}tag> ?t }} }}");
+        let err = fluree
+            .query_dataset(&dataset, &q)
+            .await
+            .expect_err("an endpoint with a pin or a graph is malformed");
+        assert!(
+            err.to_string().contains("Invalid fluree:ledger endpoint"),
+            "unexpected error for {endpoint}: {err}"
+        );
+    }
+}
+
+/// A read-only nameservice that records every id it is asked about and
+/// delegates to the real one.
+#[derive(Debug)]
+struct RecordingLookups {
+    inner: std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher>,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingLookups {
+    fn asked_about(&self, needle: &str) -> bool {
+        self.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id.contains(needle))
+    }
+
+    fn record(&self, id: &str) {
+        self.asked.lock().unwrap().push(id.to_string());
+    }
+}
+
+mod recording_lookups {
+    use super::RecordingLookups;
+    use async_trait::async_trait;
+    use fluree_db_nameservice::{
+        ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord, LedgerHeads,
+        NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup, RefValue, Result,
+        StatusLookup, StatusValue,
+    };
+
+    #[async_trait]
+    impl GraphSourceLookup for RecordingLookups {
+        async fn lookup_graph_source(&self, id: &str) -> Result<Option<GraphSourceRecord>> {
+            self.record(id);
+            self.inner.lookup_graph_source(id).await
+        }
+        async fn lookup_any(&self, id: &str) -> Result<NsLookupResult> {
+            self.record(id);
+            self.inner.lookup_any(id).await
+        }
+        async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+            self.inner.all_graph_source_records().await
+        }
+    }
+
+    #[async_trait]
+    impl RefLookup for RecordingLookups {
+        async fn get_ref(&self, id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+            self.record(id);
+            self.inner.get_ref(id, kind).await
+        }
+    }
+
+    #[async_trait]
+    impl StatusLookup for RecordingLookups {
+        async fn get_status(&self, id: &str) -> Result<Option<StatusValue>> {
+            self.record(id);
+            self.inner.get_status(id).await
+        }
+    }
+
+    #[async_trait]
+    impl ConfigLookup for RecordingLookups {
+        async fn get_config(&self, id: &str) -> Result<Option<ConfigValue>> {
+            self.record(id);
+            self.inner.get_config(id).await
+        }
+    }
+
+    #[async_trait]
+    impl NameServiceLookup for RecordingLookups {
+        async fn lookup(&self, id: &str) -> Result<Option<NsRecord>> {
+            self.record(id);
+            self.inner.lookup(id).await
+        }
+        async fn all_records(&self) -> Result<Vec<NsRecord>> {
+            self.inner.all_records().await
+        }
+        async fn list_branches(&self, name: &str) -> Result<Vec<NsRecord>> {
+            self.record(name);
+            self.inner.list_branches(name).await
+        }
+        async fn heads(&self, id: &str) -> Result<Option<LedgerHeads>> {
+            self.record(id);
+            self.inner.heads(id).await
+        }
+    }
+}
+
+/// Naming a ledger as a SERVICE endpoint never loads it: SERVICE endpoints are
+/// not authorized the way dataset members are, so a load would be a way around
+/// that. The refusal (and the empty SILENT answer) comes without the
+/// nameservice ever being asked about the endpoint's ledger, while the
+/// dataset's own members are loaded through it as usual.
+#[tokio::test]
+async fn a_service_endpoint_is_never_loaded() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_pair(&fluree, "noload").await;
+    let gamma = "xl-gamma-noload:main";
+    seed(
+        &fluree,
+        gamma,
+        json!([{"@id": format!("{BETA}g1"), format!("{BETA}tag"): "gamma"}]),
+    )
+    .await;
+    let recording = std::sync::Arc::new(RecordingLookups {
+        inner: fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("read-write nameservice"),
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    let observed = fluree_db_api::Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        fluree_db_api::NameServiceMode::ReadOnly(recording.clone()),
+    );
+
+    let q = format!(
+        "SELECT ?s FROM <{alpha}> FROM NAMED <{gamma}> \
+         WHERE {{ SERVICE <fluree:ledger:{beta}> {{ ?s <{BETA}tag> ?t }} }}"
+    );
+    let err = observed
+        .query_from()
+        .sparql(&q)
+        .execute_formatted()
+        .await
+        .expect_err("a non-member endpoint is refused");
+    assert_eq!(err.status_code(), 400, "{err}");
+
+    let silent = q.replace("SERVICE <", "SERVICE SILENT <");
+    let out = observed
+        .query_from()
+        .sparql(&silent)
+        .execute_formatted()
+        .await
+        .expect("SILENT answers");
+    assert_eq!(out["results"]["bindings"], json!([]), "{out}");
+
+    assert!(
+        recording.asked_about("xl-alpha-noload"),
+        "the dataset's members load through this nameservice"
+    );
+    assert!(
+        !recording.asked_about("xl-beta-noload"),
+        "the SERVICE endpoint's ledger was looked up: {:?}",
+        recording.asked.lock().unwrap()
+    );
+}
