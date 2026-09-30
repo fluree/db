@@ -4031,3 +4031,105 @@ async fn a_view_refuses_a_jsonld_from_naming_another_ledger() {
         assert_eq!(rows, expected, "from {own}");
     }
 }
+
+/// A caller that authorizes the ledgers a query names before running it reads
+/// them from `DatasetSpec::from_query_json` (JSON-LD) and
+/// `sparql_dataset_ledger_ids` (SPARQL). For every shape here, each ledger
+/// whose record the engine reads while running the query (seen through a
+/// recording nameservice) is among the reported ones, so an authorizer built on
+/// them cannot miss one. The check does not care how a body names a ledger,
+/// only which ledgers were read.
+#[tokio::test]
+async fn reported_dataset_ledgers_cover_every_ledger_the_engine_reads() {
+    use crate::support::recording_ns::RecordingLookups;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_people_ledger(&fluree, "rep-a:main").await;
+    seed_orgs_ledger(&fluree, "rep-b:main").await;
+    seed_people_ledger(&fluree, "rep-h:main").await;
+
+    let canonical = |id: &str| -> String {
+        fluree_db_core::LedgerRef::parse(id)
+            .map(|r| r.id().to_string())
+            .unwrap_or_else(|_| id.to_string())
+    };
+    let observed = || {
+        let recording = std::sync::Arc::new(RecordingLookups::new(
+            fluree
+                .nameservice_mode()
+                .publisher_arc()
+                .expect("read-write nameservice"),
+        ));
+        let observed = fluree_db_api::Fluree::from_backend(
+            fluree.config().clone(),
+            fluree.backend().clone(),
+            fluree_db_api::NameServiceMode::ReadOnly(recording.clone()),
+        );
+        (observed, recording)
+    };
+    let mut failures = Vec::new();
+    let mut check = |case: String, reported: Vec<String>, read: Vec<String>| {
+        let reported: Vec<String> = reported.iter().map(|id| canonical(id)).collect();
+        if read.is_empty() {
+            failures.push(format!("{case}: the query read no ledger"));
+        }
+        for id in read {
+            let id = canonical(&id);
+            if !reported.contains(&id) {
+                failures.push(format!("{case}: read '{id}', reported {reported:?}"));
+            }
+        }
+    };
+
+    for dataset in [
+        json!({"from": "rep-a:main"}),
+        json!({"from": ["rep-a", "rep-b:main"]}),
+        json!({"from": {"@id": "rep-h:main", "t": 1}}),
+        json!({"from": "rep-h:main@t:1"}),
+        json!({"from": "rep-a:main", "fromNamed": {"x": {"@id": "rep-b:main"}}}),
+        json!({"from-named": ["rep-b:main"]}),
+        json!({"opts": {"from": "rep-b:main"}}),
+        json!({"ledger": "rep-a:main"}),
+        json!({"from": "urn:fluree:rep-a:main#txn-meta"}),
+    ] {
+        let mut body = json!({"select": ["?s"], "where": {"@id": "?s"}});
+        for (k, v) in dataset.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (spec, _) = DatasetSpec::from_query_json(&body).expect("parse");
+        let reported = spec
+            .default_graphs
+            .iter()
+            .chain(spec.named_graphs.iter())
+            .map(|g| g.identifier.split('#').next().unwrap().to_string())
+            .collect();
+        let (observed, recording) = observed();
+        let _ = observed.query_from().jsonld(&body).execute().await;
+        check(
+            format!("JSON-LD {dataset}"),
+            reported,
+            recording.records_read(),
+        );
+    }
+
+    for sparql in [
+        "SELECT ?s FROM<rep-a:main> WHERE { ?s ?p ?o }",
+        "SELECT ?s FROM rep-a:main WHERE { ?s ?p ?o }",
+        "SELECT ?s FROM <rep-a> FROM <rep-b:main> FROM NAMED <rep-h:main> WHERE { ?s ?p ?o }",
+        "# FROM <rep-b:main>\nSELECT ?s FROM <rep-a:main> WHERE { ?s ?p ?o }",
+        "SELECT ?s FROM <urn:fluree:rep-b:main> WHERE { ?s ?p ?o }",
+        "SELECT ?s FROM <rep-h:main@t:1> WHERE { ?s ?p ?o }",
+        "SELECT ?s FROM <rep-a:main> WHERE { SERVICE <fluree:ledger:rep-b:main> { ?s ?p ?o } }",
+    ] {
+        let reported = fluree_db_api::sparql_dataset_ledger_ids(sparql).expect("parse");
+        let (observed, recording) = observed();
+        let _ = observed.query_from().sparql(sparql).execute().await;
+        check(
+            format!("SPARQL {sparql}"),
+            reported,
+            recording.records_read(),
+        );
+    }
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

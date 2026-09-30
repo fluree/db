@@ -220,15 +220,44 @@ impl DatasetSpec {
 /// A named member is known by its [`GraphSource::name`]: its alias when it has
 /// one, else the text as written, pin included, so `FROM NAMED <L@t:2>` is
 /// `GRAPH <L@t:2>` and two pins of one ledger are two members.
+///
+/// Two fields stay public for callers that read which ledgers a query names
+/// before running it (an authorizer, for one): [`GraphSource::identifier`] and
+/// [`GraphSource::policy_override`]. Both are derived from the parse, and
+/// resolution reads the typed reference, never them.
 #[derive(Debug, Clone)]
 pub struct GraphSource {
+    /// The reference as the query named it, with an address's `@` time pin
+    /// removed (the member's time holds it) and any `#graph` kept:
+    /// `hist:main@t:42#txn-meta` → `hist:main#txn-meta`, and an object's `@id`
+    /// as written. A graph keyword or a graph IRI is kept as written.
+    pub identifier: String,
+    /// The per-source policy the object form's `policy` names, applied to this
+    /// source in place of the request's policy.
+    pub policy_override: Option<SourcePolicyOverride>,
     written: Arc<str>,
     /// What `written` names. An address here carries no pin: the pin lives in
     /// `at`, where a JSON-LD `t` / `at` key or a path pin also lands.
     reference: MemberRef,
     at: Option<TimeSpec>,
     alias: Option<String>,
-    policy_override: Option<SourcePolicyOverride>,
+}
+
+/// [`GraphSource::identifier`] for a member written `written`: an address
+/// loses its `@` pin, and anything else is kept as written.
+fn identifier_of(written: &str, reference: &MemberRef) -> String {
+    if reference.address().is_none() {
+        return written.to_string();
+    }
+    let (before_graph, graph) = match written.split_once('#') {
+        Some((before, graph)) => (before, Some(graph)),
+        None => (written, None),
+    };
+    match (before_graph.split_once('@'), graph) {
+        (Some((base, _pin)), Some(graph)) => format!("{base}#{graph}"),
+        (Some((base, _pin)), None) => base.to_string(),
+        (None, _) => written.to_string(),
+    }
 }
 
 impl GraphSource {
@@ -266,11 +295,12 @@ impl GraphSource {
             other => (other, None),
         };
         Self {
+            identifier: identifier_of(&written, &reference),
+            policy_override: None,
             written,
             reference,
             at,
             alias: None,
-            policy_override: None,
         }
     }
 
@@ -986,6 +1016,7 @@ fn parse_object_source(
     }
 
     let mut source = GraphSource::ledger(address);
+    source.identifier = identifier_of(raw_identifier, &source.reference);
     source.written = raw_identifier.into();
     if let Some(policy_val) = obj.get("policy") {
         source = source.with_policy(parse_source_policy_override(policy_val)?);
@@ -1130,29 +1161,56 @@ fn validate_alias_uniqueness(spec: &DatasetSpec) -> Result<(), DatasetParseError
     Ok(())
 }
 
-/// The ledgers a SPARQL query's `FROM` / `FROM NAMED` / `TO` clauses name by
-/// address, each once, as canonical `name:branch` ids (see
-/// [`DatasetSpec::ledgers`]). A bare graph IRI names no ledger and is not
-/// returned; prefixed and BASE-relative IRIs are expanded first.
-///
-/// Returns `Ok(vec![])` if the query has no dataset clause, and `Err` for a
-/// query that does not parse or a clause IRI that is neither an address nor an
-/// absolute IRI.
+/// The ledgers a SPARQL query's dataset clause names, for a caller that
+/// authorizes them before execution: each member's
+/// [`GraphSource::identifier`] with any `#graph` removed, and the history
+/// range's ledger, in order and deduplicated. Members are parsed once, by the
+/// grammar execution uses. A reference whose reading depends on a ledger's
+/// graph registry (a graph IRI that may be a graph or a ledger) is reported
+/// too: reporting too much can only deny a read, reporting too little would
+/// allow one unchecked. [`sparql_dataset_ledgers`] gives the typed ids of the
+/// ledgers the connection path loads.
 pub fn sparql_dataset_ledger_ids(sparql: &str) -> Result<Vec<String>, DatasetParseError> {
+    let spec = DatasetSpec::from_sparql_ast(&parse_sparql_for_dataset(sparql)?)?;
+    let mut out: Vec<String> = Vec::new();
+    let reported = spec
+        .sources()
+        .map(|source| {
+            source
+                .identifier
+                .split('#')
+                .next()
+                .unwrap_or(&source.identifier)
+                .to_string()
+        })
+        .chain(spec.history_range.iter().map(|r| r.ledger.to_string()));
+    for id in reported {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// The typed ids of the ledgers the connection path loads for a SPARQL query's
+/// dataset clause: every member with an address reading, and the history
+/// range's ledger ([`DatasetSpec::ledgers`]).
+pub fn sparql_dataset_ledgers(sparql: &str) -> Result<Vec<LedgerId>, DatasetParseError> {
+    Ok(DatasetSpec::from_sparql_ast(&parse_sparql_for_dataset(sparql)?)?.ledgers())
+}
+
+fn parse_sparql_for_dataset(
+    sparql: &str,
+) -> Result<fluree_db_sparql::SparqlAst, DatasetParseError> {
     let parsed = fluree_db_sparql::parse_sparql(sparql);
-    let ast = parsed.ast.ok_or_else(|| {
+    parsed.ast.ok_or_else(|| {
         let msg = parsed
             .diagnostics
             .first()
             .map(|d| d.message.clone())
             .unwrap_or_else(|| "unknown parse error".to_string());
         DatasetParseError::InvalidFrom(format!("SPARQL parse error: {msg}"))
-    })?;
-    Ok(DatasetSpec::from_sparql_ast(&ast)?
-        .ledgers()
-        .into_iter()
-        .map(String::from)
-        .collect())
+    })
 }
 
 /// Whether a SPARQL query carries a dataset clause (`FROM`, `FROM NAMED` or
@@ -2512,6 +2570,112 @@ mod tests {
     fn test_sparql_dataset_ledger_ids_parse_error() {
         let result = sparql_dataset_ledger_ids("NOT VALID SPARQL }{}{");
         assert!(result.is_err());
+    }
+
+    // =============================================================================
+    // The parsers' public shape, as an authorizer outside db reads it
+    // =============================================================================
+
+    /// What an authorizer that calls `from_query_json` sees: every member's
+    /// `identifier`, default graphs then named graphs, and whether any member
+    /// carries its own policy.
+    fn reported(body: &JsonValue) -> (Vec<String>, bool) {
+        let (spec, _) = DatasetSpec::from_query_json(body).expect("parse");
+        let ids = spec
+            .default_graphs
+            .iter()
+            .chain(spec.named_graphs.iter())
+            .map(|g| g.identifier.clone())
+            .collect();
+        let overridden = spec
+            .default_graphs
+            .iter()
+            .chain(spec.named_graphs.iter())
+            .any(|g| g.policy_override.is_some());
+        (ids, overridden)
+    }
+
+    /// The JSON-LD shapes an authorizer built on `from_query_json` depends on:
+    /// every place a body can name a ledger is reported, with the reference as
+    /// the query named it (a pin removed, a `#graph` kept), and a per-source
+    /// policy is visible on the member.
+    #[test]
+    fn from_query_json_reports_every_named_ledger() {
+        let cases: Vec<(JsonValue, Vec<&str>)> = vec![
+            (json!({"select": ["?s"]}), vec![]),
+            (json!({"from": "a:main"}), vec!["a:main"]),
+            (json!({"from": ["a:main", "b"]}), vec!["a:main", "b"]),
+            (
+                json!({"from": {"@id": "hist:main", "t": 42}}),
+                vec!["hist:main"],
+            ),
+            (json!({"from": "hist:main@t:42"}), vec!["hist:main"]),
+            (
+                json!({"from": "hist:main@t:42#txn-meta"}),
+                vec!["hist:main#txn-meta"],
+            ),
+            (
+                json!({"from": "a:main", "fromNamed": {"x": {"@id": "c:main"}}}),
+                vec!["a:main", "c:main"],
+            ),
+            (json!({"from-named": ["d:main"]}), vec!["d:main"]),
+            (json!({"opts": {"from": "e:main"}}), vec!["e:main"]),
+            (json!({"ledger": "f:main"}), vec!["f:main"]),
+            (
+                json!({"from": "urn:fluree:g:main"}),
+                vec!["urn:fluree:g:main"],
+            ),
+        ];
+        for (body, expected) in cases {
+            let (ids, overridden) = reported(&body);
+            assert_eq!(ids, expected, "{body}");
+            assert!(!overridden, "{body}");
+        }
+
+        let (ids, overridden) = reported(&json!({
+            "from": {"@id": "a:main", "policy": {"identity": "did:example:x"}}
+        }));
+        assert_eq!(ids, vec!["a:main"]);
+        assert!(overridden, "a per-source policy is visible on the member");
+    }
+
+    /// The SPARQL shapes an authorizer built on `sparql_dataset_ledger_ids`
+    /// depends on, including the lexical corners: no space after `FROM`, a
+    /// bare prefixed name whose prefix is not declared (a ledger address as
+    /// written), and a commented-out clause (not part of the query).
+    #[test]
+    fn sparql_dataset_ledger_ids_reports_every_named_ledger() {
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            ("SELECT ?s WHERE { ?s ?p ?o }", vec![]),
+            ("SELECT ?s FROM<x:main> WHERE { ?s ?p ?o }", vec!["x:main"]),
+            (
+                "SELECT ?s FROM ledger:main WHERE { ?s ?p ?o }",
+                vec!["ledger:main"],
+            ),
+            (
+                "SELECT ?s FROM <a> FROM <b:main> FROM NAMED <c> WHERE { ?s ?p ?o }",
+                vec!["a", "b:main", "c"],
+            ),
+            (
+                "# FROM <hidden:main>\nSELECT ?s FROM <a:main> WHERE { ?s ?p ?o }",
+                vec!["a:main"],
+            ),
+            (
+                "SELECT ?s FROM <hist:main@t:1> TO <hist:main@t:latest> WHERE { ?s ?p ?o }",
+                vec!["hist:main"],
+            ),
+            (
+                "SELECT ?s FROM <urn:fluree:u:main#config> WHERE { ?s ?p ?o }",
+                vec!["urn:fluree:u:main"],
+            ),
+        ];
+        for (sparql, expected) in cases {
+            assert_eq!(
+                sparql_dataset_ledger_ids(sparql).unwrap(),
+                expected,
+                "{sparql}"
+            );
+        }
     }
 
     // --- GovernanceOptions::default_allow tri-state parsing ---

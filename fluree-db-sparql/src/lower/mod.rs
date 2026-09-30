@@ -224,6 +224,13 @@ pub fn resolve_dataset_clause(ast: &SparqlAst) -> Result<Option<ResolvedDatasetC
                 }
                 _ => Arc::clone(s),
             }),
+            // `FROM ledger:main` with no `ledger:` prefix declared names the
+            // ledger address as written; a declared prefix expands.
+            crate::ast::term::IriValue::Prefixed { prefix, local }
+                if !prefixes.contains_key(prefix) =>
+            {
+                Ok(Arc::from(format!("{prefix}:{local}")))
+            }
             crate::ast::term::IriValue::Prefixed { .. } => {
                 term::expand_iri_with(&prefixes, base.as_deref(), iri).map(Arc::from)
             }

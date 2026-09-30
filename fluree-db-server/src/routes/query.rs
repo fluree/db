@@ -649,6 +649,17 @@ async fn attach_default_context_to_graph(
     Ok(graph.with_default_context(ctx))
 }
 
+/// The canonical ids of the ledgers a SPARQL query's dataset loads (every
+/// member with an address reading, and a history range's ledger), for the
+/// server's own authorization, refresh and comparison. A graph IRI is not a
+/// ledger here: it names a graph of the route's ledger, or nothing.
+fn sparql_dataset_ledger_strings(
+    sparql: &str,
+) -> std::result::Result<Vec<String>, fluree_db_api::DatasetParseError> {
+    fluree_db_api::sparql_dataset_ledgers(sparql)
+        .map(|ids| ids.into_iter().map(|id| id.to_string()).collect())
+}
+
 /// Authorize every ledger a SPARQL dataset (FROM / FROM NAMED) names.
 ///
 /// A dataset that does not parse is refused rather than skipped: the scope
@@ -657,7 +668,7 @@ pub(crate) fn authorize_sparql_dataset(
     p: &crate::extract::DataPrincipal,
     sparql: &str,
 ) -> Result<()> {
-    let ledger_ids = fluree_db_api::sparql_dataset_ledger_ids(sparql)
+    let ledger_ids = sparql_dataset_ledger_strings(sparql)
         .map_err(|e| ServerError::bad_request(e.to_string()))?;
     for ledger_id in &ledger_ids {
         if !p.can_read(&crate::error::scope_id(ledger_id)?) {
@@ -804,11 +815,11 @@ pub async fn query(
 
         let min_t_requirements = collect_sparql_min_t_requirements(headers.min_t, &sparql, None)?;
         if min_t_requirements.is_empty() {
-            if let Ok(ledger_ids) = fluree_db_api::sparql_dataset_ledger_ids(&sparql) {
+            if let Ok(ledger_ids) = sparql_dataset_ledger_strings(&sparql) {
                 maybe_refresh_query_ledgers(state.as_ref(), ledger_ids).await;
             }
         } else {
-            let ledger_ids = fluree_db_api::sparql_dataset_ledger_ids(&sparql).unwrap_or_default();
+            let ledger_ids = sparql_dataset_ledger_strings(&sparql).unwrap_or_default();
             await_query_min_t_requirements(state.as_ref(), min_t_requirements.clone()).await?;
             refresh_ledgers_without_min_t(
                 state.as_ref(),
@@ -1502,7 +1513,7 @@ pub async fn explain_ledger(
             // explain at a different ledger via FROM. Multi-FROM and FROM
             // NAMED are still routed through the connection-explain path,
             // which itself enforces single-ledger.
-            let from_ids = fluree_db_api::sparql_dataset_ledger_ids(&sparql)
+            let from_ids = sparql_dataset_ledger_strings(&sparql)
                 .unwrap_or_default();
             let has_dataset_clauses = !from_ids.is_empty();
             if has_dataset_clauses {
@@ -2348,7 +2359,7 @@ pub(crate) fn collect_sparql_min_t_requirements(
     }
 
     let mut requirements = BTreeMap::new();
-    let ledger_ids = fluree_db_api::sparql_dataset_ledger_ids(sparql).unwrap_or_default();
+    let ledger_ids = sparql_dataset_ledger_strings(sparql).unwrap_or_default();
 
     let parsed = fluree_db_sparql::parse_sparql(sparql);
     if let Some(ast) = parsed.ast.as_ref() {
@@ -4392,7 +4403,7 @@ pub async fn explain(
             // Determine target ledger: header wins, otherwise require a single FROM ledger id.
             // FROM may carry a time-travel suffix (`@t:N` / `@iso:` / `@commit:`);
             // strip it for the auth check so a scoped read token still authorizes.
-            let from_ids_raw = fluree_db_api::sparql_dataset_ledger_ids(&sparql)
+            let from_ids_raw = sparql_dataset_ledger_strings(&sparql)
                 .unwrap_or_default();
             let ledger_id_raw = if let Some(ref l) = headers.ledger {
                 l.clone()
@@ -4932,7 +4943,7 @@ fn collect_multi_query_min_t_requirements(
                     let mut sub_requirements =
                         collect_sparql_min_t_requirements(None, sparql, None)?;
                     if let Some(min_t) = sub_min_t {
-                        if let Ok(ledgers) = fluree_db_api::sparql_dataset_ledger_ids(sparql) {
+                        if let Ok(ledgers) = sparql_dataset_ledger_strings(sparql) {
                             for ledger_id in ledgers {
                                 merge_min_t_requirement(&mut sub_requirements, &ledger_id, min_t);
                             }
