@@ -658,6 +658,10 @@ async fn trailing_values_join_before_grouping() {
         json!([["Net", 6], ["Local", 4], ["Remote", 2]]),
     )
     .await;
+    // Bound before grouping, a VALUES variable is one ORDER BY can read, as a
+    // SAMPLE like any other non-key variable (HAVING alone reads it unbound).
+    let body = format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a ORDER BY ?v VALUES ?v {{ 1 }}");
+    assert_eq!(run(&fluree, &ledger, &body).await.row_count(), 3, "{body}");
 }
 
 /// The sub-SELECT twin: its trailing VALUES also joins before grouping, and its
