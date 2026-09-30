@@ -79,6 +79,7 @@ pub use namespace::{
     stable_blank_node_sid, stable_blank_node_sid_from_label, NamespaceRegistry,
     SharedNamespaceAllocator, BLANK_NODE_ID_PREFIX, BLANK_NODE_PREFIX,
 };
+pub use parse::has_graph_blocks;
 pub use parse::{
     might_contain_graph_block, parse_graph_insert, parse_sync_transaction, parse_transaction,
     parse_trig_phase1, resolve_trig_meta, unwrap_trig_graph_blocks, NamedGraphBlock, RawObject,

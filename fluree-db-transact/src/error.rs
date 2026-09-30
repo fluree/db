@@ -37,6 +37,11 @@ pub enum TransactError {
     #[error("Parse error: {0}")]
     Parse(String),
 
+    /// RDF text (Turtle, TriG) that does not parse. Positions are byte
+    /// offsets into the document as the caller sent it.
+    #[error("Turtle parse error: {0}")]
+    Turtle(#[from] fluree_graph_turtle::TurtleError),
+
     /// A syntactically valid transaction feature is not yet implemented.
     ///
     /// Distinct from [`Self::Parse`] (which is user-error) and
