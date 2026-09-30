@@ -51,6 +51,15 @@ async fn rows(
     body: &str,
     vars: &[&str],
 ) -> Vec<Vec<Option<String>>> {
+    rows_and_fuel(fluree, body, vars).await.0
+}
+
+/// [`rows`], and the fuel the query burned.
+async fn rows_and_fuel(
+    fluree: &fluree_db_api::Fluree,
+    body: &str,
+    vars: &[&str],
+) -> (Vec<Vec<Option<String>>>, f64) {
     let result = fluree
         .query_from()
         .sparql(&sparql(body))
@@ -68,7 +77,7 @@ async fn rows(
         })
         .collect();
     out.sort();
-    out
+    (out, result.fuel.expect("fuel must be tracked"))
 }
 
 async fn plan_ops(fluree: &fluree_db_api::Fluree, body: &str) -> Vec<String> {
@@ -320,6 +329,112 @@ async fn jsonld_bind_reads_the_value_its_triple_binds_after_an_undef_cell() {
         .collect();
     expected.sort_by_key(ToString::to_string);
     assert_eq!(found, expected);
+}
+
+/// `ex:s{i} ex:num i` for `i < subjects`, `ex:t{j} ex:val j` for `j < targets`,
+/// and `extra`.
+async fn seed_computed_keys(
+    fluree: &fluree_db_api::Fluree,
+    subjects: usize,
+    targets: usize,
+    extra: Vec<JsonValue>,
+    indexed: bool,
+) {
+    let graph: Vec<JsonValue> = (0..subjects)
+        .map(|i| json!({"@id": format!("ex:s{i}"), "ex:num": i}))
+        .chain((0..targets).map(|j| json!({"@id": format!("ex:t{j}"), "ex:val": j})))
+        .chain(extra)
+        .collect();
+    fluree
+        .insert(
+            genesis_ledger(fluree, LEDGER_ID),
+            &json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": graph}),
+        )
+        .await
+        .expect("seed insert");
+    if indexed {
+        crate::support::rebuild_and_publish_index(fluree, LEDGER_ID).await;
+    }
+}
+
+fn s(i: &str) -> Option<String> {
+    Some(format!("http://example.org/ns/{i}"))
+}
+
+/// A BIND computes the key a later triple joins on, and a FILTER reads it.
+fn computed_key(filter: &str) -> String {
+    format!(
+        "SELECT ?s ?t WHERE {{
+          ?s ex:num ?num .
+          BIND(IRI(CONCAT(\"http://example.org/ns/t\", STR(?num))) AS ?t)
+          ?t ex:val ?v .
+          FILTER({filter})
+        }}"
+    )
+}
+
+#[tokio::test]
+async fn filter_on_a_bind_target_prunes_before_the_join_on_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_computed_keys(&fluree, 1000, 2000, Vec::new(), true).await;
+
+    // The same rows either way. A FILTER on `?num` is settled at the first
+    // step; one on `?t` waits for `?t ex:val ?v`, which can still bind `?t` on
+    // a row where the BIND errored, so only a guarded copy can run early.
+    let (on_t, t_fuel) = rows_and_fuel(
+        &fluree,
+        &computed_key("STRENDS(STR(?t), '77')"),
+        &["s", "t"],
+    )
+    .await;
+    let (on_num, num_fuel) = rows_and_fuel(
+        &fluree,
+        &computed_key("STRENDS(STR(?num), '77')"),
+        &["s", "t"],
+    )
+    .await;
+    let mut expected: Vec<Vec<Option<String>>> = (0..10)
+        .map(|h| h * 100 + 77)
+        .map(|n| vec![s(&format!("s{n}")), s(&format!("t{n}"))])
+        .collect();
+    expected.sort();
+    assert_eq!(on_t, expected);
+    assert_eq!(on_num, expected);
+    assert!(
+        t_fuel <= num_fuel * 1.2,
+        "a FILTER on the BIND target should prune before the join on it: \
+         {t_fuel} fuel vs {num_fuel} with the FILTER on ?num"
+    );
+}
+
+#[tokio::test]
+async fn filter_on_a_bind_target_keeps_a_row_whose_bind_errored() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    // `ex:bad`'s `?num + 0` errors, so its `?t` is unbound until `?t ex:val ?v`
+    // binds it to every target; the FILTER then keeps the ones ending in 77.
+    seed_computed_keys(
+        &fluree,
+        200,
+        300,
+        vec![json!({"@id": "ex:bad", "ex:num": "x"})],
+        false,
+    )
+    .await;
+    let body = "SELECT ?s ?t WHERE {
+      ?s ex:num ?num .
+      BIND(IRI(CONCAT(\"http://example.org/ns/t\", STR(?num + 0))) AS ?t)
+      ?t ex:val ?v .
+      FILTER(STRENDS(STR(?t), '77'))
+    }";
+    let mut expected = vec![
+        vec![s("s77"), s("t77")],
+        vec![s("s177"), s("t177")],
+        vec![s("bad"), s("t77")],
+        vec![s("bad"), s("t177")],
+        vec![s("bad"), s("t277")],
+    ];
+    expected.sort();
+    assert_eq!(rows(&fluree, body, &["s", "t"]).await, expected);
 }
 
 #[tokio::test]

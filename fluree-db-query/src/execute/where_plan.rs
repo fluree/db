@@ -15,7 +15,7 @@ use crate::bm25::Bm25SearchOperator;
 use crate::cyclic_bgp::{analyze_cyclic_bgp, CyclicBgpOperator};
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
-use crate::eval::PreparedBoolExpression;
+use crate::eval::{expression_is_duplication_safe, PreparedBoolExpression};
 use crate::exists::ExistsOperator;
 use crate::filter::{contains_exists, FilterOperator};
 use crate::hash_join::HashJoinPlanner;
@@ -977,6 +977,8 @@ pub struct FilterPattern {
     pub required_vars: HashSet<VarId>,
     /// The filter expression to evaluate
     pub expr: Expression,
+    /// Whether an earlier step already runs its [`Settled::guarded_copy`]
+    guarded_copy_placed: bool,
 }
 
 impl FilterPattern {
@@ -986,6 +988,7 @@ impl FilterPattern {
             original_idx,
             required_vars,
             expr,
+            guarded_copy_placed: false,
         }
     }
 }
@@ -1357,13 +1360,42 @@ impl Settled {
     fn admits_var(&self, var: VarId) -> bool {
         self.bound.contains(&var) && !self.unsettled.contains(&var)
     }
+
+    /// A copy of `filter` that can run while some of its variables are only
+    /// unsettled: `!BOUND(?v) || … || filter`. A later join cannot change a
+    /// variable a row already binds, so the copy drops only rows the filter
+    /// itself drops. A row where one is unbound passes, and the filter decides
+    /// once the triple that binds it has run.
+    fn guarded_copy(&self, filter: &FilterPattern) -> Option<Expression> {
+        if !filter.required_vars.is_subset(&self.bound)
+            || !expression_is_duplication_safe(&filter.expr)
+        {
+            return None;
+        }
+        let mut unsettled: Vec<VarId> = filter
+            .required_vars
+            .intersection(&self.unsettled)
+            .copied()
+            .collect();
+        if unsettled.is_empty() {
+            return None;
+        }
+        unsettled.sort_unstable();
+        let mut args: Vec<Expression> = unsettled
+            .into_iter()
+            .map(|v| Expression::not(Expression::call(Function::Bound, vec![Expression::Var(v)])))
+            .collect();
+        args.push(filter.expr.clone());
+        Some(Expression::or(args))
+    }
 }
 
 /// Partition filters into those eligible for inline evaluation and those still waiting.
 ///
 /// Filters consumed by pushdown are silently dropped. Filters `settled` admits
 /// are returned as ready expressions (first element); the rest are returned
-/// as-is (second element).
+/// as-is (second element). A waiting filter held only by unsettled variables
+/// also contributes its [`Settled::guarded_copy`] to the ready ones, once.
 fn partition_eligible_filters(
     filters: Vec<FilterPattern>,
     settled: &Settled,
@@ -1371,7 +1403,7 @@ fn partition_eligible_filters(
 ) -> (Vec<Expression>, Vec<FilterPattern>) {
     let mut ready = Vec::new();
     let mut pending = Vec::new();
-    for pf in filters {
+    for mut pf in filters {
         if filter_idxs_consumed.contains(&pf.original_idx) {
             continue;
         }
@@ -1379,14 +1411,19 @@ fn partition_eligible_filters(
         // inline evaluation is synchronous, and both require the async path on
         // FilterOperator (EXISTS via filter_batch_with_exists, metadata via the
         // policy-filtered resolver). Defer them to a real FilterOperator.
-        if settled.admits(&pf.required_vars)
-            && !contains_exists(&pf.expr)
-            && !crate::eval::metadata_resolve::contains_metadata_read(&pf.expr)
-        {
+        let inlinable = !contains_exists(&pf.expr)
+            && !crate::eval::metadata_resolve::contains_metadata_read(&pf.expr);
+        if inlinable && settled.admits(&pf.required_vars) {
             ready.push(pf.expr);
-        } else {
-            pending.push(pf);
+            continue;
         }
+        if inlinable && !pf.guarded_copy_placed {
+            if let Some(copy) = settled.guarded_copy(&pf) {
+                ready.push(copy);
+                pf.guarded_copy_placed = true;
+            }
+        }
+        pending.push(pf);
     }
     (ready, pending)
 }
@@ -6059,6 +6096,57 @@ mod tests {
         );
         assert!(remaining_binds.is_empty());
         assert!(remaining_filters.is_empty());
+    }
+
+    #[test]
+    fn filter_on_an_unsettled_var_runs_a_guarded_copy_once() {
+        // BIND(… AS ?t) . ?t :val ?v . FILTER(?t > 18): the triple can still
+        // bind ?t where the BIND errored, so the filter waits for it, and a
+        // `!BOUND(?t) || filter` copy prunes the rows that do bind ?t now.
+        let t = VarId(1);
+        let filter_expr =
+            Expression::gt(Expression::Var(t), Expression::Const(FlakeValue::Long(18)));
+        let guarded = Expression::or(vec![
+            Expression::not(Expression::call(Function::Bound, vec![Expression::Var(t)])),
+            filter_expr.clone(),
+        ]);
+        let settled = Settled {
+            bound: [VarId(0), t].into(),
+            unsettled: [t].into(),
+        };
+
+        let (ready, pending) = partition_eligible_filters(
+            vec![FilterPattern::new(0, filter_expr.clone())],
+            &settled,
+            &[],
+        );
+        assert_eq!(format!("{ready:?}"), format!("{:?}", [&guarded]));
+        assert_eq!(pending.len(), 1, "the filter itself still waits");
+
+        let (ready, pending) = partition_eligible_filters(pending, &settled, &[]);
+        assert!(ready.is_empty(), "the copy is placed once: {ready:?}");
+
+        let (ready, pending) =
+            partition_eligible_filters(pending, &Settled::all(settled.bound.clone()), &[]);
+        assert_eq!(format!("{ready:?}"), format!("{:?}", [&filter_expr]));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn filter_that_differs_per_evaluation_gets_no_guarded_copy() {
+        let t = VarId(1);
+        let filter_expr = Expression::lt(
+            Expression::call(Function::Rand, Vec::new()),
+            Expression::Var(t),
+        );
+        let settled = Settled {
+            bound: [t].into(),
+            unsettled: [t].into(),
+        };
+        let (ready, pending) =
+            partition_eligible_filters(vec![FilterPattern::new(0, filter_expr)], &settled, &[]);
+        assert!(ready.is_empty(), "{ready:?}");
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
