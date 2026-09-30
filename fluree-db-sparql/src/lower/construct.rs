@@ -47,7 +47,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             })
             .collect();
 
-        // Lower solution modifiers (CONSTRUCT supports ORDER BY, LIMIT, OFFSET but not GROUP BY/HAVING)
+        // Lower solution modifiers. CONSTRUCT supports ORDER BY, LIMIT and
+        // OFFSET; GROUP BY / HAVING change which solutions instantiate the
+        // template, and this lowering has no grouping stage, so they are
+        // refused rather than dropped.
+        if construct.modifiers.group_by.is_some() || construct.modifiers.having.is_some() {
+            return Err(LowerError::unsupported_form(
+                "CONSTRUCT with GROUP BY/HAVING",
+                construct.span,
+            ));
+        }
         let BaseModifiers {
             limit,
             offset,

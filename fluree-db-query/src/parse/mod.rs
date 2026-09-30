@@ -244,6 +244,17 @@ fn parse_query_ast_internal(
                 "\"ask\" must be an array or object of where-clause patterns".to_string(),
             ));
         }
+        // `ask` returns before `parse_options`, so grouping options would be
+        // dropped, and they change the answer (a `having` that rejects every
+        // group is false). Refuse them, as SPARQL ASK does.
+        if let Some(key) = ["groupBy", "group-by", "having"]
+            .into_iter()
+            .find(|key| obj.contains_key(*key))
+        {
+            return Err(ParseError::InvalidOption(format!(
+                "\"ask\" does not support \"{key}\""
+            )));
+        }
         let object_var_parsing = options::parse_object_var_parsing(obj);
         where_clause::parse_where_with_counters(
             ask_val,

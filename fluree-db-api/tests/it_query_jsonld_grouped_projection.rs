@@ -448,6 +448,31 @@ async fn jsonld_grouped_read_errors_name_the_variable() {
     }
 }
 
+/// `ask` had no grouping stage and dropped `groupBy` / `having`, answering
+/// `true` for a `having` that rejects every group. It now refuses them, like
+/// SPARQL ASK.
+#[tokio::test]
+async fn jsonld_ask_refuses_grouping() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/ask:main").await;
+    let ctx = json!({"ex": "http://example.org/"});
+    for (key, value) in [
+        ("having", json!("(= ?a \"Nope\")")),
+        ("groupBy", json!(["?a"])),
+    ] {
+        let mut query = json!({"@context": ctx, "ask": {"@id": "?e", "ex:area": "?a"}});
+        query[key] = value;
+        let err = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect_err("ask with a grouping option");
+        assert!(
+            err.to_string()
+                .contains(&format!("\"ask\" does not support \"{key}\"")),
+            "{err}"
+        );
+    }
+}
+
 /// Must-not-change guards: grouped JSON-LD shapes that fluree/solo runs today
 /// (keys, aggregates and expressions of aggregates only). Their answers are
 /// unchanged by the grouped-projection work.
