@@ -1,7 +1,7 @@
 //! Mutations: tier 3 only, opt-in, and going through the same write path
 //! everything else does.
 
-use crate::support::{genesis_ledger, MemoryFluree};
+use crate::support::{genesis_ledger, shacl_enabled_config_node, MemoryFluree};
 use fluree_db_api::graphql::{schema_sdl, schema_sdl_with_mutations, GraphQlRequest};
 use fluree_db_api::{FlureeBuilder, GraphDb, LedgerState};
 use serde_json::{json, Value as JsonValue};
@@ -22,7 +22,8 @@ fn view(ledger: &LedgerState) -> GraphDb {
     GraphDb::from_ledger_state(ledger).with_default_context(Some(context()))
 }
 
-/// A ledger with a Person shape and a curated schema built from `schema_extra`.
+/// A ledger with a Person shape, the config that enables SHACL, and a curated
+/// schema built from `schema_extra`.
 async fn seeded(ledger_id: &str, schema_extra: JsonValue) -> (MemoryFluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = genesis_ledger(&fluree, ledger_id);
@@ -68,7 +69,8 @@ async fn seeded(ledger_id: &str, schema_extra: JsonValue) -> (MemoryFluree, Ledg
                         ]
                     },
                     schema_node,
-                    { "@id": "ex:acme", "@type": "ex:Company", "ex:name": "Acme" }
+                    { "@id": "ex:acme", "@type": "ex:Company", "ex:name": "Acme" },
+                    shacl_enabled_config_node()
                 ]
             }),
         )

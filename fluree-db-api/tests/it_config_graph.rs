@@ -1372,7 +1372,27 @@ async fn shacl_config_disables_validation() {
         .unwrap();
     let ledger = result.ledger;
 
-    // Step 2: Verify violation fails WITHOUT config (shapes-exist heuristic)
+    // Step 2: Enable SHACL in config; the violation fails
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:shaclEnabled true .
+        }}
+    "
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write should succeed")
+        .ledger;
     let err = fluree
         .insert(
             ledger.clone(),
@@ -1389,11 +1409,10 @@ async fn shacl_config_disables_validation() {
             err,
             fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
         ),
-        "without config, shapes-exist heuristic should trigger SHACL rejection: {err:?}"
+        "with SHACL enabled, the violation is rejected: {err:?}"
     );
 
     // Step 3: Write config disabling SHACL
-    let config_iri = config_graph_iri(ledger_id);
     let trig = format!(
         r"
         @prefix f: <https://ns.flur.ee/db#> .
@@ -2354,7 +2373,7 @@ async fn shacl_turtle_insert_rejected_when_violating() {
         )
         .await
         .unwrap();
-    let ledger = result.ledger;
+    let ledger = support::enable_shacl(&fluree, result.ledger).await;
 
     // Violating Turtle: an ex:Person with no ex:name.
     let turtle = r"
@@ -2365,7 +2384,7 @@ async fn shacl_turtle_insert_rejected_when_violating() {
     let err = fluree
         .insert_turtle(ledger, turtle)
         .await
-        .expect_err("Turtle insert must honor SHACL reject mode (shapes-exist heuristic)");
+        .expect_err("Turtle insert must honor SHACL reject mode");
 
     assert!(
         matches!(

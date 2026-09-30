@@ -291,7 +291,23 @@ async fn a_stage_on_a_subject_written_under_a_moved_code_is_restaged() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stage_behind_a_commit_that_adds_a_shape_is_validated_against_it() {
     let (_dir, fluree, handle) = open().await;
-    update(&fluree, &handle, "INSERT DATA { ex:seed ex:p 0 }").await;
+    // The ledger config enables SHACL: shapes are enforced only where it does.
+    let config = fluree_db_core::graph_registry::config_graph_iri(LEDGER);
+    update(
+        &fluree,
+        &handle,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             INSERT DATA {{ \
+               ex:seed ex:p 0 . \
+               GRAPH <{config}> {{ \
+                 <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> . \
+                 <urn:config:shacl> f:shaclEnabled true . \
+               }} \
+             }}"
+        ),
+    )
+    .await;
 
     let (parked, release) = handle.gate_next_optimistic_stage_for_test();
     let behind = {
