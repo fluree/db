@@ -108,7 +108,7 @@ There are two ways to target graphs in `insert` / `delete` templates:
 
 Notes:
 - `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`)
-- The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in a top-level `graph` and in `from`: the update reads and writes the default graph and never creates a named graph called by the address. A per-node `@graph` or a `["graph", …]` template resolves the address like any other graph IRI. `urn:fluree:mydb:main#config` is the config graph, not the address.
+- The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in every graph position: a top-level `graph`, `from`, `fromNamed`, a per-node `@graph` and a `["graph", …]` template. The update reads and writes the default graph and never creates a named graph called by the address, and `mydb:main#<graph IRI>` names that graph. A `graph` or `@graph` spelled as the address is accepted even when the `@context` defines no `mydb` prefix, as `from` is. See [the ledger's own address in a graph position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position). `urn:fluree:mydb:main#config` is the config graph, not the address.
 - Named-graph reads are available after indexing completes (see `docs/query/datasets.md`)
 
 ## Dataset scoping for WHERE (`from` / `fromNamed`)

@@ -34,7 +34,7 @@ In Fluree, named graphs are used in several ways:
 
 Fluree exposes two query styles over HTTP:
 
-- **Connection-scoped** (`POST /query`): the ledger(s) and graphs are identified by `from` / `fromNamed` (JSON-LD) or `FROM` / `FROM NAMED` (SPARQL). This is the dataset path and supports multi-ledger datasets. There is no target ledger, so a graph is named together with its ledger (`<mydb:main#http://example.org/ns/archive>`); a graph IRI or keyword on its own names no ledger and is refused with a 400.
+- **Connection-scoped** (`POST /query`): the ledger(s) and graphs are identified by `from` / `fromNamed` (JSON-LD) or `FROM` / `FROM NAMED` (SPARQL). This is the dataset path and supports multi-ledger datasets. There is no target ledger, so a graph is named together with its ledger (`<mydb:main#http://example.org/ns/archive>`). A keyword, or an IRI that cannot be a ledger address (`http://example.org/g`), names no ledger and is refused with a 400; an IRI that could be one (`urn:g1`, read as ledger `urn`, branch `g1`) is looked up as a ledger.
 - **Ledger-scoped** (`POST /query/{ledger}`): the ledger is fixed by the URL. The request may still select a **named graph inside that ledger**:
   - JSON-LD: `"from": "default"`, `"from": "txn-meta"`, `"from": "config"`, or `"from": "<graph IRI>"`
   - SPARQL: `FROM <default>`, `FROM <txn-meta>`, `FROM <config>`, `FROM <graph IRI>`, and `FROM NAMED <graph IRI>`
@@ -42,6 +42,28 @@ Fluree exposes two query styles over HTTP:
   - `GRAPH <iri> { ... }` and `GRAPH ?g { ... }` resolve the ledger's registered user named graphs **without** an explicit `FROM NAMED` (the reserved `#txn-meta` / `#config` graphs stay private). Supplying `FROM NAMED` still narrows resolution to exactly the graphs listed.
 
 If the request body tries to target a different ledger than the one in the URL, the server rejects it with a "Ledger mismatch" error.
+
+### The ledger's own address in a graph position
+
+Wherever a query or an update names a graph of the ledger it reads or writes, one table decides which graph the name is. That covers `GRAPH <iri>` in a query or in an update's `WHERE`, an update template's `GRAPH <iri>`, an `INSERT DATA` / `DELETE DATA` quad, a TriG block (in a transaction or a bulk import), `WITH`, and the JSON-LD forms (top-level `graph`, a node's `@graph`, `["graph", …]`). A dataset clause on a ledger-scoped surface (`FROM`, `FROM NAMED`, `USING`, `USING NAMED`, JSON-LD `from` / `fromNamed`) reads the ledger's own address and `mydb:main#<graph IRI>` the same way, and differs only as the list above says: another ledger's address is refused there, and a query's `FROM` may carry a time.
+
+| The name | reads | writes |
+|---|---|---|
+| the ledger's own address, in any spelling: `mydb`, `mydb:main`, `urn:fluree:mydb:main` | the default graph | the default graph |
+| the address with a graph IRI: `mydb:main#http://example.org/g` | the graph `http://example.org/g` | the graph `http://example.org/g` |
+| a registered graph IRI | that graph | that graph |
+| any other IRI | nothing | a new graph by that IRI |
+
+- No write registers a graph under the ledger's own address, and the graph-management verbs (`CREATE`, `COPY`, `MOVE`, `ADD`) do not create one there. The address with a time (`mydb:main@t:5`) names no graph in these positions.
+- A `GRAPH ?g` template writes the graph its binding names in this table, which is the graph the `WHERE` read: `DELETE { GRAPH ?g { ?s ?p ?o } } USING NAMED <mydb:main> WHERE { GRAPH ?g { ?s ?p ?o } }` deletes from the default graph.
+- The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
+
+A graph registered under the ledger's address by an earlier version (for instance by a TriG block `GRAPH <mydb:main> { … }`) keeps its data and is reached as `<mydb:main#mydb:main>`: the address, `#`, and the IRI it is registered under. `GRAPH ?g` lists it under that name, in queries and updates alike, so a `?g` binding reads it back. The graph-management verbs name registered graphs exactly, so they still reach it by the address itself; to move its data into the default graph:
+
+```sparql
+ADD GRAPH <mydb:main> TO DEFAULT ;
+DROP GRAPH <mydb:main>
+```
 
 #### Named graphs with no default graph (changed in 4.1.4)
 

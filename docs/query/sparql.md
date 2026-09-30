@@ -560,9 +560,14 @@ SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }
 
 An unbound `GRAPH ?g` ranges over **named graphs only**, per SPARQL 1.1: it
 binds `?g` to each user-registered named graph and never to the default
-graph. The default graph remains explicitly addressable by the ledger alias
-(`GRAPH <mydb:main> { ... }`) when named directly or bound from another
-pattern — it just isn't enumerated.
+graph. The default graph remains explicitly addressable by the ledger's own
+address in any spelling (`GRAPH <mydb:main> { ... }`, `GRAPH <mydb> { ... }`)
+when named directly or bound from another pattern — it just isn't
+enumerated. `GRAPH <mydb:main#http://example.org/g>` addresses the graph
+`http://example.org/g`, and a graph an earlier version registered under the
+address is listed, and read, as
+`<mydb:main#mydb:main>` (see [the ledger's own address in a graph
+position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)).
 
 Only user-registered named graphs are exposed this way; the reserved system
 graphs (`#txn-meta`, `#config`) remain addressable only via an explicit
@@ -1210,8 +1215,6 @@ SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
 - **`USING <iri>`**: scopes the default graph(s) for `WHERE` evaluation. Repeated `USING` clauses are evaluated as a **merged default graph**. A graph that doesn’t exist contributes nothing, so a lone `USING` of an unknown graph gives the `WHERE` an empty default graph.
 - **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs. With `USING NAMED` and no `USING`, the `WHERE`’s default graph is empty.
 
-The ledger’s own address (`mydb`, `mydb:main` or `urn:fluree:mydb:main`, with no `#fragment` and no time pin) names the ledger’s default graph in `USING` and `WITH`. `WITH <mydb:main>` therefore reads and writes the default graph and never creates a named graph called `mydb:main`. Only these two clauses treat the address this way: a `GRAPH <iri>` block in a template or in the `WHERE`, `USING NAMED`, and an `INSERT DATA`/`DELETE DATA` quad resolve it like any other graph IRI. The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
-
 Each `USING`, `USING NAMED` or `WITH` IRI resolves in the ledger being updated,
 the same way a query's `FROM` does: the ledger's own address (`mydb`,
 `mydb:main`, `urn:fluree:mydb:main`) names its default graph, `mydb:main#config`
@@ -1219,6 +1222,16 @@ or its URN names the config graph, and a registered graph IRI names that graph.
 A graph the ledger does not have contributes nothing, so `WHERE` over it binds
 nothing and the update changes nothing (SPARQL 1.1 Update §3.1.3). Another
 ledger's address, or an address with a time pin, is refused with a 400.
+
+A `GRAPH <iri>` block in the `WHERE` or in a template, and an `INSERT DATA` /
+`DELETE DATA` quad, read the address the same way: `mydb:main` is the default
+graph, so `WITH <mydb:main>` and `GRAPH <mydb:main> { … }` read and write it and
+never create a named graph called `mydb:main`, and `mydb:main#<graph IRI>` is
+that graph. See [the ledger's own address in a graph
+position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)
+for the full table, and for a graph an earlier version registered under the
+address. The reserved graphs keep their own IRIs, such as
+`urn:fluree:mydb:main#config`.
 
 ### Graph variables in templates
 
@@ -1235,6 +1248,7 @@ WHERE  { GRAPH ?g { ?s ex:status "old" } }
 `DELETE WHERE { GRAPH ?g { ... } }` works the same way.
 
 - In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>`.
+- The template writes the graph `?g` names in the ledger (see [the ledger's own address in a graph position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)), which is the graph the `WHERE` read: a `?g` bound to the ledger's own address writes the default graph.
 - `?g` may name a graph that does not exist yet, for example one built with `BIND(IRI(...) AS ?g)`. The commit registers it.
 - A solution that leaves `?g` unbound writes nothing for that block. A `?g` bound to a literal or a blank node is an error, as is a `?g` that names `#txn-meta`.
 
