@@ -944,3 +944,89 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
         );
     }
 }
+
+// =============================================================================
+// A DELETE can name a stored ill-typed literal
+// =============================================================================
+
+/// A file-backed ledger holding the Turtle `ttl`, optionally indexed.
+async fn seeded_turtle(
+    name: &str,
+    ttl: &str,
+    indexed: bool,
+) -> (tempfile::TempDir, Fluree, LedgerState) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("file fluree");
+    let id = format!("it/delete-stored-{name}-{indexed}:main");
+    let ledger = fluree.create_ledger(&id).await.expect("create");
+    let ledger = fluree
+        .insert_turtle(ledger, ttl)
+        .await
+        .expect("seed")
+        .ledger;
+    if !indexed {
+        return (dir, fluree, ledger);
+    }
+    drop(ledger);
+    support::rebuild_and_publish_index(&fluree, &id).await;
+    let ledger = fluree.ledger(&id).await.expect("reload");
+    (dir, fluree, ledger)
+}
+
+/// A Turtle write keeps an ill-typed literal as its lexical form with the
+/// declared datatype. A DELETE names that stored term: its template keeps the
+/// lexical form as stored instead of refusing it, on SPARQL and JSON-LD. An
+/// insert still refuses one.
+#[tokio::test]
+async fn a_delete_names_a_stored_ill_typed_literal() {
+    let ttl = format!(
+        "@prefix ex: <{EX}> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+         ex:s ex:n \"abc\"^^xsd:integer .\n"
+    );
+    for indexed in [false, true] {
+        for surface in ["sparql", "jsonld"] {
+            let (_d, fluree, ledger) =
+                seeded_turtle(&format!("ill-typed-{surface}"), &ttl, indexed).await;
+            assert_eq!(facts(&fluree, &ledger).await, ["n=abc"], "precondition");
+            let r = if surface == "sparql" {
+                sparql_update(
+                    &fluree,
+                    ledger,
+                    "DELETE DATA { ex:s ex:n \"abc\"^^xsd:integer }",
+                )
+                .await
+            } else {
+                jsonld_update(
+                    &fluree,
+                    ledger,
+                    json!({"delete": {"@id": "ex:s", "ex:n": {"@value": "abc", "@type": "xsd:integer"}}}),
+                )
+                .await
+            };
+            assert_eq!(r.receipt.retract_count, 1, "{surface}, indexed={indexed}");
+            assert!(
+                facts(&fluree, &r.ledger).await.is_empty(),
+                "{surface}, indexed={indexed}"
+            );
+        }
+    }
+
+    // An insert still refuses an ill-typed literal.
+    let text = format!(
+        "PREFIX ex: <{EX}>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+         INSERT DATA {{ ex:s ex:n \"abc\"^^xsd:integer }}"
+    );
+    let parsed = fluree_db_sparql::parse_sparql(&text);
+    let mut ns = fluree_db_transact::NamespaceRegistry::new();
+    assert!(
+        fluree_db_transact::lower_sparql_update_ast(
+            &parsed.ast.expect("ast"),
+            &mut ns,
+            fluree_db_transact::TxnOpts::default(),
+        )
+        .is_err(),
+        "INSERT DATA refuses an ill-typed literal"
+    );
+}
