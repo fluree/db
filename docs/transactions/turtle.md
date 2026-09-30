@@ -645,6 +645,18 @@ SELECT DISTINCT ?b WHERE {
 }
 ```
 
+That query reads the default graph. Blank nodes a TriG upsert wrote inside `GRAPH` blocks live in those graphs; the same check, graph by graph:
+
+```sparql
+SELECT DISTINCT ?g ?b WHERE {
+  GRAPH ?g {
+    ?b ?p ?o .
+    FILTER(isBlank(?b))
+    FILTER NOT EXISTS { ?s ?q ?b }
+  }
+}
+```
+
 Review the list before deleting: a document can hold unreferenced blank-node subjects on purpose. Deleting an orphaned node leaves the nodes it referenced orphaned in turn, so repeat until the query returns nothing.
 
 ### Querying Named Graphs

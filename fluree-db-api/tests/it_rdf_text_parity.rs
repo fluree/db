@@ -785,9 +785,9 @@ async fn upserting_the_same_document_again_commits_nothing() {
         .any(|f| f.contains("note String(\"edited\")")));
 }
 
-/// The query `turtle.md` documents for blank nodes nothing references
-/// finds the node an edited document left behind, and not the one that
-/// replaced it.
+/// The queries `turtle.md` documents for blank nodes nothing references
+/// find the node an edited document left behind, and not the one that
+/// replaced it: in the default graph, and graph by graph.
 #[tokio::test]
 async fn the_documented_query_lists_the_blank_nodes_an_edit_left_behind() {
     let fluree = memory();
@@ -814,6 +814,30 @@ async fn the_documented_query_lists_the_blank_nodes_an_edit_left_behind() {
     )
     .await;
     assert_eq!(values, vec![row(&["v1"])], "the orphan is v1's node");
+
+    // The same edit inside a GRAPH block, found by the per-graph query.
+    let g = "http://example.org/g";
+    let v1 = format!(
+        "@prefix ex: <http://example.org/> .\nGRAPH <{g}> {{ ex:A ex:part [ ex:k \"v1\" ] . }}\n"
+    );
+    let first = fluree
+        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-orphans-graph:main"), &v1)
+        .await
+        .expect("v1 in a graph");
+    let v2 = v1.replace("\"v1\"", "\"v2\"");
+    let second = fluree
+        .upsert_turtle(first.ledger, &v2)
+        .await
+        .expect("v2 in a graph");
+    let orphans = select(
+        &fluree,
+        &second.ledger,
+        "SELECT DISTINCT ?g ?b WHERE {\n  GRAPH ?g {\n    ?b ?p ?o .\n    FILTER(isBlank(?b))\n    \
+         FILTER NOT EXISTS { ?s ?q ?b }\n  }\n}",
+    )
+    .await;
+    assert_eq!(orphans.len(), 1, "{orphans:?}");
+    assert_eq!(orphans[0][0], g, "{orphans:?}");
 }
 
 // =============================================================================
