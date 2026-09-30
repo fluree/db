@@ -5326,3 +5326,115 @@ async fn violation_carries_resolved_results() {
     );
     assert_eq!(result.severity, "http://www.w3.org/ns/shacl#Violation");
 }
+
+/// A ledger whose `ex:Player` nodes are checked by one `sh:sparql` constraint
+/// with the given `sh:select`.
+async fn ledger_with_player_constraint(
+    fluree: &crate::Fluree,
+    ledger_id: &str,
+    select: &str,
+) -> crate::LedgerState {
+    let shape_txn = json!({
+        "@context": shacl_context(),
+        "@id": "ex:PlayerShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:sparql": {
+            "@id": "ex:PlayerShape-sparql",
+            "sh:message": "player constraint",
+            "sh:select": select
+        }
+    });
+    let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+    fluree.upsert(ledger, &shape_txn).await.unwrap().ledger
+}
+
+/// Insert one `ex:Player` with the given `ex:score`.
+async fn insert_player(
+    fluree: &crate::Fluree,
+    ledger: crate::LedgerState,
+    id: &str,
+    score: i64,
+) -> Result<crate::LedgerState, ApiError> {
+    let player = json!({
+        "@context": shacl_context(),
+        "@id": id,
+        "@type": "ex:Player",
+        "ex:score": score
+    });
+    fluree
+        .upsert(ledger, &player)
+        .await
+        .map(|result| result.ledger)
+}
+
+// `sh:select` is lowered like a SPARQL query but skips the SPARQL validator,
+// so the grouped-query semantics reach shape constraints directly: a stored
+// shape's verdict follows them.
+
+/// HAVING without GROUP BY or an aggregate is a filter over the solutions
+/// (SPARQL 1.1 §18.2.4.2). It used to be dropped, so every scored player was a
+/// violation.
+#[tokio::test]
+async fn shacl_sparql_having_without_grouping_filters() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_player_constraint(
+        &fluree,
+        "shacl/sparql-having-filter:main",
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s } HAVING (?s > 10)",
+    )
+    .await;
+    let ledger = insert_player(&fluree, ledger, "ex:low", 5)
+        .await
+        .expect("HAVING filters out a score of 5");
+    let err = insert_player(&fluree, ledger, "ex:high", 20)
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "player constraint");
+}
+
+/// A HAVING read of a variable that is not a GROUP BY key means `SAMPLE(?v)`
+/// (SPARQL 1.1 §18.2.4.1). It used to read the per-group list: a panic in a
+/// debug build, and no solutions (so no violation) in release.
+#[tokio::test]
+async fn shacl_sparql_having_reads_a_sample_of_a_non_key_variable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_player_constraint(
+        &fluree,
+        "shacl/sparql-having-sample:main",
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s } \
+         GROUP BY $this HAVING (?s > 10)",
+    )
+    .await;
+    let ledger = insert_player(&fluree, ledger, "ex:low", 5)
+        .await
+        .expect("the sampled score 5 is not > 10");
+    let err = insert_player(&fluree, ledger, "ex:high", 20)
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "player constraint");
+}
+
+/// Projecting a variable that is neither a GROUP BY key nor an aggregate is a
+/// validator error for a SPARQL query; `sh:select` skips the validator, and the
+/// plan-time check now fails the constraint closed. The per-group list used to
+/// read as no value, reporting a violation at the focus node.
+#[tokio::test]
+async fn shacl_sparql_grouped_projection_of_a_non_key_fails_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_player_constraint(
+        &fluree,
+        "shacl/sparql-grouped-projection:main",
+        "SELECT $this ?value WHERE { $this <http://example.org/ns/score> ?value } \
+         GROUP BY $this",
+    )
+    .await;
+    let err = insert_player(&fluree, ledger, "ex:p1", 5)
+        .await
+        .unwrap_err();
+    let message = format!("{err:?}");
+    assert!(
+        message.contains("is neither a GROUP BY key nor an aggregate result"),
+        "expected the grouped-projection plan error, got: {message}"
+    );
+}
