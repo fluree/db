@@ -72,7 +72,7 @@ this table, so it is the one that rots. Add a row when you add a bench file.
 
 | Crate | Bench file | Topic |
 |---|---|---|
-| `fluree-db-api` | `insert_formats.rs` | JSON-LD vs Turtle insert throughput, matrix of (format × txn count × nodes/txn) |
+| `fluree-db-api` | `insert_formats.rs` | JSON-LD vs Turtle insert throughput, matrix of (format × txn count × nodes/txn); also Turtle upsert (new subjects and over existing ones) and TriG insert with a trailing graph block |
 | `fluree-db-api` | `vector_query.rs` | End-to-end vector similarity through the query engine, 1K/5K articles, 768-dim |
 | `fluree-db-api` | `fulltext_query.rs` | Full-text query through novelty + index |
 | `fluree-db-api` | `import_bulk.rs` | Bulk Turtle import via `fluree.create(id).import(path).execute()`; single- vs default-threaded |
