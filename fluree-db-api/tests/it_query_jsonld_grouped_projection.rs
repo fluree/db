@@ -357,3 +357,78 @@ async fn jsonld_subquery_cannot_return_a_per_group_list() {
         );
     }
 }
+
+/// Must-not-change guards: grouped JSON-LD shapes that fluree/solo runs today
+/// (keys, aggregates and expressions of aggregates only). Their answers are
+/// unchanged by the grouped-projection work.
+#[tokio::test]
+async fn solo_grouped_jsonld_shapes_are_unchanged() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "jsonld-grouped/solo:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:i1", "ex:kind": "A", "ex:titleFr": "Bonjour", "ex:x": {"@id": "ex:v1"}},
+                    {"@id": "ex:i2", "ex:kind": "A", "ex:x": {"@id": "ex:v2"}},
+                    {"@id": "ex:i3", "ex:kind": "B", "ex:titleEn": "Hello", "ex:x": {"@id": "ex:v3"}},
+                    {"@id": "ex:p1", "ex:sort": [5, 3]},
+                    {"@id": "ex:p2", "ex:sort": 1},
+                    {"@id": "ex:p3", "ex:sort": 4}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let run = |query: JsonValue| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            support::query_jsonld(fluree, ledger, &query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_jsonld(&ledger.snapshot)
+                .expect("to_jsonld")
+        }
+    };
+
+    // A compound expression of aggregates beside a distinct count, grouped by
+    // a key (solo's lambda-model queries).
+    let found = run(json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": [
+            "?k",
+            "(as (coalesce (sample ?fr) (sample ?en)) ?title)",
+            "(as (count-distinct ?x) ?c)"
+        ],
+        "where": [
+            {"@id": "?i", "ex:kind": "?k", "ex:x": "?x"},
+            ["optional", {"@id": "?i", "ex:titleFr": "?fr"}],
+            ["optional", {"@id": "?i", "ex:titleEn": "?en"}]
+        ],
+        "groupBy": ["?k"]
+    }))
+    .await;
+    assert_eq!(
+        normalize_rows(&found),
+        normalize_rows(&json!([["A", "Bonjour", 2], ["B", "Hello", 1]]))
+    );
+
+    // The grouped paging subquery (solo `instances/query.ts`): a key and an
+    // aggregate per subject, ordered outside by the aggregate.
+    let found = run(json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?s", "?sortValue"],
+        "where": [["query", {
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?s", "(as (min ?sort) ?sortValue)"],
+            "where": {"@id": "?s", "ex:sort": "?sort"},
+            "groupBy": ["?s"]
+        }]],
+        "orderBy": ["?sortValue"]
+    }))
+    .await;
+    assert_eq!(found, json!([["ex:p2", 1], ["ex:p1", 3], ["ex:p3", 4]]));
+}

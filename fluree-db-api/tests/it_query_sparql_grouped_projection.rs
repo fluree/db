@@ -584,3 +584,161 @@ async fn having_without_grouping_filters() {
     .await;
     assert_eq!(result.row_count(), 0);
 }
+
+/// Cypher parity. Cypher makes a non-aggregate RETURN expression a grouping
+/// key, so `RETURN CASE … AS seg, count(e)` groups by the label — SPARQL's
+/// `GROUP BY (IF(…) AS ?seg)`. Grouping by the area first and mapping it after
+/// (`WITH e.area AS a, count(e) AS n RETURN CASE … AS seg, n`) is what a
+/// SPARQL SELECT expression over `GROUP BY ?a` means. The mapping is
+/// non-injective (three areas, two labels), so the two readings differ.
+#[tokio::test]
+async fn grouped_select_expression_matches_cypher() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "grouped-projection/cypher:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:e1", "@type": "ex:E", "ex:area": "Net"},
+                    {"@id": "ex:e2", "@type": "ex:E", "ex:area": "Net"},
+                    {"@id": "ex:e3", "@type": "ex:E", "ex:area": "Net"},
+                    {"@id": "ex:e4", "@type": "ex:E", "ex:area": "Local"},
+                    {"@id": "ex:e5", "@type": "ex:E", "ex:area": "Local"},
+                    {"@id": "ex:e6", "@type": "ex:E", "ex:area": "Remote"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = support::graphdb_from_ledger(&ledger)
+        .with_default_context(Some(json!({"@vocab": "http://example.org/"})));
+    let cypher = |query: &'static str| {
+        let (fluree, db) = (&fluree, &db);
+        async move {
+            let rows = fluree
+                .query_cypher(db, query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld");
+            normalize_rows(&rows)
+        }
+    };
+    let sparql = |body: String| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            let rows = run(fluree, ledger, &body)
+                .await
+                .to_jsonld(&ledger.snapshot)
+                .expect("jsonld");
+            normalize_rows(&rows)
+        }
+    };
+
+    let per_area = json!([["network", 3], ["other", 2], ["other", 1]]);
+    assert_eq!(
+        cypher(
+            "MATCH (e:E) WITH e.area AS a, count(e) AS n \
+             RETURN CASE WHEN a = 'Net' THEN 'network' ELSE 'other' END AS seg, n"
+        )
+        .await,
+        normalize_rows(&per_area)
+    );
+    assert_eq!(
+        sparql(format!("SELECT {SEG} (COUNT(?e) AS ?n) {W} GROUP BY ?a")).await,
+        normalize_rows(&per_area)
+    );
+
+    let per_label = json!([["network", 3], ["other", 3]]);
+    assert_eq!(
+        cypher(
+            "MATCH (e:E) \
+             RETURN CASE WHEN e.area = 'Net' THEN 'network' ELSE 'other' END AS seg, \
+             count(e) AS n"
+        )
+        .await,
+        normalize_rows(&per_label)
+    );
+    assert_eq!(
+        sparql(format!(
+            r#"SELECT ?seg (COUNT(?e) AS ?n) {W} GROUP BY (IF(?a = "Net", "network", "other") AS ?seg)"#
+        ))
+        .await,
+        normalize_rows(&per_label)
+    );
+}
+
+/// Must-not-change guards: grouped shapes that fluree/solo runs today, which
+/// project only keys, aggregates and expressions of aggregates. Their answers
+/// are unchanged by the grouped-projection work.
+#[tokio::test]
+async fn solo_grouped_sparql_shapes_are_unchanged() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "grouped-projection/solo-sparql:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:g1", "ex:link": [{"@id": "ex:l1"}, {"@id": "ex:l2"}, {"@id": "ex:l3"}]},
+                    {"@id": "ex:g2", "ex:link": [{"@id": "ex:l4"}, {"@id": "ex:l5"}, {"@id": "ex:l6"}]},
+                    {"@id": "ex:g3", "ex:link": [{"@id": "ex:l7"}]},
+                    {"@id": "ex:s1", "ex:doc": {"@id": "ex:d1"}, "ex:score": 0.9},
+                    {"@id": "ex:s2", "ex:doc": {"@id": "ex:d1"}, "ex:score": 0.5},
+                    {"@id": "ex:s3", "ex:doc": {"@id": "ex:d2"}, "ex:score": 0.85}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    // Nested grouped sub-SELECT (solo `golden.ts` clusterSizes): entities per
+    // link count, and the links they hold.
+    assert_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?n (COUNT(?e) AS ?entities) (SUM(?n) AS ?records) WHERE {
+           { SELECT ?e (COUNT(?l) AS ?n) WHERE { ?e ex:link ?l } GROUP BY ?e }
+         } GROUP BY ?n",
+        json!([
+            {"n": "3", "entities": "2", "records": "6"},
+            {"n": "1", "entities": "1", "records": "1"}
+        ]),
+        json!([[3, 2, 6], [1, 1, 1]]),
+    )
+    .await;
+
+    // SUM(IF(…)) buckets per key (solo `golden.ts` evidenceScoreBuckets).
+    assert_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?d (SUM(IF(?score >= 0.8, 1, 0)) AS ?high) (SUM(IF(?score < 0.8, 1, 0)) AS ?low)
+         WHERE { ?s ex:doc ?d ; ex:score ?score } GROUP BY ?d",
+        json!([
+            {"d": "http://example.org/d1", "high": "1", "low": "1"},
+            {"d": "http://example.org/d2", "high": "1", "low": "0"}
+        ]),
+        json!([["ex:d1", 1, 1], ["ex:d2", 1, 0]]),
+    )
+    .await;
+
+    // Two aggregate-only sub-SELECTs under an ungrouped SELECT * (the pattern
+    // solo's chat prompt teaches, `prose.rs`).
+    assert_rows(
+        &fluree,
+        &ledger,
+        "SELECT * WHERE {
+           { SELECT (COUNT(?l) AS ?links) (COUNT(DISTINCT ?e) AS ?entities) WHERE { ?e ex:link ?l } }
+           { SELECT (COUNT(?s) AS ?scores) WHERE { ?s ex:score ?score } }
+         }",
+        json!([{"links": "7", "entities": "3", "scores": "3"}]),
+        json!([{"?links": 7, "?entities": 3, "?scores": 3}]),
+    )
+    .await;
+}
