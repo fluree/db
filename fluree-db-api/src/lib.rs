@@ -361,11 +361,11 @@ pub use fluree_db_transact::{
 
 // Re-export SPARQL types (product feature; always enabled)
 pub use fluree_db_sparql::{
-    lower_sparql, parse_sparql, validate as validate_sparql, Capabilities as SparqlCapabilities,
-    Diagnostic as SparqlDiagnostic, LowerError as SparqlLowerError,
-    ParseOutput as SparqlParseOutput, Prologue as SparqlPrologue, QueryBody as SparqlQueryBody,
-    Severity as SparqlSeverity, SourceSpan as SparqlSourceSpan, SparqlAst,
-    UpdateOperation as SparqlUpdateOperation,
+    lower_sparql, parse_sparql, resolve_dataset_clause, validate as validate_sparql,
+    Capabilities as SparqlCapabilities, Diagnostic as SparqlDiagnostic,
+    LowerError as SparqlLowerError, ParseOutput as SparqlParseOutput, Prologue as SparqlPrologue,
+    QueryBody as SparqlQueryBody, ResolvedDatasetClause, Severity as SparqlSeverity,
+    SourceSpan as SparqlSourceSpan, SparqlAst, UpdateOperation as SparqlUpdateOperation,
 };
 
 // Re-export Cypher types (product feature; always enabled).

@@ -450,8 +450,43 @@ pub async fn run(
     // routes to the connection-scoped path. A plain same-endpoint query is left
     // on the single-target path below.
     let endpoint_id = target_endpoint_id(&target);
-    let use_connection =
-        force_connection || query_targets_foreign_source(query_format, &content, &endpoint_id)?;
+    let use_connection = force_connection || {
+        let (path, registry) = match &target {
+            context::QueryTarget::Ledger(LedgerMode::Local { fluree, alias })
+                if query_names_dataset(query_format, &content) =>
+            {
+                (
+                    EndpointPath::LocalView,
+                    local_graph_registry(fluree, alias).await,
+                )
+            }
+            // A graph source has no named graphs.
+            context::QueryTarget::GraphSource { .. } => {
+                (EndpointPath::LocalView, Some(Default::default()))
+            }
+            // A peer runs locally over index blocks fetched from its remote.
+            context::QueryTarget::Peer {
+                fluree,
+                remote_alias,
+                ..
+            } if query_names_dataset(query_format, &content) => (
+                EndpointPath::LocalView,
+                local_graph_registry(fluree, remote_alias).await,
+            ),
+            context::QueryTarget::Ledger(LedgerMode::Local { .. })
+            | context::QueryTarget::Peer { .. } => (EndpointPath::LocalView, None),
+            context::QueryTarget::Ledger(LedgerMode::Tracked { .. }) => {
+                (EndpointPath::LedgerRoute, None)
+            }
+        };
+        query_needs_connection(
+            query_format,
+            &content,
+            &endpoint_id,
+            path,
+            registry.as_ref(),
+        )
+    };
     if use_connection {
         return run_connection_query(
             target,
@@ -1650,53 +1685,162 @@ fn print_footer(total_rows: usize, limit: Option<usize>, elapsed: std::time::Dur
 // Graph-source / connection (federated) query routing
 // ---------------------------------------------------------------------------
 
-/// Strip the branch (`:branch`), time-travel (`@t:` / `@iso:` / `@commit:`), and
-/// named-graph fragment (`#…`) suffixes from a ledger / graph-source identifier,
-/// leaving the bare base name. Lets a query's `FROM` targets be compared to the
-/// endpoint regardless of how either is spelled (`mydb`, `mydb:main`,
-/// `mydb:main@t:3`, `mydb:main#g` all share the base `mydb`).
-fn base_ledger_id(id: &str) -> &str {
-    let id = id.split('#').next().unwrap_or(id);
-    let id = id.split('@').next().unwrap_or(id);
-    id.split(':').next().unwrap_or(id)
-}
-
-/// Extract the `from` targets declared in a JSON-LD query body (a string or an
-/// array of strings). Missing / non-string values yield an empty list.
-fn jsonld_from_targets(body: &serde_json::Value) -> Vec<String> {
-    match body.get("from") {
-        Some(serde_json::Value::String(s)) => vec![s.clone()],
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
+/// The graph registry of a local endpoint ledger, for resolving a query's
+/// dataset references in it. `None` when the endpoint is not a ledger the local
+/// store holds.
+async fn local_graph_registry(
+    fluree: &fluree_db_api::Fluree,
+    alias: &str,
+) -> Option<std::collections::HashMap<String, fluree_db_core::GraphId>> {
+    let handle = fluree.ledger_cached(alias).await.ok()?;
+    let view = handle.snapshot().await;
+    let mut ids = std::collections::HashMap::new();
+    for (g_id, iri) in view.snapshot.graph_registry.iter_entries() {
+        ids.insert(iri.to_string(), g_id);
     }
+    if let Some(store) = view.binary_store.as_ref() {
+        for (g_id, iri) in store.graph_entries() {
+            ids.entry(iri.to_string()).or_insert(g_id);
+        }
+    }
+    Some(ids)
 }
 
-/// Whether the query body targets a source *other than* the endpoint via
-/// `FROM`/`FROM NAMED` (SPARQL) or `from` (JSON-LD). This is the gate for
-/// auto-routing a federated query to the connection-scoped path: a plain
-/// same-endpoint query (no `FROM`, or `FROM <self>`) returns `false` and stays
-/// on the single-target path.
-fn query_targets_foreign_source(
+/// Where the endpoint's own path would run a query.
+#[derive(Clone, Copy)]
+enum EndpointPath {
+    /// The local view path. It reads SPARQL `FROM` / `FROM NAMED` graphs of its
+    /// own ledger but no time pin, and of JSON-LD only a `from` naming the whole
+    /// ledger. `registry` resolves the query's references exactly.
+    LocalView,
+    /// A remote ledger route, which resolves a reference against its own graph
+    /// registry. Only a reference that names another ledger leaves it.
+    LedgerRoute,
+}
+
+/// Whether a query must run on the connection path instead of the endpoint's
+/// own path. Each dataset reference resolves in the endpoint's ledger through
+/// the table every surface shares ([`fluree_db_core::TargetLedger`]): one that
+/// names another ledger, another branch included, leaves the endpoint, and so
+/// does anything the endpoint's path would not read ([`EndpointPath`]).
+fn query_needs_connection(
     query_format: detect::QueryFormat,
     content: &str,
     endpoint_id: &str,
-) -> CliResult<bool> {
-    let endpoint_base = base_ledger_id(endpoint_id);
-    let targets: Vec<String> = match query_format {
-        detect::QueryFormat::Sparql => {
-            fluree_db_api::sparql_dataset_ledger_ids(content).unwrap_or_default()
-        }
-        detect::QueryFormat::JsonLd => match serde_json::from_str::<serde_json::Value>(content) {
-            Ok(body) => jsonld_from_targets(&body),
-            // A body we can't parse here will fail later with a clearer error;
-            // don't divert it to the connection path on a parse hiccup.
-            Err(_) => Vec::new(),
-        },
+    path: EndpointPath,
+    registry: Option<&std::collections::HashMap<String, fluree_db_core::GraphId>>,
+) -> bool {
+    use fluree_db_core::{LedgerRef, MemberRef, TargetError, TargetLedger};
+
+    let Ok(endpoint) = LedgerRef::parse(endpoint_id) else {
+        // No endpoint ledger: a query that names a dataset needs the connection.
+        return query_names_dataset(query_format, content);
     };
-    Ok(targets.iter().any(|t| base_ledger_id(t) != endpoint_base))
+    let target = endpoint.id();
+    let lookup = |iri: &str| registry.and_then(|r| r.get(iri).copied());
+    let resolver = TargetLedger::new(target, &lookup);
+    let local = matches!(path, EndpointPath::LocalView);
+
+    // A reference the endpoint's path cannot read. One that does not parse is
+    // left to the path's own error.
+    let leaves = |written: &str| -> bool {
+        let Ok(member) = MemberRef::parse(written) else {
+            return false;
+        };
+        let pinned = member.address().is_some_and(|a| a.at().is_some());
+        match resolver.resolve(written, &member, pinned) {
+            Ok(_) => local && pinned,
+            Err(TargetError::GraphNotFound(_)) => false,
+            Err(TargetError::CrossLedger { also_iri, .. }) => local || !also_iri,
+        }
+    };
+    // The local view path reads a JSON-LD source only when it names the whole
+    // ledger: its own address, bare.
+    let whole_ledger = |written: &str| {
+        MemberRef::parse(written).is_ok_and(|member| {
+            member
+                .address()
+                .is_some_and(|a| a.id() == target && a.is_bare())
+        })
+    };
+
+    match query_format {
+        detect::QueryFormat::Sparql => {
+            let Some(ast) = fluree_db_api::parse_sparql(content).ast else {
+                return false;
+            };
+            let Ok(Some(clause)) = fluree_db_api::resolve_dataset_clause(&ast) else {
+                return false;
+            };
+            clause.to_graph.is_some()
+                || clause
+                    .default_graphs
+                    .iter()
+                    .chain(&clause.named_graphs)
+                    .any(|iri| leaves(iri))
+        }
+        detect::QueryFormat::JsonLd => {
+            let Ok(body) = serde_json::from_str::<serde_json::Value>(content) else {
+                // A body we can't parse here fails later with a clearer error.
+                return false;
+            };
+            let opts = body.get("opts");
+            let key = |k: &str| body.get(k).or_else(|| opts.and_then(|o| o.get(k)));
+            if key("to").is_some() {
+                return true;
+            }
+            let sources = |v: &serde_json::Value| -> Vec<(String, bool)> {
+                // (written @id, whether it carries more than an @id)
+                let one = |v: &serde_json::Value| match v {
+                    serde_json::Value::String(s) => Some((s.clone(), false)),
+                    serde_json::Value::Object(o) => o
+                        .get("@id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|id| (id.to_string(), o.keys().any(|k| k != "@id"))),
+                    _ => None,
+                };
+                match v {
+                    serde_json::Value::Array(items) => items.iter().filter_map(one).collect(),
+                    serde_json::Value::Object(o) if o.get("@id").is_none() => {
+                        o.values().filter_map(one).collect()
+                    }
+                    other => one(other).into_iter().collect(),
+                }
+            };
+            let named = key("fromNamed").or_else(|| key("from-named"));
+            let from = key("from").or_else(|| key("ledger"));
+            if local {
+                named.is_some()
+                    || from.is_some_and(|v| {
+                        let sources = sources(v);
+                        sources.is_empty()
+                            || sources
+                                .iter()
+                                .any(|(id, more)| *more || !whole_ledger(id) || leaves(id))
+                    })
+            } else {
+                named
+                    .into_iter()
+                    .chain(from)
+                    .flat_map(sources)
+                    .any(|(id, _)| leaves(&id))
+            }
+        }
+    }
+}
+
+/// Whether a query names a dataset at all (`FROM`, `FROM NAMED`, or JSON-LD
+/// `from` / `fromNamed`).
+fn query_names_dataset(query_format: detect::QueryFormat, content: &str) -> bool {
+    match query_format {
+        detect::QueryFormat::Sparql => fluree_db_api::sparql_has_dataset_clause(content),
+        detect::QueryFormat::JsonLd => serde_json::from_str::<serde_json::Value>(content)
+            .is_ok_and(|body| {
+                ["from", "fromNamed", "from-named", "ledger"]
+                    .iter()
+                    .any(|k| body.get(k).is_some())
+            }),
+    }
 }
 
 /// The endpoint identifier a query is scoped to, used to decide whether the
@@ -2011,10 +2155,10 @@ async fn connection_query_local(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_time_suffix_preserving_fragment, base_ledger_id, cli_delimited_config,
-        cli_sparql_json_config, format_tally_suffix, inject_sparql_from_before_where,
-        json_path_display_format, json_path_formatter_config, jsonld_from_targets, parse_time_spec,
-        query_targets_foreign_source, reject_graph_source_unsupported, time_spec_to_suffix,
+        attach_time_suffix_preserving_fragment, cli_delimited_config, cli_sparql_json_config,
+        format_tally_suffix, inject_sparql_from_before_where, json_path_display_format,
+        json_path_formatter_config, parse_time_spec, query_needs_connection,
+        reject_graph_source_unsupported, time_spec_to_suffix, EndpointPath,
     };
     use crate::detect::QueryFormat;
     use crate::output::OutputFormatKind;
@@ -2216,85 +2360,115 @@ mod tests {
         assert_eq!(out, "SELECT * FROM <myledger:main@t:1> WHERE { ?s ?p ?o }");
     }
 
-    #[test]
-    fn base_ledger_id_strips_branch_time_and_fragment() {
-        assert_eq!(base_ledger_id("mydb"), "mydb");
-        assert_eq!(base_ledger_id("mydb:main"), "mydb");
-        assert_eq!(base_ledger_id("mydb:feature-x"), "mydb");
-        assert_eq!(base_ledger_id("mydb:main@t:3"), "mydb");
-        assert_eq!(base_ledger_id("mydb:main#txn-meta"), "mydb");
-        assert_eq!(base_ledger_id("warehouse-orders:main"), "warehouse-orders");
+    fn needs(
+        format: QueryFormat,
+        content: &str,
+        endpoint: &str,
+        path: EndpointPath,
+        graphs: Option<&[&str]>,
+    ) -> bool {
+        let registry: Option<std::collections::HashMap<String, fluree_db_core::GraphId>> = graphs
+            .map(|graphs| {
+                graphs
+                    .iter()
+                    .zip(3u16..)
+                    .map(|(iri, g)| (iri.to_string(), g))
+                    .collect()
+            });
+        query_needs_connection(format, content, endpoint, path, registry.as_ref())
     }
 
+    /// #1972: the local router resolves the body's references in the
+    /// endpoint's ledger before choosing a path. The view path keeps what it
+    /// reads (its own ledger in any spelling, its graphs); another branch or
+    /// ledger, a pin, and every JSON-LD source other than the whole ledger go
+    /// to the connection path, which reads them.
     #[test]
-    fn jsonld_from_targets_handles_string_and_array() {
-        let s: serde_json::Value =
-            serde_json::from_str(r#"{"from":"mydb","select":["*"]}"#).unwrap();
-        assert_eq!(jsonld_from_targets(&s), vec!["mydb".to_string()]);
-
-        let a: serde_json::Value =
-            serde_json::from_str(r#"{"from":["a:main","b:main"],"select":["*"]}"#).unwrap();
-        assert_eq!(
-            jsonld_from_targets(&a),
-            vec!["a:main".to_string(), "b:main".to_string()]
-        );
-
-        let none: serde_json::Value = serde_json::from_str(r#"{"select":["*"]}"#).unwrap();
-        assert!(jsonld_from_targets(&none).is_empty());
-    }
-
-    #[test]
-    fn foreign_source_detection_sparql() {
-        // No FROM → same-endpoint single target.
-        assert!(!query_targets_foreign_source(
-            QueryFormat::Sparql,
+    fn local_routing_resolves_the_body_in_the_endpoints_ledger() {
+        let graphs: &[&str] = &["http://ex.org/g", "urn:x"];
+        let local = |format, content: &str| {
+            needs(
+                format,
+                content,
+                "mydb:main",
+                EndpointPath::LocalView,
+                Some(graphs),
+            )
+        };
+        for q in [
             "SELECT ?s WHERE { ?s ?p ?o }",
-            "mydb:main",
-        )
-        .unwrap());
-
-        // FROM the same ledger (any branch spelling) → not foreign.
-        assert!(!query_targets_foreign_source(
-            QueryFormat::Sparql,
             "SELECT ?s FROM <mydb:main> WHERE { ?s ?p ?o }",
-            "mydb",
-        )
-        .unwrap());
-
-        // FROM a different source → foreign → connection path.
-        assert!(query_targets_foreign_source(
-            QueryFormat::Sparql,
+            "SELECT ?s FROM <mydb> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM <urn:fluree:mydb:main#config> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM <mydb:main#config> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM <http://ex.org/g> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM NAMED <http://ex.org/g> WHERE { GRAPH ?g { ?s ?p ?o } }",
+            "SELECT ?s FROM <mydb:main> FROM NAMED <urn:ex:doc:1> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM NAMED <urn:x> WHERE { GRAPH ?g { ?s ?p ?o } }",
+        ] {
+            assert!(!local(QueryFormat::Sparql, q), "view path: {q}");
+        }
+        for q in [
+            "SELECT ?s FROM <mydb:feature-x> WHERE { ?s ?p ?o }",
             "SELECT ?s FROM <warehouse-orders:main> WHERE { ?s ?p ?o }",
-            "mydb:main",
-        )
-        .unwrap());
+            "SELECT ?s FROM <mydb:main@t:1> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM NAMED <other:main> WHERE { GRAPH ?g { ?s ?p ?o } }",
+        ] {
+            assert!(local(QueryFormat::Sparql, q), "connection: {q}");
+        }
+
+        for body in [
+            r#"{"select":["?s"],"where":{"@id":"?s"}}"#,
+            r#"{"from":"mydb","select":["?s"]}"#,
+            r#"{"from":"mydb:main","select":["?s"]}"#,
+            r#"{"from":"urn:fluree:mydb:main","select":["?s"]}"#,
+            r#"{"from":{"@id":"mydb:main"},"select":["?s"]}"#,
+        ] {
+            assert!(!local(QueryFormat::JsonLd, body), "view path: {body}");
+        }
+        for body in [
+            r#"{"from":"mydb:main#http://ex.org/g","select":["?s"]}"#,
+            r#"{"from":"mydb:main#config","select":["?s"]}"#,
+            r#"{"from":{"@id":"mydb:main","graph":"http://ex.org/g"},"select":["?s"]}"#,
+            r#"{"from":{"@id":"nope:main"},"select":["?s"]}"#,
+            r#"{"from":"mydb:feature-x","select":["?s"]}"#,
+            r#"{"from":"mydb@t:1","select":["?s"]}"#,
+            r#"{"from":["mydb","warehouse-orders:main"],"select":["?s"]}"#,
+            r#"{"fromNamed":["http://ex.org/g"],"select":["?s"]}"#,
+            r#"{"from":"mydb","to":"mydb@t:2","select":["?s"]}"#,
+        ] {
+            assert!(local(QueryFormat::JsonLd, body), "connection: {body}");
+        }
     }
 
+    /// A remote ledger route resolves a reference against its own graph
+    /// registry, so only a reference that names another ledger leaves it.
     #[test]
-    fn foreign_source_detection_jsonld() {
-        // `from` equal to the endpoint → not foreign.
-        assert!(!query_targets_foreign_source(
+    fn remote_routing_sends_only_another_ledger_to_the_connection() {
+        let remote =
+            |format, content: &str| needs(format, content, "mydb", EndpointPath::LedgerRoute, None);
+        for q in [
+            "SELECT ?s FROM <mydb:main#config> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM <mydb:main@t:1> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM <http://ex.org/g> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM NAMED <urn:x> WHERE { GRAPH ?g { ?s ?p ?o } }",
+        ] {
+            assert!(!remote(QueryFormat::Sparql, q), "ledger route: {q}");
+        }
+        for q in [
+            "SELECT ?s FROM <warehouse-orders> WHERE { ?s ?p ?o }",
+            "SELECT ?s FROM <mydb:feature-x@t:1> WHERE { ?s ?p ?o }",
+        ] {
+            assert!(remote(QueryFormat::Sparql, q), "connection: {q}");
+        }
+        assert!(!remote(
             QueryFormat::JsonLd,
-            r#"{"from":"mydb:main","select":["*"],"where":{"@id":"?s"}}"#,
-            "mydb",
-        )
-        .unwrap());
-
-        // `from` a different source → foreign.
-        assert!(query_targets_foreign_source(
+            r#"{"from":"mydb:main#config","select":["?s"]}"#
+        ));
+        assert!(remote(
             QueryFormat::JsonLd,
-            r#"{"from":"warehouse-orders:main","select":["*"],"where":{"@id":"?s"}}"#,
-            "mydb",
-        )
-        .unwrap());
-
-        // No `from` → not foreign.
-        assert!(!query_targets_foreign_source(
-            QueryFormat::JsonLd,
-            r#"{"select":["*"],"where":{"@id":"?s"}}"#,
-            "mydb",
-        )
-        .unwrap());
+            r#"{"from":{"@id":"warehouse-orders"},"select":["?s"]}"#
+        ));
     }
 
     #[test]
