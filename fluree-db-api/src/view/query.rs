@@ -2107,8 +2107,8 @@ mod graph_source_guard_tests {
 
     #[async_trait]
     impl R2rmlProvider for StubProvider {
-        async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-            true
+        async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+            Ok(true)
         }
 
         async fn compiled_mapping(

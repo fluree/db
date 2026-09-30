@@ -5,6 +5,7 @@
 //!
 //! Key types:
 //! - [`GraphRef`]: A borrowed reference to a single graph (db + overlay + time bounds)
+//! - [`MemberKind`]: Whether a graph reads a ledger's index or a graph source
 //! - [`DataSet`]: An immutable collection of default and named graphs
 //! - [`ActiveGraph`]: Enum indicating which graph(s) are currently active for scanning
 //!
@@ -25,6 +26,27 @@ use fluree_db_core::ids::GraphId;
 use fluree_db_core::{LedgerSnapshot, OverlayProvider};
 
 use crate::policy::QueryPolicyEnforcer;
+
+/// What a graph the caller loaded reads: a ledger's own index, or a graph
+/// source whose rows come from a provider.
+///
+/// The executor asks the R2RML provider whether a graph is a mapped graph
+/// source only when its kind leaves that open. A [`Native`](Self::Native)
+/// graph is never looked up, so a query over ledgers does not depend on the
+/// graph-source registry being reachable, and a lookup that does run and fails
+/// fails the query instead of reading a graph source as an empty graph.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemberKind {
+    /// The caller did not say. The executor asks the provider, as it does for
+    /// a graph source.
+    #[default]
+    Unclassified,
+    /// A ledger graph, read from its snapshot and novelty. Never looked up as
+    /// a graph source.
+    Native,
+    /// A graph source. The executor asks the provider whether it is mapped.
+    GraphSource,
+}
 
 /// Reference to a single graph view (borrowed, for execution)
 ///
@@ -65,6 +87,8 @@ pub struct GraphRef<'a> {
     /// Enables per-graph policy in datasets (e.g., different policies for
     /// different named graphs).
     pub policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
+    /// What this graph reads, when the caller that loaded it knows.
+    pub kind: MemberKind,
 }
 
 impl<'a> GraphRef<'a> {
@@ -90,6 +114,7 @@ impl<'a> GraphRef<'a> {
             to_t,
             ledger_id: ledger_id.into(),
             policy_enforcer: None,
+            kind: MemberKind::Unclassified,
         }
     }
 
@@ -117,6 +142,7 @@ impl<'a> GraphRef<'a> {
             to_t,
             ledger_id: ledger_id.into(),
             policy_enforcer: Some(policy_enforcer),
+            kind: MemberKind::Unclassified,
         }
     }
 
@@ -135,7 +161,14 @@ impl<'a> GraphRef<'a> {
             to_t,
             ledger_id: Arc::from(snapshot.ledger_id.as_str()),
             policy_enforcer: None,
+            kind: MemberKind::Unclassified,
         }
+    }
+
+    /// Record what this graph reads (see [`MemberKind`]).
+    pub fn with_kind(mut self, kind: MemberKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Check if this graph has a policy enforcer attached
@@ -155,6 +188,7 @@ impl fmt::Debug for GraphRef<'_> {
             .field("to_t", &self.to_t)
             .field("ledger_id", &self.ledger_id)
             .field("has_policy", &self.policy_enforcer.is_some())
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -266,6 +300,7 @@ impl<'a> DataSet<'a> {
                 to_t: graph.to_t,
                 ledger_id: Arc::clone(&graph.ledger_id),
                 policy_enforcer: graph.policy_enforcer.clone(),
+                kind: graph.kind,
             }
         };
         DataSet {

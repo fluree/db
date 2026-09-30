@@ -5,7 +5,7 @@
 
 use crate::annotation_edge_probe::AnnotationSidecarCache;
 use crate::bm25::{Bm25IndexProvider, Bm25SearchProvider};
-use crate::dataset::{ActiveGraph, ActiveGraphs, DataSet};
+use crate::dataset::{ActiveGraph, ActiveGraphs, DataSet, MemberKind};
 use crate::error::QueryError;
 use crate::policy::QueryPolicyEnforcer;
 use crate::r2rml::{R2rmlProvider, R2rmlTableProvider};
@@ -363,6 +363,10 @@ pub struct ExecutionContext<'a> {
     /// with its `ledger_id` in this set, it routes triple patterns through
     /// R2RML scan instead of native index scan.
     pub r2rml_graph_ids: std::collections::HashSet<Arc<str>>,
+    /// What the primary snapshot reads when there is no dataset, as the caller
+    /// that loaded it said (see [`MemberKind`]). A native primary's own id is
+    /// never looked up as a graph source.
+    pub primary_kind: MemberKind,
     /// Cached result of the multi-ledger check.
     ///
     /// `true` when the active query scope spans more than one distinct ledger ID.
@@ -513,6 +517,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
@@ -573,6 +578,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
@@ -637,6 +643,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
@@ -690,6 +697,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
@@ -742,6 +750,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
@@ -796,6 +805,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
@@ -1360,6 +1370,22 @@ impl<'a> ExecutionContext<'a> {
     /// unregistered, or it names a reserved system graph. The ledger alias is
     /// reserved for the default graph and never resolves here, even if a
     /// registered graph shares the ledger's IRI.
+    /// Whether `iri` names a graph the caller loaded as a ledger graph: a
+    /// dataset member (or member alias) of kind [`MemberKind::Native`], or,
+    /// with no dataset, a native primary's own id. Such a graph is never asked
+    /// about as a graph source.
+    pub fn graph_is_native(&self, iri: &str) -> bool {
+        match self.dataset {
+            Some(ds) => ds
+                .named_graph(iri)
+                .is_some_and(|graph| graph.kind == MemberKind::Native),
+            None => {
+                self.primary_kind == MemberKind::Native
+                    && iri == self.active_snapshot.ledger_id.as_str()
+            }
+        }
+    }
+
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
         if self.dataset.is_some() || iri == self.active_snapshot.ledger_id.as_str() {
             return None;
@@ -1433,6 +1459,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: self.english_lang_id,
             remote_service: self.remote_service,
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
+            primary_kind: self.primary_kind,
             multi_ledger,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
@@ -1496,6 +1523,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: self.english_lang_id,
             remote_service: self.remote_service,
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
+            primary_kind: self.primary_kind,
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
@@ -1555,6 +1583,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: self.english_lang_id,
             remote_service: self.remote_service,
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
+            primary_kind: self.primary_kind,
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,

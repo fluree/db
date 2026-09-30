@@ -60,23 +60,29 @@ use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 // Note: tracing::debug removed to fix compilation - add tracing dependency if needed
 
-/// Best-effort load of the compiled R2RML mapping for `graph_iri`, used only to
-/// let [`rewrite_patterns_for_r2rml`] decide whether a same-subject `rdf:type`
-/// may be safely fused into a star scan. Returns `None` (which disables class
-/// fusion but stays correct) when there is no provider or the load fails; the
-/// R2RML operator loads the mapping again at setup, so within a query this is a
-/// cache hit under the query-scoped catalog session.
+/// Load the compiled R2RML mapping for `graph_iri`, which the caller has just
+/// found to be an R2RML graph source, so [`rewrite_patterns_for_r2rml`] can
+/// decide whether a same-subject `rdf:type` may be safely fused into a star
+/// scan. `None` only when there is no provider. A failed load fails the query
+/// rather than silently disabling the rewrite; the R2RML operator loads the
+/// mapping again at setup, so within a query this is a cache hit under the
+/// query-scoped catalog session.
 async fn r2rml_mapping_for_rewrite(
     ctx: &ExecutionContext<'_>,
     graph_iri: &str,
-) -> Option<Arc<CompiledR2rmlMapping>> {
-    let provider = ctx.r2rml_provider?;
+) -> Result<Option<Arc<CompiledR2rmlMapping>>> {
+    let Some(provider) = ctx.r2rml_provider else {
+        return Ok(None);
+    };
     let as_of_t = if ctx.dataset.is_some() {
         None
     } else {
         Some(ctx.to_t)
     };
-    provider.compiled_mapping(graph_iri, as_of_t).await.ok()
+    provider
+        .compiled_mapping(graph_iri, as_of_t)
+        .await
+        .map(Some)
 }
 
 /// GRAPH pattern operator - scopes inner patterns to a specific graph
@@ -282,16 +288,20 @@ impl GraphOperator {
         }
 
         // Check if this graph is backed by an R2RML mapping.
-        // Prefer the precomputed set (populated in runner.rs for dataset queries),
-        // but fall back to asking the provider dynamically for the no-dataset
-        // single-source path where the GRAPH IRI may differ from the ledger_id.
+        // Prefer the precomputed set (populated in runner.rs from the query's
+        // graphs), but fall back to asking the provider dynamically for the
+        // no-dataset single-source path where the GRAPH IRI may differ from the
+        // ledger_id.
         let is_r2rml_gs = if ctx.r2rml_graph_ids.contains(graph_iri.as_ref()) {
             true
-        } else if ctx.single_db_user_graph_id(&graph_iri).is_some() {
-            // Registered native graph — never R2RML; skip the per-graph probe.
+        } else if ctx.single_db_user_graph_id(&graph_iri).is_some()
+            || ctx.graph_is_native(&graph_iri)
+        {
+            // A registered graph, or a graph loaded as a ledger graph: never
+            // R2RML, so skip the per-graph probe.
             false
         } else if let Some(provider) = ctx.r2rml_provider {
-            provider.has_r2rml_mapping(&graph_iri).await
+            provider.has_r2rml_mapping(&graph_iri).await?
         } else {
             false
         };
@@ -299,7 +309,7 @@ impl GraphOperator {
         // Determine which patterns to use (rewritten for R2RML or original)
         let patterns_to_execute: std::borrow::Cow<'_, [Pattern]> = if is_r2rml_gs {
             // Rewrite triple patterns to R2RML patterns
-            let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
+            let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
             let rewrite_result = rewrite_patterns_for_r2rml(
                 &self.inner_patterns,
                 &graph_iri,
@@ -536,7 +546,7 @@ impl GraphOperator {
             graph_ctx.eager_materialization = true;
         }
 
-        let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
+        let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
         let rewrite_result = rewrite_patterns_for_r2rml(
             &self.inner_patterns,
             &graph_iri,
@@ -756,7 +766,7 @@ impl Operator for GraphOperator {
                         && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
                             true
                         } else if let Some(provider) = ctx.r2rml_provider {
-                            provider.has_r2rml_mapping(iri).await
+                            provider.has_r2rml_mapping(iri).await?
                         } else {
                             false
                         };
@@ -799,7 +809,7 @@ impl Operator for GraphOperator {
                                 && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
                                     true
                                 } else if let Some(provider) = ctx.r2rml_provider {
-                                    provider.has_r2rml_mapping(iri).await
+                                    provider.has_r2rml_mapping(iri).await?
                                 } else {
                                     false
                                 };
@@ -846,7 +856,7 @@ impl Operator for GraphOperator {
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
                                             true
                                         } else if let Some(provider) = ctx.r2rml_provider {
-                                            provider.has_r2rml_mapping(&bound_iri).await
+                                            provider.has_r2rml_mapping(&bound_iri).await?
                                         } else {
                                             false
                                         };

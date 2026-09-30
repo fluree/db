@@ -236,6 +236,7 @@ impl DataSetDb {
                 Arc::clone(&view.ledger_id),
             );
             graph.policy_enforcer = view.policy_enforcer().cloned();
+            graph.kind = view.member_kind();
             ds = ds.with_default_graph(graph);
         }
 
@@ -248,6 +249,7 @@ impl DataSetDb {
                 Arc::clone(&view.ledger_id),
             );
             graph.policy_enforcer = view.policy_enforcer().cloned();
+            graph.kind = view.member_kind();
             graph
         }
         for iri in &self.named_order {
