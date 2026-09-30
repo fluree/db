@@ -1883,11 +1883,20 @@ fn lower_object_with_subject(
     let graph_key = graph_entry_key(map, effective_json_ld, walk.root);
     let has_id = map.contains_key("@id")
         || (effective_json_ld.id_key != "@id" && map.contains_key(&effective_json_ld.id_key));
+    // The document's own top-level `@graph` is read the way the parser reads
+    // it (`doc_shape`): without an `@id`, any node content, a bare `{"@id"}`
+    // included, makes the document an envelope.
+    let root_envelope = walk.root
+        && !has_id
+        && map
+            .get("@graph")
+            .is_some_and(|g| matches!(fluree_graph_json_ld::is_envelope_graph(g, false), Ok(true)));
     let (own_graph, content_graph, content_in_scope) = match graph_key
         .as_ref()
         .and_then(|k| map.get(k))
         .map(classify_graph_value)
     {
+        _ if root_envelope => (None, None, true),
         Some(GraphValue::Selector(raw)) => (Some(raw.to_string()), None, false),
         // A JSON-LD named graph: its content is scoped to the graph its
         // `@id` names (expanded as the parser expands it).

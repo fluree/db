@@ -126,21 +126,24 @@ pub fn doc_shape(obj: &Map<String, Value>) -> Result<DocShape> {
 
 /// Whether a top-level object with this `@graph` value is an envelope (a
 /// default-graph wrapper): it has no `@id`, and the value is node content. At
-/// the top level any array of node objects is content, a one-element array
-/// of a bare `{"@id"}` included: every reader has always taken
-/// `{"@graph": [...]}` to be an envelope. (Below the top level that
-/// one-element form is a graph selector.)
+/// the top level any node object, or array of node objects, is content, a
+/// bare `{"@id"}` included, alone or as a one-element array: every reader has
+/// always taken `{"@graph": ...}` to be an envelope. (Below the top level
+/// both bare forms are graph selectors.)
 pub fn is_envelope_graph(graph: &Value, has_id: bool) -> Result<bool> {
     if has_id {
         return Ok(false);
     }
-    if let Value::Array(items) = graph {
-        if items
-            .iter()
-            .all(|item| matches!(item, Value::Object(map) if !is_value_like(map)))
+    match graph {
+        Value::Array(items)
+            if items
+                .iter()
+                .all(|item| matches!(item, Value::Object(map) if !is_value_like(map))) =>
         {
             return Ok(true);
         }
+        Value::Object(map) if !is_value_like(map) => return Ok(true),
+        _ => {}
     }
     match classify_graph_value(graph) {
         GraphValue::Content(_) => Ok(true),
@@ -239,6 +242,16 @@ mod tests {
         assert_eq!(
             shape(json!({"@graph": {"@id": "ex:a", "ex:p": 1}, "f:message": "m"})),
             DocShape::Envelope
+        );
+        // So is a single bare `{"@id"}`, exactly like its one-element array:
+        // at the top level neither is a graph selector.
+        assert_eq!(
+            shape(json!({"@graph": {"@id": "ex:X"}, "f:message": "m"})),
+            DocShape::Envelope
+        );
+        assert_eq!(
+            shape(json!({"@id": "ex:s", "@graph": {"@id": "ex:g"}})),
+            DocShape::Node
         );
         // A single object with a string selector is a node, never an envelope.
         assert_eq!(
