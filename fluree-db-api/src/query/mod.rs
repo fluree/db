@@ -145,6 +145,10 @@ pub struct QueryResult {
     /// mixed-dataset paths not routed through that method leave it false → today's
     /// raw rendering is unchanged.
     pub from_graph_source: bool,
+    /// Non-fatal notes about how the query was read (see
+    /// [`crate::QueryAdvisory`]). Empty for most queries; never changes the
+    /// result.
+    pub advisories: Vec<crate::QueryAdvisory>,
 }
 
 impl std::fmt::Debug for QueryResult {

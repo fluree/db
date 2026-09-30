@@ -185,14 +185,17 @@ impl Fluree {
             .await?;
 
         // 5. Build result with max_t across all views
-        Ok(build_query_result(
+        let advisories = dataset.advisories(&parsed.patterns);
+        let mut result = build_query_result(
             vars,
             parsed,
             batches,
             dataset.result_t(),
             dataset.composite_overlay(),
             primary.binary_graph(),
-        ))
+        );
+        result.advisories = advisories;
+        Ok(result)
     }
 
     pub(crate) async fn query_dataset_with_r2rml_options(
@@ -301,14 +304,17 @@ impl Fluree {
             )
             .await?;
 
-        Ok(build_query_result(
+        let advisories = dataset.advisories(&parsed.patterns);
+        let mut result = build_query_result(
             vars,
             parsed,
             batches,
             dataset.result_t(),
             dataset.composite_overlay(),
             primary.binary_graph(),
-        ))
+        );
+        result.advisories = advisories;
+        Ok(result)
     }
 
     /// Execute a dataset query with tracking.

@@ -268,6 +268,22 @@ impl DataSetDb {
         ds
     }
 
+    /// The advisories for a query over this dataset whose lowered patterns are
+    /// `patterns` ([`crate::QueryAdvisory`]).
+    pub(crate) fn advisories(
+        &self,
+        patterns: &[fluree_db_query::ir::Pattern],
+    ) -> Vec<crate::QueryAdvisory> {
+        let mut out = Vec::new();
+        if self.default.is_empty()
+            && !self.named.is_empty()
+            && crate::advisory::reads_default_graph(patterns)
+        {
+            out.push(crate::QueryAdvisory::EmptyDefaultGraph);
+        }
+        out
+    }
+
     /// Build a composite overlay across all graphs (for hydration formatting).
     pub(crate) fn composite_overlay(&self) -> Option<Arc<dyn OverlayProvider>> {
         let mut overlays: Vec<Arc<dyn OverlayProvider>> = Vec::new();

@@ -4133,3 +4133,72 @@ async fn reported_dataset_ledgers_cover_every_ledger_the_engine_reads() {
 
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// A dataset that names only named graphs has an empty default graph (SPARQL
+/// 1.1 §13.2), so a query that also matches outside `GRAPH` reads nothing
+/// there. The result says so with a typed advisory, in either language and
+/// wherever the pattern sits (an `EXISTS` filter included). A query that stays
+/// inside `GRAPH`, or whose dataset names a default graph, carries none.
+#[tokio::test]
+async fn a_named_only_dataset_advises_when_the_query_reads_its_empty_default_graph() {
+    use fluree_db_api::QueryAdvisory;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_people_ledger(&fluree, "adv-a:main").await;
+    let empty = vec![QueryAdvisory::EmptyDefaultGraph];
+
+    for (sparql, expected) in [
+        (
+            "SELECT ?s FROM NAMED <adv-a:main> WHERE { ?s ?p ?o }",
+            empty.clone(),
+        ),
+        (
+            "SELECT ?s FROM NAMED <adv-a:main> \
+             WHERE { GRAPH ?g { ?s ?p ?o } FILTER EXISTS { ?s ?p ?o } }",
+            empty.clone(),
+        ),
+        (
+            "SELECT ?s FROM NAMED <adv-a:main> \
+             WHERE { GRAPH ?g { ?s ?p ?o } FILTER(EXISTS { ?s ?p ?o } || false) }",
+            empty.clone(),
+        ),
+        (
+            "SELECT ?s FROM NAMED <adv-a:main> WHERE { GRAPH ?g { ?s ?p ?o } }",
+            vec![],
+        ),
+        (
+            "SELECT ?s FROM <adv-a:main> FROM NAMED <adv-a:main> WHERE { ?s ?p ?o }",
+            vec![],
+        ),
+    ] {
+        let result = fluree
+            .query_from()
+            .sparql(sparql)
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+        assert_eq!(result.advisories, expected, "{sparql}");
+    }
+
+    for (body, expected) in [
+        (
+            json!({"fromNamed": ["adv-a:main"], "select": ["?s"],
+                   "where": {"@id": "?s", "?p": "?o"}}),
+            empty.clone(),
+        ),
+        (
+            json!({"fromNamed": ["adv-a:main"], "select": ["?s"],
+                   "where": [["graph", "adv-a:main", {"@id": "?s", "?p": "?o"}]]}),
+            vec![],
+        ),
+    ] {
+        let result = fluree
+            .query_from()
+            .jsonld(&body)
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{body}: {e}"));
+        assert_eq!(result.advisories, expected, "{body}");
+    }
+    assert!(QueryAdvisory::EmptyDefaultGraph.message().contains("FROM"));
+}

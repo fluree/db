@@ -6398,3 +6398,47 @@ fn local_query_reads_the_graph_or_branch_its_dataset_names() {
         .failure()
         .stdout(predicate::str::contains("in-default").not());
 }
+
+/// A dataset naming only named graphs has an empty default graph; a query that
+/// also matches outside `GRAPH` is told so on stderr, on the view path and on
+/// the connection path, and the rows are unchanged (none).
+#[test]
+fn a_named_only_dataset_warns_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "advdb");
+    fluree_cmd(&tmp)
+        .args(["create", "advother"])
+        .assert()
+        .success();
+
+    for sparql in [
+        // The target's own ledger: the view path.
+        "SELECT ?o FROM NAMED <advdb:main> WHERE { ?s <http://example.org/p> ?o }",
+        // Another ledger: the connection path.
+        "SELECT ?o FROM NAMED <advother:main> WHERE { ?s <http://example.org/p> ?o }",
+    ] {
+        fluree_cmd(&tmp)
+            .args([
+                "query", "-l", "advdb", "--sparql", "--format", "json", "-e", sparql,
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("default graph is empty"))
+            .stdout(predicate::str::contains("in-default").not());
+    }
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "-l",
+            "advdb",
+            "--sparql",
+            "--format",
+            "json",
+            "-e",
+            "SELECT ?o WHERE { ?s <http://example.org/p> ?o }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("default graph is empty").not());
+}
