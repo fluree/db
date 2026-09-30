@@ -35,6 +35,7 @@ pub mod compact;
 pub mod context;
 pub mod error;
 pub mod expand;
+pub mod graph_shape;
 pub mod iri;
 pub mod normalize;
 
@@ -50,6 +51,7 @@ pub mod ndjson_splitter;
 pub use compact::ContextCompactor;
 pub use context::{Container, ContextEntry, ParsedContext, TypeValue};
 pub use error::{JsonLdError, Result};
+pub use graph_shape::{classify_graph_value, doc_shape, is_graph_key, DocShape, GraphValue};
 pub use iri::UnresolvedIriDisposition;
 pub use ndjson_splitter::{FirstLineContextPolicy, NdjsonChunkPayload, NdjsonReader};
 pub use normalize::{Algorithm, Format, NormalizeOptions};
