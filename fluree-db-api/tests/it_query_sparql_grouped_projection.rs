@@ -607,17 +607,17 @@ async fn having_without_grouping_filters() {
     assert_eq!(result.row_count(), 0);
 }
 
-/// A trailing VALUES clause joins after HAVING (SPARQL 1.1 §18.2.4), so
-/// HAVING cannot read its variables: grouped or not, `HAVING (?v = 1)` over
-/// `VALUES ?v { 1 }` keeps nothing. The grouped form used to read `?v` as a
-/// SAMPLE of the VALUES column, which was joined before grouping, and kept
-/// every group.
+/// A trailing VALUES clause joins right after the WHERE, before grouping, as
+/// it did before this change (AJ-27): it restricts the aggregates' input, so
+/// the "VALUES as a parameter" idiom keeps its answers. SPARQL 1.1 §18.2.4.3
+/// joins it after HAVING instead; that is a deliberate, documented deviation.
 ///
-/// Joined after grouping, the VALUES rows no longer multiply the aggregates'
-/// input: each group row pairs with each VALUES row instead. Before, `COUNT`
-/// counted twice as many rows.
+/// HAVING reads a VALUES variable the WHERE does not bind as unbound, as it
+/// would after HAVING: `HAVING (?v = 1) VALUES ?v { 1 }` keeps nothing,
+/// grouped or not, as before this change. The implicit SAMPLE must not reach
+/// it (that kept every group).
 #[tokio::test]
-async fn trailing_values_joins_after_having() {
+async fn trailing_values_join_before_grouping() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_areas(&fluree, "grouped-projection/trailing-values:main").await;
     for body in [
@@ -627,33 +627,45 @@ async fn trailing_values_joins_after_having() {
         let result = run(&fluree, &ledger, &body).await;
         assert_eq!(result.row_count(), 0, "{body}");
     }
+    // VALUES as a parameter: it restricts what the aggregates count.
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a VALUES ?e {{ ex:e1 }}"),
+        json!([{"a": "Net", "n": "1"}]),
+        json!([["Net", 1]]),
+    )
+    .await;
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!("SELECT (COUNT(?e) AS ?n) {W} VALUES ?e {{ ex:e1 ex:e4 }}"),
+        json!([{"n": "2"}]),
+        json!([[2]]),
+    )
+    .await;
+    // A VALUES variable the WHERE does not bind multiplies the aggregates'
+    // input (the spec would pair each group row with each VALUES row).
     assert_rows(
         &fluree,
         &ledger,
         &format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a VALUES ?x {{ 1 2 }}"),
         json!([
-            {"a": "Net", "n": "3"}, {"a": "Net", "n": "3"},
-            {"a": "Local", "n": "2"}, {"a": "Local", "n": "2"},
-            {"a": "Remote", "n": "1"}, {"a": "Remote", "n": "1"}
+            {"a": "Net", "n": "6"},
+            {"a": "Local", "n": "4"},
+            {"a": "Remote", "n": "2"}
         ]),
-        json!([
-            ["Net", 3],
-            ["Net", 3],
-            ["Local", 2],
-            ["Local", 2],
-            ["Remote", 1],
-            ["Remote", 1]
-        ]),
+        json!([["Net", 6], ["Local", 4], ["Remote", 2]]),
     )
     .await;
 }
 
-/// The sub-SELECT twin. A sub-SELECT still joins its trailing VALUES before
-/// grouping (the spec joins it after HAVING), but its HAVING reads the VALUES
-/// variables as unbound, as the spec's order gives, grouped or not. They used
-/// to be read as bound: the grouped HAVING as a SAMPLE of the VALUES column
-/// (every group kept), the ungrouped one as the joined value. A VALUES
-/// variable the level binds before HAVING (here the key `?a`) is still read.
+/// The sub-SELECT twin: its trailing VALUES also joins before grouping, and its
+/// HAVING also reads the VALUES variables the WHERE does not bind as unbound,
+/// grouped or not. The grouped HAVING used to read them as a SAMPLE of the
+/// VALUES column (every group kept), and the ungrouped one as the joined
+/// value. A VALUES variable the level binds before HAVING (here the key `?a`)
+/// is still read, and VALUES as a parameter still restricts the aggregates.
 #[tokio::test]
 async fn sub_select_having_reads_trailing_values_as_unbound() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -687,6 +699,17 @@ async fn sub_select_having_reads_trailing_values_as_unbound() {
         ),
         json!([{"a": "Net", "n": "3"}]),
         json!([{"?a": "Net", "?n": 3}]),
+    )
+    .await;
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!(
+            "SELECT * WHERE {{ {{ SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a \
+             VALUES ?e {{ ex:e1 }} }} }}"
+        ),
+        json!([{"a": "Net", "n": "1"}]),
+        json!([{"?a": "Net", "?n": 1}]),
     )
     .await;
 }

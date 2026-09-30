@@ -61,7 +61,6 @@ pub use error::{LowerError, Result};
 
 use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
 
-use fluree_db_query::ir::pattern::produced_vars_of;
 use fluree_db_query::ir::Pattern;
 use fluree_db_query::ir::{Query, QueryOutput, ReasoningConfig};
 
@@ -71,7 +70,7 @@ use fluree_db_query::var_registry::{VarId, VarRegistry};
 
 use fluree_graph_json_ld::{parse_context, ParsedContext};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Lower a SPARQL AST to a Query.
@@ -543,21 +542,11 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // `Query.order_binds` (a dedicated post-grouping stage in the
                 // operator tree) so they evaluate uniformly with or without
                 // grouping.
-                let having_unbound: HashSet<VarId> = match &post_values {
-                    Some(Pattern::Values { vars, .. }) => {
-                        let where_vars = produced_vars_of(&patterns);
-                        vars.iter()
-                            .copied()
-                            .filter(|v| !where_vars.contains(v))
-                            .collect()
-                    }
-                    _ => HashSet::new(),
-                };
                 let level = self.lower_select_level(
                     &select_query.select,
                     &select_query.modifiers,
                     &mut patterns,
-                    &having_unbound,
+                    post_values.as_ref(),
                 )?;
                 let star_projection = level.star_projection;
                 let grouping = level.grouping;
