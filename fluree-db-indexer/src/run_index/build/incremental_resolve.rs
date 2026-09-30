@@ -85,6 +85,27 @@ impl std::fmt::Display for IncrementalResolveError {
 
 impl std::error::Error for IncrementalResolveError {}
 
+/// The custom datatype IRIs in a root's datatype list, which starts with the
+/// reserved ones.
+///
+/// A root that lists more datatypes than a dt id can address cannot come
+/// from a valid index. Building on it would write rows the index cannot
+/// represent, so it is refused.
+fn custom_datatype_iris(datatype_iris: &[String]) -> Result<Vec<String>, IncrementalResolveError> {
+    let max = usize::from(DatatypeDictId::MAX) + 1;
+    if datatype_iris.len() > max {
+        return Err(IncrementalResolveError::RootLoad(format!(
+            "index root lists {} datatypes, but a dt id can address at most {max}",
+            datatype_iris.len()
+        )));
+    }
+    Ok(datatype_iris
+        .iter()
+        .skip(usize::from(DatatypeDictId::RESERVED_COUNT))
+        .cloned()
+        .collect())
+}
+
 impl From<io::Error> for IncrementalResolveError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
@@ -232,12 +253,7 @@ pub async fn resolve_incremental_commits_v6(
     );
 
     // 2. Build OTypeRegistry from root's datatype and language metadata.
-    let custom_dt_iris: Vec<String> = root
-        .datatype_iris
-        .iter()
-        .skip(DatatypeDictId::RESERVED_COUNT as usize)
-        .cloned()
-        .collect();
+    let custom_dt_iris = custom_datatype_iris(&root.datatype_iris)?;
     let o_type_registry = OTypeRegistry::new(&custom_dt_iris);
 
     // 3. Load subject + string reverse dict trees (same DictRefs as V5).
@@ -1602,6 +1618,26 @@ fn remap_record(
 mod tests {
     use super::*;
     use fluree_db_core::subject_id::SubjectId;
+
+    #[test]
+    fn custom_datatype_iris_refuses_a_root_past_the_dt_id_width() {
+        let reserved = usize::from(DatatypeDictId::RESERVED_COUNT);
+        let full = usize::from(DatatypeDictId::MAX) + 1;
+        let iris = |n: usize| {
+            (0..n)
+                .map(|i| format!("http://example.org/U{i}"))
+                .collect::<Vec<_>>()
+        };
+
+        let custom = custom_datatype_iris(&iris(full)).expect("a full root is valid");
+        assert_eq!(custom.len(), full - reserved);
+        assert_eq!(custom[0], format!("http://example.org/U{reserved}"));
+
+        assert!(matches!(
+            custom_datatype_iris(&iris(full + 1)),
+            Err(IncrementalResolveError::RootLoad(_))
+        ));
+    }
 
     const OP_RETRACT: u8 = 0;
     const OP_ASSERT: u8 = 1;

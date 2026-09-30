@@ -4841,6 +4841,29 @@ pub(crate) mod tests {
         );
     }
 
+    /// A dt id past the `OType` payload width can only come from a damaged or
+    /// future-format row. Decoding it yields an unknown value.
+    #[test]
+    fn decode_value_from_kind_dt_past_payload_width_is_null() {
+        use fluree_db_core::o_type::OType;
+
+        let cache_dir = temp_cache_dir();
+        let cs: Arc<dyn ContentStore> = Arc::new(CountingContentStore::new());
+        let store = empty_store(cs, cache_dir);
+
+        for dt in [OType::MAX_PAYLOAD + 1, u16::MAX] {
+            let o_kind = ObjKind::LEX_ID.as_u8();
+            assert_eq!(
+                store.o_type_from_kind(o_kind, dt, 0),
+                OType::RESERVED.as_u16()
+            );
+            let val = store
+                .decode_value_from_kind(o_kind, 7, 0, dt, 0, 0)
+                .unwrap();
+            assert_eq!(val, FlakeValue::Null, "dt {dt}");
+        }
+    }
+
     /// Regression test for fluree/db-r#142: legacy data where integral doubles
     /// were stored as NUM_INT but the property datatype is xsd:double/float.
     /// decode_value_from_kind must detect the mismatch and convert i64 → f64

@@ -455,6 +455,7 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 - `400 Bad Request`: the body carries `merged_commits`
 - `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
 - `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
+- `422 Unprocessable Entity` with `err:db/DatatypeLimitExceeded`: the commits would bring the ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit)
 
 ### POST /push-merges/*ledger
 

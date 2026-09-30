@@ -3835,12 +3835,22 @@ fn value_to_otype_okey(
         }
         FlakeValue::String(s) => {
             let str_id = resolve_string_v3(s, store, dict_novelty)?;
-            let ot = dt_otype.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "datatype not resolvable to OType for String value",
-                )
-            })?;
+            let ot = dt_otype
+                .and_then(|ot| {
+                    if ot.is_string_keyed() {
+                        Some(ot)
+                    } else {
+                        // Ill-typed literal: keyed like the indexer's
+                        // `OTypeRegistry::resolve` keys it (#1987).
+                        store.find_dt_id(dt_sid).map(OType::customer_datatype)
+                    }
+                })
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "datatype not resolvable to OType for String value",
+                    )
+                })?;
             Ok((ot, str_id as u64))
         }
         FlakeValue::Json(s) => {
