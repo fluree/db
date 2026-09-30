@@ -96,7 +96,7 @@ async fn config_write_trig_roundtrip() {
 // =============================================================================
 
 #[tokio::test]
-async fn config_write_json_ld() {
+async fn config_write_trig_iri_groups() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-jsonld:main";
     let ledger = genesis_ledger(&fluree, ledger_id);
@@ -140,6 +140,91 @@ async fn config_write_json_ld() {
             .map(std::vec::Vec::as_slice),
         Some(["https://ns.flur.ee/db#rdfs".to_string()].as_slice()),
         "reasoning modes should round-trip as full IRIs"
+    );
+}
+
+/// #1979: the JSON-LD recipe in `docs/ledger-config/writing-config.md`,
+/// verbatim apart from the ledger name. The nested `f:shaclDefaults` group
+/// inherits the node's `"@graph"` selector, so all four statements land in
+/// `#config` (two used to land in the default graph, leaving an empty SHACL
+/// group that read as disabled) and the configured SHACL enforces.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn config_write_json_ld_nested_groups_land_in_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-jsonld-nested:main";
+    let config_iri = config_graph_iri(ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": { "f": "https://ns.flur.ee/db#" },
+                "@graph": [
+                    {
+                        "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                        "@type": "f:LedgerConfig",
+                        "@graph": config_iri,
+                        "f:shaclDefaults": {
+                            "f:shaclEnabled": true,
+                            "f:validationMode": { "@id": "f:ValidationReject" }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("documented config write")
+        .ledger;
+
+    let view = fluree.db(ledger_id).await.unwrap();
+    let shacl = view
+        .ledger_config()
+        .and_then(|c| c.shacl.clone())
+        .expect("SHACL group read from #config");
+    assert_eq!(
+        shacl.enabled,
+        Some(true),
+        "f:shaclEnabled landed in #config"
+    );
+    assert_eq!(
+        shacl.validation_mode,
+        Some(fluree_db_core::ledger_config::ValidationMode::Reject),
+        "f:validationMode landed in #config"
+    );
+
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person"
+            }),
+        )
+        .await
+        .expect_err("the record the shape forbids must be refused");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "{err:?}"
     );
 }
 
