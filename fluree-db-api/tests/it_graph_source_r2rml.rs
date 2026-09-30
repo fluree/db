@@ -3013,7 +3013,8 @@ async fn run_val_agg(
         }],
         vec![],
         None,
-    );
+    )
+    .expect("valid grouping");
 
     let executable = ExecutableQuery::simple(parsed);
     let tracker = Tracker::disabled();
@@ -3187,7 +3188,8 @@ async fn fused_fallback_applies_offset_once() {
         }],
         vec![],
         None,
-    );
+    )
+    .expect("valid grouping");
     parsed.offset = Some(1);
 
     let executable = ExecutableQuery::simple(parsed);

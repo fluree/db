@@ -164,9 +164,13 @@ pub(crate) fn lower_query<E: IriEncoder>(
         _ => None,
     };
     let output = match select_mode {
+        // `Reject` by default: the JSON-LD user-query entry (`parse_query`)
+        // allows per-group lists; datalog rule bodies, which also lower here,
+        // do not.
         SelectMode::Many | SelectMode::One => QueryOutput::Select {
             projection,
             restriction,
+            ungrouped: crate::ir::UngroupedProjection::Reject,
         },
         SelectMode::Construct => {
             let template = match ast.construct_template {
@@ -2124,7 +2128,8 @@ fn lower_grouping(
         );
     }
 
-    Ok(Grouping::assemble(group_by, aggregates, post_binds, having))
+    Grouping::assemble(group_by, aggregates, post_binds, having)
+        .map_err(|e| ParseError::InvalidOption(format!("grouping: {e}")))
 }
 
 #[cfg(test)]

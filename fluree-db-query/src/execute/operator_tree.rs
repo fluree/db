@@ -46,7 +46,7 @@ use crate::having::HavingOperator;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{
     AggregateFn, AggregateSpec, Aggregation, Expression, Grouping, InputSemantics, PathModifier,
-    Pattern, Query, QueryOutput,
+    Pattern, Query, QueryOutput, UngroupedProjection,
 };
 use crate::limit::LimitOperator;
 use crate::offset::OffsetOperator;
@@ -3319,6 +3319,7 @@ fn build_operator_tree_inner(
         &query.order_binds,
         &query.ordering,
         projected.as_deref(),
+        query.output.ungrouped_projection(),
         query.output.is_distinct(),
         query.offset,
         query.limit,
@@ -3342,6 +3343,13 @@ fn build_operator_tree_inner(
 /// caller. `variable_deps` drives projection trimming; pass `None` to skip it.
 /// `partitioned` is the streaming-GroupAggregate partition hint (callers that
 /// don't benefit pass `false`).
+///
+/// `ungrouped` says whether the projection may read a variable the grouping
+/// does not produce (as a per-group list): only a JSON-LD top-level query may.
+/// Every other post-grouping read of such a variable — HAVING, the grouping's
+/// binds, ORDER BY, and the projection under
+/// [`UngroupedProjection::Reject`] — fails the plan here, in every build
+/// ([`Grouping::first_ungrouped_read`]). A sub-query passes `Reject`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_solution_modifiers(
     mut operator: BoxedOperator,
@@ -3349,6 +3357,7 @@ pub(crate) fn apply_solution_modifiers(
     order_binds: &[(VarId, Expression)],
     ordering: &[SortSpec],
     select_vars: Option<&[VarId]>,
+    ungrouped: UngroupedProjection,
     distinct: bool,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -3514,6 +3523,41 @@ pub(crate) fn apply_solution_modifiers(
     // Get the schema after WHERE (before grouping), including any unbound pads.
     let where_schema: Arc<[VarId]> = Arc::from(where_schema_vec.into_boxed_slice());
 
+    // After grouping, a variable the WHERE binds but the grouping neither keys,
+    // aggregates nor binds is a per-group list. Only a JSON-LD top-level
+    // projection may read one; any other read (HAVING, a SELECT expression, an
+    // ORDER BY key or expression, a projection under `Reject`) fails the plan,
+    // in every build — a sub-query can never return such a list.
+    if let Some(g) = grouping {
+        let where_vars: HashSet<VarId> = where_schema.iter().copied().collect();
+        if let Some(read) =
+            g.first_ungrouped_read(&where_vars, order_binds, ordering, select_vars, ungrouped)
+        {
+            return Err(QueryError::InvalidQuery(read.message()));
+        }
+    }
+    // With no per-group list allowed out, the grouping carries only what its own
+    // stages read: keys and aggregate inputs into the aggregation, keys and
+    // aggregate outputs out of it. Dependency trimming already does this when it
+    // applies; a sub-query (no dependency sets) used to carry every WHERE column
+    // through the traditional lane as a list.
+    let reject_trim = ungrouped == UngroupedProjection::Reject && variable_deps.is_none();
+    let groupby_trim: Option<Vec<VarId>> = reject_trim.then(|| {
+        let mut vars = group_by_vec.clone();
+        for spec in &aggregates_vec {
+            match &spec.function {
+                AggregateFn::CountDistinctAll(visible) => vars.extend(visible.iter().copied()),
+                other => vars.extend(other.input_var()),
+            }
+        }
+        vars
+    });
+    let aggregate_trim: Option<Vec<VarId>> = reject_trim.then(|| {
+        let mut vars = group_by_vec.clone();
+        vars.extend(aggregates_vec.iter().map(|spec| spec.output_var));
+        vars
+    });
+
     // GROUP BY + Aggregates
     // We use streaming GroupAggregateOperator when all aggregates are streamable
     // (COUNT, SUM, AVG, MIN, MAX). This is O(groups) memory instead of O(rows).
@@ -3578,20 +3622,22 @@ pub(crate) fn apply_solution_modifiers(
             .collect();
 
         // The streaming GroupAggregateOperator only outputs GROUP BY keys + aggregate outputs.
-        // If the SELECT projects any *grouped* variables (non-key, non-aggregate),
-        // we must use the traditional GroupByOperator path so those vars become
-        // `Binding::Grouped(Vec<Binding>)` and remain selectable. Post-aggregation
-        // bind outputs (e.g. `(count(a)+count(b)) AS total`) are NOT grouped
-        // passthroughs — they are computed by a downstream BindOperator — so they
-        // must not force the traditional path (which would drop the row when the
-        // bind's aggregate inputs aren't themselves projected).
-        let select_needs_grouped_vars = select_vars.is_some_and(|vars| {
-            vars.iter().any(|v| {
-                !group_by_vec.contains(v)
-                    && !aggregates_vec.iter().any(|a| a.output_var == *v)
-                    && !post_binds_vec.iter().any(|(out, _)| out == v)
-            })
-        });
+        // If a JSON-LD top-level SELECT projects a *grouped* variable (non-key,
+        // non-aggregate), the traditional GroupByOperator path must run so it
+        // becomes a `Binding::Grouped(Vec<Binding>)` list. Every other surface
+        // rejected that projection above. Post-aggregation bind outputs (e.g.
+        // `(count(a)+count(b)) AS total`) are NOT grouped passthroughs — they are
+        // computed by a downstream BindOperator — so they never force the
+        // traditional path.
+        let select_needs_grouped_vars = ungrouped == UngroupedProjection::PerGroupList
+            && select_vars.is_some_and(|vars| {
+                vars.iter().any(|v| {
+                    where_schema.contains(v)
+                        && !group_by_vec.contains(v)
+                        && !aggregates_vec.iter().any(|a| a.output_var == *v)
+                        && !post_binds_vec.iter().any(|(out, _)| out == v)
+                })
+            });
 
         let use_streaming = !aggregates_vec.is_empty()
             && GroupAggregateOperator::all_streamable(&streaming_specs)
@@ -3643,7 +3689,8 @@ pub(crate) fn apply_solution_modifiers(
                 GroupByOperator::new(operator, group_by_vec.clone()).with_out_schema(
                     variable_deps
                         .as_ref()
-                        .map(|d| d.required_groupby_vars.as_slice()),
+                        .map(|d| d.required_groupby_vars.as_slice())
+                        .or(groupby_trim.as_deref()),
                 ),
             );
             if !aggregates_vec.is_empty() {
@@ -3651,7 +3698,8 @@ pub(crate) fn apply_solution_modifiers(
                     AggregateOperator::new(operator, aggregates_vec.clone()).with_out_schema(
                         variable_deps
                             .as_ref()
-                            .map(|d| d.required_aggregate_vars.as_slice()),
+                            .map(|d| d.required_aggregate_vars.as_slice())
+                            .or(aggregate_trim.as_deref()),
                     ),
                 );
             }
@@ -3693,32 +3741,10 @@ pub(crate) fn apply_solution_modifiers(
     // For ungrouped queries this is simply a post-WHERE stage. This placement is
     // what makes expression ORDER BY work uniformly across no-grouping,
     // dedup-only GROUP BY (no aggregation stage), and aggregating queries.
+    // Under grouping, an order-key expression reads only keys, aggregate
+    // outputs and bind outputs: `first_ungrouped_read` rejected the plan above
+    // otherwise.
     if !order_binds.is_empty() {
-        // Under grouping, an order-key expression may only read GROUP BY keys,
-        // aggregate outputs, and post-aggregation bind outputs. Referencing any
-        // other variable means it is `Binding::Grouped` here — reject cleanly
-        // rather than evaluating the bind over a grouped binding (which panics
-        // in `eval`), matching how bare `ORDER BY ?groupedVar` is rejected.
-        if needs_grouping {
-            let mut allowed: HashSet<VarId> = group_by_vec.iter().copied().collect();
-            for spec in &aggregates_vec {
-                allowed.insert(spec.output_var);
-            }
-            for (var, _) in &post_binds_vec {
-                allowed.insert(*var);
-            }
-            for (out_var, expr) in order_binds {
-                for v in expr.referenced_vars() {
-                    if !allowed.contains(&v) {
-                        return Err(QueryError::InvalidQuery(format!(
-                            "ORDER BY expression references variable {v:?}, which is not a GROUP BY key or aggregate result"
-                        )));
-                    }
-                }
-                // A later order bind may legitimately reference an earlier one.
-                allowed.insert(*out_var);
-            }
-        }
         for (var, expr) in order_binds {
             operator = Box::new(
                 crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
@@ -3758,46 +3784,14 @@ pub(crate) fn apply_solution_modifiers(
         }
     }
 
-    // Validate ORDER BY vars exist in the post-group schema and are allowed under grouping.
-    if !ordering.is_empty() {
-        // Disallow sorting on Grouped variables (non-key, non-aggregated) because comparison is undefined.
-        let mut allowed_sort_vars: Option<HashSet<VarId>> = None;
-        if needs_grouping {
-            let mut allowed = HashSet::new();
-            for v in &group_by_vec {
-                allowed.insert(*v);
-            }
-            for spec in &aggregates_vec {
-                allowed.insert(spec.output_var);
-            }
-            // Post-aggregation binds (SELECT expressions like `(CEIL(?avg) AS
-            // ?c)`) are per-group scalars computed after aggregation — they are
-            // valid sort keys.
-            for (var, _) in &post_binds_vec {
-                allowed.insert(*var);
-            }
-            // Desugared expression-ORDER-BY keys run as a post-grouping stage
-            // and are validated above to read only allowed vars.
-            for (var, _) in order_binds {
-                allowed.insert(*var);
-            }
-            allowed_sort_vars = Some(allowed);
-        }
-        for spec in ordering {
-            if !post_group_schema.contains(&spec.var) {
-                return Err(QueryError::VariableNotFound(format!(
-                    "Sort variable {:?} not found in query schema",
-                    spec.var
-                )));
-            }
-            if let Some(ref allowed) = allowed_sort_vars {
-                if !allowed.contains(&spec.var) {
-                    return Err(QueryError::InvalidQuery(format!(
-                        "Cannot ORDER BY variable {:?} because it is grouped (non-key, non-aggregate)",
-                        spec.var
-                    )));
-                }
-            }
+    // Validate ORDER BY vars exist in the post-group schema. (A sort key
+    // reading a per-group list was rejected by `first_ungrouped_read` above.)
+    for spec in ordering {
+        if !post_group_schema.contains(&spec.var) {
+            return Err(QueryError::VariableNotFound(format!(
+                "Sort variable {:?} not found in query schema",
+                spec.var
+            )));
         }
     }
 
@@ -3990,13 +3984,15 @@ mod tests {
                             .collect(),
                         vec![],
                         None,
-                    );
+                    )
+                    .expect("valid grouping");
                     let mut op = apply_solution_modifiers(
                         input,
                         grouping.as_ref(),
                         &[],
                         &[],
                         Some(&outputs),
+                        UngroupedProjection::Reject,
                         false,
                         None,
                         None,
@@ -4053,13 +4049,16 @@ mod tests {
             }],
             vec![],
             None,
-        );
+        )
+        .expect("valid grouping");
+        // The per-group list of `value` is a JSON-LD top-level projection.
         let mut op = apply_solution_modifiers(
             input,
             grouping.as_ref(),
             &[],
             &[],
             Some(&[value, count]),
+            UngroupedProjection::PerGroupList,
             false,
             None,
             None,
@@ -4084,6 +4083,115 @@ mod tests {
         );
         assert_eq!(batch.get_by_col(0, 1), &two);
         op.close();
+    }
+
+    /// The plan-time check holds without dependency sets (the sub-query
+    /// pipeline passes none): HAVING, a grouping bind, ORDER BY and a `Reject`
+    /// projection may not read a WHERE variable the grouping does not produce.
+    /// A `PerGroupList` projection (JSON-LD top level) may.
+    #[test]
+    fn solution_modifiers_reject_ungrouped_reads_without_dependency_sets() {
+        use crate::binding::{Batch, Binding};
+        use crate::seed::BatchSeedOperator;
+        use fluree_db_core::FlakeValue;
+
+        let (key, other, n, bound) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let lit = |i| Binding::lit(FlakeValue::Long(i), Sid::xsd_integer());
+        let input = || -> BoxedOperator {
+            let batch = Batch::new(
+                Arc::from(vec![key, other].into_boxed_slice()),
+                vec![vec![lit(1), lit(1)], vec![lit(2), lit(3)]],
+            )
+            .unwrap();
+            Box::new(BatchSeedOperator::from_batch(batch))
+        };
+        let count = || AggregateSpec {
+            function: AggregateFn::Count(other),
+            output_var: n,
+        };
+        let plan = |grouping: &Grouping,
+                    ordering: &[SortSpec],
+                    select: &[VarId],
+                    ungrouped: UngroupedProjection| {
+            apply_solution_modifiers(
+                input(),
+                Some(grouping),
+                &[],
+                ordering,
+                Some(select),
+                ungrouped,
+                false,
+                None,
+                None,
+                false,
+                None,
+                &PlanningContext::current(),
+            )
+            .err()
+            .map(|e| e.to_string())
+        };
+        let group = |having: Option<Expression>, binds: Vec<(VarId, Expression)>| {
+            Grouping::assemble(vec![key], vec![count()], binds, having)
+                .expect("valid grouping")
+                .expect("a grouping")
+        };
+
+        let having = group(Some(Expression::Var(other)), vec![]);
+        let err = plan(&having, &[], &[key, n], UngroupedProjection::Reject);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("HAVING reads variable VarId(1)")),
+            "{err:?}"
+        );
+        let bind = group(None, vec![(bound, Expression::Var(other))]);
+        let err = plan(&bind, &[], &[key, bound], UngroupedProjection::Reject);
+        assert!(
+            err.as_deref().is_some_and(
+                |e| e.contains("the SELECT expression for VarId(3) reads variable VarId(1)")
+            ),
+            "{err:?}"
+        );
+        let plain = group(None, vec![]);
+        let err = plan(
+            &plain,
+            &[SortSpec::asc(other)],
+            &[key, n],
+            UngroupedProjection::Reject,
+        );
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("ORDER BY variable VarId(1)")),
+            "{err:?}"
+        );
+        let err = plan(&plain, &[], &[key, other], UngroupedProjection::Reject);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("projected variable VarId(1)")),
+            "{err:?}"
+        );
+        assert_eq!(
+            plan(
+                &plain,
+                &[],
+                &[key, other],
+                UngroupedProjection::PerGroupList
+            ),
+            None
+        );
+        // Keys, aggregate outputs and bind outputs are what grouping produces.
+        let fine = group(
+            Some(Expression::Var(n)),
+            vec![(bound, Expression::Var(key))],
+        );
+        assert_eq!(
+            plan(
+                &fine,
+                &[SortSpec::asc(bound)],
+                &[key, n, bound],
+                UngroupedProjection::Reject
+            ),
+            None
+        );
     }
 
     /// PR-5: the scan-side top-k directive offered to the child must carry
@@ -4140,6 +4248,7 @@ mod tests {
             &[],
             &[SortSpec::desc(VarId(1))],
             None,
+            UngroupedProjection::Reject,
             false,
             Some(5),
             Some(10),
@@ -4205,6 +4314,7 @@ mod tests {
             &[],
             &[SortSpec::asc(VarId(1))],
             None,
+            UngroupedProjection::Reject,
             false,
             None,
             Some(10),
@@ -4458,7 +4568,8 @@ mod tests {
                 }],
                 vec![],
                 None,
-            ),
+            )
+            .expect("valid grouping"),
             ordering,
             order_binds,
             limit: None,

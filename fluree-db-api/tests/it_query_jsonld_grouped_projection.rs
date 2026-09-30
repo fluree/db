@@ -108,3 +108,39 @@ async fn jsonld_having_without_grouping_filters() {
     .await;
     assert_eq!(found, json!([]));
 }
+
+/// A subquery cannot return a per-group list: its projection is plain
+/// variables, so projecting a variable its grouping does not produce is a plan
+/// error. The list used to cross into the enclosing query — rendered as lists
+/// when projected there, and silently matching nothing when joined on.
+#[tokio::test]
+async fn jsonld_subquery_cannot_return_a_per_group_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/subquery-list:main").await;
+    let ctx = json!({"ex": "http://example.org/"});
+    let subquery = json!(["query", {
+        "@context": ctx,
+        "select": ["?a", "?e"],
+        "where": {"@id": "?e", "ex:area": "?a"},
+        "groupBy": ["?a"]
+    }]);
+    for query in [
+        // The enclosing query projects the list.
+        json!({"@context": ctx, "select": ["?a", "?e"], "where": [subquery]}),
+        // The enclosing query joins on it.
+        json!({
+            "@context": ctx,
+            "select": ["?a"],
+            "where": [subquery, {"@id": "?e", "ex:area": "?other"}]
+        }),
+    ] {
+        let err = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect_err("a subquery projecting a non-key variable of its grouping");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is neither a GROUP BY key nor an aggregate result"),
+            "{query}: {msg}"
+        );
+    }
+}

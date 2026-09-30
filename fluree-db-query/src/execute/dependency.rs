@@ -354,6 +354,7 @@ mod tests {
             output: QueryOutput::Select {
                 projection: crate::ir::Projection::Tuple(columns),
                 restriction: None,
+                ungrouped: crate::ir::UngroupedProjection::Reject,
             },
             patterns: vec![],
             reasoning: ReasoningConfig::default(),

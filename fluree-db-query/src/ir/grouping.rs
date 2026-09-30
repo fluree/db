@@ -268,40 +268,142 @@ pub enum Grouping {
     },
 }
 
+/// A grouping phase that cannot be built: the pieces ask for a post-grouping
+/// stage (HAVING, per-group binds) but there is nothing to group by and nothing
+/// to aggregate.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GroupingError {
+    /// A HAVING with neither a group key nor an aggregate. A lowerer turns it
+    /// into a Filter first (SPARQL 1.1 §18.2.4.2); reaching `assemble` means
+    /// a caller did not.
+    #[error("HAVING without GROUP BY or an aggregate must be lowered as a filter")]
+    HavingWithoutGrouping,
+    /// Per-group binds with neither a group key nor an aggregate: they belong
+    /// in the WHERE as ordinary binds.
+    #[error("per-group SELECT expressions without GROUP BY or an aggregate")]
+    BindsWithoutGrouping,
+}
+
 impl Grouping {
     /// Assemble a grouping phase from the loose pieces produced by lowering.
     ///
-    /// Returns `None` when there is no grouping phase to build (no `GROUP BY`,
-    /// no aggregates). Otherwise selects the variant that satisfies the
-    /// type-level invariants:
+    /// Returns `Ok(None)` when there is no grouping phase to build (no `GROUP
+    /// BY`, no aggregates, no HAVING, no binds). Otherwise selects the variant
+    /// that satisfies the type-level invariants:
     ///   - `Explicit` when `group_by` is non-empty (regardless of whether an
     ///     aggregation stage is present — `GROUP BY` alone deduplicates by key).
     ///   - `Implicit` when there's no `GROUP BY` but at least one aggregate.
     ///
-    /// Any leftover `having` or `binds` when no grouping exists is dropped on
-    /// the floor — the parser/validator owns rejecting that surface form.
+    /// A `having` or `binds` with neither a key nor an aggregate is an error,
+    /// not dropped: the SPARQL and JSON-LD lowerers turn such a HAVING into a
+    /// filter before calling this, so the error is for any other caller.
     pub fn assemble(
         group_by: Vec<VarId>,
         aggregates: Vec<AggregateSpec>,
         binds: Vec<(VarId, Expression)>,
         having: Option<Expression>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, GroupingError> {
         let aggregation =
             NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation { aggregates });
         if let Some(group_by) = NonEmpty::try_from_vec(group_by) {
-            Some(Self::Explicit {
+            return Ok(Some(Self::Explicit {
                 group_by,
                 aggregation,
                 having,
                 binds,
-            })
-        } else {
-            aggregation.map(|aggregation| Self::Implicit {
+            }));
+        }
+        match aggregation {
+            Some(aggregation) => Ok(Some(Self::Implicit {
                 aggregation,
                 having,
                 binds,
-            })
+            })),
+            None if having.is_some() => Err(GroupingError::HavingWithoutGrouping),
+            None if !binds.is_empty() => Err(GroupingError::BindsWithoutGrouping),
+            None => Ok(None),
         }
+    }
+
+    /// The first post-grouping read of a variable that the pre-group pipeline
+    /// binds (`where_vars`) but this grouping neither keys, aggregates nor
+    /// binds. Such a read would observe a per-group list, which only a JSON-LD
+    /// top-level projection may do (`policy`); everything else must be
+    /// rejected before the plan runs.
+    ///
+    /// Stage order is the executor's: HAVING, the grouping's binds (each may
+    /// read the ones before it), the ORDER BY binds, ORDER BY, then the
+    /// projection (checked only under [`UngroupedProjection::Reject`]). A
+    /// variable nothing binds before grouping is not an ungrouped read: it is
+    /// unbound there (a HAVING reading a SELECT alias, §18.2.4.2).
+    /// [`Expression::referenced_vars`] includes `EXISTS` correlation variables,
+    /// so an `EXISTS` inside a grouped expression is covered too.
+    ///
+    /// The lowerers never produce such a read (they rewrite non-key HAVING /
+    /// ORDER BY reads to `SAMPLE`, [`sample_ungrouped_reads`]); this is the
+    /// fail-closed check for everything else.
+    pub fn first_ungrouped_read(
+        &self,
+        where_vars: &HashSet<VarId>,
+        order_binds: &[(VarId, Expression)],
+        ordering: &[crate::sort::SortSpec],
+        projection: Option<&[VarId]>,
+        policy: super::query::UngroupedProjection,
+    ) -> Option<UngroupedRead> {
+        /// The first of `vars` the WHERE binds that is not produced by grouping.
+        fn find(
+            where_vars: &HashSet<VarId>,
+            grouped: &HashSet<VarId>,
+            mut vars: impl Iterator<Item = VarId>,
+        ) -> Option<VarId> {
+            vars.find(|v| where_vars.contains(v) && !grouped.contains(v))
+        }
+        let mut grouped: HashSet<VarId> = self.group_by_vars().collect();
+        grouped.extend(self.aggregates().map(|spec| spec.output_var));
+
+        if let Some(having) = self.having() {
+            if let Some(var) = find(where_vars, &grouped, having.referenced_vars().into_iter()) {
+                return Some(UngroupedRead {
+                    var,
+                    stage: ReadStage::Having,
+                });
+            }
+        }
+        for (out, expr) in self.binds() {
+            if let Some(var) = find(where_vars, &grouped, expr.referenced_vars().into_iter()) {
+                return Some(UngroupedRead {
+                    var,
+                    stage: ReadStage::Bind(*out),
+                });
+            }
+            grouped.insert(*out);
+        }
+        for (out, expr) in order_binds {
+            if let Some(var) = find(where_vars, &grouped, expr.referenced_vars().into_iter()) {
+                return Some(UngroupedRead {
+                    var,
+                    stage: ReadStage::OrderBind(*out),
+                });
+            }
+            grouped.insert(*out);
+        }
+        if let Some(var) = find(where_vars, &grouped, ordering.iter().map(|s| s.var)) {
+            return Some(UngroupedRead {
+                var,
+                stage: ReadStage::OrderBy,
+            });
+        }
+        if policy == super::query::UngroupedProjection::Reject {
+            if let Some(var) =
+                projection.and_then(|p| find(where_vars, &grouped, p.iter().copied()))
+            {
+                return Some(UngroupedRead {
+                    var,
+                    stage: ReadStage::Projection,
+                });
+            }
+        }
+        None
     }
 
     /// Borrow the `having` filter, if any, from either variant.
@@ -392,6 +494,55 @@ impl Grouping {
         }
         if let Some(expr) = having {
             expr.substitute_var(old, new);
+        }
+    }
+}
+
+/// A post-grouping read of a variable the grouping does not produce (see
+/// [`Grouping::first_ungrouped_read`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UngroupedRead {
+    /// The variable read.
+    pub var: VarId,
+    /// Where it is read.
+    pub stage: ReadStage,
+}
+
+/// The post-grouping stage of an [`UngroupedRead`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadStage {
+    /// The HAVING expression.
+    Having,
+    /// The grouping's bind (a SELECT expression) that outputs this variable.
+    Bind(VarId),
+    /// The ORDER BY bind that outputs this variable.
+    OrderBind(VarId),
+    /// An ORDER BY key.
+    OrderBy,
+    /// The projection.
+    Projection,
+}
+
+impl UngroupedRead {
+    /// The user-facing message: which stage reads which variable, and what to
+    /// do instead. Plan-time code has no variable names, so variables print as
+    /// their ids.
+    pub fn message(&self) -> String {
+        let var = self.var;
+        let neither = "neither a GROUP BY key nor an aggregate result";
+        match self.stage {
+            ReadStage::Having => format!("HAVING reads variable {var:?}, which is {neither}"),
+            ReadStage::Bind(out) => format!(
+                "the SELECT expression for {out:?} reads variable {var:?}, which is {neither}"
+            ),
+            ReadStage::OrderBind(_) => {
+                format!("an ORDER BY expression reads variable {var:?}, which is {neither}")
+            }
+            ReadStage::OrderBy => format!("ORDER BY variable {var:?} is {neither}"),
+            ReadStage::Projection => format!(
+                "projected variable {var:?} is {neither}; aggregate it (e.g. with SAMPLE, \
+                 collect or group-concat)"
+            ),
         }
     }
 }
@@ -745,6 +896,157 @@ mod tests {
         assert!(
             !refs.contains(&alias),
             "the alias is read as a fresh, unbound var"
+        );
+    }
+
+    #[test]
+    fn assemble_fails_closed_without_keys_or_aggregates() {
+        let (a, x) = (VarId(0), VarId(1));
+        assert!(matches!(
+            Grouping::assemble(vec![], vec![], vec![], Some(Expression::Var(a))),
+            Err(GroupingError::HavingWithoutGrouping)
+        ));
+        assert!(matches!(
+            Grouping::assemble(vec![], vec![], vec![(x, Expression::Var(a))], None),
+            Err(GroupingError::BindsWithoutGrouping)
+        ));
+        assert!(matches!(
+            Grouping::assemble(vec![], vec![], vec![], None),
+            Ok(None)
+        ));
+        // A dedup-only GROUP BY keeps its binds.
+        let g = Grouping::assemble(vec![a], vec![], vec![(x, Expression::Var(a))], None)
+            .expect("valid")
+            .expect("explicit");
+        assert_eq!(g.bind_list().len(), 1);
+        assert!(g.aggregation().is_none());
+    }
+
+    #[test]
+    fn first_ungrouped_read_by_stage_and_variable_kind() {
+        use crate::ir::UngroupedProjection::{PerGroupList, Reject};
+        use crate::sort::SortSpec;
+        // ?k key, ?n aggregate output, ?b an earlier bind, ?w a non-key WHERE
+        // variable, ?u a variable nothing binds before grouping.
+        let (k, n, b, w, u, out) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4), VarId(5));
+        let where_vars: HashSet<VarId> = [k, w].into_iter().collect();
+        let count = AggregateSpec {
+            function: AggregateFn::Count(w),
+            output_var: n,
+        };
+        let grouping = |having: Option<Expression>, binds: Vec<(VarId, Expression)>| {
+            Grouping::assemble(vec![k], vec![count.clone()], binds, having)
+                .expect("valid")
+                .expect("grouping")
+        };
+        for (read, ungrouped) in [(k, false), (n, false), (b, false), (w, true), (u, false)] {
+            let expect = |stage| ungrouped.then_some(UngroupedRead { var: read, stage });
+            let earlier = (b, Expression::Var(k));
+
+            let g = grouping(Some(Expression::Var(read)), vec![]);
+            // HAVING runs before the binds, so it reads ?b as unbound: not a
+            // grouped read.
+            assert_eq!(
+                g.first_ungrouped_read(&where_vars, &[], &[], None, Reject),
+                expect(ReadStage::Having),
+                "HAVING {read:?}"
+            );
+            let g = grouping(None, vec![earlier.clone(), (out, Expression::Var(read))]);
+            assert_eq!(
+                g.first_ungrouped_read(&where_vars, &[], &[], None, Reject),
+                expect(ReadStage::Bind(out)),
+                "bind {read:?}"
+            );
+            let g = grouping(None, vec![earlier.clone()]);
+            assert_eq!(
+                g.first_ungrouped_read(
+                    &where_vars,
+                    &[(out, Expression::Var(read))],
+                    &[],
+                    None,
+                    Reject
+                ),
+                expect(ReadStage::OrderBind(out)),
+                "order bind {read:?}"
+            );
+            assert_eq!(
+                g.first_ungrouped_read(&where_vars, &[], &[SortSpec::asc(read)], None, Reject),
+                expect(ReadStage::OrderBy),
+                "ORDER BY {read:?}"
+            );
+            assert_eq!(
+                g.first_ungrouped_read(&where_vars, &[], &[], Some(&[read]), Reject),
+                expect(ReadStage::Projection),
+                "projection {read:?}"
+            );
+            // A JSON-LD top-level projection may carry the per-group list...
+            assert_eq!(
+                g.first_ungrouped_read(&where_vars, &[], &[], Some(&[read]), PerGroupList),
+                None,
+                "per-group-list projection {read:?}"
+            );
+            // ...but no other stage may read it under that policy either.
+            assert_eq!(
+                g.first_ungrouped_read(
+                    &where_vars,
+                    &[],
+                    &[SortSpec::asc(read)],
+                    Some(&[read]),
+                    PerGroupList
+                ),
+                expect(ReadStage::OrderBy),
+                "ORDER BY under per-group-list {read:?}"
+            );
+        }
+    }
+
+    /// The lowerers' SAMPLE rewrite and the plan-time predicate compose: after
+    /// the rewrite, a HAVING read of a non-key variable is a read of an
+    /// aggregate output; without it, the predicate rejects the plan (s04b:
+    /// `?a (GROUP_CONCAT(?e) AS ?g) … GROUP BY ?a HAVING (?e = ex:e1)`).
+    #[test]
+    fn sample_rewrite_then_predicate() {
+        use crate::ir::UngroupedProjection::Reject;
+        let (a, e, g, iri) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let where_vars: HashSet<VarId> = [a, e].into_iter().collect();
+        let concat = AggregateSpec {
+            function: AggregateFn::GroupConcat {
+                input: e,
+                semantics: InputSemantics::List,
+                separator: " ".into(),
+            },
+            output_var: g,
+        };
+        let having = || Expression::eq(Expression::Var(e), Expression::Var(iri));
+
+        let skipped = Grouping::assemble(vec![a], vec![concat.clone()], vec![], Some(having()))
+            .expect("valid")
+            .expect("grouping");
+        assert_eq!(
+            skipped.first_ungrouped_read(&where_vars, &[], &[], Some(&[a, g]), Reject),
+            Some(UngroupedRead {
+                var: e,
+                stage: ReadStage::Having
+            })
+        );
+
+        let mut aggregates = vec![concat];
+        let mut rewritten = having();
+        sample_ungrouped_reads(
+            &[a],
+            &mut aggregates,
+            Some(&mut rewritten),
+            &mut [],
+            &mut [],
+            &where_vars,
+            &mut |_| VarId(9),
+        );
+        let sampled = Grouping::assemble(vec![a], aggregates, vec![], Some(rewritten))
+            .expect("valid")
+            .expect("grouping");
+        assert_eq!(
+            sampled.first_ungrouped_read(&where_vars, &[], &[], Some(&[a, g]), Reject),
+            None
         );
     }
 

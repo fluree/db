@@ -22,7 +22,7 @@ use fluree_db_query::var_registry::VarId;
 
 use std::collections::{HashMap, HashSet};
 
-use super::{LoweringContext, Result};
+use super::{LowerError, LoweringContext, Result};
 
 /// The SELECT expressions of one query level, placed.
 pub(super) struct SelectExtends {
@@ -239,7 +239,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             lowered.aggregates,
             extends.extends,
             lowered.having,
-        );
+        )
+        .map_err(|e| LowerError::InvalidGrouping {
+            message: e.to_string(),
+            span: select.span,
+        })?;
         Ok(LoweredSelectLevel {
             base: lowered.base,
             distinct: lowered.distinct,

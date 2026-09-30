@@ -976,6 +976,7 @@ mod tests {
         r.output = fluree_db_query::ir::QueryOutput::Select {
             projection: Projection::Scalar(Column::Var(x)),
             restriction: None,
+            ungrouped: fluree_db_query::ir::UngroupedProjection::PerGroupList,
         };
         assert!(r.output.should_flatten_scalar());
         assert_parity(&r, &c);
