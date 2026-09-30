@@ -153,7 +153,7 @@ fn annotations(n: usize) -> Value {
 
 fn parse_once(doc: &Value, txn_type: TxnType) -> usize {
     let mut ns = NamespaceRegistry::new();
-    let txn = parse_transaction(doc, txn_type, TxnOpts::default(), &mut ns)
+    let txn = parse_transaction(doc, txn_type, TxnOpts::default(), &mut ns, "bench:main")
         .expect("bench document parses");
     txn.insert_templates.len()
 }

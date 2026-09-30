@@ -616,6 +616,132 @@ pub(crate) fn names_ledger(ledger_id: &fluree_db_core::LedgerId, iri: &str) -> b
             .is_ok_and(|r| r.at.is_none() && r.fragment.is_none() && r.id == *ledger_id)
 }
 
+/// A write-side graph name after resolution: the default graph, a named
+/// graph by absolute IRI (the ledger's config graph included), or a WHERE
+/// variable (`GRAPH ?g`, update templates only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphName {
+    /// The default graph.
+    Default,
+    /// A named graph.
+    Iri(fluree_db_core::dataset_ref::GraphIri),
+    /// The graph a WHERE variable binds.
+    Var(VarId),
+}
+
+/// The graph every template of one lexical scope is written to.
+///
+/// A JSON-LD node's statements, and those of every node nested in it, are
+/// written to the node's scope: its own graph selector if it has one, else
+/// its parent's. The parser passes the scope down the recursion by
+/// reference, so a nested node cannot be emitted without one.
+///
+/// Built only by [`WriteGraphs::scope`] or [`GraphScope::default_graph`], so
+/// a named graph a scope can carry is always registered in
+/// [`Txn::write_graphs`].
+///
+/// The scope an update's `graph` key opens (SPARQL `WITH`) is the update's
+/// template default graph ([`Txn::template_default_graph`]): its templates,
+/// and those of nested nodes that inherit it, are marked
+/// [`TripleTemplate::graph_from_template_default`]. A scope a template opens
+/// itself (a node's `@graph`, a `["graph", …]` item) is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphScope {
+    graph: TemplateGraph,
+    template_default: bool,
+}
+
+impl GraphScope {
+    /// The default graph.
+    pub fn default_graph() -> Self {
+        GraphScope {
+            graph: TemplateGraph::Default,
+            template_default: false,
+        }
+    }
+
+    /// This scope as the update's template default graph. Only a named graph
+    /// is one: the default graph needs no mapping.
+    pub fn as_template_default(self) -> Self {
+        let template_default = matches!(self.graph, TemplateGraph::Iri(_));
+        GraphScope {
+            template_default,
+            ..self
+        }
+    }
+
+    /// The graph this scope writes to.
+    pub fn graph(&self) -> &TemplateGraph {
+        &self.graph
+    }
+
+    /// Emit one template in this scope.
+    pub fn emit(
+        &self,
+        out: &mut Vec<TripleTemplate>,
+        subject: TemplateTerm,
+        predicate: TemplateTerm,
+        object: TemplateTerm,
+        dtc: Option<DatatypeConstraint>,
+        list_index: Option<i32>,
+    ) {
+        out.push(TripleTemplate {
+            subject,
+            predicate,
+            object,
+            dtc,
+            list_index,
+            graph: self.graph.clone(),
+            graph_from_template_default: self.template_default,
+        });
+    }
+}
+
+/// The named graphs one transaction writes to, interned so every template of
+/// a graph shares its IRI. The only way to obtain a named [`GraphScope`].
+#[derive(Debug, Default)]
+pub struct WriteGraphs {
+    interned: std::collections::HashMap<String, Arc<str>>,
+}
+
+impl WriteGraphs {
+    /// No graphs yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The scope for `name`, registering a named graph as a write target.
+    pub fn scope(&mut self, name: GraphName) -> GraphScope {
+        match name {
+            GraphName::Default => GraphScope::default_graph(),
+            GraphName::Var(var) => GraphScope {
+                graph: TemplateGraph::Var(var),
+                template_default: false,
+            },
+            GraphName::Iri(iri) => {
+                let iri = iri.into_string();
+                let interned = match self.interned.get(&iri) {
+                    Some(interned) => Arc::clone(interned),
+                    None => {
+                        let interned: Arc<str> = Arc::from(iri.as_str());
+                        self.interned.insert(iri, Arc::clone(&interned));
+                        interned
+                    }
+                };
+                GraphScope {
+                    graph: TemplateGraph::Iri(interned),
+                    template_default: false,
+                }
+            }
+        }
+    }
+
+    /// The registered named-graph IRIs, for [`Txn::write_graphs`].
+    pub fn into_iris(self) -> BTreeSet<String> {
+        self.interned.into_keys().collect()
+    }
+}
+
 /// A term in a triple template
 #[derive(Debug, Clone)]
 pub enum TemplateTerm {

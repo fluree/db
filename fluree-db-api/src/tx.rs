@@ -2272,6 +2272,7 @@ fn parse_graph_payload<'a>(
     mode: GraphOpMode,
     txn_opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
+    ledger_id: &str,
 ) -> Result<(Txn, std::borrow::Cow<'a, JsonValue>)> {
     let bad_request = |message: String| ApiError::Http {
         status: 400,
@@ -2332,12 +2333,21 @@ fn parse_graph_payload<'a>(
         }
     };
     let mut txn = match mode {
-        GraphOpMode::Sync { .. } => {
-            fluree_db_transact::parse_sync_transaction(&txn_json, graph, txn_opts, ns_registry)?
-        }
+        GraphOpMode::Sync { .. } => fluree_db_transact::parse_sync_transaction(
+            &txn_json,
+            graph,
+            txn_opts,
+            ns_registry,
+            ledger_id,
+        )?,
         GraphOpMode::Insert => {
-            let txn =
-                fluree_db_transact::parse_graph_insert(&txn_json, graph, txn_opts, ns_registry)?;
+            let txn = fluree_db_transact::parse_graph_insert(
+                &txn_json,
+                graph,
+                txn_opts,
+                ns_registry,
+                ledger_id,
+            )?;
             if txn.insert_templates.is_empty() {
                 return Err(bad_request(
                     "the payload has no triples; there is nothing to add".to_string(),
@@ -2853,7 +2863,13 @@ impl crate::Fluree {
         } else {
             let parse_span = tracing::debug_span!("txn_parse", txn_type = ?txn_type);
             let _guard = parse_span.enter();
-            parse_transaction(txn_json, txn_type, txn_opts, &mut ns_registry)?
+            parse_transaction(
+                txn_json,
+                txn_type,
+                txn_opts,
+                &mut ns_registry,
+                &ledger.snapshot.ledger_id,
+            )?
         };
 
         // If TriG metadata was extracted, resolve it and merge into txn_meta
@@ -2980,7 +2996,14 @@ impl crate::Fluree {
         let (txn, txn_json) = {
             let parse_span = tracing::debug_span!("txn_parse", txn_type = "graph");
             let _guard = parse_span.enter();
-            parse_graph_payload(graph, payload, mode, txn_opts, &mut ns_registry)?
+            parse_graph_payload(
+                graph,
+                payload,
+                mode,
+                txn_opts,
+                &mut ns_registry,
+                &ledger.snapshot.ledger_id,
+            )?
         };
         self.stage_built_txn_tracked(
             ledger,
@@ -3318,6 +3341,7 @@ impl crate::Fluree {
                 input.txn_type,
                 input.txn_opts,
                 &mut ns_registry,
+                &ledger.snapshot.ledger_id,
             )
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?
         };

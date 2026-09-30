@@ -66,8 +66,8 @@ pub use error::{Result, TransactError};
 pub use flake_sink::FlakeSink;
 pub use generate::{apply_cancellation, FlakeGenerator};
 pub use ir::{
-    GraphMgmtOp, GraphSel, GraphTarget, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate,
-    Txn, TxnOpts, TxnType,
+    GraphMgmtOp, GraphName, GraphScope, GraphSel, GraphTarget, InlineValues, TemplateGraph,
+    TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType, WriteGraphs,
 };
 pub use lower_sparql_update::{
     lower_sparql_update, lower_sparql_update_ast, lower_sparql_update_request, LowerError,

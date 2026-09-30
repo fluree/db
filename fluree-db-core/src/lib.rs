@@ -35,6 +35,7 @@ pub mod comparator;
 pub mod conflict_key;
 pub mod content_id;
 pub mod content_kind;
+pub mod dataset_ref;
 pub mod datatype_constraint;
 pub mod datatypes;
 pub mod db;
