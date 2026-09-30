@@ -727,3 +727,130 @@ async fn graph_builder_stage_keeps_upsert_graph_blocks() {
     )
     .await;
 }
+
+// =============================================================================
+// A directive applies only to what follows it
+// =============================================================================
+
+/// Every triple as `[graph, s, p, o]` with full IRIs; `graph` is empty for
+/// the default graph.
+async fn quads(fluree: &MemoryFluree, db: &GraphDb) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = select(fluree, db, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .into_iter()
+        .map(|r| [vec![String::new()], r].concat())
+        .collect();
+    rows.extend(
+        select(
+            fluree,
+            db,
+            "SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }",
+        )
+        .await,
+    );
+    rows.sort();
+    rows
+}
+
+/// TriG phase 1 rebuilt a document's default graph with every directive
+/// first and expanded every graph block with the document's final prefix
+/// map, so a later `@prefix`/`@base` silently rewrote the IRIs before it.
+/// Upsert takes phase 1 whenever the text holds `{` or the bytes "graph",
+/// even inside a literal; insert takes it for TriG. The last case is a
+/// control with no redefinition.
+#[tokio::test]
+async fn a_redefined_prefix_or_base_applies_only_after_it() {
+    let fluree = memory();
+    let (g1, g2) = (G1, G2);
+    let q = |g: &str, s: &str, p: &str, o: &str| row(&[g, s, p, o]);
+    let cases = [
+        (
+            "a prefix redefined after a default triple that mentions \"graph\"",
+            "@prefix ex: <http://a.org/> .\n\
+             ex:x ex:p \"mentions the graph word\" .\n\
+             @prefix ex: <http://b.org/> .\n\
+             ex:y ex:p \"second\" .\n"
+                .to_string(),
+            vec![
+                q(
+                    "",
+                    "http://a.org/x",
+                    "http://a.org/p",
+                    "mentions the graph word",
+                ),
+                q("", "http://b.org/y", "http://b.org/p", "second"),
+            ],
+        ),
+        (
+            "graph blocks before and after a prefix redefinition",
+            format!(
+                "@prefix ex: <http://a.org/> .\n\
+                 GRAPH <{g1}> {{ ex:x ex:p \"1\" . }}\n\
+                 @prefix ex: <http://b.org/> .\n\
+                 GRAPH <{g2}> {{ ex:y ex:p \"2\" . }}\n"
+            ),
+            vec![
+                q(g1, "http://a.org/x", "http://a.org/p", "1"),
+                q(g2, "http://b.org/y", "http://b.org/p", "2"),
+            ],
+        ),
+        (
+            "a base redefined after a default triple",
+            format!(
+                "@base <http://a.org/> .\n\
+                 <x> <p> \"mentions the graph word\" .\n\
+                 GRAPH <{g1}> {{ <y> <p> \"1\" . }}\n\
+                 @base <http://b.org/> .\n\
+                 <z> <p> \"2\" .\n"
+            ),
+            vec![
+                q(
+                    "",
+                    "http://a.org/x",
+                    "http://a.org/p",
+                    "mentions the graph word",
+                ),
+                q("", "http://b.org/z", "http://b.org/p", "2"),
+                q(g1, "http://a.org/y", "http://a.org/p", "1"),
+            ],
+        ),
+        (
+            "control: no redefinition",
+            format!(
+                "@prefix ex: <http://a.org/> .\n\
+                 ex:x ex:p \"graph\" .\n\
+                 GRAPH <{g1}> {{ ex:y ex:p \"1\" . }}\n"
+            ),
+            vec![
+                q("", "http://a.org/x", "http://a.org/p", "graph"),
+                q(g1, "http://a.org/y", "http://a.org/p", "1"),
+            ],
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (i, (case, doc, expected)) in cases.iter().enumerate() {
+        for lane in ["upsert", "insert"] {
+            let ledger = genesis_ledger(&fluree, &format!("it/trig-directives-{i}-{lane}:main"));
+            let result = if lane == "upsert" {
+                fluree
+                    .stage_owned(ledger)
+                    .upsert_turtle(doc)
+                    .execute()
+                    .await
+            } else {
+                fluree.insert_turtle(ledger, doc).await
+            };
+            match result {
+                Ok(r) => {
+                    let got = quads(&fluree, &GraphDb::from_ledger_state(&r.ledger)).await;
+                    if got != *expected {
+                        failures.push(format!("{case} ({lane}): {got:?}"));
+                    }
+                }
+                Err(e) => failures.push(format!("{case} ({lane}): {e}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
