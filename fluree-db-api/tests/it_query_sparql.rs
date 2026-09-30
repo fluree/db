@@ -947,10 +947,13 @@ async fn sparql_order_by_expression_count_by_predicate_not_dropped() {
 }
 
 #[tokio::test]
-async fn sparql_order_by_expression_over_grouped_var_errors_cleanly() {
+async fn sparql_order_by_expression_over_non_key_var_reads_a_sample() {
     // Regression (P1b): an aggregating query whose ORDER BY expression reads a
-    // variable that is neither a GROUP BY key nor an aggregate output must be
-    // rejected with a clean error — NOT panic on a Grouped binding.
+    // variable that is neither a GROUP BY key nor an aggregate output must not
+    // panic on a Grouped binding. It used to be rejected; SPARQL 1.1 §18.2.4.1
+    // gives it a meaning — the ORDER BY reads SAMPLE(?favNum) — so it now runs
+    // (which value SAMPLE picks is implementation-defined, so only the groups
+    // are asserted, not their order).
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people(&fluree, "people:main").await;
@@ -966,10 +969,13 @@ async fn sparql_order_by_expression_over_grouped_var_errors_cleanly() {
         ORDER BY (?favNum + 1)
     ";
 
-    let result = support::query_sparql(&fluree, &ledger, query).await;
-    assert!(
-        result.is_err(),
-        "ORDER BY over a non-grouped variable should error, got: {result:?}"
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("ORDER BY over a non-key variable reads a sample of it");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["bbob", 1], ["jbob", 7], ["jdoe", 4]]))
     );
 }
 

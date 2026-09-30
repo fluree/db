@@ -62,7 +62,7 @@ pub use error::{LowerError, Result};
 use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
 
 use fluree_db_query::ir::Pattern;
-use fluree_db_query::ir::{Grouping, Query, QueryOutput, ReasoningConfig};
+use fluree_db_query::ir::{Query, QueryOutput, ReasoningConfig};
 
 use self::select::BaseModifiers;
 use fluree_db_query::parse::encode::IriEncoder;
@@ -533,35 +533,23 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     None
                 };
 
-                // Lower solution modifiers (LIMIT/OFFSET/ORDER BY/DISTINCT/GROUP BY/HAVING/aggregates).
-                // Expression-based GROUP BY produces pre-group BINDs that must be
-                // injected into the WHERE pattern list before query building.
-                let mut lowered_modifiers =
-                    self.lower_solution_modifiers(&select_query.modifiers, &select_query.select)?;
-
-                // SELECT expressions (e.g. `(SHA512(?x) AS ?hash)`), placed once
-                // the level's grouping is known: WHERE binds for an ungrouped
-                // level (and a key's expression), per-group Extends otherwise.
-                let where_vars = select::pre_group_vars(&patterns, post_values.as_ref())
-                    .into_iter()
-                    .chain(
-                        lowered_modifiers
-                            .pre_group_binds
-                            .iter()
-                            .flat_map(Pattern::produced_vars),
-                    )
-                    .collect();
-                let extends = self.lower_select_extends(
+                // Solution modifiers (LIMIT/OFFSET/ORDER BY/DISTINCT/GROUP BY/
+                // HAVING/aggregates) and SELECT expressions (e.g.
+                // `(SHA512(?x) AS ?hash)`). The WHERE-side pieces (GROUP BY and
+                // aggregate-input BINDs, SELECT BINDs of an ungrouped level, a
+                // HAVING-as-Filter) land on `patterns`; SELECT Extends ride in
+                // the grouping phase. Expression-based ORDER BY binds ride on
+                // `Query.order_binds` (a dedicated post-grouping stage in the
+                // operator tree) so they evaluate uniformly with or without
+                // grouping.
+                let level = self.lower_select_level(
                     &select_query.select,
-                    &mut lowered_modifiers,
-                    where_vars,
+                    &select_query.modifiers,
+                    &mut patterns,
+                    post_values.as_ref(),
                 )?;
-                patterns.extend(extends.pre);
-                patterns.extend(std::mem::take(&mut lowered_modifiers.pre_group_binds));
-                let groups = lowered_modifiers.groups();
-                let star_projection =
-                    (matches!(select_query.select.variables, SelectVariables::Star) && groups)
-                        .then(|| self.grouped_star_projection(&lowered_modifiers.group_by));
+                let star_projection = level.star_projection;
+                let grouping = level.grouping;
                 let BaseModifiers {
                     limit,
                     offset,
@@ -570,20 +558,8 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     // Consumed in `lower_solution_modifiers` (lowered into
                     // `order_binds` after aggregate hoisting); empty here.
                     deferred_order_exprs: _,
-                } = lowered_modifiers.base;
-                let distinct = lowered_modifiers.distinct;
-
-                // Assemble the grouping phase from the lowered components.
-                // SELECT Extends ride in the grouping phase. Expression-based
-                // ORDER BY binds ride on `Query.order_binds` (a dedicated
-                // post-grouping stage in the operator tree) so they evaluate
-                // uniformly with or without grouping.
-                let grouping = Grouping::assemble(
-                    lowered_modifiers.group_by,
-                    lowered_modifiers.aggregates,
-                    extends.extends,
-                    lowered_modifiers.having,
-                );
+                } = level.base;
+                let distinct = level.distinct;
 
                 // Build a JSON-LD-like context from SPARQL prologue prefixes so formatters can compact IRIs.
                 let ctx = self.build_jsonld_context()?;

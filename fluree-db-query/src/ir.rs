@@ -50,8 +50,8 @@ pub use adapters::{
 pub use expression::{ArithmeticOp, CompareOp, Expression, Function};
 pub use fluree_db_core::value::FlakeValue;
 pub use grouping::{
-    AggregateFn, AggregateSpec, Aggregation, Grouping, InputSemantics, SelectExprPlacement,
-    SelectExprPlacer,
+    having_as_filter, sample_ungrouped_reads, AggregateFn, AggregateSpec, Aggregation, Grouping,
+    InputSemantics, SelectExprPlacement, SelectExprPlacer,
 };
 pub use path::{
     PathDirection, PathModifier, PathNodeFilter, PathStep, PropertyPathPattern, ShortestPathMode,

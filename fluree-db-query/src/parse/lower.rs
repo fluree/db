@@ -111,6 +111,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
     // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) land in `post_binds`
     // in source order.
     let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    let mut select_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
     let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
     for column in ast.select.columns() {
         if let UnresolvedColumn::Computation { expr, alias } = column {
@@ -123,6 +124,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
                 &aggregate_output_vars,
                 &post_bind_aliases,
             )?;
+            select_aliases.insert(alias_var);
             match placement {
                 SelectExprPlacement::Post => {
                     post_bind_aliases.insert(alias_var);
@@ -141,8 +143,15 @@ pub(crate) fn lower_query<E: IriEncoder>(
     // Lower the reasoning config, ordering, and grouping (each is its own axis).
     // Post-aggregation binds collected above ride inside the grouping phase.
     let reasoning = lower_options(&ast.options);
-    let ordering = lower_ordering(&ast.options, vars);
-    let grouping = lower_grouping(&ast.options, vars, post_binds)?;
+    let mut ordering = lower_ordering(&ast.options, vars);
+    let grouping = lower_grouping(
+        &ast.options,
+        vars,
+        post_binds,
+        &mut patterns,
+        &mut ordering,
+        &select_aliases,
+    )?;
     let limit = ast.options.limit;
     let offset = ast.options.offset;
 
@@ -1361,6 +1370,7 @@ fn lower_subquery<E: IriEncoder>(
         .collect();
     let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
     let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    let mut select_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
     for column in columns {
         if let UnresolvedColumn::Computation { expr, alias } = column {
             let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
@@ -1372,6 +1382,7 @@ fn lower_subquery<E: IriEncoder>(
                 &aggregate_output_vars,
                 &post_bind_aliases,
             )?;
+            select_aliases.insert(alias_var);
             match placement {
                 SelectExprPlacement::Post => {
                     post_binds.push((alias_var, lowered_expr));
@@ -1387,6 +1398,26 @@ fn lower_subquery<E: IriEncoder>(
         }
     }
 
+    // GROUP BY / aggregates / HAVING / post-aggregation binds (needed for
+    // subqueries used in filters/unions). Post-binds collected above ride in
+    // the grouping phase's `binds`; a HAVING on a subquery that does not group
+    // becomes a filter on its patterns, and a grouped `orderBy` read of a
+    // non-key variable a SAMPLE.
+    let mut ordering: Vec<SortSpec> = subquery
+        .options
+        .order_by
+        .iter()
+        .map(|s| lower_sort_spec(s, vars))
+        .collect();
+    let grouping = lower_grouping(
+        &subquery.options,
+        vars,
+        post_binds,
+        &mut patterns,
+        &mut ordering,
+        &select_aliases,
+    )?;
+
     // Build SubqueryPattern with options
     let mut sq = SubqueryPattern::new(select, patterns);
 
@@ -1399,20 +1430,10 @@ fn lower_subquery<E: IriEncoder>(
     if subquery.options.distinct {
         sq = sq.with_distinct();
     }
-    if !subquery.options.order_by.is_empty() {
-        let sort_specs: Vec<_> = subquery
-            .options
-            .order_by
-            .iter()
-            .map(|s| lower_sort_spec(s, vars))
-            .collect();
-        sq = sq.with_ordering(sort_specs);
+    if !ordering.is_empty() {
+        sq = sq.with_ordering(ordering);
     }
-
-    // GROUP BY / aggregates / HAVING / post-aggregation binds (needed for
-    // subqueries used in filters/unions). Post-binds collected above ride in
-    // the grouping phase's `binds`.
-    sq.grouping = lower_grouping(&subquery.options, vars, post_binds)?;
+    sq.grouping = grouping;
 
     Ok(sq)
 }
@@ -2050,26 +2071,59 @@ fn lower_ordering(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Vec<SortS
 /// been computed and HAVING has filtered the groups; they ride in the
 /// resulting `Grouping`'s `binds`. Both top-level
 /// and subquery callers populate them from post-aggregation SELECT expressions.
+///
+/// The spec edges get SPARQL 1.1 semantics, as on the SPARQL surface (both
+/// share the IR helpers):
+/// - in a grouping query, a `having` / `orderBy` read of a non-key variable
+///   means `SAMPLE(?v)` (§18.2.4.1), so `ordering` may be rewritten;
+/// - a `having` on a query that does not group is a filter over its solutions
+///   (§18.2.4.2), appended to `patterns`; it cannot see the query's SELECT
+///   expressions (`select_aliases`).
 fn lower_grouping(
     opts: &UnresolvedOptions,
     vars: &mut VarRegistry,
     post_binds: Vec<(VarId, Expression)>,
+    patterns: &mut Vec<Pattern>,
+    ordering: &mut [SortSpec],
+    select_aliases: &std::collections::HashSet<VarId>,
 ) -> Result<Option<Grouping>> {
     let group_by: Vec<VarId> = opts
         .group_by
         .iter()
         .map(|v| vars.get_or_insert(v))
         .collect();
-    let aggregates: Vec<AggregateSpec> = opts
+    let mut aggregates: Vec<AggregateSpec> = opts
         .aggregates
         .iter()
         .map(|a| lower_aggregate_spec(a, vars))
         .collect();
-    let having = opts
+    let mut having = opts
         .having
         .as_ref()
         .map(|e| lower_filter_expr(e, vars))
         .transpose()?;
+
+    if group_by.is_empty() && aggregates.is_empty() {
+        if let Some(having) = having.take() {
+            patterns.push(crate::ir::having_as_filter(
+                having,
+                select_aliases,
+                &mut |_| vars.get_or_insert(&format!("?__having_unbound_{}", vars.len())),
+            ));
+        }
+    } else {
+        let where_vars: std::collections::HashSet<VarId> =
+            patterns.iter().flat_map(Pattern::produced_vars).collect();
+        crate::ir::sample_ungrouped_reads(
+            &group_by,
+            &mut aggregates,
+            having.as_mut(),
+            &mut [],
+            ordering,
+            &where_vars,
+            &mut |_| vars.get_or_insert(&format!("?__sample_{}", vars.len())),
+        );
+    }
 
     Ok(Grouping::assemble(group_by, aggregates, post_binds, having))
 }

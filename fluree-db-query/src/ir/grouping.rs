@@ -396,6 +396,106 @@ impl Grouping {
     }
 }
 
+/// In a grouping level, give every HAVING / ORDER BY read of a non-key
+/// variable its SPARQL 1.1 meaning, `SAMPLE(?v)` (§18.2.4.1: "For each … HAVING(X),
+/// and each ORDER BY X … For each unaggregated variable V in X / Replace V with
+/// Sample(V)").
+///
+/// A read of `?v` is rewritten when the level's pre-group pipeline binds `?v`
+/// (`where_vars`) and `?v` is not a group key. Everything else is left alone:
+/// a key (`SAMPLE(key)` is the key), an aggregate output, a per-group `Extend`
+/// output (HAVING reads it unbound, §18.2.4.2; ORDER BY reads the Extend), and a
+/// variable nothing binds (unbound either way). The rewrite reuses a `SAMPLE(?v)`
+/// the level already computes, and otherwise adds one whose output `mint`
+/// names. It renames with [`Expression::substitute_var`], which also reaches
+/// `EXISTS` patterns. After it, every such read is a read of an aggregate
+/// output, so running it again changes nothing.
+///
+/// Which value SAMPLE picks is implementation-defined.
+pub fn sample_ungrouped_reads(
+    keys: &[VarId],
+    aggregates: &mut Vec<AggregateSpec>,
+    having: Option<&mut Expression>,
+    order_binds: &mut [(VarId, Expression)],
+    ordering: &mut [crate::sort::SortSpec],
+    where_vars: &HashSet<VarId>,
+    mint: &mut dyn FnMut(VarId) -> VarId,
+) {
+    let ungrouped = |v: &VarId| where_vars.contains(v) && !keys.contains(v);
+    let mut reads: Vec<VarId> = Vec::new();
+    let mut note = |v: VarId| {
+        if ungrouped(&v) && !reads.contains(&v) {
+            reads.push(v);
+        }
+    };
+    if let Some(having) = having.as_deref() {
+        having.referenced_vars().into_iter().for_each(&mut note);
+    }
+    for (_, expr) in order_binds.iter() {
+        expr.referenced_vars().into_iter().for_each(&mut note);
+    }
+    for spec in ordering.iter() {
+        note(spec.var);
+    }
+    if reads.is_empty() {
+        return;
+    }
+
+    let mut having = having;
+    for v in reads {
+        let sampled = aggregates
+            .iter()
+            .find(|spec| spec.function == AggregateFn::Sample(v))
+            .map(|spec| spec.output_var)
+            .unwrap_or_else(|| {
+                let output_var = mint(v);
+                aggregates.push(AggregateSpec {
+                    function: AggregateFn::Sample(v),
+                    output_var,
+                });
+                output_var
+            });
+        if let Some(having) = having.as_deref_mut() {
+            having.substitute_var(v, sampled);
+        }
+        for (_, expr) in order_binds.iter_mut() {
+            expr.substitute_var(v, sampled);
+        }
+        for spec in ordering.iter_mut() {
+            if spec.var == v {
+                spec.var = sampled;
+            }
+        }
+    }
+}
+
+/// A HAVING on a level that does not group: SPARQL 1.1 §18.2.4.2 makes it a
+/// Filter over the level's solutions ("For each HAVING(E) in Q / P :=
+/// Filter(E, P)"), which does not depend on grouping.
+///
+/// The level's SELECT expressions are evaluated after HAVING, so HAVING cannot
+/// see them — but in a level that does not group they are WHERE `BIND`s, which a
+/// Filter placed in the WHERE could see. Reads of `select_aliases` are therefore
+/// renamed to fresh variables (named by `mint`) that nothing binds.
+pub fn having_as_filter(
+    mut having: Expression,
+    select_aliases: &HashSet<VarId>,
+    mint: &mut dyn FnMut(VarId) -> VarId,
+) -> super::pattern::Pattern {
+    let mut read: Vec<VarId> = having
+        .referenced_vars()
+        .into_iter()
+        .filter(|v| select_aliases.contains(v))
+        .collect();
+    read.sort_unstable();
+    read.dedup();
+    for alias in read {
+        let unbound = mint(alias);
+        having.substitute_var(alias, unbound);
+    }
+    super::pattern::Pattern::Filter(having)
+}
+
 /// Where a SELECT-clause expression `(expr AS ?alias)` of one query level is
 /// evaluated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +628,125 @@ mod tests {
     use super::*;
     use crate::var_registry::VarId;
     use fluree_db_core::FlakeValue;
+
+    /// A FILTER pattern reading `v`, for EXISTS bodies.
+    fn filter_on(v: VarId) -> crate::ir::Pattern {
+        crate::ir::Pattern::Filter(Expression::Var(v))
+    }
+
+    #[test]
+    fn sample_ungrouped_reads_rewrites_only_non_key_where_reads() {
+        use crate::sort::SortSpec;
+        // ?a key, ?e non-key WHERE var, ?n aggregate output, ?x an Extend
+        // output, ?nosuch bound nowhere, ?es a JSON-LD pre-group alias.
+        let (a, e, n, x, nosuch, es) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4), VarId(5));
+        let where_vars: HashSet<VarId> = [a, e, es].into_iter().collect();
+        let mut aggregates = vec![AggregateSpec {
+            function: AggregateFn::Count(e),
+            output_var: n,
+        }];
+        let mut having = Expression::and(vec![
+            Expression::Var(a),
+            Expression::Var(e),
+            Expression::Var(n),
+            Expression::Var(x),
+            Expression::Var(nosuch),
+            Expression::Exists {
+                patterns: vec![filter_on(e)],
+                negated: false,
+            },
+        ]);
+        let mut order_binds = vec![(VarId(20), Expression::Var(es))];
+        let mut ordering = vec![SortSpec::asc(e), SortSpec::asc(a), SortSpec::asc(x)];
+        let mut next = 100;
+        let mut mint = |_| {
+            next += 1;
+            VarId(next)
+        };
+        sample_ungrouped_reads(
+            &[a],
+            &mut aggregates,
+            Some(&mut having),
+            &mut order_binds,
+            &mut ordering,
+            &where_vars,
+            &mut mint,
+        );
+
+        // ?e and ?es are sampled, once each, in first-read order.
+        let samples: Vec<(VarId, VarId)> = aggregates
+            .iter()
+            .filter_map(|s| match s.function {
+                AggregateFn::Sample(v) => Some((v, s.output_var)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(samples, vec![(e, VarId(101)), (es, VarId(102))]);
+        let refs = having.referenced_vars();
+        assert!(!refs.contains(&e), "?e renamed, EXISTS body included");
+        assert!(refs.contains(&VarId(101)));
+        for kept in [a, n, x, nosuch] {
+            assert!(refs.contains(&kept), "{kept:?} left alone");
+        }
+        assert_eq!(order_binds[0].1.referenced_vars(), vec![VarId(102)]);
+        assert_eq!(
+            ordering.iter().map(|s| s.var).collect::<Vec<_>>(),
+            vec![VarId(101), a, x]
+        );
+
+        // Idempotent: every such read is now an aggregate output.
+        let (having_before, aggregates_before) = (format!("{having:?}"), aggregates.len());
+        sample_ungrouped_reads(
+            &[a],
+            &mut aggregates,
+            Some(&mut having),
+            &mut order_binds,
+            &mut ordering,
+            &where_vars,
+            &mut mint,
+        );
+        assert_eq!(aggregates.len(), aggregates_before);
+        assert_eq!(format!("{having:?}"), having_before);
+    }
+
+    #[test]
+    fn sample_ungrouped_reads_reuses_an_existing_sample() {
+        use crate::sort::SortSpec;
+        let (a, e, s) = (VarId(0), VarId(1), VarId(2));
+        let mut aggregates = vec![AggregateSpec {
+            function: AggregateFn::Sample(e),
+            output_var: s,
+        }];
+        let mut ordering = vec![SortSpec::asc(e)];
+        sample_ungrouped_reads(
+            &[a],
+            &mut aggregates,
+            None,
+            &mut [],
+            &mut ordering,
+            &[a, e].into_iter().collect(),
+            &mut |_| panic!("an existing SAMPLE(?e) is reused"),
+        );
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(ordering[0].var, s);
+    }
+
+    #[test]
+    fn having_as_filter_hides_select_aliases() {
+        let (a, alias) = (VarId(0), VarId(1));
+        let having = Expression::and(vec![Expression::Var(a), Expression::Var(alias)]);
+        let crate::ir::Pattern::Filter(filter) =
+            having_as_filter(having, &[alias].into_iter().collect(), &mut |_| VarId(9))
+        else {
+            panic!("a Filter pattern");
+        };
+        let refs = filter.referenced_vars();
+        assert!(refs.contains(&a) && refs.contains(&VarId(9)));
+        assert!(
+            !refs.contains(&alias),
+            "the alias is read as a fresh, unbound var"
+        );
+    }
 
     #[test]
     fn select_expr_placement_rule() {
