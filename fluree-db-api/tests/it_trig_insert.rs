@@ -573,7 +573,7 @@ async fn parse_errors_name_the_real_problem() {
         .expect_err("malformed TriG")
         .to_string();
     assert!(
-        err.contains("expected '}' to close GRAPH block"),
+        err.contains("unclosed graph block"),
         "a malformed block must be reported as one, not as Turtle choking on GRAPH, got: {err}"
     );
 }

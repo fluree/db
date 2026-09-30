@@ -232,10 +232,11 @@ async fn allow_most(ledger: &LedgerState) -> PolicyContext {
     .expect("build policy context")
 }
 
-/// Every upsert entry point stores `tag:`/`kb:` IRIs verbatim. The JSON-LD
-/// round trip refused each of them with "Unresolved compact IRI".
+/// Every upsert entry point, and every insert entry point for a document
+/// with graph blocks, stores `tag:`/`kb:` IRIs verbatim. The JSON-LD round
+/// trip refused each of them with "Unresolved compact IRI".
 #[tokio::test]
-async fn upsert_stores_iris_the_json_ld_round_trip_refused() {
+async fn every_rdf_text_lane_stores_iris_the_json_ld_round_trip_refused() {
     let doc = iri_doc();
     let expected = iri_rows();
     let fluree = memory();
@@ -249,6 +250,11 @@ async fn upsert_stores_iris_the_json_ld_round_trip_refused() {
         "cached handle",
         "cached handle + policy",
         "graph builder",
+        "insert: Fluree::insert_turtle",
+        "insert: owned builder",
+        "insert: cached handle",
+        "insert: cached handle + policy",
+        "insert: graph builder",
     ] {
         let id = format!(
             "it/rdf-iri-{}:main",
@@ -305,6 +311,40 @@ async fn upsert_stores_iris_the_json_ld_round_trip_refused() {
                 .graph(&id)
                 .transact()
                 .upsert_turtle(&doc)
+                .commit()
+                .await
+                .map(|_| ()),
+            "insert: Fluree::insert_turtle" => fluree.insert_turtle(ledger, &doc).await.map(|_| ()),
+            "insert: owned builder" => fluree
+                .stage_owned(ledger)
+                .insert_turtle(&doc)
+                .execute()
+                .await
+                .map(|_| ()),
+            "insert: cached handle" => {
+                let handle = fluree.ledger_cached(&id).await.expect("handle");
+                fluree
+                    .stage(&handle)
+                    .insert_turtle(&doc)
+                    .execute()
+                    .await
+                    .map(|_| ())
+            }
+            "insert: cached handle + policy" => {
+                let policy = allow_most(&ledger).await;
+                let handle = fluree.ledger_cached(&id).await.expect("handle");
+                fluree
+                    .stage(&handle)
+                    .insert_turtle(&doc)
+                    .policy(policy)
+                    .execute()
+                    .await
+                    .map(|_| ())
+            }
+            "insert: graph builder" => fluree
+                .graph(&id)
+                .transact()
+                .insert_turtle(&doc)
                 .commit()
                 .await
                 .map(|_| ()),

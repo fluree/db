@@ -3833,8 +3833,8 @@ impl crate::Fluree {
     /// Stage a Turtle or TriG INSERT.
     ///
     /// Turtle is parsed directly to flakes by `FlakeSink`, bypassing JSON-LD /
-    /// IR. A TriG document (graph blocks, `<#txn-meta>`) is staged through the
-    /// named-graph path TriG upsert uses, with insert semantics.
+    /// IR. A TriG document (graph blocks, `<#txn-meta>`) is parsed into
+    /// templates, as a TriG upsert is, and staged with insert semantics.
     pub async fn stage_turtle_insert(
         &self,
         ledger: LedgerState,
@@ -4017,9 +4017,10 @@ impl crate::Fluree {
         })
     }
 
-    /// Stage a document the streaming Turtle parser rejected as a TriG insert,
-    /// through the same named-graph path TriG upsert takes. A document with no
-    /// graph blocks and no txn-meta isn't TriG, so its Turtle error stands.
+    /// Stage a document the streaming Turtle parser rejected as a TriG insert:
+    /// parsed once into templates, as a TriG upsert is, with insert semantics.
+    /// A document with no graph block (`<#txn-meta>` included) isn't TriG, so
+    /// its Turtle error stands; a malformed block is reported as one.
     #[allow(clippy::too_many_arguments)]
     async fn stage_trig_insert(
         &self,
@@ -4031,28 +4032,21 @@ impl crate::Fluree {
         tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
-        // Most rejected documents are plain Turtle with a typo; rule TriG out
-        // without copying them.
-        if !fluree_db_transact::might_contain_graph_block(trig) {
-            return Err(turtle_err);
-        }
-        let phase1 = fluree_db_transact::parse_trig_phase1(trig)?;
-        if phase1.named_graphs.is_empty() && phase1.raw_meta.is_none() {
+        // Most rejected documents are plain Turtle with a typo; the locator
+        // rules TriG out from tokens alone.
+        if !fluree_db_transact::has_graph_blocks(trig).map_err(rdf_text_error)? {
             return Err(turtle_err);
         }
         stamp_fast_path(
             TURTLE_INSERT_SITE,
             FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
         );
-        let txn_json = fluree_graph_turtle::parse_to_json(&phase1.turtle)?;
-        self.stage_transaction_with_named_graphs_tracked(
+        self.stage_rdf_text_tracked(
             ledger,
             TxnType::Insert,
-            &txn_json,
+            trig,
             txn_opts,
             index_config,
-            phase1.raw_meta.as_ref(),
-            &phase1.named_graphs,
             tracker,
             policy,
         )
