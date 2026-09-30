@@ -3679,10 +3679,19 @@ impl ContentStoreRangeFetcher {
             Ok(Some(buf))
         }
 
+        let kind = || {
+            id.content_kind().map_or_else(
+                || "unknown".to_string(),
+                |k| format!("{k:?}").to_lowercase(),
+            )
+        };
         // Try local path first — positional read.
         if let Some(local_path) = self.cs.resolve_local_path(id) {
             match read_range_from_file(&local_path, range.clone())? {
-                Some(buf) => return Ok(buf),
+                Some(buf) => {
+                    fluree_db_core::io_stats::record(kind, "local-range", buf.len());
+                    return Ok(buf);
+                }
                 None => {
                     tracing::debug!(
                         path = %local_path.display(),
@@ -3697,6 +3706,7 @@ impl ContentStoreRangeFetcher {
         if self.cs.permits_plaintext_cache() {
             let cache_path = self.cache_dir.join(id.to_string());
             if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
+                fluree_db_core::io_stats::record(kind, "cache-range", buf.len());
                 return Ok(buf);
             }
         }

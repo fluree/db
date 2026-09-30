@@ -762,6 +762,14 @@ async fn fetch_uncached(
         .await
 }
 
+/// The accounting label for an artifact fetched by CID alone.
+fn kind_name(id: &ContentId) -> String {
+    id.content_kind().map_or_else(
+        || "unknown".to_string(),
+        |k| format!("{k:?}").to_lowercase(),
+    )
+}
+
 pub async fn fetch_cached_bytes(
     cs: &dyn ContentStore,
     id: &ContentId,
@@ -776,6 +784,7 @@ pub async fn fetch_cached_bytes(
 
     if let Some(local_path) = cs.resolve_local_path(id) {
         if let Some(bytes) = try_read_cached_bytes(&local_path)? {
+            crate::io_stats::record(|| ext, "local", bytes.len());
             return Ok(bytes);
         }
         tracing::debug!(
@@ -790,6 +799,7 @@ pub async fn fetch_cached_bytes(
     }
 
     if let Some(bytes) = try_read_cached_bytes(&cached)? {
+        crate::io_stats::record(|| ext, "cache", bytes.len());
         return Ok(bytes);
     }
     cache
@@ -812,6 +822,7 @@ pub async fn fetch_cached_bytes_cid(
 
     if let Some(local_path) = cs.resolve_local_path(id) {
         if let Some(bytes) = try_read_cached_bytes(&local_path)? {
+            crate::io_stats::record(|| kind_name(id), "local", bytes.len());
             return Ok(bytes);
         }
         tracing::debug!(
@@ -826,6 +837,7 @@ pub async fn fetch_cached_bytes_cid(
     }
 
     if let Some(bytes) = try_read_cached_bytes(&cached)? {
+        crate::io_stats::record(|| kind_name(id), "cache", bytes.len());
         return Ok(bytes);
     }
     cache

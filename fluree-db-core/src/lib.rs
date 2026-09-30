@@ -55,6 +55,7 @@ pub mod graph_registry;
 pub mod ids;
 pub mod index_schema;
 pub mod index_stats;
+pub mod io_stats;
 pub mod ledger_config;
 pub mod ledger_id;
 pub mod namespaces;
