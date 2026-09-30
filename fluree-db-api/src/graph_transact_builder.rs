@@ -192,22 +192,35 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
         self.core.validate()
     }
 
-    /// Writes always apply at HEAD. A handle from `graph_at` names a past
-    /// state, so transacting through it would silently write somewhere other
-    /// than the state the caller pinned.
-    fn reject_time_pinned(&self) -> Result<()> {
-        if matches!(self.graph.time_spec, crate::dataset::TimeSpec::Latest) {
-            Ok(())
-        } else {
-            Err(ApiError::http(
+    /// The ledger a write applies to: the handle's whole ledger, at HEAD. A
+    /// handle that pins a time (`graph_at`, or `ledger@t:5`) names a past state,
+    /// and one that names a graph (`ledger#graph`) names part of the ledger, so
+    /// transacting through either would silently write somewhere other than
+    /// what the handle names.
+    fn write_target(&self) -> Result<fluree_db_core::LedgerId> {
+        let address = self.graph.address()?;
+        if !matches!(self.graph.time_spec()?, crate::dataset::TimeSpec::Latest) {
+            return Err(ApiError::http(
                 400,
                 format!(
                     "cannot transact through a time-pinned graph handle for '{}'; \
                      use graph(..) (HEAD) for writes",
                     self.graph.ledger_id
                 ),
-            ))
+            ));
         }
+        if !address.graph().is_default() {
+            return Err(ApiError::http(
+                400,
+                format!(
+                    "cannot transact through the graph-qualified handle '{}'; transact \
+                     through graph(\"{}\") and name the graph in the transaction",
+                    self.graph.ledger_id,
+                    address.id()
+                ),
+            ));
+        }
+        Ok(address.id().clone())
     }
 
     /// Stage + commit the transaction against the latest ledger head.
@@ -226,12 +239,8 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     ///     .await?;
     /// ```
     pub async fn commit(self) -> Result<TransactResultRef> {
-        self.reject_time_pinned()?;
-        let handle = self
-            .graph
-            .fluree
-            .ledger_cached(&self.graph.ledger_id)
-            .await?;
+        let ledger_id = self.write_target()?;
+        let handle = self.graph.fluree.ledger_cached(ledger_id.as_str()).await?;
         self.graph
             .fluree
             .commit_with_handle(&handle, self.core)
@@ -255,7 +264,7 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     /// let preview = staged.query().jsonld(&q).execute().await?;
     /// ```
     pub async fn stage(self) -> Result<StagedGraph<'a>> {
-        self.reject_time_pinned()?;
+        let ledger_id = self.write_target()?;
         self.core.validate().map_err(ApiError::Builder)?;
 
         let index_config = self
@@ -264,7 +273,7 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
 
-        let ledger_state = self.graph.fluree.ledger(&self.graph.ledger_id).await?;
+        let ledger_state = self.graph.fluree.ledger(ledger_id.as_str()).await?;
         let tracker = self
             .core
             .tracking

@@ -4191,3 +4191,197 @@ async fn the_config_graph_is_addressable_by_its_full_iri() {
         .expect("the alias form resolves too");
     assert_eq!(aliased.graph_id, fluree_db_core::CONFIG_GRAPH_ID);
 }
+
+/// `graph()` takes every address `db()` takes (#1961): a graph selector
+/// (`ledger#txn-meta`, `ledger#<graph IRI>`), the `urn:fluree:` spelling and a
+/// time pin, alone or together with `graph_at`. A write applies to the whole
+/// ledger at HEAD, so a handle that names a graph or a past state refuses it.
+#[tokio::test]
+async fn graph_handles_take_the_addresses_db_takes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-handle-addresses:main";
+    let audit = "http://example.org/graphs/audit";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let trig = format!(
+        r#"
+        @prefix ex: <http://example.org/> .
+        ex:alice ex:name "Alice" .
+        GRAPH <{audit}> {{ ex:event1 ex:desc "login" . }}
+        "#
+    );
+    let first = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("t1");
+    fluree
+        .insert(
+            first.ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:bob", "ex:name": "Bob"}),
+        )
+        .await
+        .expect("t2");
+
+    let ctx = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    let names = json!({"@context": ctx, "select": "?n",
+                       "where": {"@id": "?s", "ex:name": "?n"}, "orderBy": "?n"});
+    let descs = json!({"@context": ctx, "select": "?d", "where": {"@id": "?s", "ex:desc": "?d"}});
+    let commits = json!({"@context": ctx, "select": "?t",
+                         "where": {"@id": "?c", "f:t": "?t"}, "orderBy": "?t"});
+    async fn run(
+        graph: fluree_db_api::Graph<'_>,
+        q: &serde_json::Value,
+    ) -> fluree_db_api::Result<serde_json::Value> {
+        graph.query().jsonld(q).execute_formatted().await
+    }
+
+    let both = json!(["Alice", "Bob"]);
+    let alice = json!(["Alice"]);
+    for (address, query, expected) in [
+        (ledger_id.to_string(), &names, &both),
+        (format!("urn:fluree:{ledger_id}"), &names, &both),
+        (format!("{ledger_id}@t:1"), &names, &alice),
+        (format!("{ledger_id}#{audit}"), &descs, &json!(["login"])),
+        (format!("{ledger_id}#{audit}"), &names, &json!([])),
+    ] {
+        let rows = run(fluree.graph(&address), query)
+            .await
+            .unwrap_or_else(|e| panic!("graph({address}): {e}"));
+        assert_eq!(&rows, expected, "graph({address})");
+    }
+
+    // The reserved txn-meta graph, as the connection route reads it.
+    let txn_meta = format!("{ledger_id}#txn-meta");
+    let via_handle = run(fluree.graph(&txn_meta), &commits)
+        .await
+        .expect("graph(ledger#txn-meta)");
+    let mut from = commits.clone();
+    from["from"] = json!(txn_meta);
+    let via_from = fluree
+        .query_from()
+        .jsonld(&from)
+        .execute_formatted()
+        .await
+        .expect("from ledger#txn-meta");
+    assert_eq!(via_handle, via_from);
+    assert_eq!(via_handle.as_array().map(Vec::len), Some(2), "{via_handle}");
+
+    // A pin in the address and one from graph_at: equal is fine, different is refused.
+    let at_one = format!("{ledger_id}@t:1");
+    let rows = run(
+        fluree.graph_at(&at_one, fluree_db_api::TimeSpec::AtT(1)),
+        &names,
+    )
+    .await
+    .expect("same pin twice");
+    assert_eq!(rows, alice);
+    let err = run(
+        fluree.graph_at(&at_one, fluree_db_api::TimeSpec::AtT(2)),
+        &names,
+    )
+    .await
+    .expect_err("two different pins");
+    assert_eq!(err.status_code(), 400, "{err}");
+
+    // db() honors a pin too.
+    let view = fluree.db(&at_one).await.expect("db(ledger@t:1)");
+    let rows = fluree
+        .query(&view, &names)
+        .await
+        .expect("query the pinned view")
+        .to_jsonld(view.snapshot.as_ref())
+        .expect("to_jsonld");
+    assert_eq!(rows, alice);
+
+    // Writes: the whole ledger at HEAD, in any spelling of its address.
+    let data =
+        json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:carol", "ex:name": "Carol"});
+    for (address, refusal) in [
+        (format!("{ledger_id}#{audit}"), "graph-qualified"),
+        (format!("{ledger_id}#txn-meta"), "graph-qualified"),
+        (at_one.clone(), "time-pinned"),
+    ] {
+        let err = fluree
+            .graph(&address)
+            .transact()
+            .insert(&data)
+            .commit()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("transact through {address} must be refused"));
+        assert_eq!(err.status_code(), 400, "{address}: {err}");
+        assert!(err.to_string().contains(refusal), "{address}: {err}");
+        let err = fluree
+            .graph(&address)
+            .transact()
+            .insert(&data)
+            .stage()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("stage through {address} must be refused"));
+        assert!(err.to_string().contains(refusal), "{address}: {err}");
+    }
+    let out = fluree
+        .graph(&format!("urn:fluree:{ledger_id}"))
+        .transact()
+        .insert(&data)
+        .commit()
+        .await
+        .expect("transact through the URN spelling");
+    assert_eq!(out.receipt.t, 3);
+}
+
+/// A well-formed id that names no ledger stays a not-found error whose text
+/// says so, through every address entry point (callers match on it), and
+/// `refresh` reports nothing to refresh.
+#[tokio::test]
+async fn a_missing_ledger_reads_as_not_found_at_every_entry_point() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let missing = "it/no-such-ledger:main";
+    let query = json!({"select": ["?s"], "where": {"@id": "?s", "?p": "?o"}});
+
+    let mut errors = vec![
+        (
+            "ledger_cached",
+            fluree
+                .ledger_cached(missing)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        ),
+        (
+            "ledger_info",
+            fluree
+                .ledger_info(missing)
+                .execute()
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        ),
+        ("db", fluree.db(missing).await.err().map(|e| e.to_string())),
+        (
+            "graph().query()",
+            fluree
+                .graph(missing)
+                .query()
+                .jsonld(&query)
+                .execute()
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        ),
+    ];
+    errors.retain(|(_, e)| {
+        !e.as_deref()
+            .is_some_and(|e| e.to_lowercase().contains("not found"))
+    });
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(fluree
+        .refresh(missing, Default::default())
+        .await
+        .expect("refresh")
+        .is_none());
+}

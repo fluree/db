@@ -480,15 +480,30 @@ impl Fluree {
         }
     }
 
-    /// Load the current snapshot from a ledger.
-    ///
-    /// Returns a [`GraphDb`] — an immutable, point-in-time snapshot.
-    /// For the lazy API, use [`graph()`](Self::graph) instead.
-    pub async fn db(&self, ledger_id: &str) -> Result<GraphDb> {
-        let address = Self::parse_unpinned(ledger_id)?;
-        let view = self.load_graph_db(address.id()).await?;
+    /// Load the view a typed address names: its ledger at `spec`, re-scoped to
+    /// its graph, with that graph's config attached. The loader behind `db()`
+    /// and the lazy [`graph()`](Self::graph) handle. `spec` is the time to
+    /// read; the address's own pin is the caller's to fold into it.
+    pub(crate) async fn load_address_at(
+        &self,
+        address: &LedgerRef,
+        spec: TimeSpec,
+    ) -> Result<GraphDb> {
+        let view = self.load_graph_db_at(address.id(), spec).await?;
         let view = Self::select_graph(view, address.graph())?;
         self.resolve_and_attach_config(view).await
+    }
+
+    /// Load the current snapshot from a ledger.
+    ///
+    /// Returns a [`GraphDb`] — an immutable, point-in-time snapshot. The
+    /// address may name a graph (`mydb:main#txn-meta`, `mydb#<graph IRI>`)
+    /// and a time (`mydb@t:5`).
+    /// For the lazy API, use [`graph()`](Self::graph) instead.
+    pub async fn db(&self, ledger_id: &str) -> Result<GraphDb> {
+        let address = LedgerRef::parse(ledger_id)?;
+        let spec = address.at().cloned().unwrap_or(TimeSpec::Latest);
+        self.load_address_at(&address, spec).await
     }
 
     /// Load a historical snapshot at a specific transaction time.

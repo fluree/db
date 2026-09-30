@@ -3940,3 +3940,94 @@ async fn connection_dataset_iris_expand_against_the_prologue() {
         .expect("a prefixed FROM expands to the ledger address");
     assert_eq!(rows["results"]["bindings"].as_array().unwrap().len(), 2);
 }
+
+/// A JSON-LD query on a view reads that view's ledger. A `from` or `fromNamed`
+/// naming another ledger, or a ledger that does not exist, was ignored and the
+/// query answered from the view. Every view entry point refuses it now,
+/// buffered and tracked, with and without the graph-source providers. Naming
+/// the view's own ledger, in any spelling, still answers from the view.
+#[tokio::test]
+async fn a_view_refuses_a_jsonld_from_naming_another_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_people_ledger(&fluree, "o4-people:main").await;
+    seed_orgs_ledger(&fluree, "o4-orgs:main").await;
+    let view = fluree.db("o4-people:main").await.expect("view");
+
+    let with = |key: &str, members: JsonValue| {
+        let mut q = json!({
+            "@context": {"schema": "http://schema.org/"},
+            "select": ["?name"],
+            "where": {"@id": "?s", "schema:name": "?name"},
+            "orderBy": "?name"
+        });
+        q[key] = members;
+        q
+    };
+    let names = |r: fluree_db_api::QueryResult| {
+        normalize_rows(&r.to_jsonld(view.snapshot.as_ref()).expect("to_jsonld"))
+    };
+    let expected = names(
+        fluree
+            .query(&view, &with("select", json!(["?name"])))
+            .await
+            .expect("no from"),
+    );
+    assert_eq!(expected.len(), 2, "{expected:?}");
+
+    for (key, members) in [
+        ("from", json!("o4-orgs:main")),
+        ("from", json!("o4-nosuch:main")),
+        ("from", json!({"@id": "o4-orgs:main"})),
+        ("from", json!(["o4-people:main", "o4-orgs"])),
+        ("fromNamed", json!(["o4-orgs:main"])),
+    ] {
+        let q = with(key, members.clone());
+        let case = format!("{key}: {members}");
+        let mut failures = Vec::new();
+
+        match fluree.query(&view, &q).await {
+            Err(e) if e.status_code() == 400 && e.to_string().contains("query_from()") => {}
+            other => failures.push(format!("query: {other:?}")),
+        }
+        match fluree
+            .graph("o4-people:main")
+            .query()
+            .jsonld(&q)
+            .execute()
+            .await
+        {
+            Err(e) if e.status_code() == 400 && e.to_string().contains("query_from()") => {}
+            other => failures.push(format!("graph().query(): {other:?}")),
+        }
+        match view.query(&fluree).jsonld(&q).execute_tracked().await {
+            Err(e) if e.status == 400 && e.error.contains("query_from()") => {}
+            other => failures.push(format!("view tracked: {:?}", other.map(|_| ()))),
+        }
+        match fluree
+            .graph("o4-people:main")
+            .query()
+            .jsonld(&q)
+            .execute_tracked()
+            .await
+        {
+            Err(e) if e.status == 400 && e.error.contains("query_from()") => {}
+            other => failures.push(format!("graph() tracked: {:?}", other.map(|_| ()))),
+        }
+        assert!(failures.is_empty(), "{case}:\n{}", failures.join("\n"));
+    }
+
+    for own in [
+        json!("o4-people"),
+        json!("o4-people:main"),
+        json!("urn:fluree:o4-people:main"),
+        json!({"@id": "o4-people:main"}),
+    ] {
+        let rows = names(
+            fluree
+                .query(&view, &with("from", own.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("from {own}: {e}")),
+        );
+        assert_eq!(rows, expected, "from {own}");
+    }
+}

@@ -60,6 +60,50 @@ fn residency_content_store(
     cs.miss_register().is_some().then_some(cs)
 }
 
+/// A JSON-LD query on a view reads that view's ledger. A `from` or
+/// `fromNamed` member that names ANOTHER ledger was ignored, so the query
+/// silently answered from this view instead; it is a caller error. Members
+/// that name this ledger or one of its graphs keep their current reading.
+/// Dataset keys that do not parse are left to that reading too.
+fn refuse_cross_ledger_from(db: &GraphDb, json: &JsonValue) -> Result<()> {
+    use fluree_db_core::{TargetError, TargetLedger};
+
+    let Ok(spec) = crate::dataset::DatasetSpec::from_json(json) else {
+        return Ok(());
+    };
+    if spec.num_graphs() == 0 {
+        return Ok(());
+    }
+    let target = &db.snapshot.ledger_id;
+    let registry = &db.snapshot.graph_registry;
+    let store = db.binary_store.as_ref();
+    let lookup = |iri: &str| {
+        registry
+            .graph_id_for_iri(iri)
+            .or_else(|| store.and_then(|s| s.graph_id_for_iri(iri)))
+    };
+    let resolver = TargetLedger::new(target, &lookup);
+    for source in spec.default_graphs.iter().chain(&spec.named_graphs) {
+        let pinned = source.address().is_some_and(|a| a.at().is_some());
+        if let Err(TargetError::CrossLedger {
+            named, also_iri, ..
+        }) = resolver.resolve(source.written(), source.reference(), pinned)
+        {
+            return Err(ApiError::invalid_query(format!(
+                "JSON-LD from '{}' {}names ledger '{named}', but this query runs on a view of \
+                 '{target}', which reads only that ledger. To query '{named}', use query_from()",
+                source.written(),
+                if also_iri {
+                    "is not a graph of this ledger, and as an address it "
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// If the view was created from a graph source, wrap all top-level patterns
 /// in `GRAPH <gs_id> { ... }` so the R2RML provider handles them.
 ///
@@ -379,6 +423,7 @@ impl Fluree {
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
+                refuse_cross_ledger_from(db, json)?;
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None)?
             }
             QueryInput::Sparql(sparql) => {
@@ -703,6 +748,7 @@ impl Fluree {
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
+                refuse_cross_ledger_from(db, json)?;
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None)?
             }
             QueryInput::Sparql(sparql) => {
@@ -869,7 +915,7 @@ impl Fluree {
                     let tracker = tracked_query_tracker(&input, &tracking_override);
                     let _ = charge_query_floor(&tracker);
                     return Err(crate::query::TrackedErrorResponse::new(
-                        400,
+                        e.status_code(),
                         e.to_string(),
                         tracker.tally(),
                     ));
@@ -895,6 +941,13 @@ impl Fluree {
         // Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
+                refuse_cross_ledger_from(db, json).map_err(|e| {
+                    crate::query::TrackedErrorResponse::new(
+                        e.status_code(),
+                        e.to_string(),
+                        tracker.tally(),
+                    )
+                })?;
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None).map_err(
                     |e| {
                         crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
@@ -1026,7 +1079,7 @@ impl Fluree {
                 Err(e) => {
                     let _ = charge_query_floor(&tracker);
                     return Err(crate::query::TrackedErrorResponse::new(
-                        400,
+                        e.status_code(),
                         e.to_string(),
                         tracker.tally(),
                     ));
@@ -1048,6 +1101,13 @@ impl Fluree {
 
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
+                refuse_cross_ledger_from(db, json).map_err(|e| {
+                    crate::query::TrackedErrorResponse::new(
+                        e.status_code(),
+                        e.to_string(),
+                        tracker.tally(),
+                    )
+                })?;
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None).map_err(
                     |e| {
                         crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
