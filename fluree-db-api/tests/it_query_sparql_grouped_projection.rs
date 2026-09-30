@@ -457,3 +457,79 @@ async fn grouped_select_expression_every_results_format() {
         "scalar cells: {typed}"
     );
 }
+
+/// §18.2.4.1: in a grouped level, HAVING and ORDER BY read a non-key variable
+/// as `SAMPLE(?v)`. The HAVING below is true for any sample, so every group
+/// survives. With COUNT it returned no rows (the streaming lane read `?e` as
+/// unbound); with GROUP_CONCAT (the traditional lane) it panicked a debug build.
+#[tokio::test]
+async fn having_on_a_non_key_variable_reads_a_sample() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/having-sample:main").await;
+    for aggregate in ["(COUNT(?e) AS ?n)", "(GROUP_CONCAT(STR(?e)) AS ?n)"] {
+        let result = run(
+            &fluree,
+            &ledger,
+            &format!(
+                r#"SELECT ?a {aggregate} {W} GROUP BY ?a
+                   HAVING (STRSTARTS(STR(?e), "http://example.org/e"))"#
+            ),
+        )
+        .await;
+        let keys: Vec<String> = sorted(sparql_rows(&result, &ledger))
+            .into_iter()
+            .map(|r| r["a"].clone())
+            .collect();
+        assert_eq!(keys, vec!["Local", "Net", "Remote"], "{aggregate}");
+    }
+}
+
+/// ORDER BY a non-key variable sorts by a sample of it. The groups own disjoint
+/// IRI ranges (e1–e3, e4–e5, e6), so every sample orders them alike. Both used
+/// to be rejected ("Sort variable … not found", "ORDER BY expression references
+/// variable …").
+#[tokio::test]
+async fn order_by_a_non_key_variable_reads_a_sample() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/order-sample:main").await;
+    for (order_by, expected) in [
+        ("?e", ["Net", "Local", "Remote"]),
+        ("DESC(STR(?e))", ["Remote", "Local", "Net"]),
+    ] {
+        let result = run(
+            &fluree,
+            &ledger,
+            &format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a ORDER BY {order_by}"),
+        )
+        .await;
+        let keys: Vec<String> = sparql_rows(&result, &ledger)
+            .into_iter()
+            .map(|r| r["a"].clone())
+            .collect();
+        assert_eq!(keys, expected, "ORDER BY {order_by}");
+    }
+}
+
+/// §18.2.4.2: HAVING on a level that does not group is a Filter over its
+/// solutions (it used to be ignored), and it cannot see the SELECT expressions,
+/// so `BOUND(?s)` is false for every solution.
+#[tokio::test]
+async fn having_without_grouping_filters() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/having-filter:main").await;
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!(r#"SELECT ?a {W} HAVING (?a = "Net")"#),
+        json!([{"a": "Net"}, {"a": "Net"}, {"a": "Net"}]),
+        json!([["Net"], ["Net"], ["Net"]]),
+    )
+    .await;
+    let result = run(
+        &fluree,
+        &ledger,
+        &format!("SELECT ?a (STR(?a) AS ?s) {W} HAVING (BOUND(?s))"),
+    )
+    .await;
+    assert_eq!(result.row_count(), 0);
+}
