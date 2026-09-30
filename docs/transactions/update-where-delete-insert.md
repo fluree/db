@@ -698,7 +698,7 @@ Updates ALL entities with status="pending".
 | **Other properties** | Preserved | Preserved |
 | **Conditional** | Yes (with filters) | No |
 | **Pattern matching** | Yes | No |
-| **Idempotent** | Depends on logic | Yes |
+| **Idempotent** | Depends on logic | Yes, with one exception (see [Upsert](upsert.md#idempotency)) |
 | **Use case** | Partial updates | Complete replacement |
 
 ## Best Practices

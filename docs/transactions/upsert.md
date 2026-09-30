@@ -1,6 +1,6 @@
 # Upsert
 
-Upsert operations provide idempotent transactions by **replacing the values of the predicates you supply** for an entity (matched by `@id`).
+Upsert operations **replace the values of the predicates you supply** for an entity (matched by `@id`). Repeating an upsert is idempotent, with one exception for values stored with less detail than they were written (see [Idempotency](#idempotency)).
 
 ## What is Upsert?
 
@@ -210,7 +210,7 @@ POST /upsert?ledger=mydb:main
 **Behavior:**
 - Replaces values **for the predicates you supply** (per subject)
 - Leaves other predicates unchanged
-- Retry-safe/idempotent for the supplied predicates
+- Retry-safe/idempotent for the supplied predicates, except for values stored with less detail than they were written (see [Idempotency](#idempotency))
 
 ## Use Cases
 
@@ -551,10 +551,10 @@ For partial updates, use WHERE/DELETE/INSERT:
 |---------|--------------|--------------|
 | **Behavior** | Additive | Replaces each named predicate's values |
 | **Predicates not in the payload** | Preserved | Preserved |
-| **Idempotent** | No | Yes |
+| **Idempotent** | No | Yes, with one exception (see [Idempotency](#idempotency)) |
 | **Partial updates** | Yes (with WHERE/DELETE/INSERT) | Per predicate |
 | **Use case** | Adding data | Synchronization |
-| **Retry safety** | Requires care | Safe by default |
+| **Retry safety** | Requires care | Safe by default, with the same exception |
 | **Performance** | Fewer operations | More operations |
 
 ## Related Documentation
