@@ -1582,9 +1582,29 @@ fn parse_expanded_object_with_ctx(
 
     // Parse each predicate-object pair
     for (key, value) in obj {
-        // Skip JSON-LD keywords except @type which becomes rdf:type
-        if key == "@id" || key == "@context" || key == "@graph" {
-            continue;
+        match key.as_str() {
+            // Handled above, or (`@index`) carries no statement.
+            "@id" | "@context" | "@graph" | "@index" => continue,
+            // JSON-LD 1.1 §4.7: nodes described alongside this one, with no
+            // statement linking them; they share its scope.
+            "@included" => {
+                for node in node_objects(value, "@included")? {
+                    parse_expanded_object_with_ctx(node, scope, ctx, out)?;
+                }
+                continue;
+            }
+            // JSON-LD 1.1 §4.8: statements whose object is this node.
+            "@reverse" => {
+                parse_reverse_properties(value, &subject, scope, ctx, out)?;
+                continue;
+            }
+            "@type" => {}
+            k if is_keyword_form(k) => {
+                return Err(TransactError::Parse(format!(
+                    "JSON-LD keyword {k:?} is not supported on a node object"
+                )));
+            }
+            _ => {}
         }
 
         if key == "@type" {
@@ -1649,6 +1669,81 @@ fn parse_expanded_object_with_ctx(
     }
 
     Ok(subject)
+}
+
+/// A key spelled like a JSON-LD keyword (`@` then letters). Keys that
+/// merely start with `@` (`@odata.etag`) are ordinary property names.
+fn is_keyword_form(key: &str) -> bool {
+    key.strip_prefix('@')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphabetic()))
+}
+
+/// The node objects of an `@included` value (one node or an array of them).
+fn node_objects<'v>(value: &'v Value, keyword: &str) -> Result<Vec<&'v Value>> {
+    let items: Vec<&Value> = match value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    for item in &items {
+        let is_node = item
+            .as_object()
+            .is_some_and(|m| !m.contains_key("@value") && !m.contains_key("@list"));
+        if !is_node {
+            return Err(TransactError::Parse(format!(
+                "{keyword} must hold node objects"
+            )));
+        }
+    }
+    Ok(items)
+}
+
+/// Emit a node's reverse properties (the expanded `@reverse` map): for each
+/// property `p` and each value `v`, the statement `(v, p, owner)` in the
+/// owner's scope. A value that is a node object is parsed in that scope
+/// first.
+fn parse_reverse_properties(
+    value: &Value,
+    owner: &TemplateTerm,
+    scope: &GraphScope,
+    ctx: &mut TemplateParseCtx<'_>,
+    out: &mut Vec<TripleTemplate>,
+) -> Result<()> {
+    let maps: Vec<&serde_json::Map<String, Value>> = match value {
+        Value::Object(map) => vec![map],
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_object().ok_or_else(|| {
+                    TransactError::Parse("@reverse must be a map of properties".to_string())
+                })
+            })
+            .collect::<Result<_>>()?,
+        _ => {
+            return Err(TransactError::Parse(
+                "@reverse must be a map of properties".to_string(),
+            ))
+        }
+    };
+    for map in maps {
+        for (property, values) in map {
+            if property.starts_with('@') || property.starts_with('?') {
+                return Err(TransactError::Parse(format!(
+                    "@reverse may hold only property IRIs, not {property:?}"
+                )));
+            }
+            let predicate = TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(property));
+            for node in node_objects(values, "a reverse property's value")? {
+                let subject = match node.get("@id") {
+                    Some(id) if node.as_object().is_some_and(|m| m.len() == 1) => {
+                        parse_expanded_id_with_ctx(id, ctx)?
+                    }
+                    _ => parse_expanded_object_with_ctx(node, scope, ctx, out)?,
+                };
+                scope.emit(out, subject, predicate.clone(), owner.clone(), None, None);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse an expanded @id value
@@ -3762,6 +3857,241 @@ mod tests {
         assert!(
             labels.contains("_:b0") && labels.contains("_:mine"),
             "{labels:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Keywords on node objects (D-B3, L-B13, L-B16).
+    // ---------------------------------------------------------------------
+
+    fn pred_local(t: &TripleTemplate) -> String {
+        match &t.predicate {
+            TemplateTerm::Sid(s) => s.name.to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn sid_local(term: &TemplateTerm) -> String {
+        match term {
+            TemplateTerm::Sid(s) => s.name.to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// `@reverse` (keyword and a context term defined with `@reverse`) emits
+    /// the inverse statement. The keyword used to become a predicate named
+    /// `@reverse`, and the term form was written forward.
+    #[test]
+    fn reverse_properties_emit_the_inverse_statement() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "parent": {"@reverse": "ex:child", "@type": "@id"}
+            },
+            "@id": "ex:kid",
+            "parent": "ex:mom",
+            "@reverse": {"ex:child": {"@id": "ex:dad", "ex:name": "Dad"}}
+        });
+        let txn = parse_doc(&doc, TxnType::Insert).unwrap();
+        let mut child: Vec<(String, String)> = txn
+            .insert_templates
+            .iter()
+            .filter(|t| pred_local(t) == "child")
+            .map(|t| (sid_local(&t.subject), sid_local(&t.object)))
+            .collect();
+        child.sort();
+        assert_eq!(
+            child,
+            [
+                ("dad".to_string(), "kid".to_string()),
+                ("mom".to_string(), "kid".to_string())
+            ]
+        );
+        assert!(
+            txn.insert_templates.iter().any(|t| pred_local(t) == "name"),
+            "the reverse value node's own statements are written"
+        );
+    }
+
+    /// `@included` nodes are written in the owner's scope with no linking
+    /// statement; `@index` carries none.
+    #[test]
+    fn included_nodes_share_the_owner_scope_and_index_is_dropped() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{
+                "@id": "ex:a",
+                "@graph": "ex:g",
+                "@index": "ignored",
+                "ex:p": 1,
+                "@included": [{"@id": "ex:b", "ex:q": {"ex:r": 2}}]
+            }]
+        });
+        let txn = parse_doc(&doc, TxnType::Insert).unwrap();
+        let preds: Vec<String> = txn.insert_templates.iter().map(pred_local).collect();
+        assert_eq!(txn.insert_templates.len(), 3, "{preds:?}");
+        assert!(txn.insert_templates.iter().all(|t| t.graph == in_graph(G)));
+        assert!(!preds.iter().any(|p| p.starts_with('@')), "{preds:?}");
+    }
+
+    /// L-B16: `@nest` merges into the enclosing node through the whole
+    /// transaction path (expansion, then templates).
+    #[test]
+    fn nest_properties_belong_to_the_enclosing_node() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "@nest": {"ex:a": 1, "@nest": {"ex:b": 2}}
+        });
+        let txn = parse_doc(&doc, TxnType::Insert).unwrap();
+        assert_eq!(txn.insert_templates.len(), 2);
+        assert!(txn
+            .insert_templates
+            .iter()
+            .all(|t| sid_local(&t.subject) == "s"));
+    }
+
+    /// L-B13: keys that merely start with `@` are ordinary property names,
+    /// as before; keyword-form keys that are not supported on a node object
+    /// are refused rather than written as a predicate named after the key.
+    #[test]
+    fn keyword_form_keys_refused_other_at_keys_unchanged() {
+        let odata = json!({
+            "@id": "http://example.org/s",
+            "@odata.etag": "W/\"1\"",
+            "http://example.org/p": 1
+        });
+        let txn = parse_doc(&odata, TxnType::Insert).unwrap();
+        // Exactly the predicate the key always produced: the key, as an IRI.
+        let odata_pred = test_registry().sid_for_iri("@odata.etag");
+        assert_eq!(txn.insert_templates.len(), 2);
+        assert!(
+            txn.insert_templates
+                .iter()
+                .any(|t| matches!(&t.predicate, TemplateTerm::Sid(s) if *s == odata_pred)),
+            "{:?}",
+            txn.insert_templates
+        );
+
+        for key in ["@foo", "@language", "@direction", "@value"] {
+            let mut doc = serde_json::Map::new();
+            doc.insert("@id".into(), json!("http://example.org/s"));
+            doc.insert("http://example.org/p".into(), json!(1));
+            doc.insert(key.into(), json!("x"));
+            let err = parse_doc(&Value::Object(doc), TxnType::Insert);
+            match err {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.starts_with("Parse error: ") || msg.starts_with("JSON-LD error: "),
+                        "{key}: {msg}"
+                    );
+                }
+                Ok(txn) => panic!("{key} must be refused, got {:?}", txn.insert_templates),
+            }
+        }
+    }
+
+    /// L-B14/L-B16: every refusal this change introduces renders with a
+    /// "Parse error: " or "JSON-LD error: " prefix, the classes clients map
+    /// to a 400.
+    #[test]
+    fn new_refusals_render_as_parse_or_json_ld_errors() {
+        let ctx = json!({"ex": "http://example.org/"});
+        let cases: Vec<(&str, TxnType, Value)> = vec![
+            (
+                "invalid @graph value",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:s", "@graph": true, "ex:p": 1}),
+            ),
+            (
+                "variable graph outside update templates",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:s", "@graph": "?g", "ex:p": 1}),
+            ),
+            (
+                "relative graph name",
+                TxnType::Insert,
+                json!({"@id": "http://example.org/s", "@graph": "g1", "http://example.org/p": 1}),
+            ),
+            (
+                "txn-meta keyword",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:s", "@graph": "txn-meta", "ex:p": 1}),
+            ),
+            (
+                "blank named-graph name",
+                TxnType::Insert,
+                json!({"@id": "_:g", "@graph": [{"@id": "http://example.org/a", "http://example.org/p": 1}]}),
+            ),
+            (
+                "graph object without @id below the top level",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:s", "ex:p": {"@graph": [{"@id": "ex:a", "ex:q": 1}]}}),
+            ),
+            (
+                "unknown keyword",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:s", "@foo": 1, "ex:p": 1}),
+            ),
+            (
+                "node-level @language",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:s", "@language": "en", "ex:p": 1}),
+            ),
+            (
+                "@nest with @id",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:s", "@nest": {"@id": "ex:o", "ex:p": 1}}),
+            ),
+            (
+                "@reverse that is not a map",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:s", "@reverse": "ex:o"}),
+            ),
+            (
+                "annotation inside @reverse",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "ex:s", "@reverse": {"ex:p": {"@id": "ex:o", "@annotation": {"ex:r": 1}}}}),
+            ),
+            (
+                "reserved annotation label",
+                TxnType::Insert,
+                json!({"@context": ctx, "@id": "_:fluree_ann_0", "ex:p": 1}),
+            ),
+            (
+                "variable update graph key",
+                TxnType::Update,
+                json!({"@context": ctx, "graph": "?g", "insert": {"@id": "ex:s", "ex:p": 1}}),
+            ),
+            (
+                "graph-item name that is not a graph IRI",
+                TxnType::Update,
+                json!({"@context": ctx, "insert": [["graph", 7, {"@id": "ex:s", "ex:p": 1}]]}),
+            ),
+        ];
+        for (what, txn_type, doc) in cases {
+            let msg = parse_doc(&doc, txn_type)
+                .map(|t| format!("accepted: {:?}", t.insert_templates))
+                .unwrap_or_else(|e| e.to_string());
+            assert!(
+                msg.starts_with("Parse error: ") || msg.starts_with("JSON-LD error: "),
+                "{what}: {msg}"
+            );
+        }
+        let mut ns = test_registry();
+        let msg = parse_graph_insert(
+            &json!({"@context": ctx, "@id": "ex:s", "@graph": "ex:other", "ex:p": 1}),
+            &GraphSel::Graph(G.to_string()),
+            TxnOpts::default(),
+            &mut ns,
+            TEST_LEDGER,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.starts_with("Parse error: "),
+            "graph insert addressing a graph: {msg}"
         );
     }
 }
