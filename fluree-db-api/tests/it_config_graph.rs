@@ -281,6 +281,100 @@ async fn config_guard_refuses_a_group_split_across_graphs() {
     config_guard_refusal(err);
 }
 
+/// The same split cannot be reached in two accepted writes, in either order:
+/// the edge first and the fields later outside the config graph (the #1979
+/// shape: a policy group's `f:defaultAllow false` lost), or the fields first
+/// outside it and the edge later. Moving the fields into the config graph in
+/// the transaction that adds the edge is accepted.
+#[tokio::test]
+async fn config_guard_refuses_a_group_split_across_transactions() {
+    let ledger_id = "it/config-guard-split-txns:main";
+    let cfg = config_graph_iri(ledger_id);
+    let f_ctx = json!({"f": "https://ns.flur.ee/db#"});
+
+    // Edge first, fields later.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = sparql_update(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id),
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             INSERT DATA {{ GRAPH <{cfg}> {{ \
+               <urn:config:main> a f:LedgerConfig ; f:policyDefaults <urn:config:policy> \
+             }} }}"
+        ),
+    )
+    .await
+    .expect("the edge alone")
+    .ledger;
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({"@context": f_ctx, "@id": "urn:config:policy", "f:defaultAllow": false}),
+        )
+        .await
+        .expect_err("the group's fields outside the config graph");
+    let message = config_guard_refusal(err);
+    assert!(
+        message.contains("f:policyDefaults")
+            && message.contains("f:defaultAllow")
+            && message.contains("the default graph"),
+        "{message}"
+    );
+
+    // Fields first, edge later.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({"@context": f_ctx, "@id": "urn:config:shacl", "f:shaclEnabled": true}),
+        )
+        .await
+        .expect("f: data in the default graph, not yet part of any config")
+        .ledger;
+    let edge = format!(
+        "PREFIX f: <https://ns.flur.ee/db#> \
+         INSERT DATA {{ GRAPH <{cfg}> {{ \
+           <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> \
+         }} }}"
+    );
+    let err = sparql_update(&fluree, ledger.clone(), &edge)
+        .await
+        .expect_err("an edge to a group whose fields are in the default graph");
+    let message = config_guard_refusal(err);
+    assert!(
+        message.contains("f:shaclDefaults")
+            && message.contains("f:shaclEnabled")
+            && message.contains("the default graph"),
+        "{message}"
+    );
+
+    // The same edge, moving the fields into the config graph with it.
+    let ledger = sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             DELETE {{ <urn:config:shacl> f:shaclEnabled true }} \
+             INSERT {{ GRAPH <{cfg}> {{ \
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> . \
+               <urn:config:shacl> f:shaclEnabled true \
+             }} }} WHERE {{}}"
+        ),
+    )
+    .await
+    .expect("the repair moves the fields with the edge")
+    .ledger;
+    let view = fluree.db(ledger_id).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.clone())
+            .and_then(|s| s.enabled),
+        Some(true)
+    );
+    let _ = ledger;
+}
+
 /// A config typed outside the config graph is never read, so the write is
 /// refused: the JSON-LD shape `concepts/reasoning.md` showed (no graph, so the
 /// default graph), and the same config through Turtle insert.

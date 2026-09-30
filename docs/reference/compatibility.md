@@ -348,7 +348,7 @@ Inline shapes sent with a transaction (`opts.shapes`) are now governed by the SH
 
 #### Config writes are checked, and config-only writes are never blocked by validation
 
-A transaction that writes a setting group into the config graph with its fields in another graph, types an `f:LedgerConfig` / `f:GraphConfig` outside the config graph, or leaves a single-valued setting (or the ledger's `f:LedgerConfig` subject) with two values is refused with a `Parse error` (HTTP 400). Writing the same value again is still accepted. See [What a config write is checked for](../ledger-config/writing-config.md#what-a-config-write-is-checked-for).
+A transaction that writes a setting group into the config graph with its fields in another graph (in that transaction or split across two), types an `f:LedgerConfig` / `f:GraphConfig` outside the config graph, or leaves a single-valued setting (or the ledger's `f:LedgerConfig` subject) with two values is refused with a `Parse error` (HTTP 400). Writing the same value again is still accepted. See [What a config write is checked for](../ledger-config/writing-config.md#what-a-config-write-is-checked-for).
 
 A transaction that writes only the config graph is no longer validated against SHACL shapes or uniqueness constraints, and no longer needs a shapes, schema or constraints source to be resolvable, so a config repair is never blocked by the source it repairs (a policy source still applies to config writes). Shapes that target nodes in the config graph are no longer checked. Where SHACL or uniqueness is enabled and its source cannot be resolved, data writes fail with an error naming it, and a config read failure now fails a write instead of letting it through without uniqueness checks.
 

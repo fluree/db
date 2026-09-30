@@ -225,12 +225,12 @@ A transaction that writes ledger config is checked before it commits, and refuse
 
 | Refused | Why | Write it instead |
 |---|---|---|
-| A setting group linked from the config graph whose fields are written to another graph | The reader reads groups only from the config graph, so the group reads as empty | Put the group's fields in the config graph too (in JSON-LD, nest the group under the config node, or give it `"@graph": "config"`) |
+| A setting group linked from the config graph whose fields are written to another graph, in the same transaction or a later one; or a link to a group whose fields already sit in another graph | The reader reads groups only from the config graph, so the group reads as empty | Put the group's fields in the config graph too (in JSON-LD, nest the group under the config node, or give it `"@graph": "config"`); to link fields that sit elsewhere, move them in the same transaction ([Repairing a config split across graphs](#repairing-a-config-split-across-graphs)) |
 | An `f:LedgerConfig` or `f:GraphConfig` written outside the config graph | Config is read only from the config graph, so the write has no effect | Write it to `urn:fluree:{ledger_id}#config` (or `"@graph": "config"`) |
 | A second value for a single-valued setting (`f:shaclEnabled`, `f:defaultAllow`, a group pointer such as `f:shaclDefaults`, ...), or a second `f:LedgerConfig` subject | The reader would pick one of them | Upsert, or delete the old value in the same transaction; add settings to the existing config subject |
 | An unrecognized `f:reasoningModes` value | Query-time reasoning would skip it silently | Use a supported mode name |
 
-Writing the same value again is not refused. The checks read only the transaction and the current config graph.
+Writing the same value again is not refused. The checks read only the transaction, the current config graph, and (for a new link to a group) that group's statements in the other graphs.
 
 A transaction that writes only the config graph is never validated against SHACL shapes or uniqueness constraints, and never needs a shapes, schema or constraints source to be available: you can always turn SHACL or uniqueness off, or point a source somewhere else, even when the source it names is gone. Policy is the exception. A config write is still subject to the ledger's policy, including a policy source in another ledger, because policy decides who may change the config.
 

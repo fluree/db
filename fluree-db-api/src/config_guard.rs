@@ -104,7 +104,8 @@ const MAX_STAGED_REASONING_LIST_LEN: usize = 64;
 ///
 /// Refuses, with `TransactError::Parse`:
 /// - a config group split across graphs: a config edge written into the
-///   config graph whose target node gets its `f:` fields in another graph;
+///   config graph whose target node gets its `f:` fields in another graph,
+///   in this transaction or across two;
 /// - an `f:LedgerConfig` or `f:GraphConfig` typed outside the config graph,
 ///   which has no effect;
 /// - a second value for a single-valued config setting, or a second
@@ -112,8 +113,9 @@ const MAX_STAGED_REASONING_LIST_LEN: usize = 64;
 /// - an unrecognized `f:reasoningModes` value.
 ///
 /// A plain data transaction writes nothing to the config graph, types nothing
-/// with an `f:` class and asserts no reasoning modes: one pass over the staged
-/// flakes establishes that, and nothing else is read.
+/// with an `f:` class, asserts no reasoning modes and writes no `f:` field in
+/// a user graph: one pass over the staged flakes establishes that, and
+/// nothing else is read.
 ///
 /// `ns` and `graph_delta` name terms and graphs in messages.
 pub(crate) async fn validate_staged_config(
@@ -124,14 +126,18 @@ pub(crate) async fn validate_staged_config(
     let rdf_type = Sid::new(RDF, fluree_vocab::rdf_names::TYPE);
     let modes_p = fluree_sid(config_iris::REASONING_MODES);
     let (mut writes_config, mut types_config, mut asserts_modes) = (false, false, false);
+    let mut writes_fields_elsewhere = false;
     for (g_id, flake) in view.staged_flakes_by_graph() {
         writes_config |= g_id == CONFIG_GRAPH_ID;
         types_config |= flake.op
             && flake.p == rdf_type
             && matches!(&flake.o, FlakeValue::Ref(o) if o.namespace_code == FLUREE_DB);
         asserts_modes |= flake.op && flake.p == modes_p;
+        writes_fields_elsewhere |= flake.op
+            && flake.p.namespace_code == FLUREE_DB
+            && !crate::export::is_system_graph(g_id);
     }
-    if !(writes_config || types_config || asserts_modes) {
+    if !(writes_config || types_config || asserts_modes || writes_fields_elsewhere) {
         return Ok(());
     }
 
@@ -142,6 +148,9 @@ pub(crate) async fn validate_staged_config(
     if writes_config {
         refuse_split_groups(view, &names)?;
         refuse_second_values(view, &names, &rdf_type).await?;
+    }
+    if writes_config || writes_fields_elsewhere {
+        refuse_groups_split_across_transactions(view, &names).await?;
     }
     if asserts_modes {
         validate_reasoning_modes(view, &modes_p)?;
@@ -229,6 +238,131 @@ fn refuse_split_groups(view: &StagedLedger, names: &Names<'_>) -> Result<(), Tra
             )))
         }
     }
+}
+
+/// A config group split across transactions, which [`refuse_split_groups`]
+/// (seeing only this transaction) cannot catch: `f:` fields this transaction
+/// writes outside the config graph for a node the config graph's edges already
+/// point at, or a config edge it writes into the config graph to a node that
+/// already has `f:` fields in another graph. Either way the reader would see
+/// the group without those fields: a policy group's `f:defaultAllow false`
+/// lost, a SHACL group read as off.
+///
+/// Runs only for a transaction that writes the config graph or `f:` fields
+/// in a user graph, and reads only what it needs: the config graph (small)
+/// once, and each new edge target's statements in the user graphs. Fields
+/// this transaction retracts (a repair moving them into the config graph)
+/// do not count.
+async fn refuse_groups_split_across_transactions(
+    view: &StagedLedger,
+    names: &Names<'_>,
+) -> Result<(), TransactError> {
+    let edges: Vec<Sid> = CONFIG_EDGES.iter().map(|iri| fluree_sid(iri)).collect();
+    let mut new_edges: BTreeMap<&Sid, &Sid> = BTreeMap::new();
+    let mut retracted_edges: BTreeSet<(&Sid, &Sid, &Sid)> = BTreeSet::new();
+    let mut fields_elsewhere: BTreeMap<(&Sid, GraphId), BTreeSet<&Sid>> = BTreeMap::new();
+    let mut retracted_elsewhere: Vec<(GraphId, &Sid, &Sid, &FlakeValue)> = Vec::new();
+    for (g_id, flake) in view.staged_flakes_by_graph() {
+        if g_id == CONFIG_GRAPH_ID {
+            if let (true, FlakeValue::Ref(node)) = (edges.contains(&flake.p), &flake.o) {
+                if flake.op {
+                    new_edges.insert(node, &flake.p);
+                } else {
+                    retracted_edges.insert((&flake.s, &flake.p, node));
+                }
+            }
+        } else if flake.p.namespace_code == FLUREE_DB && !crate::export::is_system_graph(g_id) {
+            if flake.op {
+                fields_elsewhere
+                    .entry((&flake.s, g_id))
+                    .or_default()
+                    .insert(&flake.p);
+            } else {
+                retracted_elsewhere.push((g_id, &flake.s, &flake.p, &flake.o));
+            }
+        }
+    }
+    let fields_list = |fields: &BTreeSet<&Sid>| {
+        fields
+            .iter()
+            .map(|p| names.term(p))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // Fields written elsewhere for a node the config graph already points at.
+    // The config graph is small: its edges are read once.
+    if !fields_elsewhere.is_empty() {
+        let mut pointed_at: HashMap<Sid, Sid> = HashMap::new();
+        for flake in config_graph_flakes(view, RangeMatch::new()).await? {
+            if !edges.contains(&flake.p) {
+                continue;
+            }
+            if let FlakeValue::Ref(node) = &flake.o {
+                if !retracted_edges.contains(&(&flake.s, &flake.p, node)) {
+                    pointed_at.insert(node.clone(), flake.p.clone());
+                }
+            }
+        }
+        for ((node, g_id), fields) in &fields_elsewhere {
+            if let Some(edge) = pointed_at.get(*node) {
+                return Err(TransactError::Parse(format!(
+                    "config group {} (the value of {} in the config graph) would get its fields \
+                     {} in {}; a group is read only from the config graph <{}>, so write its \
+                     fields into that graph",
+                    names.term(node),
+                    names.term(edge),
+                    fields_list(fields),
+                    names.graph(*g_id),
+                    names.config_graph,
+                )));
+            }
+        }
+    }
+
+    // A new edge to a node whose fields already sit in another graph.
+    if new_edges.is_empty() {
+        return Ok(());
+    }
+    let registry = &view.base().snapshot.graph_registry;
+    let user_graphs: BTreeSet<GraphId> = std::iter::once(fluree_db_core::DEFAULT_GRAPH_ID)
+        .chain(registry.iter_entries().map(|(g_id, _)| g_id))
+        .filter(|g_id| !crate::export::is_system_graph(*g_id))
+        .collect();
+    for (node, edge) in new_edges {
+        for &g_id in &user_graphs {
+            let statements = graph_flakes(
+                view,
+                g_id,
+                RangeMatch {
+                    s: Some(node.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let fields: BTreeSet<&Sid> = statements
+                .iter()
+                .filter(|f| {
+                    f.p.namespace_code == FLUREE_DB
+                        && !retracted_elsewhere.contains(&(g_id, &f.s, &f.p, &f.o))
+                })
+                .map(|f| &f.p)
+                .collect();
+            if !fields.is_empty() {
+                return Err(TransactError::Parse(format!(
+                    "config group {} (the value of {} written into the config graph) already has \
+                     fields {} in {}; a group is read only from the config graph <{}>, so move \
+                     them into that graph in the same transaction",
+                    names.term(node),
+                    names.term(edge),
+                    fields_list(&fields),
+                    names.graph(g_id),
+                    names.config_graph,
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A single-valued config setting with more than one value after this
@@ -335,10 +469,20 @@ async fn config_graph_flakes(
     view: &StagedLedger,
     pattern: RangeMatch,
 ) -> Result<Vec<Flake>, TransactError> {
+    graph_flakes(view, CONFIG_GRAPH_ID, pattern).await
+}
+
+/// Graph `g_id`'s flakes matching `pattern` (by subject), as of the
+/// pre-transaction state.
+async fn graph_flakes(
+    view: &StagedLedger,
+    g_id: GraphId,
+    pattern: RangeMatch,
+) -> Result<Vec<Flake>, TransactError> {
     let base = view.base();
     range_with_overlay(
         &base.snapshot,
-        CONFIG_GRAPH_ID,
+        g_id,
         base.novelty.as_ref(),
         IndexType::Spot,
         RangeTest::Eq,
