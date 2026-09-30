@@ -369,7 +369,8 @@ mod tests {
             }],
             vec![],
             None,
-        );
+        )
+        .expect("valid grouping");
         Query {
             context: ParsedContext::default(),
             orig_context: None,

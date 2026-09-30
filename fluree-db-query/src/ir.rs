@@ -51,7 +51,7 @@ pub use expression::{ArithmeticOp, CompareOp, Expression, Function};
 pub use fluree_db_core::value::FlakeValue;
 pub use grouping::{
     having_as_filter, sample_ungrouped_reads, AggregateFn, AggregateSpec, Aggregation, Grouping,
-    InputSemantics, SelectExprPlacement, SelectExprPlacer,
+    GroupingError, InputSemantics, ReadStage, SelectExprPlacement, SelectExprPlacer, UngroupedRead,
 };
 pub use path::{
     PathDirection, PathModifier, PathNodeFilter, PathStep, PropertyPathPattern, ShortestPathMode,
@@ -62,6 +62,8 @@ pub use projection::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec,
     Projection, Root,
 };
-pub use query::{ConstructTemplate, Query, QueryOutput, Restriction, TemplateReification};
+pub use query::{
+    ConstructTemplate, Query, QueryOutput, Restriction, TemplateReification, UngroupedProjection,
+};
 pub use reasoning::{ReasoningConfig, ReasoningModes};
 pub use triple::{Ref, Term, TriplePattern};

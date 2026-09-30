@@ -167,15 +167,33 @@ pub enum Restriction {
     One,
 }
 
+/// What a grouped SELECT may do with a projected variable its grouping neither
+/// keys, aggregates nor binds.
+///
+/// It is a property of the top-level output only. A sub-query's projection is a
+/// bare `Vec<VarId>` ([`super::SubqueryPattern`]), so it cannot carry
+/// [`Self::PerGroupList`]: a per-group list never crosses a sub-query boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UngroupedProjection {
+    /// A plan error (the SPARQL rule, SPARQL 1.1 §11.4, and Cypher's).
+    #[default]
+    Reject,
+    /// Rendered as a per-group list: the documented JSON-LD query behavior.
+    /// Set only by the JSON-LD user-query entry point.
+    PerGroupList,
+}
+
 /// Describes what the query produces.
 #[derive(Debug, Clone)]
 pub enum QueryOutput {
     /// SELECT — projects rows from the algebra. The `projection` carries
     /// column structure (and per-column hydration); `restriction` carries the
-    /// optional `selectDistinct` / `selectOne` modifier.
+    /// optional `selectDistinct` / `selectOne` modifier; `ungrouped` what a
+    /// grouped query may do with a projected variable it does not group.
     Select {
         projection: Projection,
         restriction: Option<Restriction>,
+        ungrouped: UngroupedProjection,
     },
     /// CONSTRUCT — template patterns instantiated with bindings.
     Construct(ConstructTemplate),
@@ -188,6 +206,7 @@ impl QueryOutput {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
             restriction,
+            ungrouped: UngroupedProjection::Reject,
         }
     }
 
@@ -211,6 +230,7 @@ impl QueryOutput {
         Self::Select {
             projection: Projection::Wildcard,
             restriction: None,
+            ungrouped: UngroupedProjection::Reject,
         }
     }
 
@@ -220,6 +240,24 @@ impl QueryOutput {
         Self::Select {
             projection: Projection::Wildcard,
             restriction: Some(Restriction::Distinct),
+            ungrouped: UngroupedProjection::Reject,
+        }
+    }
+
+    /// What a grouped query may do with a projected variable it does not
+    /// group. [`UngroupedProjection::Reject`] for every non-SELECT output.
+    pub fn ungrouped_projection(&self) -> UngroupedProjection {
+        match self {
+            QueryOutput::Select { ungrouped, .. } => *ungrouped,
+            _ => UngroupedProjection::Reject,
+        }
+    }
+
+    /// Let a grouped SELECT project an ungrouped variable as a per-group list
+    /// (the JSON-LD query surface). No effect on other outputs.
+    pub fn allow_per_group_lists(&mut self) {
+        if let QueryOutput::Select { ungrouped, .. } = self {
+            *ungrouped = UngroupedProjection::PerGroupList;
         }
     }
 

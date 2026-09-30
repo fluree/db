@@ -1195,9 +1195,12 @@ impl NestedLoopJoinOperator {
                             // Leave as variable (Poisoned vars from OPTIONAL also remain unbound)
                         }
                         Binding::Grouped(_) => {
-                            // Grouped bindings shouldn't appear in join codepaths
-                            debug_assert!(false, "Grouped binding in join bind");
-                            // Leave as variable
+                            // A per-group list never leaves a grouping stage (the
+                            // plan-time `Grouping::first_ungrouped_read` check);
+                            // leaving the slot a variable would match anything.
+                            return Err(QueryError::Internal(
+                                "grouped (list-valued) binding reached a join".to_string(),
+                            ));
                         }
                         Binding::Path { .. } => {
                             // A path value is never a join key — leave as variable.

@@ -6922,9 +6922,13 @@ mod tests {
 
     /// A grouped sub-SELECT: `SELECT <select> { <body> } GROUP BY <group_key>`.
     fn grouped_sq(select: Vec<VarId>, group_key: VarId, body: Vec<Pattern>) -> Pattern {
-        Pattern::Subquery(crate::ir::SubqueryPattern::new(select, body).with_grouping(
-            crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None).unwrap(),
-        ))
+        Pattern::Subquery(
+            crate::ir::SubqueryPattern::new(select, body).with_grouping(
+                crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None)
+                    .expect("valid grouping")
+                    .unwrap(),
+            ),
+        )
     }
 
     #[test]
@@ -7163,6 +7167,7 @@ mod tests {
             vec![],
             None,
         )
+        .expect("valid grouping")
         .expect("aggregate present")
     }
 

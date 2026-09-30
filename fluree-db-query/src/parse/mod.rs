@@ -1464,7 +1464,12 @@ pub fn parse_query<E: IriEncoder>(
     strict_override: Option<bool>,
 ) -> Result<Query> {
     let (ast, select_mode) = parse_query_ast(json, strict_override)?;
-    lower_query(ast, encoder, vars, select_mode)
+    let mut query = lower_query(ast, encoder, vars, select_mode)?;
+    // The JSON-LD query surface projects a variable its grouping does not
+    // produce as a per-group list (documented in `docs/query/jsonld-query.md`).
+    // Only the top-level output may: a subquery's projection cannot carry it.
+    query.output.allow_per_group_lists();
+    Ok(query)
 }
 
 /// Parse a filter expression value and lower it to a Expression.

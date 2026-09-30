@@ -950,6 +950,8 @@ impl SubqueryOperator {
             &self.subquery.order_binds,
             &self.subquery.ordering,
             select_vars,
+            // A per-group list never crosses a sub-query boundary.
+            crate::ir::UngroupedProjection::Reject,
             self.subquery.distinct,
             self.subquery.offset,
             self.subquery.limit,

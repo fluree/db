@@ -349,7 +349,8 @@ fn lower_single_branch_inner<E: IriEncoder>(
     // the non-aggregates become GROUP BY keys (Cypher's implicit
     // grouping rule). RETURN has no WHERE/HAVING — those live on WITH.
     // `post_binds` carry aggregate-composite expressions (`count(a)+count(b)`).
-    let grouping = Grouping::assemble(group_keys, aggregates, post_binds, None);
+    let grouping = Grouping::assemble(group_keys, aggregates, post_binds, None)
+        .map_err(|e| LowerError::generic(e.to_string()))?;
 
     Ok(SingleBranch {
         patterns,
@@ -1272,7 +1273,8 @@ fn lower_with<E: IriEncoder>(
         projection.aggregates,
         projection.post_binds,
         having,
-    );
+    )
+    .map_err(|e| LowerError::generic(e.to_string()))?;
 
     // ORDER BY may also reference property accessors; emit any
     // resulting auxiliary triples into the subquery body before we
@@ -1573,8 +1575,10 @@ fn prepend_group_keys(grouping: Grouping, extra: &[VarId]) -> Grouping {
     let aggregates: Vec<AggregateSpec> = grouping.aggregates().cloned().collect();
     let binds: Vec<(VarId, fluree_db_query::ir::Expression)> = grouping.binds().cloned().collect();
     let having = grouping.having().cloned();
-    Grouping::assemble(group_by, aggregates, binds, having)
-        .expect("non-empty group_by yields Explicit grouping")
+    match Grouping::assemble(group_by, aggregates, binds, having) {
+        Ok(Some(grouping)) => grouping,
+        Ok(None) | Err(_) => unreachable!("non-empty group_by yields Explicit grouping"),
+    }
 }
 
 fn visible_vars_from_patterns<E: IriEncoder>(

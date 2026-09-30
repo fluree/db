@@ -529,7 +529,13 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             // Plain IRI string
             GroupKeyOwned::MaterializedSid(0, iri.clone())
         }
-        Binding::Grouped(_) => GroupKeyOwned::Absent, // Shouldn't happen
+        // Unreachable: a per-group list never leaves its grouping stage (the
+        // plan-time `Grouping::first_ungrouped_read` check). This function
+        // cannot fail, so a list here would merge every group into one.
+        Binding::Grouped(_) => {
+            debug_assert!(false, "Grouped binding used as a group key");
+            GroupKeyOwned::Absent
+        }
         // A path groups per distinct (nodes, per-hop edges) identity — needed
         // for `WITH path, collect(...)` over allShortestPaths (IC14). Edges are
         // included to match PartialEq/Hash: two paths over the same node
