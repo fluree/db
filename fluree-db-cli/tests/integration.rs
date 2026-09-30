@@ -800,6 +800,56 @@ fn insert_with_txn_meta_sidecar() {
         .stdout(predicate::str::contains("Committed t=1"));
 }
 
+/// Inline shapes in a transaction body's `opts` are honored in local mode as
+/// they are over HTTP: a record breaking them is refused, and one that
+/// conforms commits.
+#[test]
+fn insert_honors_inline_shapes_in_the_body() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "shapesdb"])
+        .assert()
+        .success();
+    let body = |node: &str| {
+        format!(
+            r#"{{
+                "@context": {{"ex": "http://example.org/ns/"}},
+                "opts": {{"shapes": {{
+                    "@context": {{"ex": "http://example.org/ns/", "sh": "http://www.w3.org/ns/shacl#"}},
+                    "@graph": [
+                        {{"@id": "ex:PersonShape", "@type": "sh:NodeShape",
+                          "sh:targetClass": {{"@id": "ex:Person"}},
+                          "sh:property": {{"@id": "ex:nameShape"}}}},
+                        {{"@id": "ex:nameShape", "sh:path": {{"@id": "ex:name"}}, "sh:minCount": 1}}
+                    ]
+                }}}},
+                {node}
+            }}"#
+        )
+    };
+
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            &body(r#""@id": "ex:alice", "@type": "ex:Person""#),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("MinCount"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            &body(r#""@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob""#),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Committed t=1"));
+}
+
 // ============================================================================
 // Error path tests
 // ============================================================================
