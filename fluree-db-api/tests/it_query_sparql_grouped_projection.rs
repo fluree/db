@@ -685,6 +685,46 @@ async fn ask_and_construct_refuse_grouping() {
     );
 }
 
+/// An EXISTS in a grouped HAVING is evaluated per group row, with the row's
+/// keys and aggregate outputs bound, by the same evaluator as FILTER. HAVING
+/// used a separate evaluator that never resolved EXISTS, so `HAVING (EXISTS
+/// …)` kept no group and `HAVING (NOT EXISTS …)` kept every group.
+///
+/// A non-key variable inside the EXISTS reads a SAMPLE, like any other HAVING
+/// read of it.
+#[tokio::test]
+async fn having_exists_is_evaluated_per_group() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/having-exists:main").await;
+    let exists = "EXISTS { ?x ex:area ?a FILTER(?x = ex:e4) }";
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING ({exists})"),
+        json!([{"a": "Local", "n": "2"}]),
+        json!([["Local", 2]]),
+    )
+    .await;
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!("SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING (NOT {exists})"),
+        json!([{"a": "Net", "n": "3"}, {"a": "Remote", "n": "1"}]),
+        json!([["Net", 3], ["Remote", 1]]),
+    )
+    .await;
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!(
+            r#"SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING (EXISTS {{ ?e ex:area "Net" }})"#
+        ),
+        json!([{"a": "Net", "n": "3"}]),
+        json!([["Net", 3]]),
+    )
+    .await;
+}
+
 /// Cypher parity. Cypher makes a non-aggregate RETURN expression a grouping
 /// key, so `RETURN CASE … AS seg, count(e)` groups by the label — SPARQL's
 /// `GROUP BY (IF(…) AS ?seg)`. Grouping by the area first and mapping it after

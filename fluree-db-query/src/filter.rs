@@ -563,20 +563,16 @@ async fn filter_batch_with_exists(
     Ok(batch.filter_rows(&keep))
 }
 
-/// Filter operator - applies a predicate to each row from child
+/// The row predicate of a FILTER or a HAVING: one evaluator for both.
 ///
-/// Rows where the filter evaluates to `false` or encounters an error
-/// (type mismatch, unbound var) are filtered out.
-pub struct FilterOperator {
-    /// Child operator providing input rows
-    child: BoxedOperator,
-    /// Filter expression to evaluate
+/// EXISTS subexpressions resolve through the planner (uncorrelated ones once
+/// per batch, correlated ones per row, simple correlated ones through a
+/// semijoin cache built at `open`), and a Cypher metadata read under a
+/// non-root view policy through the policy-filtered async path. Everything
+/// else evaluates synchronously.
+pub(crate) struct RowPredicate {
     expr: Expression,
     prepared_expr: PreparedBoolExpression,
-    /// Output schema (same as child)
-    schema: Arc<[VarId]>,
-    /// Operator state
-    state: OperatorState,
     /// Whether the expression contains EXISTS subexpressions (cached)
     has_exists: bool,
     /// Whether the expression contains a Cypher metadata read that must be
@@ -584,8 +580,76 @@ pub struct FilterOperator {
     has_metadata: bool,
     /// Optional semijoin caches for simple correlated EXISTS patterns.
     exists_semijoin: Option<ExistsSemijoinCache>,
-    /// Planning context captured at planner-time for FILTER EXISTS subplans.
+    /// Planning context captured at planner-time for EXISTS subplans.
     planning: crate::temporal_mode::PlanningContext,
+}
+
+impl RowPredicate {
+    pub(crate) fn new(expr: Expression, planning: crate::temporal_mode::PlanningContext) -> Self {
+        let has_exists = contains_exists(&expr);
+        let has_metadata = crate::eval::metadata_resolve::contains_metadata_read(&expr);
+        let prepared_expr = PreparedBoolExpression::new(expr.clone());
+        Self {
+            expr,
+            prepared_expr,
+            has_exists,
+            has_metadata,
+            exists_semijoin: None,
+            planning,
+        }
+    }
+
+    pub(crate) fn expr(&self) -> &Expression {
+        &self.expr
+    }
+
+    /// Prepare for rows of `schema` (the semijoin cache for simple EXISTS).
+    pub(crate) fn open(&mut self, schema: &[VarId], ctx: &ExecutionContext<'_>) -> Result<()> {
+        if self.has_exists {
+            self.exists_semijoin = build_exists_semijoin_cache(&self.expr, schema, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// Keep the rows of `batch` the predicate holds for; `None` when none do.
+    pub(crate) async fn filter(
+        &self,
+        batch: Batch,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Batch>> {
+        // Cypher metadata reads must be resolved through the policy-filtered
+        // async path when a non-root view policy is active (the synchronous
+        // readers are fail-closed there).
+        let needs_metadata = self.has_metadata && !ctx.allow_unfiltered();
+        if self.has_exists || needs_metadata {
+            filter_batch_with_exists(
+                batch,
+                &self.expr,
+                ctx,
+                self.exists_semijoin.as_ref(),
+                &self.planning,
+                needs_metadata,
+            )
+            .await
+        } else {
+            filter_batch(batch, &self.prepared_expr, ctx)
+        }
+    }
+}
+
+/// Filter operator - applies a predicate to each row from child
+///
+/// Rows where the filter evaluates to `false` or encounters an error
+/// (type mismatch, unbound var) are filtered out.
+pub struct FilterOperator {
+    /// Child operator providing input rows
+    child: BoxedOperator,
+    /// The predicate, shared with HAVING
+    predicate: RowPredicate,
+    /// Output schema (same as child)
+    schema: Arc<[VarId]>,
+    /// Operator state
+    state: OperatorState,
 }
 
 impl FilterOperator {
@@ -610,25 +674,17 @@ impl FilterOperator {
         planning: crate::temporal_mode::PlanningContext,
     ) -> Self {
         let schema = Arc::from(child.schema().to_vec().into_boxed_slice());
-        let has_exists = contains_exists(&expr);
-        let has_metadata = crate::eval::metadata_resolve::contains_metadata_read(&expr);
-        let prepared_expr = PreparedBoolExpression::new(expr.clone());
         Self {
             child,
-            expr,
-            prepared_expr,
+            predicate: RowPredicate::new(expr, planning),
             schema,
             state: OperatorState::Created,
-            has_exists,
-            has_metadata,
-            exists_semijoin: None,
-            planning,
         }
     }
 
     /// Get the filter expression
     pub fn expr(&self) -> &Expression {
-        &self.expr
+        self.predicate.expr()
     }
 }
 
@@ -653,9 +709,7 @@ impl Operator for FilterOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
-        if self.has_exists {
-            self.exists_semijoin = build_exists_semijoin_cache(&self.expr, &self.schema, ctx)?;
-        }
+        self.predicate.open(&self.schema, ctx)?;
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -678,25 +732,7 @@ impl Operator for FilterOperator {
                 continue;
             }
 
-            // Cypher metadata reads in a WHERE expression must be resolved
-            // through the policy-filtered async path when a non-root view
-            // policy is active (the synchronous readers are fail-closed there).
-            let needs_metadata = self.has_metadata && !ctx.allow_unfiltered();
-            let filtered = if self.has_exists || needs_metadata {
-                filter_batch_with_exists(
-                    batch,
-                    &self.expr,
-                    ctx,
-                    self.exists_semijoin.as_ref(),
-                    &self.planning,
-                    needs_metadata,
-                )
-                .await?
-            } else {
-                filter_batch(batch, &self.prepared_expr, ctx)?
-            };
-
-            if let Some(filtered) = filtered {
+            if let Some(filtered) = self.predicate.filter(batch, ctx).await? {
                 return Ok(Some(filtered));
             }
         }
