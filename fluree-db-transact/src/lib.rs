@@ -48,6 +48,7 @@ pub mod parse;
 pub mod raw_txn_upload;
 pub mod stage;
 pub mod staged_dicts;
+pub mod template_sink;
 pub mod value_convert;
 
 #[cfg(feature = "import")]
@@ -79,7 +80,9 @@ pub use namespace::{
     stable_blank_node_sid, stable_blank_node_sid_from_label, NamespaceRegistry,
     SharedNamespaceAllocator, BLANK_NODE_ID_PREFIX, BLANK_NODE_PREFIX,
 };
-pub use parse::has_graph_blocks;
+pub use parse::{
+    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, Placement, RdfText, RdfTextSummary,
+};
 pub use parse::{
     might_contain_graph_block, parse_graph_insert, parse_sync_transaction, parse_transaction,
     parse_trig_phase1, resolve_trig_meta, unwrap_trig_graph_blocks, NamedGraphBlock, RawObject,
@@ -93,6 +96,7 @@ pub use stage::{
 pub use staged_dicts::{
     attach_binary_provider, attach_staged_dicts, detach_binary_provider, staged_dicts, StagedDicts,
 };
+pub use template_sink::{RdfTextParts, TemplateSink};
 
 #[cfg(feature = "shacl")]
 pub use stage::{validate_view_with_shacl, ShaclGraphPolicy, ShaclValidationOutcome};

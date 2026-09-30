@@ -1881,7 +1881,7 @@ fn split_prefixed_name(span: &str) -> (&str, &str) {
 }
 
 /// Validate txn-meta limits.
-fn validate_limits(entries: &[TxnMetaEntry]) -> Result<()> {
+pub(crate) fn validate_limits(entries: &[TxnMetaEntry]) -> Result<()> {
     if entries.len() > MAX_TXN_META_ENTRIES {
         return Err(TransactError::Parse(format!(
             "txn-meta entry count {} exceeds maximum {}",
