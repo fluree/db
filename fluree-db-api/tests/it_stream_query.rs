@@ -360,9 +360,11 @@ async fn jsonld_per_group_list_is_rejected_before_streaming() {
     assert_eq!(records.last().expect("terminal")["rows"], 3, "{records:?}");
 }
 
-/// `select *` under `groupBy` includes the per-group lists: `/query` returns
-/// them, and the stream refuses the query before it starts instead of silently
-/// dropping those columns. With every WHERE variable a key, it streams.
+/// `select *` under `groupBy` on the `GroupByOperator` lane includes the
+/// per-group lists: `/query` returns them, and the stream refuses the query
+/// before it starts instead of silently dropping those columns. With every
+/// WHERE variable a key, it streams. So does a query whose aggregates all
+/// stream: `/query` then returns the keys and aggregates only.
 #[tokio::test]
 async fn jsonld_wildcard_with_list_columns_is_rejected_before_streaming() {
     let (fluree, ledger) = seed_areas().await;
@@ -413,11 +415,26 @@ async fn jsonld_wildcard_with_list_columns_is_rejected_before_streaming() {
 
     let records = collect_records(
         &fluree,
-        ledger,
+        ledger.clone(),
         OwnedStreamQuery::JsonLd(query(json!(["?a", "?e"]))),
     )
     .await;
     assert_eq!(records.last().expect("terminal")["rows"], 6, "{records:?}");
+
+    // A `count` in HAVING: every aggregate streams, and `/query` has no list.
+    let mut counted = query(json!(["?a"]));
+    counted["having"] = json!("(> (count ?e) 0)");
+    let rows = support::query_jsonld(&fluree, &ledger, &counted)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert!(
+        rows.as_array().is_some_and(|rows| rows.len() == 3) && !rows.to_string().contains("ex:e"),
+        "the keys only: {rows}"
+    );
+    let records = collect_records(&fluree, ledger, OwnedStreamQuery::JsonLd(counted)).await;
+    assert_eq!(records.last().expect("terminal")["rows"], 3, "{records:?}");
 }
 
 /// A grouped projection of a variable nothing binds is the same named 400 on
