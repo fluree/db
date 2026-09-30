@@ -358,6 +358,52 @@ async fn jsonld_subquery_cannot_return_a_per_group_list() {
     }
 }
 
+/// A grouped-read plan error names the variable, not its internal id. The
+/// planner has only ids; the error is named where the query's variable
+/// registry is at hand, both for a subquery (planned while the query runs) and
+/// for the top level (planned before it runs).
+#[tokio::test]
+async fn jsonld_grouped_read_errors_name_the_variable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/error-names:main").await;
+    let ctx = json!({"ex": "http://example.org/"});
+    let cases = [
+        // A subquery projecting a non-key variable of its grouping.
+        (
+            json!({
+                "@context": ctx,
+                "select": ["?a", "?x"],
+                "where": [["query", {
+                    "@context": ctx,
+                    "select": ["?a", "?x"],
+                    "where": {"@id": "?x", "ex:area": "?a"},
+                    "groupBy": ["?a"]
+                }]]
+            }),
+            "projected variable ?x is neither a GROUP BY key nor an aggregate result",
+        ),
+        // A top-level expression reading an aggregate and a non-key variable:
+        // it runs once per group, where `?x` is a per-group list.
+        (
+            json!({
+                "@context": ctx,
+                "select": ["?a", "(as (+ (count ?x) (strlen (str ?x))) ?t)"],
+                "where": {"@id": "?x", "ex:area": "?a"},
+                "groupBy": ["?a"]
+            }),
+            "the SELECT expression for ?t reads variable ?x, which is neither",
+        ),
+    ];
+    for (query, expected) in cases {
+        let err = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect_err("a grouped read of a non-key variable");
+        let msg = err.to_string();
+        assert!(msg.contains(expected), "{query}: {msg}");
+        assert!(!msg.contains("VarId("), "{query}: {msg}");
+    }
+}
+
 /// Must-not-change guards: grouped JSON-LD shapes that fluree/solo runs today
 /// (keys, aggregates and expressions of aggregates only). Their answers are
 /// unchanged by the grouped-projection work.

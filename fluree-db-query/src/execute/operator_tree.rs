@@ -3527,13 +3527,15 @@ pub(crate) fn apply_solution_modifiers(
     // aggregates nor binds is a per-group list. Only a JSON-LD top-level
     // projection may read one; any other read (HAVING, a SELECT expression, an
     // ORDER BY key or expression, a projection under `Reject`) fails the plan,
-    // in every build — a sub-query can never return such a list.
+    // in every build — a sub-query can never return such a list. The error
+    // carries the variable's id; callers holding the query's registry name it
+    // (`QueryError::name_variables`).
     if let Some(g) = grouping {
         let where_vars: HashSet<VarId> = where_schema.iter().copied().collect();
         if let Some(read) =
             g.first_ungrouped_read(&where_vars, order_binds, ordering, select_vars, ungrouped)
         {
-            return Err(QueryError::InvalidQuery(read.message()));
+            return Err(QueryError::UngroupedRead(read));
         }
     }
     // With no per-group list allowed out, the grouping carries only what its own
