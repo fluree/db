@@ -161,7 +161,7 @@ pub fn parse_rdf_text(
                             sink.set_scope(default_scope.clone());
                         }
                         Placement::Into(target) => {
-                            return Err(TransactError::Parse(format!(
+                            return Err(TransactError::PayloadGraphMismatch(format!(
                                 "the request targets one graph, {}; the body also has a \
                                  GRAPH block for <{iri}>",
                                 describe_target(target)
@@ -197,7 +197,7 @@ pub fn parse_rdf_text(
     if let Placement::Into(target) = placement {
         if default_statements > 0 && named_blocks > 0 {
             let target = describe_target(target);
-            return Err(TransactError::Parse(format!(
+            return Err(TransactError::PayloadGraphMismatch(format!(
                 "a TriG body holds {target}'s triples either in GRAPH {target} blocks or as \
                  default-graph triples, not both"
             )));

@@ -1,16 +1,17 @@
-//! Turtle-star on the JSON-LD-converted write paths (upsert, graph sync).
+//! Turtle-star on the write paths other than the streaming insert (upsert,
+//! graph sync, the JSON-LD conversion).
 //!
 //! `insert_turtle` streams Turtle straight into the transaction sink, which
 //! has accepted RDF 1.2 reifiers (`~ r`, `{| … |}`, `<< s p o >>`) since the
-//! edge-annotation M1 work. `upsert_turtle`, `sync_named_graph` and the
-//! memory importer instead convert Turtle to JSON-LD first
-//! (`fluree_graph_turtle::parse_to_json`), and that conversion used to
+//! edge-annotation M1 work. `upsert_turtle` and graph sync parse RDF text
+//! into transaction templates; the memory importer converts Turtle to
+//! JSON-LD (`fluree_graph_turtle::parse_to_json`), a conversion that used to
 //! refuse every star construct with "not supported on this ingest path".
 //!
-//! These tests pin that the converted path now yields the same reifier
-//! bundles as a direct insert, that the annotations are queryable on every
-//! query surface, and that the upsert semantics (replace the body, keep the
-//! edge) hold for annotated edges.
+//! These tests pin that those paths yield the same reifier bundles as a
+//! direct insert, that the annotations are queryable on every query surface,
+//! and that the upsert semantics (replace the body, keep the edge) hold for
+//! annotated edges.
 
 use crate::support::{self, genesis_ledger};
 use fluree_db_api::{FlureeBuilder, SyncGraphOpts};

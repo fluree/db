@@ -2268,14 +2268,15 @@ enum GraphOpMode {
 
 /// Build the [`Txn`] for a payload scoped to `graph` (see
 /// [`crate::GraphPayload`]), returning it with the JSON-LD it parsed from,
-/// which the staging tail reads limits and the SHACL context from.
+/// which the staging tail reads limits and the SHACL context from (`null`
+/// for RDF text, which has neither).
 ///
-/// RDF text: a TriG body's blocks are unwrapped in place and the whole body
-/// read by the Turtle parser, so block contents get the full Turtle grammar
-/// and every format converges on the JSON-LD path. Blocks must name `graph`,
-/// and triples outside a block belong to TriG's default graph, so for a named
-/// target a body with both is refused rather than guessed at. For the default
-/// graph, every block names some other graph.
+/// RDF text is parsed once into templates homed on `graph`
+/// ([`fluree_db_transact::Placement::Into`]), so block contents get the full
+/// Turtle grammar. Blocks must name `graph`, and triples outside a block
+/// belong to TriG's default graph, so for a named target a body with both is
+/// refused rather than guessed at. For the default graph, every block names
+/// some other graph.
 fn parse_graph_payload<'a>(
     graph: &GraphSel,
     payload: crate::GraphPayload<'a>,
@@ -2287,39 +2288,29 @@ fn parse_graph_payload<'a>(
         status: 400,
         message,
     };
-    let (txn_json, raw_meta) = match payload {
-        crate::GraphPayload::JsonLd(json) => (std::borrow::Cow::Borrowed(json), None),
+    let txn_json = match payload {
+        crate::GraphPayload::JsonLd(json) => std::borrow::Cow::Borrowed(json),
         crate::GraphPayload::Rdf(text) => {
-            let trig = fluree_db_transact::unwrap_trig_graph_blocks(text)?;
             let target = match graph {
-                GraphSel::Graph(iri) => format!("<{iri}>"),
-                GraphSel::Default => "the default graph".to_string(),
-            };
-            let named = match graph {
                 GraphSel::Graph(iri) => Some(iri.as_str()),
                 GraphSel::Default => None,
             };
-            if let Some(other) = trig
-                .graph_iris
-                .iter()
-                .find(|iri| Some(iri.as_str()) != named)
-            {
-                return Err(bad_request(format!(
-                    "the request targets one graph, {target}; the body also has a GRAPH block \
-                     for <{other}>"
-                )));
-            }
-            if trig.mixes_default_and_named {
-                return Err(bad_request(format!(
-                    "a TriG body holds {target}'s triples either in GRAPH {target} blocks or as \
-                     default-graph triples, not both"
-                )));
-            }
-            let nodes = match fluree_graph_turtle::parse_to_json(&trig.turtle)? {
-                JsonValue::Array(nodes) => nodes,
-                node => vec![node],
-            };
-            if nodes.is_empty() {
+            let sync = matches!(mode, GraphOpMode::Sync { .. });
+            let (txn, summary) = fluree_db_transact::parse_rdf_text_txn(
+                text,
+                TxnType::Insert,
+                Placement::Into(target),
+                sync,
+                txn_opts,
+                ns_registry,
+            )
+            .map_err(|e| match e {
+                fluree_db_transact::TransactError::PayloadGraphMismatch(message) => {
+                    bad_request(message)
+                }
+                other => rdf_text_error(other),
+            })?;
+            if summary.statements == 0 {
                 match mode {
                     GraphOpMode::Sync { allow_empty: true } => {}
                     GraphOpMode::Sync { allow_empty: false } => {
@@ -2336,12 +2327,10 @@ fn parse_graph_payload<'a>(
                     }
                 }
             }
-            // `"@graph": []` is the JSON-LD explicit-empty form.
-            let json = serde_json::json!({ "@graph": nodes });
-            (std::borrow::Cow::Owned(json), trig.raw_meta)
+            return Ok((txn, std::borrow::Cow::Owned(JsonValue::Null)));
         }
     };
-    let mut txn = match mode {
+    let txn = match mode {
         GraphOpMode::Sync { .. } => {
             fluree_db_transact::parse_sync_transaction(&txn_json, graph, txn_opts, ns_registry)?
         }
@@ -2356,10 +2345,6 @@ fn parse_graph_payload<'a>(
             txn
         }
     };
-    if let Some(raw_meta) = &raw_meta {
-        txn.txn_meta
-            .extend(resolve_trig_meta(raw_meta, ns_registry)?);
-    }
     Ok((txn, txn_json))
 }
 

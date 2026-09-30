@@ -2,8 +2,8 @@
 //!
 //! The RDF payload takes the same delta path as JSON-LD sync: a graph written
 //! in one format and re-synced in another must not commit. A TriG body's
-//! blocks are unwrapped and read by the Turtle parser, so block contents get
-//! the full Turtle grammar (`/upsert`'s block parser rejects `[ … ]`).
+//! blocks are read by the Turtle parser, in place, so block contents get the
+//! full Turtle grammar.
 
 #![cfg(feature = "native")]
 

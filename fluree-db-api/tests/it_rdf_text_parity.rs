@@ -10,15 +10,15 @@
 use crate::support::{genesis_ledger, rebuild_and_publish_index, MemoryFluree};
 use fluree_db_api::policy_builder::build_policy_context_from_opts;
 use fluree_db_api::{
-    CommitOpts, Fluree, FlureeBuilder, GovernanceOptions, GraphDb, LedgerState, PolicyContext,
-    TrackingOptions,
+    CommitOpts, Fluree, FlureeBuilder, GovernanceOptions, GraphDb, GraphPayload, LedgerState,
+    PolicyContext, TrackingOptions,
 };
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::{
     range_with_overlay, ContentStore as _, Flake, FlakeValue, RangeMatch, RangeOptions, RangeTest,
     Sid,
 };
-use fluree_db_transact::TxnOpts;
+use fluree_db_transact::{GraphSel, TxnOpts};
 use serde_json::{json, Value as JsonValue};
 
 const TAG: &str = "tag:example.org,2025:";
@@ -362,6 +362,149 @@ async fn every_rdf_text_lane_stores_iris_the_json_ld_round_trip_refused() {
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Graph sync and graph insert of RDF text (the `/sync` and graph store
+/// routes) store `tag:`/`kb:` IRIs verbatim, from a plain Turtle body and
+/// from a TriG block naming the target. Both converted the body to JSON-LD
+/// and refused them.
+#[tokio::test]
+async fn graph_payload_lanes_store_iris_the_json_ld_round_trip_refused() {
+    let fluree = memory();
+    let target = format!("{TAG}g");
+    let statements = format!(
+        "<{TAG}s> <{TAG}p> <{KB}o> ; a <{KB}Class> ; <{KB}q> \"v\"^^<{TAG}dt> .\n\
+         <{KB}s2> <{TAG}p> <{TAG}o> .\n"
+    );
+    let block = format!("GRAPH <{target}> {{\n{statements}}}\n");
+    let default_rows: Vec<Vec<String>> =
+        iri_rows().into_iter().filter(|r| r[0].is_empty()).collect();
+    let named_rows: Vec<Vec<String>> = default_rows
+        .iter()
+        .map(|r| [vec![target.clone()], r[1..].to_vec()].concat())
+        .collect();
+    let mut failures = Vec::new();
+    for (lane, graph, body, expected) in [
+        (
+            "sync default graph",
+            GraphSel::Default,
+            &statements,
+            &default_rows,
+        ),
+        (
+            "sync named graph, Turtle body",
+            GraphSel::Graph(target.clone()),
+            &statements,
+            &named_rows,
+        ),
+        (
+            "sync named graph, TriG block",
+            GraphSel::Graph(target.clone()),
+            &block,
+            &named_rows,
+        ),
+        (
+            "graph insert, TriG block",
+            GraphSel::Graph(target.clone()),
+            &block,
+            &named_rows,
+        ),
+    ] {
+        let id = format!(
+            "it/rdf-graph-iri-{}:main",
+            lane.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+        );
+        let builder = fluree.stage_owned(genesis_ledger(&fluree, &id));
+        let builder = if lane.starts_with("sync") {
+            builder.sync_graph_payload(graph, GraphPayload::Rdf(body), false)
+        } else {
+            builder.insert_graph_payload(graph, GraphPayload::Rdf(body))
+        };
+        match builder.execute().await {
+            Ok(result) => {
+                let got = iri_quads(&fluree, &result.ledger).await;
+                if got != *expected {
+                    failures.push(format!("{lane}: {got:#?}"));
+                }
+            }
+            Err(e) => failures.push(format!("{lane}: {e}")),
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A collection synced into a graph keeps its order and repeats: the sync
+/// body was converted to JSON-LD, which stored a collection's entries as
+/// unordered values.
+#[tokio::test]
+async fn a_synced_collection_keeps_its_order() {
+    let fluree = memory();
+    let g = "http://example.org/g";
+    let body = "@prefix ex: <http://example.org/> .\nex:s ex:items ( \"b\" \"a\" \"b\" ) .\n";
+    let result = fluree
+        .stage_owned(genesis_ledger(&fluree, "it/rdf-sync-list:main"))
+        .sync_graph_payload(
+            GraphSel::Graph(g.to_string()),
+            GraphPayload::Rdf(body),
+            false,
+        )
+        .execute()
+        .await
+        .expect("sync");
+    let xsd = "^^http://www.w3.org/2001/XMLSchema#string";
+    assert_eq!(
+        facts(&result.ledger, Some(g)).await,
+        vec![
+            format!("http://example.org/s http://example.org/items String(\"a\") {xsd}#1"),
+            format!("http://example.org/s http://example.org/items String(\"b\") {xsd}#0"),
+            format!("http://example.org/s http://example.org/items String(\"b\") {xsd}#2"),
+        ]
+    );
+}
+
+/// Sync scopes blank nodes to the target graph, and the parse labels them
+/// as the JSON-LD conversion did, so a graph last synced through that
+/// conversion re-syncs from the same text without a commit: its blank
+/// nodes are the same stored nodes.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // the conversion the RDF lane replaced
+async fn a_graph_synced_through_json_ld_resyncs_from_the_same_text_as_a_no_op() {
+    let fluree = memory();
+    let id = "it/rdf-sync-identity:main";
+    let g = "http://example.org/g";
+    let doc = "@prefix ex: <http://example.org/> .\n\
+               @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+               ex:w ex:owner _:o1 ; ex:spec [ ex:unit \"mm\" ; ex:tol 0.01 ] ;\n\
+                    ex:label \"Widget\"@en ; ex:made \"2024-01-15\"^^xsd:date .\n\
+               _:o1 ex:name \"Owner\" .\n";
+    let nodes = fluree_graph_turtle::parse_to_json(doc).expect("convert");
+    let converted = json!({ "@graph": nodes });
+    let first = fluree
+        .stage_owned(genesis_ledger(&fluree, id))
+        .sync_graph_payload(
+            GraphSel::Graph(g.to_string()),
+            GraphPayload::JsonLd(&converted),
+            false,
+        )
+        .execute()
+        .await
+        .expect("sync through JSON-LD");
+    assert!(first.receipt.flake_count > 0);
+    let again = fluree
+        .stage_owned(first.ledger)
+        .sync_graph_payload(
+            GraphSel::Graph(g.to_string()),
+            GraphPayload::Rdf(doc),
+            false,
+        )
+        .execute()
+        .await
+        .expect("sync from text");
+    assert_eq!(
+        (again.receipt.flake_count, again.receipt.t),
+        (0, first.receipt.t),
+        "the same graph from the text must not commit"
+    );
 }
 
 // =============================================================================
