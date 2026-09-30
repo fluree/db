@@ -726,9 +726,17 @@ async fn dataset_options_and_envelope_defaults_cannot_replace_authority() {
         "select": ["?name", "?class"],
         "where": {"@id": "?s", "http://schema.org/name": "?name", "http://example.org/classification": "?class"}
     });
-    for uri in [
-        "/v1/fluree/query".to_string(),
-        format!("/v1/fluree/query/{ledger}"),
+    // The redirected query's `opts.from` is the source the dataset parser
+    // reads. The connection route resolves it to `other`, which the token does
+    // not cover: not found, as if it did not exist. The ledger route refuses a
+    // lone `from` naming another ledger before loading anything: a 400 that
+    // says no more than the request did.
+    for (uri, redirected_status) in [
+        ("/v1/fluree/query".to_string(), StatusCode::NOT_FOUND),
+        (
+            format!("/v1/fluree/query/{ledger}"),
+            StatusCode::BAD_REQUEST,
+        ),
     ] {
         let resp = app
             .clone()
@@ -764,7 +772,12 @@ async fn dataset_options_and_envelope_defaults_cannot_replace_authority() {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let (status, body) = json_body(resp).await;
+        assert_eq!(status, redirected_status, "{uri}: {body}");
+        assert!(
+            !body.to_string().contains("Executive Salaries"),
+            "{uri}: {body}"
+        );
     }
     let envelope = serde_json::json!({
         "opts": {"policy-class": ["http://example.org/ManagerClass"], "policy": [{"f:required": true, "f:action": "f:view", "f:allow": true}], "default-allow": true},

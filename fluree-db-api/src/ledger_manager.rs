@@ -546,9 +546,17 @@ impl LedgerHandle {
     /// IMPORTANT: Queries must NOT execute while holding the internal lock.
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
-        self.touch();
         // Read-side compaction trigger (policy: query/maintenance path only).
         self.compact_if_needed().await;
+        self.peek().await
+    }
+
+    /// The cached head as [`snapshot`](Self::snapshot) returns it, without
+    /// its read-side compaction check, which visits every graph in novelty.
+    /// For a lookup ahead of a query on the same request (a route resolving
+    /// the query's dataset references): the query's own load runs the check.
+    pub async fn peek(&self) -> LedgerView {
+        self.touch();
         let state = self.inner.state.read().await;
         let binary_store = self.inner.binary_store.read().await.clone();
         let mut snap = LedgerView::from_state(&state);
