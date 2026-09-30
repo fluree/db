@@ -269,7 +269,8 @@ impl Fluree {
             executable,
             &prepare_config,
         )
-        .await?;
+        .await
+        .map_err(|e| e.name_variables(vars))?;
 
         // Wire R2RML so a graph-source query that routed through the
         // single-ledger streaming path applies its mapping (parity with the
@@ -537,7 +538,10 @@ fn query_error_code(e: &fluree_db_query::QueryError) -> &'static str {
         // (mirrors the server `@type` `err:r2rml/UnsupportedPattern`) so the
         // streaming path is as machine-discriminable as the buffered one.
         QE::R2rmlUnsupportedPattern { .. } => "r2rml_unsupported_pattern",
-        QE::InvalidQuery(_) | QE::InvalidFilter(_) | QE::InvalidExpression(_) => "invalid_query",
+        QE::InvalidQuery(_)
+        | QE::UngroupedRead(_)
+        | QE::InvalidFilter(_)
+        | QE::InvalidExpression(_) => "invalid_query",
         _ => "internal",
     }
 }

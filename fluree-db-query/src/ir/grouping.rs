@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use fluree_db_core::NonEmpty;
 
 use super::expression::Expression;
-use crate::var_registry::VarId;
+use crate::var_registry::{VarId, VarRegistry};
 
 /// How an aggregate function interprets duplicate input values.
 ///
@@ -525,22 +525,36 @@ pub enum ReadStage {
 
 impl UngroupedRead {
     /// The user-facing message: which stage reads which variable, and what to
-    /// do instead. Plan-time code has no variable names, so variables print as
-    /// their ids.
+    /// do instead. Variables print as their ids: plan-time code has no
+    /// variable names. [`Self::named_message`] names them.
     pub fn message(&self) -> String {
-        let var = self.var;
+        self.message_with(|var| format!("{var:?}"))
+    }
+
+    /// [`Self::message`] with each variable named from `vars`, falling back to
+    /// its id for one the registry does not hold.
+    pub fn named_message(&self, vars: &VarRegistry) -> String {
+        self.message_with(|var| {
+            vars.try_name(var)
+                .map_or_else(|| format!("{var:?}"), str::to_string)
+        })
+    }
+
+    fn message_with(&self, name: impl Fn(VarId) -> String) -> String {
+        let var = name(self.var);
         let neither = "neither a GROUP BY key nor an aggregate result";
         match self.stage {
-            ReadStage::Having => format!("HAVING reads variable {var:?}, which is {neither}"),
+            ReadStage::Having => format!("HAVING reads variable {var}, which is {neither}"),
             ReadStage::Bind(out) => format!(
-                "the SELECT expression for {out:?} reads variable {var:?}, which is {neither}"
+                "the SELECT expression for {} reads variable {var}, which is {neither}",
+                name(out)
             ),
             ReadStage::OrderBind(_) => {
-                format!("an ORDER BY expression reads variable {var:?}, which is {neither}")
+                format!("an ORDER BY expression reads variable {var}, which is {neither}")
             }
-            ReadStage::OrderBy => format!("ORDER BY variable {var:?} is {neither}"),
+            ReadStage::OrderBy => format!("ORDER BY variable {var} is {neither}"),
             ReadStage::Projection => format!(
-                "projected variable {var:?} is {neither}; aggregate it (e.g. with SAMPLE, \
+                "projected variable {var} is {neither}; aggregate it (e.g. with SAMPLE, \
                  collect or group-concat)"
             ),
         }
@@ -998,6 +1012,44 @@ mod tests {
                 "ORDER BY under per-group-list {read:?}"
             );
         }
+    }
+
+    /// The message names variables from the registry when one is at hand, and
+    /// falls back to the id for one it does not hold.
+    #[test]
+    fn ungrouped_read_message_names_variables() {
+        let mut vars = VarRegistry::new();
+        let x = vars.get_or_insert("?x");
+        let t = vars.get_or_insert("?t");
+        let read = UngroupedRead {
+            var: x,
+            stage: ReadStage::Bind(t),
+        };
+        assert_eq!(
+            read.named_message(&vars),
+            "the SELECT expression for ?t reads variable ?x, which is neither a GROUP BY key \
+             nor an aggregate result"
+        );
+        assert_eq!(
+            read.message(),
+            format!(
+                "the SELECT expression for {t:?} reads variable {x:?}, which is neither a \
+                 GROUP BY key nor an aggregate result"
+            )
+        );
+        let unknown = UngroupedRead {
+            var: VarId(99),
+            stage: ReadStage::OrderBy,
+        };
+        assert_eq!(
+            unknown.named_message(&vars),
+            "ORDER BY variable VarId(99) is neither a GROUP BY key nor an aggregate result"
+        );
+        let err = crate::error::QueryError::UngroupedRead(read).name_variables(&vars);
+        assert!(
+            matches!(&err, crate::error::QueryError::InvalidQuery(msg) if msg.contains("?x")),
+            "{err:?}"
+        );
     }
 
     /// The lowerers' SAMPLE rewrite and the plan-time predicate compose: after

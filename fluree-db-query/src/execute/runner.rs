@@ -945,7 +945,10 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         }
     }
 
-    run_operator_streaming(prepared.operator, &ctx, sink).await
+    // A sub-query plans at run time; name the variables in its plan errors.
+    run_operator_streaming(prepared.operator, &ctx, sink)
+        .await
+        .map_err(|e| e.name_variables(vars))
 }
 
 /// Prepare and execute a query in a single call.
@@ -969,6 +972,8 @@ pub async fn execute<'a>(
             .dataset
             .is_some_and(|ds| ds.default_graphs().len() >= 2),
     );
-    let prepared = prepare_execution_with_config(db, query, &prepare_config).await?;
+    let prepared = prepare_execution_with_config(db, query, &prepare_config)
+        .await
+        .map_err(|e| e.name_variables(vars))?;
     execute_prepared(db, vars, prepared, config).await
 }

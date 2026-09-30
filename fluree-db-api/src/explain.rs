@@ -603,7 +603,7 @@ fn explain_from_parsed(
         let stats_arc = stats_view.clone().map(std::sync::Arc::new);
         match fluree_db_query::build_operator_tree(parsed, stats_arc, &planning) {
             Ok(op) => serde_json::to_value(op.describe()).unwrap_or(JsonValue::Null),
-            Err(e) => json!({ "error": e.to_string() }),
+            Err(e) => json!({ "error": e.name_variables(vars).to_string() }),
         }
     };
 
