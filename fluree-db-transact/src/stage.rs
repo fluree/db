@@ -51,33 +51,23 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 /// their slots for list positions.
 pub const DELETE_WITNESSED_SITE: &str = "delete_witnessed";
 
-/// Build a reverse lookup from graph Sid → GraphId.
-///
-/// Given `graph_sids` (ledger GraphId → Sid), returns the
-/// inverse mapping. Used by SHACL/policy to determine which graph a flake
-/// belongs to based on its `Flake.g` field.
 /// Generate cascade `f:reifies*` retraction flakes for any base edges
 /// being retracted in `flakes`.
 ///
 /// For each retract flake whose predicate is *not* a system-controlled
-/// `f:reifies*` predicate, build the corresponding `EdgeKey` and look
-/// up its currently-asserted annotations against the merged
-/// snapshot+novelty view. For each annotation, emit the inverse
-/// `f:reifies*` bundle so the durable encoding doesn't keep pointing
-/// at a retracted edge.
+/// `f:reifies*` predicate, build the corresponding `EdgeKey` and look up the
+/// annotations that reify it. Each one's bundle is retracted **as stored**,
+/// read by [`CurrentFacts::of_subject`] with the edge's graph stamped: the
+/// retraction names exactly the bundle facts the ledger holds, whichever
+/// builder wrote them, so a named-graph bundle is retracted in its graph with
+/// its `f:reifiesGraph` anchor, and a default-graph bundle stays in the
+/// default graph.
 ///
-/// **Read path:** uses scan-based lookup through
-/// `range_with_overlay`, which reads novelty + indexed base storage,
-/// so annotations that have rolled into base storage post-reindex
-/// are still found and cascaded.
-///
-/// **Graph context:** the inverse bundle is emitted via
-/// `EdgeKey::to_reifies_facts_jsonld_compatible`, which carries the
-/// edge's `g` through to each retract flake. Named-graph assertions
-/// are retracted in the same named graph; default-graph assertions
-/// stay in the default graph. Without this graph-aware emission,
-/// named-graph annotations would be orphaned by mismatched-graph
-/// retracts.
+/// **Read path:** the annotation candidates come from one POST point lookup
+/// per retracted edge (`range_with_overlay`, novelty + indexed base), so
+/// annotations that have rolled into base storage post-reindex are still
+/// found and cascaded; each candidate's facts then take one bounded subject
+/// read.
 ///
 /// **Performance:** a ledger that has never observed a `f:reifies*`
 /// flake pays zero — the dual-gate fast-path below returns immediately
@@ -142,6 +132,19 @@ async fn cascade_attachment_retracts(
             fluree_vocab::db::REIFIES_SUBJECT,
         );
         let to_t = ledger.t();
+        let current = CurrentFacts::new(ledger);
+        let is_bundle = |f: &StoredFact| is_reserved_reifies_predicate(&f.flake().p);
+        let retract_all = |facts: Vec<StoredFact>| {
+            facts
+                .into_iter()
+                .map(|f| f.retract(new_t).into_flake())
+                .collect::<Vec<_>>()
+        };
+        // `EdgeKey::from_reifies_facts` reads flakes.
+        let decode = |bundle: &[StoredFact]| {
+            let flakes: Vec<Flake> = bundle.iter().map(|f| f.flake().clone()).collect();
+            EdgeKey::from_reifies_facts(&flakes)
+        };
 
         // Annotation subjects already cascaded in pass 1 (base-edge
         // retract). Pass 2 (orphan-cleanup) skips these so the
@@ -210,34 +213,19 @@ async fn cascade_attachment_retracts(
                     continue;
                 }
 
-                // SPOT scan for ALL of the candidate's flakes (system
-                // bundle + body metadata). Splitting after the scan
-                // lets us reuse the same flake set for bundle-validation
-                // and (for anonymous annotations) metadata cleanup.
-                let all_ann_flakes = fluree_db_core::range_with_overlay(
-                    &ledger.snapshot,
-                    g_id,
-                    ledger.novelty.as_ref(),
-                    IndexType::Spot,
-                    RangeTest::Eq,
-                    RangeMatch::new().with_subject(ann_sid.clone()),
-                    RangeOptions::new().with_to_t(to_t),
-                )
-                .await?;
-                // `from_reifies_facts` reconciles the bundle's `f:reifiesGraph`
-                // value against the flake-level `g`, so an indexed named-graph
-                // bundle decoded as `GraphMismatch` and the `Err(_) => continue`
-                // below swallowed it: deleting a base edge left the claim that
-                // reifies it live, pointing at a triple that no longer exists.
-                let mut all_ann_flakes = all_ann_flakes;
-                stamp_graph(&mut all_ann_flakes, flake.g.as_ref());
-                let (bundle, metadata): (Vec<Flake>, Vec<Flake>) = all_ann_flakes
+                // All of the candidate's facts (system bundle + body
+                // metadata), stamped with the edge's graph: index rows decode
+                // without one, and `from_reifies_facts` reconciles the
+                // bundle's `f:reifiesGraph` against the flake-level `g`.
+                let (bundle, metadata): (Vec<StoredFact>, Vec<StoredFact>) = current
+                    .of_subject(g_id, flake.g.as_ref(), &ann_sid)
+                    .await?
                     .into_iter()
-                    .partition(|f| is_reserved_reifies_predicate(&f.p));
+                    .partition(is_bundle);
                 if bundle.is_empty() {
                     continue;
                 }
-                let cand_edge = match EdgeKey::from_reifies_facts(&bundle) {
+                let cand_edge = match decode(&bundle) {
                     Ok(k) => k,
                     Err(_) => continue,
                 };
@@ -245,11 +233,8 @@ async fn cascade_attachment_retracts(
                     continue;
                 }
 
-                // Build the f:reifies* retraction bundle. JSON-LD-
-                // compatible shape (no f:reifiesDatatype) so the
-                // inverse retract is byte-symmetric with the original
-                // assertion.
-                cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(&ann_sid, new_t, false));
+                // Retract the bundle as stored.
+                cascade.extend(retract_all(bundle));
 
                 // Annotation-body metadata cleanup. Two modes:
                 //
@@ -266,16 +251,7 @@ async fn cascade_attachment_retracts(
                 let cleanup_metadata = lpg_edge_lifecycle
                     || ann_sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE;
                 if cleanup_metadata {
-                    for asserted in metadata {
-                        // Mirror the asserted shape with `op = false`
-                        // and the new transaction's `t`. Preserves
-                        // graph (`g`), datatype, and metadata so the
-                        // retract matches the assertion's identity.
-                        let mut retract = asserted.clone();
-                        retract.t = new_t;
-                        retract.op = false;
-                        cascade.push(retract);
-                    }
+                    cascade.extend(retract_all(metadata));
                 }
                 // Track this annotation as already-cascaded so the
                 // orphan-cleanup pass below doesn't double-retract.
@@ -336,35 +312,24 @@ async fn cascade_attachment_retracts(
                 continue;
             }
 
-            // Scan all currently-asserted flakes for this subject.
-            let all_flakes = fluree_db_core::range_with_overlay(
-                &ledger.snapshot,
-                g_id,
-                ledger.novelty.as_ref(),
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch::new().with_subject(ann_sid.clone()),
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            // Same seam as the base-edge pass above: stamp before decoding.
-            // The group's own retracts are this transaction's flakes for this
-            // subject, so they carry the graph the scan dropped.
-            let mut all_flakes = all_flakes;
-            stamp_graph(
-                &mut all_flakes,
-                retract_set.first().and_then(|f| f.g.as_ref()),
-            );
-            let (bundle, current_metadata): (Vec<Flake>, Vec<Flake>) = all_flakes
+            // Every current fact of the subject. The group's own retracts
+            // are this transaction's flakes for this subject, so they carry
+            // the graph to stamp.
+            let (bundle, current_metadata): (Vec<StoredFact>, Vec<StoredFact>) = current
+                .of_subject(
+                    g_id,
+                    retract_set.first().and_then(|f| f.g.as_ref()),
+                    &ann_sid,
+                )
+                .await?
                 .into_iter()
-                .partition(|f| is_reserved_reifies_predicate(&f.p));
+                .partition(is_bundle);
             if bundle.is_empty() {
                 continue; // not an annotation subject
             }
-            let edge_key = match EdgeKey::from_reifies_facts(&bundle) {
-                Ok(k) => k,
-                Err(_) => continue, // malformed; skip
-            };
+            if decode(&bundle).is_err() {
+                continue; // malformed; skip
+            }
 
             // Compute the post-transaction metadata set:
             // (current metadata - retracts in this txn) ∪ asserts in this
@@ -401,7 +366,7 @@ async fn cascade_attachment_retracts(
             // dedupe for free).
             let post_metadata: HashSet<FlakeIdentity> = current_metadata
                 .iter()
-                .map(identity)
+                .map(|f| identity(f.flake()))
                 .filter(|id| !retracted_ids.contains(id))
                 .chain(asserted_ids)
                 .collect();
@@ -410,23 +375,22 @@ async fn cascade_attachment_retracts(
             }
 
             // Annotation has no surviving metadata after the txn → the
-            // user is disposing of it. Retract the bundle in the
-            // JSON-LD-compatible shape so it cancels the original
-            // assertion.
-            cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(&ann_sid, new_t, false));
+            // user is disposing of it. Retract the bundle as stored.
+            cascade.extend(retract_all(bundle));
         }
 
         // ---------------------------------------------------------------
-        // Pass 3: body cleanup for user-explicit bundle retracts.
+        // Pass 3: completing a user-explicit bundle retract.
         //
         // The by-id retract pre-pass
         // (`fluree_db_transact::parse::edge_annotations::lower_delete_annotation_blocks`)
-        // synthesizes only `f:reifies*` retracts — the bundle, no body.
-        // Without this pass, the annotation's body metadata persists
-        // after the bundle is gone. That matches the design contract
-        // for explicit-IRI annotations in default RDF mode
-        // (user-named resources stay queryable as ordinary RDF) but
-        // breaks two cases:
+        // names the bundle's subject, predicate and object slots — not
+        // `f:reifiesGraph`, `f:reifiesLang` or the body. Retracting the
+        // required slots disposes of the attachment, so every other slot
+        // of the stored bundle is retracted with them: an `f:reifiesGraph`
+        // anchor left behind would describe nothing.
+        //
+        // The body is cleaned up in two cases:
         //
         // 1. **Anonymous (BLANK_NODE) annotations:** body becomes
         //    orphaned bnode-keyed flakes that the wildcard-hide filter
@@ -465,10 +429,8 @@ async fn cascade_attachment_retracts(
             }
 
             // Verify all three required slots are retracted at the same
-            // t. The pre-pass emits exactly those three (plus
-            // `f:reifiesGraph` for named-graph annotations); a partial
-            // user-issued retract isn't a "complete bundle retract"
-            // signal.
+            // t; a partial user-issued retract isn't a "complete bundle
+            // retract" signal.
             let has_required = [
                 fluree_vocab::db::REIFIES_SUBJECT,
                 fluree_vocab::db::REIFIES_PREDICATE,
@@ -487,31 +449,30 @@ async fn cascade_attachment_retracts(
 
             let is_anonymous = ann_sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE;
             let cleanup_body = is_anonymous || lpg_edge_lifecycle;
-            if !cleanup_body {
+            // A re-pointed reifier keeps a bundle; the transaction writes it.
+            let complete_bundle = !repointed.contains(&ann_sid);
+            if !cleanup_body && !complete_bundle {
                 continue;
             }
 
-            // Scan currently-asserted flakes for this annotation
-            // subject. Filter out the bundle (Pass 1's domain) and
-            // emit retracts mirroring each body assertion.
-            let all_flakes = fluree_db_core::range_with_overlay(
-                &ledger.snapshot,
-                g_id,
-                ledger.novelty.as_ref(),
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch::new().with_subject(ann_sid.clone()),
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            for asserted in all_flakes {
-                if is_reserved_reifies_predicate(&asserted.p) {
-                    continue;
-                }
-                let mut retract = asserted.clone();
-                retract.t = new_t;
-                retract.op = false;
-                cascade.push(retract);
+            // Current facts of the annotation subject, stamped with the
+            // graph of the bundle being retracted. The slots this
+            // transaction already retracts come back too; the caller dedups
+            // cascade output against them.
+            let (bundle, body): (Vec<StoredFact>, Vec<StoredFact>) = current
+                .of_subject(
+                    g_id,
+                    bundle_retracts.first().and_then(|f| f.g.as_ref()),
+                    &ann_sid,
+                )
+                .await?
+                .into_iter()
+                .partition(is_bundle);
+            if complete_bundle {
+                cascade.extend(retract_all(bundle));
+            }
+            if cleanup_body {
+                cascade.extend(retract_all(body));
             }
         }
 
@@ -522,6 +483,11 @@ async fn cascade_attachment_retracts(
     .await
 }
 
+/// Build a reverse lookup from graph Sid → GraphId.
+///
+/// Given `graph_sids` (ledger GraphId → Sid), returns the
+/// inverse mapping. Used by SHACL/policy to determine which graph a flake
+/// belongs to based on its `Flake.g` field.
 fn build_reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, GraphId> {
     graph_sids
         .iter()
