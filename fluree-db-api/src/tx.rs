@@ -403,7 +403,7 @@ fn is_empty_default_graph(json: &JsonValue) -> bool {
 /// A read failure fails the transaction: without the config there is no
 /// telling what SHACL or uniqueness would have enforced, and reading it as
 /// "no config" would admit the write unchecked.
-async fn load_transaction_config(
+pub(crate) async fn load_transaction_config(
     ledger: &LedgerState,
 ) -> std::result::Result<Option<Arc<LedgerConfig>>, fluree_db_transact::TransactError> {
     #[cfg(test)]
@@ -428,23 +428,23 @@ async fn load_transaction_config(
 pub(crate) async fn enforcement_config(
     view: &StagedLedger,
 ) -> std::result::Result<Option<Arc<LedgerConfig>>, fluree_db_transact::TransactError> {
-    if written_user_graphs(view).is_empty() {
+    let writes_user_graph = view
+        .staged_flakes_by_graph()
+        .any(|(g_id, _)| !crate::export::is_system_graph(g_id));
+    if !writes_user_graph {
         return Ok(None);
     }
     load_transaction_config(view.base()).await
 }
 
 /// The user graphs (the default graph and named graphs; never `#config` or
-/// `#txn-meta`) a staged transaction writes, sorted.
-fn written_user_graphs(view: &StagedLedger) -> Vec<GraphId> {
-    let mut graphs: Vec<GraphId> = view
-        .staged_flakes_by_graph()
+/// `#txn-meta`) a staged transaction writes, in id order.
+#[cfg(feature = "shacl")]
+fn written_user_graphs(view: &StagedLedger) -> std::collections::BTreeSet<GraphId> {
+    view.staged_flakes_by_graph()
         .map(|(g_id, _)| g_id)
         .filter(|g_id| !crate::export::is_system_graph(*g_id))
-        .collect();
-    graphs.sort_unstable();
-    graphs.dedup();
-    graphs
+        .collect()
 }
 
 /// Test-only fault injection for [`load_transaction_config`]: while a guard
@@ -1481,9 +1481,11 @@ fn refuse_inline_shapes_in_policy_scope(
 }
 
 /// The SHACL inputs a transaction request carries, taken off the `Txn` before
-/// staging consumes it.
+/// staging consumes it. A write with no request surface (a branch operation)
+/// carries the default: no inline shapes, mode, identity or policy.
 #[cfg(feature = "shacl")]
-struct ShaclRequest<'a> {
+#[derive(Default)]
+pub(crate) struct ShaclRequest<'a> {
     /// Inline shapes (`opts.shapes`). Moved off the txn rather than cloned:
     /// the staging path itself never reads them, and they can be a large
     /// JSON-LD document. (So the take is not retry-safe: a retry on the same
@@ -1644,6 +1646,73 @@ async fn enforce_unique_after_staging(
     }
     enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
     Ok(true)
+}
+
+/// What a write brings to the checks on its staged view. A write with no
+/// request surface (a branch operation) takes the default.
+#[derive(Default)]
+pub(crate) struct WriteChecks<'a> {
+    /// The request's SHACL inputs (inline shapes, requested mode, identity,
+    /// policy).
+    #[cfg(feature = "shacl")]
+    pub(crate) shacl_request: ShaclRequest<'a>,
+    /// Inline `opts.uniqueProperties`.
+    pub(crate) unique_properties: Option<&'a [String]>,
+    pub(crate) tracker: Option<&'a Tracker>,
+    /// The request's `@context`, to compact violation reports against.
+    pub(crate) txn_context: Option<&'a JsonValue>,
+    /// Whether the staged-config guard runs: on every authoring lane. Branch
+    /// operations do not run it here.
+    pub(crate) config_guard: bool,
+}
+
+/// The checks every write runs on its staged view before it may commit, in
+/// one place so write lanes cannot drift apart: one pre-transaction config
+/// read ([`enforcement_config`]), then SHACL, uniqueness, and (for authoring
+/// lanes) the staged-config guard. `ns` is the staged namespace registry
+/// (its delta holds the codes the write introduces) and `graph_delta` the
+/// staged named graphs' IRIs. Returns whether a governance check ran, which
+/// commit provenance records.
+pub(crate) async fn check_staged_write(
+    view: &mut StagedLedger,
+    ns: &mut NamespaceRegistry,
+    graph_delta: &FxHashMap<u16, String>,
+    checks: WriteChecks<'_>,
+    resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+) -> std::result::Result<bool, fluree_db_transact::TransactError> {
+    let config = enforcement_config(view).await?;
+
+    #[cfg(feature = "shacl")]
+    let validated = Box::pin(validate_staged_shacl(
+        view,
+        ns,
+        graph_delta,
+        checks.shacl_request,
+        config.as_deref(),
+        resolve_ctx,
+        checks.tracker,
+        checks.txn_context,
+    ))
+    .await?;
+    #[cfg(not(feature = "shacl"))]
+    let validated = {
+        let _ = (checks.tracker, checks.txn_context);
+        false
+    };
+
+    let unique_enforced = enforce_unique_after_staging(
+        view,
+        graph_delta,
+        resolve_ctx,
+        checks.unique_properties,
+        ns,
+        config.as_deref(),
+    )
+    .await?;
+    if checks.config_guard {
+        crate::config_guard::validate_staged_config(view, ns, graph_delta).await?;
+    }
+    Ok(validated || unique_enforced)
 }
 
 /// Derive the set of user graph IDs that staged assertions touch. Used by
@@ -2600,7 +2669,6 @@ impl crate::Fluree {
         let base_t = ledger.t();
         let mut resolve_ctx =
             crate::cross_ledger::ResolveCtx::new(&ledger_id, self).with_data_state(ledger.clone());
-        #[cfg(feature = "shacl")]
         let tracker = options.tracker;
         #[cfg(feature = "shacl")]
         let shacl_request = ShaclRequest::take(&mut txn, options.policy_ctx);
@@ -2612,7 +2680,6 @@ impl crate::Fluree {
         // inlined into each of them overflows rustc's layout depth limit in
         // callers that nest a few async layers deep.
         let staged = Box::pin(stage_txn(ledger, txn, ns_registry, options)).await;
-        #[cfg_attr(not(feature = "shacl"), allow(unused_mut))]
         let (mut view, mut ns_registry, graph_delta) = match staged {
             Ok(staged) => staged,
             Err(e) => {
@@ -2622,44 +2689,27 @@ impl crate::Fluree {
             }
         };
 
-        // One config read serves SHACL and uniqueness, and none happens for
-        // a transaction that writes only system graphs.
-        let config = enforcement_config(&view).await?;
-
-        #[cfg(feature = "shacl")]
-        let validated = Box::pin(validate_staged_shacl(
+        let governed = Box::pin(check_staged_write(
             &mut view,
             &mut ns_registry,
             &graph_delta,
-            shacl_request,
-            config.as_deref(),
+            WriteChecks {
+                #[cfg(feature = "shacl")]
+                shacl_request,
+                unique_properties: inline_unique_properties.as_deref(),
+                tracker,
+                txn_context,
+                config_guard: true,
+            },
             &mut resolve_ctx,
-            tracker,
-            txn_context,
         ))
         .await?;
-        #[cfg(not(feature = "shacl"))]
-        let validated = {
-            let _ = txn_context;
-            false
-        };
-
-        let unique_enforced = enforce_unique_after_staging(
-            &view,
-            &graph_delta,
-            &mut resolve_ctx,
-            inline_unique_properties.as_deref(),
-            &ns_registry,
-            config.as_deref(),
-        )
-        .await?;
-        crate::config_guard::validate_staged_config(&view, &ns_registry, &graph_delta).await?;
 
         Ok(CheckedStage {
             view,
             ns_registry,
             graph_delta,
-            governed: validated || unique_enforced,
+            governed,
         })
     }
 }
@@ -3874,7 +3924,7 @@ impl crate::Fluree {
         // write would skip transaction-time enforcement entirely (the JSON/IR
         // path applies it via StageOptions; the direct flake path must too).
         let options = stage_options(index_config, policy, tracker);
-        let view = match stage_flakes(ledger, flakes, options).await {
+        let mut view = match stage_flakes(ledger, flakes, options).await {
             Ok(view) => view,
             Err(e) => {
                 self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
@@ -3882,58 +3932,28 @@ impl crate::Fluree {
                 return Err(e.into());
             }
         };
-        // The same config checks a JSON-LD or SPARQL transaction gets.
-        crate::config_guard::validate_staged_config(
-            &view,
-            &ns_registry,
+        // The checks every write lane runs on its staged view
+        // (`check_staged_write`): SHACL, uniqueness and the staged-config
+        // guard, under one config read. Plain Turtle has no named-graph
+        // metadata (that's TriG), so there is no graph delta: every flake
+        // `FlakeSink` produces is in the default graph. Turtle carries no
+        // request surface (inline shapes, validation mode, JSON-LD context),
+        // so it runs the configured posture and violations name full IRIs.
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+            .with_data_state(view.base().clone());
+        check_staged_write(
+            &mut view,
+            &mut ns_registry,
             &rustc_hash::FxHashMap::default(),
+            WriteChecks {
+                tracker,
+                config_guard: true,
+                ..WriteChecks::default()
+            },
+            &mut resolve_ctx,
         )
         .await
         .map_err(ApiError::from)?;
-
-        // Apply SHACL policy to the staged view. Plain Turtle has no named-graph
-        // metadata (that's TriG), so there is no graph_delta: every flake
-        // `FlakeSink` produces is in the default graph. Config is read after
-        // staging, from the pre-stage state the view keeps, and only when the
-        // insert writes a user graph; shapes sources resolve inside the pass,
-        // only where SHACL is enabled.
-        // The SHACL pass attaches the staged dictionaries to the view.
-        #[cfg(feature = "shacl")]
-        let mut view = view;
-        #[cfg(feature = "shacl")]
-        {
-            let config = enforcement_config(&view).await.map_err(ApiError::from)?;
-            let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
-                .with_data_state(view.base().clone());
-            apply_shacl_policy_to_staged_view(
-                &mut view,
-                StagedShaclContext {
-                    graph_delta: None,
-                    tracker,
-                    staged_ns: Some(&ns_registry),
-                    // The prefixes this document declared, which the snapshot has
-                    // not seen yet — without them a violation on a predicate the
-                    // document introduces has no IRI to report.
-                    uncommitted_namespaces: Some(ns_registry.delta()),
-                    // Turtle carries its prefixes in the document, not as a
-                    // JSON-LD context the API sees, so violations name full IRIs.
-                    txn_context: None,
-                    // Turtle insert API has no `opts.shapes` surface
-                    // today — inline SHACL flows in over the JSON
-                    // transaction path. Wireable later if needed.
-                    inline_shape_bundle: None,
-                    // Turtle insert likewise has no `opts.validationMode`
-                    // surface — it always runs the configured posture.
-                    requested_validation_mode: None,
-                    request_identity: None,
-                    origin_validated_replay: false,
-                },
-                config.as_deref(),
-                Some(&mut resolve_ctx),
-            )
-            .await
-            .map_err(ApiError::from)?;
-        }
 
         // Plain Turtle doesn't support named graphs or txn-meta extraction (TriG support handles these)
         Ok(StageResult {

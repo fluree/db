@@ -1,11 +1,12 @@
-//! SHACL validation for branch operations.
+//! Validation for branch operations.
 //!
-//! Merge, rebase, revert, and merge preview build their commits on a path
-//! parallel to the transaction pipeline, staging flakes straight into a
-//! [`StagedLedger`]. This module runs the same post-stage validation the
-//! transaction path runs (`apply_shacl_policy_to_staged_view`), so a branch
-//! operation whose resulting state the ledger's shapes reject fails exactly
-//! as a transaction producing that state would.
+//! Merge (fast-forward included), rebase, revert, and their previews build
+//! their commits on a path parallel to the transaction pipeline, staging
+//! flakes straight into a [`StagedLedger`]. This module runs the checks the
+//! transaction path runs on a staged view (`check_staged_write`: SHACL and
+//! uniqueness under the target's configuration), so a branch operation whose
+//! resulting state the ledger's configuration rejects fails exactly as a
+//! transaction producing that state would.
 //!
 //! A branch operation is authoring, not replay: the combination it stages
 //! onto the target is new state nobody has validated. So, unlike commit
@@ -18,22 +19,34 @@ use crate::error::{ApiError, Result};
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::{ConflictKey, Flake, GraphId, Sid};
 use fluree_db_ledger::{LedgerState, StagedLedger};
+use fluree_db_transact::TransactError;
 use std::collections::{BTreeSet, HashMap};
 
 /// Outcome of validating a branch operation's staged view.
 ///
 /// Warn-mode violations are logged by the validator and never surface here,
-/// matching the transaction path. Only reject-mode violations produce a
-/// report.
-#[derive(Clone, Debug, Default)]
+/// matching the transaction path. Only a rejection produces an outcome: a
+/// SHACL violation report, or a uniqueness violation.
+#[derive(Debug, Default)]
 pub(crate) struct BranchOpValidation {
-    /// Formatted violation report, `None` when the view conforms.
-    pub(crate) report: Option<String>,
+    /// The error a transaction producing the same state would fail with,
+    /// `None` when the view conforms.
+    rejection: Option<TransactError>,
 }
 
 impl BranchOpValidation {
     pub(crate) fn conforms(&self) -> bool {
-        self.report.is_none()
+        self.rejection.is_none()
+    }
+
+    /// The rejection as a report for a preview: the SHACL violation report,
+    /// or the uniqueness violation's message. `None` when the view conforms.
+    pub(crate) fn report(&self) -> Option<String> {
+        self.rejection.as_ref().map(|rejection| match rejection {
+            #[cfg(feature = "shacl")]
+            TransactError::ShaclViolation(report) => report.clone(),
+            other => other.to_string(),
+        })
     }
 
     /// Turn a rejected outcome into the error a transaction producing the
@@ -42,23 +55,21 @@ impl BranchOpValidation {
         self.into_result_with(|report| report)
     }
 
-    /// Like [`Self::into_result`], with `describe` wrapping the report in
+    /// Like [`Self::into_result`], with `describe` wrapping a SHACL report in
     /// the operation's own context (which commit a rebase stopped on, say).
+    /// A uniqueness violation already names the values that collide and is
+    /// returned as it is.
     pub(crate) fn into_result_with(self, describe: impl FnOnce(String) -> String) -> Result<()> {
-        match self.report {
+        match self.rejection {
             None => Ok(()),
             #[cfg(feature = "shacl")]
-            Some(report) => {
-                Err(fluree_db_transact::TransactError::ShaclViolation(describe(report)).into())
+            Some(TransactError::ShaclViolation(report)) => {
+                Err(TransactError::ShaclViolation(describe(report)).into())
             }
-            // Without the feature no validator runs, so no report is ever
-            // produced; keep the match total without naming a variant that
-            // does not exist in this configuration.
-            #[cfg(not(feature = "shacl"))]
-            Some(report) => Err(crate::error::ApiError::internal(format!(
-                "SHACL violation reported without the shacl feature: {}",
-                describe(report)
-            ))),
+            Some(rejection) => {
+                let _ = describe;
+                Err(rejection.into())
+            }
         }
     }
 }
@@ -189,20 +200,19 @@ impl crate::Fluree {
             .map(Some)
     }
 
-    /// Validate a staged view against the target ledger's SHACL
-    /// configuration and shapes. `new_graph_iris` names graphs the incoming
-    /// commits create, which the target's registry does not know yet.
-    #[cfg(feature = "shacl")]
+    /// Run the checks a transaction runs on its staged view
+    /// ([`crate::tx::check_staged_write`]) against the target's
+    /// configuration: SHACL and uniqueness, under the target's pre-operation
+    /// config. `new_graph_iris` names graphs the incoming commits create,
+    /// which the target's registry does not know yet.
     async fn validate_branch_op_view(
         &self,
         view: &mut StagedLedger,
         namespace_delta: &HashMap<u16, String>,
         new_graph_iris: &HashMap<GraphId, String>,
     ) -> Result<BranchOpValidation> {
-        use crate::tx::{
-            apply_shacl_policy_to_staged_view, enforcement_config, StagedShaclContext,
-        };
-        use fluree_db_transact::{NamespaceRegistry, TransactError};
+        use crate::tx::{check_staged_write, WriteChecks};
+        use fluree_db_transact::NamespaceRegistry;
 
         if !view.has_staged() {
             return Ok(BranchOpValidation::default());
@@ -210,14 +220,11 @@ impl crate::Fluree {
 
         let base = view.base();
         let ledger_id = base.snapshot.ledger_id.clone();
-
-        // Config from the target's pre-operation state. Shapes and schema
-        // sources resolve inside the SHACL pass, only where SHACL is enabled.
-        let config = enforcement_config(view).await?;
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, self);
 
         // The staged namespace registry: the snapshot's codes plus the ones
-        // this operation brings in.
+        // this operation brings in (its delta then holds them, for violation
+        // messages and `sh:sparql` lowering).
         // Sibling branches allocate codes independently, so a code or prefix
         // the source introduced can already mean something else on the
         // target. The commit builder rejects such a merge too; surfacing it
@@ -233,7 +240,7 @@ impl crate::Fluree {
             })?;
         // Graph routing for the staged flakes: every named graph they touch,
         // with its IRI for per-graph config resolution. The default graph
-        // always gets the ledger-wide policy.
+        // always gets the ledger-wide settings.
         let mut graph_delta: rustc_hash::FxHashMap<u16, String> = rustc_hash::FxHashMap::default();
         for (g_id, _) in view.staged_flakes_by_graph().filter(|(g_id, _)| *g_id != 0) {
             let iri = base
@@ -247,47 +254,35 @@ impl crate::Fluree {
             }
         }
 
-        let ctx = StagedShaclContext {
-            graph_delta: Some(&graph_delta),
-            tracker: None,
-            staged_ns: Some(&staged_ns),
-            uncommitted_namespaces: Some(namespace_delta),
-            txn_context: None,
-            inline_shape_bundle: None,
-            requested_validation_mode: None,
-            request_identity: None,
-            origin_validated_replay: false,
-        };
-
-        // The flag says whether validation actually ran, which the
-        // transaction path threads into commit provenance. A branch
-        // operation only needs to know whether anything rejected it, and a
-        // pass that was skipped (SHACL disabled, or no shapes) rejects
-        // nothing.
-        match apply_shacl_policy_to_staged_view(
+        // A branch operation only needs to know whether anything rejected
+        // it; whether a check ran (commit provenance for a transaction) does
+        // not matter here.
+        match check_staged_write(
             view,
-            ctx,
-            config.as_deref(),
-            Some(&mut resolve_ctx),
+            &mut staged_ns,
+            &graph_delta,
+            WriteChecks::default(),
+            &mut resolve_ctx,
         )
         .await
         {
-            Ok(_ran) => Ok(BranchOpValidation::default()),
-            Err(TransactError::ShaclViolation(report)) => Ok(BranchOpValidation {
-                report: Some(report),
+            Ok(_governed) => Ok(BranchOpValidation::default()),
+            Err(rejection) if is_rejection(&rejection) => Ok(BranchOpValidation {
+                rejection: Some(rejection),
             }),
             Err(e) => Err(e.into()),
         }
     }
+}
 
-    /// Without the `shacl` feature there is nothing to validate against.
-    #[cfg(not(feature = "shacl"))]
-    async fn validate_branch_op_view(
-        &self,
-        _view: &mut StagedLedger,
-        _namespace_delta: &HashMap<u16, String>,
-        _new_graph_iris: &HashMap<GraphId, String>,
-    ) -> Result<BranchOpValidation> {
-        Ok(BranchOpValidation::default())
+/// Whether `error` is a validation rejection (the staged state breaks the
+/// ledger's shapes or uniqueness constraints) rather than a failure to
+/// validate at all.
+fn is_rejection(error: &TransactError) -> bool {
+    match error {
+        TransactError::UniqueConstraintViolation { .. } => true,
+        #[cfg(feature = "shacl")]
+        TransactError::ShaclViolation(_) => true,
+        _ => false,
     }
 }

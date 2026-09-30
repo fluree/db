@@ -298,7 +298,7 @@ impl crate::Fluree {
                 Some(match staged {
                     Some((_view, outcome)) => ValidationSummary {
                         conforms: outcome.conforms(),
-                        report: outcome.report,
+                        report: outcome.report(),
                     },
                     // The strategy left nothing to apply, so nothing can reject
                     // it.

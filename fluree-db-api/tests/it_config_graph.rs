@@ -3397,6 +3397,54 @@ async fn unique_basic_enforcement() {
     );
 }
 
+/// Every write lane runs the same post-staging checks, uniqueness included:
+/// a plain Turtle insert (the streaming lane that skips JSON-LD) refuses the
+/// duplicate a JSON-LD insert refuses. It used to commit it.
+#[tokio::test]
+async fn unique_enforced_on_turtle_insert() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/unique-turtle:main";
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@graph": [
+                    {"@id": "ex:email", "f:enforceUnique": true},
+                    {"@id": "ex:alice", "ex:email": "alice@example.com"}
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = write_unique_config(&fluree, ledger, ledger_id).await.ledger;
+    let t = ledger.t();
+
+    let err = fluree
+        .stage_owned(ledger)
+        .insert_turtle(
+            "<http://example.org/bob> <http://example.org/email> \"alice@example.com\" .",
+        )
+        .execute()
+        .await
+        .expect_err("the Turtle lane enforces uniqueness");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(
+                fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+            )
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        fluree.ledger(ledger_id).await.unwrap().t(),
+        t,
+        "nothing committed"
+    );
+}
+
 /// Test: annotations exist but uniqueEnabled not set → duplicates allowed.
 #[tokio::test]
 async fn unique_not_enabled_no_enforcement() {

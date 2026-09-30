@@ -127,12 +127,14 @@ impl Default for MergePreviewOpts {
     }
 }
 
-/// SHACL outcome of staging the merge's resolved change set on the target.
+/// Outcome of staging the merge's resolved change set on the target and
+/// running a transaction's checks on it: SHACL and uniqueness, under the
+/// target's configuration.
 #[derive(Clone, Debug, Serialize)]
 pub struct ValidationSummary {
-    /// `true` when the merged state conforms to the target's shapes under
-    /// its configured posture (warn-mode violations are logged, not
-    /// reported, matching the transaction path).
+    /// `true` when the merged state passes the target's shapes and
+    /// uniqueness constraints under its configuration (warn-mode violations
+    /// are logged, not reported, matching the transaction path).
     pub conforms: bool,
     /// The violation report the merge would fail with. Present iff
     /// `conforms` is `false`.
@@ -717,7 +719,7 @@ impl crate::Fluree {
                     .await?;
                 Some(ValidationSummary {
                     conforms: outcome.conforms(),
-                    report: outcome.report,
+                    report: outcome.report(),
                 })
             } else {
                 None

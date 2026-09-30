@@ -622,6 +622,103 @@ async fn preview_fast_forward_carries_no_validation() {
     assert!(preview.mergeable);
 }
 
+/// Seed `mydb:main` with `ex:email f:enforceUnique true`, the config that
+/// enables uniqueness, and `ex:u1 ex:email "a@x"`, then fork `dev`.
+async fn seed_unique_email(fluree: &fluree_db_api::Fluree) {
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": EX, "f": "https://ns.flur.ee/db#"},
+                "@graph": [
+                    {"@id": "ex:email", "f:enforceUnique": true},
+                    {"@id": "ex:u1", "ex:email": "a@x"}
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .insert(
+            main,
+            &json!({
+                "@id": "urn:config:main",
+                "@type": "https://ns.flur.ee/db#LedgerConfig",
+                "@graph": "config",
+                "https://ns.flur.ee/db#transactDefaults": {
+                    "@id": "urn:config:transact",
+                    "https://ns.flur.ee/db#uniqueEnabled": true
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+}
+
+fn email(id: &str, value: &str) -> serde_json::Value {
+    json!({"@context": {"ex": EX}, "@id": id, "ex:email": value})
+}
+
+fn assert_unique_violation(err: &ApiError, context: &str) {
+    assert!(
+        matches!(
+            err,
+            ApiError::Transact(TransactError::UniqueConstraintViolation { .. })
+        ),
+        "{context}: expected UniqueConstraintViolation, got: {err:?}"
+    );
+}
+
+/// A merge runs the checks a transaction producing the merged state runs,
+/// uniqueness included: a value dev writes that main already holds under a
+/// unique constraint is refused, and the preview reports it.
+#[tokio::test]
+async fn merge_enforces_uniqueness_like_a_transaction() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_unique_email(&fluree).await;
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(dev, &email("ex:u2", "a@x"))
+        .await
+        .expect("dev takes the write");
+    // main moves on, so the merge is a general one.
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    fluree.insert(main, &email("ex:u9", "z@x")).await.unwrap();
+    let before = head_t(&fluree, "mydb:main").await;
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, MergePreviewOpts::default())
+        .await
+        .expect("preview");
+    assert!(!preview.fast_forward);
+    let validation = preview.validation.expect("validated");
+    assert!(!validation.conforms);
+    assert!(
+        validation
+            .report
+            .as_deref()
+            .is_some_and(|r| r.contains("Unique constraint violation")),
+        "{validation:?}"
+    );
+
+    let err = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect_err("the value is already taken on main");
+    assert_unique_violation(&err, "general merge");
+    assert_eq!(
+        head_t(&fluree, "mydb:main").await,
+        before,
+        "main keeps its head"
+    );
+}
+
 /// Opting out leaves the field absent and `mergeable` back to the
 /// strategy-only answer, for count-only previews.
 #[tokio::test]
