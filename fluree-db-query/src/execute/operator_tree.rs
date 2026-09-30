@@ -3296,26 +3296,35 @@ fn build_operator_tree_inner(
         planning,
     )?;
 
-    // Apply post-query VALUES clause after the WHERE tree is fully built.
-    // This is kept separate from `patterns` so the WHERE-clause planner cannot
-    // reorder it relative to OPTIONAL/UNION (which would change semantics).
-    if let Some(Pattern::Values { vars, rows }) = &query.post_values {
-        operator = Box::new(crate::values::ValuesOperator::new(
-            operator,
-            vars.clone(),
-            rows.clone(),
-        ));
-    }
+    // Apply the post-query VALUES clause after the WHERE tree is fully built.
+    // It is kept separate from `patterns` so the WHERE-clause planner cannot
+    // reorder it relative to OPTIONAL/UNION (which would change semantics). A
+    // grouped query joins it after HAVING instead (SPARQL 1.1 §18.2.4), in the
+    // modifier tail, so HAVING cannot read its variables.
+    let grouped_post_values = match &query.post_values {
+        Some(values) if query.grouping.is_some() => Some(values),
+        Some(Pattern::Values { vars, rows }) => {
+            operator = Box::new(crate::values::ValuesOperator::new(
+                operator,
+                vars.clone(),
+                rows.clone(),
+            ));
+            None
+        }
+        _ => None,
+    };
 
     // The solution-modifier tail (grouping → HAVING → post-binds → order-binds
     // → sort/validate → PROJECT → DISTINCT → OFFSET → LIMIT) is shared with the
     // per-row correlated-subquery pipeline (`SubqueryOperator`) via
     // `apply_solution_modifiers`, so both inherit identical modifier semantics.
-    // Only the WHERE build and outermost-only concerns (post-VALUES) stay here.
+    // Only the WHERE build and outermost-only concerns (an ungrouped query's
+    // post-VALUES) stay here.
     let projected = query.output.projected_vars();
     apply_solution_modifiers(
         operator,
         query.grouping.as_ref(),
+        grouped_post_values,
         &query.order_binds,
         &query.ordering,
         projected.as_deref(),
@@ -3344,6 +3353,9 @@ fn build_operator_tree_inner(
 /// `partitioned` is the streaming-GroupAggregate partition hint (callers that
 /// don't benefit pass `false`).
 ///
+/// `post_values` is a grouped query's trailing VALUES clause, joined after
+/// HAVING (SPARQL 1.1 §18.2.4); a sub-query has none.
+///
 /// `ungrouped` says whether the projection may read a variable the grouping
 /// does not produce (as a per-group list): only a JSON-LD top-level query may.
 /// Every other post-grouping read of such a variable — HAVING, the grouping's
@@ -3354,6 +3366,7 @@ fn build_operator_tree_inner(
 pub(crate) fn apply_solution_modifiers(
     mut operator: BoxedOperator,
     grouping: Option<&Grouping>,
+    post_values: Option<&Pattern>,
     order_binds: &[(VarId, Expression)],
     ordering: &[SortSpec],
     select_vars: Option<&[VarId]>,
@@ -3719,6 +3732,16 @@ pub(crate) fn apply_solution_modifiers(
         );
     }
 
+    // A grouped query's trailing VALUES clause joins here, after HAVING and
+    // before the SELECT expressions (SPARQL 1.1 §18.2.4).
+    if let Some(Pattern::Values { vars, rows }) = post_values {
+        operator = Box::new(crate::values::ValuesOperator::new(
+            operator,
+            vars.clone(),
+            rows.clone(),
+        ));
+    }
+
     // Post-aggregation BINDs (e.g., SELECT (CEIL(?avg) AS ?ceil))
     if !post_binds_vec.is_empty() {
         for (i, (var, expr)) in post_binds_vec.iter().enumerate() {
@@ -3991,6 +4014,7 @@ mod tests {
                     let mut op = apply_solution_modifiers(
                         input,
                         grouping.as_ref(),
+                        None,
                         &[],
                         &[],
                         Some(&outputs),
@@ -4057,6 +4081,7 @@ mod tests {
         let mut op = apply_solution_modifiers(
             input,
             grouping.as_ref(),
+            None,
             &[],
             &[],
             Some(&[value, count]),
@@ -4118,6 +4143,7 @@ mod tests {
             apply_solution_modifiers(
                 input(),
                 Some(grouping),
+                None,
                 &[],
                 ordering,
                 Some(select),
@@ -4247,6 +4273,7 @@ mod tests {
         let _tree = apply_solution_modifiers(
             op,
             None,
+            None,
             &[],
             &[SortSpec::desc(VarId(1))],
             None,
@@ -4312,6 +4339,7 @@ mod tests {
         // ORDER BY ASC(?1) LIMIT 10.
         let _tree = apply_solution_modifiers(
             op,
+            None,
             None,
             &[],
             &[SortSpec::asc(VarId(1))],
