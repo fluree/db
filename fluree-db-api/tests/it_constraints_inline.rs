@@ -257,3 +257,42 @@ async fn inline_unique_property_enforced_in_second_named_graph_jsonld() {
         "expected uniqueness violation error, got: {err}"
     );
 }
+
+/// `# PRAGMA unique-properties` is the SPARQL UPDATE twin of
+/// `opts.uniqueProperties`, applied wherever the update is lowered. The same
+/// duplicate without the pragma commits, so the rejection is the pragma's.
+#[tokio::test]
+async fn inline_unique_property_via_sparql_pragma() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let alias = "test/inline-constraints/sparql-pragma:main";
+    fluree.create_ledger(alias).await.expect("create ledger");
+    let insert = |pragma: &str, subject: &str| {
+        format!(
+            "{pragma}\nPREFIX ex: <http://example.org/ns/>\n\
+             INSERT DATA {{ ex:{subject} ex:email \"alice@example.org\" }}"
+        )
+    };
+    let update = |sparql: String| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph(alias)
+                .transact()
+                .sparql_update(&sparql)
+                .commit()
+                .await
+        }
+    };
+
+    update(insert("", "alice")).await.expect("seed alice");
+    update(insert("", "carol"))
+        .await
+        .expect("without the pragma a duplicate commits");
+    let err = update(insert("# PRAGMA unique-properties: ex:email", "bob"))
+        .await
+        .expect_err("duplicate value on a pragma-unique property must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected uniqueness violation error, got: {err}"
+    );
+}

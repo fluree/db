@@ -498,6 +498,10 @@ endpoints, used for replication, send an `ETag` and an immutable `Cache-Control`
 | `fluree-max-fuel` | Number | Fail the query once it consumes this much fuel |
 | `fluree-min-t` | Transaction `t` | See [Fluree-Min-T](#fluree-min-t) |
 
+A SPARQL request can carry these options in its text instead, as
+[`# PRAGMA` comments](../query/sparql.md#request-options--pragma) (all but `fluree-ledger` and the
+inline `fluree-policy`); a pragma wins over the header that names the same option.
+
 Whether a request may choose its own identity or policy depends on the server's
 authorization settings; see [Policy in Queries](../security/policy-in-queries.md). Tracking and
 fuel are covered in [Tracking and Fuel Limits](../query/tracking-and-fuel.md).

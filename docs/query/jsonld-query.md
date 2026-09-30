@@ -321,8 +321,9 @@ with the Fluree vocabulary (`https://ns.flur.ee/db#`, e.g. stored
 predicates — the internal storage encoding of edge annotations. They are
 system-written (user transactions cannot assert them), redundant with the
 edge and annotation content already in the results, and therefore hidden from
-variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` to
-surface them for debugging or inspection. Commit metadata (`f:t`, `f:address`,
+variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` (in
+SPARQL, `# PRAGMA include-system-facts: true`) to surface them for debugging or
+inspection. Commit metadata (`f:t`, `f:address`,
 …) lives in the ledger's txn-meta graph, not the default graph, so it never
 appears in default-graph scans either way.
 

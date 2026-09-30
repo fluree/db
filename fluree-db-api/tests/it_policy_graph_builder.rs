@@ -282,6 +282,80 @@ async fn identity_selects_its_stored_policy_class() {
 }
 
 // =========================================================================
+// SPARQL: `# PRAGMA` policy selection, the counterpart of `opts`
+// =========================================================================
+
+fn sparql_rows(v: &Value) -> usize {
+    v.pointer("/results/bindings")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+/// Runs `pragmas` + a query over `property` through both builders, after an
+/// unrestricted control, and returns the two row counts.
+async fn sparql_through_both_builders(
+    fluree: &Fluree,
+    ledger_id: &str,
+    property: &str,
+    pragmas: &str,
+) -> (usize, usize) {
+    let body = format!("SELECT ?s WHERE {{ ?s <{property}> ?v }}");
+    let control = fluree
+        .graph(ledger_id)
+        .query()
+        .sparql(&body)
+        .execute_formatted()
+        .await
+        .expect("control");
+    assert_eq!(sparql_rows(&control), 5, "control: {control}");
+
+    let graph = fluree
+        .graph(ledger_id)
+        .query()
+        .sparql(&format!("{pragmas}\n{body}"))
+        .execute_formatted()
+        .await
+        .expect("graph-scoped sparql");
+    let from = fluree
+        .query_from()
+        .sparql(&format!(
+            "{pragmas}\nSELECT ?s FROM <{ledger_id}> WHERE {{ ?s <{property}> ?v }}"
+        ))
+        .execute_formatted()
+        .await
+        .expect("from-driven sparql");
+    (sparql_rows(&graph), sparql_rows(&from))
+}
+
+/// Twin of `policy_class_selects_stored_rules`.
+#[tokio::test]
+async fn sparql_pragma_policy_class_selects_stored_rules() {
+    const LEDGER: &str = "repro/gqb-sparql-pragma-class:main";
+    let fluree = setup(LEDGER).await;
+    let pragmas = format!(
+        "# PRAGMA policy-class: <{READER}>\n\
+         # PRAGMA policy-values: {{\"?$identity\": {{\"@id\": \"{ALICE_ID}\"}}}}\n\
+         # PRAGMA default-allow: false"
+    );
+    assert_eq!(
+        sparql_through_both_builders(&fluree, LEDGER, SSN, &pragmas).await,
+        (1, 1)
+    );
+}
+
+/// Twin of `identity_selects_its_stored_policy_class`.
+#[tokio::test]
+async fn sparql_pragma_identity_selects_its_stored_policy_class() {
+    const LEDGER: &str = "repro/gqb-sparql-pragma-identity:main";
+    let fluree = setup(LEDGER).await;
+    let pragmas = format!("# PRAGMA identity: <{ALICE_ID}>");
+    assert_eq!(
+        sparql_through_both_builders(&fluree, LEDGER, SSN, &pragmas).await,
+        (1, 1)
+    );
+}
+
+// =========================================================================
 // Every terminal, not just `execute_formatted`
 // =========================================================================
 

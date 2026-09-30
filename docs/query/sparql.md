@@ -1320,6 +1320,45 @@ curl -X POST http://localhost:8090/v1/fluree/update \
       INSERT DATA { ex:alice ex:name "Alice" }'
 ```
 
+## Request options (`# PRAGMA`)
+
+A SPARQL request carries Fluree options in comments of the form `# PRAGMA name: value`. They are the SPARQL counterpart of a JSON-LD request's `opts` block and of the `fluree-*` [request headers](../api/headers.md#fluree-request-headers), and because they are comments, the text stays valid SPARQL for any other tool.
+
+```sparql
+# PRAGMA max-fuel: 5000
+# PRAGMA meta: fuel, time
+# PRAGMA policy-class: ex:EmployeeClass
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name WHERE { ?person ex:name ?name }
+```
+
+| Pragma | Value | Applies to | JSON-LD `opts` | Header |
+|--------|-------|------------|----------------|--------|
+| `reasoning` | `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`, `none`, or a list | queries | `reasoning` | — |
+| `reasoning-max-facts`, `reasoning-max-seconds`, `reasoning-max-memory-mb` | integer | queries | `reasoningBudget` | — |
+| `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
+| `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |
+| `meta` | `true`, `false`, or a list of `time`, `fuel`, `policy` | queries and updates | `meta` | `fluree-track-*` |
+| `max-fuel` | number | queries and updates | `max-fuel` | `fluree-max-fuel` |
+| `identity` | IRI | queries and updates | `identity` | `fluree-identity` |
+| `policy-class` | IRI list | queries and updates | `policy-class` | `fluree-policy-class` |
+| `policy-values` | one-line JSON object | queries and updates | `policy-values` | `fluree-policy-values` |
+| `default-allow` | `true` / `false` | queries and updates | `default-allow` | `fluree-default-allow` |
+| `event-time` | RFC 3339 timestamp | updates | `eventTime` | — |
+| `validation-mode` | `warn` / `reject` | updates | `validationMode` | — |
+| `unique-properties` | IRI list | updates | `uniqueProperties` | — |
+
+Rules:
+
+- **A comment whose first word is `PRAGMA` is a directive.** The name is case-insensitive, the `:` is optional, and list values are separated by commas or spaces. A pragma may sit anywhere a comment can, including after the query. When one repeats, the last wins.
+- **Errors are never silent.** An unknown name, a malformed value, or a pragma that does not apply to the request (`min-t` on an update, `event-time` on a query) fails the request with a `400` (diagnostic `F012`), rather than running it without the option it asked for.
+- **IRIs** may be written `<…>` or as a prefixed name the request declares with `PREFIX`; anything else (a DID, a URN) is taken as written.
+- **A pragma wins over the header** that names the same option, as a JSON-LD body's `opts` do.
+- **Policy pragmas are held to the caller's credential exactly as headers are.** A selection the credential does not permit is refused with a `403`. The inline policy document has no pragma; send it with the `fluree-policy` header. See [Policy in queries](../security/policy-in-queries.md#sparql-queries).
+- **In a multi-query envelope**, a SPARQL alias's pragmas act as its body `opts`, so they win over the alias's and the envelope's `opts`.
+- **The MCP `sparql_query` tool** refuses policy and `min-t` pragmas: the connection's identity selects policy, and the tool's `t` argument pins the snapshot.
+
 ## Best Practices
 
 1. **Use PREFIX Declarations**: Makes queries readable

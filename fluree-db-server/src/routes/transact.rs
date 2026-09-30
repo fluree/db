@@ -278,6 +278,24 @@ fn effective_did<'a>(
     governance.identity.as_deref().or(author)
 }
 
+/// Stamp a caller-supplied event time (`opts.eventTime`, `# PRAGMA
+/// event-time`) on the commit, for backdated historical loads.
+///
+/// Validated for RFC 3339 shape at the boundary; monotonicity/future bounds
+/// are enforced by the commit build path against the ledger head. Recording
+/// the wall-clock receipt time alongside flips the ledger into dual-stamp mode
+/// so `@recorded:` (audit-axis) time travel stays exact.
+fn with_event_time(commit_opts: CommitOpts, event_time: &str, field: &str) -> Result<CommitOpts> {
+    if chrono::DateTime::parse_from_rfc3339(event_time).is_err() {
+        return Err(ServerError::bad_request(format!(
+            "{field} is not a valid RFC 3339 timestamp: {event_time}"
+        )));
+    }
+    Ok(commit_opts
+        .with_timestamp(event_time.to_string())
+        .with_received_at(chrono::Utc::now().to_rfc3339()))
+}
+
 /// Build the [`CommitOpts`] for the transaction.
 ///
 /// Encodes the effective identity (so the commit records its author) and,
@@ -1988,12 +2006,6 @@ pub(crate) async fn execute_transaction(
         let did = effective_did(&prepared_transaction.governance, author);
         let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
 
-        // `opts.eventTime`: caller-supplied event time for this commit
-        // (backdated historical loads). Validated for RFC 3339 shape at the
-        // boundary; monotonicity/future bounds are enforced by the commit
-        // build path against the ledger head. Recording the wall-clock
-        // receipt time alongside flips the ledger into dual-stamp mode so
-        // `@recorded:` (audit-axis) time travel stays exact.
         if let Some(event_time_raw) = prepared_transaction
             .body
             .get("opts")
@@ -2005,15 +2017,8 @@ pub(crate) async fn execute_transaction(
                     "opts.eventTime must be an RFC 3339 timestamp string",
                 ));
             };
-            if chrono::DateTime::parse_from_rfc3339(event_time).is_err() {
-                set_span_error_code(&span, "error:BadRequest");
-                return Err(ServerError::bad_request(format!(
-                    "opts.eventTime is not a valid RFC 3339 timestamp: {event_time}"
-                )));
-            }
-            commit_opts = commit_opts
-                .with_timestamp(event_time.to_string())
-                .with_received_at(chrono::Utc::now().to_rfc3339());
+            commit_opts = with_event_time(commit_opts, event_time, "opts.eventTime")
+                .inspect_err(|_| set_span_error_code(&span, "error:BadRequest"))?;
         }
 
         let txn_opts = txn_opts_from_body(&prepared_transaction.body, &span)?;
@@ -2459,6 +2464,15 @@ pub(crate) async fn submit_sparql_update(
 ) -> Result<Response> {
     let tx_id = compute_tx_id_sparql(&sparql);
 
+    // `# PRAGMA` options win over the headers that name the same thing. The
+    // transaction-level ones (`validation-mode`, `unique-properties`) ride the
+    // text itself and are applied where it is lowered.
+    let pragmas = fluree_db_sparql::request_pragmas(&sparql).map_err(|e| {
+        set_span_error_code(parent_span, "error:BadRequest");
+        ServerError::bad_request(e)
+    })?;
+    let headers = &headers.clone().with_sparql_pragmas(&pragmas);
+
     // Resolve the ledger handle up front: a missing ledger surfaces as a 404
     // here, and the handle provides the canonical ledger ID for commit_opts.
     let handle = match state.fluree.ledger_cached(ledger_id).await {
@@ -2477,12 +2491,16 @@ pub(crate) async fn submit_sparql_update(
     let governance =
         crate::routes::policy_auth::bound_governance(effective_identity.as_deref(), headers)?;
 
-    let commit_opts = build_commit_opts(
+    let mut commit_opts = build_commit_opts(
         effective_identity.as_deref(),
         credential,
         &state.fluree,
         &handle,
     );
+    if let Some(event_time) = &pragmas.event_time {
+        commit_opts = with_event_time(commit_opts, event_time, "pragma `event-time`")
+            .inspect_err(|_| set_span_error_code(parent_span, "error:BadRequest"))?;
+    }
 
     // The query is parsed and lowered inside the consensus layer, under the
     // ledger write lock — so namespace allocation shares the staging

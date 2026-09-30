@@ -786,6 +786,8 @@ pub async fn query(
 
         // Log query text according to configuration
         log_query_text(&sparql, &state.telemetry_config, &span);
+        // `# PRAGMA` options win over the headers that name the same thing.
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Connection-scoped SPARQL requires a FROM/FROM NAMED clause to specify the ledger.
         //
@@ -1156,6 +1158,8 @@ pub async fn query_ledger(
 
         // Log query text according to configuration
         log_query_text(&sparql, &state.telemetry_config, &span);
+        // `# PRAGMA` options win over the headers that name the same thing.
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Enforce bearer ledger scope for unsigned requests
         if let Some(p) = bearer.0.as_ref() {
@@ -1478,6 +1482,8 @@ pub async fn explain_ledger(
         if is_sparql_request(&headers, &credential, &params) {
             let sparql = resolve_sparql_text(&params, &credential)?;
             log_query_text(&sparql, &state.telemetry_config, &span);
+            // `# PRAGMA` options win over the headers that name the same thing.
+            let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
             // Enforce bearer ledger scope for unsigned requests
             if let Some(p) = bearer.0.as_ref() {
@@ -4145,6 +4151,8 @@ pub async fn explain(
         if is_sparql_request(&headers, &credential, &params) {
             let sparql = resolve_sparql_text(&params, &credential)?;
             log_query_text(&sparql, &state.telemetry_config, &span);
+            // `# PRAGMA` options win over the headers that name the same thing.
+            let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
             // Determine target ledger: header wins, otherwise require a single FROM ledger id.
             // FROM may carry a time-travel suffix (`@t:N` / `@iso:` / `@commit:`);
@@ -4683,6 +4691,12 @@ fn collect_multi_query_min_t_requirements(
             }
             SubqueryLanguage::Sparql => {
                 if let Some(sparql) = sub.query.as_str() {
+                    // `# PRAGMA min-t` is the alias's body option, so it wins
+                    // over the alias's `opts`.
+                    let sub_min_t = fluree_db_sparql::request_pragmas(sparql)
+                        .map_err(ServerError::bad_request)?
+                        .min_t
+                        .or(sub_min_t);
                     // The envelope already applied any `Fluree-Min-T` header to
                     // every distinct ledger; the sub-collector only needs to pick
                     // up per-query `@t:` pins, so pass no header here.
@@ -5082,11 +5096,62 @@ fn apply_envelope_sparql_auth(
     envelope_opts: Option<&JsonValue>,
     headers: &FlureeHeaders,
 ) -> Result<()> {
-    let merged = fluree_db_api::query::multi::merged_opts(envelope_opts, sub.opts.as_ref());
+    use fluree_db_api::query::multi::merged_opts;
+
+    // The alias's `# PRAGMA` options are its body opts, which the dispatcher
+    // lays over `sub.opts`: authorize the selection it will actually run with.
+    let pragma_opts = sparql_alias_pragma_opts(sub)?;
+    let merged = merged_opts(
+        merged_opts(envelope_opts, sub.opts.as_ref()).as_ref(),
+        pragma_opts.as_ref(),
+    );
     let mut synthetic = serde_json::json!({"opts": merged});
     crate::routes::policy_auth::apply_authorization_to_opts(&mut synthetic, headers)?;
     sub.opts = synthetic.get("opts").cloned();
+
+    // Authorization accepts a pragma selection only where it matches the
+    // bound one, so laying the pragmas back over the result changes nothing.
+    // Hold that here rather than lean on it: a difference would be a pragma
+    // replacing the authorized selection.
+    if let Some(pragma_opts) = &pragma_opts {
+        let selection = |opts: Option<JsonValue>| {
+            fluree_db_api::GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
+                .map_err(|e| ServerError::bad_request(e.to_string()))
+        };
+        let authorized = selection(sub.opts.clone())?;
+        let dispatched = selection(merged_opts(sub.opts.as_ref(), Some(pragma_opts)))?;
+        if !same_policy_selection(&authorized, &dispatched) {
+            return Err(fluree_db_api::ApiError::http(
+                403,
+                "Credential does not permit policy selection: a SPARQL alias's pragmas \
+                 conflict with the authorized selection",
+            )
+            .into());
+        }
+    }
     Ok(())
+}
+
+/// A SPARQL alias's pragmas as `opts`, with a malformed pragma as a 400.
+fn sparql_alias_pragma_opts(sub: &MultiQuerySubquery) -> Result<Option<JsonValue>> {
+    fluree_db_api::query::multi::sparql_pragma_opts(sub.query.as_str().unwrap_or_default())
+        .map_err(ServerError::bad_request)
+}
+
+/// Whether two policy selections pick the same policies; class order and
+/// repeats do not change the set.
+fn same_policy_selection(
+    a: &fluree_db_api::GovernanceOptions,
+    b: &fluree_db_api::GovernanceOptions,
+) -> bool {
+    fn classes(o: &fluree_db_api::GovernanceOptions) -> Option<BTreeSet<&String>> {
+        o.policy_class.as_ref().map(|c| c.iter().collect())
+    }
+    a.identity == b.identity
+        && classes(a) == classes(b)
+        && a.policy == b.policy
+        && a.policy_values == b.policy_values
+        && a.default_allow == b.default_allow
 }
 
 /// Merge envelope, alias, and body options before authorization, using the

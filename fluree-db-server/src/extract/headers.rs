@@ -384,6 +384,49 @@ impl FlureeHeaders {
         Ok(fluree_headers)
     }
 
+    /// Lay a SPARQL request's `# PRAGMA` options over the header values.
+    ///
+    /// A pragma is the request body's own option, so it wins over the header
+    /// that names the same thing — as a JSON-LD body's `opts` do. Call after
+    /// [`crate::routes::policy_auth::bind_authorization`]: the policy
+    /// selection lands in the same fields a caller's headers do, and
+    /// `bound_governance` holds it to the bound credential exactly as it holds
+    /// a header (a conflicting selection is refused, never silently replaced).
+    pub fn with_sparql_pragmas(mut self, pragmas: &fluree_db_sparql::Pragmas) -> Self {
+        if let Some(meta) = pragmas.meta {
+            self.track_meta = false;
+            self.track_time = meta.time;
+            self.track_fuel = meta.fuel;
+            self.track_policy = meta.policy;
+        }
+        if pragmas.max_fuel.is_some() {
+            self.max_fuel = pragmas.max_fuel;
+        }
+        if pragmas.min_t.is_some() {
+            self.min_t = pragmas.min_t;
+        }
+        if pragmas.identity.is_some() {
+            self.identity = pragmas.identity.clone();
+        }
+        if let Some(classes) = &pragmas.policy_class {
+            self.policy_class = classes.clone();
+        }
+        if let Some(values) = &pragmas.policy_values {
+            self.policy_values = Some(JsonValue::Object(values.clone()));
+        }
+        if pragmas.default_allow.is_some() {
+            self.default_allow = pragmas.default_allow;
+        }
+        self
+    }
+
+    /// [`Self::with_sparql_pragmas`] for request text; a malformed pragma is a 400.
+    pub fn with_sparql_request_pragmas(self, sparql: &str) -> Result<Self> {
+        let pragmas =
+            fluree_db_sparql::request_pragmas(sparql).map_err(ServerError::bad_request)?;
+        Ok(self.with_sparql_pragmas(&pragmas))
+    }
+
     /// Check if tracking is enabled (any tracking header or max-fuel limit)
     pub fn has_tracking(&self) -> bool {
         self.track_meta

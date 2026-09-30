@@ -2145,5 +2145,271 @@ async fn enforcement_signal_follows_configured_default_allow() {
     );
 }
 
+// ── SPARQL `# PRAGMA` policy selection ─────────────────────────────────────
+//
+// A SPARQL request names its policy with pragmas, the counterpart of a JSON-LD
+// body's `opts`. Each test mirrors a header test above: the pragma must select
+// the same policies, win over a header naming the same thing, and be held to a
+// bound credential exactly as a header is.
+
+const DOCS_SPARQL: &str = "PREFIX ex: <http://example.org/>\n\
+                           PREFIX schema: <http://schema.org/>\n\
+                           SELECT ?name WHERE { ?doc a ex:Document ; schema:name ?name . }";
+
+async fn sparql_query(
+    app: axum::Router,
+    ledger: &str,
+    sparql: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, JsonValue) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/query/{ledger}"))
+        .header("content-type", "application/sparql-query");
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let resp = app
+        .oneshot(req.body(Body::from(sparql.to_string())).unwrap())
+        .await
+        .unwrap();
+    json_body(resp).await
+}
+
+/// Twin of `restricted_bearer_cannot_impersonate_via_sparql_header`.
+#[tokio::test]
+async fn restricted_bearer_cannot_impersonate_via_sparql_pragma() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag1:main").await;
+    let token = identity_token(
+        &SigningKey::from_bytes(&[80u8; 32]),
+        "http://example.org/employee-user",
+        "prag1:main",
+    );
+
+    let sparql = format!("# PRAGMA identity: <http://example.org/manager-user>\n{DOCS_SPARQL}");
+    let bearer = format!("Bearer {token}");
+    let (status, json) =
+        sparql_query(app, "prag1:main", &sparql, &[("authorization", &bearer)]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
+}
+
+/// Twin of `policy_authority_can_delegate_sparql_access`: a pragma naming the
+/// credential's own identity is accepted and the delegated classes apply. A
+/// guard against over-refusal, not a regression test: ignoring the pragma
+/// gives the same answer.
+#[tokio::test]
+async fn delegated_sparql_pragma_identity_is_accepted() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag2:main").await;
+    register_root_identity(&app, "prag2:main", "http://example.org/svc-pragma").await;
+    let token = delegated_token(
+        "http://example.org/svc-pragma",
+        "prag2:main",
+        serde_json::json!({"policy-class": ["http://example.org/PublicClass"]}),
+    );
+
+    let sparql = format!("# PRAGMA identity: <http://example.org/svc-pragma>\n{DOCS_SPARQL}");
+    let bearer = format!("Bearer {token}");
+    let (status, json) =
+        sparql_query(app, "prag2:main", &sparql, &[("authorization", &bearer)]).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(sparql_names(&json), vec!["Public Post"]);
+}
+
+/// Twin of `multi_value_policy_class_via_repeated_sparql_headers`; the classes
+/// are written with the query's own `ex:` prefix.
+#[tokio::test]
+async fn policy_class_via_sparql_pragma_expands_query_prefixes() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag3:main").await;
+
+    let sparql = format!("# PRAGMA policy-class: ex:PublicClass, ex:EmployeeClass\n{DOCS_SPARQL}");
+    let (status, json) = sparql_query(app, "prag3:main", &sparql, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let mut names = sparql_names(&json);
+    names.sort_unstable();
+    assert_eq!(names, vec!["Internal Memo", "Public Post"]);
+}
+
+/// Twin of `policy_values_via_header_for_sparql`. The inline policy document has
+/// no pragma and stays a header; its values and `default-allow` ride pragmas.
+#[tokio::test]
+async fn policy_values_via_sparql_pragma() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag4:main").await;
+    assign_docs_to_identities(&app, "prag4:main").await;
+
+    let inline_policy = serde_json::json!([{
+        "@id": "ex:adhocByAssignment",
+        "@type": "f:AccessPolicy",
+        "f:action": [{"@id": "f:view"}],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": {"ex": "http://example.org/"},
+                "where": [{"@id": "?$this", "ex:assignedTo": "?$identity"}]
+            }
+        }
+    }]);
+    let sparql = format!(
+        "# PRAGMA policy-values: {{\"?$identity\": {{\"@id\": \"http://example.org/manager-user\"}}}}\n\
+         # PRAGMA default-allow: false\n{DOCS_SPARQL}"
+    );
+    let policy = inline_policy.to_string();
+    let (status, json) =
+        sparql_query(app, "prag4:main", &sparql, &[("fluree-policy", &policy)]).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(sparql_names(&json), vec!["Executive Salaries"]);
+}
+
+/// A pragma is the request's own option, so it wins over the header that names
+/// the same thing — as a JSON-LD body's `opts` do.
+#[tokio::test]
+async fn sparql_pragma_policy_class_wins_over_header() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag5:main").await;
+
+    let sparql = format!("# PRAGMA policy-class: ex:ManagerClass\n{DOCS_SPARQL}");
+    let (status, json) = sparql_query(
+        app,
+        "prag5:main",
+        &sparql,
+        &[("fluree-policy-class", "http://example.org/PublicClass")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(sparql_names(&json).len(), 3, "{json}");
+}
+
+fn rewrite_doc1_content_sparql(identity: &str) -> String {
+    format!(
+        "# PRAGMA identity: <{identity}>\n\
+         PREFIX ex: <http://example.org/>\n\
+         DELETE {{ ex:doc1 ex:content ?c }}\n\
+         INSERT {{ ex:doc1 ex:content \"rewritten\" }}\n\
+         WHERE {{ ex:doc1 ex:content ?c }}"
+    )
+}
+
+async fn sparql_update(
+    app: axum::Router,
+    ledger: &str,
+    sparql: &str,
+    token: Option<&str>,
+) -> (StatusCode, JsonValue) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/update/{ledger}"))
+        .header("content-type", "application/sparql-update");
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = app
+        .oneshot(req.body(Body::from(sparql.to_string())).unwrap())
+        .await
+        .unwrap();
+    json_body(resp).await
+}
+
+/// Twin of `sparql_update_under_employee_bearer_denied`, with the identity
+/// named by pragma on an unauthenticated request; the manager control shows
+/// the gate is real.
+#[tokio::test]
+async fn sparql_update_pragma_identity_enforces_modify_policy() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag6:main").await;
+    add_modify_policies(&app, "prag6:main").await;
+
+    let employee = rewrite_doc1_content_sparql("http://example.org/employee-user");
+    let (status, json) = sparql_update(app.clone(), "prag6:main", &employee, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(
+        json.to_string()
+            .contains("Employees may not modify document content."),
+        "{json}"
+    );
+
+    let manager = rewrite_doc1_content_sparql("http://example.org/manager-user");
+    let (status, json) = sparql_update(app, "prag6:main", &manager, None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+#[tokio::test]
+async fn sparql_update_pragma_cannot_escape_bearer_identity() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag7:main").await;
+    add_modify_policies(&app, "prag7:main").await;
+    let token = identity_token_rw(
+        &SigningKey::from_bytes(&[81u8; 32]),
+        "http://example.org/employee-user",
+        "prag7:main",
+    );
+
+    let sparql = rewrite_doc1_content_sparql("http://example.org/manager-user");
+    let (status, json) = sparql_update(app, "prag7:main", &sparql, Some(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
+}
+
+fn docs_alias(ledger: &str, pragma: &str) -> JsonValue {
+    serde_json::json!({
+        "queries": {
+            "sparql_docs": {
+                "language": "sparql",
+                "query": format!(
+                    "{pragma}\nPREFIX ex: <http://example.org/>\n\
+                     PREFIX schema: <http://schema.org/>\n\
+                     SELECT ?name FROM <{ledger}> WHERE {{ ?doc a ex:Document ; schema:name ?name }}"
+                )
+            }
+        }
+    })
+}
+
+/// Twin of `multi_query_sparql_alias_enforces_policy_for_restricted_identity`:
+/// an alias's pragma cannot lift the bearer's policy.
+#[tokio::test]
+async fn multi_query_sparql_alias_pragma_cannot_escape_bearer() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag8:main").await;
+    let token = identity_token(
+        &SigningKey::from_bytes(&[82u8; 32]),
+        "http://example.org/public-user",
+        "prag8:main",
+    );
+
+    let envelope = docs_alias(
+        "prag8:main",
+        "# PRAGMA identity: <http://example.org/manager-user>",
+    );
+    let (status, body) = post_envelope(app, &envelope, Some(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.to_string().contains("Executive Salaries"), "{body}");
+}
+
+/// An alias's pragma selects its policy the way its JSON-LD twin's body `opts`
+/// do.
+#[tokio::test]
+async fn multi_query_sparql_alias_pragma_selects_policy() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag9:main").await;
+
+    let envelope = docs_alias("prag9:main", "# PRAGMA policy-class: ex:PublicClass");
+    let (status, body) = post_envelope(app, &envelope, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let alias = serde_json::to_string(&body["results"]["sparql_docs"]).unwrap();
+    assert!(alias.contains("Public Post"), "{alias}");
+    assert!(
+        !alias.contains("Internal Memo") && !alias.contains("Executive Salaries"),
+        "{alias}"
+    );
+}
+
 #[path = "policy_authorization_regression.rs"]
 mod policy_authorization_regression;

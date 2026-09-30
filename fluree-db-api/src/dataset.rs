@@ -1072,6 +1072,32 @@ impl GovernanceOptions {
         })
     }
 
+    /// The policy selection a SPARQL request's `# PRAGMA identity` /
+    /// `policy-class` / `policy-values` / `default-allow` name — the twin of
+    /// [`Self::from_json`] for a request with no `opts` block. The inline
+    /// `policy` document has no pragma.
+    pub fn from_sparql_pragmas(pragmas: &fluree_db_sparql::Pragmas) -> Self {
+        Self {
+            identity: pragmas.identity.clone(),
+            policy_class: pragmas.policy_class.clone(),
+            policy: None,
+            policy_values: pragmas
+                .policy_values
+                .as_ref()
+                .map(|values| values.clone().into_iter().collect()),
+            server_identity: None,
+            default_allow: pragmas.default_allow,
+        }
+    }
+
+    /// [`Self::from_sparql_pragmas`] for request text. A request whose pragmas
+    /// do not parse selects nothing: the parse that would run it rejects it.
+    pub fn from_sparql(sparql: &str) -> Self {
+        fluree_db_sparql::request_pragmas(sparql)
+            .map(|pragmas| Self::from_sparql_pragmas(&pragmas))
+            .unwrap_or_default()
+    }
+
     /// Resolve the tri-state flag to the concrete bool the policy wrapper needs.
     /// Call this only after [`crate::config_resolver::merge_policy_opts`] has had
     /// a chance to fill `None` from the ledger's `f:defaultAllow`; still-unset

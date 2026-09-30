@@ -268,3 +268,29 @@ async fn bm25_sub_floor_max_fuel_rejected_before_parse() {
         "should reject on the floor before parsing, got: {msg}"
     );
 }
+
+/// SPARQL twin of `untracked_max_fuel_below_floor_rejected_before_parse`:
+/// `# PRAGMA max-fuel` caps an untracked query on the view path, and above the
+/// floor the same query runs.
+#[tokio::test]
+async fn untracked_sparql_max_fuel_pragma_below_floor_rejected() {
+    let (fluree, ledger) = seed_one().await;
+    const QUERY: &str = "SELECT ?name WHERE { ?s <http://a.co/name> ?name }";
+
+    let err = support::query_sparql(
+        &fluree,
+        &ledger,
+        &format!("# PRAGMA max-fuel: 0.5\n{QUERY}"),
+    )
+    .await
+    .expect_err("sub-floor max-fuel pragma should fail");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+
+    support::query_sparql(
+        &fluree,
+        &ledger,
+        &format!("# PRAGMA max-fuel: 100\n{QUERY}"),
+    )
+    .await
+    .expect("a budget above the floor runs");
+}

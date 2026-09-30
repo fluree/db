@@ -132,6 +132,20 @@ pub(crate) fn parse_and_lower_sparql_update(
         return Err(ApiError::sparql(message, errors));
     }
 
+    // Transaction options a `# PRAGMA` names, under the same precedence as
+    // their JSON-LD `opts` twins: a value the caller set programmatically wins.
+    let mut txn_opts = txn_opts;
+    if txn_opts.validation_mode.is_none() {
+        txn_opts.validation_mode = ast
+            .pragmas
+            .validation_mode
+            .as_deref()
+            .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
+    }
+    if txn_opts.unique_properties.is_none() {
+        txn_opts.unique_properties = ast.pragmas.unique_properties.clone();
+    }
+
     let mut ns = NamespaceRegistry::from_db(snapshot);
     lower_sparql_update_request(&ast, &mut ns, txn_opts)
         .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))
@@ -505,6 +519,19 @@ pub(crate) struct TransactCore<'a> {
 }
 
 impl<'a> TransactCore<'a> {
+    /// The request's tracker: the caller's tracking options, else the fuel
+    /// limit a SPARQL UPDATE names with `# PRAGMA max-fuel` — the twin of a
+    /// JSON-LD body's `max-fuel`, which staging applies on its own.
+    pub(crate) fn tracker(&self) -> Tracker {
+        match (&self.tracking, self.pending_sparql) {
+            (Some(opts), _) => Tracker::new(opts.clone()),
+            (None, Some(sparql)) => crate::query::helpers::tracker_for_input_limits(
+                &crate::view::QueryInput::Sparql(sparql),
+            ),
+            (None, None) => Tracker::disabled(),
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             operation: None,
@@ -876,12 +903,7 @@ impl<'a> OwnedTransactBuilder<'a> {
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
         let store_raw_txn = self.core.txn_opts.store_raw_txn.unwrap_or(false);
-        let tracker = self
-            .core
-            .tracking
-            .clone()
-            .map(Tracker::new)
-            .unwrap_or_default();
+        let tracker = self.core.tracker();
 
         let (staged, txn_type, commit_opts, _) = self
             .fluree
@@ -909,12 +931,7 @@ impl<'a> OwnedTransactBuilder<'a> {
             .index_config
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
-        let tracker = self
-            .core
-            .tracking
-            .clone()
-            .map(Tracker::new)
-            .unwrap_or_else(Tracker::disabled);
+        let tracker = self.core.tracker();
 
         // No commit follows, so there is no raw transaction to upload.
         let (stage_result, ..) = self
@@ -2125,7 +2142,7 @@ impl Fluree {
     pub(crate) async fn build_commit_with_handle(
         &self,
         ledger: &LedgerHandle,
-        mut core: TransactCore<'_>,
+        core: TransactCore<'_>,
     ) -> Result<Option<(LedgerWriteGuard, fluree_db_transact::StagedCommit)>> {
         core.validate().map_err(ApiError::Builder)?;
 
@@ -2134,11 +2151,7 @@ impl Fluree {
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
         let store_raw_txn = core.txn_opts.store_raw_txn.unwrap_or(false);
-        let tracker = core
-            .tracking
-            .take()
-            .map(Tracker::new)
-            .unwrap_or_else(Tracker::disabled);
+        let tracker = core.tracker();
 
         let write_guard = ledger.lock_for_write().await;
         // The dry-run/consensus path has no response channel for a trailing
@@ -2262,11 +2275,7 @@ impl Fluree {
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
         let store_raw_txn = core.txn_opts.store_raw_txn.unwrap_or(false);
-        let tracker = core
-            .tracking
-            .take()
-            .map(Tracker::new)
-            .unwrap_or_else(Tracker::disabled);
+        let tracker = core.tracker();
 
         // Fast path: pre-built Txn IR, Cypher sequences, or policy-gated
         // requests need the write lock held across the entire stage +

@@ -166,19 +166,30 @@ A policy with no `f:onProperty` / `f:onClass` / `f:onSubject` applies to **every
 
 ## SPARQL queries
 
-SPARQL queries have no `opts` block, so policy is delivered via headers:
+A SPARQL query selects policy with [`# PRAGMA` comments](../query/sparql.md#request-options--pragma), the counterpart of a JSON-LD body's `opts`:
+
+```sparql
+# PRAGMA identity: ex:aliceIdentity
+# PRAGMA policy-class: ex:CorpPolicy
+# PRAGMA default-allow: false
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name WHERE { ?p <http://schema.org/name> ?name }
+```
+
+or with headers:
 
 ```bash
 curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \
   -H 'Content-Type: application/sparql-query' \
   -H "Authorization: Bearer $JWT" \
-  -H 'fluree-identity: ex:aliceIdentity' \
-  -H 'fluree-policy-class: ex:CorpPolicy' \
+  -H 'fluree-identity: http://example.org/ns/aliceIdentity' \
+  -H 'fluree-policy-class: http://example.org/ns/CorpPolicy' \
   -H 'fluree-default-allow: false' \
   -d 'SELECT ?name WHERE { ?p <http://schema.org/name> ?name }'
 ```
 
-The full header set is documented in the [policy model](policy-model.md#request-time-options).
+A pragma wins over the header that names the same option, and both are held to the caller's credential the same way. A pragma's prefixed name expands against the query's own `PREFIX` declarations; a header takes the IRI as written. The inline policy document has no pragma: send it with the `fluree-policy` header. The full header set is documented in the [policy model](policy-model.md#request-time-options).
 
 ## JSON-LD queries
 
@@ -255,8 +266,8 @@ filters, which is exactly what row-level enforcement exists to prevent.
 
 What a caller *can* ask for is whether policy governed the request. Turn on
 policy tracking — `"opts": {"meta": {"policy": true}}` in a JSON-LD body, or
-the `fluree-track-policy: true` request header (SPARQL bodies have no `opts`
-to carry it) — and the response gains two siblings:
+`# PRAGMA meta: policy` in a SPARQL request, or the `fluree-track-policy: true`
+request header — and the response gains two siblings:
 
 ```json
 {

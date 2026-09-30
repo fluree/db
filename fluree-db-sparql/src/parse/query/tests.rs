@@ -6,6 +6,7 @@ use crate::ast::{
     OrderExpr, PredicateTerm, SelectModifier, SelectVariable, SelectVariables, SubjectTerm, Term,
     VarOrIri,
 };
+use crate::diag::Diagnostic;
 
 fn parse(input: &str) -> ParseOutput<SparqlAst> {
     parse_sparql(input)
@@ -2856,10 +2857,243 @@ fn test_ordinary_comments_are_not_pragmas() {
     assert_eq!(ast.pragmas.reasoning, None);
 }
 
+/// The pragma diagnostics of a request that must fail to parse.
+fn pragma_errors(input: &str) -> Vec<Diagnostic> {
+    let output = parse(input);
+    assert!(output.ast.is_none(), "expected a rejected parse: {input}");
+    output
+        .diagnostics
+        .into_iter()
+        .filter(|d| d.code == DiagCode::InvalidPragma)
+        .collect()
+}
+
+/// A misspelled or unsupported pragma fails the parse instead of running the
+/// request without the option it asked for.
 #[test]
-fn test_unknown_pragma_ignored() {
-    let ast = assert_parses("# PRAGMA timeout: 30\nSELECT * WHERE { }");
-    assert_eq!(ast.pragmas.reasoning, None);
+fn test_unknown_pragma_rejected() {
+    let input = "# PRAGMA timeout: 30\nSELECT * WHERE { }";
+    let errors = pragma_errors(input);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].message.contains("unknown pragma `timeout`"),
+        "{}",
+        errors[0].message
+    );
+    assert_eq!(errors[0].span.slice(input), "# PRAGMA timeout: 30");
+
+    let errors = pragma_errors("# PRAGMA max-feul: 10\nSELECT * WHERE { }");
+    assert!(
+        errors[0].message.contains("max-fuel"),
+        "{}",
+        errors[0].message
+    );
+}
+
+#[test]
+fn test_pragma_without_name_rejected() {
+    for input in [
+        "# PRAGMA\nSELECT * WHERE { }",
+        "# PRAGMA: 1\nSELECT * WHERE { }",
+    ] {
+        let errors = pragma_errors(input);
+        assert!(
+            errors[0].message.contains("expected a pragma name"),
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn test_request_option_pragmas() {
+    let ast = assert_parses(
+        "# PRAGMA meta: fuel, time\n\
+         # PRAGMA max-fuel: 2500.5\n\
+         # PRAGMA min-t: 42\n\
+         # PRAGMA identity: <did:key:z6Mkalice>\n\
+         # PRAGMA policy-class: http://ex.org/Manager, <http://ex.org/Auditor>\n\
+         # PRAGMA policy-values: {\"?dept\": \"sales\"}\n\
+         # PRAGMA default-allow: FALSE\n\
+         # PRAGMA include-system-facts: true\n\
+         SELECT * WHERE { }",
+    );
+    let p = &ast.pragmas;
+    assert_eq!(
+        p.meta,
+        Some(crate::ast::MetaPragma {
+            time: true,
+            fuel: true,
+            policy: false
+        })
+    );
+    assert_eq!(p.max_fuel, Some(2500.5));
+    assert_eq!(p.min_t, Some(42));
+    assert_eq!(p.identity.as_deref(), Some("did:key:z6Mkalice"));
+    assert_eq!(
+        p.policy_class,
+        Some(vec![
+            "http://ex.org/Manager".to_string(),
+            "http://ex.org/Auditor".to_string()
+        ])
+    );
+    assert_eq!(
+        p.policy_values.as_ref().and_then(|v| v.get("?dept")),
+        Some(&serde_json::json!("sales"))
+    );
+    assert_eq!(p.default_allow, Some(false));
+    assert_eq!(p.include_system_facts, Some(true));
+    assert!(p.has_policy_selection());
+
+    let all = assert_parses("# PRAGMA meta: true\nSELECT * WHERE { }");
+    assert_eq!(
+        all.pragmas.meta,
+        Some(crate::ast::MetaPragma {
+            time: true,
+            fuel: true,
+            policy: true
+        })
+    );
+    let none = assert_parses("SELECT * WHERE { }");
+    assert!(!none.pragmas.has_policy_selection());
+    assert_eq!(none.pragmas.max_fuel, None);
+}
+
+#[test]
+fn test_malformed_pragma_values_rejected() {
+    for (pragma, expected) in [
+        ("max-fuel: -1", "non-negative number"),
+        ("max-fuel: lots", "non-negative number"),
+        ("min-t: -3", "non-negative integer"),
+        ("min-t: 1.5", "non-negative integer"),
+        ("meta: memory", "does not know `memory`"),
+        ("meta:", "expects true, false"),
+        ("default-allow: yes", "true or false"),
+        ("include-system-facts:", "true or false"),
+        ("identity: did:a did:b", "one IRI"),
+        ("identity:", "one IRI"),
+        ("policy-class:", "at least one IRI"),
+        ("policy-values: [1]", "JSON object"),
+        ("policy-values: {\"?a\":", "JSON object"),
+    ] {
+        let errors = pragma_errors(&format!("# PRAGMA {pragma}\nSELECT * WHERE {{ }}"));
+        assert!(
+            errors.iter().any(|d| d.message.contains(expected)),
+            "{pragma}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_update_pragmas() {
+    let ast = assert_parses(
+        "PREFIX ex: <http://ex.org/>\n\
+         # PRAGMA event-time: 2024-01-02T03:04:05Z\n\
+         # PRAGMA validation-mode: Warn\n\
+         # PRAGMA unique-properties: ex:email, <http://ex.org/ssn>\n\
+         INSERT DATA { ex:a ex:email \"a@ex.org\" }",
+    );
+    let p = &ast.pragmas;
+    assert_eq!(p.event_time.as_deref(), Some("2024-01-02T03:04:05Z"));
+    assert_eq!(p.validation_mode.as_deref(), Some("warn"));
+    assert_eq!(
+        p.unique_properties,
+        Some(vec![
+            "http://ex.org/email".to_string(),
+            "http://ex.org/ssn".to_string()
+        ])
+    );
+
+    for (pragma, expected) in [
+        ("validation-mode: soft", "warn or reject"),
+        ("event-time:", "RFC 3339"),
+        ("unique-properties:", "at least one IRI"),
+    ] {
+        let errors = pragma_errors(&format!(
+            "# PRAGMA {pragma}\nINSERT DATA {{ <urn:s> <urn:p> 1 }}"
+        ));
+        assert!(errors[0].message.contains(expected), "{pragma}: {errors:?}");
+    }
+}
+
+/// IRI-valued pragmas expand a prefix the request declares, including one a
+/// later update operation declares; undeclared prefixes (a DID's `did:`) and
+/// `<…>` IRIs are kept as written.
+#[test]
+fn test_pragma_iris_expand_declared_prefixes() {
+    let ast = assert_parses(
+        "PREFIX ex: <http://ex.org/>\n\
+         # PRAGMA identity: did:key:z6Mk\n\
+         # PRAGMA policy-class: ex:Manager, <ex:Literal>, urn:x:y\n\
+         SELECT * WHERE { }",
+    );
+    assert_eq!(ast.pragmas.identity.as_deref(), Some("did:key:z6Mk"));
+    assert_eq!(
+        ast.pragmas.policy_class,
+        Some(vec![
+            "http://ex.org/Manager".to_string(),
+            "ex:Literal".to_string(),
+            "urn:x:y".to_string()
+        ])
+    );
+
+    let ast = assert_parses(
+        "INSERT DATA { <urn:a> <urn:p> 1 } ;\n\
+         PREFIX ex: <http://ex.org/>\n\
+         # PRAGMA identity: ex:alice\n\
+         INSERT DATA { <urn:b> <urn:p> 2 }",
+    );
+    assert_eq!(ast.pragmas.identity.as_deref(), Some("http://ex.org/alice"));
+}
+
+#[test]
+fn test_request_pragmas_helper() {
+    use crate::parse::request_pragmas;
+
+    // No mention of a pragma: defaults, without a parse.
+    assert_eq!(
+        request_pragmas("SELECT * WHERE { }"),
+        Ok(Default::default())
+    );
+    let pragmas = request_pragmas("# PRAGMA max-fuel: 7\nSELECT * WHERE { }").unwrap();
+    assert_eq!(pragmas.max_fuel, Some(7.0));
+    // A pragma error is reported; any other parse failure is left to the
+    // parse that would run the request.
+    let err = request_pragmas("# PRAGMA max-feul: 7\nSELECT * WHERE { }").unwrap_err();
+    assert!(err.contains("unknown pragma `max-feul`"), "{err}");
+    assert_eq!(
+        request_pragmas("# PRAGMA max-fuel: 7\nSELEKT nonsense"),
+        Ok(Default::default())
+    );
+}
+
+/// Query options are refused on an UPDATE; the shared request options apply
+/// to both forms.
+#[test]
+fn test_pragma_form_applicability() {
+    for pragma in ["min-t: 1", "reasoning: rdfs", "include-system-facts: true"] {
+        let errors = pragma_errors(&format!(
+            "# PRAGMA {pragma}\nINSERT DATA {{ <urn:s> <urn:p> 1 }}"
+        ));
+        assert!(
+            errors[0]
+                .message
+                .contains("applies to queries, not updates"),
+            "{pragma}: {errors:?}"
+        );
+    }
+    let ast = assert_parses(
+        "# PRAGMA max-fuel: 10\n# PRAGMA identity: did:key:x\nINSERT DATA { <urn:s> <urn:p> 1 }",
+    );
+    assert_eq!(ast.pragmas.max_fuel, Some(10.0));
+    assert_eq!(ast.pragmas.identity.as_deref(), Some("did:key:x"));
+
+    let errors = pragma_errors("# PRAGMA event-time: 2024-01-01T00:00:00Z\nSELECT * WHERE { }");
+    assert!(
+        errors[0]
+            .message
+            .contains("applies to updates, not queries"),
+        "{errors:?}"
+    );
 }
 
 #[test]

@@ -45,9 +45,9 @@ pub mod validate;
 pub mod lower;
 
 // Re-exports
-pub use ast::{Prologue, QueryBody, SparqlAst, UpdateOperation};
+pub use ast::{MetaPragma, Pragmas, Prologue, QueryBody, SparqlAst, UpdateOperation};
 pub use diag::{DiagCode, Diagnostic, ParseOutput, Severity};
-pub use parse::parse_sparql;
+pub use parse::{parse_sparql, request_pragmas};
 pub use span::SourceSpan;
 pub use validate::{validate, Capabilities};
 

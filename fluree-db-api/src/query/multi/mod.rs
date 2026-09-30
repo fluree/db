@@ -756,6 +756,40 @@ pub fn merged_opts(envelope: Option<&JsonValue>, inner: Option<&JsonValue>) -> O
     }
 }
 
+/// A SPARQL sub-query's `# PRAGMA` options as the `opts` object a JSON-LD body
+/// would carry: the body layer of the alias's opts merge, so they win over the
+/// alias's and the envelope's `opts` as a JSON-LD body's do. `Err` names a
+/// pragma that does not parse.
+pub fn sparql_pragma_opts(sparql: &str) -> std::result::Result<Option<JsonValue>, String> {
+    let pragmas = fluree_db_sparql::request_pragmas(sparql)?;
+    let mut opts = serde_json::Map::new();
+    if let Some(meta) = pragmas.meta {
+        opts.insert(
+            "meta".into(),
+            serde_json::json!({"time": meta.time, "fuel": meta.fuel, "policy": meta.policy}),
+        );
+    }
+    if let Some(max_fuel) = pragmas.max_fuel {
+        opts.insert("max-fuel".into(), serde_json::json!(max_fuel));
+    }
+    if let Some(min_t) = pragmas.min_t {
+        opts.insert("min-t".into(), serde_json::json!(min_t));
+    }
+    if let Some(identity) = pragmas.identity {
+        opts.insert("identity".into(), JsonValue::String(identity));
+    }
+    if let Some(classes) = pragmas.policy_class {
+        opts.insert("policy-class".into(), serde_json::json!(classes));
+    }
+    if let Some(values) = pragmas.policy_values {
+        opts.insert("policy-values".into(), JsonValue::Object(values));
+    }
+    if let Some(default_allow) = pragmas.default_allow {
+        opts.insert("default-allow".into(), JsonValue::Bool(default_allow));
+    }
+    Ok((!opts.is_empty()).then_some(JsonValue::Object(opts)))
+}
+
 /// Shallow merge two JSON values, returning a new value. If both are objects,
 /// `inner`'s keys override `outer`'s on conflict. If either is not an object,
 /// `inner` wins entirely (matches "sub-query overrides envelope" semantics).

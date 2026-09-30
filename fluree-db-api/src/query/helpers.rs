@@ -592,9 +592,10 @@ pub(crate) fn charge_query_floor(
 }
 
 /// Tracker for a "tracked" query path: an explicit `tracking_override` if given,
-/// otherwise the per-input default — opts-derived for JSON-LD, all-enabled for
-/// SPARQL (which has no `opts` carrier). This is the single derivation shared by
-/// the view/dataset tracked entry points and [`floor_only_tally`].
+/// otherwise what the request names — JSON-LD `opts.meta` / `max-fuel`, or a
+/// SPARQL request's `# PRAGMA meta` / `max-fuel` — falling back to all tracking.
+/// This is the single derivation shared by the view/dataset tracked entry
+/// points and [`floor_only_tally`].
 pub(crate) fn tracked_query_tracker(
     input: &QueryInput<'_>,
     tracking_override: &Option<TrackingOptions>,
@@ -603,15 +604,34 @@ pub(crate) fn tracked_query_tracker(
         Some(opts) => Tracker::new(opts.clone()),
         None => match input {
             QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-            QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
+            QueryInput::Sparql(sparql) => {
+                let tracking = sparql_tracking_options(sparql);
+                if tracking.any_enabled() {
+                    Tracker::new(tracking)
+                } else {
+                    Tracker::new(TrackingOptions::all_enabled())
+                }
+            }
         },
+    }
+}
+
+/// Fuel-limit tracker for an untracked query: the JSON-LD body's `max-fuel`,
+/// or a SPARQL request's `# PRAGMA max-fuel`.
+pub(crate) fn tracker_for_input_limits(input: &QueryInput<'_>) -> Tracker {
+    match input {
+        QueryInput::JsonLd(json) => tracker_for_limits(json),
+        QueryInput::Sparql(sparql) => limits_tracker(sparql_tracking_options(sparql).max_fuel),
     }
 }
 
 pub(crate) fn tracker_for_limits(query_json: &JsonValue) -> Tracker {
     let opts = query_json.as_object().and_then(|o| o.get("opts"));
-    let tracking = TrackingOptions::from_opts_value(opts);
-    match tracking.max_fuel.filter(|limit| *limit > 0) {
+    limits_tracker(TrackingOptions::from_opts_value(opts).max_fuel)
+}
+
+fn limits_tracker(max_fuel: Option<u64>) -> Tracker {
+    match max_fuel.filter(|limit| *limit > 0) {
         Some(limit) => Tracker::new(TrackingOptions {
             track_time: false,
             track_fuel: true,
@@ -619,6 +639,23 @@ pub(crate) fn tracker_for_limits(query_json: &JsonValue) -> Tracker {
             max_fuel: Some(limit),
         }),
         None => Tracker::disabled(),
+    }
+}
+
+/// The tracking a SPARQL request's `# PRAGMA meta` / `max-fuel` names — the
+/// twin of [`TrackingOptions::from_opts_value`]. A request whose pragmas do
+/// not parse gets none: the parse that runs it reports the error.
+pub(crate) fn sparql_tracking_options(sparql: &str) -> TrackingOptions {
+    let pragmas = fluree_db_sparql::request_pragmas(sparql).unwrap_or_default();
+    let meta = pragmas.meta.unwrap_or_default();
+    let max_fuel = pragmas
+        .max_fuel
+        .map(fluree_db_core::tracking::fuel_to_micro);
+    TrackingOptions {
+        track_time: meta.time,
+        track_fuel: meta.fuel || max_fuel.is_some(),
+        track_policy: meta.policy,
+        max_fuel,
     }
 }
 

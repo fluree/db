@@ -592,8 +592,9 @@ injects each field into the request body's `opts` object using the same names
 should treat header values as defaults that body values override.
 
 For SPARQL requests (`Content-Type: application/sparql-query`,
-`application/sparql-update`), headers are the only transport — the SPARQL body
-has no opts block.
+`application/sparql-update`), the CLI sends headers only. A SPARQL body can also
+carry the same options as [`# PRAGMA` comments](../query/sparql.md#request-options--pragma),
+which win over the headers, as body `opts` do for JSON-LD.
 
 For `POST /multi-query`, the CLI **does not** inject policy fields into the
 envelope body — it sends headers only. The server folds the headers into the

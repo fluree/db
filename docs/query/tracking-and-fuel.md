@@ -150,7 +150,7 @@ Set fuel limits via `opts.max-fuel` (decimal allowed). Setting a fuel limit impl
 }
 ```
 
-You can also use `"maxFuel"` or `"max_fuel"` as alternative key names. The HTTP equivalent is the `fluree-max-fuel` header.
+You can also use `"maxFuel"` or `"max_fuel"` as alternative key names. The HTTP equivalent is the `fluree-max-fuel` header. A SPARQL request names both in its text as `# PRAGMA max-fuel: 1000` and `# PRAGMA meta: true` (or `meta: fuel, time`); see [Request options](sparql.md#request-options--pragma).
 
 Because the `1.000` query floor is charged before execution and counts toward the limit, `max-fuel` must leave room for it:
 
@@ -218,7 +218,7 @@ The same JSON rides the `x-fdb-reasoning` response header. See
 [Reasoning — materialization budget](reasoning.md#materialization-budget)
 for budget configuration.
 
-Tracked transaction responses (`/insert`, `/upsert`, `/update`, including Turtle/TriG and SPARQL UPDATE when tracking headers are used) expose the same top-level `time`, `fuel`, and `policy` fields when present, alongside the transaction receipt fields.
+Tracked transaction responses (`/insert`, `/upsert`, `/update`, including Turtle/TriG, and SPARQL UPDATE when tracking headers or pragmas are used) expose the same top-level `time`, `fuel`, and `policy` fields when present, alongside the transaction receipt fields.
 
 ## Best Practices
 
