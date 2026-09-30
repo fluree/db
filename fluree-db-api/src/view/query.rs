@@ -60,43 +60,52 @@ fn residency_content_store(
     cs.miss_register().is_some().then_some(cs)
 }
 
-/// A JSON-LD query on a view reads that view's ledger. A `from` or
-/// `fromNamed` member that names ANOTHER ledger was ignored, so the query
-/// silently answered from this view instead; it is a caller error. Members
-/// that name this ledger or one of its graphs keep their current reading.
-/// Dataset keys that do not parse are left to that reading too.
-fn refuse_cross_ledger_from(db: &GraphDb, json: &JsonValue) -> Result<()> {
-    use fluree_db_core::{TargetError, TargetLedger};
-
-    let Ok(spec) = crate::dataset::DatasetSpec::from_json(json) else {
-        return Ok(());
-    };
-    if spec.num_graphs() == 0 {
-        return Ok(());
-    }
+/// A JSON-LD query on a view reads that view's ledger, whole, at the view's
+/// time. Its dataset, read as the engine's parser reads it (`opts` first), may
+/// name only that: the ledger's own address in any spelling, as a default
+/// graph, with nothing of its own beside the address (no graph, time, alias
+/// or other member option). The view reads nothing else a dataset can say
+/// (another ledger, a graph of this one, a pin, named graphs, a history range)
+/// and would answer from itself instead, so each is refused, as is a dataset
+/// that does not parse: the connection query (`query_from()`) reads them.
+pub(super) fn refuse_cross_ledger_from(db: &GraphDb, json: &JsonValue) -> Result<()> {
     let target = &db.snapshot.ledger_id;
-    let registry = &db.snapshot.graph_registry;
-    let store = db.binary_store.as_ref();
-    let lookup = |iri: &str| {
-        registry
-            .graph_id_for_iri(iri)
-            .or_else(|| store.and_then(|s| s.graph_id_for_iri(iri)))
+    let refuse = |what: String| {
+        ApiError::invalid_query(format!(
+            "{what}, but this query runs on a view of '{target}', which reads only that \
+             ledger, whole, at the view's time. Use query_from() to query a dataset"
+        ))
     };
-    let resolver = TargetLedger::new(target, &lookup);
-    for source in spec.default_graphs.iter().chain(&spec.named_graphs) {
-        let pinned = source.address().is_some_and(|a| a.at().is_some());
-        if let Err(TargetError::CrossLedger {
-            named, also_iri, ..
-        }) = resolver.resolve(source.written(), source.reference(), pinned)
-        {
-            return Err(ApiError::invalid_query(format!(
-                "JSON-LD from '{}' {}names ledger '{named}', but this query runs on a view of \
-                 '{target}', which reads only that ledger. To query '{named}', use query_from()",
+    let spec = crate::dataset::DatasetSpec::from_json(json)
+        .map_err(|e| refuse(format!("The query's dataset does not parse ({e})")))?;
+    if spec.history_range.is_some() {
+        return Err(refuse("The query names a history range (`to`)".to_string()));
+    }
+    if let Some(named) = spec.named_graphs.first() {
+        return Err(refuse(format!(
+            "JSON-LD fromNamed '{}' names a named graph",
+            named.written()
+        )));
+    }
+    for source in &spec.default_graphs {
+        let whole_ledger = source
+            .address()
+            .is_some_and(|address| address.is_own_address(target))
+            && source.time_spec().is_none()
+            && source.alias().is_none()
+            && source.policy_override().is_none();
+        if !whole_ledger {
+            return Err(refuse(format!(
+                "JSON-LD from '{}' {}",
                 source.written(),
-                if also_iri {
-                    "is not a graph of this ledger, and as an address it "
-                } else {
-                    ""
+                match source.address() {
+                    Some(address) if address.id() != target => {
+                        format!("names ledger '{}'", address.id())
+                    }
+                    Some(_) => "names more than this ledger's own address (a graph, a time, \
+                                or another option of its own)"
+                        .to_string(),
+                    None => "names a graph, not this ledger".to_string(),
                 }
             )));
         }
@@ -423,7 +432,9 @@ impl Fluree {
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
-                refuse_cross_ledger_from(db, json)?;
+                if !options.view_is_the_dataset {
+                    refuse_cross_ledger_from(db, json)?;
+                }
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None)?
             }
             QueryInput::Sparql(sparql) => {
@@ -748,7 +759,9 @@ impl Fluree {
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
-                refuse_cross_ledger_from(db, json)?;
+                if !options.view_is_the_dataset {
+                    refuse_cross_ledger_from(db, json)?;
+                }
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None)?
             }
             QueryInput::Sparql(sparql) => {
@@ -941,13 +954,15 @@ impl Fluree {
         // Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
-                refuse_cross_ledger_from(db, json).map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(
-                        e.status_code(),
-                        e.to_string(),
-                        tracker.tally(),
-                    )
-                })?;
+                if !options.view_is_the_dataset {
+                    refuse_cross_ledger_from(db, json).map_err(|e| {
+                        crate::query::TrackedErrorResponse::new(
+                            e.status_code(),
+                            e.to_string(),
+                            tracker.tally(),
+                        )
+                    })?;
+                }
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None).map_err(
                     |e| {
                         crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
@@ -1101,13 +1116,15 @@ impl Fluree {
 
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
-                refuse_cross_ledger_from(db, json).map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(
-                        e.status_code(),
-                        e.to_string(),
-                        tracker.tally(),
-                    )
-                })?;
+                if !options.view_is_the_dataset {
+                    refuse_cross_ledger_from(db, json).map_err(|e| {
+                        crate::query::TrackedErrorResponse::new(
+                            e.status_code(),
+                            e.to_string(),
+                            tracker.tally(),
+                        )
+                    })?;
+                }
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None).map_err(
                     |e| {
                         crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())

@@ -90,8 +90,11 @@ impl Fluree {
         if dataset.is_single_ledger() {
             if let Some(view) = dataset.primary() {
                 match &input {
+                    // This view is the whole dataset, already read from the body.
                     QueryInput::JsonLd(_) => {
-                        return self.query_with_options(view, input, options).await;
+                        return self
+                            .query_with_options(view, input, options.on_the_datasets_view())
+                            .await;
                     }
                     QueryInput::Sparql(sparql) => {
                         // Reuse the entry method's AST when it threaded one
@@ -212,6 +215,7 @@ impl Fluree {
         if dataset.is_single_ledger() {
             if let Some(view) = dataset.primary() {
                 match &input {
+                    // This view is the whole dataset, already read from the body.
                     QueryInput::JsonLd(_) => {
                         return self
                             .query_view_with_r2rml_options(
@@ -219,7 +223,7 @@ impl Fluree {
                                 input,
                                 r2rml_provider,
                                 r2rml_table_provider,
-                                options,
+                                options.on_the_datasets_view(),
                             )
                             .await;
                     }

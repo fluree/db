@@ -3941,13 +3941,16 @@ async fn connection_dataset_iris_expand_against_the_prologue() {
     assert_eq!(rows["results"]["bindings"].as_array().unwrap().len(), 2);
 }
 
-/// A JSON-LD query on a view reads that view's ledger. A `from` or `fromNamed`
-/// naming another ledger, or a ledger that does not exist, was ignored and the
-/// query answered from the view. Every view entry point refuses it now,
-/// buffered and tracked, with and without the graph-source providers. Naming
-/// the view's own ledger, in any spelling, still answers from the view.
+/// A JSON-LD query on a view reads that view's ledger, whole, at the view's
+/// time. A dataset member naming anything else was ignored and the query
+/// answered from the view: another ledger or one that does not exist, and
+/// equally a pin, a graph of this ledger (by address, keyword or object), a
+/// named graph, or a history range. Every view entry point refuses each now,
+/// buffered and tracked, with and without the graph-source providers, and the
+/// streaming planner, wherever the parser reads the dataset (`opts` first).
+/// Naming the view's own ledger, in any spelling, still answers from the view.
 #[tokio::test]
-async fn a_view_refuses_a_jsonld_from_naming_another_ledger() {
+async fn a_view_refuses_a_jsonld_dataset_beyond_its_own_ledger() {
     let fluree = FlureeBuilder::memory().build_memory();
     seed_people_ledger(&fluree, "o4-people:main").await;
     seed_orgs_ledger(&fluree, "o4-orgs:main").await;
@@ -3980,6 +3983,19 @@ async fn a_view_refuses_a_jsonld_from_naming_another_ledger() {
         ("from", json!({"@id": "o4-orgs:main"})),
         ("from", json!(["o4-people:main", "o4-orgs"])),
         ("fromNamed", json!(["o4-orgs:main"])),
+        // The view's own ledger, but more than the whole of it at the view's
+        // time: a pin, a graph (by address, keyword or object), a named graph.
+        ("from", json!("o4-people:main@t:1")),
+        ("from", json!({"@id": "o4-people:main", "t": 1})),
+        ("from", json!("o4-people:main#txn-meta")),
+        ("from", json!("config")),
+        ("from", json!({"@id": "o4-people:main", "graph": "config"})),
+        ("fromNamed", json!(["o4-people:main"])),
+        // A dataset that does not parse (a `to` with no `from`).
+        ("to", json!("o4-people:main@t:latest")),
+        // `opts` is where the parser reads first.
+        ("opts", json!({"from": "o4-orgs:main"})),
+        ("opts", json!({"from": "o4-people:main@t:1"})),
     ] {
         let q = with(key, members.clone());
         let case = format!("{key}: {members}");
@@ -4013,7 +4029,22 @@ async fn a_view_refuses_a_jsonld_from_naming_another_ledger() {
             Err(e) if e.status == 400 && e.error.contains("query_from()") => {}
             other => failures.push(format!("graph() tracked: {:?}", other.map(|_| ()))),
         }
+        match fluree
+            .plan_stream_query(&view, &fluree_db_api::OwnedStreamQuery::JsonLd(q.clone()))
+            .await
+        {
+            Err(e) if e.status_code() == 400 && e.to_string().contains("query_from()") => {}
+            other => failures.push(format!("stream plan: {:?}", other.map(|_| ()))),
+        }
         assert!(failures.is_empty(), "{case}:\n{}", failures.join("\n"));
+    }
+
+    // A history range, with the `from` it starts at.
+    let mut history = with("from", json!("o4-people:main@t:1"));
+    history["to"] = json!("o4-people:main@t:latest");
+    match fluree.query(&view, &history).await {
+        Err(e) if e.status_code() == 400 && e.to_string().contains("history range") => {}
+        other => panic!("history range on a view: {:?}", other.map(|_| ())),
     }
 
     for own in [
@@ -4029,7 +4060,21 @@ async fn a_view_refuses_a_jsonld_from_naming_another_ledger() {
                 .unwrap_or_else(|e| panic!("from {own}: {e}")),
         );
         assert_eq!(rows, expected, "from {own}");
+        fluree
+            .plan_stream_query(
+                &view,
+                &fluree_db_api::OwnedStreamQuery::JsonLd(with("from", own.clone())),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("stream plan, from {own}: {e}"));
     }
+    let rows = names(
+        fluree
+            .query(&view, &with("opts", json!({"from": "o4-people"})))
+            .await
+            .expect("opts.from naming the view's own ledger"),
+    );
+    assert_eq!(rows, expected, "opts.from");
 }
 
 /// A caller that authorizes the ledgers a query names before running it reads

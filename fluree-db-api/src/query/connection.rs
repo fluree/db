@@ -139,7 +139,9 @@ impl Fluree {
             .prepare_single_view_for_connection(&spec, &qc_opts)
             .await?
         {
-            return self.query_with_options(&view, query_json, options).await;
+            return self
+                .query_with_options(&view, query_json, options.on_the_datasets_view())
+                .await;
         }
 
         // Multi-ledger: use DataSetDb
@@ -186,10 +188,19 @@ impl Fluree {
         if let Some(view) = single {
             let result = match r2rml {
                 Some((rp, rtp)) => {
-                    self.query_view_with_r2rml_options(&view, query_json, rp, rtp, options)
+                    self.query_view_with_r2rml_options(
+                        &view,
+                        query_json,
+                        rp,
+                        rtp,
+                        options.on_the_datasets_view(),
+                    )
+                    .await?
+                }
+                None => {
+                    self.query_with_options(&view, query_json, options.on_the_datasets_view())
                         .await?
                 }
-                None => self.query_with_options(&view, query_json, options).await?,
             };
             return Ok((result, FormatTarget::Single(Box::new(view))));
         }
@@ -243,7 +254,7 @@ impl Fluree {
                     query_json,
                     r2rml_provider,
                     r2rml_table_provider,
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
@@ -336,7 +347,7 @@ impl Fluree {
                 query_json,
                 format_config,
                 tracking_override,
-                options,
+                options.on_the_datasets_view(),
             ))
             .await;
         }
@@ -390,7 +401,9 @@ impl Fluree {
             .prepare_single_view_for_connection_with_policy(&spec, policy)
             .await?
         {
-            return self.query_with_options(&view, query_json, options).await;
+            return self
+                .query_with_options(&view, query_json, options.on_the_datasets_view())
+                .await;
         }
 
         // Multi-ledger: use DataSetDb and apply explicit policy to each view
@@ -426,7 +439,7 @@ impl Fluree {
                     query_json,
                     r2rml_provider,
                     r2rml_table_provider,
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
@@ -485,7 +498,7 @@ impl Fluree {
                         provider: r2rml_provider,
                         table_provider: r2rml_table_provider,
                     },
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
@@ -549,7 +562,7 @@ impl Fluree {
                     format_config,
                     tracking_override,
                     r2rml,
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
@@ -613,7 +626,7 @@ impl Fluree {
                     query_json,
                     format_config,
                     tracking_override,
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
