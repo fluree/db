@@ -270,12 +270,6 @@ async fn bound_typed_literal_matches_values_from_both_surfaces() {
                 both,
                 "{lane}: SPARQL constant {literal:?}"
             );
-            // Separate gap, not this issue's: once indexed, a JSON-LD constant
-            // typed with a non-default numeric subtype matches nothing, even for
-            // JSON-LD-written data.
-            if lane == "indexed" && matches!(literal.2, "long" | "float") {
-                continue;
-            }
             assert_eq!(
                 jsonld_subjects_with(&fluree, &ledger, literal).await,
                 both,
