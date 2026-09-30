@@ -42,10 +42,13 @@ use crate::error::{Result, ShaclError};
 use crate::validate::{FocusNode, ValidationResult};
 use fluree_db_core::{FlakeValue, GraphDbRef, Sid};
 use fluree_db_query::{
-    execute, Binding, ContextConfig, ExecutableQuery, ExecutionContext, Pattern, VarId, VarRegistry,
+    execute, Binding, ContextConfig, ExecutableQuery, ExecutionContext, Pattern, QueryError, VarId,
+    VarRegistry,
 };
 use fluree_db_sparql::ast::pattern::{GraphPattern, SubSelect};
-use fluree_db_sparql::ast::query::{GroupCondition, SelectVariable, SelectVariables};
+use fluree_db_sparql::ast::query::{
+    GroupCondition, SelectVariable, SelectVariables, SolutionModifiers,
+};
 use fluree_db_sparql::{parse_sparql, QueryBody, SparqlAst};
 use fluree_vocab::shacl as sh_vocab;
 use std::sync::Arc;
@@ -142,7 +145,7 @@ fn analyze_select(text: &str) -> std::result::Result<Arc<SparqlAst>, String> {
             .join("; ");
         return Err(format!("invalid sh:select query: {msg}"));
     }
-    let ast = out
+    let mut ast = out
         .ast
         .ok_or_else(|| "invalid sh:select query".to_string())?;
 
@@ -165,7 +168,60 @@ fn analyze_select(text: &str) -> std::result::Result<Arc<SparqlAst>, String> {
         }
     }
     check_pattern(&select.where_clause.pattern)?;
+    if let QueryBody::Select(select) = &mut ast.body {
+        group_by_pre_bound(&select.select.variables, &mut select.modifiers);
+        group_by_pre_bound_in(&mut select.where_clause.pattern);
+    }
     Ok(Arc::new(ast))
+}
+
+/// The pre-bound variables a query can project (`$shapesGraph` and
+/// `$currentShape` are rejected above).
+const PRE_BOUND: [&str; 2] = ["this", "PATH"];
+
+/// A pre-bound variable is constant within one evaluation, so grouping by it
+/// changes no group. Add each one a level projects to that level's GROUP BY
+/// when it is missing: otherwise the level projects a variable its grouping
+/// does not produce, which the planner rejects, and every sub-SELECT here
+/// projects `$this`. A level without GROUP BY needs nothing: with an aggregate
+/// it already groups by the variables it projects beside the aggregates.
+fn group_by_pre_bound(variables: &SelectVariables, modifiers: &mut SolutionModifiers) {
+    let (SelectVariables::Explicit(items), Some(group_by)) = (variables, &mut modifiers.group_by)
+    else {
+        return;
+    };
+    for item in items {
+        let SelectVariable::Var(var) = item else {
+            continue;
+        };
+        let keyed = group_by
+            .conditions
+            .iter()
+            .any(|c| matches!(c, GroupCondition::Var(key) if key.name == var.name));
+        if PRE_BOUND.contains(&var.name.as_ref()) && !keyed {
+            group_by.conditions.push(GroupCondition::Var(var.clone()));
+        }
+    }
+}
+
+/// [`group_by_pre_bound`] for every sub-SELECT the restriction walk visits.
+fn group_by_pre_bound_in(pattern: &mut GraphPattern) {
+    match pattern {
+        GraphPattern::Group { patterns, .. } => patterns.iter_mut().for_each(group_by_pre_bound_in),
+        GraphPattern::Optional { pattern, .. } | GraphPattern::Graph { pattern, .. } => {
+            group_by_pre_bound_in(pattern);
+        }
+        GraphPattern::Union { left, right, .. } => {
+            group_by_pre_bound_in(left);
+            group_by_pre_bound_in(right);
+        }
+        GraphPattern::SubSelect { query, .. } => {
+            let query = &mut **query;
+            group_by_pre_bound(&query.variables, &mut query.modifiers);
+            group_by_pre_bound_in(&mut query.pattern);
+        }
+        _ => {}
+    }
 }
 
 /// Reject assignment to `$this` in a SELECT clause (`... AS $this`).
@@ -268,9 +324,17 @@ fn inject_bindings(patterns: &mut Vec<Pattern>, bound: &[(VarId, Sid)]) {
                 inject_bindings(&mut sq.patterns, bound);
                 // The restriction walk guarantees the sub-SELECT projects
                 // $this explicitly; $PATH may not be projected, so extend
-                // the projection to keep the injected binding joinable.
+                // the projection to keep the injected binding joinable. Not
+                // past a grouping that does not produce it: a grouped level
+                // cannot project a variable it does not group by (its value
+                // is the same constant on both sides of the join anyway).
                 for (var, _) in bound {
-                    if !sq.select.contains(var) {
+                    let grouped_out = sq.grouping.as_ref().is_some_and(|g| {
+                        !g.group_by_vars().any(|key| key == *var)
+                            && !g.aggregates().any(|spec| spec.output_var == *var)
+                            && !g.binds().any(|(out, _)| out == var)
+                    });
+                    if !sq.select.contains(var) && !grouped_out {
                         sq.select.push(*var);
                     }
                 }
@@ -433,13 +497,20 @@ pub(crate) async fn validate_sparql_constraint(
         return Ok(Vec::new());
     }
 
+    let iri = |sid: &Sid| {
+        db.snapshot
+            .decode_sid(sid)
+            .unwrap_or_else(|| sid.to_string())
+    };
+    let constraint_failure = |message: String| ShaclError::SparqlConstraint {
+        constraint: iri(&constraint.source),
+        message,
+    };
+
     let ast = constraint
         .parsed
         .as_ref()
-        .map_err(|e| ShaclError::SparqlConstraint {
-            constraint: constraint.source.clone(),
-            message: e.clone(),
-        })?;
+        .map_err(|e| constraint_failure(e.clone()))?;
 
     // Lower against the staged registry when one is provided, else the data
     // snapshot — a fresh `VarRegistry` per call keeps compiled shapes
@@ -450,10 +521,8 @@ pub(crate) async fn validate_sparql_constraint(
         Some(encoder) => fluree_db_sparql::lower_sparql(ast, &encoder, &mut vars),
         None => fluree_db_sparql::lower_sparql(ast, db.snapshot, &mut vars),
     };
-    let mut query = lowered.map_err(|e| ShaclError::SparqlConstraint {
-        constraint: constraint.source.clone(),
-        message: format!("failed to lower sh:select query: {e}"),
-    })?;
+    let mut query =
+        lowered.map_err(|e| constraint_failure(format!("failed to lower sh:select query: {e}")))?;
 
     // Lowered variables register under their `?`-prefixed surface name.
     let this_var = vars.get_or_insert("?this");
@@ -477,12 +546,11 @@ pub(crate) async fn validate_sparql_constraint(
         // $PATH is only meaningful on a property shape with a plain
         // predicate path; bind it exactly like $this.
         let Some(path) = fallback_path else {
-            return Err(ShaclError::SparqlConstraint {
-                constraint: constraint.source.clone(),
-                message: "$PATH is only supported in sh:sparql constraints on property shapes \
-                          with a plain predicate path"
+            return Err(constraint_failure(
+                "$PATH is only supported in sh:sparql constraints on property shapes with a \
+                 plain predicate path"
                     .to_string(),
-            });
+            ));
         };
         bound.push((vars.get_or_insert("?PATH"), path.clone()));
     }
@@ -504,7 +572,16 @@ pub(crate) async fn validate_sparql_constraint(
             ..Default::default()
         },
     )
-    .await?;
+    .await
+    .map_err(|e| match e.name_variables(&vars) {
+        // A query the planner rejects (e.g. a projected variable its grouping
+        // does not produce) is a broken constraint: a validation failure
+        // naming the shape, like a query that does not parse.
+        QueryError::InvalidQuery(message) => {
+            constraint_failure(format!("on shape {}: {message}", iri(source_shape)))
+        }
+        other => ShaclError::QueryError(other),
+    })?;
 
     // Decode context for late-materialized (encoded) bindings.
     let ctx = ExecutionContext::from_graph_db_ref(db, &vars);
