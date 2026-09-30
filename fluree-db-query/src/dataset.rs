@@ -217,6 +217,26 @@ pub struct DataSet<'a> {
     /// ledger's union default graph is not named by the query; see
     /// [`Self::implicit`].
     explicit: bool,
+    /// Reads any other name as one of the above
+    /// ([`DataSet::with_name_resolver`]).
+    name_resolver: Option<GraphNameResolver<'a>>,
+}
+
+/// Reads a `GRAPH` name no member is keyed by as the key of the member it
+/// names. An update's WHERE over a ledger's whole graph store reads `GRAPH
+/// <iri>` through the ledger's graph-position table this way, so every
+/// spelling of a graph's name reaches it without a key per spelling.
+#[derive(Clone)]
+pub struct GraphNameResolver<'a>(Arc<ResolveGraphName<'a>>);
+
+/// The function a [`GraphNameResolver`] wraps: a `GRAPH` name to the key of
+/// the member it names.
+type ResolveGraphName<'a> = dyn Fn(&str) -> Option<Arc<str>> + Send + Sync + 'a;
+
+impl std::fmt::Debug for GraphNameResolver<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GraphNameResolver")
+    }
 }
 
 impl<'a> DataSet<'a> {
@@ -227,6 +247,7 @@ impl<'a> DataSet<'a> {
             named_graphs: HashMap::new(),
             named_graph_aliases: HashMap::new(),
             explicit: true,
+            name_resolver: None,
         }
     }
 
@@ -244,6 +265,18 @@ impl<'a> DataSet<'a> {
     /// Whether the query named this dataset; see [`Self::implicit`].
     pub fn is_explicit(&self) -> bool {
         self.explicit
+    }
+
+    /// Read a `GRAPH` name that no member is keyed by through `resolve`,
+    /// which returns the key of the member the name denotes (or `None`). The
+    /// resolved name is addressable, not enumerated: `GRAPH ?g` still binds
+    /// only the members' own names.
+    pub fn with_name_resolver(
+        mut self,
+        resolve: impl Fn(&str) -> Option<Arc<str>> + Send + Sync + 'a,
+    ) -> Self {
+        self.name_resolver = Some(GraphNameResolver(Arc::new(resolve)));
+        self
     }
 
     /// Add a default graph
@@ -277,9 +310,16 @@ impl<'a> DataSet<'a> {
 
     /// Get a named graph by IRI (None if not found)
     pub fn named_graph(&self, iri: &str) -> Option<&GraphRef<'a>> {
+        self.keyed_graph(iri).or_else(|| {
+            let key = (self.name_resolver.as_ref()?.0)(iri)?;
+            self.keyed_graph(&key)
+        })
+    }
+
+    fn keyed_graph(&self, name: &str) -> Option<&GraphRef<'a>> {
         self.named_graphs
-            .get(iri)
-            .or_else(|| self.named_graph_aliases.get(iri))
+            .get(name)
+            .or_else(|| self.named_graph_aliases.get(name))
     }
 
     /// Get all named graph IRIs (for GRAPH ?g iteration)
@@ -289,7 +329,7 @@ impl<'a> DataSet<'a> {
 
     /// Check if a named graph exists
     pub fn has_named_graph(&self, iri: &str) -> bool {
-        self.named_graphs.contains_key(iri) || self.named_graph_aliases.contains_key(iri)
+        self.named_graph(iri).is_some()
     }
 
     /// Copy of this dataset where every graph matching the primary
@@ -337,6 +377,10 @@ impl<'a> DataSet<'a> {
                 .map(|(iri, g)| (Arc::clone(iri), patch(g)))
                 .collect(),
             explicit: self.explicit,
+            name_resolver: self.name_resolver.as_ref().map(|resolver| {
+                let resolve: Arc<ResolveGraphName<'b>> = resolver.0.clone();
+                GraphNameResolver(resolve)
+            }),
         }
     }
 

@@ -120,8 +120,8 @@ pub use content_kind::{
     CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
 };
 pub use dataset_ref::{
-    DatasetRef, GraphIri, GraphSel, LedgerRef, MemberRef, RefError, TargetError, TargetGraph,
-    TargetLedger, TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS,
+    DatasetRef, GraphIri, GraphPosition, GraphSel, LedgerRef, MemberRef, RefError, TargetError,
+    TargetGraph, TargetLedger, TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS,
 };
 pub use datatype_constraint::DatatypeConstraint;
 pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};

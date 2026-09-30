@@ -12,7 +12,7 @@ pub use accumulator::FlakeAccumulator;
 pub use cancellation::{apply_cancellation, dedup_retractions};
 #[cfg(feature = "import")]
 pub(crate) use flakes::DT_ID;
-pub use flakes::{infer_datatype, FlakeGenerator};
+pub use flakes::{infer_datatype, FlakeGenerator, GraphTable, WriteGraph};
 pub(crate) use flakes::{
     validate_value_dt_pair, DT_BOOLEAN, DT_DATE, DT_DATE_TIME, DT_DAY_TIME_DURATION, DT_DECIMAL,
     DT_DOUBLE, DT_DURATION, DT_G_DAY, DT_G_MONTH, DT_G_MONTH_DAY, DT_G_YEAR, DT_G_YEAR_MONTH,
