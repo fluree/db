@@ -156,7 +156,7 @@ impl<'a> Validator<'a> {
         self.validate_query_where(&query.where_clause.pattern);
         projection::check_projection_scope(
             &query.select.variables,
-            query.modifiers.group_by.as_ref(),
+            &query.modifiers,
             query.select.span,
             &mut self.diagnostics,
         );
@@ -166,6 +166,11 @@ impl<'a> Validator<'a> {
             &mut self.diagnostics,
         );
         projection::check_nested_aggregates(
+            &query.select.variables,
+            &query.modifiers,
+            &mut self.diagnostics,
+        );
+        projection::check_aggregate_over_select_alias(
             &query.select.variables,
             &query.modifiers,
             &mut self.diagnostics,
@@ -654,7 +659,7 @@ impl<'a> Validator<'a> {
                 self.validate_graph_pattern(&query.pattern);
                 projection::check_projection_scope(
                     &query.variables,
-                    query.modifiers.group_by.as_ref(),
+                    &query.modifiers,
                     *span,
                     &mut self.diagnostics,
                 );
@@ -664,6 +669,11 @@ impl<'a> Validator<'a> {
                     &mut self.diagnostics,
                 );
                 projection::check_nested_aggregates(
+                    &query.variables,
+                    &query.modifiers,
+                    &mut self.diagnostics,
+                );
+                projection::check_aggregate_over_select_alias(
                     &query.variables,
                     &query.modifiers,
                     &mut self.diagnostics,
@@ -1368,6 +1378,66 @@ mod tests {
         let diags =
             validate_query("SELECT ?s WHERE { { SELECT ?o { ?s ?p ?o } GROUP BY ?s } ?s ?p ?o2 }");
         assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    #[test]
+    fn test_projection_implicit_group_via_having_or_order_by() {
+        // §18.2.4.1: an aggregate in HAVING or ORDER BY groups the level too,
+        // so a projected variable must be a key or aggregated there as well.
+        for query in [
+            "SELECT ?o WHERE { ?s ?p ?o } HAVING (COUNT(*) > 1)",
+            "SELECT (STR(?o) AS ?x) WHERE { ?s ?p ?o } HAVING (COUNT(*) > 1)",
+            "SELECT ?o WHERE { ?s ?p ?o } ORDER BY DESC(COUNT(?o))",
+        ] {
+            let diags = validate_query(query);
+            assert!(
+                has_code(&diags, DiagCode::UngroupedVariableInProjection),
+                "{query}: {diags:?}"
+            );
+        }
+        // Not grouped: HAVING without an aggregate, or SELECT * (which projects
+        // the keys — none — under implicit grouping).
+        for query in [
+            "SELECT ?o WHERE { ?s ?p ?o } HAVING (?o > 1)",
+            "SELECT * WHERE { ?s ?p ?o } HAVING (COUNT(*) > 1)",
+        ] {
+            let diags = validate_query(query);
+            assert!(
+                !diags.iter().any(Diagnostic::is_error),
+                "{query}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_aggregate_over_same_level_select_alias_rejected() {
+        for query in [
+            "SELECT ?s (STR(?o) AS ?x) (COUNT(?x) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?s",
+            "SELECT ?s (STR(?o) AS ?x) WHERE { ?s ?p ?o } GROUP BY ?s HAVING (COUNT(?x) > 1)",
+            "SELECT ?s (COUNT(?o) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?s ORDER BY (SUM(?n))",
+            "SELECT ?s WHERE { { SELECT ?s (STR(?o) AS ?x) (COUNT(?x) AS ?c) \
+             WHERE { ?s ?p ?o } GROUP BY ?s } }",
+        ] {
+            let diags = validate_query(query);
+            let diag = diags
+                .iter()
+                .find(|d| d.code == DiagCode::AggregateOverSelectAlias)
+                .unwrap_or_else(|| panic!("{query}: {diags:?}"));
+            assert!(
+                diag.message
+                    .contains("is assigned by this SELECT clause, after aggregation"),
+                "{}",
+                diag.message
+            );
+        }
+        // The aggregate reads a WHERE variable, not the alias: fine.
+        let diags = validate_query(
+            "SELECT ?s (STR(?s) AS ?x) (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?s",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::AggregateOverSelectAlias),
+            "{diags:?}"
+        );
     }
 
     // =========================================================================

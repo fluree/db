@@ -175,6 +175,11 @@ pub enum DiagCode {
     #[serde(rename = "V008")]
     AnonymousAnnotationInGroundData,
 
+    /// Aggregate reads an alias assigned by the same SELECT clause, which is
+    /// bound only after aggregation (SPARQL §18.2.4.4)
+    #[serde(rename = "V009")]
+    AggregateOverSelectAlias,
+
     /// Anonymous annotation (fresh blank-node reifier) in a DELETE form
     #[serde(rename = "F011")]
     AnonymousAnnotationInDelete,
@@ -236,6 +241,7 @@ impl DiagCode {
             Self::NestedAggregate => "V006",
             Self::DuplicateValuesVariable => "V007",
             Self::AnonymousAnnotationInGroundData => "V008",
+            Self::AggregateOverSelectAlias => "V009",
             Self::BlankNodeInDelete => "F010",
             Self::AnonymousAnnotationInDelete => "F011",
             // Rust port

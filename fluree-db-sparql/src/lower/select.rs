@@ -190,6 +190,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ) -> Result<LoweredSelectLevel> {
         let where_vars = pre_group_vars(patterns, post_values);
         let mut lowered = self.lower_solution_modifiers(modifiers, select, &where_vars)?;
+        // One definition of "groups": validation (V4) reads it off the AST,
+        // lowering off the lowered keys and aggregates.
+        debug_assert_eq!(
+            lowered.groups(),
+            modifiers.level_groups(&select.variables),
+            "lowering and validation disagree on whether the level groups"
+        );
         let where_vars = where_vars
             .into_iter()
             .chain(

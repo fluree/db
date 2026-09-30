@@ -510,6 +510,57 @@ async fn order_by_a_non_key_variable_reads_a_sample() {
     }
 }
 
+/// An aggregate in HAVING or ORDER BY groups the level (§18.2.4.1), so a
+/// projected non-key variable is the same V4 error as under an explicit GROUP
+/// BY. The projected expression used to expand into one row per solution, and
+/// the projected variable used to become an implicit GROUP BY key.
+#[tokio::test]
+async fn implicit_grouping_via_having_checks_the_projection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/v4-having:main").await;
+    for body in [
+        format!("SELECT {SEG} {W} HAVING (COUNT(*) > 1)"),
+        format!("SELECT ?a {W} HAVING (COUNT(*) > 1)"),
+    ] {
+        let query = format!("{PREFIX}{body}");
+        let err = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .expect_err("a projected non-key variable of a grouped level");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("?a is projected but is neither a GROUP BY key nor aggregated"),
+            "{body}: {msg}"
+        );
+    }
+}
+
+/// An aggregate over an alias of the same SELECT clause reads it before the
+/// SELECT's Extend binds it; per the spec `COUNT(?seg)` would be 0 for every
+/// group. It used to count solutions (and expand `?seg`); it is now a named
+/// error.
+#[tokio::test]
+async fn aggregate_over_a_same_level_select_alias_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/agg-alias:main").await;
+    for body in [
+        format!("SELECT ?a {SEG} (COUNT(?seg) AS ?c) {W} GROUP BY ?a"),
+        format!("SELECT ?a {SEG} {W} GROUP BY ?a HAVING (COUNT(?seg) > 1)"),
+    ] {
+        let query = format!("{PREFIX}{body}");
+        let err = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .expect_err("an aggregate over a same-level SELECT alias");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "?seg is assigned by this SELECT clause, after aggregation, so it cannot \
+                 be aggregated at the same level"
+            ),
+            "{body}: {msg}"
+        );
+    }
+}
+
 /// §18.2.4.2: HAVING on a level that does not group is a Filter over its
 /// solutions (it used to be ignored), and it cannot see the SELECT expressions,
 /// so `BOUND(?s)` is false for every solution.
