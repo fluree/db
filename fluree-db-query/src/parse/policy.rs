@@ -4,12 +4,14 @@
 //! This replaces separate `(context, path_aliases, strict)` parameter lists
 //! with a single `&JsonLdParseCtx`.
 
+use super::graph_name::GraphNameEnv;
 use super::PathAliasMap;
 use fluree_graph_json_ld::{
     details_with_policy, details_with_vocab_policy, expand_iri_with_policy, ContextEntry,
     ParsedContext,
 };
 use serde_json::Value as JsonValue;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Parse-time policy flags for JSON-LD parsing.
 ///
@@ -36,6 +38,13 @@ pub struct JsonLdParseCtx {
     pub context: ParsedContext,
     pub path_aliases: PathAliasMap,
     pub policy: JsonLdParsePolicy,
+    /// What resolves a graph name beyond the `@context`
+    /// ([`super::graph_name`]): an update's ledger and `fromNamed` aliases.
+    pub graph_names: GraphNameEnv,
+    /// How many graph scopes (`["graph", …]` or a node-level `@graph`)
+    /// enclose the pattern being parsed. A `default` selector cannot leave
+    /// one, so it is refused inside.
+    pub(crate) enclosing_graphs: AtomicU32,
 }
 
 impl JsonLdParseCtx {
@@ -48,7 +57,30 @@ impl JsonLdParseCtx {
             context,
             path_aliases,
             policy,
+            graph_names: GraphNameEnv::default(),
+            enclosing_graphs: AtomicU32::new(0),
         }
+    }
+
+    /// The same context, resolving graph names with `env` (an update's
+    /// ledger and `fromNamed` aliases).
+    #[must_use]
+    pub fn with_graph_names(mut self, env: GraphNameEnv) -> Self {
+        self.graph_names = env;
+        self
+    }
+
+    /// Run `parse` with one more enclosing graph scope.
+    pub(crate) fn in_graph_scope<T>(&self, parse: impl FnOnce() -> T) -> T {
+        self.enclosing_graphs.fetch_add(1, Ordering::Relaxed);
+        let out = parse();
+        self.enclosing_graphs.fetch_sub(1, Ordering::Relaxed);
+        out
+    }
+
+    /// Whether any graph scope encloses the pattern being parsed.
+    pub(crate) fn in_any_graph_scope(&self) -> bool {
+        self.enclosing_graphs.load(Ordering::Relaxed) > 0
     }
 
     /// Expand a subject `@id` value (uses `@base`, not `@vocab`).

@@ -23,6 +23,7 @@ pub mod error;
 pub mod filter_common;
 pub mod filter_data;
 pub mod filter_sexpr;
+pub mod graph_name;
 pub mod lower;
 pub mod node_map;
 pub mod options;
@@ -42,6 +43,7 @@ pub use ast::{
 };
 pub use encode::{IriEncoder, MemoryEncoder, NoEncoder};
 pub use error::{ParseError, Result};
+pub use graph_name::{classify_written_graph_name, GraphNameEnv, WrittenGraphName};
 pub(crate) use lower::{lower_query, SelectMode};
 pub use lower::{lower_unresolved_pattern, lower_unresolved_patterns};
 pub use policy::{JsonLdParseCtx, JsonLdParsePolicy};
@@ -213,7 +215,14 @@ fn parse_query_ast_internal(
     // compact IRIs inside @path expressions honor `opts.strictCompactIri`.
     let parse_policy = policy::resolve_parse_policy(strict_override, obj);
     let path_aliases = extract_path_aliases(context_val, &context, parse_policy)?;
-    let ctx = JsonLdParseCtx::new(context.clone(), path_aliases, parse_policy);
+    // A node-level `@graph` in `where` can name a `fromNamed` alias, which
+    // must stay the alias rather than expand as an IRI.
+    let ctx = JsonLdParseCtx::new(context.clone(), path_aliases, parse_policy).with_graph_names(
+        GraphNameEnv {
+            ledger_id: None,
+            aliases: query_from_named_aliases(obj),
+        },
+    );
 
     let mut query = UnresolvedQuery::new(context.clone());
 
@@ -438,6 +447,49 @@ pub(crate) fn extract_path_aliases(
     let tmp_ctx = JsonLdParseCtx::new(parsed_context.clone(), PathAliasMap::new(), policy);
     extract_path_aliases_into(context_val, &tmp_ctx, &mut aliases)?;
     Ok(aliases)
+}
+
+/// The names a query's `fromNamed` (or legacy `from-named`) gives its named
+/// graphs, which `where` graph patterns may use: the object form's keys, and
+/// the array form's strings, `alias`es and `@id`s. Each maps to the graph IRI
+/// when the entry gives one, else to the name itself.
+fn query_from_named_aliases(obj: &serde_json::Map<String, JsonValue>) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    let graph_of = |entry: &JsonValue| {
+        entry
+            .get("@graph")
+            .or_else(|| entry.get("graph"))
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+    };
+    let mut add = |name: &str, iri: Option<String>| {
+        aliases.insert(name.to_string(), iri.unwrap_or_else(|| name.to_string()));
+    };
+    match obj.get("fromNamed").or_else(|| obj.get("from-named")) {
+        Some(JsonValue::Object(entries)) => {
+            for (alias, entry) in entries {
+                add(alias, graph_of(entry));
+            }
+        }
+        Some(JsonValue::String(name)) => add(name, None),
+        Some(JsonValue::Array(items)) => {
+            for item in items {
+                match item {
+                    JsonValue::String(name) => add(name, None),
+                    JsonValue::Object(entry) => {
+                        for key in ["alias", "@id"] {
+                            if let Some(name) = entry.get(key).and_then(JsonValue::as_str) {
+                                add(name, graph_of(item));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    aliases
 }
 
 /// Recursive helper that accumulates path aliases from a context value.
@@ -1484,6 +1536,47 @@ mod tests {
     /// Helper to extract the triple pattern from an UnresolvedPattern
     fn triple(p: &UnresolvedPattern) -> &UnresolvedTriplePattern {
         p.as_triple().expect("Expected UnresolvedPattern::Triple")
+    }
+
+    /// A node-level `@graph` in a query's `where` can name a `fromNamed`
+    /// alias, which stays the alias even where `@base` or a prefix could
+    /// expand it; any other compact name expands.
+    #[test]
+    fn node_level_graph_in_query_keeps_from_named_aliases() {
+        let graph_name = |query: JsonValue| {
+            let (ast, _) = parse_query_ast(&query, None).unwrap();
+            match &ast.patterns[..] {
+                [UnresolvedPattern::Graph { name, .. }] => name.to_string(),
+                other => panic!("expected one GRAPH pattern, got {other:?}"),
+            }
+        };
+        let context = json!({"ex": "http://example.org/", "@base": "http://base.example/"});
+        for (from_named, alias) in [
+            (
+                json!({"products": {"@id": "mydb:main", "@graph": "http://example.org/p"}}),
+                "products",
+            ),
+            (json!(["mydb:main"]), "mydb:main"),
+            (json!([{"@id": "mydb:main", "alias": "p2"}]), "p2"),
+        ] {
+            assert_eq!(
+                graph_name(json!({
+                    "@context": context,
+                    "fromNamed": from_named,
+                    "select": ["?s"],
+                    "where": {"@id": "?s", "@graph": alias, "ex:p": "?o"}
+                })),
+                alias
+            );
+        }
+        assert_eq!(
+            graph_name(json!({
+                "@context": context,
+                "select": ["?s"],
+                "where": {"@id": "?s", "@graph": "ex:g", "ex:p": "?o"}
+            })),
+            "http://example.org/g"
+        );
     }
 
     #[test]

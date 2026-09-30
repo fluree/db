@@ -596,13 +596,15 @@ pub fn parse_where_array_element(
                 ParseError::InvalidWhere("graph name must be a string".to_string())
             })?;
             // Remaining elements are patterns
-            let graph_patterns = parse_subquery_patterns(
-                &arr[2..],
-                ctx,
-                subject_counter,
-                nested_counter,
-                object_var_parsing,
-            )?;
+            let graph_patterns = ctx.in_graph_scope(|| {
+                parse_subquery_patterns(
+                    &arr[2..],
+                    ctx,
+                    subject_counter,
+                    nested_counter,
+                    object_var_parsing,
+                )
+            })?;
             query
                 .patterns
                 .push(UnresolvedPattern::graph(graph_name, graph_patterns));
@@ -853,6 +855,90 @@ mod tests {
             &mut query
         )
         .is_err());
+    }
+
+    /// A node-level `@graph` in `where` names its graph exactly as the same
+    /// key does in an insert or delete: a compact IRI expands against the
+    /// `@context`, and in an update's `where` the keywords and `fromNamed`
+    /// aliases resolve as the templates resolve them. `default` matches the
+    /// where's default graph, and cannot leave an enclosing graph.
+    #[test]
+    fn node_level_graph_in_where_resolves_names_like_templates() {
+        let context = test_context();
+        let env = crate::parse::GraphNameEnv {
+            ledger_id: Some("mydb:main".to_string()),
+            aliases: [("g1".to_string(), "http://example.org/one".to_string())].into(),
+        };
+        let parse = |where_val: JsonValue, env: Option<&crate::parse::GraphNameEnv>| {
+            let mut ctx = test_parse_ctx(&context);
+            if let Some(env) = env {
+                ctx = ctx.with_graph_names(env.clone());
+            }
+            let mut query = UnresolvedQuery::new(context.clone());
+            parse_where_with_counters(&where_val, &ctx, &mut query, &mut 0, &mut 0, true)
+                .map(|()| query.patterns)
+        };
+        let graph_name = |where_val: JsonValue, env| match &parse(where_val, env).unwrap()[..] {
+            [UnresolvedPattern::Graph { name, .. }] => name.to_string(),
+            other => panic!("expected one GRAPH pattern, got {other:?}"),
+        };
+
+        // A compact name expands, in a query and in an update alike.
+        for env in [None, Some(&env)] {
+            assert_eq!(
+                graph_name(json!({"@id": "?s", "@graph": "ex:g", "ex:p": "?o"}), env),
+                "http://example.org/g"
+            );
+            assert_eq!(
+                graph_name(json!({"@id": "?s", "@graph": "?g", "ex:p": "?o"}), env),
+                "?g"
+            );
+        }
+        // An update's keywords name this ledger's graphs; an alias stays the
+        // name the dataset resolves.
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "config", "ex:p": "?o"}),
+                Some(&env)
+            ),
+            "urn:fluree:mydb:main#config"
+        );
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "txn-meta", "ex:p": "?o"}),
+                Some(&env)
+            ),
+            "urn:fluree:mydb:main#txn-meta"
+        );
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "g1", "ex:p": "?o"}),
+                Some(&env)
+            ),
+            "g1"
+        );
+
+        // `default` is the where's default graph: the node's patterns as they
+        // are, with no GRAPH around them.
+        let plain = parse(json!({"@id": "?s", "ex:p": "?o"}), Some(&env)).unwrap();
+        let default = parse(
+            json!({"@id": "?s", "@graph": "default", "ex:p": "?o"}),
+            Some(&env),
+        )
+        .unwrap();
+        assert_eq!(format!("{plain:?}"), format!("{default:?}"));
+        // Inside another graph it would have to leave it, which a where
+        // pattern cannot do: refused, whichever form encloses it.
+        for enclosed in [
+            json!({"@id": "?s", "@graph": "ex:g", "ex:child": {"@graph": "default", "ex:q": "?v"}}),
+            json!([["graph", "http://example.org/g",
+                    {"@id": "?s", "ex:child": {"@graph": "default", "ex:q": "?v"}}]]),
+            json!([["graph", "http://example.org/g",
+                    {"@id": "?s", "@graph": "default", "ex:p": "?o"}]]),
+        ] {
+            let err = parse(enclosed.clone(), Some(&env)).unwrap_err().to_string();
+            assert!(err.contains("\"default\""), "{enclosed}: {err}");
+        }
     }
 
     #[test]

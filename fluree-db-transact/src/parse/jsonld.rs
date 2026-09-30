@@ -18,7 +18,7 @@ use crate::ir::{
     Txn, TxnOpts, TxnType, WriteGraphs,
 };
 use crate::namespace::NamespaceRegistry;
-use fluree_db_core::dataset_ref::{self, GraphIri};
+use fluree_db_core::dataset_ref::GraphIri;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
 use fluree_db_query::parse::{
@@ -492,7 +492,13 @@ fn parse_update(
         let parse_policy = JsonLdParsePolicy {
             strict_compact_iri: strict,
         };
-        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy);
+        // Graph names in the WHERE resolve as in the templates: this ledger's
+        // keywords and the same `fromNamed` aliases.
+        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
+            .with_graph_names(fluree_db_query::parse::GraphNameEnv {
+                ledger_id: Some(ledger_id.to_string()),
+                aliases: from_named_aliases.clone(),
+            });
         parse_where_with_counters(
             where_val,
             &ctx,
@@ -1038,21 +1044,27 @@ impl<'a> TemplateParseCtx<'a> {
     }
 
     /// Resolve a graph name written in this document. Every position (a node
-    /// selector, a `["graph", g, …]` item, the update `graph` key) uses this
-    /// one order:
+    /// selector, a `["graph", g, …]` item, the update `graph` key, and a
+    /// node-level `@graph` in `where`) classifies the name by the one order
+    /// in [`classify_written_graph_name`]; here that means:
     ///
     /// 1. `?name` is a WHERE variable, in update templates only.
     /// 2. A `fromNamed` alias names its IRI (checked before the keywords, so
     ///    an alias named `config` keeps meaning its IRI).
-    /// 3. A keyword, from the one keyword table ([`dataset_ref::GraphSel`]):
-    ///    `default` is the default graph, `config` this ledger's config
-    ///    graph; `txn-meta` is not a write target.
+    /// 3. A keyword: `default` is the default graph, `config` this ledger's
+    ///    config graph; `txn-meta` is not a write target.
     /// 4. Anything else expands as a node identifier (`@id`-style,
     ///    `@base`-relative) and must be an absolute IRI.
     fn resolve_graph_name(&mut self, raw: &str, role: GraphRole) -> Result<GraphName> {
-        if raw.starts_with('?') {
-            return match role {
-                GraphRole::UpdateTemplate => Ok(GraphName::Var(self.vars.get_or_insert(raw))),
+        use fluree_db_query::parse::WrittenGraphName as W;
+        match fluree_db_query::parse::classify_written_graph_name(
+            raw,
+            self.from_named_aliases,
+            self.context,
+            self.strict_compact_iri,
+        )? {
+            W::Var(var) => match role {
+                GraphRole::UpdateTemplate => Ok(GraphName::Var(self.vars.get_or_insert(var))),
                 GraphRole::Data => Err(TransactError::Parse(format!(
                     "graph {raw:?} is a variable; a variable graph names the graph a \"where\" \
                      binds, so it is only valid in an update's insert or delete"
@@ -1061,32 +1073,19 @@ impl<'a> TemplateParseCtx<'a> {
                     "the update \"graph\" key names the transaction's default graph and takes \
                      a graph IRI, not the variable {raw:?}"
                 ))),
-            };
-        }
-        if let Some(iri) = self.from_named_aliases.get(raw) {
-            return named_graph(raw, iri);
-        }
-        match dataset_ref::GraphSel::keyword(raw) {
-            Some(dataset_ref::GraphSel::Default) => Ok(GraphName::Default),
-            Some(dataset_ref::GraphSel::Config) => named_graph(
+            },
+            W::Alias { iri, .. } => named_graph(raw, iri),
+            W::Default => Ok(GraphName::Default),
+            W::Config => named_graph(
                 raw,
                 &fluree_db_core::graph_registry::config_graph_iri(self.ledger_id),
             ),
-            Some(dataset_ref::GraphSel::TxnMeta) => Err(TransactError::Parse(format!(
+            W::TxnMeta => Err(TransactError::Parse(format!(
                 "graph \"txn-meta\" names the reserved system graph <{}>, which is not a write \
                  target; transaction metadata goes in the \"txn-meta\" sidecar",
                 fluree_db_core::graph_registry::txn_meta_graph_iri(self.ledger_id)
             ))),
-            Some(dataset_ref::GraphSel::Named(iri)) => Ok(GraphName::Iri(iri)),
-            None => {
-                let (expanded, _) = fluree_graph_json_ld::details_with_vocab_policy(
-                    raw,
-                    self.context,
-                    false,
-                    self.strict_compact_iri,
-                )?;
-                named_graph(raw, &expanded)
-            }
+            W::Expanded(iri) => named_graph(raw, &iri),
         }
     }
 

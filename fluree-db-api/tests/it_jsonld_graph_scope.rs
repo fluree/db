@@ -586,6 +586,121 @@ async fn annotation_under_the_ledger_address_lands_in_the_default_graph() {
         Some("Engineer"),
         "the annotation is with its edge in the default graph"
     );
+}
+
+/// A node-level `@graph` names the same graph in `where` as in `delete` and
+/// `insert`: the one document writes one name, `ex:g`, compact, and the
+/// update deletes what the insert wrote. (The `where` side used to take the
+/// name as written, so it matched nothing and the update committed nothing.)
+/// The keywords resolve alike in an update's `where`: `config` reads this
+/// ledger's config graph, and `default` the default graph.
+#[tokio::test]
+async fn node_level_graph_in_where_resolves_names_like_templates() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/scope-where-names:main";
+    let ledger = insert(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id),
+        &json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:a", "@graph": "ex:g", "ex:p": 1},
+                {"@id": "ex:a", "ex:p": 2}
+            ]
+        }),
+    )
+    .await;
+
+    let rows = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": "?v",
+            "where": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"}
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("jsonld");
+    assert_eq!(rows, json!([1]), "the compact name is the graph's IRI");
+
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "where": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"},
+                "delete": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"}
+            }),
+        )
+        .await
+        .expect("update")
+        .ledger;
+    assert!(
+        values(&fluree, &ledger, Some(G), "p").await.is_empty(),
+        "the update deleted what the insert wrote"
+    );
+    assert_eq!(values(&fluree, &ledger, None, "p").await, ["2"]);
+
+    // `default` reads the default graph, and the update moves the value into
+    // `ex:g`.
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "where": {"@id": "ex:a", "@graph": "default", "ex:p": "?v"},
+                "delete": {"@id": "ex:a", "@graph": "default", "ex:p": "?v"},
+                "insert": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"}
+            }),
+        )
+        .await
+        .expect("update")
+        .ledger;
+    assert_eq!(values(&fluree, &ledger, Some(G), "p").await, ["2"]);
+    assert!(values(&fluree, &ledger, None, "p").await.is_empty());
+
+    // `config` reads the ledger's config graph, as it writes it.
+    let config = fluree_db_core::graph_registry::config_graph_iri(ledger_id);
+    let ledger = insert(
+        &fluree,
+        ledger,
+        &json!({
+            "@context": {"rdfs": "http://www.w3.org/2000/01/rdf-schema#"},
+            "@id": "urn:cfg:main",
+            "@graph": "config",
+            "@type": "https://ns.flur.ee/db#LedgerConfig",
+            "rdfs:label": "main config"
+        }),
+    )
+    .await;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": {"rdfs": "http://www.w3.org/2000/01/rdf-schema#"},
+                "where": {"@id": "?c", "@graph": "config", "rdfs:label": "?l"},
+                "delete": {"@id": "?c", "@graph": "config", "rdfs:label": "?l"}
+            }),
+        )
+        .await
+        .expect("update")
+        .ledger;
+    let labels = sparql_rows(
+        &fluree,
+        &ledger,
+        &format!(
+            "SELECT ?l WHERE {{ GRAPH <{config}> {{ ?c <http://www.w3.org/2000/01/rdf-schema#label> ?l }} }}"
+        ),
+    )
+    .await;
+    assert!(
+        labels.is_empty(),
+        "deleted from the config graph: {labels:?}"
+    );
+}
 
 /// D-B6: a node-level `@graph` in `where` scopes the pattern to the graph, as
 /// `["graph", g, …]` and SPARQL `GRAPH <g>` do. A query returns the graph's
