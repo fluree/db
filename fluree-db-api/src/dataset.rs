@@ -243,20 +243,25 @@ pub struct GraphSource {
     alias: Option<String>,
 }
 
-/// [`GraphSource::identifier`] for a member written `written`: an address
-/// loses its `@` pin, and anything else is kept as written.
+/// [`GraphSource::identifier`] for a member written `written`: an address is
+/// reported as `name[:branch][#graph]`, whatever its spelling (the
+/// `urn:fluree:` wrapper and the `@` pin removed, a bare name kept bare), and
+/// anything else is kept as written.
 fn identifier_of(written: &str, reference: &MemberRef) -> String {
     if reference.address().is_none() {
         return written.to_string();
     }
-    let (before_graph, graph) = match written.split_once('#') {
+    let body = written
+        .strip_prefix(fluree_db_core::LEDGER_URN_PREFIX)
+        .unwrap_or(written);
+    let (before_graph, graph) = match body.split_once('#') {
         Some((before, graph)) => (before, Some(graph)),
-        None => (written, None),
+        None => (body, None),
     };
     match (before_graph.split_once('@'), graph) {
         (Some((base, _pin)), Some(graph)) => format!("{base}#{graph}"),
         (Some((base, _pin)), None) => base.to_string(),
-        (None, _) => written.to_string(),
+        (None, _) => body.to_string(),
     }
 }
 
@@ -2621,9 +2626,13 @@ mod tests {
             (json!({"from-named": ["d:main"]}), vec!["d:main"]),
             (json!({"opts": {"from": "e:main"}}), vec!["e:main"]),
             (json!({"ledger": "f:main"}), vec!["f:main"]),
+            // An address is reported as `name[:branch][#graph]` whatever its
+            // spelling; a bare name stays bare.
+            (json!({"from": "urn:fluree:g:main"}), vec!["g:main"]),
+            (json!({"from": "urn:fluree:g@t:3#config"}), vec!["g#config"]),
             (
-                json!({"from": "urn:fluree:g:main"}),
-                vec!["urn:fluree:g:main"],
+                json!({"from": {"@id": "urn:fluree:g:dev", "t": 3}}),
+                vec!["g:dev"],
             ),
         ];
         for (body, expected) in cases {
@@ -2666,7 +2675,12 @@ mod tests {
             ),
             (
                 "SELECT ?s FROM <urn:fluree:u:main#config> WHERE { ?s ?p ?o }",
-                vec!["urn:fluree:u:main"],
+                vec!["u:main"],
+            ),
+            (
+                "SELECT ?s FROM <urn:fluree:u@t:2> FROM NAMED <urn:fluree:v:dev> \
+                 WHERE { ?s ?p ?o }",
+                vec!["u", "v:dev"],
             ),
         ];
         for (sparql, expected) in cases {
