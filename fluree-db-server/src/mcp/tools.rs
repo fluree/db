@@ -44,7 +44,7 @@ fn authorize(
 /// is the reason [`invalid_ledger`] reports.
 fn parse_ledger(raw: &str) -> Result<LedgerRef, String> {
     let address = LedgerRef::parse(raw).map_err(|e| e.to_string())?;
-    if address.at.is_some() {
+    if address.at().is_some() {
         return Err(
             "a ledger here takes no `@` time suffix; sparql_query takes `t` instead".to_string(),
         );
@@ -61,9 +61,10 @@ fn invalid_ledger(raw: &str, why: &str) -> CallToolResult {
 
 /// The address the loader resolves: the parsed id and any graph selector.
 fn load_address(address: &LedgerRef) -> String {
-    match &address.fragment {
-        Some(graph) => format!("{}#{graph}", address.id),
-        None => address.id.to_string(),
+    if address.graph().is_default() {
+        address.id().to_string()
+    } else {
+        format!("{}#{}", address.id(), address.graph())
     }
 }
 
@@ -148,7 +149,7 @@ impl FlureeToolService {
             Ok(address) => address,
             Err(why) => return Ok(invalid_ledger(&req.ledger, &why)),
         };
-        let Some(principal) = authorize(&context, &address.id) else {
+        let Some(principal) = authorize(&context, address.id()) else {
             return Ok(ledger_not_found());
         };
         // The principal's identity drives policy enforcement.
@@ -344,7 +345,7 @@ impl FlureeToolService {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = std::time::Instant::now();
         let address = match parse_ledger(&req.ledger) {
-            Ok(address) if address.fragment.is_none() => address,
+            Ok(address) if address.graph().is_default() => address,
             Ok(_) => {
                 return Ok(invalid_ledger(
                     &req.ledger,
@@ -353,7 +354,7 @@ impl FlureeToolService {
             }
             Err(why) => return Ok(invalid_ledger(&req.ledger, &why)),
         };
-        if authorize(&context, &address.id).is_none() {
+        if authorize(&context, address.id()).is_none() {
             return Ok(ledger_not_found());
         }
 
@@ -366,7 +367,7 @@ impl FlureeToolService {
         let info = self
             .state
             .fluree
-            .ledger_info(&address.id)
+            .ledger_info(address.id())
             .execute()
             .await
             .map_err(|e| {
@@ -423,7 +424,7 @@ mod tests {
     #[test]
     fn a_ledger_argument_is_parsed_once_for_scope_and_load() {
         let address = parse_ledger("urn:fluree:open#txn-meta").unwrap();
-        assert_eq!(&*address.id, "open:main");
+        assert_eq!(address.id().as_str(), "open:main");
         assert_eq!(load_address(&address), "open:main#txn-meta");
         assert_eq!(load_address(&parse_ledger("open").unwrap()), "open:main");
 

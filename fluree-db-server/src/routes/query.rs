@@ -1920,34 +1920,48 @@ pub(crate) struct PathPin {
 
 impl PathLedger {
     pub(crate) fn parse(raw: &str) -> Result<Self> {
-        let parsed = fluree_db_api::LedgerRef::parse(raw)?;
-        // `LedgerRef` splits at `#` before `@`, so `<ledger>#g@t:1` arrives as a
-        // fragment carrying the pin. Refuse it as `<ledger>@t:1#g` is refused,
-        // rather than read head.
-        let pin_in_fragment = parsed.fragment.as_deref().is_some_and(|f| f.contains('@'));
-        if parsed.fragment.is_some() && (parsed.at.is_some() || pin_in_fragment) {
-            return Err(ServerError::bad_request(format!(
+        let combined = || {
+            ServerError::bad_request(format!(
                 "Ledger path '{raw}' combines a time pin with a graph fragment; \
                  select the graph in the query instead"
-            )));
+            ))
+        };
+        // `<ledger>#g@t:1` splits at `#` first, so its pin would ride inside
+        // the fragment. Refuse it as `<ledger>@t:1#g` is refused, rather than
+        // read head.
+        let fragment = raw.split_once('#').map(|(_, fragment)| fragment);
+        if fragment.is_some_and(|f| f.contains('@')) {
+            return Err(combined());
         }
-        let Some(at) = parsed.at else {
+        let parsed = fluree_db_api::LedgerRef::parse(raw).map_err(|e| {
+            if raw.split('#').next().is_some_and(|base| base.contains('@')) {
+                ServerError::bad_request(format!("Invalid time pin in ledger path '{raw}': {e}"))
+            } else {
+                ServerError::from(e)
+            }
+        })?;
+        if fragment.is_some() && parsed.at().is_some() {
+            return Err(combined());
+        }
+        let Some(spec) = parsed.at().cloned() else {
             return Ok(Self {
                 ledger: raw.to_string(),
-                id: parsed.id,
+                id: parsed.into_id(),
                 pin: None,
             });
         };
-        // The grammar a body `from: "<ledger>@..."` is parsed with.
-        let spec = TimeSpec::parse_address_suffix(&at).map_err(|e| {
-            ServerError::bad_request(format!("Invalid time pin in ledger path '{raw}': {e}"))
-        })?;
-        // `LedgerRef` splits at the first `@`; with no fragment the pin runs to the end.
-        let ledger = raw[..raw.len() - at.len() - 1].to_string();
+        // Names cannot contain '@', so with no fragment the pin is everything
+        // after the first '@'.
+        let (ledger, at) = raw
+            .split_once('@')
+            .expect("a parsed pin follows an '@' in the path");
         Ok(Self {
-            ledger,
-            id: parsed.id,
-            pin: Some(PathPin { raw: at, spec }),
+            ledger: ledger.to_string(),
+            id: parsed.into_id(),
+            pin: Some(PathPin {
+                raw: at.to_string(),
+                spec,
+            }),
         })
     }
 
@@ -2079,24 +2093,33 @@ fn pin_jsonld_source(
     path: &PathLedger,
     pin: &PathPin,
 ) -> Result<usize> {
-    let names_path_ledger = |id: &str| {
-        fluree_db_api::LedgerRef::parse(id)
-            .ok()
-            .filter(|r| r.id == path.id)
-    };
     let invalid = |detail: String| {
         ServerError::bad_request(format!("Invalid time pin in the query's `{key}`: {detail}"))
     };
+    // The source when it names the path's ledger. A malformed pin on the
+    // path's own ledger is reported as that pin's error.
+    let names_path_ledger = |id: &str| -> Result<Option<fluree_db_api::LedgerRef>> {
+        match fluree_db_api::LedgerRef::parse(id) {
+            Ok(r) => Ok((*r.id() == path.id).then_some(r)),
+            Err(e) => match id.split('#').next().and_then(|base| base.split_once('@')) {
+                Some((ledger, _))
+                    if fluree_db_api::LedgerRef::parse(ledger)
+                        .is_ok_and(|r| *r.id() == path.id) =>
+                {
+                    Err(invalid(e.to_string()))
+                }
+                _ => Ok(None),
+            },
+        }
+    };
     match source {
         JsonValue::String(id) => {
-            let Some(r) = names_path_ledger(id) else {
+            let Some(r) = names_path_ledger(id)? else {
                 return Ok(0);
             };
-            match r.at {
-                Some(at) => {
-                    let own =
-                        TimeSpec::parse_address_suffix(&at).map_err(|e| invalid(e.to_string()))?;
-                    pin.reconcile(&own, || format!("the query's `{key}` '{id}'"))?;
+            match r.at() {
+                Some(own) => {
+                    pin.reconcile(own, || format!("the query's `{key}` '{id}'"))?;
                 }
                 None => {
                     let (field, value) = pin.jsonld_field();
@@ -2117,13 +2140,10 @@ fn pin_jsonld_source(
             else {
                 return Ok(0);
             };
-            let Some(r) = names_path_ledger(&id) else {
+            let Some(r) = names_path_ledger(&id)? else {
                 return Ok(0);
             };
-            let mut own = Vec::new();
-            if let Some(at) = &r.at {
-                own.push(TimeSpec::parse_address_suffix(at).map_err(|e| invalid(e.to_string()))?);
-            }
+            let mut own: Vec<TimeSpec> = r.at().cloned().into_iter().collect();
             if let Some(t) = obj.get("t") {
                 let t = t
                     .as_i64()

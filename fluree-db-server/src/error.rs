@@ -479,7 +479,7 @@ impl From<fluree_db_api::LedgerIdParseError> for ServerError {
 /// returns the id the API will resolve it to, so a scope check and the
 /// operation it guards cannot disagree about which ledger that is.
 pub(crate) fn scope_id(raw: &str) -> std::result::Result<fluree_db_api::LedgerId, ServerError> {
-    Ok(fluree_db_api::LedgerRef::parse(raw)?.id)
+    Ok(fluree_db_api::LedgerRef::parse(raw)?.into_id())
 }
 
 impl From<NameServiceError> for ServerError {

@@ -6,9 +6,10 @@
 //! [urn:fluree:]name[:branch][@<tag>:<spec>][#fragment]
 //! ```
 //!
-//! Parse user input once, at the edge, with [`LedgerRef::parse`] (full address)
-//! or [`LedgerId::parse`] (bare id). Everything past the edge carries a
-//! [`LedgerId`], which is always canonical `name:branch`. `LedgerId` derefs to
+//! Parse user input once, at the edge, with
+//! [`LedgerRef::parse`](crate::LedgerRef::parse) (full address, in
+//! `dataset_ref`) or [`LedgerId::parse`] (bare id). Everything past the edge
+//! carries a [`LedgerId`], which is always canonical `name:branch`. `LedgerId` derefs to
 //! `str` for reading but deliberately does not implement `Borrow<str>`: a map
 //! keyed by `LedgerId` cannot be probed with a raw string, so a missed
 //! normalization is a compile error rather than a silent cache miss.
@@ -210,10 +211,21 @@ impl LedgerId {
     /// Parse `name` or `name:branch`, applying [`DEFAULT_BRANCH`].
     ///
     /// Rejects time-travel suffixes and graph fragments; parse a full address
-    /// with [`LedgerRef::parse`].
+    /// with [`LedgerRef::parse`](crate::LedgerRef::parse).
+    ///
+    /// This is the grammar for ids that arrive as input. A branch may not
+    /// begin with `/` here: `name://…` is the authority form of an IRI, so
+    /// `http://ex.org/g` is never read as ledger `http`, branch `//ex.org/g`.
+    /// Stored records are parsed with [`Self::parse_persisted`] instead.
     pub fn parse(input: &str) -> Result<Self, LedgerIdParseError> {
         match input.split_once(':') {
             Some((name, branch)) => {
+                if branch.starts_with('/') {
+                    return Err(LedgerIdParseError::new(format!(
+                        "Invalid ledger id '{input}': branch cannot begin with '/' \
+                         ('name://...' is an IRI, not a ledger address)"
+                    )));
+                }
                 validate_name_part(name, input)?;
                 validate_branch_part(branch, input)?;
                 Ok(Self::new_unchecked(name, branch))
@@ -454,64 +466,6 @@ impl IntoLedgerId for &String {
     }
 }
 
-/// A full ledger address: id plus optional time-travel suffix and fragment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LedgerRef {
-    pub id: LedgerId,
-    /// Raw spec after `@` (`t:5`, `time:…`). Each layer interprets it with its
-    /// own grammar; [`LedgerRef::time_spec`] applies the core one.
-    pub at: Option<String>,
-    /// Graph selector after `#` (`txn-meta`, `config`, or an IRI).
-    pub fragment: Option<String>,
-}
-
-impl LedgerRef {
-    /// Parse `[urn:fluree:]name[:branch][@spec][#fragment]`.
-    ///
-    /// Because names and branches cannot contain `@` or `#`, the first `#`
-    /// always starts the fragment and the first `@` before it always starts
-    /// the time spec.
-    pub fn parse(input: &str) -> Result<Self, LedgerIdParseError> {
-        let body = input.strip_prefix(LEDGER_URN_PREFIX).unwrap_or(input);
-        let (before_fragment, fragment) = match body.split_once('#') {
-            Some((_, "")) => {
-                return Err(LedgerIdParseError::new(format!(
-                    "Invalid ledger address '{input}': missing graph after '#'"
-                )))
-            }
-            Some((left, right)) => (left, Some(right.to_string())),
-            None => (body, None),
-        };
-        let (base, at) = match before_fragment.split_once('@') {
-            Some(("", _)) => {
-                return Err(LedgerIdParseError::new(format!(
-                    "Invalid ledger address '{input}': ledger id cannot be empty before '@'"
-                )))
-            }
-            Some((_, "")) => {
-                return Err(LedgerIdParseError::new(format!(
-                    "Invalid ledger address '{input}': missing time spec after '@'"
-                )))
-            }
-            Some((base, spec)) => (base, Some(spec.to_string())),
-            None => (before_fragment, None),
-        };
-        Ok(Self {
-            id: LedgerId::parse(base)?,
-            at,
-            fragment,
-        })
-    }
-
-    /// Interpret the `@` suffix with the core time-travel grammar.
-    pub fn time_spec(&self) -> Result<Option<LedgerIdTimeSpec>, LedgerIdParseError> {
-        self.at
-            .as_deref()
-            .map(|spec| parse_time_travel_spec(spec, "@"))
-            .transpose()
-    }
-}
-
 /// Split a `name[:branch]` ledger ID into (name, branch), applying the default branch.
 pub fn split_ledger_id(ledger_id: &str) -> Result<(String, String), LedgerIdParseError> {
     let id = LedgerId::parse(ledger_id)?;
@@ -555,7 +509,7 @@ pub const COMMIT_PREFIX_MIN_LEN: usize = 6;
 /// The tags [`parse_time_travel_spec`] recognises, in the order it tries them.
 ///
 /// Exposed so surfaces that layer their own spellings on top of this grammar —
-/// `fluree_db_api::TimeSpec::parse_at`, which also accepts a bare integer and a
+/// [`TimeSpec::parse_at`](crate::TimeSpec::parse_at), which also accepts a bare integer and a
 /// bare ISO-8601 timestamp — can tell "the user reached for a canonical tag and
 /// got it wrong" apart from "the user typed one of the bare forms".
 pub const TIME_TRAVEL_TAGS: [&str; 6] =
@@ -570,7 +524,7 @@ pub const TIME_TRAVEL_TAGS: [&str; 6] =
 /// stays accepted as an alias. `t:latest` is deliberately *not*
 /// accepted: [`LedgerIdTimeSpec`] has no "latest" variant because resolving one
 /// needs the ledger's current `t`, which this layer does not have. Callers that
-/// support it (`fluree_db_api::TimeSpec::parse`) take it before delegating here.
+/// support it ([`TimeSpec::parse`](crate::TimeSpec::parse)) take it before delegating here.
 ///
 /// `sigil` is what the calling surface writes in front of a tag when it quotes
 /// one back to the user: `"@"` for a ledger address, `""` for a bare spec. It
@@ -905,26 +859,6 @@ mod tests {
         assert!(LedgerId::expect_canonical("mydb:main", "x").is_ok());
     }
 
-    #[test]
-    fn ledger_ref_splits_every_part_once() {
-        let r = LedgerRef::parse("urn:fluree:mydb:dev@t:5#txn-meta").unwrap();
-        assert_eq!(r.id, "mydb:dev");
-        assert_eq!(r.at.as_deref(), Some("t:5"));
-        assert_eq!(r.fragment.as_deref(), Some("txn-meta"));
-        assert_eq!(r.time_spec().unwrap(), Some(LedgerIdTimeSpec::AtT(5)));
-
-        let r = LedgerRef::parse("mydb").unwrap();
-        assert_eq!((r.id.as_str(), r.at, r.fragment), ("mydb:main", None, None));
-
-        // A fragment IRI may itself contain ':' and '@'.
-        let r = LedgerRef::parse("mydb#http://ex.org/g@1").unwrap();
-        assert_eq!(r.fragment.as_deref(), Some("http://ex.org/g@1"));
-
-        assert!(LedgerRef::parse("mydb#").is_err());
-        assert!(LedgerRef::parse("@t:5").is_err());
-        assert!(LedgerRef::parse("mydb@").is_err());
-    }
-
     /// `split_ledger_id` used to accept `mydb@t:5` as name `mydb@t`, branch `5`.
     #[test]
     fn split_rejects_time_suffix() {
@@ -1028,14 +962,6 @@ mod tests {
         assert!(validate_ledger_name("mydb:main").is_err());
         // Existing ledgers with such names still parse.
         assert!(LedgerId::parse("a/main/index/child:main").is_ok());
-    }
-
-    #[test]
-    fn fragment_keeps_later_hash_and_at() {
-        let r = LedgerRef::parse("mydb#http://ex.org/g#frag@2").unwrap();
-        assert_eq!(r.id, "mydb:main");
-        assert_eq!(r.at, None);
-        assert_eq!(r.fragment.as_deref(), Some("http://ex.org/g#frag@2"));
     }
 
     #[test]

@@ -594,8 +594,8 @@ pub enum TemplateGraph {
 
 /// Whether the graph IRI `iri` is the address of the ledger `ledger_id`: any
 /// spelling [`LedgerRef::parse`](fluree_db_core::LedgerRef::parse) accepts
-/// (`name`, `name:branch`, `urn:fluree:…`), with no time pin and no graph
-/// fragment.
+/// (`name`, `name:branch`, `urn:fluree:…`), with no time pin and the default
+/// graph ([`LedgerRef::is_own_address`](fluree_db_core::LedgerRef::is_own_address)).
 ///
 /// Only an update's default-graph positions consult it, and they read such an
 /// IRI as the ledger's default graph (the within-ledger convention, D-3): the
@@ -612,8 +612,7 @@ pub(crate) fn names_ledger(ledger_id: &fluree_db_core::LedgerId, iri: &str) -> b
         .strip_prefix(fluree_db_core::ledger_id::LEDGER_URN_PREFIX)
         .unwrap_or(iri);
     body.starts_with(ledger_id.name())
-        && fluree_db_core::LedgerRef::parse(iri)
-            .is_ok_and(|r| r.at.is_none() && r.fragment.is_none() && r.id == *ledger_id)
+        && fluree_db_core::LedgerRef::parse(iri).is_ok_and(|r| r.is_own_address(ledger_id))
 }
 
 /// A term in a triple template
