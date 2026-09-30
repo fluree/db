@@ -615,20 +615,24 @@ fn count_bound_object_v6(
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
     // A bare number counts every numeric datatype holding an equal value: one
-    // (o_type, o_key) per datatype the predicate carries. Unprovable slices
-    // decline to the generic count.
+    // (o_type, o_key) per datatype the predicate carries. A slice that needs
+    // the decoded-value filter declines to the generic count.
     if let Term::Value(value @ (FlakeValue::Long(_) | FlakeValue::Double(_))) = object {
+        // This path reads the index at its max_t, so arena handles are current.
         let slices = crate::binary_scan::untyped_numeric_slices(
-            stats_view,
+            store,
             g_id,
-            fluree_db_core::RuntimePredicateId::from_u32(p_id),
+            Some(p_id),
+            crate::binary_scan::observed_datatypes(stats_view, g_id, p_id),
             value,
+            true,
         )
-        .ok_or_else(|| {
-            QueryError::Internal("numeric datatypes of the predicate are unknown".to_string())
-        })?;
+        .ok_or_else(|| QueryError::Internal("non-finite numeric constant".to_string()))?;
         let mut total = 0;
         for (o_type, o_key) in slices {
+            let o_key = o_key.ok_or_else(|| {
+                QueryError::Internal("NumBig rows need the decoded-value filter".to_string())
+            })?;
             total += count_object_key_v6(store, g_id, p_id, o_type.as_u16(), o_key, cancellation)?;
         }
         return Ok(total);

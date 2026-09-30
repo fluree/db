@@ -9,7 +9,8 @@
 //! o_type once indexed (`{"@value":"25","@type":"xsd:long"}` returned the
 //! `xsd:integer` row). A bare number seeked a single o_type once indexed, so
 //! `25` lost the `xsd:long`/`xsd:int`/`xsd:double` rows it matched in
-//! novelty, and the COUNT fast path counted only `xsd:integer`.
+//! novelty, and the COUNT fast path counted only `xsd:integer`. Under a
+//! policy, the range provider kept only one numeric family's key.
 //!
 //! Own test binary: toggles the process-global fast-path kill switch and
 //! asserts fast-path routing via span capture.
@@ -20,13 +21,19 @@
 mod span_capture;
 
 use fluree_db_api::admin::ReindexOptions;
-use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, FormatterConfig};
+use fluree_db_api::{
+    set_fast_paths_disabled, Fluree, FlureeBuilder, GovernanceOptions, GraphDb, QueryInput,
+    TimeSpec,
+};
 use serde_json::{json, Value};
 
 const LEDGER: &str = "numeric-constants:main";
+const EX: &str = "http://example.org/ns/";
 const PREFIX: &str = "PREFIX ex: <http://example.org/ns/>\n\
                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
 const COUNT_SITE: &str = "predicate_object_count";
+const POLICY_SCAN_SITE: &str = "policy_predicate_scan";
+const SEEK_SITE: &str = "bare_number_seek";
 
 fn ctx() -> Value {
     json!({"ex": "http://example.org/ns/", "xsd": "http://www.w3.org/2001/XMLSchema#"})
@@ -43,6 +50,9 @@ fn data() -> Value {
         {"@id": "ex:c", "ex:v": typed("25", "long")},
         {"@id": "ex:d", "ex:v": typed("25.0", "double")},
         {"@id": "ex:e", "ex:v": typed("26", "long")},
+        {"@id": "ex:j", "ex:v": typed("25", "decimal")},
+        // Its NumBig arena handle is the same number as `ex:j`'s.
+        {"@id": "ex:k", "ex:dec": typed("7.5", "decimal")},
         {"@id": "ex:f", "ex:w": typed("1.5", "float")},
         {"@id": "ex:g", "ex:w": typed("1.5", "double")},
         {"@id": "ex:h", "ex:only": typed("25", "long")}
@@ -58,7 +68,13 @@ fn novelty_over_index_data() -> Value {
 struct Case {
     name: &'static str,
     sparql: String,
+    /// `None` where JSON-LD can't express the shape.
     jsonld: Option<Value>,
+    /// A `COUNT`, answered by the `predicate_object_count` fast path once indexed.
+    count: bool,
+    /// The constant is a bare integer or double on both surfaces, so an indexed
+    /// scan must seek its slices rather than walk.
+    seeks: bool,
     /// Subjects on the novelty and indexed lanes; `ex:i` joins the bare `ex:v`
     /// matches once it is written over the index.
     expected: &'static [&'static str],
@@ -83,11 +99,15 @@ fn case(
         })),
         expected,
         matches_short,
+        count: false,
+        // SPARQL reads `25.0` as a decimal; `25` and `25.0e0` are bare numbers.
+        seeks: !sparql_object.contains("^^")
+            && (!sparql_object.contains('.') || sparql_object.contains('e')),
     }
 }
 
 fn cases() -> Vec<Case> {
-    const BARE_25: &[&str] = &["ex:a", "ex:b", "ex:c", "ex:d"];
+    const BARE_25: &[&str] = &["ex:a", "ex:b", "ex:c", "ex:d", "ex:j"];
     vec![
         case("bare 25", "25", json!(25), "v", BARE_25, true),
         case("bare 25.0", "25.0e0", json!(25.0), "v", BARE_25, true),
@@ -149,19 +169,40 @@ fn cases() -> Vec<Case> {
             false,
         ),
         Case {
+            name: "bare 25, any predicate",
+            sparql: "SELECT ?s WHERE { ?s ?p 25 }".to_string(),
+            // JSON-LD rejects a constant object under a variable predicate.
+            jsonld: None,
+            expected: &["ex:a", "ex:b", "ex:c", "ex:d", "ex:h", "ex:j"],
+            matches_short: true,
+            count: false,
+            seeks: true,
+        },
+        Case {
+            name: "bare 7.5, any predicate",
+            sparql: "SELECT ?s WHERE { ?s ?p 7.5e0 }".to_string(),
+            jsonld: None,
+            expected: &["ex:k"],
+            matches_short: false,
+            count: false,
+            seeks: true,
+        },
+        Case {
             name: "COUNT bare 25",
             sparql: "SELECT (COUNT(?s) AS ?n) WHERE { ?s ex:v 25 }".to_string(),
             jsonld: None,
-            expected: &["4"],
+            expected: &["5"],
             matches_short: true,
+            count: true,
+            seeks: true,
         },
     ]
 }
 
 fn expected_for(case: &Case, lane: &str) -> Vec<String> {
-    if lane == "novelty over index" && case.matches_short {
-        if case.jsonld.is_none() {
-            return vec!["5".to_string()];
+    if lane.starts_with("novelty over index") && case.matches_short {
+        if case.count {
+            return vec!["6".to_string()];
         }
         let mut subjects: Vec<String> = case.expected.iter().map(|s| (*s).to_string()).collect();
         subjects.push("ex:i".to_string());
@@ -180,7 +221,7 @@ fn first_column(rows: &Value) -> Vec<String> {
         .map(|row| {
             let cell = if row.is_array() { &row[0] } else { row };
             match cell {
-                Value::String(s) => s.clone(),
+                Value::String(s) => s.replace(EX, "ex:"),
                 other => other.to_string(),
             }
         })
@@ -189,69 +230,124 @@ fn first_column(rows: &Value) -> Vec<String> {
     out
 }
 
-async fn run_sparql(fluree: &Fluree, sparql: &str) -> Vec<String> {
-    let full = format!("{PREFIX}{sparql}");
-    let db = fluree.graph(LEDGER).load().await.expect("load");
-    first_column(
-        &db.query()
-            .sparql(&full)
-            .format(FormatterConfig::jsonld())
-            .execute_formatted()
-            .await
-            .unwrap_or_else(|e| panic!("{sparql}: {e}")),
-    )
+/// How a lane reads the ledger.
+enum View {
+    Latest,
+    /// Under a policy that may touch every predicate the cases scan but hides
+    /// nothing, so every scan takes the policy-filtered range fallback.
+    Policy,
+    AtT(i64),
 }
 
-async fn run_jsonld(fluree: &Fluree, query: &Value) -> Vec<String> {
-    let db = fluree.graph(LEDGER).load().await.expect("load");
-    first_column(
-        &db.query()
-            .jsonld(query)
-            .format(FormatterConfig::jsonld())
-            .execute_formatted()
+async fn open_view(fluree: &Fluree, view: &View) -> GraphDb {
+    match view {
+        View::Latest => fluree.graph(LEDGER).load().await.expect("load").into_db(),
+        View::Policy => {
+            let on_property = ["v", "w", "only"].map(|p| json!({"@id": format!("{EX}{p}")}));
+            fluree
+                .db_with_policy(
+                    LEDGER,
+                    &GovernanceOptions {
+                        policy: Some(json!([{
+                            "@id": format!("{EX}allowNumbers"),
+                            "f:action": "f:view",
+                            "f:onProperty": on_property,
+                            "f:allow": true
+                        }])),
+                        default_allow: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("db_with_policy")
+        }
+        View::AtT(t) => fluree
+            .graph_at(LEDGER, TimeSpec::AtT(*t))
+            .load()
             .await
-            .unwrap_or_else(|e| panic!("{query}: {e}")),
-    )
+            .expect("load at t")
+            .into_db(),
+    }
+}
+
+async fn run(fluree: &Fluree, db: &GraphDb, query: QueryInput<'_>) -> Vec<String> {
+    let label = format!("{query:?}");
+    let result = fluree
+        .query(db, query)
+        .await
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+    first_column(&result.to_jsonld(&db.snapshot).expect("jsonld"))
+}
+
+/// Outcomes stamped on `site` since `before`.
+fn outcomes(store: &span_capture::SpanStore, before: usize, site: &str) -> Vec<String> {
+    store.find_events("fast-path outcome")[before..]
+        .iter()
+        .filter(|e| e.fields.get("site").map(String::as_str) == Some(site))
+        .filter_map(|e| e.fields.get("outcome").cloned())
+        .collect()
 }
 
 /// Every case on both surfaces, with fast paths on and off. Returns failures.
-async fn check_lane(fluree: &Fluree, lane: &str, store: &span_capture::SpanStore) -> Vec<String> {
+async fn check_lane(
+    fluree: &Fluree,
+    lane: &str,
+    view: View,
+    store: &span_capture::SpanStore,
+) -> Vec<String> {
+    let db = open_view(fluree, &view).await;
+    let indexed = lane != "novelty";
+    let policed = matches!(view, View::Policy);
     let mut failures = Vec::new();
     for c in cases() {
         let expected = expected_for(&c, lane);
         for fast_paths in [true, false] {
             set_fast_paths_disabled(!fast_paths);
             let lane_name = if fast_paths { "fast" } else { "generic" };
-            let before = store.find_events("fast-path outcome").len();
-            let got = run_sparql(fluree, &c.sparql).await;
-            let count_proceeded =
-                store.find_events("fast-path outcome")[before..]
-                    .iter()
-                    .any(|e| {
-                        e.fields.get("site").map(String::as_str) == Some(COUNT_SITE)
-                            && e.fields.get("outcome").map(String::as_str) == Some("proceed")
-                    });
-            if got != expected {
-                failures.push(format!(
-                    "{lane} / {lane_name} / SPARQL {}: got {got:?}, expected {expected:?}",
-                    c.name
-                ));
-            }
-            // The COUNT must be served by its fast path wherever that path
-            // applies (a fully indexed ledger), or this case pins nothing.
-            if c.jsonld.is_none() && fast_paths && lane == "indexed" && !count_proceeded {
-                failures.push(format!(
-                    "{lane} / SPARQL {}: `{COUNT_SITE}` did not proceed",
-                    c.name
-                ));
-            }
+            let sparql = format!("{PREFIX}{}", c.sparql);
+            let mut surfaces = vec![("SPARQL", QueryInput::Sparql(&sparql))];
             if let Some(q) = &c.jsonld {
-                let got = run_jsonld(fluree, q).await;
+                surfaces.push(("JSON-LD", QueryInput::JsonLd(q)));
+            }
+            for (surface, query) in surfaces {
+                let before = store.find_events("fast-path outcome").len();
+                let got = run(fluree, &db, query).await;
                 if got != expected {
                     failures.push(format!(
-                        "{lane} / {lane_name} / JSON-LD {}: got {got:?}, expected {expected:?}",
+                        "{lane} / {lane_name} / {surface} {}: got {got:?}, expected {expected:?}",
                         c.name
                     ));
+                }
+                // The COUNT must be served by its fast path wherever that path
+                // applies (a fully indexed ledger), or this case pins nothing.
+                let count_proceeded =
+                    outcomes(store, before, COUNT_SITE).contains(&"proceed".to_string());
+                if c.count && fast_paths && lane == "indexed" && !count_proceeded {
+                    failures.push(format!(
+                        "{lane} / SPARQL {}: `{COUNT_SITE}` did not proceed",
+                        c.name
+                    ));
+                }
+                // A scan over the index must seek a bare number, whatever the
+                // predicate: a walk returns the same rows, only slower.
+                if c.seeks && indexed && !policed && !count_proceeded {
+                    let seen = outcomes(store, before, SEEK_SITE);
+                    if seen.is_empty() || seen.iter().any(|o| o != "proceed") {
+                        failures.push(format!(
+                            "{lane} / {lane_name} / {surface} {}: `{SEEK_SITE}` must proceed, saw {seen:?}",
+                            c.name
+                        ));
+                    }
+                }
+                // Likewise the policy lane must reach the range fallback.
+                if policed {
+                    let seen = outcomes(store, before, POLICY_SCAN_SITE);
+                    if seen.is_empty() || seen.iter().any(|o| o != "fallback:gate_declined") {
+                        failures.push(format!(
+                            "{lane} / {surface} {}: `{POLICY_SCAN_SITE}` must decline, saw {seen:?}",
+                            c.name
+                        ));
+                    }
                 }
             }
         }
@@ -283,7 +379,7 @@ async fn numeric_constants_match_the_same_rows_on_every_lane_and_surface() {
     let ledger = fluree.create_ledger(LEDGER).await.expect("create");
     fluree.insert(ledger, &data()).await.expect("insert");
 
-    let mut failures = check_lane(&fluree, "novelty", &store).await;
+    let mut failures = check_lane(&fluree, "novelty", View::Latest, &store).await;
 
     fluree
         .reindex(LEDGER, ReindexOptions::default())
@@ -299,13 +395,22 @@ async fn numeric_constants_match_the_same_rows_on_every_lane_and_surface() {
         indexed.t(),
         "indexed lane has no novelty"
     );
-    failures.extend(check_lane(&fluree, "indexed", &store).await);
+    failures.extend(check_lane(&fluree, "indexed", View::Latest, &store).await);
+    failures.extend(check_lane(&fluree, "indexed, policy", View::Policy, &store).await);
 
     fluree
         .insert(indexed, &novelty_over_index_data())
         .await
         .expect("insert over index");
-    failures.extend(check_lane(&fluree, "novelty over index", &store).await);
+    failures.extend(check_lane(&fluree, "novelty over index", View::Latest, &store).await);
+    failures.extend(check_lane(&fluree, "novelty over index, policy", View::Policy, &store).await);
+
+    // A read below the index's max_t can't use NumBig arena handles.
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("reindex over novelty");
+    failures.extend(check_lane(&fluree, "time travel", View::AtT(1), &store).await);
 
     assert!(
         failures.is_empty(),
