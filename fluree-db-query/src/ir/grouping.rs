@@ -521,6 +521,9 @@ pub enum ReadStage {
     OrderBy,
     /// The projection.
     Projection,
+    /// The projection, of a variable nothing in the query binds: not the
+    /// WHERE, the grouping or a trailing VALUES.
+    UnboundProjection,
 }
 
 impl UngroupedRead {
@@ -557,6 +560,9 @@ impl UngroupedRead {
                 "projected variable {var} is {neither}; aggregate it (e.g. with SAMPLE, \
                  collect or group-concat)"
             ),
+            ReadStage::UnboundProjection => {
+                format!("projected variable {var} is unbound: nothing in the query binds it")
+            }
         }
     }
 }
@@ -1080,6 +1086,14 @@ mod tests {
         assert_eq!(
             unknown.named_message(&vars),
             "ORDER BY variable VarId(99) is neither a GROUP BY key nor an aggregate result"
+        );
+        let unbound = UngroupedRead {
+            var: x,
+            stage: ReadStage::UnboundProjection,
+        };
+        assert_eq!(
+            unbound.named_message(&vars),
+            "projected variable ?x is unbound: nothing in the query binds it"
         );
         let err = crate::error::QueryError::UngroupedRead(read).name_variables(&vars);
         assert!(
