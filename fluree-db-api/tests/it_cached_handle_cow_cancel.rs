@@ -18,9 +18,19 @@
 //! sees `t = 0` and that the commit still lands.
 
 use crate::support;
-use fluree_db_api::{Fluree, FlureeBuilder, LedgerHandle};
+use async_trait::async_trait;
+use fluree_db_api::{Fluree, FlureeBuilder, LedgerHandle, NameServiceMode};
+use fluree_db_core::content_kind::ContentKind;
+use fluree_db_core::storage::ContentWriteResult;
+use fluree_db_core::{
+    ContentAddressedWrite, MemoryStorage, StorageMethod, StorageRead, StorageWrite,
+};
+use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{Notify, Semaphore};
 
 fn person(id: &str) -> serde_json::Value {
     json!({
@@ -30,22 +40,116 @@ fn person(id: &str) -> serde_json::Value {
     })
 }
 
-/// Block until `handle` is write-locked, i.e. a commit is in flight.
+/// Parks the next commit-blob write once armed, until released.
 ///
-/// Observing the lock from another task is a precise signal that the commit is
-/// inside the detached window: the commit path takes the lock and reaches the
-/// point where the cache slot is emptied without an intervening await, so the
-/// first moment another task can run is after the slot is already empty.
-async fn await_commit_in_flight(handle: &LedgerHandle) {
-    // Bounds "the commit never locked", not "the runner is busy" — nextest
-    // hard-kills a genuine hang at 360s, so patience here costs nothing.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !handle.is_locked() {
-        assert!(
-            Instant::now() < deadline,
-            "the commit never took the ledger write lock"
-        );
-        tokio::time::sleep(Duration::from_millis(1)).await;
+/// The commit blob is written inside the detached window, under the write
+/// lock. Parking it there holds the commit in flight for as long as the test
+/// needs. Polling `is_locked` for the window instead is a race the poller can
+/// lose: the optimistic path holds the lock only for the commit itself, which
+/// can start and finish between two polls.
+#[derive(Debug, Clone)]
+struct CommitGate {
+    inner: MemoryStorage,
+    armed: Arc<AtomicBool>,
+    parked: Arc<Notify>,
+    release: Arc<Semaphore>,
+}
+
+impl CommitGate {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStorage::new(),
+            armed: Arc::new(AtomicBool::new(false)),
+            parked: Arc::new(Notify::new()),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    /// Park the next commit-blob write.
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until a commit-blob write is parked.
+    async fn parked(&self) {
+        // `notify_one` stores a permit, so a write that parks before this
+        // call is not missed. Bounded so a regression fails instead of
+        // hanging until nextest kills the run.
+        tokio::time::timeout(Duration::from_secs(60), self.parked.notified())
+            .await
+            .expect("the armed commit never wrote its commit blob");
+    }
+
+    /// Let the parked write proceed.
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[async_trait]
+impl StorageRead for CommitGate {
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        self.inner.encryption_admin()
+    }
+
+    async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
+        self.inner.read_bytes(address).await
+    }
+
+    async fn exists(&self, address: &str) -> fluree_db_core::Result<bool> {
+        self.inner.exists(address).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> fluree_db_core::Result<Vec<String>> {
+        self.inner.list_prefix(prefix).await
+    }
+
+    fn resolve_local_path(&self, address: &str) -> Option<std::path::PathBuf> {
+        self.inner.resolve_local_path(address)
+    }
+}
+
+#[async_trait]
+impl StorageWrite for CommitGate {
+    async fn write_bytes(&self, address: &str, bytes: &[u8]) -> fluree_db_core::Result<()> {
+        self.inner.write_bytes(address, bytes).await
+    }
+
+    async fn delete(&self, address: &str) -> fluree_db_core::Result<()> {
+        self.inner.delete(address).await
+    }
+}
+
+#[async_trait]
+impl ContentAddressedWrite for CommitGate {
+    async fn content_write_bytes_with_hash(
+        &self,
+        kind: ContentKind,
+        ledger_id: &str,
+        content_hash_hex: &str,
+        bytes: &[u8],
+    ) -> fluree_db_core::Result<ContentWriteResult> {
+        if kind == ContentKind::Commit && self.armed.swap(false, Ordering::SeqCst) {
+            self.parked.notify_one();
+            self.release
+                .acquire()
+                .await
+                .expect("gate semaphore is never closed")
+                .forget();
+        }
+        self.inner
+            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+            .await
+    }
+}
+
+impl StorageMethod for CommitGate {
+    fn storage_method(&self) -> &str {
+        self.inner.storage_method()
     }
 }
 
@@ -66,11 +170,11 @@ async fn wait_for_t(handle: &LedgerHandle, want: i64) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_commit_never_exposes_the_empty_cache_slot() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let fluree: Fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
-        .without_indexing()
-        .build()
-        .expect("build");
+    let gate = CommitGate::new();
+    let fluree: Fluree = FlureeBuilder::memory().build_with(
+        gate.clone(),
+        NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new())),
+    );
 
     let ledger_id = "it/cow-cancel:main";
     fluree
@@ -92,7 +196,9 @@ async fn cancelled_commit_never_exposes_the_empty_cache_slot() {
     assert_eq!(handle.t().await, 1);
 
     // A second commit, on its own task so the caller can be cancelled the way
-    // a client disconnect cancels an axum handler future.
+    // a client disconnect cancels an axum handler future. The gate holds it
+    // inside the detached window until the test releases it.
+    gate.arm();
     let committer = {
         let fluree = fluree.clone();
         let handle = handle.clone();
@@ -101,7 +207,11 @@ async fn cancelled_commit_never_exposes_the_empty_cache_slot() {
             fluree.stage(&handle).insert(&bob).execute().await
         })
     };
-    await_commit_in_flight(&handle).await;
+    gate.parked().await;
+    assert!(
+        handle.is_locked(),
+        "the commit blob was written outside the ledger write lock"
+    );
 
     // Park a reader behind the in-flight commit. It is queued before anything
     // the cancellation could schedule, so it is the first thing to observe the
@@ -113,6 +223,9 @@ async fn cancelled_commit_never_exposes_the_empty_cache_slot() {
     tokio::time::sleep(Duration::from_millis(5)).await;
 
     committer.abort();
+    // Only now let the commit finish. Before the commit was shielded, the
+    // abort alone released the lock, and the reader saw the empty slot.
+    gate.release();
 
     let observed = reader.await.expect("reader task");
     assert_ne!(
