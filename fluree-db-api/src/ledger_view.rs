@@ -86,17 +86,19 @@ impl CommitRef {
     /// happened and did not. The length rule belongs where the stripping does.
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(t_str) = s.strip_prefix("t:") {
-            let t: i64 = t_str
-                .parse()
-                .map_err(|_| ApiError::query(format!("invalid t value in commit ref '{s}'")))?;
+            let t: i64 = t_str.parse().map_err(|_| {
+                ApiError::invalid_query(format!("invalid t value in commit ref '{s}'"))
+            })?;
             Ok(CommitRef::T(t))
         } else if let Some(prefix) = s.strip_prefix("commit:") {
             if prefix.is_empty() {
-                return Err(ApiError::query(format!("empty commit prefix in '{s}'")));
+                return Err(ApiError::invalid_query(format!(
+                    "empty commit prefix in '{s}'"
+                )));
             }
             Ok(CommitRef::Prefix(prefix.to_string()))
         } else if s.is_empty() {
-            Err(ApiError::query("empty commit reference"))
+            Err(ApiError::invalid_query("empty commit reference"))
         } else if let Ok(t) = s.parse::<i64>() {
             Ok(CommitRef::T(t))
         } else if let Some(cid) = ContentId::parse_canonical(s) {
@@ -295,7 +297,7 @@ pub(crate) fn normalize_commit_ref(input: &str) -> Result<String> {
     }
 
     if stripped.len() < COMMIT_PREFIX_MIN_LEN {
-        return Err(ApiError::query(format!(
+        return Err(ApiError::invalid_query(format!(
             "Commit prefix must be at least {COMMIT_PREFIX_MIN_LEN} characters, got {}",
             stripped.len()
         )));
@@ -304,20 +306,10 @@ pub(crate) fn normalize_commit_ref(input: &str) -> Result<String> {
     // An abbreviated CID carries almost no digest — the first twelve characters
     // are a constant — so it cannot be scanned for. Say that, rather than
     // reporting it as a prefix that matched nothing.
-    //
-    // Typed the same way as the "No commit found with prefix" case it stands
-    // beside. That is not a good type — `ApiError::query` builds an
-    // `ApiError::Internal`, so every commit-resolution failure reaches the CLI
-    // as "Internal error: Query error: …" and the server as a 500, for what is
-    // a user typing the wrong thing. Retyping it is a separate change: the
-    // obvious candidate, `NotFound`, is swallowed by `build_source_view`, which
-    // rewrites any `is_not_found()` from `db_at` into "ledger not found", so
-    // switching would make the `from`-clause surface worse while making the
-    // others better.
     if stripped.starts_with(COMMIT_CID_CONSTANT_HEAD)
         || COMMIT_CID_CONSTANT_HEAD.starts_with(stripped)
     {
-        return Err(ApiError::query(format!(
+        return Err(ApiError::invalid_query(format!(
             "'{input}' is an abbreviated CID, not a commit id this can resolve: \
              its leading characters are a constant shared by every commit. \
              Pass the hex digest that `fluree log` prints, or a full CID."
@@ -326,7 +318,7 @@ pub(crate) fn normalize_commit_ref(input: &str) -> Result<String> {
 
     // SHA-256 in hex is 64 characters
     if stripped.len() > 64 {
-        return Err(ApiError::query(format!(
+        return Err(ApiError::invalid_query(format!(
             "Commit prefix too long ({} chars). SHA-256 in hex is 64 characters.",
             stripped.len()
         )));
@@ -354,7 +346,7 @@ pub(crate) fn ambiguous_commit_prefix<'a>(
     hex_digests: impl IntoIterator<Item = &'a str>,
 ) -> ApiError {
     let candidates: Vec<&str> = hex_digests.into_iter().collect();
-    ApiError::query(format!(
+    ApiError::invalid_query(format!(
         "Ambiguous commit prefix '{prefix}': it matches at least {candidates:?}. \
          Retype it with enough characters to pick one out."
     ))
@@ -529,7 +521,7 @@ async fn resolve_t_to_commit_id(
         }
         _ => {
             let ids: Vec<_> = matches.iter().map(|h| &h[..7.min(h.len())]).collect();
-            Err(ApiError::query(format!(
+            Err(ApiError::invalid_query(format!(
                 "Ambiguous t={target_t}: multiple commits match {ids:?} (likely a rebased history). Disambiguate by passing the full commit CID."
             )))
         }

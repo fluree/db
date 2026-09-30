@@ -398,8 +398,10 @@ where
     }
 
     // Step 4: Return result based on match count
+    // A 400, not `NotFound`: `load_view_from_source` takes any `is_not_found()`
+    // from `db_at` to mean the source is not a ledger.
     match matching_commits.len() {
-        0 => Err(ApiError::query(format!(
+        0 => Err(ApiError::invalid_query(format!(
             "No commit found with prefix: {normalized}"
         ))),
         1 => {

@@ -40,6 +40,10 @@ pub const CONFIG_GRAPH_ID: GraphId = 2;
 /// First GraphId available for user-defined named graphs.
 pub const FIRST_USER_GRAPH_ID: GraphId = 3;
 
+/// The name ledger info gives the default graph, which has no IRI of its own.
+/// Anywhere a graph within a ledger is addressed, it names the default graph.
+pub const DEFAULT_GRAPH_IRI: &str = "urn:default";
+
 /// Construct the ledger-scoped txn-meta graph IRI from a ledger ID.
 ///
 /// Each ledger has its own txn-meta named graph. The IRI follows the pattern

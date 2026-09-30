@@ -443,7 +443,7 @@ impl GraphSelector {
 
     /// Parse from string value (as used in JSON "graph" field)
     ///
-    /// - `"default"` → Default
+    /// - `"default"` or `urn:default` (the name ledger info lists it under) → Default
     /// - `"txn-meta"` → TxnMeta
     /// - `"config"` → Config
     /// - anything else → Iri(value)
@@ -455,7 +455,7 @@ impl GraphSelector {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
-            "default" => Self::Default,
+            "default" | fluree_db_core::DEFAULT_GRAPH_IRI => Self::Default,
             "txn-meta" => Self::TxnMeta,
             "config" => Self::Config,
             _ => Self::Iri(s.to_string()),

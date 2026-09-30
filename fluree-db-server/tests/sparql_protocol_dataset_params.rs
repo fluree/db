@@ -287,6 +287,103 @@ async fn a_value_that_is_not_an_iri_is_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
 }
 
+/// A graph the ledger does not hold is the caller's mistake: a 400 naming the
+/// graph, on both routes. It was a 500.
+#[tokio::test]
+async fn a_graph_the_ledger_does_not_hold_is_a_400() {
+    let (_tmp, app) = seeded_app().await;
+    let unknown = "http://ex.org/nope";
+
+    for (path, graph) in [
+        (ledger_path(), unknown.to_string()),
+        (
+            "/v1/fluree/query".to_string(),
+            format!("{LEDGER}#{unknown}"),
+        ),
+    ] {
+        for key in ["default-graph-uri", "named-graph-uri"] {
+            let (status, json) =
+                get_query(&app, &path, NAMES, &format!("{key}={}", enc(&graph))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {key}: {json}");
+            assert!(json.to_string().contains(unknown), "{json}");
+        }
+    }
+}
+
+/// `urn:default`, the name ledger info lists the default graph under, names
+/// the default graph wherever a graph within the ledger is named.
+#[tokio::test]
+async fn urn_default_names_the_default_graph() {
+    let (_tmp, app) = seeded_app().await;
+    let default = "urn:default";
+
+    let (status, json) = get_query(
+        &app,
+        &ledger_path(),
+        NAMES,
+        &format!("default-graph-uri={}", enc(default)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(values(&json, "n"), ["D"], "{json}");
+
+    let (status, json) = get_query(
+        &app,
+        &ledger_path(),
+        NAMES,
+        &format!(
+            "default-graph-uri={}&default-graph-uri={}",
+            enc(default),
+            enc(G1)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(values(&json, "n"), ["A", "B", "D"], "{json}");
+
+    let (status, json) = get_query(
+        &app,
+        &ledger_path(),
+        "PREFIX ex: <http://ex.org/> SELECT ?n WHERE { GRAPH <urn:default> { ?s ex:name ?n } }",
+        &format!("named-graph-uri={}", enc(default)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(values(&json, "n"), ["D"], "{json}");
+
+    let (status, json) = get_query(
+        &app,
+        "/v1/fluree/query",
+        NAMES,
+        &format!("default-graph-uri={}", enc(&format!("{LEDGER}#{default}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(values(&json, "n"), ["D"], "{json}");
+
+    // The JSON-LD twin: `from` names a graph within the ledger the same way.
+    let (status, json) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri(ledger_path())
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "@context": {"ex": "http://ex.org/"},
+                    "from": default,
+                    "select": ["?n"],
+                    "where": {"@id": "?s", "ex:name": "?n"}
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json, serde_json::json!([["D"]]), "{json}");
+}
+
 /// Replacing a `FROM` that pins a time would silently turn a snapshot read
 /// into a current-head read, so the protocol dataset refuses it.
 #[tokio::test]

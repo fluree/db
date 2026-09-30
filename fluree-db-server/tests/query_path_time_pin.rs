@@ -366,6 +366,70 @@ async fn malformed_path_pin_is_a_400() {
     }
 }
 
+/// A commit pin the ledger cannot resolve is the caller's mistake: a 400 on
+/// every surface that takes one, naming the cause. Each of these passes the
+/// address grammar and was a 500 from the resolver.
+#[tokio::test]
+async fn an_unresolvable_commit_pin_is_a_400() {
+    let (_tmp, app, commit1) = fixture().await;
+    let from = |iri: &str| {
+        format!("PREFIX ex: <http://ex.org/> SELECT ?s ?n FROM <{iri}> WHERE {{ ?s ex:name ?n }}")
+    };
+
+    for (commit, cause) in [
+        // Too short once `sha256:` is stripped.
+        ("sha256:abc", "at least 6 characters"),
+        (&commit1.id[..8], "abbreviated CID"),
+        ("ffffffff", "No commit found"),
+    ] {
+        let pin = format!("@commit:{commit}");
+        let (status, body) = sparql(&app, &query_uri(&pin), SPARQL_DEFAULT).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "path {pin}: {body}");
+        assert!(body.contains(cause), "path {pin}: {body}");
+
+        let sparql_from = from(&format!("{LEDGER}{pin}"));
+        let (status, body) = sparql(&app, "/v1/fluree/query", &sparql_from).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "FROM {pin}: {body}");
+
+        let jsonld_from = with(
+            jsonld_default(),
+            "from",
+            json!({ "@id": LEDGER, "at": commit }),
+        );
+        let (status, body) = jsonld(&app, "/v1/fluree/query", &jsonld_from).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "from at {commit}: {body}");
+    }
+
+    for (i, commit) in ["sha256:abc", &commit1.id[..8]].into_iter().enumerate() {
+        let branch = json!({ "ledger": "pinned", "branch": format!("b{i}"), "at": commit });
+        let (status, body) = jsonld(&app, "/v1/fluree/branch", &branch).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "branch at {commit}: {body}"
+        );
+    }
+}
+
+/// A ledger path takes a commit id only with its tag, which `at` does not
+/// require; the refusal names the tagged spelling.
+#[tokio::test]
+async fn an_untagged_commit_id_in_the_path_names_its_tag() {
+    let (_tmp, app, commit1) = fixture().await;
+
+    let (status, body) = sparql(
+        &app,
+        &query_uri(&format!("@{}", commit1.id)),
+        SPARQL_DEFAULT,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains(&format!("did you mean '@commit:{}'?", commit1.id)),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn a_body_pin_must_agree_with_the_path_pin() {
     let (_tmp, app, _) = fixture().await;
