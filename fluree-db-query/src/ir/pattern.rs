@@ -2,6 +2,7 @@
 //! `SubqueryPattern`, `ServicePattern`, plus the small `GraphName` /
 //! `ServiceEndpoint` types they depend on.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::adapters::{
@@ -559,6 +560,12 @@ pub fn values_column_all_undef(rows: &[Vec<Binding>], col: usize) -> bool {
         && rows
             .iter()
             .all(|row| matches!(row.get(col), Some(Binding::Unbound)))
+}
+
+/// Variables some pattern of `patterns` may bind (the planner's
+/// `must_bind_vars` gives the ones bound on every row).
+pub fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
+    patterns.iter().flat_map(Pattern::produced_vars).collect()
 }
 
 impl Pattern {

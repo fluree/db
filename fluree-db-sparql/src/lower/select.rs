@@ -11,6 +11,7 @@ use crate::ast::query::{
 };
 use crate::span::SourceSpan;
 
+use fluree_db_query::ir::pattern::produced_vars_of;
 use fluree_db_query::ir::AggregateSpec;
 use fluree_db_query::ir::{
     having_as_filter, sample_ungrouped_reads, Expression, FlakeValue, Grouping, Pattern,
@@ -111,19 +112,6 @@ pub(super) struct LoweredSelectLevel {
     pub star_projection: Option<Vec<VarId>>,
 }
 
-/// The variables a level's pre-group pipeline binds: everything its patterns
-/// produce, plus a trailing VALUES clause joined before grouping.
-pub(super) fn pre_group_vars(
-    patterns: &[Pattern],
-    post_values: Option<&Pattern>,
-) -> HashSet<VarId> {
-    patterns
-        .iter()
-        .chain(post_values)
-        .flat_map(Pattern::produced_vars)
-        .collect()
-}
-
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// The registered variables a user can see, in registration order.
     ///
@@ -188,7 +176,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         patterns: &mut Vec<Pattern>,
         post_values: Option<&Pattern>,
     ) -> Result<LoweredSelectLevel> {
-        let where_vars = pre_group_vars(patterns, post_values);
+        // Variables bound before grouping: the patterns', plus the trailing
+        // VALUES clause joined before grouping.
+        let mut where_vars = produced_vars_of(patterns);
+        if let Some(values) = post_values {
+            where_vars.extend(values.produced_vars());
+        }
         let mut lowered = self.lower_solution_modifiers(modifiers, select, &where_vars)?;
         // One definition of "groups": validation (V4) reads it off the AST,
         // lowering off the lowered keys and aggregates.
@@ -197,15 +190,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             modifiers.level_groups(&select.variables),
             "lowering and validation disagree on whether the level groups"
         );
-        let where_vars = where_vars
-            .into_iter()
-            .chain(
-                lowered
-                    .pre_group_binds
-                    .iter()
-                    .flat_map(Pattern::produced_vars),
-            )
-            .collect();
+        where_vars.extend(produced_vars_of(&lowered.pre_group_binds));
         let extends = self.lower_select_extends(select, &mut lowered, where_vars)?;
 
         // HAVING on a level that does not group: a Filter over its solutions
@@ -472,11 +457,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // means SAMPLE(?v) (§18.2.4.1). The level's variables bound before
         // grouping include the GROUP BY / aggregate-input binds lowered above.
         if !group_by.is_empty() || !aggregates.is_empty() {
-            let where_vars: HashSet<VarId> = where_vars
-                .iter()
-                .copied()
-                .chain(pre_group_binds.iter().flat_map(Pattern::produced_vars))
-                .collect();
+            let mut where_vars = where_vars.clone();
+            where_vars.extend(produced_vars_of(&pre_group_binds));
             let vars = &mut self.vars;
             sample_ungrouped_reads(
                 &group_by,

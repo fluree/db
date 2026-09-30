@@ -1365,15 +1365,6 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
         .any(|v| bound_vars.contains(v))
 }
 
-/// Variables some pattern of `patterns` may bind (see [`must_bind_vars`] for
-/// the ones bound on every row).
-fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
-    patterns
-        .iter()
-        .flat_map(super::ir::Pattern::produced_vars)
-        .collect()
-}
-
 /// Try to nest a deferred pattern into a compound pattern's inner lists.
 ///
 /// Returns `true` if the pattern was nested, `false` if the pattern is not
@@ -1392,7 +1383,7 @@ fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool
         Pattern::Union(branches) => {
             let produced_in_every_branch = branches
                 .iter()
-                .map(|b| produced_vars_of(b))
+                .map(|b| crate::ir::pattern::produced_vars_of(b))
                 .reduce(|mut union_vars, branch_vars| {
                     union_vars.retain(|v| branch_vars.contains(v));
                     union_vars

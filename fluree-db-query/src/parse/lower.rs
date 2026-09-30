@@ -1211,8 +1211,7 @@ fn lower_select_computations<'a, E: IriEncoder>(
     pp_counter: &mut u32,
     patterns: &mut Vec<Pattern>,
 ) -> Result<SelectComputations> {
-    let where_vars: std::collections::HashSet<VarId> =
-        patterns.iter().flat_map(Pattern::produced_vars).collect();
+    let where_vars = crate::ir::pattern::produced_vars_of(patterns);
     let keys: Vec<VarId> = opts
         .group_by
         .iter()
@@ -2083,8 +2082,7 @@ fn lower_grouping(
             ));
         }
     } else {
-        let where_vars: std::collections::HashSet<VarId> =
-            patterns.iter().flat_map(Pattern::produced_vars).collect();
+        let where_vars = crate::ir::pattern::produced_vars_of(patterns);
         crate::ir::sample_ungrouped_reads(
             &group_by,
             &mut aggregates,
