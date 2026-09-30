@@ -2664,6 +2664,15 @@ impl crate::Fluree {
         options: StageOptions<'_>,
         txn_context: Option<&JsonValue>,
     ) -> std::result::Result<CheckedStage, fluree_db_transact::TransactError> {
+        // Without SHACL support inline shapes cannot be applied, and a request
+        // that carries them expects its data checked: refuse rather than
+        // commit unchecked.
+        #[cfg(not(feature = "shacl"))]
+        if txn.opts.shapes.is_some() {
+            return Err(fluree_db_transact::TransactError::UnsupportedFeature(
+                "inline SHACL shapes (opts.shapes) need a build with SHACL support".to_string(),
+            ));
+        }
         let inline_unique_properties = txn.opts.unique_properties.clone();
         let ledger_id = ledger.snapshot.ledger_id.clone();
         let base_t = ledger.t();
@@ -4636,6 +4645,36 @@ mod tests {
             }
             other => panic!("ordinary label must stay BlankNode, got {other:?}"),
         }
+    }
+
+    /// Without SHACL support, a transaction carrying inline shapes is refused
+    /// rather than committed unchecked.
+    #[cfg(not(feature = "shacl"))]
+    #[tokio::test]
+    async fn inline_shapes_are_refused_without_shacl_support() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let ledger = fluree
+            .create_ledger("tx/no-shacl:main")
+            .await
+            .expect("create");
+        let err = fluree
+            .insert(
+                ledger,
+                &serde_json::json!({
+                    "opts": {"shapes": {"@id": "http://example.org/Shape"}},
+                    "@id": "http://example.org/a",
+                    "http://example.org/p": 1
+                }),
+            )
+            .await
+            .expect_err("inline shapes cannot be applied");
+        assert!(
+            matches!(
+                err,
+                ApiError::Transact(fluree_db_transact::TransactError::UnsupportedFeature(_))
+            ),
+            "{err:?}"
+        );
     }
 
     /// A config read failure refuses the transaction instead of admitting it

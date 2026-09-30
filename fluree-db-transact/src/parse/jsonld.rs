@@ -119,6 +119,13 @@ fn parse_rooted(
             .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
     }
 
+    // The request's own constraints (`opts.shapes`, `opts.uniqueProperties`),
+    // same precedence. Read here, where every surface parses a JSON
+    // transaction (the server, the embedded API, the CLI), so none drops them
+    // and leaves the caller believing its data was checked. Whether they
+    // apply is decided at staging (override control, policy scope).
+    read_body_constraints(json, &mut opts)?;
+
     // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
     // `f:reifies*` system encoding before JSON-LD expansion, rejecting
     // user-authored `f:reifies*` IRIs and every deferred shape (literal-
@@ -174,6 +181,58 @@ fn parse_rooted(
         check_reifiers_match_edges(&txn.insert_templates)?;
     }
     Ok(txn)
+}
+
+/// Fill `opts.shapes` and `opts.unique_properties` from the body's `opts`
+/// block where the caller set neither: `shapes` a JSON-LD object or an array
+/// of them, `uniqueProperties` an array of property IRI strings (an empty one
+/// means none). A malformed value is refused rather than ignored.
+fn read_body_constraints(json: &Value, opts: &mut TxnOpts) -> Result<()> {
+    let Some(body_opts) = json
+        .as_object()
+        .and_then(|m| m.get("opts"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    if opts.shapes.is_none() {
+        if let Some(shapes) = body_opts.get("shapes") {
+            let well_formed = match shapes {
+                Value::Object(_) => true,
+                Value::Array(items) => items.iter().all(Value::is_object),
+                _ => false,
+            };
+            if !well_formed {
+                return Err(TransactError::Parse(
+                    "opts.shapes must be a JSON-LD object or an array of JSON-LD objects"
+                        .to_string(),
+                ));
+            }
+            opts.shapes = Some(shapes.clone());
+        }
+    }
+    if opts.unique_properties.is_none() {
+        if let Some(raw) = body_opts.get("uniqueProperties") {
+            let iris = raw
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_string))
+                        .collect::<Option<Vec<String>>>()
+                })
+                .ok_or_else(|| {
+                    TransactError::Parse(
+                        "opts.uniqueProperties must be an array of property IRI strings"
+                            .to_string(),
+                    )
+                })?;
+            if !iris.is_empty() {
+                opts.unique_properties = Some(iris);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every reifier bundle the annotation lowering added must reify an edge this
@@ -4055,6 +4114,73 @@ mod tests {
                 }
                 Ok(txn) => panic!("{key} must be refused, got {:?}", txn.insert_templates),
             }
+        }
+    }
+
+    /// A transaction body's `opts.shapes` and `opts.uniqueProperties` reach
+    /// the transaction on every surface that parses it (the HTTP server used
+    /// to be the only one reading them), for inserts and updates alike; a
+    /// caller's own options win, and a malformed value is refused.
+    #[test]
+    fn body_constraints_are_read_from_opts() {
+        let shapes = json!({"@id": "http://example.org/Shape", "@type": "http://www.w3.org/ns/shacl#NodeShape"});
+        let body = |extra: Value| {
+            let mut doc = json!({
+                "opts": {"shapes": shapes, "uniqueProperties": ["http://example.org/email"]},
+                "@id": "http://example.org/a",
+                "http://example.org/email": "a@x"
+            });
+            if let Value::Object(map) = extra {
+                doc.as_object_mut().unwrap().extend(map);
+            }
+            doc
+        };
+        let txn = parse_doc(&body(json!({})), TxnType::Insert).unwrap();
+        assert_eq!(txn.opts.shapes, Some(shapes.clone()));
+        assert_eq!(
+            txn.opts.unique_properties,
+            Some(vec!["http://example.org/email".to_string()])
+        );
+
+        let update = json!({
+            "opts": {"shapes": [shapes]},
+            "insert": {"@id": "http://example.org/a", "http://example.org/p": 1}
+        });
+        let txn = parse_doc(&update, TxnType::Update).unwrap();
+        assert_eq!(txn.opts.shapes, Some(json!([shapes])));
+
+        // The caller's own options win over the body's.
+        let mut ns = test_registry();
+        let mine = json!({"@id": "http://example.org/Mine"});
+        let txn = parse_transaction(
+            &body(json!({})),
+            TxnType::Insert,
+            TxnOpts {
+                shapes: Some(mine.clone()),
+                ..TxnOpts::default()
+            },
+            &mut ns,
+            TEST_LEDGER,
+        )
+        .unwrap();
+        assert_eq!(txn.opts.shapes, Some(mine));
+
+        for (opts, what) in [
+            (json!({"shapes": "not a document"}), "shapes"),
+            (json!({"shapes": [1]}), "shapes"),
+            (
+                json!({"uniqueProperties": "http://example.org/email"}),
+                "uniqueProperties",
+            ),
+            (json!({"uniqueProperties": [1]}), "uniqueProperties"),
+        ] {
+            let doc =
+                json!({"opts": opts, "@id": "http://example.org/a", "http://example.org/p": 1});
+            let err = parse_doc(&doc, TxnType::Insert).unwrap_err().to_string();
+            assert!(
+                err.starts_with("Parse error: ") && err.contains(what),
+                "{opts}: {err}"
+            );
         }
     }
 

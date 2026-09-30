@@ -632,7 +632,9 @@ Semantics and limits:
 In addition to shapes stored in a ledger, a transaction can supply
 **inline shapes** via the `opts.shapes` field. The shapes are
 enforced only for that one transaction and never written into the
-ledger.
+ledger. The field is read wherever the transaction is sent: over HTTP,
+through the embedded API, and by the CLI in local mode. It must be a
+JSON-LD object or an array of them; anything else is refused.
 
 ```json
 {

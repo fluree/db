@@ -680,3 +680,110 @@ async fn inline_shapes_apply_under_an_unrestricted_policy_default() {
         .expect_err("the inline shape requires ex:name");
     assert_shacl_violation(&err, "unrestricted policy default");
 }
+
+// =============================================================================
+// The request's own constraints in the transaction body (`opts`)
+// =============================================================================
+
+/// `opts.shapes` in a transaction body is honored by the embedded API as it is
+/// over HTTP, for an insert and an update alike: a record breaking the shapes
+/// is refused and nothing commits. (Only the HTTP server used to read it; the
+/// embedded API and the CLI's local mode dropped it and committed.)
+#[tokio::test]
+async fn inline_shapes_in_the_body_are_honored() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "test/inline-shapes/body:main";
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &person("ex:seed", Some("Seed")),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let t = ledger.t();
+
+    let mut doc = person("ex:alice", None);
+    doc["opts"] = json!({"shapes": person_shape_jsonld()});
+    let err = fluree
+        .insert(ledger.clone(), &doc)
+        .await
+        .expect_err("the body's inline shape requires ex:name");
+    assert_shacl_violation(&err, "insert with body shapes");
+
+    let err = fluree
+        .update(
+            ledger.clone(),
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "opts": {"shapes": person_shape_jsonld()},
+                "insert": {"@id": "ex:bob", "@type": "ex:Person"}
+            }),
+        )
+        .await
+        .expect_err("the body's inline shape applies to an update too");
+    assert_shacl_violation(&err, "update with body shapes");
+    assert_eq!(head_t(&fluree, ledger_id).await, t, "nothing committed");
+
+    // A conforming record commits under the same body shapes.
+    let mut doc = person("ex:carol", Some("Carol"));
+    doc["opts"] = json!({"shapes": person_shape_jsonld()});
+    fluree.insert(ledger, &doc).await.expect("conforms");
+}
+
+/// The body's shapes follow the same policy-scope rule as the caller's own:
+/// in a policy-scoped request they are refused.
+#[tokio::test]
+async fn inline_shapes_in_the_body_are_refused_in_a_policy_scoped_request() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_config(
+        &fluree,
+        "test/inline-shapes/body-policy:main",
+        "<urn:cfg:main> rdf:type f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> . \
+         <urn:cfg:policy> f:defaultAllow false .",
+    )
+    .await;
+    let mut doc = person("ex:bob", Some("Bob"));
+    doc["opts"] = json!({"shapes": person_shape_jsonld()});
+    let err = fluree
+        .insert(ledger, &doc)
+        .await
+        .expect_err("config policy defaults scope the request");
+    assert_policy_scoped_refusal(&err);
+}
+
+/// `opts.uniqueProperties` in a transaction body is honored by the embedded
+/// API too: a duplicate of an existing value is refused.
+#[tokio::test]
+async fn unique_properties_in_the_body_are_honored() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, "test/inline-unique/body:main"),
+            &json!({"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:u1", "ex:email": "a@x"}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "opts": {"uniqueProperties": ["http://example.org/ns/email"]},
+                "@id": "ex:u2",
+                "ex:email": "a@x"
+            }),
+        )
+        .await
+        .expect_err("the body's unique property is enforced");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(
+                fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+            )
+        ),
+        "{err:?}"
+    );
+}
