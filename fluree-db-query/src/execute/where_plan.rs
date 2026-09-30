@@ -1455,7 +1455,10 @@ fn apply_deferred_patterns(
     (child, remaining_binds, remaining_filters)
 }
 
-/// Apply all remaining BINDs and FILTERs at the end of a block.
+/// Apply all remaining BINDs and FILTERs at the end of a block. Every block
+/// builder ends with this, so no BIND or FILTER it collected is dropped: one
+/// that could not be inlined (EXISTS, a metadata read) or that reads a
+/// variable nothing binds still applies here.
 ///
 /// Filters are fused into each BindOperator when the BIND's variable is the
 /// last dependency the filter was waiting on.  Any filters still remaining
@@ -1647,17 +1650,14 @@ fn build_property_join_block(
         operator = apply_values(operator, block_values);
     }
 
-    let mut settled = Settled::all(bound_vars_from_operator(&operator));
     if let Some(child) = operator.take() {
-        let (child, _, _) = apply_deferred_patterns(
+        operator = Some(apply_all_remaining(
             child,
-            &mut settled,
             pending_binds,
             pending_filters,
             &pushdown.consumed_indices,
             planning,
-        );
-        operator = Some(child);
+        ));
     }
 
     Ok(operator)
