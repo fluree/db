@@ -648,6 +648,49 @@ async fn trailing_values_joins_after_having() {
     .await;
 }
 
+/// The sub-SELECT twin. A sub-SELECT still joins its trailing VALUES before
+/// grouping (the spec joins it after HAVING), but its HAVING reads the VALUES
+/// variables as unbound, as the spec's order gives, grouped or not. They used
+/// to be read as bound: the grouped HAVING as a SAMPLE of the VALUES column
+/// (every group kept), the ungrouped one as the joined value. A VALUES
+/// variable the level binds before HAVING (here the key `?a`) is still read.
+#[tokio::test]
+async fn sub_select_having_reads_trailing_values_as_unbound() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "grouped-projection/sub-select-values:main").await;
+    for (inner, rows) in [
+        (
+            format!(
+                "SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a HAVING (?v = 1) VALUES ?v {{ 1 }}"
+            ),
+            0,
+        ),
+        (
+            format!("SELECT ?a {W} HAVING (?v = 1) VALUES ?v {{ 1 }}"),
+            0,
+        ),
+        (
+            format!("SELECT ?a {W} HAVING (!BOUND(?v)) VALUES ?v {{ 1 }}"),
+            6,
+        ),
+    ] {
+        let body = format!("SELECT * WHERE {{ {{ {inner} }} }}");
+        let result = run(&fluree, &ledger, &body).await;
+        assert_eq!(result.row_count(), rows, "{body}");
+    }
+    assert_rows(
+        &fluree,
+        &ledger,
+        &format!(
+            "SELECT * WHERE {{ {{ SELECT ?a (COUNT(?e) AS ?n) {W} GROUP BY ?a \
+             HAVING (?a = \"Net\") VALUES ?a {{ \"Net\" \"Local\" }} }} }}"
+        ),
+        json!([{"a": "Net", "n": "3"}]),
+        json!([{"?a": "Net", "?n": 3}]),
+    )
+    .await;
+}
+
 /// ASK and CONSTRUCT have no grouping stage in this lowering. GROUP BY, HAVING
 /// and an aggregate ORDER BY used to be dropped, which changed the answer
 /// (`ASK { … } HAVING (?a = "Nope")` was true; the CONSTRUCT below built all

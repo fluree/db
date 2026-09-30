@@ -653,18 +653,31 @@ pub fn having_as_filter(
     select_aliases: &HashSet<VarId>,
     mint: &mut dyn FnMut(VarId) -> VarId,
 ) -> super::pattern::Pattern {
-    let mut read: Vec<VarId> = having
+    read_as_unbound(&mut having, select_aliases, mint);
+    super::pattern::Pattern::Filter(having)
+}
+
+/// Rename every read of `vars` in `expr` to a fresh variable, named by
+/// `mint`, that nothing binds, so `expr` reads them as unbound wherever it is
+/// evaluated. For a HAVING that must not see variables a later stage binds:
+/// the level's SELECT expressions, or its trailing VALUES clause (joined after
+/// HAVING, SPARQL 1.1 §18.2.4).
+pub fn read_as_unbound(
+    expr: &mut Expression,
+    vars: &HashSet<VarId>,
+    mint: &mut dyn FnMut(VarId) -> VarId,
+) {
+    let mut read: Vec<VarId> = expr
         .referenced_vars()
         .into_iter()
-        .filter(|v| select_aliases.contains(v))
+        .filter(|v| vars.contains(v))
         .collect();
     read.sort_unstable();
     read.dedup();
-    for alias in read {
-        let unbound = mint(alias);
-        having.substitute_var(alias, unbound);
+    for var in read {
+        let unbound = mint(var);
+        expr.substitute_var(var, unbound);
     }
-    super::pattern::Pattern::Filter(having)
 }
 
 /// Where a SELECT-clause expression `(expr AS ?alias)` of one query level is
