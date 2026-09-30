@@ -40,6 +40,8 @@ mod it_rebase;
 mod it_refresh;
 #[path = "it_revert.rs"]
 mod it_revert;
+#[path = "it_revert_legacy_phantom.rs"]
+mod it_revert_legacy_phantom;
 #[path = "it_revert_preview.rs"]
 mod it_revert_preview;
 #[path = "it_stable_hashes.rs"]
