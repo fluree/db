@@ -43,6 +43,7 @@ pub mod bm25_worker;
 mod branch_validation;
 mod commit_data;
 pub mod commit_transfer;
+mod config_guard;
 pub mod config_resolver;
 #[cfg(feature = "credential")]
 pub mod credential;
