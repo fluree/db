@@ -16,7 +16,7 @@
 #[path = "support/span_capture.rs"]
 mod span_capture;
 
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{Fluree, FlureeBuilder, LedgerState, TransactResult};
 use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
@@ -115,6 +115,36 @@ async fn delete_witnessed_lane_fires_only_on_a_list_free_ledger() {
     );
 }
 
+/// An update on either surface.
+enum Update {
+    JsonLd(JsonValue),
+    Sparql(&'static str),
+}
+
+async fn apply(fluree: &Fluree, ledger: LedgerState, update: Update) -> TransactResult {
+    match update {
+        Update::JsonLd(txn) => fluree.update(ledger, &txn).await.expect("JSON-LD update"),
+        Update::Sparql(body) => {
+            let text = format!("PREFIX ex: <http://example.org/ns/>\n{body}");
+            let parsed = fluree_db_sparql::parse_sparql(&text);
+            assert!(!parsed.has_errors(), "{text}: {:?}", parsed.diagnostics);
+            let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+            let txn = fluree_db_transact::lower_sparql_update_ast(
+                &parsed.ast.expect("ast"),
+                &mut ns,
+                fluree_db_transact::TxnOpts::default(),
+            )
+            .expect("lower");
+            fluree
+                .stage_owned(ledger)
+                .txn(txn)
+                .execute()
+                .await
+                .expect("SPARQL update")
+        }
+    }
+}
+
 /// A value bound by the sole triple of an OPTIONAL, or of one UNION branch,
 /// is the decode of that triple's fact, so its row takes the witnessed lane:
 /// the JSON-LD and SPARQL shapes, and Cypher `SET` and `DETACH DELETE`,
@@ -147,7 +177,10 @@ async fn optional_and_union_rows_take_the_witnessed_lane() {
                     {"@id": "ex:b", "@type": "ex:Node", "ex:tag": "y"},
                     {"@id": "ex:c", "@type": "ex:Node", "ex:tag": "z"},
                     {"@id": "ex:d", "@type": "ex:Node", "ex:tag": "w", "ex:other": "v"},
-                    {"@id": "ex:e", "@type": "ex:Node", "ex:tag": "u"}
+                    {"@id": "ex:e", "@type": "ex:Node", "ex:tag": "u"},
+                    {"@id": "ex:f", "@type": "ex:Node", "ex:tag": "t"},
+                    {"@id": "ex:g", "@type": "ex:Node", "ex:tag": "s"},
+                    {"@id": "ex:h", "@type": "ex:Node", "ex:tag": "r", "ex:other": "q"}
                 ]
             }),
         )
@@ -155,54 +188,75 @@ async fn optional_and_union_rows_take_the_witnessed_lane() {
         .expect("seed")
         .ledger;
 
-    let cases: Vec<(&str, JsonValue, &str)> = vec![
+    // (case, update, witnessed). Each retracts one fact either way; where
+    // the other UNION branch binds the object from another predicate, the
+    // row goes through the resolver.
+    let cases = [
         (
             "JSON-LD OPTIONAL",
-            json!({
+            Update::JsonLd(json!({
                 "@context": ctx(),
                 "where": [{"@id": "ex:a", "@type": "ex:Node"},
                           ["optional", {"@id": "ex:a", "ex:tag": "?o"}]],
                 "delete": {"@id": "ex:a", "ex:tag": "?o"}
-            }),
-            "proceed",
+            })),
+            true,
         ),
         (
             "JSON-LD UNION",
-            json!({
+            Update::JsonLd(json!({
                 "@context": ctx(),
                 "where": [["union", {"@id": "ex:b", "ex:tag": "?o"}, {"@id": "ex:b", "@type": "?t"}]],
                 "delete": {"@id": "ex:b", "ex:tag": "?o"}
-            }),
-            "proceed",
+            })),
+            true,
         ),
-    ];
-    for (what, txn, expected) in cases {
-        let before = store.find_events("fast-path outcome").len();
-        let r = fluree.update(ledger, &txn).await.expect(what);
-        assert_eq!(r.receipt.retract_count, 1, "{what}");
-        assert_eq!(outcomes(before), [expected], "{what}");
-        ledger = r.ledger;
-    }
-
-    // The other branch binds the object from another predicate: matched.
-    let before = store.find_events("fast-path outcome").len();
-    let r = fluree
-        .update(
-            ledger,
-            &json!({
+        (
+            "SPARQL OPTIONAL",
+            Update::Sparql(
+                "DELETE { ex:f ex:tag ?o } WHERE { ex:f a ex:Node OPTIONAL { ex:f ex:tag ?o } }",
+            ),
+            true,
+        ),
+        (
+            "SPARQL UNION",
+            Update::Sparql(
+                "DELETE { ex:g ex:tag ?o } WHERE { { ex:g ex:tag ?o } UNION { ex:g a ?t } }",
+            ),
+            true,
+        ),
+        (
+            "JSON-LD UNION binding the object twice",
+            Update::JsonLd(json!({
                 "@context": ctx(),
                 "where": [["union", {"@id": "ex:d", "ex:tag": "?o"}, {"@id": "ex:d", "ex:other": "?o"}]],
                 "delete": {"@id": "ex:d", "ex:tag": "?o"}
-            }),
-        )
-        .await
-        .expect("UNION binding the object twice");
-    assert_eq!(r.receipt.retract_count, 1, "the delete still retracts");
-    assert!(
-        outcomes(before).is_empty(),
-        "a UNION binding the object twice is not a witness"
-    );
-    ledger = r.ledger;
+            })),
+            false,
+        ),
+        (
+            "SPARQL UNION binding the object twice",
+            Update::Sparql(
+                "DELETE { ex:h ex:tag ?o } WHERE { { ex:h ex:tag ?o } UNION { ex:h ex:other ?o } }",
+            ),
+            false,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (what, update, witnessed) in cases {
+        let before = store.find_events("fast-path outcome").len();
+        let r = apply(&fluree, ledger, update).await;
+        let stamps = outcomes(before);
+        let expected: &[&str] = if witnessed { &["proceed"] } else { &[] };
+        if r.receipt.retract_count != 1 || stamps != expected {
+            failures.push(format!(
+                "{what}: {} retracted, stamps {stamps:?}",
+                r.receipt.retract_count
+            ));
+        }
+        ledger = r.ledger;
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 
     for (what, stmt) in [
         (
