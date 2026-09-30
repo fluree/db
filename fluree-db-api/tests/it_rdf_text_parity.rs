@@ -785,6 +785,16 @@ async fn upserting_the_same_document_again_commits_nothing() {
         .any(|f| f.contains("note String(\"edited\")")));
 }
 
+/// `turtle.md`'s query for blank-node subjects of the default graph that
+/// nothing references, in any graph.
+const ORPHANS_DEFAULT: &str = "SELECT DISTINCT ?b WHERE {\n  ?b ?p ?o .\n  FILTER(isBlank(?b))\n  \
+     FILTER NOT EXISTS { ?s ?q ?b }\n  FILTER NOT EXISTS { GRAPH ?h { ?s2 ?q2 ?b } }\n}";
+
+/// `turtle.md`'s query for the same, graph by graph.
+const ORPHANS_PER_GRAPH: &str = "SELECT DISTINCT ?g ?b WHERE {\n  GRAPH ?g {\n    ?b ?p ?o .\n    \
+     FILTER(isBlank(?b))\n  }\n  FILTER NOT EXISTS { ?s ?q ?b }\n  \
+     FILTER NOT EXISTS { GRAPH ?h { ?s2 ?q2 ?b } }\n}";
+
 /// The queries `turtle.md` documents for blank nodes nothing references
 /// find the node an edited document left behind, and not the one that
 /// replaced it: in the default graph, and graph by graph.
@@ -798,13 +808,7 @@ async fn the_documented_query_lists_the_blank_nodes_an_edit_left_behind() {
         .expect("v1");
     let v2 = v1.replace("\"v1\"", "\"v2\"");
     let second = fluree.upsert_turtle(first.ledger, &v2).await.expect("v2");
-    let orphans = select(
-        &fluree,
-        &second.ledger,
-        "SELECT DISTINCT ?b WHERE {\n  ?b ?p ?o .\n  FILTER(isBlank(?b))\n  \
-         FILTER NOT EXISTS { ?s ?q ?b }\n}",
-    )
-    .await;
+    let orphans = select(&fluree, &second.ledger, ORPHANS_DEFAULT).await;
     assert_eq!(orphans.len(), 1, "{orphans:?}");
     let values = select(
         &fluree,
@@ -829,15 +833,48 @@ async fn the_documented_query_lists_the_blank_nodes_an_edit_left_behind() {
         .upsert_turtle(first.ledger, &v2)
         .await
         .expect("v2 in a graph");
-    let orphans = select(
-        &fluree,
-        &second.ledger,
-        "SELECT DISTINCT ?g ?b WHERE {\n  GRAPH ?g {\n    ?b ?p ?o .\n    FILTER(isBlank(?b))\n    \
-         FILTER NOT EXISTS { ?s ?q ?b }\n  }\n}",
-    )
-    .await;
+    let orphans = select(&fluree, &second.ledger, ORPHANS_PER_GRAPH).await;
     assert_eq!(orphans.len(), 1, "{orphans:?}");
     assert_eq!(orphans[0][0], g, "{orphans:?}");
+}
+
+/// A blank-node label names one node across a TriG document, so a node
+/// described in one graph can be referenced from another graph, or from the
+/// default graph. The documented queries do not list it; a check within the
+/// node's own graph would.
+#[tokio::test]
+async fn the_documented_query_counts_references_from_other_graphs() {
+    let fluree = memory();
+    let doc = "@prefix ex: <http://example.org/> .\n\
+               _:d ex:k \"described in the default graph\" .\n\
+               GRAPH <http://example.org/g1> { _:n ex:k \"described in g1\" . }\n\
+               GRAPH <http://example.org/g2> { ex:A ex:part _:n , _:d . }\n";
+    let r = fluree
+        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-orphans-across:main"), doc)
+        .await
+        .expect("upsert");
+    let default_orphans = select(&fluree, &r.ledger, ORPHANS_DEFAULT).await;
+    assert!(default_orphans.is_empty(), "{default_orphans:?}");
+    let graph_orphans = select(&fluree, &r.ledger, ORPHANS_PER_GRAPH).await;
+    assert!(graph_orphans.is_empty(), "{graph_orphans:?}");
+
+    // Checked within the node's own graph only, both would be listed.
+    let own_graph_only = select(
+        &fluree,
+        &r.ledger,
+        "SELECT DISTINCT ?g ?b WHERE { GRAPH ?g { ?b ?p ?o . FILTER(isBlank(?b)) \
+         FILTER NOT EXISTS { ?s ?q ?b } } }",
+    )
+    .await;
+    assert_eq!(own_graph_only.len(), 1, "{own_graph_only:?}");
+    let default_only = select(
+        &fluree,
+        &r.ledger,
+        "SELECT DISTINCT ?b WHERE { ?b ?p ?o . FILTER(isBlank(?b)) \
+         FILTER NOT EXISTS { ?s ?q ?b } }",
+    )
+    .await;
+    assert_eq!(default_only.len(), 1, "{default_only:?}");
 }
 
 // =============================================================================

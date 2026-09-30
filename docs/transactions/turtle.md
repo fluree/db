@@ -642,20 +642,24 @@ SELECT DISTINCT ?b WHERE {
   ?b ?p ?o .
   FILTER(isBlank(?b))
   FILTER NOT EXISTS { ?s ?q ?b }
+  FILTER NOT EXISTS { GRAPH ?h { ?s2 ?q2 ?b } }
 }
 ```
 
-That query reads the default graph. Blank nodes a TriG upsert wrote inside `GRAPH` blocks live in those graphs; the same check, graph by graph:
+That query lists subjects in the default graph. Blank nodes a TriG upsert wrote inside `GRAPH` blocks live in those graphs; the same check, graph by graph:
 
 ```sparql
 SELECT DISTINCT ?g ?b WHERE {
   GRAPH ?g {
     ?b ?p ?o .
     FILTER(isBlank(?b))
-    FILTER NOT EXISTS { ?s ?q ?b }
   }
+  FILTER NOT EXISTS { ?s ?q ?b }
+  FILTER NOT EXISTS { GRAPH ?h { ?s2 ?q2 ?b } }
 }
 ```
+
+Both look for references in every graph. A blank-node label names one node across a TriG document, so a node described in one graph can be referenced from another, and a check within its own graph would list it.
 
 Review the list before deleting: a document can hold unreferenced blank-node subjects on purpose. Deleting an orphaned node leaves the nodes it referenced orphaned in turn, so repeat until the query returns nothing.
 
