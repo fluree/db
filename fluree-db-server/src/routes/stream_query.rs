@@ -393,7 +393,7 @@ async fn stream_query_inner(
         // the path ledger, fold header opts in, enforce bearer scope over the
         // path ledger and every referenced graph, then apply auth-derived
         // identity + default policy class.
-        let registry = if crate::routes::query::names_jsonld_dataset(&query_json) {
+        let registry = if fluree_db_api::jsonld_names_dataset(&query_json) {
             crate::routes::query::scope_registry(&state, &path.id).await
         } else {
             None

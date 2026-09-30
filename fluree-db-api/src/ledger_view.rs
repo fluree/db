@@ -175,6 +175,21 @@ impl LedgerView {
         }
     }
 
+    /// The graph id registered under `iri`: the snapshot's graph registry,
+    /// then the binary index store's, the order every read path resolves a
+    /// graph name in. A borrowed lookup: nothing is copied, so a request pays
+    /// O(1) per reference however many graphs the ledger holds.
+    pub fn graph_id_for_iri(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
+        self.snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .or_else(|| {
+                self.binary_store
+                    .as_ref()
+                    .and_then(|store| store.graph_id_for_iri(iri))
+            })
+    }
+
     /// Get the ledger name (without branch suffix)
     ///
     /// Returns the base ledger name (e.g., "mydb"), NOT the canonical form (e.g., "mydb:main").

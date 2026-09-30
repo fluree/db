@@ -496,19 +496,21 @@ pub async fn run(
     // routes to the connection-scoped path. A plain same-endpoint query is left
     // on the single-target path below.
     let endpoint_id = target_endpoint_id(&target);
-    let use_connection = force_connection || {
-        let (path, registry) = match &target {
+    let route = if force_connection {
+        Route::Connection(None)
+    } else {
+        let (path, graphs) = match &target {
             context::QueryTarget::Ledger(LedgerMode::Local { fluree, alias })
                 if query_names_dataset(query_format, &content) =>
             {
                 (
                     EndpointPath::LocalView,
-                    local_graph_registry(fluree, alias).await,
+                    EndpointGraphs::of_local(fluree, alias).await,
                 )
             }
             // A graph source has no named graphs.
             context::QueryTarget::GraphSource { .. } => {
-                (EndpointPath::LocalView, Some(Default::default()))
+                (EndpointPath::LocalView, EndpointGraphs::Empty)
             }
             // A peer runs locally over index blocks fetched from its remote.
             context::QueryTarget::Peer {
@@ -517,23 +519,21 @@ pub async fn run(
                 ..
             } if query_names_dataset(query_format, &content) => (
                 EndpointPath::LocalView,
-                local_graph_registry(fluree, remote_alias).await,
+                EndpointGraphs::of_local(fluree, remote_alias).await,
             ),
             context::QueryTarget::Ledger(LedgerMode::Local { .. })
-            | context::QueryTarget::Peer { .. } => (EndpointPath::LocalView, None),
+            | context::QueryTarget::Peer { .. } => {
+                (EndpointPath::LocalView, EndpointGraphs::Unknown)
+            }
             context::QueryTarget::Ledger(LedgerMode::Tracked { .. }) => {
-                (EndpointPath::LedgerRoute, None)
+                (EndpointPath::LedgerRoute, EndpointGraphs::Unknown)
             }
         };
-        query_needs_connection(
-            query_format,
-            &content,
-            &endpoint_id,
-            path,
-            registry.as_ref(),
-        )
+        graphs
+            .with_lookup(|graphs| route_query(query_format, &content, &endpoint_id, path, graphs))?
     };
-    if use_connection {
+    if let Route::Connection(rewritten) = route {
+        let content = rewritten.unwrap_or(content);
         return run_connection_query(
             target,
             query_format,
@@ -1771,25 +1771,34 @@ fn print_footer(total_rows: usize, limit: Option<usize>, elapsed: std::time::Dur
 // Graph-source / connection (federated) query routing
 // ---------------------------------------------------------------------------
 
-/// The graph registry of a local endpoint ledger, for resolving a query's
-/// dataset references in it. `None` when the endpoint is not a ledger the local
-/// store holds.
-async fn local_graph_registry(
-    fluree: &fluree_db_api::Fluree,
-    alias: &str,
-) -> Option<std::collections::HashMap<String, fluree_db_core::GraphId>> {
-    let handle = fluree.ledger_cached(alias).await.ok()?;
-    let view = handle.snapshot().await;
-    let mut ids = std::collections::HashMap::new();
-    for (g_id, iri) in view.snapshot.graph_registry.iter_entries() {
-        ids.insert(iri.to_string(), g_id);
-    }
-    if let Some(store) = view.binary_store.as_ref() {
-        for (g_id, iri) in store.graph_entries() {
-            ids.entry(iri.to_string()).or_insert(g_id);
+/// The endpoint ledger's graph registry, as the router can read it.
+enum EndpointGraphs {
+    /// A ledger the local store holds: its cached head, where each reference
+    /// is one lookup (nothing is copied).
+    Ledger(Box<fluree_db_api::LedgerView>),
+    /// An endpoint with no named graphs (a graph source).
+    Empty,
+    /// Nothing to read here: a remote ledger, a query that names no dataset,
+    /// or an endpoint the local store does not hold.
+    Unknown,
+}
+
+impl EndpointGraphs {
+    async fn of_local(fluree: &fluree_db_api::Fluree, alias: &str) -> Self {
+        match fluree.ledger_cached(alias).await {
+            // Peek: the query's own load runs the read-side compaction check.
+            Ok(handle) => Self::Ledger(Box::new(handle.peek().await)),
+            Err(_) => Self::Unknown,
         }
     }
-    Some(ids)
+
+    fn with_lookup<R>(&self, f: impl FnOnce(Option<fluree_db_api::GraphLookup<'_>>) -> R) -> R {
+        match self {
+            Self::Ledger(view) => f(Some(&|iri: &str| view.graph_id_for_iri(iri))),
+            Self::Empty => f(Some(&|_: &str| None)),
+            Self::Unknown => f(None),
+        }
+    }
 }
 
 /// Where the endpoint's own path would run a query.
@@ -1797,135 +1806,124 @@ async fn local_graph_registry(
 enum EndpointPath {
     /// The local view path. It reads SPARQL `FROM` / `FROM NAMED` graphs of its
     /// own ledger but no time pin, and of JSON-LD only a `from` naming the whole
-    /// ledger. `registry` resolves the query's references exactly.
+    /// ledger. The registry resolves the query's references exactly.
     LocalView,
     /// A remote ledger route, which resolves a reference against its own graph
     /// registry. Only a reference that names another ledger leaves it.
     LedgerRoute,
 }
 
-/// Whether a query must run on the connection path instead of the endpoint's
-/// own path. Each dataset reference resolves in the endpoint's ledger through
-/// the table every surface shares ([`fluree_db_core::TargetLedger`]): one that
-/// names another ledger, another branch included, leaves the endpoint, and so
-/// does anything the endpoint's path would not read ([`EndpointPath`]).
-fn query_needs_connection(
+/// Where the router sends a query.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    /// The endpoint's own path, with the query as written.
+    Endpoint,
+    /// The connection path: with the query as written, or with the JSON-LD
+    /// body the local endpoint's ledger resolved (its graphs named as graphs
+    /// of that ledger, which the connection path reads).
+    Connection(Option<String>),
+}
+
+/// Where a query runs: the endpoint's own path, or the connection path. Each
+/// dataset reference resolves in the endpoint's ledger through the table every
+/// surface shares ([`fluree_db_core::TargetLedger`]), a JSON-LD body through
+/// [`fluree_db_api::resolve_jsonld_dataset_in_target`] as the server's ledger
+/// routes read it: one that names another ledger, another branch included,
+/// leaves the endpoint, and so does anything the endpoint's path would not
+/// read ([`EndpointPath`]).
+fn route_query(
     query_format: detect::QueryFormat,
     content: &str,
     endpoint_id: &str,
     path: EndpointPath,
-    registry: Option<&std::collections::HashMap<String, fluree_db_core::GraphId>>,
-) -> bool {
+    graphs: Option<fluree_db_api::GraphLookup<'_>>,
+) -> CliResult<Route> {
     use fluree_db_core::{LedgerRef, MemberRef, TargetError, TargetLedger};
 
-    let Ok(endpoint) = LedgerRef::parse(endpoint_id) else {
-        // No endpoint ledger: a query that names a dataset needs the connection.
-        return query_names_dataset(query_format, content);
-    };
-    let target = endpoint.id();
-    let lookup = |iri: &str| registry.and_then(|r| r.get(iri).copied());
-    let resolver = TargetLedger::new(target, &lookup);
-    let local = matches!(path, EndpointPath::LocalView);
-
-    // A reference the endpoint's path cannot read. One that does not parse is
-    // left to the path's own error.
-    let leaves = |written: &str| -> bool {
-        let Ok(member) = MemberRef::parse(written) else {
-            return false;
-        };
-        let pinned = member.address().is_some_and(|a| a.at().is_some());
-        match resolver.resolve(written, &member, pinned) {
-            Ok(_) => local && pinned,
-            Err(TargetError::GraphNotFound(_)) => false,
-            Err(TargetError::CrossLedger { also_iri, .. }) => local || !also_iri,
+    let connection_if = |leaves: bool| {
+        if leaves {
+            Route::Connection(None)
+        } else {
+            Route::Endpoint
         }
     };
-    // The local view path reads a JSON-LD source only when it names the whole
-    // ledger: its own address, bare.
-    let whole_ledger = |written: &str| {
-        MemberRef::parse(written).is_ok_and(|member| {
-            member
-                .address()
-                .is_some_and(|a| a.id() == target && a.is_bare())
-        })
+    let Ok(endpoint) = LedgerRef::parse(endpoint_id) else {
+        // No endpoint ledger: a query that names a dataset needs the connection.
+        return Ok(connection_if(query_names_dataset(query_format, content)));
     };
+    let target = endpoint.id();
+    let local = matches!(path, EndpointPath::LocalView);
 
     match query_format {
         detect::QueryFormat::Sparql => {
-            let Some(ast) = fluree_db_api::parse_sparql(content).ast else {
-                return false;
-            };
-            let Ok(Some(clause)) = fluree_db_api::resolve_dataset_clause(&ast) else {
-                return false;
-            };
-            clause.to_graph.is_some()
-                || clause
-                    .default_graphs
-                    .iter()
-                    .chain(&clause.named_graphs)
-                    .any(|iri| leaves(iri))
-        }
-        detect::QueryFormat::JsonLd => {
-            let Ok(body) = serde_json::from_str::<serde_json::Value>(content) else {
-                // A body we can't parse here fails later with a clearer error.
-                return false;
-            };
-            let opts = body.get("opts");
-            let key = |k: &str| body.get(k).or_else(|| opts.and_then(|o| o.get(k)));
-            if key("to").is_some() {
-                return true;
-            }
-            let sources = |v: &serde_json::Value| -> Vec<(String, bool)> {
-                // (written @id, whether it carries more than an @id)
-                let one = |v: &serde_json::Value| match v {
-                    serde_json::Value::String(s) => Some((s.clone(), false)),
-                    serde_json::Value::Object(o) => o
-                        .get("@id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|id| (id.to_string(), o.keys().any(|k| k != "@id"))),
-                    _ => None,
+            let none = |_: &str| None;
+            let resolver = TargetLedger::new(target, graphs.unwrap_or(&none));
+            // A reference the endpoint's path cannot read. One that does not
+            // parse is left to the path's own error.
+            let leaves = |written: &str| -> bool {
+                let Ok(member) = MemberRef::parse(written) else {
+                    return false;
                 };
-                match v {
-                    serde_json::Value::Array(items) => items.iter().filter_map(one).collect(),
-                    serde_json::Value::Object(o) if o.get("@id").is_none() => {
-                        o.values().filter_map(one).collect()
-                    }
-                    other => one(other).into_iter().collect(),
+                let pinned = member.address().is_some_and(|a| a.at().is_some());
+                match resolver.resolve(written, &member, pinned) {
+                    Ok(_) => local && pinned,
+                    Err(TargetError::GraphNotFound(_)) => false,
+                    Err(TargetError::CrossLedger { also_iri, .. }) => local || !also_iri,
                 }
             };
-            let named = key("fromNamed").or_else(|| key("from-named"));
-            let from = key("from").or_else(|| key("ledger"));
-            if local {
-                named.is_some()
-                    || from.is_some_and(|v| {
-                        let sources = sources(v);
-                        sources.is_empty()
-                            || sources
-                                .iter()
-                                .any(|(id, more)| *more || !whole_ledger(id) || leaves(id))
-                    })
-            } else {
-                named
-                    .into_iter()
-                    .chain(from)
-                    .flat_map(sources)
-                    .any(|(id, _)| leaves(&id))
+            let Some(ast) = fluree_db_api::parse_sparql(content).ast else {
+                return Ok(Route::Endpoint);
+            };
+            let Ok(Some(clause)) = fluree_db_api::resolve_dataset_clause(&ast) else {
+                return Ok(Route::Endpoint);
+            };
+            Ok(connection_if(
+                clause.to_graph.is_some()
+                    || clause
+                        .default_graphs
+                        .iter()
+                        .chain(&clause.named_graphs)
+                        .any(|iri| leaves(iri)),
+            ))
+        }
+        detect::QueryFormat::JsonLd => {
+            let Ok(mut body) = serde_json::from_str::<serde_json::Value>(content) else {
+                // A body we can't parse here fails later with a clearer error.
+                return Ok(Route::Endpoint);
+            };
+            // A history range runs on the connection path (the view's lane
+            // below already says so).
+            let has_to =
+                body.get("to").is_some() || body.get("opts").and_then(|o| o.get("to")).is_some();
+            let resolved = fluree_db_api::resolve_jsonld_dataset_in_target(
+                &mut body,
+                target,
+                graphs,
+                fluree_db_api::SingleFrom::AnyLedger,
+            );
+            match path {
+                // The view reads only its own ledger, whole: anything else runs
+                // on the connection path, as the ledger resolved it.
+                EndpointPath::LocalView => Ok(match resolved?.lane {
+                    fluree_db_api::JsonLdLane::View => Route::Endpoint,
+                    fluree_db_api::JsonLdLane::Dataset => Route::Connection(Some(body.to_string())),
+                }),
+                // The ledger route resolves (and reports) the rest itself.
+                EndpointPath::LedgerRoute => Ok(connection_if(
+                    has_to || resolved.is_ok_and(|resolved| resolved.names_other_ledger),
+                )),
             }
         }
     }
 }
 
 /// Whether a query names a dataset at all (`FROM`, `FROM NAMED`, or JSON-LD
-/// `from` / `fromNamed`).
+/// `from` / `fromNamed`, where the engine's parser reads them).
 fn query_names_dataset(query_format: detect::QueryFormat, content: &str) -> bool {
     match query_format {
         detect::QueryFormat::Sparql => fluree_db_api::sparql_has_dataset_clause(content),
         detect::QueryFormat::JsonLd => serde_json::from_str::<serde_json::Value>(content)
-            .is_ok_and(|body| {
-                ["from", "fromNamed", "from-named", "ledger"]
-                    .iter()
-                    .any(|k| body.get(k).is_some())
-            }),
+            .is_ok_and(|body| fluree_db_api::jsonld_names_dataset(&body)),
     }
 }
 
@@ -2246,9 +2244,9 @@ mod tests {
     use super::{
         attach_time_suffix_preserving_fragment, cli_delimited_config, cli_sparql_json_config,
         format_tally_suffix, inject_sparql_from_before_where, json_path_display_format,
-        json_path_formatter_config, parse_time_spec, pinned_remote_path, query_needs_connection,
-        reject_graph_source_unsupported, server_predates_path_pins, time_spec_to_suffix,
-        EndpointPath,
+        json_path_formatter_config, parse_time_spec, pinned_remote_path,
+        reject_graph_source_unsupported, route_query, server_predates_path_pins,
+        time_spec_to_suffix, EndpointPath, Route,
     };
     use crate::detect::QueryFormat;
     use crate::output::OutputFormatKind;
@@ -2457,15 +2455,24 @@ mod tests {
         path: EndpointPath,
         graphs: Option<&[&str]>,
     ) -> bool {
-        let registry: Option<std::collections::HashMap<String, fluree_db_core::GraphId>> = graphs
-            .map(|graphs| {
-                graphs
-                    .iter()
-                    .zip(3u16..)
-                    .map(|(iri, g)| (iri.to_string(), g))
-                    .collect()
-            });
-        query_needs_connection(format, content, endpoint, path, registry.as_ref())
+        route(format, content, endpoint, path, graphs).unwrap() != Route::Endpoint
+    }
+
+    fn route(
+        format: QueryFormat,
+        content: &str,
+        endpoint: &str,
+        path: EndpointPath,
+        graphs: Option<&[&str]>,
+    ) -> crate::error::CliResult<Route> {
+        let lookup = |iri: &str| {
+            graphs?
+                .iter()
+                .position(|g| *g == iri)
+                .map(|i| fluree_db_core::GraphId::try_from(i + 3).unwrap())
+        };
+        let lookup: fluree_db_api::GraphLookup<'_> = &lookup;
+        route_query(format, content, endpoint, path, graphs.map(|_| lookup))
     }
 
     /// #1972: the local router resolves the body's references in the
@@ -2529,6 +2536,53 @@ mod tests {
         ] {
             assert!(local(QueryFormat::JsonLd, body), "connection: {body}");
         }
+    }
+
+    /// The local router reads a JSON-LD body as the engine's parser does
+    /// (`opts` first) and hands the connection path the body its ledger
+    /// resolved, so a graph of that ledger arrives named as that ledger's
+    /// graph rather than as a keyword or IRI the connection cannot place.
+    #[test]
+    fn local_routing_hands_the_connection_the_resolved_body() {
+        let graphs: &[&str] = &["http://ex.org/g"];
+        let local = |body: &str| {
+            route(
+                QueryFormat::JsonLd,
+                body,
+                "mydb:main",
+                EndpointPath::LocalView,
+                Some(graphs),
+            )
+        };
+        for (body, from) in [
+            (
+                r#"{"from":"config","select":["?s"]}"#,
+                serde_json::json!({"@id": "mydb:main", "graph": "config"}),
+            ),
+            (
+                r#"{"from":"http://ex.org/g","select":["?s"]}"#,
+                serde_json::json!({"@id": "mydb:main", "graph": "http://ex.org/g"}),
+            ),
+        ] {
+            let Route::Connection(Some(rewritten)) = local(body).unwrap() else {
+                panic!("not sent to the connection resolved: {body}");
+            };
+            let rewritten: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+            assert_eq!(rewritten["from"], from, "{body}");
+        }
+        // `opts.from` is the source the parser reads: a pinned one leaves the
+        // view even under a whole-ledger top-level `from`...
+        assert_ne!(
+            local(r#"{"from":"mydb","opts":{"from":"mydb@t:1"},"select":["?s"]}"#).unwrap(),
+            Route::Endpoint
+        );
+        // ...and a whole-ledger one keeps it there.
+        assert_eq!(
+            local(r#"{"opts":{"from":"mydb"},"select":["?s"]}"#).unwrap(),
+            Route::Endpoint
+        );
+        // A graph of the ledger cannot take a graph of its own: refused here.
+        assert!(local(r#"{"from":{"@id":"config","graph":"http://ex.org/g"}}"#).is_err());
     }
 
     /// A remote ledger route resolves a reference against its own graph

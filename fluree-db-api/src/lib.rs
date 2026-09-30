@@ -104,6 +104,7 @@ mod revert_preview;
 pub(crate) mod runtime_dicts;
 pub mod server_defaults;
 pub(crate) mod sparql_lang;
+pub mod target_dataset;
 mod time_resolve;
 pub mod tx;
 pub mod tx_builder;
@@ -220,6 +221,11 @@ pub use rebase::{
 };
 pub use revert::{RevertReport, RevertSelection, StagedRevert};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
+pub use target_dataset::{
+    jsonld_dataset_ledger, jsonld_lane, jsonld_names_dataset, jsonld_view_ledger,
+    resolve_in_target, resolve_jsonld_dataset_in_target, GraphLookup, InTarget, JsonLdInTarget,
+    JsonLdLane, SingleFrom,
+};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
     TransactResultRef,

@@ -452,43 +452,9 @@ pub(crate) fn has_policy_opts(query_json: &JsonValue) -> bool {
         .unwrap_or(true)
 }
 
-/// Extract a representative ledger identifier from a `from` / `fromNamed`
-/// value of any supported shape.
-///
-/// Shapes handled (see `requires_dataset_features` and `parse_dataset_spec`):
-/// - string: `"ledger:main"` (optionally with an `@t:` / `#graph` suffix)
-/// - array: `["a:main", "b:main"]` or `[{"@id": "a"}, ...]` — first element
-/// - object `from`: `{"@id": "ledger:main@t:5", ...}` — the `@id`
-/// - object `fromNamed`: `{"alias": <source>, ...}` — first map value
-///
-/// Returns the first concrete ledger string found, or `None` if the value
-/// carries no resolvable identifier. This is used only to pick a ledger for
-/// auth scoping and span recording; the full multi-graph dataset is resolved
-/// later by `parse_dataset_spec` in the dataset execution path.
-fn first_ledger_identifier(value: &JsonValue) -> Option<String> {
-    match value {
-        JsonValue::String(s) => Some(s.clone()),
-        JsonValue::Array(items) => items.iter().find_map(first_ledger_identifier),
-        JsonValue::Object(map) => map
-            .get("@id")
-            .and_then(JsonValue::as_str)
-            .map(str::to_string)
-            // `fromNamed` map form: { alias -> source }. No `@id`, so fall
-            // back to the first source value that yields an identifier.
-            .or_else(|| map.values().find_map(first_ledger_identifier)),
-        _ => None,
-    }
-}
-
 /// Collect **every** concrete ledger identifier a `from` / `fromNamed` value
-/// references, across all supported shapes.
-///
-/// Unlike [`first_ledger_identifier`] (which returns a single representative
-/// id for span recording), this enumerates all of them so the bearer
-/// ledger-scope check can authorize every ledger a multi-default-graph or
-/// named-graph query will actually read — not just the first. Mirrors the
-/// shape handling of `first_ledger_identifier`: an object with `@id` is a
-/// single source; otherwise its values are sources (`fromNamed` map form).
+/// references, across all supported shapes: an object with `@id` is a single
+/// source; otherwise its values are sources (`fromNamed` map form).
 fn collect_ledger_identifiers(value: &JsonValue, out: &mut Vec<String>) {
     match value {
         JsonValue::String(s) => out.push(s.clone()),
@@ -567,28 +533,16 @@ pub(crate) fn get_ledger_id(
         return Ok(ledger.clone());
     }
 
-    // Accept every `from` shape the engine supports — string, array of
-    // sources (multi-default-graph union), or structured object (time travel
-    // / graph fragment). Earlier this only matched a bare string, so array /
-    // object `from` (and `fromNamed`-only) queries were rejected with
-    // `MissingLedger` before the dataset path could run (issue #1259).
-    //
-    // The extracted id is used only for the conservative bearer scope check
-    // and span recording; per-ledger policy and routing are applied later in
-    // `execute_dataset_query` via `parse_dataset_spec`, which sees the full
-    // dataset spec. Strip any `@t:` / `#graph` suffix so auth scopes to the
-    // base ledger.
-    let from_id = body.get("from").and_then(first_ledger_identifier);
-    let named_id = || {
-        body.get("fromNamed")
-            .or_else(|| body.get("from-named"))
-            .and_then(first_ledger_identifier)
-    };
-    if let Some(raw) = from_id.or_else(named_id) {
-        return base_ledger_id(&raw);
+    // The body's dataset, read with the engine parser's key precedence
+    // (`opts` first) and in every shape it supports (#1259): the ledger the
+    // query's view reads, else the first ledger it names. A dataset-lane query
+    // uses the id only for the conservative bearer scope check and span
+    // recording; `execute_dataset_query` reads the full dataset itself. Strip
+    // any `@t:` / `#graph` suffix so auth scopes to the base ledger.
+    match fluree_db_api::jsonld_dataset_ledger(body) {
+        Some(raw) => base_ledger_id(&raw),
+        None => Err(ServerError::MissingLedger),
     }
-
-    Err(ServerError::MissingLedger)
 }
 
 /// Inject header values into query JSON (modifies the query in place)
@@ -1258,7 +1212,7 @@ pub async fn query_ledger(
 
     // Ledger-scoped endpoint: resolve `from` / `fromNamed` in the path's ledger,
     // rejecting attempts to target a different ledger than the URL.
-    let registry = if names_jsonld_dataset(&query_json) {
+    let registry = if fluree_db_api::jsonld_names_dataset(&query_json) {
         scope_registry(&state, &path.id).await
     } else {
         None
@@ -1646,7 +1600,7 @@ pub async fn explain_ledger(
 
         // Ledger-scoped endpoint: resolve `from` / `fromNamed` in the path's
         // ledger, rejecting attempts to target a different ledger than the URL.
-        let registry = if names_jsonld_dataset(&query_json) {
+        let registry = if fluree_db_api::jsonld_names_dataset(&query_json) {
             scope_registry(&state, &path.id).await
         } else {
             None
@@ -1775,44 +1729,12 @@ pub async fn explain_ledger_tail(
     .await
 }
 
-/// Check if a query requires dataset features (multi-ledger, named graphs, etc.)
-///
-/// Dataset features that require the connection execution path:
-/// - `fromNamed` / `from-named`: Named graphs in the dataset
-/// - `from` as array: Multiple default graphs
-/// - `from` as object with special fields: graph selector, alias, time-travel
+/// Whether a JSON-LD query needs the connection execution path: named graphs,
+/// several sources, a graph, a time, a history range, or a source that is no
+/// ledger address ([`fluree_db_api::jsonld_lane`], reading the keys the
+/// engine's parser reads).
 pub(crate) fn requires_dataset_features(query: &JsonValue) -> bool {
-    // Check for fromNamed (new) or from-named (legacy)
-    if query.get("fromNamed").is_some() || query.get("from-named").is_some() {
-        return true;
-    }
-
-    // Check the structure of "from"
-    if let Some(from) = query.get("from") {
-        // Array of sources = multiple default graphs
-        if from.is_array() {
-            return true;
-        }
-
-        // String with time-travel or graph fragment requires dataset parsing
-        // so the server can apply time travel and/or named graph selection.
-        if let Some(s) = from.as_str() {
-            if s.contains('@') || s.contains('#') {
-                return true;
-            }
-        }
-
-        // Object form with special keys (graph, alias, t, iso, sha, etc.)
-        if let Some(obj) = from.as_object() {
-            // Any key other than just @id indicates dataset features
-            let has_special_keys = obj.keys().any(|k| !matches!(k.as_str(), "@id"));
-            if has_special_keys {
-                return true;
-            }
-        }
-    }
-
-    false
+    fluree_db_api::jsonld_lane(query) == fluree_db_api::JsonLdLane::Dataset
 }
 
 fn iri_to_string(iri: &fluree_db_sparql::ast::Iri) -> String {
@@ -2414,145 +2336,35 @@ pub(crate) fn collect_sparql_min_t_requirements(
     Ok(requirements)
 }
 
-/// Resolve a ledger-scoped JSON-LD query's `from` / `fromNamed` in the path's
-/// ledger ([`resolve_scoped_reference`]): a graph of the ledger, named by
-/// keyword or IRI, becomes `{"@id": <ledger>, "graph": <graph>}` (a named one
-/// keeps its written text as its name), and the ledger's own address in any
-/// spelling stays as written. A single `from` must name this ledger (another
-/// ledger is a 400); a `from` array and `fromNamed` may also name other
-/// ledgers, which stay as written for the dataset to load.
+/// Resolve a ledger-scoped JSON-LD query's dataset in the path's ledger
+/// ([`fluree_db_api::resolve_jsonld_dataset_in_target`], reading the keys the
+/// engine's parser reads): a graph of the ledger, named by keyword or IRI,
+/// becomes `{"@id": <ledger>, "graph": <graph>}` (a named one keeps its
+/// written text as its name), and the ledger's own address in any spelling
+/// stays as written. A single `from` must name this ledger (another ledger is
+/// a 400); a `from` array and `fromNamed` may also name other ledgers, which
+/// stay as written for the dataset to load.
 pub(crate) fn normalize_ledger_scoped_from(
     target: &fluree_db_api::LedgerId,
     registry: Option<&ScopeRegistry>,
     query: &mut JsonValue,
 ) -> Result<()> {
-    let Some(obj) = query.as_object_mut() else {
-        return Ok(());
-    };
-    for (key, named) in [("from", false), ("fromNamed", true), ("from-named", true)] {
-        if let Some(value) = obj.get(key) {
-            let scope = match (named, value) {
-                (false, JsonValue::String(_) | JsonValue::Object(_)) => SourceScope::ThisLedger,
-                _ => SourceScope::AnyLedger,
-            };
-            let normalized = normalize_scoped_sources(target, registry, value, named, scope)?;
-            obj.insert(key.to_string(), normalized);
-        }
-    }
-    Ok(())
-}
-
-/// Which ledgers a JSON-LD dataset position of a ledger-scoped route may name.
-#[derive(Clone, Copy)]
-enum SourceScope {
-    /// Only the path's ledger: another one is a 400.
-    ThisLedger,
-    /// Any ledger: one other than the path's stays as written.
-    AnyLedger,
-}
-
-/// Whether a JSON-LD body names a dataset the ledger-scoped routes resolve.
-pub(crate) fn names_jsonld_dataset(query: &JsonValue) -> bool {
-    ["from", "fromNamed", "from-named"]
-        .iter()
-        .any(|key| query.get(key).is_some())
-}
-
-/// Resolve one JSON-LD source, or `None` when it names another ledger that
-/// the position may name (it then stays as written).
-fn scoped_source(
-    target: &fluree_db_api::LedgerId,
-    registry: Option<&ScopeRegistry>,
-    written: &str,
-    scope: SourceScope,
-) -> Result<Option<ScopedReference>> {
-    if let SourceScope::AnyLedger = scope {
-        let registered = registry.is_some_and(|r| r.0.contains_key(written));
-        let other_ledger = fluree_db_core::MemberRef::parse(written)
-            .map(|m| m.address().is_some_and(|a| a.id() != target))
-            .unwrap_or(true);
-        if other_ledger && !registered {
-            return Ok(None);
-        }
-    }
-    resolve_scoped_reference(target, registry, written).map(Some)
-}
-
-fn normalize_scoped_sources(
-    target: &fluree_db_api::LedgerId,
-    registry: Option<&ScopeRegistry>,
-    value: &JsonValue,
-    named: bool,
-    scope: SourceScope,
-) -> Result<JsonValue> {
-    match value {
-        JsonValue::String(written) => {
-            let Some(scoped) = scoped_source(target, registry, written, scope)? else {
-                return Ok(value.clone());
-            };
-            if scoped.own_address {
-                return Ok(value.clone());
-            }
-            let mut src = serde_json::Map::new();
-            src.insert("@id".to_string(), JsonValue::String(target.to_string()));
-            src.insert(
-                "graph".to_string(),
-                JsonValue::String(scoped.graph.to_string()),
-            );
-            if named {
-                src.insert("alias".to_string(), JsonValue::String(written.clone()));
-            }
-            Ok(JsonValue::Object(src))
-        }
-        JsonValue::Array(items) => items
-            .iter()
-            .map(|item| normalize_scoped_sources(target, registry, item, named, scope))
-            .collect::<Result<Vec<_>>>()
-            .map(JsonValue::Array),
-        JsonValue::Object(obj) => match obj.get("@id").and_then(JsonValue::as_str) {
-            Some(id) => {
-                let Some(scoped) = scoped_source(target, registry, id, scope)? else {
-                    return Ok(value.clone());
-                };
-                if scoped.own_address {
-                    return Ok(value.clone());
-                }
-                // The object names a graph of this ledger by its `@id`.
-                if obj.contains_key("graph") {
-                    return Err(ServerError::bad_request(format!(
-                        "'{id}' names a graph of this ledger, so it takes no \"graph\" of its own"
-                    )));
-                }
-                let mut src = obj.clone();
-                src.insert("@id".to_string(), JsonValue::String(target.to_string()));
-                src.insert(
-                    "graph".to_string(),
-                    JsonValue::String(scoped.graph.to_string()),
-                );
-                if named && !src.contains_key("alias") {
-                    src.insert("alias".to_string(), JsonValue::String(id.to_string()));
-                }
-                Ok(JsonValue::Object(src))
-            }
-            // `fromNamed` object form: aliases mapped to sources.
-            None if named => obj
-                .iter()
-                .map(|(alias, source)| {
-                    normalize_scoped_sources(target, registry, source, named, scope)
-                        .map(|source| (alias.clone(), source))
-                })
-                .collect::<Result<serde_json::Map<_, _>>>()
-                .map(JsonValue::Object),
-            None => Ok(value.clone()),
-        },
-        other => Ok(other.clone()),
-    }
+    with_graph_lookup(registry, |graphs| {
+        fluree_db_api::resolve_jsonld_dataset_in_target(
+            query,
+            target,
+            graphs,
+            fluree_db_api::SingleFrom::TargetOnly,
+        )
+    })
+    .map(|_| ())
+    .map_err(dataset_reference_error)
 }
 
 #[cfg(test)]
 mod ledger_scoped_from_tests {
     use super::{
-        collect_jsonld_min_t_requirements, collect_sparql_min_t_requirements,
+        collect_jsonld_min_t_requirements, collect_sparql_min_t_requirements, get_ledger_id,
         normalize_ledger_scoped_from, refreshable_ledger_id, requires_dataset_features,
         ScopeRegistry,
     };
@@ -2565,7 +2377,7 @@ mod ledger_scoped_from_tests {
 
     /// A loaded ledger's registry holding `graphs`.
     fn registry(graphs: &[&str]) -> ScopeRegistry {
-        ScopeRegistry(
+        ScopeRegistry::Fixed(
             graphs
                 .iter()
                 .zip(3u16..)
@@ -2768,6 +2580,51 @@ mod ledger_scoped_from_tests {
         assert!(requires_dataset_features(&q1));
         let q2 = json!({"select": ["*"], "from": "myledger:main#txn-meta"});
         assert!(requires_dataset_features(&q2));
+    }
+
+    /// The routes read a JSON-LD dataset where the engine's parser reads it:
+    /// `opts` before the top level. A top-level `from` the parser ignores
+    /// cannot vouch for an `opts.from` naming another ledger; an `opts`-only
+    /// dataset is resolved in the path's ledger and routed by what it names;
+    /// and the connection route's view ledger is the one the parser reads.
+    #[test]
+    fn the_dataset_is_read_where_the_parser_reads_it() {
+        let target = id("b2x:main");
+        let reg = registry(&["http://ex.org/g"]);
+        let mut q = json!({"from": "b2x", "opts": {"from": "other:main"}});
+        let err = normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap_err();
+        assert!(err.to_string().contains("Ledger mismatch"), "{err}");
+
+        let mut q = json!({"opts": {"fromNamed": ["http://ex.org/g"]}});
+        normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap();
+        assert_eq!(
+            q["opts"]["fromNamed"],
+            json!([{"@id": "b2x:main", "graph": "http://ex.org/g", "alias": "http://ex.org/g"}])
+        );
+        assert!(requires_dataset_features(&q));
+        assert!(!requires_dataset_features(
+            &json!({"from": "b2x:main@t:1", "opts": {"from": "b2x"}})
+        ));
+
+        let headers = FlureeHeaders::default();
+        for (body, ledger) in [
+            (json!({"opts": {"from": "a:main"}}), "a:main"),
+            (
+                json!({"from": "a:main", "opts": {"from": "b:main"}}),
+                "b:main",
+            ),
+            (json!({"from": ["http://ex.org/g", "c@t:1"]}), "c"),
+            (
+                json!({"fromNamed": {"x": {"@id": "d:dev#config"}}}),
+                "d:dev",
+            ),
+        ] {
+            assert_eq!(
+                get_ledger_id(None, &headers, &body).unwrap(),
+                ledger,
+                "{body}"
+            );
+        }
     }
 }
 
@@ -3179,12 +3036,46 @@ async fn execute_query_proxy(
 
 /// The graph registry of a ledger-scoped route's ledger, used to resolve the
 /// request's dataset references in the ledger they target, through the table
-/// the view path and updates use. A graph source or a missing ledger has an
-/// empty one. In proxy storage there is none to read: references then resolve
-/// by address alone, and loading reports a graph that does not exist.
-pub(crate) struct ScopeRegistry(std::collections::HashMap<String, fluree_db_core::GraphId>);
+/// the view path and updates use. Each reference is one lookup in the cached
+/// head the route already reads; nothing is copied per request.
+pub(crate) enum ScopeRegistry {
+    /// The ledger's cached head.
+    Ledger(Box<fluree_db_api::LedgerView>),
+    /// A graph source, or a ledger that does not exist: no named graphs.
+    Empty,
+    /// A fixed table, for unit tests.
+    #[cfg(test)]
+    Fixed(std::collections::HashMap<String, fluree_db_core::GraphId>),
+}
 
-/// The path ledger's [`ScopeRegistry`], read from its cached head.
+impl ScopeRegistry {
+    /// The graph `iri` names in the ledger, if the ledger registers it.
+    pub(crate) fn graph_id(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
+        match self {
+            Self::Ledger(view) => view.graph_id_for_iri(iri),
+            Self::Empty => None,
+            #[cfg(test)]
+            Self::Fixed(ids) => ids.get(iri).copied(),
+        }
+    }
+}
+
+/// Run `f` with a borrowed lookup into `registry`, or with none when the route
+/// cannot read one (proxy storage: references then resolve by address alone,
+/// and loading reports a graph that does not exist).
+pub(crate) fn with_graph_lookup<R>(
+    registry: Option<&ScopeRegistry>,
+    f: impl FnOnce(Option<fluree_db_api::GraphLookup<'_>>) -> R,
+) -> R {
+    match registry {
+        Some(registry) => f(Some(&|iri: &str| registry.graph_id(iri))),
+        None => f(None),
+    }
+}
+
+/// The path ledger's [`ScopeRegistry`], read from its cached head. It peeks:
+/// the query's own load runs the read-side compaction check, which costs a
+/// visit to every graph in novelty, so a second one here is pure overhead.
 pub(crate) async fn scope_registry(
     state: &AppState,
     target: &fluree_db_api::LedgerId,
@@ -3192,98 +3083,35 @@ pub(crate) async fn scope_registry(
     if state.config.is_proxy_storage_mode() {
         return None;
     }
-    let handle = match state.fluree.ledger_cached(target.as_str()).await {
-        Ok(handle) => handle,
-        // A graph source, or a ledger that does not exist: no named graphs.
-        Err(e) if e.is_not_found() => {
-            return Some(ScopeRegistry(std::collections::HashMap::new()));
-        }
-        Err(_) => return None,
-    };
-    let view = handle.snapshot().await;
-    let mut ids = std::collections::HashMap::new();
-    for (g_id, iri) in view.snapshot.graph_registry.iter_entries() {
-        ids.insert(iri.to_string(), g_id);
+    match state.fluree.ledger_cached(target.as_str()).await {
+        Ok(handle) => Some(ScopeRegistry::Ledger(Box::new(handle.peek().await))),
+        Err(e) if e.is_not_found() => Some(ScopeRegistry::Empty),
+        Err(_) => None,
     }
-    if let Some(store) = view.binary_store.as_ref() {
-        for (g_id, iri) in store.graph_entries() {
-            ids.entry(iri.to_string()).or_insert(g_id);
-        }
-    }
-    Some(ScopeRegistry(ids))
 }
 
-/// A dataset reference of a ledger-scoped request, resolved in the path's
-/// ledger.
-pub(crate) struct ScopedReference {
-    /// The graph of the path's ledger the reference names.
-    pub(crate) graph: GraphSel,
-    /// The time the reference pins, if it is an address with a pin.
-    pub(crate) at: Option<TimeSpec>,
-    /// Written as the ledger's own address (any spelling, with or without a
-    /// graph and a pin), which the dataset parsers read as is.
-    pub(crate) own_address: bool,
+/// A dataset reference the route cannot read: the 400 it has always been.
+fn dataset_reference_error(e: ApiError) -> ServerError {
+    match e {
+        ApiError::Query(fluree_db_query::QueryError::InvalidQuery(msg)) => {
+            ServerError::bad_request(msg)
+        }
+        other => ServerError::Api(other),
+    }
 }
 
 /// Resolve one dataset reference of a ledger-scoped request (a SPARQL `FROM` /
-/// `FROM NAMED` IRI after prefix and BASE expansion, or a JSON-LD `from` /
-/// `fromNamed` string) in the path's ledger. The ledger's own address in any
-/// spelling names its default graph, or the graph the address names; a graph
-/// keyword or a registered IRI names that graph; another ledger's address is a
-/// 400. An IRI the registry does not hold is left to loading, which reports a
-/// graph the ledger does not have (404).
+/// `FROM NAMED` IRI after prefix and BASE expansion) in the path's ledger:
+/// [`fluree_db_api::resolve_in_target`] against the route's registry.
 pub(crate) fn resolve_scoped_reference(
     target: &fluree_db_api::LedgerId,
     registry: Option<&ScopeRegistry>,
     written: &str,
-) -> Result<ScopedReference> {
-    use fluree_db_core::{GraphIri, MemberRef, TargetError, TargetLedger};
-
-    let member = MemberRef::parse(written).map_err(|e| {
-        ServerError::bad_request(format!("<{written}> is not a graph of this ledger: {e}"))
-    })?;
-    let at = member.address().and_then(|a| a.at().cloned());
-    let own_address = member.address().is_some_and(|a| a.id() == target);
-    let lookup = |iri: &str| registry.and_then(|r| r.0.get(iri).copied());
-    let graph_iri = |iri: &str| {
-        GraphIri::parse(iri).map(GraphSel::Named).map_err(|e| {
-            ServerError::bad_request(format!("<{written}> is not a graph of this ledger: {e}"))
-        })
-    };
-    match TargetLedger::new(target, &lookup).resolve(written, &member, at.is_some()) {
-        Ok(graph) => Ok(ScopedReference {
-            graph: graph.graph,
-            at,
-            own_address,
-        }),
-        Err(TargetError::GraphNotFound(iri)) => Ok(ScopedReference {
-            graph: graph_iri(&iri)?,
-            at,
-            own_address,
-        }),
-        // With no registry to consult, an IRI that also reads as an address
-        // may still be a graph of this ledger: loading decides.
-        Err(TargetError::CrossLedger { also_iri: true, .. }) if registry.is_none() => {
-            Ok(ScopedReference {
-                graph: graph_iri(written)?,
-                at: None,
-                own_address: false,
-            })
-        }
-        Err(TargetError::CrossLedger {
-            named,
-            target,
-            also_iri,
-        }) => Err(ServerError::bad_request(format!(
-            "Ledger mismatch: endpoint ledger is '{target}' but <{written}> {}names ledger \
-             '{named}'",
-            if also_iri {
-                "is not a graph of this ledger, and as an address it "
-            } else {
-                ""
-            }
-        ))),
-    }
+) -> Result<fluree_db_api::InTarget> {
+    with_graph_lookup(registry, |graphs| {
+        fluree_db_api::resolve_in_target(target, graphs, written)
+    })
+    .map_err(dataset_reference_error)
 }
 
 /// The query's dataset clause with its IRIs expanded against the prologue
