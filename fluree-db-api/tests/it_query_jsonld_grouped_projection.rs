@@ -265,6 +265,50 @@ async fn jsonld_non_key_select_expression_stays_a_per_group_list() {
     );
 }
 
+/// A key-only alias that a per-solution expression reads moves before grouping
+/// with its reader, so the reader keeps the documented per-group list; the
+/// alias (constant within its group) becomes one too. This is the behavior
+/// before J3. Without the move, the reader ran per group and the plan-time
+/// check rejected its non-key read.
+#[tokio::test]
+async fn jsonld_key_only_alias_read_per_solution_stays_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_areas(&fluree, "jsonld-grouped/j3-moved-alias:main").await;
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({
+            "select": ["?a", "(as (strlen ?a) ?len)", "(as (+ ?len (strlen (str ?e))) ?x)"],
+            "groupBy": ["?a"]
+        }),
+    )
+    .await;
+    let net = found
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|r| r[0] == "Net")
+        .cloned()
+        .unwrap_or_else(|| panic!("a Net row: {found}"));
+    // strlen("Net") = 3; strlen("http://example.org/eN") = 21.
+    assert_eq!(net, json!(["Net", [3, 3, 3], [24, 24, 24]]), "{found}");
+
+    // Read only by a per-group expression, the same alias stays one value.
+    let found = rows(
+        &fluree,
+        &ledger,
+        json!({
+            "select": ["?a", "(as (strlen ?a) ?len)", "(as (+ ?len (count ?e)) ?y)"],
+            "groupBy": ["?a"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        normalize_rows(&found),
+        normalize_rows(&json!([["Net", 3, 6], ["Local", 5, 7], ["Remote", 6, 7]]))
+    );
+}
+
 /// A select expression evaluated per group cannot take the name of a variable
 /// the WHERE binds: it would silently replace that variable's value after
 /// grouping (here, the `groupBy` key itself). SPARQL rejects the same alias.

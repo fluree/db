@@ -275,7 +275,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let SelectVariables::Explicit(items) = &select.variables else {
             return Ok(SelectExtends { pre, extends });
         };
-        let mut placer = if lowered.groups() {
+        let placer = if lowered.groups() {
             SelectExprPlacer::grouped(
                 lowered.group_by.iter().copied(),
                 &lowered.aggregates,
@@ -284,6 +284,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         } else {
             SelectExprPlacer::ungrouped()
         };
+        // (alias, expression, contains an aggregate), in SELECT order.
+        let mut computed: Vec<(VarId, Expression, bool)> = Vec::new();
         for item in items {
             let SelectVariable::Expr { expr, alias, .. } = item else {
                 continue;
@@ -293,17 +295,21 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             let var = self.register_var(alias);
             if let Some(compound) = lowered.compound_select_exprs.remove(&var) {
-                placer.record_post_group(var);
-                extends.push((var, compound));
+                computed.push((var, compound, true));
                 continue;
             }
-            let lowered_expr = self.lower_expression(expr)?;
-            match placer.place(var, &lowered_expr) {
-                SelectExprPlacement::PostGroup => extends.push((var, lowered_expr)),
-                SelectExprPlacement::PreGroup => pre.push(Pattern::Bind {
-                    var,
-                    expr: lowered_expr,
-                }),
+            computed.push((var, self.lower_expression(expr)?, false));
+        }
+        let placements = placer.place_all(
+            &computed
+                .iter()
+                .map(|(var, expr, aggregate)| (*var, expr, *aggregate))
+                .collect::<Vec<_>>(),
+        );
+        for ((var, expr, _), placement) in computed.into_iter().zip(placements) {
+            match placement {
+                SelectExprPlacement::PostGroup => extends.push((var, expr)),
+                SelectExprPlacement::PreGroup => pre.push(Pattern::Bind { var, expr }),
             }
         }
         Ok(SelectExtends { pre, extends })

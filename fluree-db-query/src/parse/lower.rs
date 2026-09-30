@@ -1221,22 +1221,34 @@ fn lower_select_computations<'a, E: IriEncoder>(
         .iter()
         .map(|a| lower_aggregate_spec(a, vars))
         .collect();
-    let mut placer = if keys.is_empty() && aggregates.is_empty() {
+    let placer = if keys.is_empty() && aggregates.is_empty() {
         crate::ir::SelectExprPlacer::ungrouped()
     } else {
         crate::ir::SelectExprPlacer::grouped(keys, &aggregates, where_vars.clone())
     };
 
-    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
-    let mut aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    // (alias name, alias, expression), in SELECT order.
+    let mut computed: Vec<(&str, VarId, Expression)> = Vec::new();
     for column in columns {
         let UnresolvedColumn::Computation { expr, alias } = column else {
             continue;
         };
         let alias_var = vars.get_or_insert(alias);
         let lowered = lower_filter_expr_with_encoder(expr, vars, encoder, pp_counter)?;
+        computed.push((alias, alias_var, lowered));
+    }
+    let placements = placer.place_all(
+        &computed
+            .iter()
+            .map(|(_, alias_var, expr)| (*alias_var, expr, false))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
+    let mut aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    for ((alias, alias_var, lowered), placement) in computed.into_iter().zip(placements) {
         aliases.insert(alias_var);
-        match placer.place(alias_var, &lowered) {
+        match placement {
             crate::ir::SelectExprPlacement::PostGroup => {
                 // A per-group bind onto a variable the WHERE binds would
                 // replace that variable's value — a group key's included —
