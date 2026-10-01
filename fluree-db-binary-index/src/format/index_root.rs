@@ -1949,8 +1949,8 @@ mod tests {
     #[test]
     fn o_type_table_built_in() {
         let table = IndexRoot::build_o_type_table(&[], &[]);
-        // Should contain all 31 embedded + 13 Fluree = 44 entries.
-        assert_eq!(table.len(), 44);
+        // Should contain all 31 embedded + 14 Fluree = 45 entries.
+        assert_eq!(table.len(), 45);
 
         // Spot-check a few entries.
         let int_entry = table
@@ -1979,8 +1979,8 @@ mod tests {
     #[test]
     fn o_type_table_with_langs() {
         let table = IndexRoot::build_o_type_table(&[], &["en".to_string(), "fr".to_string()]);
-        // 44 built-in + 2 langString = 46.
-        assert_eq!(table.len(), 46);
+        // 45 built-in + 2 langString = 47.
+        assert_eq!(table.len(), 47);
 
         // lang_id is 1-based: first tag "en" gets lang_id=1
         let en_entry = table
@@ -1994,8 +1994,8 @@ mod tests {
     #[test]
     fn o_type_table_with_custom_types() {
         let table = IndexRoot::build_o_type_table(&["http://example.org/myType".to_string()], &[]);
-        // 44 built-in + 1 customer = 45.
-        assert_eq!(table.len(), 45);
+        // 45 built-in + 1 customer = 46.
+        assert_eq!(table.len(), 46);
 
         let custom = table.last().unwrap();
         assert!(OType::from_u16(custom.o_type).is_customer_datatype());
