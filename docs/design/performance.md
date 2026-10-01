@@ -359,23 +359,41 @@ with further shapes using per-row evaluation. Both the base and projected key
 sets contribute to the query's retained-memory estimate and budget checks.
 
 **`OptionalOperator`** answers a single-triple `OPTIONAL` correlated on one end
-of its triple with one batched probe for the whole driving side: a PSOT probe
-when the subject comes from the required side (`OPTIONAL { ?s :email ?e }`), an
-OPST probe when the object does (`OPTIONAL { ?c :subjectOf ?s }`). Other shapes
-look the triple up per driving row with every correlated value bound into the
-scan, whichever form the row carries it in: an encoded subject, predicate, or
-literal is decoded into its slot, so no row scans the whole predicate. When the
-row binds the subject, an encoded object is left to the join check instead of
-decoded, because the subject seek is already narrow.
+of its triple with a batched probe over the driving side: a PSOT probe when the
+subject comes from the required side (`OPTIONAL { ?s :email ?e }`), an OPST
+probe over at most 100,000 driving rows at a time when the object does
+(`OPTIONAL { ?c :subjectOf ?s }`), the window the join's own bound-object lane
+uses.
+Other shapes look the triple up per driving row with every correlated value
+bound into the scan, whichever form the row carries it in: an encoded subject,
+predicate or literal is decoded into its slot, so no row scans the whole
+predicate. With several graphs of one ledger active there is no graph view, and
+values decode through a view of the ledger's store instead; only an
+arena-backed literal (a big number or a vector, whose handle names a value
+within one graph) stays free and is matched by term. When the row binds the
+subject, an encoded IRI, string or date object is left to the join check
+instead of decoded, because the subject seek is already narrow. A numeric
+object is still substituted: the substitution matches numerics by value across
+numeric datatypes, and the join check compares terms.
 
 **Term equality across forms.** On an indexed ledger the scan emits terms
 encoded (`EncodedPid` for a predicate position, `EncodedSid` for a subject or
 reference object, `EncodedLit` for a literal); decoded producers such as
-`VALUES`, `BIND`, and scans over novelty carry the same terms decoded. Every
-equality surface (hash joins, `DISTINCT`, `GROUP BY`, `MINUS`, `EXISTS`,
-`VALUES`, `OPTIONAL`) keys an IRI by one canonical form: its subject ID when it has one,
-else its predicate ID. The predicate-to-subject mapping is resolved once per
-index, so a key over predicate bindings costs a load per row.
+`VALUES`, `BIND`, and scans over novelty carry the same terms decoded, and the
+batched lanes bind a subject minted since the last index by its novelty ID.
+The surfaces that key or compare terms (hash joins, `DISTINCT`, `GROUP BY` and
+its aggregates, `MINUS`, `EXISTS`, `VALUES`, `OPTIONAL`'s join check, the
+nested-loop join's check on a slot it could not bind, `BIND` onto a bound
+variable, and `sameTerm`) resolve an IRI to one canonical form: its subject ID
+when it has one, persisted or novelty, else its persisted predicate ID. A blank
+node follows the same rule. A decoded term resolves through the persisted
+dictionary first and the novelty dictionary second, the order every lane
+assigns IDs in. The predicate-to-subject mapping is memoized per predicate per
+index, so a key over predicate bindings costs a load per row. Property-path
+endpoints decode an encoded IRI before traversal. What stays outside the rule:
+an IRI no dictionary holds keeps its decoded form, so its `Sid` and `Iri`
+forms still compare apart, and an arena-backed literal keyed with no graph
+view keys by its graph-scoped handle.
 
 **`CyclicBgpOperator`** handles small cyclic fixed-predicate BGPs (triangles and
 4-edge cycles over reference-valued joins) that would otherwise run as left-deep
