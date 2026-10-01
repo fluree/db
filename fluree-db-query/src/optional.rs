@@ -35,8 +35,8 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::join::{
     batched_subject_probe_binary, charge_probe_rows, for_each_object_probe_match,
-    substitute_binding, BindInstruction, PatternPosition, SubjectProbeParams, Substitution,
-    UnifyInstruction,
+    substitute_binding, BindInstruction, CorrelationView, PatternPosition, SubjectProbeParams,
+    Substitution, UnifyInstruction,
 };
 use crate::object_binding::{equality_norm, same_term, EqualityNorm, TermDicts};
 use crate::operator::flush::FlushSchedule;
@@ -541,10 +541,9 @@ impl PatternOptionalBuilder {
     /// triple can match the row — a correlated value that can never fill its
     /// slot (a literal as a subject or predicate, a list or map value).
     ///
-    /// An encoded value this context cannot decode is refused rather than left
-    /// free: the slot would then be correlated only by `unify_check`, comparing
-    /// the row's encoded form of the term with the scan's, and two encoded
-    /// forms of one IRI compare unequal.
+    /// A value the context cannot decode (an arena-backed literal while
+    /// several graphs are active) stays a variable, and `unify_check`
+    /// correlates it by term equality.
     fn substitute_pattern(
         &self,
         required_batch: &Batch,
@@ -554,7 +553,7 @@ impl PatternOptionalBuilder {
         let mut pattern = self.pattern.clone();
         // Built only when a row carries an encoded value: decoded rows (the
         // novelty lane) never need it.
-        let mut gv: Option<Option<fluree_db_binary_index::BinaryGraphView>> = None;
+        let mut view: Option<Option<CorrelationView>> = None;
         let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
             if object_to_unify && instr.position == PatternPosition::Object {
@@ -568,20 +567,15 @@ impl PatternOptionalBuilder {
                     | Binding::EncodedLit { .. }
             );
             let view = if encoded {
-                gv.get_or_insert_with(|| ctx.graph_view()).as_ref()
+                view.get_or_insert_with(|| CorrelationView::of(ctx))
+                    .as_ref()
             } else {
                 None
             };
-            match substitute_binding(&mut pattern, instr.position, binding, view)? {
-                Substitution::Bound => {}
-                Substitution::Unmatchable => return Ok(None),
-                Substitution::Free if encoded => {
-                    return Err(QueryError::Internal(format!(
-                        "OPTIONAL correlation cannot decode the encoded {:?} value {binding:?}",
-                        instr.position
-                    )));
-                }
-                Substitution::Free => {}
+            if substitute_binding(&mut pattern, instr.position, binding, view)?
+                == Substitution::Unmatchable
+            {
+                return Ok(None);
             }
         }
         Ok(Some(pattern))

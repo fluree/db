@@ -1340,3 +1340,132 @@ async fn optional_unify_matches_a_novelty_minted_object() {
     );
     failures.assert_none();
 }
+
+// ---------------------------------------------------------------------------
+// A dataset of several graphs of one ledger.
+//
+// With two default graphs no graph view exists, while each graph's scan
+// still binds encoded ids. A correlated value must still decode into its
+// slot (the ids a ledger shares across graphs decode without one), and a
+// slot that cannot take it must be correlated, never left free to match
+// every row.
+// ---------------------------------------------------------------------------
+
+/// Chunks and concepts spread over two named graphs, and two `xsd:decimal`
+/// amounts (arena-backed literals) in the first, indexed.
+async fn two_graph_ledger(ledger_id: &str) -> (Fluree, LedgerHandle) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        ex:root ex:note "default graph" .
+        GRAPH <urn:g1> {
+            ex:s1 ex:derivedFrom ex:doc1 . ex:c1 ex:subjectOf ex:s1 .
+            ex:x1 ex:amount 1.5 . ex:x2 ex:amount 2.5 .
+        }
+        GRAPH <urn:g2> {
+            ex:s2 ex:derivedFrom ex:doc1 . ex:c2 ex:subjectOf ex:s2 .
+            ex:s3 ex:derivedFrom ex:doc1 .
+        }
+    "#;
+    fluree
+        .stage(&handle)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("seed TriG");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
+    let view = handle.snapshot().await;
+    assert!(view.binary_store.is_some(), "indexed");
+    assert!(view.novelty.is_empty(), "no novelty");
+    (fluree, handle)
+}
+
+/// `(label, SPARQL body, projected variables, expected rows, the correlated
+/// triple's marker and slot when its lookup must be bound)`.
+type CorrelatedCase = (
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static [&'static str]],
+    Option<(&'static str, Slot)>,
+);
+
+#[tokio::test(flavor = "current_thread")]
+async fn correlation_across_two_default_graphs_of_one_ledger() {
+    let (fluree, handle) = two_graph_ledger("it/correlation-two-graphs:main").await;
+    let (store, _guard) = init_test_tracing();
+    let cases: &[CorrelatedCase] = &[
+        (
+            "OPTIONAL correlated on its object",
+            "SELECT ?s ?c FROM <urn:g1> FROM <urn:g2> WHERE { ?s ex:derivedFrom ex:doc1 . \
+             OPTIONAL { ?c ex:subjectOf ?s } }",
+            &["s", "c"],
+            &[&["s1", "c1"], &["s2", "c2"], &["s3", "-"]],
+            Some(("name: \"subjectOf\"", Slot::O)),
+        ),
+        (
+            "OPTIONAL correlated on its subject",
+            "SELECT ?c ?s ?d FROM <urn:g1> FROM <urn:g2> WHERE { ?c ex:subjectOf ?s . \
+             OPTIONAL { ?s ex:derivedFrom ?d } }",
+            &["c", "s", "d"],
+            &[&["c1", "s1", "doc1"], &["c2", "s2", "doc1"]],
+            Some(("name: \"derivedFrom\"", Slot::S)),
+        ),
+        (
+            // Either side may drive; a slot left free must still be
+            // correlated rather than match every row.
+            "join on an encoded IRI",
+            "SELECT ?s ?c FROM <urn:g1> FROM <urn:g2> WHERE { ?s ex:derivedFrom ex:doc1 . \
+             ?c ex:subjectOf ?s }",
+            &["s", "c"],
+            &[&["s1", "c1"], &["s2", "c2"]],
+            None,
+        ),
+        (
+            // An arena-backed literal's handle names its value only within its
+            // own graph, so with no graph view it cannot become a constant: the
+            // join scans the slot free and must still pair each row with its
+            // own amount, not with every amount.
+            "join on an arena-backed literal",
+            "SELECT ?x ?y FROM <urn:g1> FROM <urn:g2> WHERE { ?x ex:amount ?v . \
+             ?y ex:amount ?v }",
+            &["x", "y"],
+            &[&["x1", "x1"], &["x2", "x2"]],
+            None,
+        ),
+        (
+            "DISTINCT across both graphs",
+            "SELECT DISTINCT ?s FROM <urn:g1> FROM <urn:g2> WHERE { { ?s ex:derivedFrom ?d } \
+             UNION { ?c ex:subjectOf ?s } }",
+            &["s"],
+            &[&["s1"], &["s2"], &["s3"]],
+            None,
+        ),
+    ];
+    let mut failures = Failures::default();
+    for (label, body, vars, expected, bound) in cases {
+        let before = store.all_events().len();
+        let query = format!("{PREFIXES}{body}");
+        let result = db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await;
+        match result {
+            Ok(json) => failures.eq(sparql_rows(&json, vars), rows(expected), label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        if let Some((marker, slot)) = bound {
+            failures.bound_lookup(&store, before, marker, *slot, label);
+        }
+    }
+    failures.assert_none();
+}

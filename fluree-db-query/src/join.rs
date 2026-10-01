@@ -16,7 +16,8 @@ use crate::fast_path_common::{
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{
-    late_materialized_object_binding, materialized_object_binding, TermDicts,
+    equality_norm, late_materialized_object_binding, materialized_object_binding, same_term,
+    EqualityNorm, TermDicts,
 };
 use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
@@ -29,7 +30,9 @@ use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::clock::Instant;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
+use fluree_db_core::{
+    DatatypeDictId, GraphId, IndexType, ObjKind, ObjectBounds, Sid, BATCHED_JOIN_SIZE,
+};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -420,13 +423,66 @@ pub(crate) enum Substitution {
     /// The slot now holds the value.
     Bound,
     /// The slot stays a variable: the value constrains nothing (unbound or
-    /// poisoned — callers screen poisoned rows first), or it is an encoded id
-    /// and there is no graph view to decode it through.
+    /// poisoned — callers screen poisoned rows first), or it is an encoded
+    /// value the context cannot decode (see [`CorrelationView`]). A caller
+    /// must then correlate the slot by term equality on the scan's output.
     Free,
     /// No triple holds this value in this slot: a literal as a subject or
     /// predicate, or a value that is not an RDF term (a list, map, path,
     /// relationship or grouped value). The slot stays a variable.
     Unmatchable,
+}
+
+/// What a correlated scan decodes a row's encoded values through.
+pub(crate) enum CorrelationView {
+    /// The active graph's view: every encoded value decodes.
+    Graph(BinaryGraphView),
+    /// The ledger's store, for a dataset of several of its graphs, where no
+    /// graph view exists while each graph's scan still binds encoded values.
+    /// What a ledger shares across its graphs decodes — subject, predicate
+    /// and string-dictionary ids, and inline literals; an arena-backed
+    /// literal handle (NUM_BIG, vector) names a value only within its own
+    /// graph and does not.
+    Ledger(BinaryGraphView),
+}
+
+impl CorrelationView {
+    /// `None` only without a store or across ledgers, where no scan binds an
+    /// encoded value.
+    pub(crate) fn of(ctx: &ExecutionContext<'_>) -> Option<Self> {
+        if let Some(gv) = ctx.graph_view() {
+            return Some(Self::Graph(gv));
+        }
+        if ctx.is_multi_ledger() {
+            return None;
+        }
+        let store = ctx.binary_store.as_ref()?;
+        Some(Self::Ledger(
+            store
+                .graph_with_novelty(ctx.binary_g_id, ctx.dict_novelty.clone())
+                .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
+                .with_tracker(ctx.tracker.clone()),
+        ))
+    }
+
+    fn view(&self) -> &BinaryGraphView {
+        match self {
+            Self::Graph(gv) | Self::Ledger(gv) => gv,
+        }
+    }
+
+    /// The view an encoded literal of `o_kind` decodes through, if any.
+    fn literal_view(&self, o_kind: u8) -> Option<&BinaryGraphView> {
+        match self {
+            Self::Graph(gv) => Some(gv),
+            Self::Ledger(_)
+                if o_kind == ObjKind::NUM_BIG.as_u8() || o_kind == ObjKind::VECTOR_ID.as_u8() =>
+            {
+                None
+            }
+            Self::Ledger(gv) => Some(gv),
+        }
+    }
 }
 
 /// Substitute one correlated left-row value into `pattern`'s `position`.
@@ -435,11 +491,11 @@ pub(crate) enum Substitution {
 /// scan — the nested-loop join's right side and OPTIONAL's per-row lookup —
 /// so a value binds the same way whichever operator carries the correlation
 /// and whichever form the row holds it in. Encoded (late-materialized) ids
-/// decode through `gv` (novelty-aware), into any position: an IRI that one
+/// decode through `view` (novelty-aware), into any position: an IRI that one
 /// pattern reaches as a predicate (`EncodedPid`) is a subject or object to
-/// another, and the reverse. Leaving an encoded value free instead would scan
-/// the whole slot and leave the match to a comparison between two encoded
-/// forms of one IRI, which `Binding`'s `PartialEq` answers `false`.
+/// another, and the reverse. A value it cannot decode stays free
+/// ([`Substitution::Free`]) for the caller to correlate by term equality;
+/// left free and uncorrelated it would match every row of the slot.
 ///
 /// Literals keep the join's term rule: a string binding pushes its datatype or
 /// language tag down with its value; numeric and other values push the value
@@ -448,8 +504,9 @@ pub(crate) fn substitute_binding(
     pattern: &mut TriplePattern,
     position: PatternPosition,
     binding: &Binding,
-    gv: Option<&BinaryGraphView>,
+    view: Option<&CorrelationView>,
 ) -> Result<Substitution> {
+    let gv = view.map(CorrelationView::view);
     let resolve_subject = |gv: &BinaryGraphView, s_id: u64| -> Result<Arc<str>> {
         let iri = gv.resolve_subject_iri(s_id).map_err(|e| {
             tracing::debug!(s_id, error = %e, "failed to resolve encoded subject binding");
@@ -526,7 +583,7 @@ pub(crate) fn substitute_binding(
                 // Must use decode_value_from_kind with the correct (o_kind, dt_id,
                 // lang_id) — dt_id is a DatatypeDictId, NOT an o_type. p_id is
                 // needed for NUM_BIG per-predicate arena lookup.
-                let Some(gv) = gv else {
+                let Some(gv) = view.and_then(|v| v.literal_view(*o_kind)) else {
                     return Ok(Substitution::Free);
                 };
                 let val = gv
@@ -762,8 +819,8 @@ pub struct NestedLoopJoinOperator {
     combined_schema: Arc<[VarId]>,
     /// Instructions for binding left values into right pattern
     bind_instructions: Vec<BindInstruction>,
-    /// Instructions for unification checks on shared vars
-    unify_instructions: Vec<UnifyInstruction>,
+    /// Term normalization for [`Self::unify_check`], built at open.
+    norm: Option<EqualityNorm>,
     /// Current state
     state: OperatorState,
     /// Current left batch being processed
@@ -995,55 +1052,6 @@ impl NestedLoopJoinOperator {
             &right_scan_inline_ops,
         );
 
-        // Build unify instructions for shared vars
-        //
-        // Variables that are in both left schema and right pattern need unification
-        // UNLESS they are fully substituted into the pattern. However, substitution
-        // depends on runtime binding types:
-        // - Subject/Predicate: Only Sid bindings are substituted
-        // - Object: Sid and Lit bindings are substituted
-        //
-        // We compute right_col based on right_output_vars (which excludes vars
-        // expected to be substituted). At runtime, if substitution doesn't happen
-        // (e.g., Lit at Subject position), the var remains in the right scan output
-        // but at a different position than expected - this is handled by skipping
-        // unification for such edge cases.
-        //
-        // Collect vars that WILL be substituted (based on position)
-        // For Object position, we assume substitution will happen (Sid/Lit)
-        // For Subject/Predicate, substitution requires Sid which we can't verify
-        // at construction time, so we don't create unify instructions for these
-        // positions when the var is in left schema (they have bind_instructions)
-        let bound_vars: std::collections::HashSet<VarId> = bind_instructions
-            .iter()
-            .filter_map(|instr| match instr.position {
-                PatternPosition::Subject => right_pattern.s.as_var(),
-                PatternPosition::Predicate => right_pattern.p.as_var(),
-                PatternPosition::Object => right_pattern.o.as_var(),
-            })
-            .collect();
-
-        let mut unify_instructions = Vec::new();
-        for var in right_pattern.produced_vars() {
-            // Skip vars that have bind_instructions - they will be substituted
-            // (or if not substituted due to binding type, the row is handled
-            // by the scan returning no results or the substitution leaving the var)
-            if bound_vars.contains(&var) {
-                continue;
-            }
-
-            if let Some(&left_col) = left_var_positions.get(&var) {
-                // This var is shared but NOT bound - find its position in right output
-                // Right output schema only includes non-bound vars
-                if let Some(right_idx) = right_output_vars.iter().position(|v| *v == var) {
-                    unify_instructions.push(UnifyInstruction {
-                        left_col,
-                        right_col: right_idx,
-                    });
-                }
-            }
-        }
-
         let has_bounds = object_bounds.is_some();
 
         let batched_eligible = is_batched_eligible(&bind_instructions, &right_pattern);
@@ -1086,7 +1094,7 @@ impl NestedLoopJoinOperator {
             right_new_vars: right_output_vars,
             combined_schema,
             bind_instructions,
-            unify_instructions,
+            norm: None,
             state: OperatorState::Created,
             current_left_batch: None,
             current_left_row: 0,
@@ -1174,43 +1182,63 @@ impl NestedLoopJoinOperator {
         })
     }
 
-    /// Substitute left row bindings into right pattern.
-    ///
-    /// Uses a novelty-aware `BinaryGraphView` for encoded binding resolution
-    /// so that novelty-only subject/string IDs resolve correctly. A value that
-    /// cannot fill its slot leaves the slot a variable here; the unify check
-    /// (or the invalid-binding screen ahead of this call) settles those rows.
+    /// Substitute left row bindings into right pattern, through
+    /// [`substitute_binding`]. `None` when no triple can match the row: a
+    /// correlated value that can never fill its slot. A value substitution
+    /// leaves free is correlated by [`Self::unify_check`].
     fn substitute_pattern_with_store(
         &self,
         left_batch: &Batch,
         left_row: usize,
-        gv: Option<&BinaryGraphView>,
-    ) -> Result<TriplePattern> {
+        view: Option<&CorrelationView>,
+    ) -> Result<Option<TriplePattern>> {
         let mut pattern = self.right_pattern.clone();
         for instr in &self.bind_instructions {
             let binding = left_batch.get_by_col(left_row, instr.left_col);
-            substitute_binding(&mut pattern, instr.position, binding, gv)?;
+            if substitute_binding(&mut pattern, instr.position, binding, view)?
+                == Substitution::Unmatchable
+            {
+                return Ok(None);
+            }
         }
-        Ok(pattern)
+        Ok(Some(pattern))
     }
 
-    /// Check if left row bindings match right row bindings for shared vars
-    ///
-    /// Returns true if all shared vars have equal values on both sides.
-    ///
-    /// Uses `eq_for_join()` for same-ledger SID optimization when comparing
-    /// `IriMatch` bindings from the same ledger.
+    /// `(left column, right column)` of each variable a right batch binds
+    /// that the left row also carries. Substitution makes a correlated slot a
+    /// constant, so its variable is absent from the right batch; one present
+    /// is a slot substitution left free — an unbound left value, or one it
+    /// could not decode. Usually empty.
+    fn shared_columns(&self, right_schema: &[VarId]) -> Vec<(usize, usize)> {
+        right_schema
+            .iter()
+            .enumerate()
+            .filter_map(|(right_col, var)| {
+                let left_col = self.left_schema.iter().position(|v| v == var)?;
+                Some((left_col, right_col))
+            })
+            .collect()
+    }
+
+    /// Whether a right row agrees with its left row on every variable both
+    /// bind ([`Self::shared_columns`]): one RDF term, whichever form each side
+    /// carries it in. An unbound left value constrains nothing —
+    /// `combine_rows` takes the right side's.
     fn unify_check(
         &self,
         left_batch: &Batch,
         left_row: usize,
         right_batch: &Batch,
         right_row: usize,
+        shared: &[(usize, usize)],
     ) -> bool {
-        self.unify_instructions.iter().all(|instr| {
-            let left_val = left_batch.get_by_col(left_row, instr.left_col);
-            let right_val = right_batch.get_by_col(right_row, instr.right_col);
-            left_val.eq_for_join(right_val)
+        shared.iter().all(|&(left_col, right_col)| {
+            let left_val = left_batch.get_by_col(left_row, left_col);
+            if left_val.is_unbound_or_poisoned() {
+                return true;
+            }
+            let right_val = right_batch.get_by_col(right_row, right_col);
+            left_val.eq_for_join(right_val) || same_term(left_val, right_val, &self.norm)
         })
     }
 
@@ -1316,6 +1344,7 @@ impl Operator for NestedLoopJoinOperator {
 
         // Open left operator
         self.left.open(ctx).await?;
+        self.norm = equality_norm(ctx);
 
         // Reset state for fresh execution
         self.pending_output.clear();
@@ -1343,7 +1372,6 @@ impl Operator for NestedLoopJoinOperator {
                 .bind_instructions
                 .iter()
                 .any(|b| b.position == PatternPosition::Object),
-            unify_instructions = self.unify_instructions.len(),
             has_object_bounds = self.object_bounds.is_some(),
             right_subject_is_var = matches!(&self.right_pattern.s, Ref::Var(_)),
             right_predicate_is_fixed = self.right_pattern.p.is_sid(),
@@ -1422,9 +1450,9 @@ impl Operator for NestedLoopJoinOperator {
             self.logged_runtime_mode = true;
         }
 
-        // Cache novelty-aware graph view once for the entire next_batch call
-        // (avoids repeated Arc::clone + construction per-row).
-        let cached_gv = ctx.graph_view();
+        // Built once for the whole next_batch call (avoids repeated Arc::clone
+        // + construction per row).
+        let cached_view = CorrelationView::of(ctx);
 
         // Process until we have output or exhaust input
         loop {
@@ -1571,11 +1599,14 @@ impl Operator for NestedLoopJoinOperator {
                     let batch_idx = self.ensure_current_batch_stored();
                     let batch_ref = BatchRef::Stored(batch_idx);
                     let left_batch = self.stored_left_batches.last().unwrap();
-                    let bound_pattern = self.substitute_pattern_with_store(
+                    let Some(bound_pattern) = self.substitute_pattern_with_store(
                         left_batch,
                         left_row,
-                        cached_gv.as_ref(),
-                    )?;
+                        cached_view.as_ref(),
+                    )?
+                    else {
+                        continue;
+                    };
                     let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
                     let mut right_scan = make_right_scan(
                         bound_pattern,
@@ -1596,8 +1627,11 @@ impl Operator for NestedLoopJoinOperator {
                 let batch_idx = self.ensure_current_batch_stored();
                 let batch_ref = BatchRef::Stored(batch_idx);
                 let left_batch = self.stored_left_batches.last().unwrap();
-                let bound_pattern =
-                    self.substitute_pattern_with_store(left_batch, left_row, cached_gv.as_ref())?;
+                let Some(bound_pattern) =
+                    self.substitute_pattern_with_store(left_batch, left_row, cached_view.as_ref())?
+                else {
+                    continue;
+                };
                 let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
                 let mut right_scan = make_right_scan(
                     bound_pattern,
@@ -1784,6 +1818,7 @@ impl NestedLoopJoinOperator {
             let (batch_ref, left_row, right_batch) = self.pending_output.front().unwrap();
             let left_row = *left_row;
             let right_batch_len = right_batch.len();
+            let shared = self.shared_columns(right_batch.schema());
 
             let left_batch = match self.resolve_left_batch(batch_ref) {
                 Some(b) => b,
@@ -1798,7 +1833,7 @@ impl NestedLoopJoinOperator {
             let mut right_row = self.pending_right_row;
             while right_row < right_batch_len && rows_added < batch_size {
                 // Unification check: shared vars must match
-                if self.unify_check(left_batch, left_row, right_batch, right_row) {
+                if self.unify_check(left_batch, left_row, right_batch, right_row, &shared) {
                     // Combine and add to output
                     let mut combined =
                         self.combine_rows(left_batch, left_row, right_batch, right_row);
@@ -4289,12 +4324,6 @@ mod tests {
             crate::temporal_mode::TemporalMode::Current,
         );
 
-        // Verify that ?v is NOT in unify_instructions (it's substituted, not unified)
-        assert!(
-            join.unify_instructions.is_empty(),
-            "No unify instructions expected when shared var at Object position has Lit binding"
-        );
-
         // Left batch: ?v = 1
         let left_batch = Batch::new(
             left_schema,
@@ -4682,9 +4711,6 @@ mod tests {
             EmitMask::ALL,
             crate::temporal_mode::TemporalMode::Current,
         );
-
-        // No unify_instructions since no shared vars between left [?s] and right [?x, ?y]
-        assert!(join.unify_instructions.is_empty());
 
         // Left batch: ?s = some:subject (a Sid)
         let left_batch = Batch::new(
