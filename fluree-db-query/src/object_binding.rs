@@ -6,7 +6,8 @@ use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_vocab::xsd_names;
-use std::sync::Arc;
+use rustc_hash::FxHashMap;
+use std::sync::{Arc, OnceLock};
 
 fn encoded_i_val(o_i: u32) -> i32 {
     if o_i == u32::MAX {
@@ -351,8 +352,9 @@ pub(crate) fn encoded_equivalent(binding: &Binding, dicts: TermDicts<'_>) -> Opt
 /// bind a term minted since the last index by its novelty id while a plain
 /// scan, with novelty pending, decodes the same term: an equality surface
 /// that resolved decoded terms through the persisted dictionary alone would
-/// key the two apart. This is the one place a query resolves a decoded term
-/// to its id; the batched lanes and every equality surface go through it.
+/// key the two apart. The batched lanes' key lookups and every equality
+/// surface resolve a decoded term through this; the scan's overlay
+/// translation keeps the same order on its own path.
 #[derive(Clone, Copy)]
 pub(crate) struct TermDicts<'a> {
     store: &'a BinaryIndexStore,
@@ -360,19 +362,33 @@ pub(crate) struct TermDicts<'a> {
     /// pending never probes it.
     novel_subjects: Option<&'a SubjectDictNovelty>,
     novel_strings: Option<&'a StringDictNovelty>,
+    /// The persisted predicates whose IRI is a subject minted in novelty,
+    /// found once for the holder's lifetime ([`EqualityNorm`]) instead of a
+    /// novelty probe per predicate key. `None`: probe per key.
+    novel_predicate_subjects: Option<&'a OnceLock<FxHashMap<u32, u64>>>,
 }
 
 impl<'a> TermDicts<'a> {
     pub(crate) fn new(store: &'a BinaryIndexStore, novelty: Option<&'a DictNovelty>) -> Self {
-        let novelty = novelty.filter(|dn| dn.is_initialized());
+        let (subjects, strings) = novelty_layers(novelty);
+        Self::from_layers(store, novelty, subjects, strings)
+    }
+
+    /// With which novelty layers hold entries already known
+    /// ([`novelty_layers`]), so a caller that builds this per row does not
+    /// walk the layer chain each time.
+    #[inline]
+    fn from_layers(
+        store: &'a BinaryIndexStore,
+        novelty: Option<&'a DictNovelty>,
+        subjects: bool,
+        strings: bool,
+    ) -> Self {
         Self {
             store,
-            novel_subjects: novelty
-                .map(|dn| &dn.subjects)
-                .filter(|subjects| !subjects.is_empty()),
-            novel_strings: novelty
-                .map(|dn| &dn.strings)
-                .filter(|strings| !strings.is_empty()),
+            novel_subjects: novelty.filter(|_| subjects).map(|dn| &dn.subjects),
+            novel_strings: novelty.filter(|_| strings).map(|dn| &dn.strings),
+            novel_predicate_subjects: None,
         }
     }
 
@@ -425,35 +441,69 @@ impl<'a> TermDicts<'a> {
         }
         // A predicate IRI first used as a subject or ref object since the
         // last index has a novelty subject id.
-        if self.novel_subjects.is_some() {
-            if let Some(sid) = self.store.p_sid_table().get(p_id as usize) {
-                if let Some(s_id) = self.novel_subject_id(sid.namespace_code, &sid.name) {
-                    return IriId::Subject(s_id);
-                }
+        if let Some(subjects) = self.novel_subjects {
+            let novel = match self.novel_predicate_subjects {
+                Some(found) => found
+                    .get_or_init(|| novel_predicate_subjects(self.store, subjects))
+                    .get(&p_id)
+                    .copied(),
+                None => self
+                    .store
+                    .p_sid_table()
+                    .get(p_id as usize)
+                    .and_then(|sid| subjects.find_subject(sid.namespace_code, &sid.name)),
+            };
+            if let Some(s_id) = novel {
+                return IriId::Subject(s_id);
             }
         }
         IriId::Predicate(p_id)
     }
 
-    /// [`IriId`] of a decoded IRI. The subject dictionary answers first: a
-    /// subject id wins over a predicate id, and most decoded IRIs are
-    /// subjects, so they cost the one lookup they cost before predicates had
-    /// ids here.
+    /// [`IriId`] of a decoded IRI. The predicate table answers first: an IRI
+    /// outside every predicate's namespace, or of a name length no predicate
+    /// there has, is rejected without hashing, and a predicate then costs a
+    /// load instead of a subject-dictionary lookup. A predicate's subject id,
+    /// when it has one, still wins ([`Self::predicate_iri_id`]).
     #[inline]
     fn decoded_iri_id(&self, sid: &Sid) -> Option<IriId> {
-        let persisted = self
-            .store
-            .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-            .ok()
-            .flatten();
-        if let Some(s_id) = persisted {
-            return Some(IriId::Subject(s_id));
-        }
         if let Some(p_id) = self.store.predicate_id_for_sid(sid) {
             return Some(self.predicate_iri_id(p_id));
         }
-        self.novel_subject_id(sid.namespace_code, &sid.name)
-            .map(IriId::Subject)
+        match self
+            .store
+            .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+        {
+            Ok(Some(s_id)) => Some(IriId::Subject(s_id)),
+            _ => self
+                .novel_subject_id(sid.namespace_code, &sid.name)
+                .map(IriId::Subject),
+        }
+    }
+}
+
+/// The persisted predicates whose IRI is a subject minted in novelty
+/// (usually none), by predicate id: one novelty probe per predicate.
+fn novel_predicate_subjects(
+    store: &BinaryIndexStore,
+    subjects: &SubjectDictNovelty,
+) -> FxHashMap<u32, u64> {
+    store
+        .p_sid_table()
+        .iter()
+        .enumerate()
+        .filter_map(|(p_id, sid)| {
+            let s_id = subjects.find_subject(sid.namespace_code, &sid.name)?;
+            Some((p_id as u32, s_id))
+        })
+        .collect()
+}
+
+/// Whether an initialized novelty dictionary holds subjects, and strings.
+fn novelty_layers(novelty: Option<&DictNovelty>) -> (bool, bool) {
+    match novelty.filter(|dn| dn.is_initialized()) {
+        Some(dn) => (!dn.subjects.is_empty(), !dn.strings.is_empty()),
+        None => (false, false),
     }
 }
 
@@ -536,12 +586,26 @@ fn is_xsd(dt: &Sid, name: &str) -> bool {
 pub(crate) struct EqualityNorm {
     store: Arc<BinaryIndexStore>,
     novelty: Option<Arc<DictNovelty>>,
+    /// Which novelty layers hold entries ([`novelty_layers`]), read once.
+    novel_subjects: bool,
+    novel_strings: bool,
+    /// See [`TermDicts`]'s field of the same name.
+    novel_predicate_subjects: OnceLock<FxHashMap<u32, u64>>,
     gv: Option<fluree_db_binary_index::BinaryGraphView>,
 }
 
 impl EqualityNorm {
+    #[inline]
     pub(crate) fn dicts(&self) -> TermDicts<'_> {
-        TermDicts::new(&self.store, self.novelty.as_deref())
+        TermDicts {
+            novel_predicate_subjects: Some(&self.novel_predicate_subjects),
+            ..TermDicts::from_layers(
+                &self.store,
+                self.novelty.as_deref(),
+                self.novel_subjects,
+                self.novel_strings,
+            )
+        }
     }
 
     pub(crate) fn parts(
@@ -573,9 +637,13 @@ pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Optio
     if ctx.is_multi_ledger() {
         return None;
     }
+    let (novel_subjects, novel_strings) = novelty_layers(ctx.dict_novelty.as_deref());
     Some(EqualityNorm {
         store: ctx.binary_store.clone()?,
         novelty: ctx.dict_novelty.clone(),
+        novel_subjects,
+        novel_strings,
+        novel_predicate_subjects: OnceLock::new(),
         gv: ctx.graph_view(),
     })
 }

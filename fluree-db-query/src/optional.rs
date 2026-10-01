@@ -140,6 +140,11 @@ pub trait OptionalBuilder: Send + Sync {
         false
     }
 
+    /// Most driving rows one coalesced seed holds.
+    fn seed_coalesce_cap(&self) -> usize {
+        optional_seed_coalesce_cap()
+    }
+
     /// Optional cache key for correlated OPTIONAL evaluation.
     ///
     /// If this returns `Some(key)`, the OptionalOperator may memoize the optional-side
@@ -708,6 +713,18 @@ impl OptionalBuilder for PatternOptionalBuilder {
             subject_probe_lane_plan(ctx, store, &pred_sid),
             Err(_) | Ok(ProbeLanePlan::Decline)
         )
+    }
+
+    /// The bound-object lane coalesces at most the window the join's own
+    /// bound-object lane flushes at: the OPST pass costs a seek per distinct
+    /// object, so a larger window saves little, while main answered these
+    /// OPTIONALs row by row and buffered nothing.
+    fn seed_coalesce_cap(&self) -> usize {
+        if self.object_probe_column().is_some() {
+            fluree_db_core::BATCHED_JOIN_SIZE.min(optional_seed_coalesce_cap())
+        } else {
+            optional_seed_coalesce_cap()
+        }
     }
 
     fn build(
@@ -2495,7 +2512,7 @@ impl OptionalOperator {
         // A scan batch can be a whole leaflet, so a budget-sized window takes
         // only the rows it needs; a cap-sized one keeps its last batch whole,
         // as before.
-        let exact = window < optional_seed_coalesce_cap();
+        let exact = window < self.optional_builder.seed_coalesce_cap();
         self.coalesce_schedule.advance();
         let mut schema: Option<Arc<[VarId]>> = None;
         let mut columns: Vec<Vec<Binding>> = Vec::new();
@@ -2576,6 +2593,7 @@ impl OptionalOperator {
             .collect();
 
         let unmatched = optional_builder.unmatched_optional().binding();
+        let coalesce_cap = optional_builder.seed_coalesce_cap();
 
         Self {
             required,
@@ -2590,7 +2608,7 @@ impl OptionalOperator {
             pending_output: VecDeque::new(),
             out_schema: None,
             result_cache: LruCache::new(NonZeroUsize::new(8192).expect("8192 is non-zero")),
-            coalesce_schedule: FlushSchedule::fixed(optional_seed_coalesce_cap()),
+            coalesce_schedule: FlushSchedule::fixed(coalesce_cap),
             required_pending: None,
             norm: None,
         }
@@ -2757,7 +2775,8 @@ impl Operator for OptionalOperator {
     /// pre-item-11 full outer scan — byte-identical results).
     fn set_row_budget(&mut self, budget: usize) {
         if crate::r2rml::optional_budget_enabled() {
-            self.coalesce_schedule = FlushSchedule::budgeted(budget, optional_seed_coalesce_cap());
+            self.coalesce_schedule =
+                FlushSchedule::budgeted(budget, self.optional_builder.seed_coalesce_cap());
             self.required.set_row_budget(budget);
         } else {
             tracing::debug!(budget, "OPTIONAL row-budget forwarding disabled by switch");
@@ -3111,8 +3130,9 @@ impl Operator for OptionalOperator {
         // drained, so its batches hold a row or a few. Columns sized for
         // `batch_size` would keep ~1,000 slots per column per required row
         // alive in every consumer that buffers the output (#1973: 160+ KB
-        // per required row). Size them to their rows.
-        if rows_added < batch_size / 2 {
+        // per required row). Size those to their rows; a batch at least an
+        // eighth full keeps its columns.
+        if rows_added < batch_size / 8 {
             for column in &mut output_columns {
                 column.shrink_to_fit();
             }
