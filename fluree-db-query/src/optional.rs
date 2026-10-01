@@ -35,7 +35,7 @@ use crate::join::{
     batched_subject_probe_binary, substitute_binding, BindInstruction, PatternPosition,
     SubjectProbeParams, Substitution, UnifyInstruction,
 };
-use crate::object_binding::{equality_norm, EqualityNorm};
+use crate::object_binding::{equality_norm, same_term, EqualityNorm};
 use crate::operator::flush::FlushSchedule;
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -2431,12 +2431,17 @@ impl OptionalOperator {
     }
 
     /// Check if required row bindings match optional row bindings for shared vars
+    ///
+    /// A shared value is one RDF term whichever form each side carries it in
+    /// ([`same_term`]): the required side may hold an IRI encoded as a
+    /// predicate while the optional side decoded it, or found it as a subject.
     fn unify_check(
         &self,
         required_batch: &Batch,
         required_row: usize,
         optional_batch: &Batch,
         optional_row: usize,
+        ctx: &ExecutionContext<'_>,
     ) -> bool {
         // Unification must be resilient to optional operator schemas that do not
         // include substituted correlation vars.
@@ -2461,7 +2466,7 @@ impl OptionalOperator {
                     {
                         return true;
                     }
-                    left_val == right_val
+                    same_term(left_val, right_val, ctx)
                 } else {
                     true
                 }
@@ -2668,6 +2673,7 @@ impl Operator for OptionalOperator {
                                 required_row,
                                 &self.pending_output.front().unwrap().optional_batches[batch_idx],
                                 opt_row,
+                                ctx,
                             ) {
                                 continue;
                             }

@@ -68,6 +68,7 @@ use crate::group_aggregate::{
 };
 use crate::ir::triple::TriplePattern;
 use crate::join::NestedLoopJoinOperator;
+use crate::object_binding::{canonical_iri_id, IriId};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -557,29 +558,31 @@ enum JoinKeyClass {
 
 /// Classify a binding's join key, normalising refs to a `u64` s_id when a store is
 /// available. Unbound → wildcard; Poisoned → dead (drop); everything else → keyed.
+///
+/// IRIs key by [`canonical_iri_id`], the rule every equality surface shares: an
+/// IRI the scan reached as a predicate (`EncodedPid`) keys by its subject id when
+/// it is also a subject, so it joins the same IRI met as a subject or object.
 fn join_key(
     binding: &Binding,
     store: Option<&BinaryIndexStore>,
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
 ) -> JoinKeyClass {
-    let keyed_ref_or_group = |sid: &fluree_db_core::Sid| {
-        store
-            .and_then(|s| {
-                s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                    .ok()
-                    .flatten()
-            })
-            .map(JoinKey::Ref)
-            .unwrap_or_else(|| JoinKey::Other(binding_to_group_key_owned(binding)))
-    };
     match binding {
         Binding::EncodedSid { s_id, .. } => JoinKeyClass::Keyed(JoinKey::Ref(*s_id)),
-        Binding::Sid { sid, .. } => JoinKeyClass::Keyed(keyed_ref_or_group(sid)),
-        Binding::IriMatch { primary_sid, .. } => {
-            JoinKeyClass::Keyed(keyed_ref_or_group(primary_sid))
-        }
         Binding::Unbound => JoinKeyClass::Wildcard,
         Binding::Poisoned => JoinKeyClass::Dead,
+        Binding::Sid { .. }
+        | Binding::IriMatch { .. }
+        | Binding::Iri(_)
+        | Binding::EncodedPid { .. } => {
+            JoinKeyClass::Keyed(match store.and_then(|s| canonical_iri_id(binding, s)) {
+                Some(IriId::Subject(s_id)) => JoinKey::Ref(s_id),
+                Some(IriId::Predicate(p_id)) => {
+                    JoinKey::Other(binding_to_group_key_owned(&Binding::EncodedPid { p_id }))
+                }
+                None => JoinKey::Other(binding_to_group_key_owned(binding)),
+            })
+        }
         // Normalize decoded literals to their encoded form so they key
         // identically to late-materialized scan output.
         other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_normalized(

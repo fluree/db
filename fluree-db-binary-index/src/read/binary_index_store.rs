@@ -324,6 +324,10 @@ pub struct BinaryIndexStore {
     /// configuration (`set_ns_split_mode`, namespace augmentation), which
     /// cannot occur once the store is behind `Arc`.
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
+    /// Per persisted predicate, the subject id of its IRI (`None`: the IRI is
+    /// only ever a predicate), resolved on first use. See
+    /// [`Self::predicate_subject_id`].
+    pred_subject_ids: std::sync::OnceLock<Box<[std::sync::OnceLock<Option<u64>>]>>,
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
@@ -393,6 +397,7 @@ impl BinaryIndexStore {
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            pred_subject_ids: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         }
     }
@@ -575,6 +580,7 @@ impl BinaryIndexStore {
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            pred_subject_ids: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         })
     }
@@ -1889,6 +1895,36 @@ impl BinaryIndexStore {
             }
             table.into()
         })
+    }
+
+    /// The persisted subject id of predicate `p_id`'s IRI: `Some` when that
+    /// IRI is also a subject or a ref object in this index, `None` when it is
+    /// only ever a predicate (or `p_id` is not a persisted predicate).
+    ///
+    /// One IRI is encoded twice: as an `EncodedPid` where a pattern reaches it
+    /// in predicate position, as an `EncodedSid` where it is a subject or
+    /// object. Equality surfaces map the first onto the second through this,
+    /// so it is memoized per predicate on first use — a key over predicate
+    /// bindings pays a load per row, not a dictionary lookup. A dictionary I/O
+    /// error is reported as `None` and not memoized.
+    pub fn predicate_subject_id(&self, p_id: u32) -> Option<u64> {
+        let table = self.pred_subject_ids.get_or_init(|| {
+            (0..self.p_sid_table().len())
+                .map(|_| std::sync::OnceLock::new())
+                .collect()
+        });
+        let slot = table.get(p_id as usize)?;
+        if let Some(found) = slot.get() {
+            return *found;
+        }
+        let sid = &self.p_sid_table()[p_id as usize];
+        match self.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+            Ok(found) => *slot.get_or_init(|| found),
+            Err(e) => {
+                tracing::debug!(p_id, error = %e, "predicate subject id lookup failed");
+                None
+            }
+        }
     }
 
     /// Lookup a predicate IRI → p_id.

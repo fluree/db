@@ -199,7 +199,17 @@ pub(crate) fn late_materialized_object_binding(
 /// match. Normalizing the decoded minority to encoded form keeps those
 /// surfaces hashing cheap raw IDs.
 ///
-/// Returns `None` when the binding is already encoded or has no encoded
+/// One IRI has one canonical form here, whichever form it arrives in: the
+/// scan encodes an IRI as `EncodedPid` in predicate position and as
+/// `EncodedSid` in subject or object position, and a decoded producer carries
+/// it as `Sid`/`Iri`. The canonical form is `EncodedSid` when the IRI has a
+/// persisted subject id, else `EncodedPid` when it has a persisted predicate
+/// id, else the decoded value. So a predicate binding maps to its subject id
+/// when its IRI is also a subject, and a decoded IRI that is only a predicate
+/// maps to its predicate id; an all-`EncodedSid` or all-`EncodedPid` key
+/// stays as it is.
+///
+/// Returns `None` when the binding is already canonical or has no encoded
 /// equivalent (value absent from the dictionaries, datatypes the scan keeps
 /// materialized). That is sound: late materialization runs only with an empty
 /// overlay, so a value outside the persisted dictionaries cannot equal any
@@ -215,26 +225,16 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
             if sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
                 return None;
             }
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .ok()??;
-            Some(Binding::EncodedSid {
-                s_id,
-                t: *t,
-                op: *op,
-            })
+            Some(canonical_iri_id(binding, store)?.into_binding(*t, *op))
         }
-        Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
-            let sid = store.encode_iri(iri.as_ref());
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .ok()??;
-            Some(Binding::EncodedSid {
-                s_id,
-                t: None,
-                op: None,
-            })
+        Binding::Iri(_) | Binding::IriMatch { .. } => {
+            Some(canonical_iri_id(binding, store)?.into_binding(None, None))
         }
+        // Canonical already unless its IRI is also a subject.
+        Binding::EncodedPid { .. } => match canonical_iri_id(binding, store)? {
+            id @ IriId::Subject(_) => Some(id.into_binding(None, None)),
+            IriId::Predicate(_) => None,
+        },
         Binding::Lit {
             val,
             dtc,
@@ -350,6 +350,53 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
     }
 }
 
+/// The persisted id an IRI canonically keys by in one store: its subject id
+/// when the IRI has one, else its predicate id.
+///
+/// The scan encodes one IRI as `EncodedPid` where a pattern reaches it as a
+/// predicate and as `EncodedSid` where it is a subject or object, and decoded
+/// producers (VALUES, BIND, eager scans) carry it as `Sid`/`Iri`. Every
+/// equality surface that keys IRIs by id goes through this, so the forms of
+/// one IRI key alike and no surface carries its own copy of the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IriId {
+    Subject(u64),
+    Predicate(u32),
+}
+
+impl IriId {
+    fn into_binding(self, t: Option<i64>, op: Option<bool>) -> Binding {
+        match self {
+            IriId::Subject(s_id) => Binding::EncodedSid { s_id, t, op },
+            IriId::Predicate(p_id) => Binding::EncodedPid { p_id },
+        }
+    }
+}
+
+/// [`IriId`] of an IRI-valued binding; `None` for any other binding, for an
+/// IRI with neither persisted id, or when the subject dictionary cannot be
+/// read. Blank-node policy is the caller's: this resolves any `Sid` it is
+/// given.
+pub(crate) fn canonical_iri_id(binding: &Binding, store: &BinaryIndexStore) -> Option<IriId> {
+    let by_sid = |sid: &Sid| match store.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+        Ok(Some(s_id)) => Some(IriId::Subject(s_id)),
+        Ok(None) => store.sid_to_p_id(sid).map(IriId::Predicate),
+        Err(_) => None,
+    };
+    match binding {
+        Binding::EncodedSid { s_id, .. } => Some(IriId::Subject(*s_id)),
+        Binding::EncodedPid { p_id } => Some(match store.predicate_subject_id(*p_id) {
+            Some(s_id) => IriId::Subject(s_id),
+            None => IriId::Predicate(*p_id),
+        }),
+        Binding::Sid { sid, .. } => by_sid(sid),
+        Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
+            by_sid(&store.encode_iri(iri.as_ref()))
+        }
+        _ => None,
+    }
+}
+
 fn is_xsd(dt: &Sid, name: &str) -> bool {
     dt.namespace_code == fluree_vocab::namespaces::XSD && dt.name.as_ref() == name
 }
@@ -437,6 +484,31 @@ pub(crate) fn normalize_for_key_cow<'a>(
         Some(encoded) => Cow::Owned(encoded),
         None => Cow::Borrowed(binding),
     }
+}
+
+/// Whether two bindings are one RDF term, across the forms one term takes:
+/// encoded or decoded, and an IRI as `EncodedPid` (reached as a predicate) or
+/// `EncodedSid` (a subject or object). `Binding`'s `PartialEq` compares forms
+/// structurally and answers `false` across them.
+///
+/// Equal bindings answer at once, and two bindings of one form other than
+/// NUM_BIG literals (whose encoded key is scoped per predicate) are two terms;
+/// only a pair of different forms pays for canonicalization, through the same
+/// [`normalize_for_key_cow`] the keyed equality surfaces use.
+pub(crate) fn same_term(
+    a: &Binding,
+    b: &Binding,
+    ctx: &crate::context::ExecutionContext<'_>,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    if std::mem::discriminant(a) == std::mem::discriminant(b) && !is_numbig_encoded(a) {
+        return false;
+    }
+    let norm = equality_norm(ctx);
+    let (store, gv) = EqualityNorm::parts(&norm);
+    normalize_for_key_cow(a, store, gv) == normalize_for_key_cow(b, store, gv)
 }
 
 /// True if this is an arena-backed (NUM_BIG) encoded literal.
