@@ -868,6 +868,24 @@ impl FileStorage {
         self.recover_wal_locked(&root_gate)
     }
 
+    /// Replays the WAL an earlier run left under this root, if any, without blocking the caller.
+    ///
+    /// It replays what [`Self::recover_wal`] replays.
+    /// It waits for the root gate asynchronously.
+    /// The replay then runs on the blocking pool, which holds the root gate until it finishes.
+    /// Dropping this future before it takes the root gate replays nothing.
+    /// Dropping it afterward leaves the replay to finish on the blocking pool.
+    pub async fn recover_wal_async(&self) -> Result<()> {
+        let root_gate = self.root_gate()?.write_owned().await;
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.recover_wal_locked(&root_gate))
+            .await
+            .unwrap_or_else(|e| match e.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(e) => Err(crate::error::Error::io(format!("WAL recovery join: {e}"))),
+            })
+    }
+
     /// Replays the WAL under this root while `_root_gate` holds its root gate exclusively.
     ///
     /// Blocking: the replay is synchronous file I/O.
@@ -3165,6 +3183,31 @@ mod wal_tests {
         assert_eq!(wal_entries(dir.path()), ["LOCK"], "replay retires the log");
     }
 
+    /// The async path replays the same records and retires the log.
+    /// It reads the files from disk, since `read_bytes` replays on a miss by itself.
+    #[tokio::test]
+    async fn recover_wal_async_restores_acknowledged_writes_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
+        commit(&storage, 1).await;
+        commit(&storage, 2).await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+        let resolver = FileStorage::new(dir.path());
+        for address in [TXN, COMMIT, HEAD] {
+            std::fs::remove_file(resolver.resolve_path(address).unwrap()).unwrap();
+        }
+
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.recover_wal_async().await.unwrap();
+        let on_disk = |address| std::fs::read(resolver.resolve_path(address).unwrap()).unwrap();
+        assert_eq!(on_disk(TXN), b"r\x02");
+        assert_eq!(on_disk(COMMIT), b"c\x02");
+        assert_eq!(on_disk(HEAD), b"h\x02");
+        assert_eq!(wal_entries(dir.path()), ["LOCK"], "replay retires the log");
+    }
+
     /// Replay applies records in order, so a delete cannot resurrect what it
     /// removed, and a later write after the delete wins.
     #[tokio::test]
@@ -3728,6 +3771,53 @@ mod wal_tests {
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("recover_wal deadlocked against an in-flight CAS");
+    }
+
+    /// `recover_wal_async` waits for the root gate without blocking its runtime thread.
+    ///
+    /// Another thread holds an operation on the root, so recovery has to wait.
+    /// A timer on the same current-thread runtime must still fire during that wait.
+    /// The test releases the operation only after the timer fires.
+    #[test]
+    fn recover_wal_async_waits_for_the_root_gate_without_blocking_the_runtime() {
+        use std::time::Duration;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // A separate thread lets a blocked runtime fail the test instead of hanging it.
+        std::thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = FileStorage::new(dir.path());
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = {
+                let storage = storage.clone();
+                std::thread::spawn(move || {
+                    let _operation = storage.begin_operation(storage.durability, "k").unwrap();
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            };
+            held_rx.recv().unwrap();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let recovery = tokio::spawn(async move { storage.recover_wal_async().await });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(
+                    !recovery.is_finished(),
+                    "recovery ran without the root gate"
+                );
+                release_tx.send(()).unwrap();
+                recovery.await.unwrap().unwrap();
+            });
+            holder.join().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("waiting for the root gate blocked the runtime thread");
     }
 
     #[tokio::test]
