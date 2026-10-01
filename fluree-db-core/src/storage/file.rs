@@ -864,16 +864,26 @@ impl FileStorage {
     /// to per-write flushing after a crash still sees the acknowledged tail.
     /// A root that never journaled is left untouched.
     pub fn recover_wal(&self) -> Result<()> {
-        let _root = futures::executor::block_on(self.root_gate()?.write_owned());
+        let root_gate = futures::executor::block_on(self.root_gate()?.write_owned());
+        self.recover_wal_locked(&root_gate)
+    }
+
+    /// Replays the WAL under this root while `_root_gate` holds its root gate exclusively.
+    ///
+    /// Blocking: the replay is synchronous file I/O.
+    fn recover_wal_locked(
+        &self,
+        _root_gate: &tokio::sync::OwnedRwLockWriteGuard<()>,
+    ) -> Result<()> {
         if self.durability == Durability::Wal {
             self.attach_wal_locked(false)?;
         } else {
-            // Replay and let go: this handle is not going to journal.
+            // This handle does not journal, so the log is replayed and then released.
             Wal::acquire(&self.base_path, self.wal_owner.as_deref(), false)
                 .map(drop)
                 .map_err(|e| Self::recovery_error(&self.base_path, e))?;
         }
-        // A root several processes journal: apply what a stopped one left.
+        // Several processes can journal one root. Apply what stopped owners left.
         wal::replay_unowned(&self.base_path)
             .map(drop)
             .map_err(|e| Self::recovery_error(&self.base_path, e))
