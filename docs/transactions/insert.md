@@ -385,6 +385,37 @@ Inline `@annotation` queries return one row per occurrence.
 
 For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).
 
+## Named graphs in JSON-LD
+
+A node's `@graph` names the graph it is written to, and the graph covers every node nested in it:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "@id": "ex:alice",
+  "@graph": "http://example.org/graphs/hr",
+  "ex:salary": 95000,
+  "ex:manager": { "@id": "ex:bob", "ex:name": "Bob" }
+}
+```
+
+Both `ex:alice`'s and `ex:bob`'s statements land in `http://example.org/graphs/hr`. A nested node's own `@graph` wins for its subtree; `"@graph": "default"` sends it to the default graph.
+
+The JSON-LD 1.1 named-graph form is accepted too: an object whose `@id` names the graph and whose `@graph` holds the nodes written to it.
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "@id": "http://example.org/graphs/hr",
+  "@graph": [
+    { "@id": "ex:alice", "ex:salary": 95000 },
+    { "@id": "ex:bob", "ex:salary": 90000 }
+  ]
+}
+```
+
+Graph names are absolute IRIs, or compact IRIs your `@context` expands; relative names are refused. `"default"` names the default graph, and `"config"` the ledger's config graph (see [Writing config data](../ledger-config/writing-config.md)).
+
 ## Turtle and TriG
 
 `/insert` also takes RDF text. Turtle (`text/turtle`) is parsed straight to flakes. TriG (`application/trig`) adds graph blocks, which land in their named graphs; a `GRAPH <#txn-meta> { ... }` block becomes commit metadata instead:

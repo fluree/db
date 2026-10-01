@@ -15,6 +15,8 @@ mod it_default_context;
 mod it_graph_commit;
 #[path = "it_graph_source_bm25.rs"]
 mod it_graph_source_bm25;
+#[path = "it_jsonld_graph_scope.rs"]
+mod it_jsonld_graph_scope;
 #[path = "it_materialize_named_graph.rs"]
 mod it_materialize_named_graph;
 #[path = "it_materialize_retract.rs"]

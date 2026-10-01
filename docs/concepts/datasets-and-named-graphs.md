@@ -404,6 +404,6 @@ Fluree's dataset implementation follows:
 - **SPARQL 1.1 Query**: FROM and FROM NAMED clauses
 - **SPARQL 1.1 Update**: GRAPH clauses in updates
 - **RDF 1.1 Datasets**: Named graph semantics
-- **JSON-LD 1.1**: @graph syntax for named graphs
+- **JSON-LD 1.1**: named graph objects (an object whose `@id` names the graph and whose `@graph` holds its nodes), plus a Fluree extension: a node's own `"@graph": "<graph IRI>"` places the node, and every node nested in it, in that graph
 
 This enables seamless integration with other RDF tools and SPARQL endpoints while providing Fluree's unique temporal and ledger capabilities.

@@ -11,7 +11,7 @@ When no config graph is present (or a setting group is absent), the system defau
 | Setting group | System default |
 |---------------|----------------|
 | Policy | Enforcement off for requests carrying no policy inputs; **fail-closed** for requests that do (see below) |
-| SHACL | Disabled — no shape validation |
+| SHACL | Disabled — no shape validation, even when the ledger holds shapes |
 | Reasoning | Disabled — no OWL/RDFS inference |
 | Datalog | Disabled — no rule evaluation |
 | Transact constraints | Disabled — no uniqueness enforcement |
@@ -105,11 +105,23 @@ Controls SHACL shape validation at transaction time.
 
 `f:shapesSource` is non-overridable. `f:shaclEnabled` and `f:validationMode` are overridable per graph.
 
+Shapes alone never enable SHACL: a graph is validated only when its effective SHACL group (the ledger-wide group merged with the graph's override) sets `f:shaclEnabled true`.
+
+| Effective SHACL group for a graph | Validation |
+|---|---|
+| None: no config, a config without a SHACL group, or an empty group | Off, whatever shapes the ledger holds |
+| `f:shaclEnabled true` | On, in `f:validationMode` (default `f:ValidationReject`) |
+| `f:shaclEnabled false` or unset | Off |
+
+A ledger that holds shapes with no graph enabling them reports `shapes present; SHACL enforcement not configured` in ledger info. To enable SHACL, see [Enabling SHACL](writing-config.md#enabling-shacl). The config graph and the `#txn-meta` graph are never validated.
+
 `f:validationMode` can additionally be overridden per **transaction** via
 `opts.validationMode` (`"warn"` / `"reject"`): strengthening is always
 honored, softening only when `f:overrideControl` permits it for the
 request's verified identity. See
 [Override control](override-control.md#shacl-fshacldefaults).
+
+Inline shapes sent with a transaction (`opts.shapes`) are a request setting governed by `f:overrideControl`, not by `f:shaclEnabled`; see [Inline shapes](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
 
 ### Example
 

@@ -4,7 +4,7 @@ SHACL (Shapes Constraint Language) is a W3C standard for defining constraints on
 
 This guide covers:
 
-- [When SHACL runs](#when-shacl-runs) — with and without a config graph
+- [When SHACL runs](#when-shacl-runs) — only where the ledger config enables it
 - [Enabling SHACL via the config graph](#enabling-shacl-via-the-config-graph)
 - [Defining shapes](#defining-shapes) — node shapes, property shapes, targets
 - [Constraint patterns](#constraint-patterns) — cardinality, datatype, ranges, patterns, values, class, pair, logical
@@ -17,12 +17,11 @@ This guide covers:
 
 ## When SHACL runs
 
-Fluree decides whether to run SHACL validation on each transaction using this order:
+SHACL runs only where the ledger config enables it: a graph the transaction writes is validated when its effective `f:shaclDefaults` group (ledger-wide, or the graph's override) sets `f:shaclEnabled true`, in that group's `f:validationMode`. Shapes on their own never enable validation, and a ledger with no SHACL config validates nothing (at no cost). So the first step is always to [enable SHACL](#enabling-shacl-via-the-config-graph); then transact shapes, and they are enforced from the next transaction on.
 
-1. **If a config graph exists with `f:shaclDefaults`** — follow the configured settings per graph (enable/disable, mode).
-2. **If no config graph section is present** — fall back to the **shapes-exist heuristic**: if any SHACL shapes are present in the database (as regular RDF triples), validation runs in `Reject` mode. If no shapes are present, validation is skipped entirely (zero overhead).
+A ledger that holds shapes but enables SHACL nowhere reports `shapes present; SHACL enforcement not configured` in ledger info, and `fluree info` prints it.
 
-This means you can start using SHACL **without writing any config** — just transact shapes and they're enforced.
+The config graph itself is never validated, so a configuration change (including turning SHACL off, or pointing `f:shapesSource` somewhere else) is never blocked by the shapes it configures.
 
 **Bulk import is deliberately exempt.** The bulk-import pipeline never runs
 SHACL — it is a trusted, high-throughput load path. If your source data must
@@ -50,6 +49,23 @@ GRAPH <urn:fluree:mydb:main#config> {
     ] .
 }
 ```
+
+The same settings as JSON-LD, with `"@graph": "config"` naming the ledger's config graph:
+
+```json
+{
+  "@context": { "f": "https://ns.flur.ee/db#" },
+  "@id": "urn:fluree:mydb:main:config:ledger",
+  "@type": "f:LedgerConfig",
+  "@graph": "config",
+  "f:shaclDefaults": {
+    "f:shaclEnabled": true,
+    "f:validationMode": { "@id": "f:ValidationReject" }
+  }
+}
+```
+
+If the ledger already has a config subject, attach the group to it instead of writing a second `f:LedgerConfig` (which is refused); [Enabling SHACL](../ledger-config/writing-config.md#enabling-shacl) has a recipe that does either.
 
 Notes:
 - `f:shaclEnabled` defaults to `false` when a `f:shaclDefaults` section exists without it — make the enable decision explicit.
@@ -616,7 +632,9 @@ Semantics and limits:
 In addition to shapes stored in a ledger, a transaction can supply
 **inline shapes** via the `opts.shapes` field. The shapes are
 enforced only for that one transaction and never written into the
-ledger.
+ledger. The field is read wherever the transaction is sent: over HTTP,
+through the embedded API, and by the CLI in local mode. It must be a
+JSON-LD object or an array of them; anything else is refused.
 
 ```json
 {
@@ -651,21 +669,31 @@ ledger.
 
 Semantics:
 
-- **Additive with the configured source.** Inline shapes enforce
-  *alongside* whatever `f:shapesSource` resolves to. A subject
-  must satisfy every shape from both sources. Note that
-  `f:shapesSource` is itself singular — its `f:graphSource` is
-  either local (no `f:ledger`) or cross-ledger (with `f:ledger`),
-  not both at the same time. Inline shapes don't change that;
-  they layer on top of whichever variant is configured.
+- **A request setting, applied on their own.** Inline shapes validate
+  every graph the transaction writes (except the config and
+  `#txn-meta` graphs), in the request's `opts.validationMode`
+  (default reject), in a pass of their own. They apply on a ledger
+  with no config, and alongside whatever stored shapes the ledger's
+  config enables; they never switch stored shapes on for a graph
+  where config leaves SHACL off. A subject must satisfy every shape
+  that applies to it.
+- **Gated by override control, not by `f:shaclEnabled`.** Inline
+  shapes apply on a ledger with no config, and on any graph whose
+  effective `f:overrideControl` permits request overrides (the
+  default `f:OverrideAll`), even when `f:shaclEnabled false`. Under
+  `f:OverrideNone`, or `f:IdentityRestricted` without a matching
+  verified identity, the transaction is refused (HTTP 400) with an
+  error naming the graph and the control, and nothing commits.
+- **Not supported in a policy-scoped request.** A transaction that
+  carries inline shapes is refused (HTTP 400, `inline request shapes
+  are not supported in a policy-scoped request`) when it runs under
+  a policy context: an identity or policy inputs on the request, or
+  policy defaults anywhere in the ledger config (ledger-wide or for a
+  graph) other than an unrestricted `f:defaultAllow true`. Support for
+  inline shapes in policy-scoped requests is a follow-up.
 - **Transient.** The shapes never appear in the ledger's data and
   vanish after the transaction completes. The next transaction
   without `opts.shapes` runs without them.
-- **Gated by config.** If `f:shaclEnabled false` (or no graph is
-  enabled), inline shapes do not bypass that posture — operator
-  config wins. To use inline shapes on a fresh ledger with no
-  config, the shapes-exist heuristic enables validation
-  automatically.
 - **No audit trail.** Because inline shapes don't persist, it
   isn't possible to reconstruct "which shapes validated which
   commit" from ledger history. If auditability matters, store
@@ -735,9 +763,9 @@ SHACL validation runs consistently on every write surface:
 - JSON-LD / SPARQL transactions (`fluree insert`, `fluree upsert`, `fluree update`)
 - Turtle / TriG ingest (`fluree insert-turtle`, `stage_turtle_insert`)
 - Commit replay (`push_commits_with_handle`, followers applying upstream commits)
-- Branch operations (`fluree branch merge`, `rebase`, `revert`): the merged, replayed, or inverted state is validated against the target branch's shapes before anything is written, and `fluree branch diff` reports the same outcome ahead of time
+- Branch operations (`fluree branch merge`, `rebase`, `revert`): the merged, replayed, or inverted state is validated against the target branch's shapes before anything is written, and `fluree branch diff` reports the same outcome ahead of time. A fast-forward merge is validated too when the target's config enables SHACL: the target checks the change it adopts as it would a transaction's
 
-All of these routes go through the same post-stage helper, so the ledger's configured SHACL posture (enable/disable, mode, per-graph, shapes source) applies uniformly. A `take-both` merge whose "both values coexist" resolution would breach a `sh:maxCount`, or a revert that removes a value a `sh:minCount` requires, is rejected with the same report a transaction gets.
+All of these routes go through the same post-stage helper, so the ledger's configured SHACL posture (enable/disable, mode, per-graph, shapes source) applies uniformly, and none of them validates where config leaves SHACL off. A shapes source (including one in another ledger) is resolved only when a graph the write touches has SHACL enabled. A `take-both` merge whose "both values coexist" resolution would breach a `sh:maxCount`, or a revert that removes a value a `sh:minCount` requires, is rejected with the same report a transaction gets.
 
 ## Validation reports (`fluree validate`)
 

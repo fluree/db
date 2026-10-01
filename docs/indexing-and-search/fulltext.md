@@ -216,10 +216,10 @@ Or as JSON-LD:
 }
 ```
 
-**HTTP / Docker:** the same JSON-LD config goes into a regular `/update` transaction. Wrap it in `@graph` and POST to the ledger:
+**HTTP / Docker:** the same JSON-LD config is a regular insert. POST it to the ledger's `/insert` endpoint:
 
 ```bash
-curl -X POST 'http://localhost:8090/v1/fluree/update?ledger=mydb:main' \
+curl -X POST 'http://localhost:8090/v1/fluree/insert?ledger=mydb:main' \
   -H 'Content-Type: application/json' \
   -d @- <<'JSON'
 {
@@ -246,7 +246,7 @@ curl -X POST 'http://localhost:8090/v1/fluree/update?ledger=mydb:main' \
 JSON
 ```
 
-The config is stored in the ledger's `#config` named graph (note the `"@graph": "urn:fluree:mydb:main#config"` placement directive on the resource). To verify, query the config graph:
+The config is stored in the ledger's `#config` named graph: the `"@graph": "urn:fluree:mydb:main#config"` placement directive on the resource places it, and the nested `f:fullTextDefaults` group and its `f:property` entries, there (`"@graph": "config"` names the same graph). To verify, query the config graph:
 
 ```bash
 curl -X POST http://localhost:8090/v1/fluree/query \

@@ -127,12 +127,14 @@ impl Default for MergePreviewOpts {
     }
 }
 
-/// SHACL outcome of staging the merge's resolved change set on the target.
+/// Outcome of staging the merge's resolved change set on the target and
+/// running a transaction's checks on it: SHACL and uniqueness, under the
+/// target's configuration.
 #[derive(Clone, Debug, Serialize)]
 pub struct ValidationSummary {
-    /// `true` when the merged state conforms to the target's shapes under
-    /// its configured posture (warn-mode violations are logged, not
-    /// reported, matching the transaction path).
+    /// `true` when the merged state passes the target's shapes and
+    /// uniqueness constraints under its configuration (warn-mode violations
+    /// are logged, not reported, matching the transaction path).
     pub conforms: bool,
     /// The violation report the merge would fail with. Present iff
     /// `conforms` is `false`.
@@ -507,9 +509,19 @@ impl crate::Fluree {
         let need_conflicts = opts.include_conflicts && !fast_forward && diff.is_some();
         let need_changes = opts.include_changes;
         // Validation stages the resolved change set on the target, so it
-        // needs the netted source delta too. A fast-forward adopts commits
-        // already validated when they were authored, so it is skipped.
+        // needs the netted source delta too. A fast-forward is checked on its
+        // own path below, as the merge checks it: when the target's
+        // configuration governs writes or the adopted commits carry config
+        // settings.
         let need_validation = opts.include_validation && !fast_forward && diff.is_some();
+        let fast_forward_base = if opts.include_validation && fast_forward && diff.is_some() {
+            Some(
+                self.fast_forward_base(&target_id, &target_branched, &target_record)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         // The change set folds every commit on the source's line, because a
         // merge the source made carries how it resolved that merge. A merge
@@ -692,7 +704,8 @@ impl crate::Fluree {
             None
         };
 
-        // ---- Validation (default on; skipped on fast-forward). -------------
+        // ---- Validation (default on; a fast-forward only when the merge ----
+        // ---- checks it). ----------------------------------------------------
         // The same staging and validation the merge performs, minus the
         // commit: resolve the netted source delta under the strategy, stage
         // it on a clone of the target state, and run the branch-operation
@@ -717,8 +730,17 @@ impl crate::Fluree {
                     .await?;
                 Some(ValidationSummary {
                     conforms: outcome.conforms(),
-                    report: outcome.report,
+                    report: outcome.report(),
                 })
+            } else if let (Some(base), Some(diff)) = (fast_forward_base, diff.as_ref()) {
+                // A fast-forward: the check the merge runs before adopting the
+                // commits, when it runs one.
+                self.validate_fast_forward(base, &source_store, diff)
+                    .await?
+                    .map(|outcome| ValidationSummary {
+                        conforms: outcome.conforms(),
+                        report: outcome.report(),
+                    })
             } else {
                 None
             };

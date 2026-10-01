@@ -156,6 +156,13 @@ pub struct Txn {
     /// added as additional named-graph keys, allowing `["graph", "<alias>", ...]` patterns.
     pub update_where_named_graphs: Option<Vec<UpdateNamedGraph>>,
 
+    /// The JSON-LD update's where reads the ledger's default graph by
+    /// [`LEDGER_DEFAULT_GRAPH`](fluree_db_query::parse::LEDGER_DEFAULT_GRAPH)
+    /// (a `"@graph": "default"` while the WHERE reads another default graph,
+    /// a top-level `graph` or `from`): staging adds that name to the WHERE
+    /// dataset.
+    pub update_where_names_ledger_default: bool,
+
     /// Transaction options
     pub opts: TxnOpts,
 
@@ -306,6 +313,7 @@ impl Txn {
             unmatched_optional: UnmatchedOptional::Unbound,
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
+            update_where_names_ledger_default: false,
             opts: TxnOpts::default(),
             vars: VarRegistry::new(),
             txn_meta: Vec::new(),
@@ -614,6 +622,177 @@ pub(crate) fn names_ledger(ledger_id: &fluree_db_core::LedgerId, iri: &str) -> b
     body.starts_with(ledger_id.name())
         && fluree_db_core::LedgerRef::parse(iri)
             .is_ok_and(|r| r.at.is_none() && r.fragment.is_none() && r.id == *ledger_id)
+}
+
+/// A write-side graph name after resolution: the default graph, a named
+/// graph by absolute IRI (the ledger's config graph included), or a WHERE
+/// variable (`GRAPH ?g`, update templates only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphName {
+    /// The default graph.
+    Default,
+    /// A named graph.
+    Iri(fluree_db_core::dataset_ref::GraphIri),
+    /// The graph a WHERE variable binds.
+    Var(VarId),
+}
+
+/// The graph every template of one lexical scope is written to.
+///
+/// A JSON-LD node's statements, and those of every node nested in it, are
+/// written to the node's scope: its own graph selector if it has one, else
+/// its parent's. The parser passes the scope down the recursion by
+/// reference, so a nested node cannot be emitted without one.
+///
+/// Built only by [`WriteGraphs::scope`] or [`GraphScope::default_graph`], so
+/// a named graph a scope can carry is always registered in
+/// [`Txn::write_graphs`].
+///
+/// The scope an update's `graph` key opens (SPARQL `WITH`) is the update's
+/// template default graph ([`Txn::template_default_graph`]): its templates,
+/// and those of nested nodes that inherit it, are marked
+/// [`TripleTemplate::graph_from_template_default`]. A scope a template opens
+/// itself (a node's `@graph`, a `["graph", …]` item) is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphScope {
+    graph: TemplateGraph,
+    template_default: bool,
+}
+
+impl GraphScope {
+    /// The default graph.
+    pub fn default_graph() -> Self {
+        GraphScope {
+            graph: TemplateGraph::Default,
+            template_default: false,
+        }
+    }
+
+    /// This scope as the update's template default graph. Only a named graph
+    /// is one: the default graph needs no mapping.
+    pub fn as_template_default(self) -> Self {
+        let template_default = matches!(self.graph, TemplateGraph::Iri(_));
+        GraphScope {
+            template_default,
+            ..self
+        }
+    }
+
+    /// The graph this scope writes to.
+    pub fn graph(&self) -> &TemplateGraph {
+        &self.graph
+    }
+
+    /// Emit one template in this scope.
+    ///
+    /// This is the one template-level emitter of `f:reifiesGraph`: a
+    /// reifier's `f:reifiesSubject` statement emitted in a named scope is
+    /// accompanied by `(reifier, f:reifiesGraph, <the scope's graph>)` in the
+    /// same scope, so a reifier bundle always names the graph of the edge it
+    /// reifies, which is the graph the bundle itself is written to. Nothing
+    /// else writes the anchor into templates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit(
+        &self,
+        out: &mut Vec<TripleTemplate>,
+        ns: &mut crate::namespace::NamespaceRegistry,
+        subject: TemplateTerm,
+        predicate: TemplateTerm,
+        object: TemplateTerm,
+        dtc: Option<DatatypeConstraint>,
+        list_index: Option<i32>,
+    ) {
+        let anchor = match (&self.graph, &predicate) {
+            (TemplateGraph::Default, _) => None,
+            (graph, TemplateTerm::Sid(p)) if is_reifies_subject(p) => Some(match graph {
+                TemplateGraph::Iri(iri) => TemplateTerm::Sid(ns.sid_for_iri(iri)),
+                TemplateGraph::Var(var) => TemplateTerm::Var(*var),
+                TemplateGraph::Default => unreachable!("matched above"),
+            }),
+            _ => None,
+        };
+        let anchor_subject = anchor.as_ref().map(|_| subject.clone());
+        out.push(TripleTemplate {
+            subject,
+            predicate,
+            object,
+            dtc,
+            list_index,
+            graph: self.graph.clone(),
+            graph_from_template_default: self.template_default,
+        });
+        if let (Some(reifier), Some(graph)) = (anchor_subject, anchor) {
+            out.push(TripleTemplate {
+                subject: reifier,
+                predicate: TemplateTerm::Sid(Sid::new(
+                    fluree_vocab::namespaces::FLUREE_DB,
+                    fluree_vocab::db::REIFIES_GRAPH,
+                )),
+                object: graph,
+                dtc: None,
+                list_index: None,
+                graph: self.graph.clone(),
+                graph_from_template_default: self.template_default,
+            });
+        }
+    }
+}
+
+/// Whether `p` is `f:reifiesSubject`, compared without allocating.
+pub(crate) fn is_reifies_subject(p: &Sid) -> bool {
+    p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+        && &*p.name == fluree_vocab::db::REIFIES_SUBJECT
+}
+
+/// Whether `p` is `f:reifiesPredicate`, compared without allocating.
+pub(crate) fn is_reifies_predicate(p: &Sid) -> bool {
+    p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+        && &*p.name == fluree_vocab::db::REIFIES_PREDICATE
+}
+
+/// The named graphs one transaction writes to, interned so every template of
+/// a graph shares its IRI. The only way to obtain a named [`GraphScope`].
+#[derive(Debug, Default)]
+pub struct WriteGraphs {
+    interned: std::collections::HashMap<String, Arc<str>>,
+}
+
+impl WriteGraphs {
+    /// No graphs yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The scope for `name`, registering a named graph as a write target.
+    pub fn scope(&mut self, name: GraphName) -> GraphScope {
+        match name {
+            GraphName::Default => GraphScope::default_graph(),
+            GraphName::Var(var) => GraphScope {
+                graph: TemplateGraph::Var(var),
+                template_default: false,
+            },
+            GraphName::Iri(iri) => {
+                let iri = iri.into_string();
+                let interned = match self.interned.get(&iri) {
+                    Some(interned) => Arc::clone(interned),
+                    None => {
+                        let interned: Arc<str> = Arc::from(iri.as_str());
+                        self.interned.insert(iri, Arc::clone(&interned));
+                        interned
+                    }
+                };
+                GraphScope {
+                    graph: TemplateGraph::Iri(interned),
+                    template_default: false,
+                }
+            }
+        }
+    }
+
+    /// The registered named-graph IRIs, for [`Txn::write_graphs`].
+    pub fn into_iris(self) -> BTreeSet<String> {
+        self.interned.into_keys().collect()
+    }
 }
 
 /// A term in a triple template

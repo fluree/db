@@ -12,6 +12,10 @@
         "tiny": 10.0,
         "small": 5.0
       },
+      "jsonld_parse": {
+        "tiny": 10.0,
+        "small": 5.0
+      },
       "vector_query": {
         "small": 5.0
       },

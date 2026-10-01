@@ -977,14 +977,16 @@ These rules are not negotiable; the CLI and other clients depend on them:
 11. **Validation.** When `include_validation == true` (the default) and
    `!fast_forward`, stage the change set from rule 10, resolved under
    `strategy` against the **uncapped** conflict set, onto the target's
-   current state and run the same SHACL validation `POST /merge` runs for
-   that strategy. Report `validation: { conforms, report? }`, where
+   current state and run the same validation (SHACL, uniqueness and the
+   config-group checks) `POST /merge` runs for that strategy. Report `validation: { conforms, report? }`, where
    `report` is present only when `conforms == false` and is the message
    the merge would fail with. `mergeable` is then
    `strategy-applies && validation.conforms`; with
    `include_validation=false` it is the strategy signal alone and
-   `validation` is absent. Fast-forward previews carry no `validation`:
-   the adopted commits were validated when authored. Under
+   `validation` is absent. A fast-forward preview carries `validation`
+   only when the target's config enables SHACL or uniqueness, or the
+   commits it adopts carry config settings (`f:` predicates), as only
+   then does the merge check them. Under
    `strategy=abort` with conflicts the merge never reaches validation, so
    `validation` is absent there too. This rule is what makes
    `mergeable=true` mean "neither the strategy nor the shapes reject it"
@@ -1513,7 +1515,7 @@ Content-Type: application/json
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `graph` (query) | No | Full **absolute** IRI of the target named graph; absent means the default graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address named graphs itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `graph` (query) | No | Full **absolute** IRI of the target named graph; absent means the default graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address any other graph itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
 | `default` (query) | No | Bare key: sync the default graph, said explicitly. Passing it with `graph` is a `400`. The CLI omits `graph` for the default graph. |
 | `dryRun` (query) | No | `true` → stage and report the delta; commit nothing. |
 | `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |

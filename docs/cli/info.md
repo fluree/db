@@ -80,6 +80,24 @@ Index t:        5
 Index ID:       bafybeig...
 ```
 
+When the ledger config is in a state that does not do what it appears to, the
+output ends with the ledger info's `configDiagnostics`, for example:
+
+```
+Config diagnostics:
+  - shapes present; SHACL enforcement not configured (shapes are enforced only where the ledger config sets f:shaclEnabled true)
+```
+
+The codes are `shacl-not-configured`, `empty-group` (a setting group that sets
+nothing in the config graph), `stranded-fields` (its fields were written to
+another graph; see [Repairing a config split across
+graphs](../ledger-config/writing-config.md#repairing-a-config-split-across-graphs)),
+`ambiguous-pointer` (a setting group pointer with several values),
+`multiple-ledger-configs` and `duplicate-graph-override` (several
+`f:GraphConfig` overrides for one graph, of which only one is used).
+`shacl-not-configured` means no graph enables SHACL: a config that enables it
+for one graph only is configured.
+
 Graph source (Iceberg):
 ```
 Name:           warehouse-orders

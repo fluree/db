@@ -27,6 +27,15 @@ pub enum JsonLdError {
     #[error("Unexpected error: {message}")]
     Unexpected { message: String },
 
+    #[error("invalid @graph value: {reason}")]
+    InvalidGraphValue { reason: &'static str },
+
+    #[error("invalid {keyword} value: {reason}")]
+    InvalidKeywordValue {
+        keyword: &'static str,
+        reason: &'static str,
+    },
+
     #[error(
         "Unresolved compact IRI '{value}': prefix '{prefix}' is not defined in @context. \
              If this is intended as an absolute IRI, use a full form (e.g. http://...) \

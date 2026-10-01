@@ -616,3 +616,82 @@ async fn unverified_identity_does_not_soften_shacl_posture() {
         "a fluree-identity header naming the allow-listed DID must not soften the posture",
     );
 }
+
+// =============================================================================
+// Inline request shapes (`opts.shapes`) in a policy-scoped request
+// =============================================================================
+
+/// Open policy and no SHACL group, so an anonymous request runs unrestricted.
+const OPEN_POLICY_TRIG: &str = r"
+@prefix f: <https://ns.flur.ee/db#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+GRAPH <urn:fluree:overridectl:main#config> {
+    <urn:overridectl:config> rdf:type f:LedgerConfig .
+    <urn:overridectl:config> f:policyDefaults <urn:overridectl:openpolicy> .
+    <urn:overridectl:openpolicy> f:defaultAllow true .
+}
+";
+
+/// A nameless `ex:Person`, sent with an inline shape that requires `ex:name`.
+fn inline_shapes_insert(subject: &str, mut opts: JsonValue) -> String {
+    opts["shapes"] = json!({
+        "@context": {"ex": "http://example.org/", "sh": "http://www.w3.org/ns/shacl#"},
+        "@id": "ex:PersonShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Person"},
+        "sh:property": {"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}
+    });
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "insert": {"@id": subject, "@type": "ex:Person"},
+        "opts": opts
+    })
+    .to_string()
+}
+
+/// Inline request shapes are not supported in a policy-scoped request (a
+/// current limitation: support for inline shapes in policy-scoped requests is
+/// a follow-up). A request carrying an identity, by header or in its opts, is
+/// refused with a 400 and nothing commits; without one, the inline shape
+/// applies.
+#[tokio::test]
+async fn inline_shapes_are_refused_in_a_policy_scoped_request_over_http() {
+    let (_tmp, app) = seeded_app_with(DataAuthMode::None, OPEN_POLICY_TRIG).await;
+    let refusal = "inline request shapes are not supported in a policy-scoped request";
+
+    let header = ("fluree-identity", ADMIN.to_string());
+    let (status, json) = insert(&app, inline_shapes_insert("ex:p1", json!({})), &[header]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "identity header: {json}");
+    assert!(
+        json.to_string().contains(refusal),
+        "identity header: {json}"
+    );
+
+    let (status, json) = insert(
+        &app,
+        inline_shapes_insert("ex:p2", json!({"identity": ADMIN})),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "opts.identity: {json}");
+    assert!(json.to_string().contains(refusal), "opts.identity: {json}");
+
+    let (status, json) = insert(&app, inline_shapes_insert("ex:p3", json!({})), &[]).await;
+    assert_shacl_rejected(status, &json, "no policy input: the inline shape applies");
+
+    let (status, json) = query(
+        &app,
+        "application/json",
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?s",
+            "where": {"@id": "?s", "@type": "ex:Person"}
+        })
+        .to_string(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json, json!([]), "nothing committed");
+}

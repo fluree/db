@@ -570,6 +570,7 @@ Scope patterns to a named graph:
 Notes:
 - `fromNamed` is an object whose keys are dataset-local aliases. Each value is an object with `@id` (ledger reference) and optional `@graph` (graph selector IRI).
 - The second element of `["graph", ...]` can be a dataset-local alias (recommended) or a graph IRI.
+- A node-level `@graph` scopes one node (and the nodes nested in it) the same way: `{"@id": "?product", "@graph": "products", "ex:name": "?name"}`. Its name can be a dataset-local alias, a graph IRI, or a compact IRI your `@context` expands, resolved as in a transaction's `insert` and `delete`. (The keywords `"config"` and `"txn-meta"` name a ledger's graphs only in an update's `where`, which knows its ledger. In a query, `"default"` names the query's default graph.)
 - The legacy `"from-named": [...]` array format is still accepted for backward compatibility.
 - For dataset and named-graph configuration details, see `docs/query/datasets.md`.
 
