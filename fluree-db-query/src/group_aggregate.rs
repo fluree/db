@@ -840,8 +840,15 @@ impl GroupAggregateOperator {
     }
 
     /// Write a row's composite group key into `key`, reusing its allocation.
-    fn fill_group_key(&self, batch: &Batch, row_idx: usize, key: &mut CompositeGroupKey) {
-        let (dicts, gv) = crate::object_binding::EqualityNorm::parts(&self.norm);
+    /// `dicts`/`gv` are this operator's normalization, read once per batch.
+    fn fill_group_key(
+        &self,
+        batch: &Batch,
+        row_idx: usize,
+        key: &mut CompositeGroupKey,
+        dicts: Option<crate::object_binding::TermDicts<'_>>,
+        gv: Option<&BinaryGraphView>,
+    ) {
         key.0.clear();
         key.0.extend(self.group_key_indices.iter().map(|&col_idx| {
             let binding = batch.get_by_col(row_idx, col_idx);
@@ -854,8 +861,14 @@ impl GroupAggregateOperator {
     /// Only `cols` participate — the user-visible columns resolved at
     /// construction — normalized the same way group keys are so a mixed
     /// encoded/decoded stream does not double-count.
-    fn extract_row_key(&self, batch: &Batch, row_idx: usize, cols: &[usize]) -> Vec<GroupKeyOwned> {
-        let (dicts, gv) = crate::object_binding::EqualityNorm::parts(&self.norm);
+    fn extract_row_key(
+        &self,
+        batch: &Batch,
+        row_idx: usize,
+        cols: &[usize],
+        dicts: Option<crate::object_binding::TermDicts<'_>>,
+        gv: Option<&BinaryGraphView>,
+    ) -> Vec<GroupKeyOwned> {
         cols.iter()
             .map(|&col_idx| {
                 let binding = batch.get_by_col(row_idx, col_idx);
@@ -866,14 +879,20 @@ impl GroupAggregateOperator {
 
     /// Per-spec composed solutions for this row, empty when no aggregate needs
     /// them. Computed before the group state is borrowed.
-    fn extract_row_keys(&self, batch: &Batch, row_idx: usize) -> Vec<Vec<GroupKeyOwned>> {
+    fn extract_row_keys(
+        &self,
+        batch: &Batch,
+        row_idx: usize,
+        dicts: Option<crate::object_binding::TermDicts<'_>>,
+        gv: Option<&BinaryGraphView>,
+    ) -> Vec<Vec<GroupKeyOwned>> {
         if !self.has_row_distinct {
             return Vec::new();
         }
         self.row_distinct_cols
             .iter()
             .map(|cols| match cols {
-                Some(cols) => self.extract_row_key(batch, row_idx, cols),
+                Some(cols) => self.extract_row_key(batch, row_idx, cols, dicts, gv),
                 None => Vec::new(),
             })
             .collect()
@@ -1024,6 +1043,8 @@ impl Operator for GroupAggregateOperator {
                             continue;
                         }
 
+                        let (dicts, norm_gv) =
+                            crate::object_binding::EqualityNorm::parts(&self.norm);
                         for row_idx in 0..batch.len() {
                             input_rows += 1;
                             let key_binding = batch.get_by_col(row_idx, key_col);
@@ -1051,11 +1072,10 @@ impl Operator for GroupAggregateOperator {
 
                             // COUNT(DISTINCT *) reads a whole solution, so
                             // compose it before the group state is borrowed.
-                            let row_keys = self.extract_row_keys(&batch, row_idx);
+                            let row_keys = self.extract_row_keys(&batch, row_idx, dicts, norm_gv);
 
                             // Update aggregate states for current group.
                             let gv_ref = self.graph_view.as_ref();
-                            let dicts = crate::object_binding::EqualityNorm::parts(&self.norm).0;
                             let group_state = current_state
                                 .as_mut()
                                 .expect("partitioned aggregation must have current group state");
@@ -1129,16 +1149,17 @@ impl Operator for GroupAggregateOperator {
                     let groups_before = self.groups.len();
 
                     // Process each row
+                    let (dicts, norm_gv) = crate::object_binding::EqualityNorm::parts(&self.norm);
                     for row_idx in 0..batch.len() {
                         input_rows += 1;
 
                         // Probe with a reused key buffer: a row joining an
                         // existing group allocates nothing.
-                        self.fill_group_key(&batch, row_idx, &mut group_key);
+                        self.fill_group_key(&batch, row_idx, &mut group_key, dicts, norm_gv);
 
                         // COUNT(DISTINCT *) reads a whole solution, so compose
                         // it here too — before the group state is borrowed.
-                        let row_keys = self.extract_row_keys(&batch, row_idx);
+                        let row_keys = self.extract_row_keys(&batch, row_idx, dicts, norm_gv);
 
                         // One hash per row; the key is cloned out of the
                         // buffer only when it opens a new group. The closure
@@ -1166,7 +1187,6 @@ impl Operator for GroupAggregateOperator {
 
                         // Update each aggregate with this row's values
                         let gv_ref = self.graph_view.as_ref();
-                        let dicts = crate::object_binding::EqualityNorm::parts(&self.norm).0;
                         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
                             match spec.input_col {
                                 Some(col_idx) => {
