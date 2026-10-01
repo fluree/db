@@ -1849,3 +1849,29 @@ async fn numeric_object_correlated_with_a_bound_subject_matches_by_value() {
     );
     failures.assert_none();
 }
+
+/// A JSON-LD `bind` onto a variable the pattern already bound keeps the row
+/// only when the computed value is the same term: the pattern binds the
+/// subject encoded, the expression computes it decoded.
+#[tokio::test(flavor = "current_thread")]
+async fn bind_onto_a_bound_variable_compares_terms_across_forms() {
+    let query = json!({
+        "@context": context(),
+        "select": ["?s"],
+        "where": [
+            {"@id": "?s", "ex:derivedFrom": {"@id": "ex:doc1"}},
+            ["bind", "?s", "(iri \"http://example.org/s2\")"]
+        ]
+    });
+    let mut failures = Failures::default();
+    for state in STATES {
+        let (fluree, handle) = ledger_in(state, "it/bind-bound-var:main").await;
+        let result = jsonld(&fluree, &handle, &query).await;
+        failures.eq(
+            jsonld_rows(&result),
+            rows(&[&["s2"]]),
+            &format!("{state:?} / bind onto a bound subject"),
+        );
+    }
+    failures.assert_none();
+}

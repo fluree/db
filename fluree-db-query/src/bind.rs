@@ -51,6 +51,9 @@ pub struct BindOperator {
     state: OperatorState,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// Term normalization for the clobber check, built at open: a bound value
+    /// and the computed one can be one term in two forms.
+    norm: Option<crate::object_binding::EqualityNorm>,
     /// True when `expr` contains an `EXISTS { ... }` subexpression, which must
     /// be resolved per-row (seeded with the row's bindings) before the value
     /// is computed — projection/BIND counterpart to the FilterOperator path.
@@ -121,6 +124,7 @@ impl BindOperator {
             is_new_var,
             state: OperatorState::Created,
             out_schema: None,
+            norm: None,
             has_exists,
             has_metadata,
             planning: crate::temporal_mode::PlanningContext::current(),
@@ -162,6 +166,7 @@ impl Operator for BindOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
+        self.norm = crate::object_binding::equality_norm(ctx);
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -256,8 +261,13 @@ impl Operator for BindOperator {
                     match existing {
                         Some(Binding::Unbound) | None => true, // Unbound - can bind
                         Some(existing_val) => {
-                            // Check if same value
-                            existing_val == &computed || matches!(computed, Binding::Unbound)
+                            // Check if same term, whichever form each carries it in
+                            matches!(computed, Binding::Unbound)
+                                || crate::object_binding::same_term(
+                                    existing_val,
+                                    &computed,
+                                    &self.norm,
+                                )
                         }
                     }
                 };
