@@ -118,6 +118,13 @@ impl HeadTemporal {
     }
 }
 
+/// An index root read while loading a [`LedgerState`], for a caller that
+/// decodes the whole root next (the binary index store).
+pub struct LoadedIndexRoot {
+    pub id: ContentId,
+    pub bytes: Vec<u8>,
+}
+
 /// Ledger state combining indexed LedgerSnapshot with novelty overlay
 ///
 /// Provides a consistent view of the ledger by combining:
@@ -198,6 +205,17 @@ impl LedgerState {
         ledger_id: &str,
         backend: &StorageBackend,
     ) -> Result<Self> {
+        Ok(Self::load_with_root(ns, ledger_id, backend).await?.0)
+    }
+
+    /// [`Self::load`], also handing back the index root it read, so a caller
+    /// that decodes the whole root next (the binary index store) does not
+    /// fetch it a second time.
+    pub async fn load_with_root(
+        ns: &dyn NameServiceLookup,
+        ledger_id: &str,
+        backend: &StorageBackend,
+    ) -> Result<(Self, Option<LoadedIndexRoot>)> {
         let record = ns
             .lookup(ledger_id)
             .await?
@@ -217,11 +235,11 @@ impl LedgerState {
         // ancestor namespaces for pre-branch-point content.
         if record.source_branch.is_some() {
             let store = Self::build_branched_store(ns, &record, backend).await?;
-            return Self::load_with_store(store, record).await;
+            return Self::load_with_store_and_root(store, record).await;
         }
 
         let store = backend.content_store(&record.ledger_id);
-        Self::load_with_store(store, record).await
+        Self::load_with_store_and_root(store, record).await
     }
 
     /// Build a recursive `BranchedContentStore` by walking the branch ancestry.
@@ -246,11 +264,34 @@ impl LedgerState {
         store: C,
         record: NsRecord,
     ) -> Result<Self> {
+        Ok(Self::load_with_store_and_root(store, record).await?.0)
+    }
+
+    /// [`Self::load_with_store`], also handing back the index root it read.
+    pub async fn load_with_store_and_root<C: ContentStore + Clone + 'static>(
+        store: C,
+        record: NsRecord,
+    ) -> Result<(Self, Option<LoadedIndexRoot>)> {
+        let root = match &record.index_head_id {
+            Some(id) => Some(LoadedIndexRoot {
+                id: id.clone(),
+                bytes: store.get(id).await?,
+            }),
+            None => None,
+        };
+        let state = Self::load_from_root(store, record, root.as_ref()).await?;
+        Ok((state, root))
+    }
+
+    async fn load_from_root<C: ContentStore + Clone + 'static>(
+        store: C,
+        record: NsRecord,
+        root: Option<&LoadedIndexRoot>,
+    ) -> Result<Self> {
         // Handle missing index (genesis fallback)
-        let (mut snapshot, mut dict_novelty) = match &record.index_head_id {
-            Some(index_cid) => {
-                let root_bytes = store.get(index_cid).await?;
-                let loaded = LedgerSnapshot::from_root_bytes(&root_bytes)?;
+        let (mut snapshot, mut dict_novelty) = match root {
+            Some(root) => {
+                let loaded = LedgerSnapshot::from_root_bytes(&root.bytes)?;
                 let dn = DictNovelty::with_watermarks(
                     loaded.subject_watermarks.clone(),
                     loaded.string_watermark,

@@ -33,7 +33,7 @@ use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::trace_first_parent_commits_by_id;
 use fluree_db_core::{ContentId, ContentStore, LedgerId, Sid, StorageBackend};
-use fluree_db_ledger::{LedgerState, TypeErasedStore};
+use fluree_db_ledger::{LedgerState, LoadedIndexRoot, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
 use rustc_hash::FxHashSet;
 use std::collections::VecDeque;
@@ -1144,7 +1144,8 @@ async fn prefetch_novelty_translation(
 /// 404 on a fresh branch that hasn't yet had its own index built.
 ///
 /// `prev` is the store this load replaces, if any (a reload of a cached
-/// ledger); artifacts the new root shares with it are carried over.
+/// ledger); artifacts the new root shares with it are carried over. `root` is
+/// the index root the state load already read, if any.
 pub(crate) async fn load_and_attach_binary_store(
     backend: &StorageBackend,
     nameservice: &dyn fluree_db_nameservice::NameServiceLookup,
@@ -1152,6 +1153,7 @@ pub(crate) async fn load_and_attach_binary_store(
     cache_dir: &std::path::Path,
     leaflet_cache: Option<Arc<LeafletCache>>,
     prev: Option<&BinaryIndexStore>,
+    root: Option<LoadedIndexRoot>,
 ) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
     let record = match state.ns_record.as_ref() {
         Some(r) => r,
@@ -1171,10 +1173,13 @@ pub(crate) async fn load_and_attach_binary_store(
         fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
             .await?;
     let root_started = Instant::now();
-    let bytes = cs
-        .get(&index_cid)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
+    let bytes = match root {
+        Some(root) if root.id == index_cid => root.bytes,
+        _ => cs
+            .get(&index_cid)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?,
+    };
     let root_read_us = root_started.elapsed().as_micros() as u64;
     let decode_started = Instant::now();
 
@@ -1645,9 +1650,10 @@ impl LedgerManager {
         // ledger cache into a global mutex for the duration of any cold load.
         // Note: we pass the original address to nameservice (it handles
         // resolution), but cache under the canonical address.
-        let load_result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
-            .await
-            .map_err(ApiError::from); // Convert LedgerError to ApiError
+        let load_result =
+            LedgerState::load_with_root(&self.nameservice_mode, ledger_id, &self.backend)
+                .await
+                .map_err(ApiError::from); // Convert LedgerError to ApiError
         tracing::debug!(
             alias = %canonical_alias,
             ok = load_result.is_ok(),
@@ -1655,7 +1661,7 @@ impl LedgerManager {
         );
 
         let publish = match load_result {
-            Ok(mut state) => {
+            Ok((mut state, root)) => {
                 // Attempt to load binary index store (v2 only).
                 // Non-fatal: if loading fails, log and continue without binary index.
                 let binary_store = match load_and_attach_binary_store(
@@ -1665,6 +1671,7 @@ impl LedgerManager {
                     &self.config.cache_dir,
                     self.config.leaflet_cache.clone(),
                     None,
+                    root,
                 )
                 .await
                 {
@@ -1928,11 +1935,12 @@ impl LedgerManager {
                 // not held over any of this and is acquired after the swap, so
                 // the two locks never overlap (avoids the entries↔state ordering
                 // hazard with `current_t`).
-                let loaded = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
-                    .await
-                    .map_err(ApiError::from);
+                let loaded =
+                    LedgerState::load_with_root(&self.nameservice_mode, ledger_id, &self.backend)
+                        .await
+                        .map_err(ApiError::from);
                 let result = match loaded {
-                    Ok(mut new_state) => {
+                    Ok((mut new_state, root)) => {
                         // Attempt to load binary index store (v2 only) — still off-lock.
                         // Artifacts shared with the store being replaced are
                         // carried over; the slot is read on its own (no
@@ -1945,6 +1953,7 @@ impl LedgerManager {
                             &self.config.cache_dir,
                             self.config.leaflet_cache.clone(),
                             prev_store.as_deref(),
+                            root,
                         )
                         .await
                         {
