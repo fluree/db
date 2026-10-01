@@ -870,6 +870,11 @@ pub(super) fn key_lock(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    open_key_lock(path)
+}
+
+/// Takes the [`key_lock`] for `path` without creating its parent directory.
+pub(super) fn open_key_lock(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)

@@ -635,6 +635,22 @@ impl FileStorage {
         }
     }
 
+    /// Takes the key lock for `path`, creating its parent directory if needed.
+    ///
+    /// A cached parent that was since removed surfaces as `NotFound`.
+    /// The cache entry is then forgotten and the directory created once more.
+    fn key_lock(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        self.ensure_parent_dir(path)?;
+        match wal::open_key_lock(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.forget_dir(path);
+                self.ensure_parent_dir(path)?;
+                wal::open_key_lock(path)
+            }
+            other => other,
+        }
+    }
+
     /// Set to a falsey value (`0`, `false`, `off`, `no`) to skip the startup
     /// sweep of orphaned staging files.
     ///
@@ -1775,14 +1791,12 @@ impl FileStorage {
             let (policy, log) = storage
                 .write_plan(&operation, bytes.len())
                 .map_err(|e| StorageExtError::io(e.to_string()))?;
-            storage
-                .ensure_parent_dir(&path)
-                .map_err(|e| StorageExtError::io(format!("mkdir for {}: {}", path.display(), e)))?;
             // The same sidecar lock a compare-and-swap on this key holds and
             // replay takes: between the link and the record no other writer
             // may advance the file, or the log would carry their transition
             // ahead of the creation it builds on.
-            let _key_lock = wal::key_lock(&path)
+            let _key_lock = storage
+                .key_lock(&path)
                 .map_err(|e| StorageExtError::io(format!("lock {}: {}", path.display(), e)))?;
             let created = create_new_atomic(&path, &bytes, &policy)
                 .map_err(|e| StorageExtError::io(format!("write {}: {}", path.display(), e)))?;
@@ -1827,9 +1841,8 @@ impl FileStorage {
         let operation = self
             .begin_operation(self.durability, &key)
             .map_err(|e| StorageExtError::io(e.to_string()))?;
-        self.ensure_parent_dir(&path)
-            .map_err(|e| StorageExtError::io(format!("mkdir for {}: {}", path.display(), e)))?;
-        let key_lock = wal::key_lock(&path)
+        let key_lock = self
+            .key_lock(&path)
             .map_err(|e| StorageExtError::io(format!("lock {}: {}", path.display(), e)))?;
 
         let current = match std::fs::read(&path) {
@@ -2158,6 +2171,26 @@ mod tests {
             std::fs::metadata(&path).unwrap().ino(),
             "CAS wrote in place, not staged and renamed"
         );
+    }
+
+    /// A dropped ledger removes a directory this storage has cached.
+    /// Inserting and swapping under it again must recreate the directory.
+    #[tokio::test]
+    async fn key_lock_recreates_a_removed_parent_directory() {
+        let (dir, storage) = storage();
+        assert!(storage.insert("ledger/h.json", b"v0").await.unwrap());
+        std::fs::remove_dir_all(dir.path().join("ledger")).unwrap();
+        assert!(storage.insert("ledger/h.json", b"v1").await.unwrap());
+
+        std::fs::remove_dir_all(dir.path().join("ledger")).unwrap();
+        let outcome = storage
+            .compare_and_swap("ledger/h.json", |_| {
+                Ok(CasAction::<()>::Write(b"v2".to_vec()))
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CasOutcome::Written));
+        assert_eq!(storage.read_bytes("ledger/h.json").await.unwrap(), b"v2");
     }
 
     /// A flush leaves no trace in the bytes on disk, so the count is the only
