@@ -3539,9 +3539,8 @@ pub(crate) fn apply_solution_modifiers(
     // carries the variable's id; callers holding the query's registry name it
     // (`QueryError::name_variables`).
     if let Some(g) = grouping {
-        let where_vars: HashSet<VarId> = where_schema.iter().copied().collect();
         if let Some(read) =
-            g.first_ungrouped_read(&where_vars, order_binds, ordering, select_vars, ungrouped)
+            g.first_ungrouped_read(&where_schema, order_binds, ordering, select_vars, ungrouped)
         {
             return Err(QueryError::UngroupedRead(read));
         }

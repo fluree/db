@@ -1210,7 +1210,6 @@ fn lower_select_computations<'a, E: IriEncoder>(
     pp_counter: &mut u32,
     patterns: &mut Vec<Pattern>,
 ) -> Result<SelectComputations> {
-    let where_vars = crate::ir::pattern::produced_vars_of(patterns);
     let keys: Vec<VarId> = opts
         .group_by
         .iter()
@@ -1221,11 +1220,6 @@ fn lower_select_computations<'a, E: IriEncoder>(
         .iter()
         .map(|a| lower_aggregate_spec(a, vars))
         .collect();
-    let placer = if keys.is_empty() && aggregates.is_empty() {
-        crate::ir::SelectExprPlacer::ungrouped()
-    } else {
-        crate::ir::SelectExprPlacer::grouped(keys, &aggregates, where_vars.clone())
-    };
 
     // (alias name, alias, expression), in SELECT order.
     let mut computed: Vec<(&str, VarId, Expression)> = Vec::new();
@@ -1237,6 +1231,23 @@ fn lower_select_computations<'a, E: IriEncoder>(
         let lowered = lower_filter_expr_with_encoder(expr, vars, encoder, pp_counter)?;
         computed.push((alias, alias_var, lowered));
     }
+    if computed.is_empty() {
+        return Ok((Vec::new(), std::collections::HashSet::new()));
+    }
+    // The WHERE's variables matter only to a grouping level's placement (and
+    // its per-group alias check below), so only a grouping level collects them.
+    let (placer, where_vars) = if keys.is_empty() && aggregates.is_empty() {
+        (
+            crate::ir::SelectExprPlacer::ungrouped(),
+            std::collections::HashSet::new(),
+        )
+    } else {
+        let where_vars = crate::ir::pattern::produced_vars_of(patterns);
+        (
+            crate::ir::SelectExprPlacer::grouped(keys, &aggregates, where_vars.clone()),
+            where_vars,
+        )
+    };
     let placements = placer.place_all(
         &computed
             .iter()
@@ -2093,14 +2104,13 @@ fn lower_grouping(
             ));
         }
     } else {
-        let where_vars = crate::ir::pattern::produced_vars_of(patterns);
         crate::ir::sample_ungrouped_reads(
             &group_by,
             &mut aggregates,
             having.as_mut(),
             &mut [],
             ordering,
-            &where_vars,
+            || crate::ir::pattern::produced_vars_of(patterns),
             &mut |_| vars.get_or_insert(&format!("?__sample_{}", vars.len())),
         );
     }
