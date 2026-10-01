@@ -988,6 +988,14 @@ pub async fn incremental_index(
         new_dict_refs.string_reverse = updated.tree_refs;
     }
 
+    // One compaction budget per cycle, shared by every forward-pack stream.
+    let mut compaction_budget = if compaction_enabled() {
+        CompactionBudget::new()
+    } else {
+        CompactionBudget::disabled()
+    };
+    let mut pack_sizes = PackSizeCache::new();
+
     // Forward pack updates (FPK1): append new pack artifacts for new subjects/strings,
     // then compact the tail of each stream that was touched. Appending alone adds a
     // routing entry per build forever; compaction is what bounds the table by data size.
@@ -997,12 +1005,6 @@ pub async fn incremental_index(
         };
         use fluree_db_binary_index::PackBranchEntry;
 
-        let mut compaction_budget = if compaction_enabled() {
-            CompactionBudget::new()
-        } else {
-            CompactionBudget::disabled()
-        };
-        let mut pack_sizes = PackSizeCache::new();
         // Every pack CID this cycle uploads, so any that compaction consumes
         // before publication can be garbaged explicitly.
         let mut uploaded_pack_cids: Vec<ContentId> = Vec::new();
@@ -1272,9 +1274,9 @@ pub async fn incremental_index(
 
     root_builder.set_dict_refs(new_dict_refs);
 
-    // Triple-term dictionary: append this window's new terms. Packs are
-    // per inner predicate and only ever append; the reverse tree is updated
-    // copy-on-write like the subject tree.
+    // Triple-term dictionary: append this window's new terms to each inner
+    // predicate's pack stream, then compact the streams that grew, as for
+    // subjects; the reverse tree is updated copy-on-write like the subject tree.
     if !novelty.new_terms.is_empty() {
         use fluree_db_binary_index::dict::forward_pack::KIND_TERM_FWD;
         use fluree_db_binary_index::dict::incremental::build_incremental_packs_for_stream;
@@ -1293,6 +1295,7 @@ pub async fn incremental_index(
                 .or_default()
                 .push((*seq as u64, key.as_slice()));
         }
+        let mut uploaded_term_packs: Vec<ContentId> = Vec::new();
         for (p_id, entries) in &by_pred {
             let existing: Vec<PackBranchEntry> = forward_packs
                 .iter()
@@ -1317,12 +1320,26 @@ pub async fn incremental_index(
                     .put(kind, &pack.bytes)
                     .await
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
+                uploaded_term_packs.push(pack_cid.clone());
                 updated.push(PackBranchEntry {
                     first_id: pack.first_id,
                     last_id: pack.last_id,
                     pack_cid,
                 });
             }
+            uploaded_term_packs.extend(
+                compact_forward_packs(
+                    content_store.as_ref(),
+                    kind,
+                    &mut updated,
+                    &mut pack_sizes,
+                    &mut compaction_budget,
+                    CompactionSpans::default(),
+                    &format!("term p_id={p_id}"),
+                )
+                .await?,
+            );
             if let Some(entry) = forward_packs.iter_mut().find(|(p, _)| p == p_id) {
                 entry.1 = updated;
             } else {
@@ -1330,6 +1347,21 @@ pub async fn incremental_index(
             }
         }
         forward_packs.sort_by_key(|(p, _)| *p);
+        // Packs a merge consumed: base packs no longer routed, and this
+        // cycle's uploads that a later merge absorbed.
+        let live: std::collections::HashSet<&ContentId> = forward_packs
+            .iter()
+            .flat_map(|(_, refs)| refs.iter().map(|r| &r.pack_cid))
+            .collect();
+        let mut consumed: Vec<ContentId> = base
+            .iter()
+            .flat_map(|b| b.forward_packs.iter())
+            .flat_map(|(_, refs)| refs.iter().map(|r| r.pack_cid.clone()))
+            .chain(uploaded_term_packs)
+            .filter(|cid| !live.contains(cid))
+            .collect();
+        consumed.sort();
+        consumed.dedup();
 
         let empty_tree = fluree_db_binary_index::DictTreeRefs {
             branch: fluree_db_core::ContentId::from_hex_digest(
@@ -1376,7 +1408,9 @@ pub async fn incremental_index(
             term_count = refs.term_count,
             "V6 Phase 3: triple-term dictionary updated"
         );
-        root_builder.set_term_dict(Some(refs), updated_tree.replaced_cids);
+        let mut replaced = updated_tree.replaced_cids;
+        replaced.extend(consumed);
+        root_builder.set_term_dict(Some(refs), replaced);
     }
 
     // Update metadata from resolver state.

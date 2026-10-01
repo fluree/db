@@ -729,3 +729,96 @@ async fn rdf_reifies_with_an_ordinary_object_is_refused() {
     };
     assert!(format!("{err}").contains("reifies"), "{err}");
 }
+
+/// Every incremental build appends a pack to each inner predicate's term
+/// stream that gained terms; compaction keeps that stream bounded, records
+/// the packs it merged away as garbage, and leaves every handle resolvable.
+#[tokio::test]
+async fn incremental_term_packs_are_compacted() {
+    use fluree_db_binary_index::format::index_root::IndexRoot;
+    use fluree_db_core::{ContentId, ContentStore};
+    use fluree_db_indexer::IndexerConfig;
+
+    const CYCLES: u64 = 12;
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/triple-term-links:term-pack-compaction";
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async {
+            let mut ledger = support::genesis_ledger(&fluree, ledger_id);
+            let mut roots: Vec<ContentId> = Vec::new();
+            for cycle in 0..CYCLES {
+                let turtle = format!(
+                    "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+                     ex:s{cycle} ex:val {cycle} ~ ex:r{cycle} {{| ex:src ex:x |}} .\n"
+                );
+                let r = fluree.upsert_turtle(ledger, &turtle).await.expect("claim");
+                support::trigger_index_and_wait(&handle, ledger_id, r.receipt.t).await;
+                support::wait_for_index_application(&fluree, ledger_id, r.receipt.t).await;
+                ledger = fluree.ledger(ledger_id).await.expect("reload");
+                let record = fluree
+                    .nameservice()
+                    .lookup(ledger_id)
+                    .await
+                    .expect("ns lookup")
+                    .expect("ns record");
+                roots.push(record.index_head_id.expect("index root"));
+            }
+
+            let cs = fluree.content_store(ledger_id);
+            let mut decoded = Vec::new();
+            for cid in &roots {
+                decoded.push(IndexRoot::decode(&cs.get(cid).await.expect("root")).expect("decode"));
+            }
+            let term_packs = |root: &IndexRoot| -> Vec<ContentId> {
+                root.term_dict
+                    .iter()
+                    .flat_map(|td| td.forward_packs.iter())
+                    .flat_map(|(_, refs)| refs.iter().map(|r| r.pack_cid.clone()))
+                    .collect()
+            };
+            let final_packs = term_packs(decoded.last().unwrap());
+            assert!(
+                final_packs.len() < CYCLES as usize,
+                "{} term packs after {CYCLES} appending builds: nothing was compacted",
+                final_packs.len()
+            );
+
+            let consumed: Vec<ContentId> = decoded
+                .iter()
+                .flat_map(term_packs)
+                .filter(|cid| !final_packs.contains(cid))
+                .collect();
+            assert!(!consumed.is_empty(), "no term pack was merged away");
+            let mut garbage = std::collections::HashSet::new();
+            for root in &decoded {
+                let Some(g) = root.garbage.as_ref() else {
+                    continue;
+                };
+                let record: fluree_db_indexer::GarbageRecord =
+                    serde_json::from_slice(&cs.get(&g.id).await.expect("garbage")).expect("parse");
+                garbage.extend(record.garbage);
+            }
+            for cid in &consumed {
+                assert!(
+                    garbage.contains(&cid.to_string()),
+                    "merged-away term pack {cid} reached no garbage record"
+                );
+            }
+
+            let got = links(&fluree, &ledger).await;
+            assert_eq!(got.len(), CYCLES as usize, "{got:#?}");
+            for cycle in 0..CYCLES {
+                assert!(
+                    got.iter().any(|row| row[0].ends_with(&format!("r{cycle}"))
+                        && row[1].contains(&format!("s{cycle}"))),
+                    "reifier r{cycle} lost its term: {got:#?}"
+                );
+            }
+        })
+        .await;
+}
