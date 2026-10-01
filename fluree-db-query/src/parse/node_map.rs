@@ -543,9 +543,6 @@ pub fn parse_node_map(
         match resolve_where_graph(raw, ctx)? {
             // The where's own default graph: the patterns match as they are.
             WhereGraph::Default => {
-                if ctx.in_any_graph_scope() {
-                    return Err(default_cannot_leave_a_graph());
-                }
                 return parse_node_map(
                     &inner_map,
                     ctx,
@@ -719,6 +716,9 @@ fn resolve_where_graph(raw: &str, ctx: &JsonLdParseCtx) -> Result<WhereGraph> {
     use WrittenGraphName as W;
 
     let env = &ctx.graph_names;
+    if let Some(refusal) = super::graph_name::reserved_graph_name(env, raw) {
+        return Err(ParseError::InvalidWhere(refusal));
+    }
     let ledger_graph = |iri: fn(&str) -> String| match env.ledger_id.as_deref() {
         Some(ledger) => WhereGraph::Named(iri(ledger)),
         None => WhereGraph::Named(raw.to_string()),
@@ -732,7 +732,18 @@ fn resolve_where_graph(raw: &str, ctx: &JsonLdParseCtx) -> Result<WhereGraph> {
         )? {
             W::Var(var) => WhereGraph::Named(var.to_string()),
             W::Alias { alias, .. } => WhereGraph::Named(alias.to_string()),
-            W::Default => WhereGraph::Default,
+            // `default` is the ledger's default graph, as in a template. It
+            // is the WHERE's own default graph unless the update reads
+            // another (`graph`, `from`); then the dataset names it. Either
+            // way a where pattern cannot leave an enclosing graph for it.
+            W::Default if ctx.in_any_graph_scope() => return Err(default_cannot_leave_a_graph()),
+            W::Default => match &env.ledger_default_graph {
+                Some(name) => {
+                    ctx.note_reads_ledger_default();
+                    WhereGraph::Named(name.clone())
+                }
+                None => WhereGraph::Default,
+            },
             W::Config => ledger_graph(config_graph_iri),
             W::TxnMeta => ledger_graph(txn_meta_graph_iri),
             W::Expanded(iri) if fluree_db_core::dataset_ref::GraphIri::parse(&iri).is_ok() => {
@@ -1750,7 +1761,6 @@ fn parse_nested_node_map(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         return match resolve_where_graph(raw, ctx)? {
-            WhereGraph::Default if ctx.in_any_graph_scope() => Err(default_cannot_leave_a_graph()),
             WhereGraph::Default => parse_nested_node_map(
                 &inner_map,
                 subject,

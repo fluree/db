@@ -561,39 +561,6 @@ fn parse_update(
     let allow_object_vars = has_where || has_values;
     let object_var_parsing = allow_object_vars && opts.object_var_parsing.unwrap_or(true);
 
-    // Parse WHERE clause using the query parser
-    // This reuses full pattern support (OPTIONAL, UNION, FILTER, etc.)
-    // Variables remain as strings in UnresolvedPattern; they'll be assigned VarIds
-    // during lowering in stage.rs using the same VarRegistry as INSERT/DELETE.
-    let where_patterns = if let Some(where_val) = obj.get("where") {
-        let mut query = UnresolvedQuery::new(context.clone());
-        let mut subject_counter: u32 = 0;
-        let mut nested_counter: u32 = 0;
-        let parse_policy = JsonLdParsePolicy {
-            strict_compact_iri: strict,
-        };
-        // Graph names in the WHERE resolve as in the templates: this ledger's
-        // keywords and the same `fromNamed` aliases.
-        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
-            .with_graph_names(fluree_db_query::parse::GraphNameEnv {
-                ledger_id: Some(ledger_id.to_string()),
-                aliases: from_named_aliases.clone(),
-            });
-        parse_where_with_counters(
-            where_val,
-            &ctx,
-            &mut query,
-            &mut subject_counter,
-            &mut nested_counter,
-            object_var_parsing,
-        )
-        .map_err(|e| TransactError::Parse(format!("WHERE clause: {e}")))?;
-
-        query.patterns
-    } else {
-        Vec::new()
-    };
-
     // The template clauses and VALUES share one blank-node issuer; they are
     // parsed a second time only when a user `_:bN` label collided with an
     // anonymous node's (see `BlankIssuer`).
@@ -621,6 +588,52 @@ fn parse_update(
         strict,
     )?
     .unwrap_or_else(|| clauses.template_root_iri.iter().cloned().collect());
+    // A where node's `"@graph": "default"` names the ledger's default graph,
+    // as a template's does. When the WHERE reads another default graph, the
+    // where reads it by its WHERE-dataset name.
+    let names_ledger_default = !where_reads_ledger_default(&where_default_graph_iris, ledger_id);
+    if from_named_aliases.contains_key(fluree_db_query::parse::LEDGER_DEFAULT_GRAPH) {
+        return Err(TransactError::Parse(format!(
+            "fromNamed alias \"{}\" is reserved: it names the ledger's default graph",
+            fluree_db_query::parse::LEDGER_DEFAULT_GRAPH
+        )));
+    }
+
+    // Parse WHERE clause using the query parser
+    // This reuses full pattern support (OPTIONAL, UNION, FILTER, etc.)
+    // Variables remain as strings in UnresolvedPattern; they'll be assigned VarIds
+    // during lowering in stage.rs using the same VarRegistry as INSERT/DELETE.
+    let (where_patterns, reads_ledger_default_by_name) = if let Some(where_val) = obj.get("where") {
+        let mut query = UnresolvedQuery::new(context.clone());
+        let mut subject_counter: u32 = 0;
+        let mut nested_counter: u32 = 0;
+        let parse_policy = JsonLdParsePolicy {
+            strict_compact_iri: strict,
+        };
+        // Graph names in the WHERE resolve as in the templates: this ledger's
+        // keywords, the same `fromNamed` aliases, and `default` for the
+        // ledger's default graph.
+        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
+            .with_graph_names(fluree_db_query::parse::GraphNameEnv {
+                ledger_id: Some(ledger_id.to_string()),
+                aliases: from_named_aliases.clone(),
+                ledger_default_graph: names_ledger_default
+                    .then(|| fluree_db_query::parse::LEDGER_DEFAULT_GRAPH.to_string()),
+            });
+        parse_where_with_counters(
+            where_val,
+            &ctx,
+            &mut query,
+            &mut subject_counter,
+            &mut nested_counter,
+            object_var_parsing,
+        )
+        .map_err(|e| TransactError::Parse(format!("WHERE clause: {e}")))?;
+
+        (query.patterns, ctx.reads_ledger_default())
+    } else {
+        (Vec::new(), false)
+    };
 
     let mut txn = Txn::update()
         .with_wheres(where_patterns)
@@ -633,10 +646,32 @@ fn parse_update(
     txn.template_default_graph = clauses.template_root_iri;
     txn.update_where_default_graph_iris = Some(where_default_graph_iris);
     txn.update_where_named_graphs = where_named_graphs;
+    txn.update_where_names_ledger_default = reads_ledger_default_by_name;
     if let Some(values) = clauses.values {
         txn = txn.with_values(values);
     }
     Ok(txn)
+}
+
+/// An update's VALUES may not bind the name its WHERE dataset gives the
+/// ledger's default graph: a `GRAPH ?g` would read that graph by it.
+fn refuse_reserved_values_name(value: &str) -> Result<()> {
+    if value == fluree_db_query::parse::LEDGER_DEFAULT_GRAPH {
+        return Err(TransactError::Parse(format!(
+            "values: {}",
+            fluree_db_query::parse::reserved_graph_name_refusal()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether an update's WHERE, reading `iris` as its default graph (empty:
+/// none named), reads the ledger's default graph and only it: no graph named,
+/// or each one this ledger's own address.
+fn where_reads_ledger_default(iris: &[String], ledger_id: &str) -> bool {
+    iris.is_empty()
+        || fluree_db_core::LedgerId::parse(ledger_id)
+            .is_ok_and(|ledger| iris.iter().all(|iri| crate::ir::names_ledger(&ledger, iri)))
 }
 
 /// The parts of an update that name blank nodes: the `graph` key's scope,
@@ -1562,7 +1597,10 @@ fn parse_values_cell(
                 )))
             }
         }
-        Value::String(s) => Ok(TemplateTerm::Value(FlakeValue::String(s.clone()))),
+        Value::String(s) => {
+            refuse_reserved_values_name(s)?;
+            Ok(TemplateTerm::Value(FlakeValue::String(s.clone())))
+        }
         Value::Object(map) => {
             if let Some(id_val) = map.get("@id") {
                 let id_str = id_val.as_str().ok_or_else(|| {
@@ -1570,6 +1608,7 @@ fn parse_values_cell(
                 })?;
                 let (expanded, _) =
                     fluree_graph_json_ld::details_with_policy(id_str, context, strict)?;
+                refuse_reserved_values_name(&expanded)?;
                 if expanded.starts_with("_:") {
                     // Stable Fluree blank-node ids address the existing node;
                     // other labels keep fresh-mint skolemization semantics.
@@ -1595,16 +1634,23 @@ fn parse_values_cell(
                     })?;
                     let (expanded, _) =
                         fluree_graph_json_ld::details_with_policy(id_str, context, strict)?;
+                    refuse_reserved_values_name(&expanded)?;
                     return Ok(TemplateTerm::Sid(ns_registry.sid_for_iri(&expanded)));
                 }
 
                 let expanded_type = expand_datatype_iri(type_val, context, strict)?;
                 let parsed = coerce_value_with_datatype(value_val, &expanded_type, ns_registry)?;
+                if let TemplateTerm::Value(FlakeValue::String(s)) = &parsed.term {
+                    refuse_reserved_values_name(s)?;
+                }
                 return Ok(parsed.term);
             }
 
             match value_val {
-                Value::String(s) => Ok(TemplateTerm::Value(FlakeValue::String(s.clone()))),
+                Value::String(s) => {
+                    refuse_reserved_values_name(s)?;
+                    Ok(TemplateTerm::Value(FlakeValue::String(s.clone())))
+                }
                 Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
                         Ok(TemplateTerm::Value(FlakeValue::Long(i)))

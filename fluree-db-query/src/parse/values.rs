@@ -120,7 +120,22 @@ pub fn parse_values_clause(values: &JsonValue, ctx: &JsonLdParseCtx) -> Result<U
 
         let mut out_row = Vec::with_capacity(var_count);
         for cell in cells {
-            out_row.push(parse_values_cell(cell, ctx)?);
+            let value = parse_values_cell(cell, ctx)?;
+            // A value an update's `GRAPH ?g` would read the ledger's default
+            // graph by: refused, as the name is when written.
+            if let UnresolvedValue::Iri(name)
+            | UnresolvedValue::Literal {
+                value: LiteralValue::String(name),
+                ..
+            } = &value
+            {
+                if let Some(refusal) =
+                    super::graph_name::reserved_graph_name(&ctx.graph_names, name)
+                {
+                    return Err(ParseError::InvalidWhere(refusal));
+                }
+            }
+            out_row.push(value);
         }
         rows.push(out_row);
     }

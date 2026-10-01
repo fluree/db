@@ -43,7 +43,10 @@ pub use ast::{
 };
 pub use encode::{IriEncoder, MemoryEncoder, NoEncoder};
 pub use error::{ParseError, Result};
-pub use graph_name::{classify_written_graph_name, GraphNameEnv, WrittenGraphName};
+pub use graph_name::{
+    classify_written_graph_name, reserved_graph_name, reserved_graph_name_refusal, GraphNameEnv,
+    WrittenGraphName, LEDGER_DEFAULT_GRAPH,
+};
 pub(crate) use lower::{lower_query, SelectMode};
 pub use lower::{lower_unresolved_pattern, lower_unresolved_patterns};
 pub use policy::{JsonLdParseCtx, JsonLdParsePolicy};
@@ -221,6 +224,7 @@ fn parse_query_ast_internal(
         GraphNameEnv {
             ledger_id: None,
             aliases: query_from_named_aliases(obj),
+            ledger_default_graph: None,
         },
     );
 

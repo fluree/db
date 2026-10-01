@@ -10,6 +10,30 @@ use fluree_db_core::dataset_ref::GraphSel;
 use fluree_graph_json_ld::{details_with_vocab_policy, ParsedContext};
 use std::collections::HashMap;
 
+/// The name an update's WHERE dataset gives the ledger's default graph when
+/// the WHERE's own default graph is another (a top-level `graph`, or `from`),
+/// so that a where node's `"@graph": "default"` reads the graph a template's
+/// `"default"` writes. It contains a space, which no IRI can, so no graph
+/// written under an IRI has it; an update refuses it as a graph name or VALUES
+/// value it writes ([`reserved_graph_name_refusal`]).
+pub const LEDGER_DEFAULT_GRAPH: &str = "@ledger default";
+
+/// The refusal for [`LEDGER_DEFAULT_GRAPH`] written as a graph name or a
+/// VALUES value in an update: there it names only the ledger's default graph,
+/// which a `where` reads by `"@graph": "default"`.
+pub fn reserved_graph_name_refusal() -> String {
+    format!(
+        "\"{LEDGER_DEFAULT_GRAPH}\" is reserved in an update for the ledger's default \
+         graph; write \"@graph\": \"default\" in the where"
+    )
+}
+
+/// In an update (`env.ledger_id` set), the refusal for `name` written as a
+/// graph name or VALUES value in its `where` ([`reserved_graph_name_refusal`]).
+pub fn reserved_graph_name(env: &GraphNameEnv, name: &str) -> Option<String> {
+    (env.ledger_id.is_some() && name == LEDGER_DEFAULT_GRAPH).then(reserved_graph_name_refusal)
+}
+
 /// What resolves a graph name beyond the `@context`: the ledger the document
 /// belongs to (for the `config` and `txn-meta` keywords) and the `fromNamed`
 /// aliases in scope. Empty for a document with neither, such as a query.
@@ -19,6 +43,11 @@ pub struct GraphNameEnv {
     pub ledger_id: Option<String>,
     /// `fromNamed` aliases, alias -> graph IRI.
     pub aliases: HashMap<String, String>,
+    /// Where `"default"` in a `where` is the ledger's default graph but not
+    /// the WHERE's own default graph, the dataset name that reads it
+    /// ([`LEDGER_DEFAULT_GRAPH`]). `None`: `"default"` is the WHERE's default
+    /// graph (an update without `graph` or `from`, or a query).
+    pub ledger_default_graph: Option<String>,
 }
 
 /// A graph name as written, classified by the one resolution order.

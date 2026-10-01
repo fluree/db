@@ -2957,6 +2957,23 @@ async fn stream_where_into_accumulator(
             named.push((composite_graph_key(&iri), g_id, false, iri));
         }
     }
+    // A JSON-LD update whose where reads the ledger's default graph by name
+    // (`"@graph": "default"` while the WHERE reads another default graph)
+    // adds that name to the dataset, never enumerated by `GRAPH ?g`. No graph
+    // written under an IRI has the name (it contains a space); a graph
+    // registered under it anyway is refused rather than shadowed.
+    if txn.update_where_names_ledger_default {
+        let reserved = fluree_db_query::parse::LEDGER_DEFAULT_GRAPH;
+        if named.iter().any(|(name, ..)| name.as_ref() == reserved) {
+            return Err(TransactError::Parse(format!(
+                "a graph is registered under the name \"{reserved}\", which this update's \
+                 where uses for the ledger's default graph; move that graph's data to a graph \
+                 with a valid IRI"
+            )));
+        }
+        let name: Arc<str> = Arc::from(reserved);
+        named.push((name.clone(), fluree_db_core::DEFAULT_GRAPH_ID, false, name));
+    }
     let mut seen_named_keys: HashSet<Arc<str>> = HashSet::new();
     let mut graph_aliases: HashMap<Arc<str>, Arc<str>> = HashMap::new();
     for (name, g_id, enumerable, canonical) in named {
