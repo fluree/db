@@ -644,6 +644,27 @@ async fn assert_object_types_survive(fluree: &fluree_db_api::Fluree, ledger: &Le
         got[0][0].ends_with("int") && got[1][0].ends_with("integer"),
         "{got:#?}"
     );
+    // The accessor's argument need not be a bare variable.
+    for select in [
+        "(DATATYPE(OBJECT(COALESCE(?t))) AS ?dt)",
+        "(DATATYPE(?o) AS ?dt)",
+    ] {
+        let got = run_link_query(
+            fluree,
+            ledger,
+            format!(
+                "SELECT {select} WHERE {{ ?r rdf:reifies ?t . \
+                 FILTER(PREDICATE(?t) = ex:size) BIND(OBJECT(COALESCE(?t)) AS ?o) }} \
+                 ORDER BY ?dt"
+            ),
+        )
+        .await;
+        assert_eq!(got.len(), 2, "{select}: {got:#?}");
+        assert!(
+            got[0][0].ends_with("int") && got[1][0].ends_with("integer"),
+            "{select}: {got:#?}"
+        );
+    }
 }
 
 /// `DATATYPE` and `LANG` over an accessor read the component the way a

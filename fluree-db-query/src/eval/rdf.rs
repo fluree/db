@@ -557,12 +557,12 @@ fn term_object_binding(
     ))
 }
 
-/// The component `SUBJECT|PREDICATE|OBJECT(?term)` names, as a binding: from
-/// the dictionary key when the term is a late-materialized handle (one
-/// lookup, no materialization), or from the term itself when it is
-/// materialized. Either way the object keeps its datatype or tag, so a
-/// `BIND`, `DATATYPE` or `LANG` over it sees what a bound variable would.
-/// `None` when the argument is not a variable bound to a term.
+/// The component `SUBJECT|PREDICATE|OBJECT(arg)` names, as a binding: from
+/// the dictionary key when the argument is a variable bound to a
+/// late-materialized handle (one lookup, no materialization), else from the
+/// term the argument evaluates to. Either way the object keeps its datatype
+/// or tag, so a `BIND`, `DATATYPE` or `LANG` over it sees what a bound
+/// variable would. `None` when the argument is not a term.
 pub(crate) fn term_component_binding<R: RowAccess>(
     func: &Function,
     args: &[Expression],
@@ -578,21 +578,29 @@ pub(crate) fn term_component_binding<R: RowAccess>(
         };
         return Ok(Some(binding));
     }
-    let [Expression::Var(v)] = args else {
-        return Ok(None);
+    let name = match func {
+        Function::TripleSubject => "SUBJECT",
+        Function::TriplePredicate => "PREDICATE",
+        Function::TripleObject => "OBJECT",
+        _ => return Ok(None),
     };
-    let Some(Binding::Lit {
-        val: fluree_db_core::FlakeValue::TripleTerm(term),
-        ..
-    }) = row.get(*v)
-    else {
-        return Ok(None);
+    let term = match args {
+        [Expression::Var(v)] => match row.get(*v) {
+            Some(Binding::Lit {
+                val: fluree_db_core::FlakeValue::TripleTerm(term),
+                ..
+            }) => term.as_ref().clone(),
+            _ => return Ok(None),
+        },
+        _ => match triple_term_arg(args, row, ctx, name)? {
+            Some(term) => term,
+            None => return Ok(None),
+        },
     };
     Ok(Some(match func {
-        Function::TripleSubject => Binding::sid(term.s.clone()),
-        Function::TriplePredicate => Binding::sid(term.p.clone()),
-        Function::TripleObject => materialized_term_object(term),
-        _ => return Ok(None),
+        Function::TripleSubject => Binding::sid(term.s),
+        Function::TriplePredicate => Binding::sid(term.p),
+        _ => materialized_term_object(&term),
     }))
 }
 
@@ -616,7 +624,7 @@ fn materialized_term_object(term: &fluree_db_core::TripleTermValue) -> Binding {
 }
 
 /// One accessor: the component's binding converted exactly as a bound
-/// variable is, else the value path for a non-variable argument.
+/// variable is.
 fn eval_term_accessor<R: RowAccess>(
     func: Function,
     args: &[Expression],
@@ -625,21 +633,10 @@ fn eval_term_accessor<R: RowAccess>(
     name: &str,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 1, name)?;
-    if let Some(binding) = term_component_binding(&func, args, row, ctx)? {
-        return super::binding_to_comparable(Some(&binding), ctx);
+    match term_component_binding(&func, args, row, ctx)? {
+        Some(binding) => super::binding_to_comparable(Some(&binding), ctx),
+        None => Ok(None),
     }
-    if matches!(args[0], Expression::Var(_)) {
-        return Ok(None);
-    }
-    let Some(term) = triple_term_arg(args, row, ctx, name)? else {
-        return Ok(None);
-    };
-    let binding = match func {
-        Function::TripleSubject => Binding::sid(term.s),
-        Function::TriplePredicate => Binding::sid(term.p),
-        _ => materialized_term_object(&term),
-    };
-    super::binding_to_comparable(Some(&binding), ctx)
 }
 
 pub fn eval_triple_subject<R: RowAccess>(
