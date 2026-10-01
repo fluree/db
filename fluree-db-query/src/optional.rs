@@ -3064,6 +3064,16 @@ impl Operator for OptionalOperator {
             return Ok(None);
         }
 
+        // The per-row path returns as soon as one required row's matches are
+        // drained, so its batches hold a row or a few. Columns sized for
+        // `batch_size` would keep ~1,000 slots per column per required row
+        // alive in every consumer that buffers the output (#1973: 160+ KB
+        // per required row). Size them to their rows.
+        if rows_added < batch_size / 2 {
+            for column in &mut output_columns {
+                column.shrink_to_fit();
+            }
+        }
         let batch = Batch::new(self.combined_schema.clone(), output_columns)?;
         if should_debug {
             tracing::debug!(
@@ -4053,6 +4063,76 @@ mod tests {
         fn unmatched_optional(&self) -> UnmatchedOptional {
             UnmatchedOptional::default()
         }
+    }
+
+    /// A builder that answers every row on the per-row path, as a miss.
+    struct PerRowMissBuilder {
+        schema: Arc<[VarId]>,
+        opt_only: Vec<VarId>,
+    }
+    #[async_trait]
+    impl OptionalBuilder for PerRowMissBuilder {
+        fn build(
+            &self,
+            _r: &Batch,
+            _row: usize,
+            _ctx: &ExecutionContext<'_>,
+        ) -> Result<Option<BoxedOperator>> {
+            Ok(None)
+        }
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        fn optional_only_vars(&self) -> &[VarId] {
+            &self.opt_only
+        }
+        fn unify_instructions(&self) -> &[UnifyInstruction] {
+            &[]
+        }
+        fn unmatched_optional(&self) -> UnmatchedOptional {
+            UnmatchedOptional::default()
+        }
+    }
+
+    /// #1973: the per-row path hands back a batch per required row; those
+    /// batches must not carry columns sized for a full `batch_size`.
+    #[test]
+    fn per_row_output_batches_are_sized_to_their_rows() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let rs: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let required = MultiBatchOp {
+            batches: [iri_batch(&rs, &["a", "b", "c"])].into_iter().collect(),
+        };
+        let opt = VarId(1);
+        let builder = PerRowMissBuilder {
+            schema: Arc::from(vec![VarId(0), opt].into_boxed_slice()),
+            opt_only: vec![opt],
+        };
+        let mut op =
+            OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        assert!(ctx.batch_size >= 100, "batch size {}", ctx.batch_size);
+
+        let rows = futures::executor::block_on(async {
+            op.open(&ctx).await.unwrap();
+            let mut rows = 0;
+            while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+                let (_, columns, len) = batch.into_parts();
+                for column in &columns {
+                    assert!(
+                        column.capacity() <= len.max(4) * 2,
+                        "{len}-row batch keeps a column of capacity {}",
+                        column.capacity()
+                    );
+                }
+                rows += len;
+            }
+            rows
+        });
+        assert_eq!(rows, 3);
     }
 
     fn iri_batch(schema: &Arc<[VarId]>, vals: &[&str]) -> Batch {
