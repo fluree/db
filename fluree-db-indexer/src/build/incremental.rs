@@ -989,8 +989,16 @@ pub async fn incremental_index(
     }
 
     // One compaction budget per cycle, shared by every forward-pack stream.
+    // The term dictionary's streams are served last, so they get a reserved
+    // share (one of three dictionaries) plus whatever the others leave.
     let mut compaction_budget = if compaction_enabled() {
         CompactionBudget::new()
+    } else {
+        CompactionBudget::disabled()
+    };
+    let mut term_budget = if novelty.base_root.term_dict.is_some() || !novelty.new_terms.is_empty()
+    {
+        compaction_budget.split_off(3)
     } else {
         CompactionBudget::disabled()
     };
@@ -1275,142 +1283,81 @@ pub async fn incremental_index(
     root_builder.set_dict_refs(new_dict_refs);
 
     // Triple-term dictionary: append this window's new terms to each inner
-    // predicate's pack stream, then compact the streams that grew, as for
-    // subjects; the reverse tree is updated copy-on-write like the subject tree.
-    if !novelty.new_terms.is_empty() {
-        use fluree_db_binary_index::dict::forward_pack::KIND_TERM_FWD;
-        use fluree_db_binary_index::dict::incremental::build_incremental_packs_for_stream;
-        use fluree_db_binary_index::dict::term_dict::pack_ns_code;
-        use fluree_db_binary_index::format::wire_helpers::PackBranchEntry;
-        let base = novelty.base_root.term_dict.clone();
-        let mut forward_packs: Vec<(u32, Vec<PackBranchEntry>)> = base
-            .as_ref()
-            .map(|b| b.forward_packs.clone())
-            .unwrap_or_default();
-        let mut by_pred: std::collections::BTreeMap<u32, Vec<(u64, &[u8])>> =
-            std::collections::BTreeMap::new();
-        for (p_id, seq, key) in &novelty.new_terms {
-            by_pred
-                .entry(*p_id)
-                .or_default()
-                .push((*seq as u64, key.as_slice()));
-        }
-        let mut uploaded_term_packs: Vec<ContentId> = Vec::new();
-        for (p_id, entries) in &by_pred {
-            let existing: Vec<PackBranchEntry> = forward_packs
-                .iter()
-                .find(|(p, _)| p == p_id)
-                .map(|(_, refs)| refs.clone())
-                .unwrap_or_default();
-            let pack_result = build_incremental_packs_for_stream(
-                KIND_TERM_FWD,
-                pack_ns_code(*p_id),
-                &existing,
-                entries,
-            )
-            .map_err(|e| {
-                IndexerError::StorageWrite(format!("term fwd pack build p_id={p_id}: {e}"))
-            })?;
-            let kind = ContentKind::DictBlob {
-                dict: fluree_db_core::DictKind::TermForward { p_id: *p_id },
-            };
-            let mut updated = existing;
-            for pack in &pack_result.new_packs {
-                let pack_cid = content_store
-                    .put(kind, &pack.bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
-                uploaded_term_packs.push(pack_cid.clone());
-                updated.push(PackBranchEntry {
-                    first_id: pack.first_id,
-                    last_id: pack.last_id,
-                    pack_cid,
-                });
-            }
-            uploaded_term_packs.extend(
-                compact_forward_packs(
-                    content_store.as_ref(),
-                    kind,
-                    &mut updated,
-                    &mut pack_sizes,
-                    &mut compaction_budget,
-                    CompactionSpans::default(),
-                    &format!("term p_id={p_id}"),
-                )
-                .await?,
-            );
-            if let Some(entry) = forward_packs.iter_mut().find(|(p, _)| p == p_id) {
-                entry.1 = updated;
-            } else {
-                forward_packs.push((*p_id, updated));
-            }
-        }
-        forward_packs.sort_by_key(|(p, _)| *p);
-        // Packs a merge consumed: base packs no longer routed, and this
-        // cycle's uploads that a later merge absorbed.
-        let live: std::collections::HashSet<&ContentId> = forward_packs
-            .iter()
-            .flat_map(|(_, refs)| refs.iter().map(|r| &r.pack_cid))
-            .collect();
-        let mut consumed: Vec<ContentId> = base
-            .iter()
-            .flat_map(|b| b.forward_packs.iter())
-            .flat_map(|(_, refs)| refs.iter().map(|r| r.pack_cid.clone()))
-            .chain(uploaded_term_packs)
-            .filter(|cid| !live.contains(cid))
-            .collect();
-        consumed.sort();
-        consumed.dedup();
+    // predicate's pack stream and compact, as for subjects; the reverse tree is
+    // updated copy-on-write like the subject tree. A cycle without new terms
+    // still compacts streams an earlier cycle left fragmented.
+    let base_terms = novelty.base_root.term_dict.clone();
+    if !novelty.new_terms.is_empty() || base_terms.is_some() {
+        term_budget.absorb(std::mem::replace(
+            &mut compaction_budget,
+            CompactionBudget::disabled(),
+        ));
+        let (forward_packs, consumed) = update_term_forward_packs(
+            content_store.as_ref(),
+            base_terms.as_ref(),
+            &novelty.new_terms,
+            base_root.index_t.unsigned_abs(),
+            &mut pack_sizes,
+            &mut term_budget,
+        )
+        .await?;
 
-        let empty_tree = fluree_db_binary_index::DictTreeRefs {
-            branch: fluree_db_core::ContentId::from_hex_digest(
-                fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
-                &fluree_db_core::sha256_hex(b""),
-            )
-            .expect("valid digest"),
-            leaves: Vec::new(),
-        };
-        let (base_reverse, base_count) = match &base {
-            Some(b) => (b.reverse.clone(), b.term_count),
-            None => (empty_tree, 0),
-        };
-        let updated_tree = if base.is_some() {
-            super::dicts::upload_incremental_reverse_tree_async_terms(
-                content_store.as_ref(),
-                &base_reverse,
-                &novelty.new_terms,
-                warm_cache.as_deref(),
-            )
-            .await?
+        if novelty.new_terms.is_empty() {
+            // Maintenance only: the dictionary changed if a merge ran.
+            if let (Some(mut refs), false) = (base_terms, consumed.is_empty()) {
+                refs.forward_packs = forward_packs;
+                root_builder.set_term_dict(Some(refs), consumed);
+            }
         } else {
-            // No base dictionary: build the tree from scratch through the
-            // same core, against an empty existing tree.
-            super::dicts::upload_incremental_reverse_tree_async_terms(
-                content_store.as_ref(),
-                &fluree_db_binary_index::DictTreeRefs {
-                    branch: base_reverse.branch.clone(),
-                    leaves: Vec::new(),
-                },
-                &novelty.new_terms,
-                warm_cache.as_deref(),
-            )
-            .await?
-        };
-        let refs = fluree_db_binary_index::TermDictRefs {
-            forward_packs,
-            reverse: updated_tree.tree_refs,
-            watermarks: novelty.term_watermarks.clone(),
-            term_count: base_count + novelty.new_terms.len() as u64,
-        };
-        tracing::debug!(
-            new_terms = novelty.new_terms.len(),
-            term_count = refs.term_count,
-            "V6 Phase 3: triple-term dictionary updated"
-        );
-        let mut replaced = updated_tree.replaced_cids;
-        replaced.extend(consumed);
-        root_builder.set_term_dict(Some(refs), replaced);
+            let empty_tree = fluree_db_binary_index::DictTreeRefs {
+                branch: fluree_db_core::ContentId::from_hex_digest(
+                    fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
+                    &fluree_db_core::sha256_hex(b""),
+                )
+                .expect("valid digest"),
+                leaves: Vec::new(),
+            };
+            let (base_reverse, base_count) = match &base_terms {
+                Some(b) => (b.reverse.clone(), b.term_count),
+                None => (empty_tree, 0),
+            };
+            let updated_tree = if base_terms.is_some() {
+                super::dicts::upload_incremental_reverse_tree_async_terms(
+                    content_store.as_ref(),
+                    &base_reverse,
+                    &novelty.new_terms,
+                    warm_cache.as_deref(),
+                )
+                .await?
+            } else {
+                // No base dictionary: build the tree from scratch through the
+                // same core, against an empty existing tree.
+                super::dicts::upload_incremental_reverse_tree_async_terms(
+                    content_store.as_ref(),
+                    &fluree_db_binary_index::DictTreeRefs {
+                        branch: base_reverse.branch.clone(),
+                        leaves: Vec::new(),
+                    },
+                    &novelty.new_terms,
+                    warm_cache.as_deref(),
+                )
+                .await?
+            };
+            let refs = fluree_db_binary_index::TermDictRefs {
+                forward_packs,
+                reverse: updated_tree.tree_refs,
+                watermarks: novelty.term_watermarks.clone(),
+                term_count: base_count + novelty.new_terms.len() as u64,
+            };
+            tracing::debug!(
+                new_terms = novelty.new_terms.len(),
+                term_count = refs.term_count,
+                "V6 Phase 3: triple-term dictionary updated"
+            );
+            let mut replaced = updated_tree.replaced_cids;
+            replaced.extend(consumed);
+            root_builder.set_term_dict(Some(refs), replaced);
+        }
     }
 
     // Update metadata from resolver state.
@@ -4335,6 +4282,22 @@ impl CompactionBudget {
         granted
     }
 
+    /// Split off `1 / divisor` of what remains, for streams that must not be
+    /// starved by the ones served before them.
+    fn split_off(&mut self, divisor: u64) -> Self {
+        let bytes = self.bytes / divisor;
+        let requests = self.requests / divisor as usize;
+        self.bytes -= bytes;
+        self.requests -= requests;
+        Self { bytes, requests }
+    }
+
+    /// Take over what another budget left unspent.
+    fn absorb(&mut self, other: Self) {
+        self.bytes += other.bytes;
+        self.requests += other.requests;
+    }
+
     /// Reserve exactly `n` operations, or nothing at all.
     ///
     /// A merge is indivisible — it either fetches every input pack or does not
@@ -4421,6 +4384,137 @@ async fn pack_encoded_sizes(
 
     // Truncate at the first unknown: the planner needs a contiguous prefix.
     sizes.into_iter().map_while(|s| s).collect()
+}
+
+/// Append new terms to their inner predicates' pack streams and compact:
+/// the streams that grew first, then the others in rotation (by `rotation`,
+/// so no cursor is persisted), until `budget` runs out. Returns the routing
+/// table and the packs a merge consumed (base packs no longer routed, and this
+/// cycle's uploads a later merge absorbed), which are garbage.
+async fn update_term_forward_packs(
+    content_store: &dyn ContentStore,
+    base: Option<&fluree_db_binary_index::TermDictRefs>,
+    new_terms: &[(u32, u32, Vec<u8>)],
+    rotation: u64,
+    pack_sizes: &mut PackSizeCache,
+    budget: &mut CompactionBudget,
+) -> Result<(
+    Vec<(u32, Vec<fluree_db_binary_index::PackBranchEntry>)>,
+    Vec<ContentId>,
+)> {
+    use fluree_db_binary_index::dict::forward_pack::KIND_TERM_FWD;
+    use fluree_db_binary_index::dict::incremental::build_incremental_packs_for_stream;
+    use fluree_db_binary_index::dict::term_dict::pack_ns_code;
+    use fluree_db_binary_index::PackBranchEntry;
+
+    let kind = |p_id: u32| ContentKind::DictBlob {
+        dict: fluree_db_core::DictKind::TermForward { p_id },
+    };
+    let mut forward_packs: Vec<(u32, Vec<PackBranchEntry>)> =
+        base.map(|b| b.forward_packs.clone()).unwrap_or_default();
+    let mut by_pred: std::collections::BTreeMap<u32, Vec<(u64, &[u8])>> =
+        std::collections::BTreeMap::new();
+    for (p_id, seq, key) in new_terms {
+        by_pred
+            .entry(*p_id)
+            .or_default()
+            .push((u64::from(*seq), key.as_slice()));
+    }
+
+    let mut uploaded: Vec<ContentId> = Vec::new();
+    for (p_id, entries) in &by_pred {
+        let existing: Vec<PackBranchEntry> = forward_packs
+            .iter()
+            .find(|(p, _)| p == p_id)
+            .map(|(_, refs)| refs.clone())
+            .unwrap_or_default();
+        let pack_result = build_incremental_packs_for_stream(
+            KIND_TERM_FWD,
+            pack_ns_code(*p_id),
+            &existing,
+            entries,
+        )
+        .map_err(|e| IndexerError::StorageWrite(format!("term fwd pack build p_id={p_id}: {e}")))?;
+        let mut updated = existing;
+        for pack in &pack_result.new_packs {
+            let pack_cid = content_store
+                .put(kind(*p_id), &pack.bytes)
+                .await
+                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+            pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
+            uploaded.push(pack_cid.clone());
+            updated.push(PackBranchEntry {
+                first_id: pack.first_id,
+                last_id: pack.last_id,
+                pack_cid,
+            });
+        }
+        uploaded.extend(
+            compact_forward_packs(
+                content_store,
+                kind(*p_id),
+                &mut updated,
+                pack_sizes,
+                budget,
+                CompactionSpans::default(),
+                &format!("term p_id={p_id}"),
+            )
+            .await?,
+        );
+        if let Some(entry) = forward_packs.iter_mut().find(|(p, _)| p == p_id) {
+            entry.1 = updated;
+        } else {
+            forward_packs.push((*p_id, updated));
+        }
+    }
+
+    // Maintenance: a stream that went quiet keeps whatever fragmentation an
+    // earlier cycle could not afford to merge.
+    let mut quiet: Vec<u32> = forward_packs
+        .iter()
+        .filter(|(p, refs)| refs.len() > 1 && !by_pred.contains_key(p))
+        .map(|(p, _)| *p)
+        .collect();
+    if !quiet.is_empty() {
+        let offset = (rotation as usize) % quiet.len();
+        quiet.rotate_left(offset);
+    }
+    for p_id in quiet {
+        if budget.exhausted() {
+            break;
+        }
+        let Some(entry) = forward_packs.iter_mut().find(|(p, _)| *p == p_id) else {
+            continue;
+        };
+        uploaded.extend(
+            compact_forward_packs(
+                content_store,
+                kind(p_id),
+                &mut entry.1,
+                pack_sizes,
+                budget,
+                CompactionSpans::default(),
+                &format!("term p_id={p_id} (maintenance)"),
+            )
+            .await?,
+        );
+    }
+    forward_packs.sort_by_key(|(p, _)| *p);
+
+    let live: std::collections::HashSet<&ContentId> = forward_packs
+        .iter()
+        .flat_map(|(_, refs)| refs.iter().map(|r| &r.pack_cid))
+        .collect();
+    let mut consumed: Vec<ContentId> = base
+        .iter()
+        .flat_map(|b| b.forward_packs.iter())
+        .flat_map(|(_, refs)| refs.iter().map(|r| r.pack_cid.clone()))
+        .chain(uploaded)
+        .filter(|cid| !live.contains(cid))
+        .collect();
+    consumed.sort();
+    consumed.dedup();
+    Ok((forward_packs, consumed))
 }
 
 /// Merge qualifying runs within one forward-dictionary stream, in place.
@@ -4980,6 +5074,82 @@ mod compaction_tests {
             next += 2; // contiguous
         }
         refs
+    }
+
+    /// Upload one small term pack of predicate `p_id` covering
+    /// `[first_seq, first_seq + count)`.
+    async fn put_term_pack(
+        store: &dyn ContentStore,
+        p_id: u32,
+        first_seq: u64,
+        count: usize,
+    ) -> PackBranchEntry {
+        use fluree_db_binary_index::dict::forward_pack::KIND_TERM_FWD;
+        use fluree_db_binary_index::dict::term_dict::pack_ns_code;
+        let owned: Vec<(u64, Vec<u8>)> = (0..count)
+            .map(|i| (first_seq + i as u64, vec![i as u8; 22]))
+            .collect();
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let bytes = encode_forward_pack(&refs, KIND_TERM_FWD, pack_ns_code(p_id), 512).unwrap();
+        let kind = ContentKind::DictBlob {
+            dict: fluree_db_core::DictKind::TermForward { p_id },
+        };
+        PackBranchEntry {
+            first_id: first_seq,
+            last_id: first_seq + count as u64 - 1,
+            pack_cid: store.put(kind, &bytes).await.unwrap(),
+        }
+    }
+
+    /// A term stream fragmented by earlier cycles is compacted in a cycle
+    /// that brings it no terms, from the term dictionary's reserved share
+    /// even when the other dictionaries spent the rest of the budget.
+    #[tokio::test]
+    async fn quiet_term_streams_are_compacted_from_their_share() {
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let mut fragmented = Vec::new();
+        for i in 0..9u64 {
+            fragmented.push(put_term_pack(&store, 7, i * 3, 3).await);
+        }
+        let single = vec![put_term_pack(&store, 9, 0, 3).await];
+        let base = fluree_db_binary_index::TermDictRefs {
+            forward_packs: vec![(7, fragmented.clone()), (9, single.clone())],
+            reverse: fluree_db_binary_index::DictTreeRefs {
+                branch: fragmented[0].pack_cid.clone(),
+                leaves: Vec::new(),
+            },
+            watermarks: vec![(7, 26), (9, 2)],
+            term_count: 30,
+        };
+
+        let mut cycle = CompactionBudget::new();
+        let mut terms = cycle.split_off(3);
+        cycle.requests = 0;
+        terms.absorb(cycle);
+
+        let (packs, consumed) = update_term_forward_packs(
+            &store,
+            Some(&base),
+            &[],
+            42,
+            &mut PackSizeCache::new(),
+            &mut terms,
+        )
+        .await
+        .expect("maintenance");
+        let stream = |p: u32| &packs.iter().find(|(q, _)| *q == p).unwrap().1;
+        assert!(stream(7).len() < fragmented.len(), "{:?}", stream(7));
+        assert_eq!(stream(7).first().unwrap().first_id, 0);
+        assert_eq!(stream(7).last().unwrap().last_id, 26);
+        assert_eq!(stream(9), &single, "a single-pack stream is left alone");
+        assert!(!consumed.is_empty());
+        assert!(
+            consumed
+                .iter()
+                .all(|cid| fragmented.iter().any(|e| &e.pack_cid == cid)),
+            "only merged-away packs are garbage: {consumed:?}"
+        );
     }
 
     #[tokio::test]
