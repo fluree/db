@@ -15,7 +15,7 @@
 //! use fluree_db_api::{FlureeBuilder, GraphDb};
 //!
 //! // Create a file-backed Fluree instance
-//! let fluree = FlureeBuilder::file("/data/fluree").build()?;
+//! let fluree = FlureeBuilder::file("/data/fluree").build_async().await?;
 //!
 //! // Create a new ledger
 //! let ledger = fluree.create_ledger("mydb").await?;

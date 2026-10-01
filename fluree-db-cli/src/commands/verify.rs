@@ -10,7 +10,7 @@ pub async fn run(
     dirs: &FlureeDir,
 ) -> CliResult<()> {
     let alias = context::resolve_ledger(ledger, dirs)?;
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let ledger_id = context::to_ledger_id(&alias)?;
 
     let report = fluree.verify_ledger(&ledger_id, limit).await.map_err(|e| {
