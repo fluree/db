@@ -32,6 +32,18 @@ pub fn pack_ns_code(p_id: u32) -> u16 {
     (p_id & 0xFFFF) as u16
 }
 
+/// The smallest reverse key past every key of subject `s_id`.
+fn next_subject(s_id: u64) -> [u8; TermKey::LEN] {
+    match s_id.checked_add(1) {
+        Some(next) => {
+            let mut end = [0u8; TermKey::LEN];
+            end[..8].copy_from_slice(&next.to_be_bytes());
+            end
+        }
+        None => [0xFF; TermKey::LEN],
+    }
+}
+
 // ── Reader ──────────────────────────────────────────────────────────────────
 
 /// Read side of the triple-term dictionary.
@@ -130,6 +142,65 @@ impl TermDictReader {
             }
             None => Ok(vec![None; keys.len()]),
         }
+    }
+
+    /// Every term whose base edge has subject `s_id` (and predicate `p_id`,
+    /// when given), with its handle: one range over the subject-first reverse
+    /// tree, which yields the keys themselves, so nothing is decoded.
+    pub fn terms_with_subject(
+        &self,
+        s_id: u64,
+        p_id: Option<u32>,
+    ) -> io::Result<Vec<(TermKey, u64)>> {
+        let Some(tree) = &self.reverse else {
+            return Ok(Vec::new());
+        };
+        let mut start = [0u8; TermKey::LEN];
+        start[..8].copy_from_slice(&s_id.to_be_bytes());
+        let mut end = [0u8; TermKey::LEN];
+        // Exclusive end: the next subject, or the next predicate of this one.
+        match p_id {
+            Some(p) => {
+                start[8..12].copy_from_slice(&p.to_be_bytes());
+                match p.checked_add(1) {
+                    Some(next) => {
+                        end[..8].copy_from_slice(&s_id.to_be_bytes());
+                        end[8..12].copy_from_slice(&next.to_be_bytes());
+                    }
+                    None => end = next_subject(s_id),
+                }
+            }
+            None => end = next_subject(s_id),
+        }
+        tree.reverse_range_scan(&start, &end)?
+            .into_iter()
+            .map(|(bytes, handle)| {
+                TermKey::from_be_bytes(&bytes)
+                    .map(|key| (key, handle))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "term reverse key has the wrong width",
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// Every term of inner predicate `p_id`, with its handle, read through the
+    /// forward packs in sequence order.
+    pub fn terms_of_predicate(&self, p_id: u32) -> io::Result<Vec<(TermKey, u64)>> {
+        let Some(watermark) = self.watermark(p_id) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(watermark as usize + 1);
+        for seq in 0..=watermark {
+            let handle = term_handle(p_id, seq);
+            if let Some(key) = self.resolve(handle)? {
+                out.push((key, handle));
+            }
+        }
+        Ok(out)
     }
 
     /// The encoded base edge behind `handle`, or `None` for an unknown handle.
@@ -418,6 +489,63 @@ mod tests {
         assert_eq!(reader.prewarm(u64::MAX), len_a + len_b);
         assert_eq!(reader.prewarm(len_a + len_b / 2), len_a + len_b / 2);
         assert_eq!(reader.prewarm(0), 0);
+    }
+
+    /// A subject prefix (and subject + predicate prefix) selects exactly its
+    /// terms, across leaves, at the edges of the key space too.
+    #[test]
+    fn terms_with_subject_reads_the_prefix_range() {
+        use crate::dict::builder::build_reverse_tree;
+        use crate::dict::reader::DictTreeReader;
+        let keys = [
+            key(4, 9, 1),
+            key(5, 2, 7),
+            key(5, 9, 1),
+            key(5, 9, 2),
+            key(5, u32::MAX, 3),
+            key(6, 0, 0),
+            key(u64::MAX, 1, 1),
+        ];
+        let mut entries: Vec<ReverseEntry> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ReverseEntry {
+                key: k.to_be_bytes().to_vec(),
+                id: i as u64 + 100,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let built = build_reverse_tree(entries, 64).unwrap();
+        let leaves = built
+            .leaves
+            .iter()
+            .zip(&built.branch.leaves)
+            .map(|(leaf, entry)| (entry.address.clone(), leaf.bytes.clone()))
+            .collect();
+        assert!(built.branch.leaves.len() > 1, "the range must cross leaves");
+        let reader = TermDictReader {
+            forward: BTreeMap::new(),
+            reverse: Some(Arc::new(DictTreeReader::from_memory(built.branch, leaves))),
+            watermarks: HashMap::new(),
+            term_count: keys.len() as u64,
+        };
+        let handles = |s: u64, p: Option<u32>| -> Vec<u64> {
+            reader
+                .terms_with_subject(s, p)
+                .unwrap()
+                .into_iter()
+                .map(|(k, h)| {
+                    assert_eq!(k, keys[(h - 100) as usize]);
+                    h
+                })
+                .collect()
+        };
+        assert_eq!(handles(5, None), vec![101, 102, 103, 104]);
+        assert_eq!(handles(5, Some(9)), vec![102, 103]);
+        assert_eq!(handles(5, Some(u32::MAX)), vec![104]);
+        assert_eq!(handles(5, Some(3)), Vec::<u64>::new());
+        assert_eq!(handles(u64::MAX, None), vec![106]);
+        assert_eq!(handles(7, None), Vec::<u64>::new());
     }
 
     #[test]

@@ -908,3 +908,62 @@ async fn link_lowering_joins_chained_edges_when_only_counted() {
         "{got:#?}"
     );
 }
+
+/// A quoted edge whose subject a previous edge bound is found through its
+/// components (the reverse tree's subject prefix) and its link read as a
+/// bound-object lookup, rather than every link of the predicate being read
+/// and decoded per input row. (Which edge leads is a cost decision; on three
+/// links the first edge's scan is cheapest.)
+#[tokio::test]
+async fn link_lowering_drives_chained_edges_through_their_subjects() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let alias = "it/triple-term-links:chained-plan";
+    let (fluree, _ledger) = import(&[("chained.ttl", CHAINED_CLAIMS)], alias).await;
+    let view = fluree.db(alias).await.expect("view");
+    let plan = fluree
+        .explain_sparql(
+            &view,
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT (COUNT(*) AS ?n) WHERE { \
+             << ex:a ex:p ?o1 >> ex:src ?s1 . << ?o1 ex:q ?o2 >> ex:src ?s2 }",
+        )
+        .await
+        .expect("explain");
+
+    /// The `TermComponentsOperator` for `term` in this subtree, if any.
+    fn components_for<'a>(node: &'a JsonValue, term: &str) -> Option<&'a JsonValue> {
+        if node["op"] == "TermComponentsOperator" && node["details"]["term"] == term {
+            return Some(node);
+        }
+        node["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|c| components_for(&c["node"], term))
+    }
+    fn link_joins(node: &JsonValue, out: &mut Vec<JsonValue>) {
+        if node["op"] == "NestedLoopJoinOperator"
+            && node["details"]["right"]
+                .as_str()
+                .is_some_and(|r| r.contains("reifies"))
+        {
+            out.push(node.clone());
+        }
+        for c in node["children"].as_array().into_iter().flatten() {
+            link_joins(&c["node"], out);
+        }
+    }
+    let mut joins = Vec::new();
+    link_joins(&plan["plan"]["physical"], &mut joins);
+    assert!(
+        !joins.is_empty(),
+        "the chained link must be a lookup: {plan:#}"
+    );
+    for join in &joins {
+        let right = join["details"]["right"].as_str().unwrap();
+        let term = right.rsplit(' ').next().unwrap();
+        let components = components_for(join, term)
+            .unwrap_or_else(|| panic!("link {right} was read without its components: {plan:#}"));
+        assert_eq!(components["details"]["access"], "subject", "{plan:#}");
+    }
+}

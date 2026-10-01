@@ -578,6 +578,10 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
             let var_names: Vec<String> = sq.select.iter().map(|v| format!("?v{}", v.0)).collect();
             format!("SUBQUERY SELECT {} {{ ... }}", var_names.join(" "))
         }
+        Pattern::TermComponents(tc) => format!(
+            "TERM COMPONENTS ?v{} ({:?} {:?} {:?})",
+            tc.term.0, tc.subject, tc.predicate, tc.object
+        ),
         Pattern::PropertyPath(pp) => format!(
             "PROPERTY PATH {} {:?}",
             format_ref(&pp.subject),

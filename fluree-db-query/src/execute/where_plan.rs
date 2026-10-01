@@ -104,6 +104,7 @@ pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
         Pattern::DefaultGraphSource { patterns } => pattern_tree_has_edge_annotation(patterns),
         Pattern::Triple(_)
         | Pattern::PropertyPath(_)
+        | Pattern::TermComponents(_)
         | Pattern::ShortestPath(_)
         | Pattern::Filter(_)
         | Pattern::Bind { .. }
@@ -776,6 +777,12 @@ pub fn collect_var_stats(
                 }
                 Pattern::PropertyPath(pp) => {
                     for v in pp.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
+                Pattern::TermComponents(tc) => {
+                    for v in tc.referenced_vars() {
                         bump_count(counts, v);
                         vars.insert(v);
                     }
@@ -2319,11 +2326,13 @@ fn values_cell_as_ref_term(binding: &crate::binding::Binding) -> Option<Term> {
     }
 }
 
-/// Drop `BIND(SUBJECT|PREDICATE|OBJECT(?term) AS ?v)` when nothing reads
-/// `?v`: no other pattern, the seed, the post-WHERE pipeline or the
-/// projection. A variable the seed binds keeps its BIND, which is then the
-/// equality check on that position. The `f:reifies*` twin of this rule is
-/// `elide_redundant_chain`.
+/// Drop a reified-edge component nobody reads: a `TermComponents` position
+/// (or a `BIND(SUBJECT|PREDICATE|OBJECT(?term) AS ?v)`) whose variable no
+/// other pattern, the seed, the post-WHERE pipeline or the projection reads.
+/// A variable the seed binds keeps its position, which is then the equality
+/// check. A `TermComponents` left with no variable and no constant subject
+/// to anchor on goes too: its constants are the link scan's filters. The
+/// `f:reifies*` twin of this rule is `elide_redundant_chain`.
 pub(crate) fn elide_unread_term_binds(
     patterns: &[Pattern],
     needed_vars: &HashSet<VarId>,
@@ -2339,10 +2348,10 @@ pub(crate) fn elide_unread_term_binds(
             } if matches!(args.as_slice(), [Expression::Var(_)])
         )
     }
-    if !patterns
-        .iter()
-        .any(|p| matches!(p, Pattern::Bind { expr, .. } if is_term_accessor(expr)))
-    {
+    if !patterns.iter().any(|p| {
+        matches!(p, Pattern::Bind { expr, .. } if is_term_accessor(expr))
+            || matches!(p, Pattern::TermComponents(_))
+    }) {
         return None;
     }
     let mut counts: HashMap<VarId, usize> = HashMap::new();
@@ -2354,14 +2363,35 @@ pub(crate) fn elide_unread_term_binds(
             && !required_where_vars.is_some_and(|r| r.contains(&var))
             && !seed_schema.contains(&var)
     };
+    let mut changed = false;
     let kept: Vec<Pattern> = patterns
         .iter()
-        .filter(
-            |p| !matches!(p, Pattern::Bind { var, expr } if is_term_accessor(expr) && unread(*var)),
-        )
-        .cloned()
+        .filter_map(|p| match p {
+            Pattern::Bind { var, expr } if is_term_accessor(expr) && unread(*var) => {
+                changed = true;
+                None
+            }
+            Pattern::TermComponents(tc) => {
+                let mut tc = tc.clone();
+                for c in [&mut tc.subject, &mut tc.predicate, &mut tc.object] {
+                    if c.var().is_some_and(unread) {
+                        *c = crate::ir::Component::Any;
+                        changed = true;
+                    }
+                }
+                // Constant components are also the link scan's filters; the
+                // pattern stays for a variable to bind or a subject to anchor.
+                let keep = tc.components().into_iter().any(|c| c.var().is_some())
+                    || matches!(tc.subject, crate::ir::Component::Node(_));
+                if !keep {
+                    changed = true;
+                }
+                keep.then_some(Pattern::TermComponents(tc))
+            }
+            other => Some(other.clone()),
+        })
         .collect();
-    (kept.len() != patterns.len()).then_some(kept)
+    changed.then_some(kept)
 }
 
 /// Drop VALUES columns that are UNDEF in every row, and a VALUES left with no
@@ -2647,7 +2677,7 @@ pub fn build_where_operators_seeded_with_needed(
     let seed_vars = seed.as_deref().map(|op| seed_vars(op)).unwrap_or_default();
 
     // A reified-edge position nobody reads costs a dictionary lookup per row
-    // and removes none; the link lowering binds every variable position.
+    // and removes none; the link lowering relates every variable position.
     let term_bind_storage = elide_unread_term_binds(
         patterns,
         needed_vars,
@@ -3219,6 +3249,16 @@ pub fn build_where_operators_seeded_with_needed(
                     negated,
                     stats.clone(),
                     *planning,
+                ));
+                i += 1;
+            }
+
+            Pattern::TermComponents(tc) => {
+                operator = Some(Box::new(
+                    crate::term_components::TermComponentsOperator::new(
+                        get_or_empty_seed(operator.take()),
+                        tc.clone(),
+                    ),
                 ));
                 i += 1;
             }

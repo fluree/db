@@ -105,6 +105,7 @@ pub(crate) mod stats_cache;
 pub mod stats_query;
 pub mod subquery;
 pub mod temporal_mode;
+pub mod term_components;
 pub mod union;
 pub mod unwind;
 pub mod values;

@@ -128,6 +128,7 @@ fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Ve
             // The three kinds the rewriter flags, named identically so one
             // query reads the same whichever guard refuses it.
             Pattern::PropertyPath(_) => kinds.push("property path"),
+            Pattern::TermComponents(_) => kinds.push("triple-term components"),
             Pattern::ShortestPath(_) => kinds.push("shortest path"),
             Pattern::Subquery(_) => kinds.push("subquery"),
             // Containers whose bodies evaluate against this view.
@@ -340,6 +341,11 @@ pub fn rewrite_patterns_for_r2rml(
             // loud error.
             Pattern::PropertyPath(_) => {
                 unsupported.push("property path");
+                result_patterns.push(pattern.clone());
+                origins.push(i);
+            }
+            Pattern::TermComponents(_) => {
+                unsupported.push("triple-term components");
                 result_patterns.push(pattern.clone());
                 origins.push(i);
             }

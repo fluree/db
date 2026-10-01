@@ -397,6 +397,10 @@ pub enum Pattern {
     /// Property path pattern (transitive traversal)
     PropertyPath(PropertyPathPattern),
 
+    /// The components of a triple term (internal: the reified-edge lowering
+    /// emits it beside the link `?r rdf:reifies ?t`).
+    TermComponents(super::TermComponentsPattern),
+
     /// Anchored shortest-path pattern (Cypher `shortestPath`/`allShortestPaths`).
     ///
     /// Both endpoints must be bound by a preceding pattern; binds a path value
@@ -683,6 +687,18 @@ impl Pattern {
             Pattern::PropertyPath(pp) => {
                 debug_assert!(!pp.referenced_vars().contains(&old), "{UNHANDLED}");
             }
+            Pattern::TermComponents(tc) => {
+                for v in std::iter::once(&mut tc.term).chain(
+                    [&mut tc.subject, &mut tc.predicate, &mut tc.object]
+                        .into_iter()
+                        .filter_map(|c| match c {
+                            super::Component::Var(v) => Some(v),
+                            _ => None,
+                        }),
+                ) {
+                    rename(v);
+                }
+            }
             Pattern::ShortestPath(sp) => {
                 debug_assert!(!sp.referenced_vars().contains(&old), "{UNHANDLED}");
                 debug_assert!(sp.path_var != old, "{UNHANDLED}");
@@ -769,6 +785,7 @@ impl Pattern {
                 inner.iter().flat_map(Pattern::referenced_vars).collect()
             }
             Pattern::PropertyPath(pp) => pp.referenced_vars(),
+            Pattern::TermComponents(tc) => tc.referenced_vars(),
             Pattern::ShortestPath(sp) => sp.referenced_vars(),
             Pattern::Subquery(sq) => sq.referenced_vars(),
             Pattern::IndexSearch(isp) => isp.referenced_vars(),
@@ -829,6 +846,7 @@ impl Pattern {
             Pattern::Values { vars, .. } => vars.clone(),
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_) => Vec::new(),
             Pattern::PropertyPath(pp) => pp.produced_vars(),
+            Pattern::TermComponents(tc) => tc.produced_vars(),
             Pattern::ShortestPath(sp) => sp.produced_vars(),
             Pattern::Subquery(sq) => sq.produced_vars(),
             Pattern::IndexSearch(isp) => isp.produced_vars(),

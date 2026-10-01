@@ -2415,9 +2415,8 @@ fn result_is_multiplicity_blind(query: &Query) -> bool {
     }
 }
 
-/// The query with the `BIND(SUBJECT|PREDICATE|OBJECT(?term) AS ?v)` patterns
-/// nothing reads removed (see `elide_unread_term_binds`), or `None` when it
-/// has none to drop.
+/// The query with the reified-edge components nothing reads removed (see
+/// `elide_unread_term_binds`), or `None` when it has none to drop.
 fn elide_unread_term_binds_in_query(query: &Query) -> Option<Query> {
     let deps = compute_variable_deps(query);
     let required = deps.as_ref().map(|d| d.required_where_vars.as_slice());

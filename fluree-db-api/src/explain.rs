@@ -281,6 +281,19 @@ fn logical_node(
             );
             node.insert("rows".into(), json!(rows.len()));
         }
+        Pattern::TermComponents(tc) => {
+            node.insert("kind".into(), json!("term-components"));
+            node.insert("term".into(), json!(vars.name(tc.term).to_string()));
+            node.insert(
+                "vars".into(),
+                json!(tc
+                    .components()
+                    .into_iter()
+                    .filter_map(fluree_db_query::ir::Component::var)
+                    .map(|v| vars.name(v).to_string())
+                    .collect::<Vec<_>>()),
+            );
+        }
         Pattern::PropertyPath(pp) => {
             node.insert("kind".into(), json!("property-path"));
             node.insert(

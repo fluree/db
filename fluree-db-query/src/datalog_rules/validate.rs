@@ -114,6 +114,8 @@ fn walk_patterns(
             // rule against. The protection that matters is the exhaustive
             // match itself — a surface that starts producing one has to come
             // back here first.
+            // Reads the ledger's own term dictionary.
+            Pattern::TermComponents(_) => {}
             Pattern::R2rml(_) => return Err(non_local(rule, "an R2RML graph source")),
             Pattern::Service(_) => {
                 return Err(reject(

@@ -1160,6 +1160,25 @@ pub fn estimate_pattern(
             row_count: estimate_branch_cardinality(patterns, stats),
         },
 
+        // A bound term is one dictionary decode; a bound subject is a reverse-
+        // tree prefix range. Otherwise the link scan should bind the term
+        // first, so this ranks after any real scan.
+        Pattern::TermComponents(tc) => {
+            let anchored = match &tc.subject {
+                crate::ir::Component::Var(v) => bound_vars.contains(v),
+                crate::ir::Component::Node(_) => true,
+                _ => false,
+            };
+            let row_count = if bound_vars.contains(&tc.term) {
+                HIGHLY_SELECTIVE
+            } else if anchored {
+                MODERATELY_SELECTIVE
+            } else {
+                FULL_SCAN
+            };
+            PatternEstimate::Source { row_count }
+        }
+
         Pattern::PropertyPath(pp) => {
             // Anchored at a bound endpoint => a bounded closure from a fixed node,
             // not a full predicate scan. Estimating it as a world scan made reorder

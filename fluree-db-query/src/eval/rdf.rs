@@ -529,7 +529,7 @@ fn encoded_term<'c, R: RowAccess>(
 /// The base edge's object as a binding, in the encoded form a scan would
 /// bind it when the kind allows, else materialized with its datatype or
 /// language tag.
-fn term_object_binding(
+pub(crate) fn term_object_binding(
     key: &fluree_db_core::triple_term::TermKey,
     t: i64,
     ctx: &ExecutionContext<'_>,
@@ -607,7 +607,7 @@ pub(crate) fn term_component_binding<R: RowAccess>(
 /// A materialized term's object with its datatype or language tag, which
 /// `OBJECT()` must keep: `"chat"@fr` is not `"chat"`, `"5"^^xsd:int` is not
 /// `5`.
-fn materialized_term_object(term: &fluree_db_core::TripleTermValue) -> Binding {
+pub(crate) fn materialized_term_object(term: &fluree_db_core::TripleTermValue) -> Binding {
     match &term.o {
         fluree_db_core::FlakeValue::Ref(sid) => Binding::sid(sid.clone()),
         other => Binding::Lit {

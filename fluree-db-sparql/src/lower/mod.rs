@@ -316,6 +316,13 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                         return Err(reject_predicate_string(format!("{reserved}")));
                     }
                 }
+                Pattern::TermComponents(tc) => {
+                    if let fluree_db_query::ir::Component::Node(p) = &tc.predicate {
+                        if fluree_db_core::is_reserved_reifies_predicate(p) {
+                            return Err(reject_predicate_string(format!("{p}")));
+                        }
+                    }
+                }
                 // ShortestPath also carries a predicate Sid; apply the same
                 // firewall (no SPARQL surface produces it today, but stay safe).
                 // The wildcard form (`predicate: None`) excludes `f:reifies*`

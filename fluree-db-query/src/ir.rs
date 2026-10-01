@@ -41,6 +41,7 @@ pub mod pattern;
 pub mod projection;
 pub mod query;
 pub mod reasoning;
+pub mod term_components;
 pub mod triple;
 
 pub use adapters::{
@@ -61,4 +62,5 @@ pub use projection::{
 };
 pub use query::{ConstructTemplate, Query, QueryOutput, Restriction, TemplateReification};
 pub use reasoning::{ReasoningConfig, ReasoningModes};
+pub use term_components::{Component, TermComponentsPattern};
 pub use triple::{Ref, Term, TriplePattern};
