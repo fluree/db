@@ -1,7 +1,9 @@
 //! Binary wire format decoders for index stats and schema sections.
 //!
 //! These decode the binary stats/schema sections embedded in `IndexRoot`
-//! (FIR6). The encode functions live in `fluree-db-indexer`.
+//! (FIR6). The encode functions live in `fluree-db-binary-index`, except the
+//! compact class tail ([`encode_class_tail`]), which lives here beside its
+//! decoder.
 
 use crate::index_schema::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
 use crate::index_stats::{
@@ -239,6 +241,226 @@ fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
     }
 }
 
+/// Wire tag identifying the compact per-graph class tail.
+const CLASS_TAIL_TAG: u8 = 2;
+
+fn read_varint(data: &[u8], pos: &mut usize) -> io::Result<u64> {
+    crate::commit::codec::varint::decode_varint(data, pos)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("stats varint: {e}")))
+}
+
+/// A count read from the wire, with capacity capped by the bytes left so a
+/// corrupt count cannot allocate past the blob.
+fn read_count(data: &[u8], pos: &mut usize) -> io::Result<(usize, usize)> {
+    let n = read_varint(data, pos)? as usize;
+    Ok((n, n.min(data.len().saturating_sub(*pos))))
+}
+
+/// Append the per-graph class tables as one compact tail section.
+///
+/// Every Sid the tables name (classes, their properties, ref targets) is
+/// written once, in a sorted table, front-coded against the previous name in
+/// the same namespace; entries refer to it by index and counts are varints.
+/// Readers that predate the section skip it (see the historical tail for why
+/// an appended section is safe), so the encoder leaves the legacy per-graph
+/// class slots empty: those readers see no class tables rather than
+/// misparsing.
+///
+/// ```text
+/// [tag: u8 = 2]
+/// [sid_count: varint]
+///   per Sid, sorted: [ns_code: u16 LE][shared: varint][rest_len: varint][rest]
+/// [graph_count: varint]
+///   per graph with classes, by g_id: [g_id: u16 LE][class_count: varint]
+///   per class, by Sid: [index delta from the previous class: varint]
+///                      [count: varint][property_count: varint]
+///     per property, by Sid: [index: varint]
+///       [n: varint] n × [tag: u8][count: varint]
+///       [n: varint] n × [len: varint][lang bytes][count: varint]
+///       [n: varint] n × [ref class index: varint][count: varint]
+/// ```
+pub fn encode_class_tail(buf: &mut Vec<u8>, graphs: &[&GraphStatsEntry]) {
+    use crate::commit::codec::varint::encode_varint;
+    use std::collections::{BTreeSet, HashMap};
+
+    let with_classes: Vec<(u16, &[ClassStatEntry])> = graphs
+        .iter()
+        .filter_map(|g| g.classes.as_deref().map(|c| (g.g_id, c)))
+        .collect();
+    let mut sids: BTreeSet<&Sid> = BTreeSet::new();
+    for (_, classes) in &with_classes {
+        for class in *classes {
+            sids.insert(&class.class_sid);
+            for usage in &class.properties {
+                sids.insert(&usage.property_sid);
+                sids.extend(usage.ref_classes.iter().map(|r| &r.class_sid));
+            }
+        }
+    }
+    let index: HashMap<&Sid, u64> = sids
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (*s, i as u64))
+        .collect();
+
+    buf.push(CLASS_TAIL_TAG);
+    encode_varint(sids.len() as u64, buf);
+    let mut prev: Option<&Sid> = None;
+    for sid in &sids {
+        let name = sid.name.as_bytes();
+        let shared = match prev {
+            Some(p) if p.namespace_code == sid.namespace_code => name
+                .iter()
+                .zip(p.name.as_bytes())
+                .take_while(|(a, b)| a == b)
+                .count(),
+            _ => 0,
+        };
+        buf.extend_from_slice(&sid.namespace_code.to_le_bytes());
+        encode_varint(shared as u64, buf);
+        encode_varint((name.len() - shared) as u64, buf);
+        buf.extend_from_slice(&name[shared..]);
+        prev = Some(sid);
+    }
+
+    let mut with_classes = with_classes;
+    with_classes.sort_by_key(|(g_id, _)| *g_id);
+    encode_varint(with_classes.len() as u64, buf);
+    for (g_id, classes) in with_classes {
+        buf.extend_from_slice(&g_id.to_le_bytes());
+        let mut classes: Vec<&ClassStatEntry> = classes.iter().collect();
+        classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+        encode_varint(classes.len() as u64, buf);
+        let mut prev_class = 0u64;
+        for class in classes {
+            let i = index[&class.class_sid];
+            encode_varint(i - prev_class, buf);
+            prev_class = i;
+            encode_varint(class.count, buf);
+            let mut usages: Vec<&ClassPropertyUsage> = class.properties.iter().collect();
+            usages.sort_by(|a, b| a.property_sid.cmp(&b.property_sid));
+            encode_varint(usages.len() as u64, buf);
+            for usage in usages {
+                encode_varint(index[&usage.property_sid], buf);
+                let mut dts: Vec<&(u8, u64)> = usage.datatypes.iter().collect();
+                dts.sort_by_key(|d| d.0);
+                encode_varint(dts.len() as u64, buf);
+                for &&(tag, count) in &dts {
+                    buf.push(tag);
+                    encode_varint(count, buf);
+                }
+                let mut langs: Vec<&(String, u64)> = usage.langs.iter().collect();
+                langs.sort_by(|a, b| a.0.cmp(&b.0));
+                encode_varint(langs.len() as u64, buf);
+                for (lang, count) in langs {
+                    encode_varint(lang.len() as u64, buf);
+                    buf.extend_from_slice(lang.as_bytes());
+                    encode_varint(*count, buf);
+                }
+                let mut refs: Vec<&ClassRefCount> = usage.ref_classes.iter().collect();
+                refs.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+                encode_varint(refs.len() as u64, buf);
+                for r in refs {
+                    encode_varint(index[&r.class_sid], buf);
+                    encode_varint(r.count, buf);
+                }
+            }
+        }
+    }
+}
+
+/// Decode the class tail written by [`encode_class_tail`] (tag already
+/// consumed): each graph's class table. Decoded Sids share their names.
+fn decode_class_tail(data: &[u8], pos: &mut usize) -> io::Result<Vec<(u16, Vec<ClassStatEntry>)>> {
+    let invalid =
+        |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("class tail: {what}"));
+
+    let (sid_count, cap) = read_count(data, pos)?;
+    let mut sids: Vec<Sid> = Vec::with_capacity(cap);
+    let mut prev: Vec<u8> = Vec::new();
+    let mut prev_ns: Option<u16> = None;
+    for _ in 0..sid_count {
+        let ns_code = read_u16(data, pos)?;
+        let shared = read_varint(data, pos)? as usize;
+        let rest = read_varint(data, pos)? as usize;
+        if shared > 0 && (prev_ns != Some(ns_code) || shared > prev.len()) {
+            return Err(invalid("shared prefix out of range"));
+        }
+        ensure_len(data, *pos, rest, "class tail sid")?;
+        prev.truncate(shared);
+        prev.extend_from_slice(&data[*pos..*pos + rest]);
+        *pos += rest;
+        let name = std::str::from_utf8(&prev).map_err(|_| invalid("sid name is not UTF-8"))?;
+        sids.push(Sid::new(ns_code, name));
+        prev_ns = Some(ns_code);
+    }
+    let sid_at = |i: u64| -> io::Result<Sid> {
+        sids.get(i as usize)
+            .cloned()
+            .ok_or_else(|| invalid("sid index out of range"))
+    };
+
+    let (graph_count, cap) = read_count(data, pos)?;
+    let mut graphs = Vec::with_capacity(cap);
+    for _ in 0..graph_count {
+        let g_id = read_u16(data, pos)?;
+        let (class_count, cap) = read_count(data, pos)?;
+        let mut classes = Vec::with_capacity(cap);
+        let mut class_index = 0u64;
+        for _ in 0..class_count {
+            class_index = class_index
+                .checked_add(read_varint(data, pos)?)
+                .ok_or_else(|| invalid("class index overflow"))?;
+            let class_sid = sid_at(class_index)?;
+            let count = read_varint(data, pos)?;
+            let (usage_count, cap) = read_count(data, pos)?;
+            let mut properties = Vec::with_capacity(cap);
+            for _ in 0..usage_count {
+                let property_sid = sid_at(read_varint(data, pos)?)?;
+                let (n, cap) = read_count(data, pos)?;
+                let mut datatypes = Vec::with_capacity(cap);
+                for _ in 0..n {
+                    let tag = read_u8(data, pos)?;
+                    datatypes.push((tag, read_varint(data, pos)?));
+                }
+                let (n, cap) = read_count(data, pos)?;
+                let mut langs = Vec::with_capacity(cap);
+                for _ in 0..n {
+                    let len = read_varint(data, pos)? as usize;
+                    ensure_len(data, *pos, len, "class tail lang")?;
+                    let lang = std::str::from_utf8(&data[*pos..*pos + len])
+                        .map_err(|_| invalid("lang tag is not UTF-8"))?
+                        .to_string();
+                    *pos += len;
+                    langs.push((lang, read_varint(data, pos)?));
+                }
+                let (n, cap) = read_count(data, pos)?;
+                let mut ref_classes = Vec::with_capacity(cap);
+                for _ in 0..n {
+                    let class_sid = sid_at(read_varint(data, pos)?)?;
+                    ref_classes.push(ClassRefCount {
+                        class_sid,
+                        count: read_varint(data, pos)?,
+                    });
+                }
+                properties.push(ClassPropertyUsage {
+                    property_sid,
+                    datatypes,
+                    langs,
+                    ref_classes,
+                });
+            }
+            classes.push(ClassStatEntry {
+                class_sid,
+                count,
+                properties,
+            });
+        }
+        graphs.push((g_id, classes));
+    }
+    Ok(graphs)
+}
+
 /// Decode the per-property payload within a class section: datatypes, langs, ref_classes.
 fn decode_class_property_payload(
     data: &[u8],
@@ -407,7 +629,27 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
         });
     }
 
-    let tail = decode_historical_tail(data, &mut pos)?;
+    // Appended sections, each led by its tag; an unknown tag ends the parse
+    // (the root length-prefixes the stats section, so the rest is skipped).
+    let mut tail = None;
+    while pos < data.len() {
+        match data[pos] {
+            HISTORICAL_TAIL_TAG => tail = decode_historical_tail(data, &mut pos)?,
+            CLASS_TAIL_TAG => {
+                pos += 1;
+                for (g_id, classes) in decode_class_tail(data, &mut pos)? {
+                    let graph = graphs.iter_mut().find(|g| g.g_id == g_id).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("class tail names graph {g_id}, which the stats do not hold"),
+                        )
+                    })?;
+                    graph.classes = (!classes.is_empty()).then_some(classes);
+                }
+            }
+            _ => pos = data.len(),
+        }
+    }
 
     let mut stats = IndexStats {
         flakes,

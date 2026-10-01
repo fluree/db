@@ -69,25 +69,6 @@ fn read_sid(data: &[u8], pos: usize) -> io::Result<(Sid, usize)> {
     Ok((Sid::new(ns_code, suffix), p))
 }
 
-/// Decode a `(ns_code, suffix_string)` tuple. Returns `((ns_code, suffix), bytes_consumed)`.
-fn read_sid_tuple(data: &[u8], pos: usize) -> io::Result<((u16, String), usize)> {
-    let mut p = pos;
-    ensure_len(data, p, 4, "sid tuple header")?;
-    let ns_code = u16::from_le_bytes(data[p..p + 2].try_into().unwrap());
-    p += 2;
-    let suffix_len = u16::from_le_bytes(data[p..p + 2].try_into().unwrap()) as usize;
-    p += 2;
-    ensure_len(data, p, suffix_len, "sid tuple suffix")?;
-    let suffix = std::str::from_utf8(&data[p..p + suffix_len]).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid UTF-8 in sid tuple: {e}"),
-        )
-    })?;
-    p += suffix_len;
-    Ok(((ns_code, suffix.to_string()), p))
-}
-
 /// Check that `data[pos..pos+need]` is within bounds.
 #[inline]
 fn ensure_len(data: &[u8], pos: usize, need: usize, ctx: &str) -> io::Result<()> {
@@ -102,15 +83,6 @@ fn ensure_len(data: &[u8], pos: usize, need: usize, ctx: &str) -> io::Result<()>
     } else {
         Ok(())
     }
-}
-
-/// Read a u8 at `pos`, advancing.
-#[inline]
-fn read_u8(data: &[u8], pos: &mut usize) -> io::Result<u8> {
-    ensure_len(data, *pos, 1, "u8")?;
-    let v = data[*pos];
-    *pos += 1;
-    Ok(v)
 }
 
 /// Read a u16 LE at `pos`, advancing.
@@ -128,15 +100,6 @@ fn read_u32(data: &[u8], pos: &mut usize) -> io::Result<u32> {
     ensure_len(data, *pos, 4, "u32")?;
     let v = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
     *pos += 4;
-    Ok(v)
-}
-
-/// Read a u64 LE at `pos`, advancing.
-#[inline]
-fn read_u64(data: &[u8], pos: &mut usize) -> io::Result<u64> {
-    ensure_len(data, *pos, 8, "u64")?;
-    let v = u64::from_le_bytes(data[*pos..*pos + 8].try_into().unwrap());
-    *pos += 8;
     Ok(v)
 }
 
@@ -182,8 +145,10 @@ pub fn encode_stats(stats: &IndexStats) -> Vec<u8> {
             encode_graph_property(&mut buf, p);
         }
 
-        // Per-graph classes (optional)
-        encode_optional_classes(&mut buf, g.classes.as_deref());
+        // Per-graph classes travel in the compact class tail; the legacy slot
+        // stays empty so readers that predate the tail see no classes rather
+        // than misparse.
+        buf.push(0);
     }
 
     // Aggregate properties (SID-keyed)
@@ -229,6 +194,9 @@ pub fn encode_stats(stats: &IndexStats) -> Vec<u8> {
 
     // Historical tail (see `encode_historical_tail` for the evolution rules).
     encode_historical_tail(&mut buf, stats);
+    if graphs_carry_classes {
+        fluree_db_core::stats_wire::encode_class_tail(&mut buf, &sorted_graphs);
+    }
 
     buf
 }
@@ -393,146 +361,6 @@ fn encode_datatypes(buf: &mut Vec<u8>, datatypes: &[(u8, u64)]) {
     }
 }
 
-/// Encode optional per-graph classes.
-///
-/// Wire format:
-/// ```text
-/// [has_classes: u8]  (0 = absent, 1 = present)
-/// if has_classes == 1:
-///     [class_count: u32 LE]
-///     for each class:
-///         [class_sid encoded]
-///         [instance_count: u64 LE]
-///         [property_count: u16 LE]
-///         for each property:
-///             [property_sid encoded]
-///             [ref_class_count: u16 LE]
-///             for each ref_class:
-///                 [ref_class_sid encoded]
-///                 [count: u64 LE]
-/// ```
-fn encode_optional_classes(buf: &mut Vec<u8>, classes: Option<&[ClassStatEntry]>) {
-    match classes {
-        None => buf.push(0),
-        Some(entries) => {
-            buf.push(1);
-
-            let mut sorted: Vec<&ClassStatEntry> = entries.iter().collect();
-            sorted.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
-
-            buf.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
-            for c in &sorted {
-                write_sid(buf, &c.class_sid);
-                buf.extend_from_slice(&c.count.to_le_bytes());
-
-                let mut sorted_props: Vec<&ClassPropertyUsage> = c.properties.iter().collect();
-                sorted_props.sort_by(|a, b| a.property_sid.cmp(&b.property_sid));
-
-                buf.extend_from_slice(&(sorted_props.len() as u16).to_le_bytes());
-                for pu in &sorted_props {
-                    write_sid(buf, &pu.property_sid);
-                    encode_class_property_payload(buf, pu);
-                }
-            }
-        }
-    }
-}
-
-/// Decode the per-property payload within a class section: datatypes, langs, ref_classes.
-fn decode_class_property_payload(
-    data: &[u8],
-    pos: &mut usize,
-    property_sid: Sid,
-) -> io::Result<ClassPropertyUsage> {
-    // Datatypes
-    let dt_count = read_u16(data, pos)? as usize;
-    let mut datatypes = Vec::with_capacity(dt_count);
-    for _ in 0..dt_count {
-        let tag = read_u8(data, pos)?;
-        let count = read_u64(data, pos)?;
-        datatypes.push((tag, count));
-    }
-
-    // Langs
-    let lang_count = read_u16(data, pos)? as usize;
-    let mut langs = Vec::with_capacity(lang_count);
-    for _ in 0..lang_count {
-        let lang_len = read_u16(data, pos)? as usize;
-        ensure_len(data, *pos, lang_len, "lang string")?;
-        let lang = std::str::from_utf8(&data[*pos..*pos + lang_len]).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid UTF-8 in lang tag: {e}"),
-            )
-        })?;
-        *pos += lang_len;
-        let count = read_u64(data, pos)?;
-        langs.push((lang.to_string(), count));
-    }
-
-    // Ref classes
-    let rc_count = read_u16(data, pos)? as usize;
-    let mut ref_classes = Vec::with_capacity(rc_count);
-    for _ in 0..rc_count {
-        let (ref_sid, new_pos) = read_sid(data, *pos)?;
-        *pos = new_pos;
-        let ref_count = read_u64(data, pos)?;
-        ref_classes.push(ClassRefCount {
-            class_sid: ref_sid,
-            count: ref_count,
-        });
-    }
-
-    Ok(ClassPropertyUsage {
-        property_sid,
-        datatypes,
-        langs,
-        ref_classes,
-    })
-}
-
-/// Decode optional per-graph classes.
-///
-/// Returns `None` if `has_classes == 0`, or `Some(vec)` if present.
-/// Empty class lists are returned as `None` for consistency.
-fn decode_optional_classes(
-    data: &[u8],
-    pos: &mut usize,
-) -> io::Result<Option<Vec<ClassStatEntry>>> {
-    let has_classes = read_u8(data, pos)?;
-    if has_classes == 0 {
-        return Ok(None);
-    }
-
-    let class_count = read_u32(data, pos)? as usize;
-    let mut classes = Vec::with_capacity(class_count);
-    for _ in 0..class_count {
-        let (class_sid, new_pos) = read_sid(data, *pos)?;
-        *pos = new_pos;
-        let instance_count = read_u64(data, pos)?;
-
-        let pu_count = read_u16(data, pos)? as usize;
-        let mut properties = Vec::with_capacity(pu_count);
-        for _ in 0..pu_count {
-            let (property_sid, new_pos2) = read_sid(data, *pos)?;
-            *pos = new_pos2;
-            properties.push(decode_class_property_payload(data, pos, property_sid)?);
-        }
-
-        classes.push(ClassStatEntry {
-            class_sid,
-            count: instance_count,
-            properties,
-        });
-    }
-
-    Ok(if classes.is_empty() {
-        None
-    } else {
-        Some(classes)
-    })
-}
-
 // ============================================================================
 // Stats decode
 // ============================================================================
@@ -546,133 +374,8 @@ pub fn decode_stats(data: &[u8]) -> io::Result<IndexStats> {
     decode_stats_with_len(data).map(|(stats, _)| stats)
 }
 
-fn decode_graph_property(data: &[u8], pos: &mut usize) -> io::Result<GraphPropertyStatEntry> {
-    let p_id = read_u32(data, pos)?;
-    let count = read_u64(data, pos)?;
-    let ndv_values = read_u64(data, pos)?;
-    let ndv_subjects = read_u64(data, pos)?;
-    let last_modified_t = read_i64(data, pos)?;
-    let datatypes = decode_datatypes(data, pos)?;
-    let observed_datatypes = PropertyStatEntry::tags_of(&datatypes);
-
-    Ok(GraphPropertyStatEntry {
-        p_id,
-        count,
-        ndv_values,
-        ndv_subjects,
-        last_modified_t,
-        datatypes,
-        observed_datatypes,
-        historical_datatypes: Vec::new(),
-    })
-}
-
 /// One graph's rows in the tail: `(g_id, [(p_id, tags)])`.
 type GraphTagSets = Vec<(u16, Vec<(u32, Vec<u8>)>)>;
-
-/// Decoded historical tail section — see [`encode_historical_tail`] for the
-/// layout and the evolution rules.
-struct HistoricalTail {
-    since_t: i64,
-    agg: Vec<((u16, String), Vec<u8>)>,
-    graphs: GraphTagSets,
-}
-
-fn read_tag_set(data: &[u8], pos: &mut usize) -> io::Result<Vec<u8>> {
-    let n = read_u8(data, pos)? as usize;
-    ensure_len(data, *pos, n, "historical tag set")?;
-    let tags = data[*pos..*pos + n].to_vec();
-    *pos += n;
-    Ok(tags)
-}
-
-/// Decode the optional historical tail. `None` when the section is absent
-/// (an old blob, exactly `pos == data.len()`) or carries an unknown future
-/// tag — in which case the remainder is consumed, which is safe because the
-/// root length-prefixes the whole stats section.
-fn decode_historical_tail(data: &[u8], pos: &mut usize) -> io::Result<Option<HistoricalTail>> {
-    if *pos >= data.len() {
-        return Ok(None);
-    }
-    let tag = read_u8(data, pos)?;
-    if tag != HISTORICAL_TAIL_TAG {
-        *pos = data.len();
-        return Ok(None);
-    }
-    let since_t = read_i64(data, pos)?;
-    let agg_count = read_u32(data, pos)? as usize;
-    let mut agg = Vec::with_capacity(agg_count);
-    for _ in 0..agg_count {
-        let (sid, new_pos) = read_sid_tuple(data, *pos)?;
-        *pos = new_pos;
-        let tags = read_tag_set(data, pos)?;
-        agg.push((sid, tags));
-    }
-    let graph_count = read_u16(data, pos)? as usize;
-    let mut graphs = Vec::with_capacity(graph_count);
-    for _ in 0..graph_count {
-        let g_id = read_u16(data, pos)?;
-        let prop_count = read_u32(data, pos)? as usize;
-        let mut props = Vec::with_capacity(prop_count);
-        for _ in 0..prop_count {
-            let p_id = read_u32(data, pos)?;
-            let tags = read_tag_set(data, pos)?;
-            props.push((p_id, tags));
-        }
-        graphs.push((g_id, props));
-    }
-    Ok(Some(HistoricalTail {
-        since_t,
-        agg,
-        graphs,
-    }))
-}
-
-/// Attach a decoded historical tail to the stats: set the boundary and fill
-/// the per-entry `historical_datatypes` sets. Entries the tail does not name
-/// keep their empty (unknown) set, which fails closed.
-fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
-    let Some(tail) = tail else { return };
-    stats.historical_since_t = Some(tail.since_t);
-    if let Some(props) = stats.properties.as_mut() {
-        let mut by_sid: std::collections::HashMap<(u16, String), Vec<u8>> =
-            tail.agg.into_iter().collect();
-        for entry in &mut *props {
-            if let Some(tags) = by_sid.remove(&entry.sid) {
-                entry.historical_datatypes = tags;
-            }
-        }
-    }
-    if let Some(graphs) = stats.graphs.as_mut() {
-        let mut by_key: std::collections::HashMap<(u16, u32), Vec<u8>> = tail
-            .graphs
-            .into_iter()
-            .flat_map(|(g_id, props)| {
-                props
-                    .into_iter()
-                    .map(move |(p_id, tags)| ((g_id, p_id), tags))
-            })
-            .collect();
-        for graph in &mut *graphs {
-            for prop in &mut graph.properties {
-                if let Some(tags) = by_key.remove(&(graph.g_id, prop.p_id)) {
-                    prop.historical_datatypes = tags;
-                }
-            }
-        }
-    }
-}
-
-fn decode_datatypes(data: &[u8], pos: &mut usize) -> io::Result<Vec<(u8, u64)>> {
-    let count = read_u8(data, pos)? as usize;
-    let mut result = Vec::with_capacity(count);
-    for _ in 0..count {
-        let dt_tag = read_u8(data, pos)?;
-        let dt_count = read_u64(data, pos)?;
-        result.push((dt_tag, dt_count));
-    }
-    Ok(result)
-}
 
 // ============================================================================
 // Schema encode
@@ -791,105 +494,11 @@ pub fn decode_schema(data: &[u8]) -> io::Result<IndexSchema> {
 // Public helpers for root encoder
 // ============================================================================
 
-/// Returns the number of bytes consumed when reading stats from a slice.
-/// Used by the root decoder to know where the stats section ends.
+/// Decode stats and the number of bytes consumed. The format has one parser,
+/// `fluree_db_core::stats_wire::decode_stats`, shared with the snapshot's
+/// metadata-only root decoder.
 pub fn decode_stats_with_len(data: &[u8]) -> io::Result<(IndexStats, usize)> {
-    let mut pos = 0usize;
-
-    let flakes = read_u64(data, &mut pos)?;
-    let size = read_u64(data, &mut pos)?;
-
-    let graph_count = read_u16(data, &mut pos)? as usize;
-    let mut graphs = Vec::with_capacity(graph_count);
-    for _ in 0..graph_count {
-        let g_id = read_u16(data, &mut pos)?;
-        let g_flakes = read_u64(data, &mut pos)?;
-        let g_size = read_u64(data, &mut pos)?;
-        let prop_count = read_u32(data, &mut pos)? as usize;
-        let mut properties = Vec::with_capacity(prop_count);
-        for _ in 0..prop_count {
-            properties.push(decode_graph_property(data, &mut pos)?);
-        }
-        // Per-graph classes (optional section after properties)
-        let graph_classes = decode_optional_classes(data, &mut pos)?;
-
-        graphs.push(GraphStatsEntry {
-            g_id,
-            flakes: g_flakes,
-            size: g_size,
-            properties,
-            classes: graph_classes,
-        });
-    }
-
-    let agg_count = read_u32(data, &mut pos)? as usize;
-    let mut agg_props = Vec::with_capacity(agg_count);
-    for _ in 0..agg_count {
-        let (sid, new_pos) = read_sid_tuple(data, pos)?;
-        pos = new_pos;
-        let count = read_u64(data, &mut pos)?;
-        let ndv_values = read_u64(data, &mut pos)?;
-        let ndv_subjects = read_u64(data, &mut pos)?;
-        let last_modified_t = read_i64(data, &mut pos)?;
-        let datatypes = decode_datatypes(data, &mut pos)?;
-        let observed_datatypes = PropertyStatEntry::tags_of(&datatypes);
-        agg_props.push(PropertyStatEntry {
-            sid,
-            count,
-            ndv_values,
-            ndv_subjects,
-            last_modified_t,
-            datatypes,
-            observed_datatypes,
-            historical_datatypes: Vec::new(),
-        });
-    }
-
-    let class_count = read_u32(data, &mut pos)? as usize;
-    let mut classes = Vec::with_capacity(class_count);
-    for _ in 0..class_count {
-        let (class_sid, new_pos) = read_sid(data, pos)?;
-        pos = new_pos;
-        let instance_count = read_u64(data, &mut pos)?;
-        let pu_count = read_u16(data, &mut pos)? as usize;
-        let mut properties = Vec::with_capacity(pu_count);
-        for _ in 0..pu_count {
-            let (property_sid, new_pos2) = read_sid(data, pos)?;
-            pos = new_pos2;
-            properties.push(decode_class_property_payload(data, &mut pos, property_sid)?);
-        }
-        classes.push(ClassStatEntry {
-            class_sid,
-            count: instance_count,
-            properties,
-        });
-    }
-
-    let tail = decode_historical_tail(data, &mut pos)?;
-
-    let mut stats = IndexStats {
-        flakes,
-        size,
-        properties: if agg_props.is_empty() {
-            None
-        } else {
-            Some(agg_props)
-        },
-        classes: if classes.is_empty() {
-            fluree_db_core::index_stats::union_per_graph_classes(&graphs)
-        } else {
-            Some(classes)
-        },
-        graphs: if graphs.is_empty() {
-            None
-        } else {
-            Some(graphs)
-        },
-        historical_since_t: None,
-    };
-    apply_historical_tail(&mut stats, tail);
-
-    Ok((stats, pos))
+    fluree_db_core::stats_wire::decode_stats(data)
 }
 
 /// Decode schema and return bytes consumed.
@@ -1161,6 +770,187 @@ mod tests {
     /// does not store it twice: the bytes are those of a root without it, and
     /// both decoders hand back the union, also for an import root that never
     /// set it.
+    fn class_tables() -> Vec<GraphStatsEntry> {
+        let usage = |property: Sid, refs: &[(Sid, u64)]| ClassPropertyUsage {
+            property_sid: property,
+            datatypes: vec![(7, 3), (1, 300)],
+            langs: vec![("fr".to_string(), 2), ("en".to_string(), 1)],
+            ref_classes: refs
+                .iter()
+                .map(|(class_sid, count)| ClassRefCount {
+                    class_sid: class_sid.clone(),
+                    count: *count,
+                })
+                .collect(),
+        };
+        let class = |class_sid: Sid, count: u64, properties| ClassStatEntry {
+            class_sid,
+            count,
+            properties,
+        };
+        let graph = |g_id: u16, classes: Option<Vec<ClassStatEntry>>| GraphStatsEntry {
+            g_id,
+            flakes: 10,
+            size: 0,
+            properties: vec![],
+            classes,
+        };
+        vec![
+            graph(
+                0,
+                Some(vec![
+                    class(
+                        sid(5, "PersonB"),
+                        1 << 62,
+                        vec![
+                            usage(sid(5, "name"), &[]),
+                            usage(
+                                sid(5, "knows"),
+                                &[(sid(6, "Person"), 9), (sid(5, "PersonA"), 1 << 40)],
+                            ),
+                        ],
+                    ),
+                    class(sid(5, "PersonA"), u64::MAX, vec![]),
+                ]),
+            ),
+            graph(1, None),
+            // Its first class is not the table's first Sid, so a class index
+            // read as absolute instead of as a delta lands elsewhere.
+            graph(
+                2,
+                Some(vec![
+                    class(
+                        sid(6, "Person"),
+                        1,
+                        vec![usage(sid(5, "knows"), &[(sid(5, "PersonB"), 2)])],
+                    ),
+                    class(sid(5, "PersonB"), 2, vec![]),
+                ]),
+            ),
+        ]
+    }
+
+    /// The canonical (sorted) form both encoders have always emitted.
+    fn sorted_classes(classes: &[ClassStatEntry]) -> Vec<ClassStatEntry> {
+        let mut classes = classes.to_vec();
+        classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+        for class in &mut classes {
+            class
+                .properties
+                .sort_by(|a, b| a.property_sid.cmp(&b.property_sid));
+            for usage in &mut class.properties {
+                usage.datatypes.sort_by_key(|d| d.0);
+                usage.langs.sort();
+                usage
+                    .ref_classes
+                    .sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+            }
+        }
+        classes
+    }
+
+    #[test]
+    fn per_graph_class_tables_round_trip_through_the_class_tail() {
+        let graphs = class_tables();
+        let stats = IndexStats {
+            flakes: 30,
+            size: 0,
+            properties: None,
+            classes: None,
+            graphs: Some(graphs.clone()),
+            historical_since_t: Some(0),
+        };
+        let bytes = encode_stats(&stats);
+        let (via_core, consumed) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        for decoded in [decode_stats(&bytes).unwrap(), via_core] {
+            assert_eq!(
+                decoded.historical_since_t,
+                Some(0),
+                "the historical tail still reads"
+            );
+            let got = decoded.graphs.unwrap();
+            assert_eq!(got.len(), 3);
+            for (got, want) in got.iter().zip(&graphs) {
+                assert_eq!(got.g_id, want.g_id);
+                assert_eq!(
+                    format!("{:?}", got.classes),
+                    format!("{:?}", want.classes.as_deref().map(sorted_classes)),
+                    "graph {}",
+                    want.g_id
+                );
+            }
+        }
+    }
+
+    /// A reader that predates the class tail parses up to it and stops; what
+    /// it sees must be exactly the stats without class tables.
+    #[test]
+    fn a_reader_without_the_class_tail_sees_no_classes() {
+        let with = IndexStats {
+            flakes: 30,
+            size: 0,
+            properties: None,
+            classes: None,
+            graphs: Some(class_tables()),
+            historical_since_t: Some(0),
+        };
+        let mut without = with.clone();
+        for g in without.graphs.iter_mut().flatten() {
+            g.classes = None;
+        }
+        let with = encode_stats(&with);
+        let without = encode_stats(&without);
+        assert!(with.len() > without.len());
+        assert_eq!(&with[..without.len()], &without[..]);
+        assert_eq!(with[without.len()], 2, "the class tail follows");
+    }
+
+    /// Roots written before the class tail carry each graph's classes in the
+    /// legacy per-graph slot, Sids spelled out, fixed-width counts.
+    #[test]
+    fn legacy_per_graph_class_slots_still_decode() {
+        let mut b = Vec::new();
+        let put_sid = |b: &mut Vec<u8>, ns: u16, name: &str| {
+            b.extend_from_slice(&ns.to_le_bytes());
+            b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+        };
+        b.extend_from_slice(&5u64.to_le_bytes()); // flakes
+        b.extend_from_slice(&0u64.to_le_bytes()); // size
+        b.extend_from_slice(&1u16.to_le_bytes()); // graphs
+        b.extend_from_slice(&0u16.to_le_bytes()); // g_id
+        b.extend_from_slice(&5u64.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // properties
+        b.push(1); // has_classes
+        b.extend_from_slice(&1u32.to_le_bytes());
+        put_sid(&mut b, 5, "Person");
+        b.extend_from_slice(&3u64.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // property usages
+        put_sid(&mut b, 5, "knows");
+        b.extend_from_slice(&1u16.to_le_bytes()); // datatypes
+        b.push(1);
+        b.extend_from_slice(&3u64.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes()); // langs
+        b.extend_from_slice(&1u16.to_le_bytes()); // ref classes
+        put_sid(&mut b, 5, "Person");
+        b.extend_from_slice(&3u64.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // aggregate properties
+        b.extend_from_slice(&0u32.to_le_bytes()); // aggregate classes
+
+        let decoded = decode_stats(&b).unwrap();
+        let graph = &decoded.graphs.as_ref().unwrap()[0];
+        let classes = graph.classes.as_ref().unwrap();
+        assert_eq!(classes[0].class_sid, sid(5, "Person"));
+        assert_eq!(classes[0].properties[0].ref_classes[0].count, 3);
+        assert_eq!(
+            format!("{:?}", decoded.classes),
+            format!("{:?}", graph.classes),
+            "the ledger-wide table is derived"
+        );
+    }
+
     #[test]
     fn the_ledger_wide_class_list_is_derived_from_the_graphs() {
         let class = |name: &str, count: u64| ClassStatEntry {
