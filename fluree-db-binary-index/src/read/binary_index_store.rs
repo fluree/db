@@ -3177,6 +3177,11 @@ impl BinaryGraphView {
         self.dict_novelty.is_some()
     }
 
+    /// The novelty dictionary this view resolves novel ids through.
+    pub fn dict_novelty(&self) -> Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>> {
+        self.dict_novelty.as_ref()
+    }
+
     // ── Internal watermark helpers ──────────────────────────────────────
 
     /// If `s_id` is above the watermark for its namespace, resolve from

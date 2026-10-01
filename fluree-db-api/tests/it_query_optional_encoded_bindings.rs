@@ -174,6 +174,9 @@ fn rows(expected: &[&[&str]]) -> Rows {
 }
 
 fn short(value: &str) -> String {
+    if value.starts_with("_:") {
+        return "BLANK".to_string();
+    }
     value
         .strip_prefix(EX)
         .or_else(|| value.strip_prefix("ex:"))
@@ -190,6 +193,7 @@ fn sparql_rows(result: &JsonValue, vars: &[&str]) -> Rows {
         .map(|b| {
             vars.iter()
                 .map(|v| match b.get(*v) {
+                    Some(term) if term["type"].as_str() == Some("bnode") => "BLANK".to_string(),
                     Some(term) => short(term["value"].as_str().expect("value")),
                     None => "-".to_string(),
                 })
@@ -1025,5 +1029,314 @@ async fn exists_in_an_expression_answers_encoded_subjects_from_the_cache() {
             }
         }
     }
+    failures.assert_none();
+}
+
+// ---------------------------------------------------------------------------
+// Novelty that touches the queried predicates.
+//
+// With novelty pending a plain scan decodes every term, while a batched lane
+// (OPTIONAL's bound-object lane, the join's batched lanes) binds a term by its
+// id: a subject minted since the last index by its novelty id, a persisted
+// blank node by its subject id. Every equality surface must see both forms as
+// one term. The `Novelty` state above writes an unrelated predicate, so these
+// lanes never meet a novelty id there.
+// ---------------------------------------------------------------------------
+
+/// Chunks of `ex:doc1` and the concepts that are `subjectOf` them; optionally
+/// a blank-node concept of `ex:s2` (both with an alias) and a blank-node chunk.
+fn chunks_base(blank_concept: bool, blank_chunk: bool) -> JsonValue {
+    let mut graph = vec![
+        json!({"@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "Doc 1"}),
+        json!({"@id": "ex:s1", "ex:derivedFrom": {"@id": "ex:doc1"}, "ex:text": "one"}),
+        json!({"@id": "ex:s2", "ex:derivedFrom": {"@id": "ex:doc1"}, "ex:text": "two"}),
+        json!({"@id": "ex:s3", "ex:derivedFrom": {"@id": "ex:doc1"}}),
+        json!({"@id": "ex:c1", "ex:subjectOf": {"@id": "ex:s1"}, "ex:alias": "c one"}),
+        json!({"@id": "ex:c2", "ex:subjectOf": {"@id": "ex:s2"}}),
+    ];
+    if blank_concept {
+        graph.push(json!({"ex:subjectOf": {"@id": "ex:s2"}, "ex:alias": "blank alias"}));
+    }
+    if blank_chunk {
+        graph.push(json!({"ex:derivedFrom": {"@id": "ex:doc1"}, "ex:text": "blank chunk"}));
+    }
+    json!({"@context": context(), "@graph": graph})
+}
+
+/// `base` indexed and reloaded from storage, then `novelty` written and left
+/// pending.
+async fn indexed_then_novelty(
+    ledger_id: &str,
+    base: &JsonValue,
+    novelty: &JsonValue,
+) -> (Fluree, LedgerHandle) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .insert(base)
+        .execute()
+        .await
+        .expect("seed");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
+    fluree
+        .stage(&handle)
+        .insert(novelty)
+        .execute()
+        .await
+        .expect("pending write");
+    let view = handle.snapshot().await;
+    assert!(view.binary_store.is_some(), "indexed");
+    assert!(!view.novelty.is_empty(), "novelty pending");
+    (fluree, handle)
+}
+
+/// A concept minted since the last index, `subjectOf` an indexed chunk.
+fn novelty_concept() -> JsonValue {
+    json!({"@context": context(), "@id": "ex:cN",
+        "ex:subjectOf": {"@id": "ex:s1"}, "ex:alias": "c new"})
+}
+
+/// OPTIONAL's bound-object lane binds `?c = ex:cN` by its novelty id; MINUS,
+/// DISTINCT, COUNT(DISTINCT), GROUP BY, sameTerm, `=` and a trailing VALUES
+/// meet the same IRI decoded by a scan.
+#[tokio::test(flavor = "current_thread")]
+async fn optional_lane_novelty_subject_is_one_term_with_its_decoded_form() {
+    let (fluree, handle) = indexed_then_novelty(
+        "it/optional-lane-novelty-subject:main",
+        &chunks_base(false, false),
+        &novelty_concept(),
+    )
+    .await;
+    let (store, _guard) = init_test_tracing();
+    let mut failures = Failures::default();
+    let cases: &[SurfaceCase] = &[
+        (
+            "plain",
+            "SELECT ?s ?c WHERE { ?s ex:derivedFrom ex:doc1 . OPTIONAL { ?c ex:subjectOf ?s } }",
+            &["s", "c"],
+            &[&["s1", "c1"], &["s1", "cN"], &["s2", "c2"], &["s3", "-"]],
+        ),
+        (
+            "MINUS",
+            "SELECT ?s ?c WHERE { ?s ex:derivedFrom ex:doc1 . OPTIONAL { ?c ex:subjectOf ?s } \
+             MINUS { ?c ex:alias ?a } }",
+            &["s", "c"],
+            &[&["s2", "c2"], &["s3", "-"]],
+        ),
+        (
+            "DISTINCT",
+            "SELECT DISTINCT ?c WHERE { { ?s ex:derivedFrom ex:doc1 . \
+             OPTIONAL { ?c ex:subjectOf ?s } } UNION { ?c ex:alias ?a } }",
+            &["c"],
+            &[&["-"], &["c1"], &["c2"], &["cN"]],
+        ),
+        (
+            "COUNT(DISTINCT)",
+            "SELECT (COUNT(DISTINCT ?c) AS ?n) WHERE { { ?s ex:derivedFrom ex:doc1 . \
+             OPTIONAL { ?c ex:subjectOf ?s } } UNION { ?c ex:alias ?a } }",
+            &["n"],
+            &[&["3"]],
+        ),
+        (
+            "GROUP BY",
+            "SELECT ?c (COUNT(*) AS ?n) WHERE { { ?s ex:derivedFrom ex:doc1 . \
+             OPTIONAL { ?c ex:subjectOf ?s } FILTER(BOUND(?c)) } UNION { ?c ex:alias ?a } } \
+             GROUP BY ?c",
+            &["c", "n"],
+            &[&["c1", "2"], &["c2", "1"], &["cN", "2"]],
+        ),
+        (
+            "sameTerm",
+            "SELECT ?s ?c ?x WHERE { ?s ex:derivedFrom ex:doc1 . OPTIONAL { ?c ex:subjectOf ?s } \
+             ?x ex:alias ?a FILTER(sameTerm(?c, ?x)) }",
+            &["s", "c", "x"],
+            &[&["s1", "c1", "c1"], &["s1", "cN", "cN"]],
+        ),
+        (
+            "FILTER =",
+            "SELECT ?s ?c ?x WHERE { ?s ex:derivedFrom ex:doc1 . OPTIONAL { ?c ex:subjectOf ?s } \
+             ?x ex:alias ?a FILTER(?c = ?x) }",
+            &["s", "c", "x"],
+            &[&["s1", "c1", "c1"], &["s1", "cN", "cN"]],
+        ),
+        (
+            "trailing VALUES",
+            "SELECT ?s ?c WHERE { ?s ex:derivedFrom ex:doc1 . OPTIONAL { ?c ex:subjectOf ?s } } \
+             VALUES ?c { ex:cN }",
+            &["s", "c"],
+            &[&["s1", "cN"], &["s3", "cN"]],
+        ),
+    ];
+    for (label, body, vars, expected) in cases {
+        let label = format!("novelty-minted ?c / {label}");
+        let before = store.all_events().len();
+        let result = sparql(&fluree, &handle, body).await;
+        failures.eq(sparql_rows(&result, vars), rows(expected), &label);
+        failures.object_probe_fired(&store, before, &label);
+    }
+
+    let jsonld_cases = [
+        (
+            "JSON-LD MINUS",
+            json!({
+                "@context": context(),
+                "select": ["?s", "?c"],
+                "where": [
+                    {"@id": "?s", "ex:derivedFrom": {"@id": "ex:doc1"}},
+                    ["optional", {"@id": "?c", "ex:subjectOf": "?s"}],
+                    ["minus", {"@id": "?c", "ex:alias": "?a"}]
+                ]
+            }),
+            rows(&[&["s2", "c2"], &["s3", "-"]]),
+        ),
+        (
+            "JSON-LD selectDistinct",
+            json!({
+                "@context": context(),
+                "selectDistinct": ["?c"],
+                "where": [
+                    ["union",
+                        [{"@id": "?s", "ex:derivedFrom": {"@id": "ex:doc1"}},
+                         ["optional", {"@id": "?c", "ex:subjectOf": "?s"}]],
+                        [{"@id": "?c", "ex:alias": "?a"}]]
+                ]
+            }),
+            rows(&[&["-"], &["c1"], &["c2"], &["cN"]]),
+        ),
+    ];
+    for (label, query, expected) in &jsonld_cases {
+        let label = format!("novelty-minted ?c / {label}");
+        let before = store.all_events().len();
+        let result = jsonld(&fluree, &handle, query).await;
+        failures.eq(jsonld_rows(&result), expected.clone(), &label);
+        failures.object_probe_fired(&store, before, &label);
+    }
+    failures.assert_none();
+}
+
+/// OPTIONAL's bound-object lane binds a persisted blank node by its subject
+/// id; MINUS and COUNT(DISTINCT) meet it decoded by a scan.
+#[tokio::test(flavor = "current_thread")]
+async fn optional_lane_blank_node_is_one_term_with_its_decoded_form() {
+    let (fluree, handle) = indexed_then_novelty(
+        "it/optional-lane-blank-node:main",
+        &chunks_base(true, false),
+        &unrelated_write(),
+    )
+    .await;
+    let (store, _guard) = init_test_tracing();
+    let mut failures = Failures::default();
+    let cases: &[SurfaceCase] = &[
+        (
+            "plain",
+            "SELECT ?s ?c WHERE { ?s ex:derivedFrom ex:doc1 . OPTIONAL { ?c ex:subjectOf ?s } }",
+            &["s", "c"],
+            &[&["s1", "c1"], &["s2", "BLANK"], &["s2", "c2"], &["s3", "-"]],
+        ),
+        (
+            "MINUS",
+            "SELECT ?s ?c WHERE { ?s ex:derivedFrom ex:doc1 . OPTIONAL { ?c ex:subjectOf ?s } \
+             MINUS { ?c ex:alias ?a } }",
+            &["s", "c"],
+            &[&["s2", "c2"], &["s3", "-"]],
+        ),
+        (
+            "COUNT(DISTINCT)",
+            "SELECT (COUNT(DISTINCT ?c) AS ?n) WHERE { { ?s ex:derivedFrom ex:doc1 . \
+             OPTIONAL { ?c ex:subjectOf ?s } } UNION { ?c ex:alias ?a } }",
+            &["n"],
+            &[&["3"]],
+        ),
+    ];
+    for (label, body, vars, expected) in cases {
+        let label = format!("blank-node ?c / {label}");
+        let before = store.all_events().len();
+        let result = sparql(&fluree, &handle, body).await;
+        failures.eq(sparql_rows(&result, vars), rows(expected), &label);
+        failures.object_probe_fired(&store, before, &label);
+    }
+    failures.assert_none();
+}
+
+/// The join's batched lane binds a novelty-minted chunk and a persisted
+/// blank-node chunk by id; MINUS and COUNT(DISTINCT) meet them decoded.
+#[tokio::test(flavor = "current_thread")]
+async fn join_lane_novelty_and_blank_subjects_are_one_term_with_their_decoded_forms() {
+    let novelty = json!({"@context": context(), "@id": "ex:sN",
+        "ex:derivedFrom": {"@id": "ex:doc1"}, "ex:text": "new"});
+    let (fluree, handle) = indexed_then_novelty(
+        "it/join-lane-novelty-blank:main",
+        &chunks_base(false, true),
+        &novelty,
+    )
+    .await;
+    let mut failures = Failures::default();
+    let cases: &[SurfaceCase] = &[
+        (
+            "MINUS",
+            "SELECT ?s WHERE { ?d a ex:Doc ; ex:title \"Doc 1\" . ?s ex:derivedFrom ?d \
+             MINUS { ?s ex:text ?t } }",
+            &["s"],
+            &[&["s3"]],
+        ),
+        (
+            // s1 s2 s3 sN and the blank chunk.
+            "COUNT(DISTINCT)",
+            "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { { ?d a ex:Doc ; ex:title \"Doc 1\" . \
+             ?s ex:derivedFrom ?d } UNION { ?s ex:text ?t } }",
+            &["n"],
+            &[&["5"]],
+        ),
+    ];
+    for (label, body, vars, expected) in cases {
+        let result = sparql(&fluree, &handle, body).await;
+        failures.eq(
+            sparql_rows(&result, vars),
+            rows(expected),
+            &format!("join lane / {label}"),
+        );
+    }
+    failures.assert_none();
+}
+
+/// Both OPTIONAL slots correlated after batched joins, the correlated IRIs
+/// minted in novelty: the joins bind `?s`/`?c` by novelty id, OPTIONAL seeks
+/// the subject and unifies the object with the decoded value its scan binds.
+#[tokio::test(flavor = "current_thread")]
+async fn optional_unify_matches_a_novelty_minted_object() {
+    let novelty = json!({"@context": context(), "@graph": [
+        {"@id": "ex:sN", "ex:derivedFrom": {"@id": "ex:doc1"}},
+        {"@id": "ex:cX", "ex:subjectOf": {"@id": "ex:sN"}}
+    ]});
+    let (fluree, handle) = indexed_then_novelty(
+        "it/optional-unify-novelty-object:main",
+        &chunks_base(false, false),
+        &novelty,
+    )
+    .await;
+    let mut failures = Failures::default();
+    let result = sparql(
+        &fluree,
+        &handle,
+        "SELECT ?s ?c ?p WHERE { ?d a ex:Doc ; ex:title \"Doc 1\" . ?s ex:derivedFrom ?d . \
+         ?c ex:subjectOf ?s . OPTIONAL { ?c ?p ?s } }",
+    )
+    .await;
+    failures.eq(
+        sparql_rows(&result, &["s", "c", "p"]),
+        rows(&[
+            &["s1", "c1", "subjectOf"],
+            &["s2", "c2", "subjectOf"],
+            &["sN", "cX", "subjectOf"],
+        ]),
+        "both slots correlated, novelty-minted IRIs",
+    );
     failures.assert_none();
 }

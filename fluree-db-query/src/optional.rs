@@ -38,7 +38,7 @@ use crate::join::{
     substitute_binding, BindInstruction, PatternPosition, SubjectProbeParams, Substitution,
     UnifyInstruction,
 };
-use crate::object_binding::{equality_norm, same_term, EqualityNorm};
+use crate::object_binding::{equality_norm, same_term, EqualityNorm, TermDicts};
 use crate::operator::flush::FlushSchedule;
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -173,25 +173,16 @@ pub trait OptionalBuilder: Send + Sync {
 /// Encoded id of a subject binding, for the batched probes; `None` when the
 /// binding has none.
 fn resolve_subject_id(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
-    let Some(store) = ctx.binary_store.as_deref() else {
+    let Some(dicts) = TermDicts::of(ctx) else {
         return Ok(None);
     };
     match binding {
         Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-        Binding::Sid { sid, .. } => {
-            // Persisted reverse dict first, then DictNovelty — subjects
-            // minted after the last index resolve to novelty s_ids, the
-            // same id space the overlay ops are translated into.
-            let persisted = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
-            Ok(persisted.or_else(|| {
-                ctx.dict_novelty
-                    .as_ref()
-                    .filter(|dn| dn.is_initialized())
-                    .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-            }))
-        }
+        // Subjects minted after the last index resolve to novelty s_ids, the
+        // same id space the overlay ops are translated into.
+        Binding::Sid { sid, .. } => dicts
+            .subject_id(sid.namespace_code, &sid.name)
+            .map_err(|e| QueryError::execution(format!("subject id lookup: {e}"))),
         _ => Ok(None),
     }
 }
@@ -1641,7 +1632,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         let seed_vars: Vec<VarId> = seed_cols.iter().map(|&c| req_schema[c]).collect();
 
         let norm = equality_norm(ctx);
-        let (store, gv) = EqualityNorm::parts(&norm);
+        let (dicts, gv) = EqualityNorm::parts(&norm);
 
         // Per row: full correlation key (for matching) + distinct seed tuple
         // over the seeded subset. A poisoned/unbound correlation var can never
@@ -1697,13 +1688,13 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             let key: Vec<GroupKeyOwned> = corr_cols
                 .iter()
                 .map(|&c| {
-                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
+                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
                 .collect();
             let seed_key: Vec<GroupKeyOwned> = seed_cols
                 .iter()
                 .map(|&c| {
-                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
+                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
                 .collect();
             if seen_seed.insert(seed_key) {
@@ -1779,7 +1770,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             for r in 0..batch.len() {
                 let key: Vec<GroupKeyOwned> = out_corr_cols
                     .iter()
-                    .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), store, gv))
+                    .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), dicts, gv))
                     .collect();
                 let projected: Vec<Binding> = out_opt_cols
                     .iter()
@@ -2465,6 +2456,8 @@ pub struct OptionalOperator {
     /// A required batch a budget-sized seed stopped partway through, and the
     /// first row it left unread.
     required_pending: Option<(Batch, usize)>,
+    /// Term normalization for `unify_check`, built once at open.
+    norm: Option<EqualityNorm>,
 }
 
 /// Tracks a required row's optional matches with progress cursor
@@ -2592,6 +2585,7 @@ impl OptionalOperator {
             result_cache: LruCache::new(NonZeroUsize::new(8192).expect("8192 is non-zero")),
             coalesce_schedule: FlushSchedule::fixed(optional_seed_coalesce_cap()),
             required_pending: None,
+            norm: None,
         }
     }
 
@@ -2650,7 +2644,6 @@ impl OptionalOperator {
         required_row: usize,
         optional_batch: &Batch,
         optional_row: usize,
-        ctx: &ExecutionContext<'_>,
     ) -> bool {
         // Unification must be resilient to optional operator schemas that do not
         // include substituted correlation vars.
@@ -2675,7 +2668,7 @@ impl OptionalOperator {
                     {
                         return true;
                     }
-                    same_term(left_val, right_val, ctx)
+                    same_term(left_val, right_val, &self.norm)
                 } else {
                     true
                 }
@@ -2774,6 +2767,7 @@ impl Operator for OptionalOperator {
 
         // Open required operator
         self.required.open(ctx).await?;
+        self.norm = equality_norm(ctx);
 
         self.state = OperatorState::Open;
         Ok(())
@@ -2882,7 +2876,6 @@ impl Operator for OptionalOperator {
                                 required_row,
                                 &self.pending_output.front().unwrap().optional_batches[batch_idx],
                                 opt_row,
-                                ctx,
                             ) {
                                 continue;
                             }

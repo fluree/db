@@ -158,9 +158,9 @@ impl MinusOperator {
             let Some(column) = batch.column(*var) else {
                 return;
             };
-            let (store, gv) = EqualityNorm::parts(&self.norm);
+            let (dicts, gv) = EqualityNorm::parts(&self.norm);
             for binding in column.iter().filter(|b| b.is_matchable()) {
-                let key = normalize_for_key_cow(binding, store, gv);
+                let key = normalize_for_key_cow(binding, dicts, gv);
                 if let Binding::EncodedSid { s_id, .. } = key.as_ref() {
                     self.minus_subjects.insert(*s_id);
                 } else {
@@ -180,8 +180,8 @@ impl MinusOperator {
                 match binding {
                     Some(b) if b.is_matchable() => {
                         key_bindings.push(Some({
-                            let (store, gv) = EqualityNorm::parts(&self.norm);
-                            normalize_for_key(b, store, gv)
+                            let (dicts, gv) = EqualityNorm::parts(&self.norm);
+                            normalize_for_key(b, dicts, gv)
                         }));
                     }
                     _ => {
@@ -232,8 +232,8 @@ impl MinusOperator {
             if !binding.is_matchable() {
                 return false;
             }
-            let (store, gv) = EqualityNorm::parts(&self.norm);
-            let key = normalize_for_key_cow(binding, store, gv);
+            let (dicts, gv) = EqualityNorm::parts(&self.norm);
+            let key = normalize_for_key_cow(binding, dicts, gv);
             if let Binding::EncodedSid { s_id, .. } = key.as_ref() {
                 return self.minus_subjects.contains(s_id);
             }
@@ -250,8 +250,8 @@ impl MinusOperator {
             match binding {
                 Some(b) if b.is_matchable() => {
                     input_bindings.push(Some({
-                        let (store, gv) = EqualityNorm::parts(&self.norm);
-                        normalize_for_key(b, store, gv)
+                        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+                        normalize_for_key(b, dicts, gv)
                     }));
                 }
                 _ => {

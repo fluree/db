@@ -257,7 +257,12 @@ impl AggState {
     /// * `binding` - The binding value to incorporate
     /// * `gv` - Optional graph view for materializing encoded bindings (needed for MIN/MAX).
     ///   When the graph view is novelty-aware, watermark routing is handled internally.
-    fn update(&mut self, binding: &Binding, gv: Option<&BinaryGraphView>) {
+    fn update(
+        &mut self,
+        binding: &Binding,
+        dicts: Option<crate::object_binding::TermDicts<'_>>,
+        gv: Option<&BinaryGraphView>,
+    ) {
         match self {
             AggState::Count { n } => {
                 // COUNT: count non-Unbound values (COUNT(*) counts all via CountAll variant)
@@ -273,11 +278,7 @@ impl AggState {
                     // Convert binding to owned group key for HashSet,
                     // normalizing decoded bindings so mixed-representation
                     // streams count as one value.
-                    let key = binding_to_group_key_normalized(
-                        binding,
-                        gv.map(BinaryGraphView::store),
-                        gv,
-                    );
+                    let key = binding_to_group_key_normalized(binding, dicts, gv);
                     seen.insert(key);
                 }
             }
@@ -472,11 +473,11 @@ impl Hash for MaterializedLitKey {
 /// per-(graph, predicate) and not canonical across representations).
 pub(crate) fn binding_to_group_key_normalized(
     binding: &Binding,
-    store: Option<&fluree_db_binary_index::BinaryIndexStore>,
+    dicts: Option<crate::object_binding::TermDicts<'_>>,
     gv: Option<&BinaryGraphView>,
 ) -> GroupKeyOwned {
     if let Some(canonical) =
-        store.and_then(|s| crate::object_binding::encoded_iri_canonical(binding, s))
+        dicts.and_then(|d| crate::object_binding::encoded_iri_canonical(binding, d))
     {
         return binding_to_group_key_owned(canonical.as_ref().unwrap_or(binding));
     }
@@ -489,8 +490,8 @@ pub(crate) fn binding_to_group_key_normalized(
         }
         return binding_to_group_key_owned(binding);
     }
-    if let Some(store) = store {
-        if let Some(normalized) = crate::object_binding::encoded_equivalent(binding, store) {
+    if let Some(dicts) = dicts {
+        if let Some(normalized) = crate::object_binding::encoded_equivalent(binding, dicts) {
             return binding_to_group_key_owned(&normalized);
         }
     }
@@ -668,11 +669,11 @@ impl CompositeGroupKey {
         bindings: impl IntoIterator<Item = &'a Binding>,
         norm: &Option<crate::object_binding::EqualityNorm>,
     ) -> Self {
-        let (store, gv) = crate::object_binding::EqualityNorm::parts(norm);
+        let (dicts, gv) = crate::object_binding::EqualityNorm::parts(norm);
         Self(
             bindings
                 .into_iter()
-                .map(|b| binding_to_group_key_normalized(b, store, gv))
+                .map(|b| binding_to_group_key_normalized(b, dicts, gv))
                 .collect(),
         )
     }
@@ -713,6 +714,9 @@ pub struct GroupAggregateOperator {
     /// When novelty-aware (via `ExecutionContext::graph_view()`), watermark routing
     /// for novelty-only subject/string IDs is handled internally.
     graph_view: Option<BinaryGraphView>,
+    /// Normalization for group keys and `COUNT(DISTINCT)`, so the forms one
+    /// term takes key as one (see [`binding_to_group_key_normalized`]).
+    norm: Option<crate::object_binding::EqualityNorm>,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
     /// Child columns each `COUNT(DISTINCT *)` spec composes its solution from,
@@ -794,6 +798,7 @@ impl GroupAggregateOperator {
             partitioned_groups: Vec::new(),
             emit_iter: None,
             graph_view,
+            norm: None,
             out_schema: None,
             row_distinct_cols,
             has_row_distinct,
@@ -836,11 +841,11 @@ impl GroupAggregateOperator {
 
     /// Write a row's composite group key into `key`, reusing its allocation.
     fn fill_group_key(&self, batch: &Batch, row_idx: usize, key: &mut CompositeGroupKey) {
-        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
+        let (dicts, gv) = crate::object_binding::EqualityNorm::parts(&self.norm);
         key.0.clear();
         key.0.extend(self.group_key_indices.iter().map(|&col_idx| {
             let binding = batch.get_by_col(row_idx, col_idx);
-            binding_to_group_key_normalized(binding, store, self.graph_view.as_ref())
+            binding_to_group_key_normalized(binding, dicts, gv)
         }));
     }
 
@@ -850,11 +855,11 @@ impl GroupAggregateOperator {
     /// construction — normalized the same way group keys are so a mixed
     /// encoded/decoded stream does not double-count.
     fn extract_row_key(&self, batch: &Batch, row_idx: usize, cols: &[usize]) -> Vec<GroupKeyOwned> {
-        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
+        let (dicts, gv) = crate::object_binding::EqualityNorm::parts(&self.norm);
         cols.iter()
             .map(|&col_idx| {
                 let binding = batch.get_by_col(row_idx, col_idx);
-                binding_to_group_key_normalized(binding, store, self.graph_view.as_ref())
+                binding_to_group_key_normalized(binding, dicts, gv)
             })
             .collect()
     }
@@ -914,6 +919,7 @@ impl Operator for GroupAggregateOperator {
         if self.graph_view.is_none() {
             self.graph_view = ctx.graph_view();
         }
+        self.norm = crate::object_binding::equality_norm(ctx);
         Ok(())
     }
 
@@ -1049,6 +1055,7 @@ impl Operator for GroupAggregateOperator {
 
                             // Update aggregate states for current group.
                             let gv_ref = self.graph_view.as_ref();
+                            let dicts = crate::object_binding::EqualityNorm::parts(&self.norm).0;
                             let group_state = current_state
                                 .as_mut()
                                 .expect("partitioned aggregation must have current group state");
@@ -1056,7 +1063,8 @@ impl Operator for GroupAggregateOperator {
                                 match spec.input_col {
                                     Some(col_idx) => {
                                         let binding = batch.get_by_col(row_idx, col_idx);
-                                        group_state.agg_states[agg_idx].update(binding, gv_ref);
+                                        group_state.agg_states[agg_idx]
+                                            .update(binding, dicts, gv_ref);
                                     }
                                     // COUNT(DISTINCT *) - count distinct solutions
                                     None if matches!(
@@ -1158,11 +1166,12 @@ impl Operator for GroupAggregateOperator {
 
                         // Update each aggregate with this row's values
                         let gv_ref = self.graph_view.as_ref();
+                        let dicts = crate::object_binding::EqualityNorm::parts(&self.norm).0;
                         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
                             match spec.input_col {
                                 Some(col_idx) => {
                                     let binding = batch.get_by_col(row_idx, col_idx);
-                                    group_state.agg_states[agg_idx].update(binding, gv_ref);
+                                    group_state.agg_states[agg_idx].update(binding, dicts, gv_ref);
                                 }
                                 // COUNT(DISTINCT *) - count distinct solutions
                                 None if matches!(

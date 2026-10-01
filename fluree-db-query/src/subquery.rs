@@ -690,9 +690,9 @@ impl SubqueryOperator {
                 if binding.is_none_or(|b| matches!(b, Binding::Unbound)) {
                     unbound.push(col);
                 }
-                let (store, gv) = EqualityNorm::parts(&self.norm);
+                let (dicts, gv) = EqualityNorm::parts(&self.norm);
                 binding
-                    .map(|b| binding_to_group_key_normalized(b, store, gv))
+                    .map(|b| binding_to_group_key_normalized(b, dicts, gv))
                     .unwrap_or(GroupKeyOwned::Absent)
             })
             .collect();
@@ -739,7 +739,7 @@ impl SubqueryOperator {
         // load-bearing in BOTH per-row and join mode — it is not a per-row
         // no-op.
         if !self.reconcile_vars.is_empty() {
-            let (store, gv) = EqualityNorm::parts(&self.norm);
+            let (dicts, gv) = EqualityNorm::parts(&self.norm);
             let incompatible = self.reconcile_vars.iter().any(|v| {
                 let parent = parent_batch.get(row_idx, *v);
                 let sub = self.select_index.get(v).and_then(|&i| subquery_row(i));
@@ -748,8 +748,8 @@ impl SubqueryOperator {
                         if !matches!(p, Binding::Unbound | Binding::Poisoned)
                             && !matches!(s, Binding::Unbound | Binding::Poisoned) =>
                     {
-                        binding_to_group_key_normalized(p, store, gv)
-                            != binding_to_group_key_normalized(s, store, gv)
+                        binding_to_group_key_normalized(p, dicts, gv)
+                            != binding_to_group_key_normalized(s, dicts, gv)
                     }
                     _ => false,
                 }
@@ -883,7 +883,7 @@ impl SubqueryOperator {
                 mat._memory.add(ctx, index_bytes)?;
                 index_bytes = 0;
             }
-            let (store, gv) = EqualityNorm::parts(&self.norm);
+            let (dicts, gv) = EqualityNorm::parts(&self.norm);
             let key: Vec<_> = self
                 .join_keys
                 .iter()
@@ -891,7 +891,7 @@ impl SubqueryOperator {
                     self.select_index
                         .get(v)
                         .and_then(|&col| row.get(col))
-                        .map(|b| binding_to_group_key_normalized(b, store, gv))
+                        .map(|b| binding_to_group_key_normalized(b, dicts, gv))
                         .unwrap_or(GroupKeyOwned::Absent)
                 })
                 .collect();

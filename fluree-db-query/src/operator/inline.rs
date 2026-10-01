@@ -84,7 +84,17 @@ pub fn apply_inline(
                     Some(pos) => match (&bindings[pos], &value) {
                         (Binding::Unbound, _) => bindings[pos] = value,
                         (_, Binding::Unbound) => continue,
-                        (a, b) if a == b => continue,
+                        // A scan's encoded value and the expression's decoded
+                        // one can be one term.
+                        (a, b)
+                            if crate::object_binding::same_term_by_dicts(
+                                a,
+                                b,
+                                ctx.and_then(crate::object_binding::equality_dicts),
+                            ) =>
+                        {
+                            continue
+                        }
                         _ => return Ok(false),
                     },
                 }

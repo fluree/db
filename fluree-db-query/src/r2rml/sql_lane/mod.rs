@@ -1384,7 +1384,11 @@ fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> GroupKeyOwned {
         Some(iri) => GroupKeyOwned::MaterializedSid(0, iri.into()),
         None => {
             let gv = ctx.graph_view();
-            binding_to_group_key_normalized(b, ctx.binary_store.as_deref(), gv.as_ref())
+            binding_to_group_key_normalized(
+                b,
+                crate::object_binding::TermDicts::of(ctx),
+                gv.as_ref(),
+            )
         }
     }
 }
