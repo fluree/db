@@ -358,6 +358,25 @@ answer the existence test. Each execution caches at most four projection shapes,
 with further shapes using per-row evaluation. Both the base and projected key
 sets contribute to the query's retained-memory estimate and budget checks.
 
+**`OptionalOperator`** answers a single-triple `OPTIONAL` correlated on one end
+of its triple with one batched probe for the whole driving side: a PSOT probe
+when the subject comes from the required side (`OPTIONAL { ?s :email ?e }`), an
+OPST probe when the object does (`OPTIONAL { ?c :subjectOf ?s }`). Other shapes
+look the triple up per driving row with every correlated value bound into the
+scan, whichever form the row carries it in: an encoded subject, predicate, or
+literal is decoded into its slot, so no row scans the whole predicate. When the
+row binds the subject, an encoded object is left to the join check instead of
+decoded, because the subject seek is already narrow.
+
+**Term equality across forms.** On an indexed ledger the scan emits terms
+encoded (`EncodedPid` for a predicate position, `EncodedSid` for a subject or
+reference object, `EncodedLit` for a literal); decoded producers such as
+`VALUES`, `BIND`, and scans over novelty carry the same terms decoded. Every
+equality surface (hash joins, `DISTINCT`, `GROUP BY`, `MINUS`, `EXISTS`,
+`VALUES`, `OPTIONAL`) keys an IRI by one canonical form: its subject ID when it has one,
+else its predicate ID. The predicate-to-subject mapping is resolved once per
+index, so a key over predicate bindings costs a load per row.
+
 **`CyclicBgpOperator`** handles small cyclic fixed-predicate BGPs (triangles and
 4-edge cycles over reference-valued joins) that would otherwise run as left-deep
 nested loops. It is intentionally narrower than a general leapfrog triejoin;
