@@ -3243,6 +3243,17 @@ fn decode_overlay_object(
                 ov.resolve_string_value(o_key as u32)
                     .map_err(|e| decode_err("resolve_string_value", &e))?,
             ),
+            (DecodeKind::TripleTermDict, _)
+                if fluree_db_core::triple_term::novelty_term_index(o_key).is_some() =>
+            {
+                let term = fluree_db_core::triple_term::novelty_term_index(o_key)
+                    .zip(ctx.dict_novelty.as_ref())
+                    .and_then(|(index, dn)| dn.terms.resolve(index))
+                    .ok_or_else(|| {
+                        decode_err("novelty term", &format!("no term for handle {o_key:#x}"))
+                    })?;
+                FlakeValue::TripleTerm(Box::new(term.clone()))
+            }
             _ => store
                 .decode_value_v3(o_type, o_key, p_id, ctx.binary_g_id)
                 .map_err(|e| decode_err("decode_value_v3", &e))?,

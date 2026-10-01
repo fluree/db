@@ -27,7 +27,7 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::o_type::OType;
-use fluree_db_core::triple_term::TermKey;
+use fluree_db_core::triple_term::{novelty_term_index, TermKey};
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid, TripleTermValue};
 use std::collections::{HashMap, HashSet};
@@ -50,11 +50,11 @@ struct EncodedConstants {
     o: Option<(u16, u64)>,
 }
 
-/// A term only novelty's links name, with its subject's id when a dictionary
-/// holds one.
+/// A term only novelty's links name: encoded under its provisional handle
+/// when dictionary novelty gives it one, else materialized.
 struct NoveltyTerm {
     term: Box<TripleTermValue>,
-    s_id: Option<u64>,
+    encoded: Option<(u64, TermKey)>,
 }
 
 pub struct TermComponentsOperator {
@@ -126,30 +126,29 @@ impl TermComponentsOperator {
         let dict_novelty = ctx.dict_novelty.as_ref();
         let mut out = Vec::new();
         for term in seen {
-            let s_id = match &self.store {
+            let encoded = match &self.store {
                 Some(store) => {
-                    match missing(crate::binary_scan::compose_term_handle(
+                    let handle = missing(crate::binary_scan::compose_term_handle(
                         &term,
                         store,
                         dict_novelty,
                     ))
                     .map_err(|e| QueryError::from_io("term components: novelty", e))?
-                    {
+                    .map(|(_, handle)| handle);
+                    match handle {
                         // The dictionary offers it already.
-                        Some(_) => continue,
-                        None => missing(crate::binary_scan::resolve_subject_v3(
-                            &term.s,
-                            store,
-                            dict_novelty,
-                        ))
-                        .map_err(|e| QueryError::from_io("term components: novelty", e))?,
+                        Some(h) if novelty_term_index(h).is_none() => continue,
+                        Some(h) => crate::binary_scan::term_key_for_handle(h, store, dict_novelty)
+                            .map_err(|e| QueryError::from_io("term components: novelty", e))?
+                            .map(|key| (h, key)),
+                        None => None,
                     }
                 }
                 None => None,
             };
             out.push(NoveltyTerm {
                 term: Box::new(term),
-                s_id,
+                encoded,
             });
         }
         Ok(out)
@@ -161,7 +160,9 @@ impl TermComponentsOperator {
         match &self.pattern.subject {
             Component::Node(sid) => nt.term.s == *sid,
             Component::Var(v) => match self.value(row, *v) {
-                Some(Binding::EncodedSid { s_id, .. }) => nt.s_id == Some(*s_id),
+                Some(Binding::EncodedSid { s_id, .. }) => {
+                    nt.encoded.is_none_or(|(_, key)| key.s_id == *s_id)
+                }
                 Some(Binding::Sid { sid, .. }) => nt.term.s == *sid,
                 _ => true,
             },
@@ -503,15 +504,29 @@ impl Operator for TermComponentsOperator {
                         let Some(store) = &self.store else {
                             continue;
                         };
-                        let key = store
-                            .resolve_term_key(o_key)
-                            .map_err(|e| QueryError::from_io("resolve_term_key", e))?
-                            .ok_or_else(|| {
-                                QueryError::Internal(format!(
-                                    "triple-term handle {o_key:#x} has no dictionary entry"
-                                ))
-                            })?;
-                        (vec![Candidate::Encoded { handle: o_key, key }], t)
+                        let key = crate::binary_scan::term_key_for_handle(
+                            o_key,
+                            store,
+                            ctx.dict_novelty.as_ref(),
+                        )
+                        .map_err(|e| QueryError::from_io("resolve_term_key", e))?;
+                        // A provisional handle whose components no dictionary
+                        // encodes is offered as its novelty term.
+                        let candidate = match key {
+                            Some(key) => Candidate::Encoded { handle: o_key, key },
+                            None => match novelty_term_index(o_key)
+                                .zip(ctx.dict_novelty.as_ref())
+                                .and_then(|(index, dn)| dn.terms.resolve(index))
+                            {
+                                Some(term) => Candidate::Materialized(Box::new(term.clone())),
+                                None => {
+                                    return Err(QueryError::Internal(format!(
+                                        "triple-term handle {o_key:#x} has no dictionary entry"
+                                    )))
+                                }
+                            },
+                        };
+                        (vec![candidate], t)
                     }
                     Some(Binding::Lit {
                         val: FlakeValue::TripleTerm(term),
@@ -582,7 +597,10 @@ impl Operator for TermComponentsOperator {
                             self.novelty_terms
                                 .iter()
                                 .filter(|nt| self.novelty_anchor_matches(&row, nt))
-                                .map(|nt| Candidate::Materialized(nt.term.clone())),
+                                .map(|nt| match nt.encoded {
+                                    Some((handle, key)) => Candidate::Encoded { handle, key },
+                                    None => Candidate::Materialized(nt.term.clone()),
+                                }),
                         );
                         (candidates, 0)
                     }

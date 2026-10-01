@@ -941,7 +941,9 @@ impl LedgerState {
 
         Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&flakes);
         Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&flakes);
-        Arc::make_mut(&mut self.novelty).apply_commit(flakes, next_t, &reverse_graph)?;
+        let links =
+            Arc::make_mut(&mut self.novelty).apply_commit(flakes, next_t, &reverse_graph)?;
+        Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&links);
 
         Ok(())
     }
@@ -1071,7 +1073,9 @@ impl LedgerState {
         // avoids the unconditional deep clone the previous clone-then-swap forced.
         Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&all_flakes);
         Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&all_flakes);
-        Arc::make_mut(&mut self.novelty).apply_commit(all_flakes, commit_t, &reverse_graph)?;
+        let links =
+            Arc::make_mut(&mut self.novelty).apply_commit(all_flakes, commit_t, &reverse_graph)?;
+        Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&links);
 
         // Update state
         self.head_commit_id = Some(commit_id.clone());

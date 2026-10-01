@@ -2937,6 +2937,26 @@ impl BinaryGraphView {
         self.namespace_codes_fallback.clone()
     }
 
+    /// A provisional triple-term handle's term, from dictionary novelty;
+    /// `None` for an indexed handle.
+    fn novelty_term(
+        dn: &fluree_db_core::dict_novelty::DictNovelty,
+        handle: u64,
+    ) -> Option<io::Result<FlakeValue>> {
+        let index = fluree_db_core::triple_term::novelty_term_index(handle)?;
+        Some(
+            dn.terms
+                .resolve(index)
+                .map(|term| FlakeValue::TripleTerm(Box::new(term.clone())))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("provisional triple-term handle {handle:#x} not in novelty"),
+                    )
+                }),
+        )
+    }
+
     /// Decode a value from `(o_type, o_key)`. Novelty-aware when `dict_novelty`
     /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through
     /// watermark checks; all other types delegate directly to the store.
@@ -2959,6 +2979,11 @@ impl BinaryGraphView {
                     DecodeKind::JsonArena => {
                         if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
                             return Ok(FlakeValue::Json(s));
+                        }
+                    }
+                    DecodeKind::TripleTermDict => {
+                        if let Some(term) = Self::novelty_term(dn, o_key) {
+                            return term;
                         }
                     }
                     DecodeKind::Duration => {
@@ -3020,6 +3045,10 @@ impl BinaryGraphView {
                 } else if o_kind == ObjKind::JSON_ID.as_u8() {
                     if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
                         return Ok(FlakeValue::Json(s));
+                    }
+                } else if o_kind == ObjKind::TRIPLE_TERM.as_u8() {
+                    if let Some(term) = Self::novelty_term(dn, o_key) {
+                        return term;
                     }
                 }
             }

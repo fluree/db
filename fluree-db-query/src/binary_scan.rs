@@ -1483,8 +1483,7 @@ impl BinaryScanOperator {
                 if o_type != OType::TRIPLE_TERM.as_u16() {
                     continue;
                 }
-                let Some(key) = store_arc
-                    .resolve_term_key(o_key)
+                let Some(key) = term_key_for_handle(o_key, &store_arc, dict_novelty_arc.as_ref())
                     .map_err(|e| QueryError::from_io("resolve_term_key", e))?
                 else {
                     continue;
@@ -4529,20 +4528,46 @@ fn encode_term_key_filter(
     Ok(TermKeyFilter { s_id, o })
 }
 
-/// A constant triple term's handle, composed through the term dictionary.
-/// A subject, predicate, object or term the dictionary does not hold is
-/// `NotFound`: the link index only ever carries interned handles, so the
-/// pattern cannot match a base row and the caller may skip to novelty.
+/// A constant triple term's handle: the term dictionary's, else the
+/// provisional handle dictionary novelty gives a term the index has not
+/// interned. A term neither holds is `NotFound`: no link names it, so the
+/// pattern cannot match.
 pub(crate) fn compose_term_handle(
     term: &fluree_db_core::TripleTermValue,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> std::io::Result<(OType, u64)> {
     use std::io::{Error, ErrorKind};
+    match persisted_term_handle(term, store, dict_novelty) {
+        Ok(Some(handle)) => return Ok((OType::TRIPLE_TERM, handle)),
+        Ok(None) => {}
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::Unsupported) => {}
+        Err(e) => return Err(e),
+    }
+    let provisional = dict_novelty
+        .filter(|dn| dn.is_initialized())
+        .and_then(|dn| dn.terms.find(term))
+        .zip(store.sid_to_p_id(&term.p))
+        .map(|(index, p_id)| fluree_db_core::triple_term::novelty_term_handle(p_id, index));
+    match provisional {
+        Some(handle) => Ok((OType::TRIPLE_TERM, handle)),
+        None => Err(Error::new(
+            ErrorKind::NotFound,
+            "triple term is not interned",
+        )),
+    }
+}
+
+/// The handle the persisted term dictionary holds for `term`.
+fn persisted_term_handle(
+    term: &fluree_db_core::TripleTermValue,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<Option<u64>> {
+    let Some(p_id) = store.sid_to_p_id(&term.p) else {
+        return Ok(None);
+    };
     let s_id = resolve_subject_v3(&term.s, store, dict_novelty)?;
-    let p_id = store
-        .sid_to_p_id(&term.p)
-        .ok_or_else(|| Error::new(ErrorKind::NotFound, "triple term predicate is not known"))?;
     let (o_type, o_key) = value_to_otype_okey(
         &term.o,
         &term.dt,
@@ -4551,18 +4576,56 @@ pub(crate) fn compose_term_handle(
         dict_novelty,
         None,
     )?;
-    let key = fluree_db_core::triple_term::TermKey {
+    store.find_term_handle(&fluree_db_core::triple_term::TermKey {
         s_id,
         p_id,
         o_type,
         o_key,
+    })
+}
+
+/// The encoded base edge behind any term handle: the dictionary's key, or for
+/// a provisional handle the key its novelty term encodes to. `None` when
+/// neither dictionary can name it.
+pub(crate) fn term_key_for_handle(
+    handle: u64,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<Option<fluree_db_core::triple_term::TermKey>> {
+    use fluree_db_core::triple_term::{novelty_term_index, term_handle_p_id, TermKey};
+    let Some(index) = novelty_term_index(handle) else {
+        return store.resolve_term_key(handle);
     };
-    match store.find_term_handle(&key)? {
-        Some(handle) => Ok((OType::TRIPLE_TERM, handle)),
-        None => Err(Error::new(
-            ErrorKind::NotFound,
-            "triple term is not interned",
-        )),
+    let Some(term) = dict_novelty.and_then(|dn| dn.terms.resolve(index)) else {
+        return Ok(None);
+    };
+    let encoded = resolve_subject_v3(&term.s, store, dict_novelty).and_then(|s_id| {
+        value_to_otype_okey(
+            &term.o,
+            &term.dt,
+            term.lang.as_deref(),
+            store,
+            dict_novelty,
+            None,
+        )
+        .map(|(o_type, o_key)| TermKey {
+            s_id,
+            p_id: term_handle_p_id(handle),
+            o_type,
+            o_key,
+        })
+    });
+    match encoded {
+        Ok(key) => Ok(Some(key)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
     }
 }
 

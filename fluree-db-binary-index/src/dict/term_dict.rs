@@ -267,11 +267,12 @@ impl TermDictBuilder {
             return Ok(*h);
         }
         let next = self.next_seq.entry(key.p_id).or_insert(0);
-        if *next == u32::MAX {
+        // The sequences above are novelty's provisional handles.
+        if *next >= fluree_db_core::triple_term::NOVELTY_TERM_SEQ_BASE {
             return Err(io::Error::other(format!(
-                "triple-term dictionary: predicate {} exhausted its {}-bit sequence space",
+                "triple-term dictionary: predicate {} exhausted its {} indexed sequences",
                 key.p_id,
-                fluree_db_core::triple_term::TERM_SEQ_BITS
+                fluree_db_core::triple_term::NOVELTY_TERM_SEQ_BASE
             )));
         }
         let handle = term_handle(key.p_id, *next);

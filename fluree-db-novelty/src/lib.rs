@@ -863,16 +863,19 @@ impl Novelty {
     /// Unknown graph Sids cause an error — no silent fallback to the default
     /// graph.
     ///
-    /// Atomic: graph routing (the only fallible step) is resolved before any
-    /// mutation, so an error leaves novelty untouched.
+    /// Atomic: graph routing and link derivation (the fallible steps) run
+    /// before any mutation, so an error leaves novelty untouched.
+    ///
+    /// Returns the reification links derived for the commit (see [`links`]),
+    /// which the caller's dictionary novelty must register.
     pub fn apply_commit(
         &mut self,
         flakes: Vec<Flake>,
         commit_t: i64,
         reverse_graph: &HashMap<Sid, GraphId>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Flake>> {
         if flakes.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let span = tracing::debug_span!(
@@ -913,10 +916,12 @@ impl Novelty {
 
         // Links read the index, so they are derived before any mutation too.
         let links_current = self.current_link_base().is_some();
+        let mut derived: Vec<Flake> = Vec::new();
         if let Some(base) = self.current_link_base() {
             let touched = links::touched_reifiers(routed.iter().map(|(f, g)| (*g, f)));
             if !touched.is_empty() {
                 let links = self.derive_links(base, &touched, self.t)?;
+                derived = links.iter().map(|(_, f)| f.clone()).collect();
                 routed.extend(links.into_iter().map(|(g_id, f)| (f, g_id)));
             }
         }
@@ -1009,7 +1014,7 @@ impl Novelty {
             self.push_segment(g_id, seg);
         }
 
-        Ok(())
+        Ok(derived)
     }
 
     /// Bulk-apply many commits' flakes in a single pass (first-load / catch-up).

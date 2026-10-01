@@ -1146,7 +1146,11 @@ fn finalize_state_with_base(
         if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
             reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
         }
-        Arc::make_mut(&mut new_novelty).apply_commit(all_flakes, new_t, &reverse_graph)?;
+        let links =
+            Arc::make_mut(&mut new_novelty).apply_commit(all_flakes, new_t, &reverse_graph)?;
+        if !links.is_empty() {
+            populate_dict_novelty(Arc::make_mut(&mut dict_novelty), store.as_deref(), &links)?;
+        }
     }
 
     // Rebuild + reattach the provider with the UPDATED dicts so reads through the

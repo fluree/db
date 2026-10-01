@@ -1253,3 +1253,32 @@ async fn novelty_links_follow_the_index_they_were_published_over() {
         })
         .await;
 }
+
+/// A count over links whose terms only novelty holds stays on the count plan:
+/// those terms get provisional handles, so their links join the encoded
+/// overlay instead of the raw-flake lane the plan declines on.
+#[tokio::test(flavor = "current_thread")]
+async fn novelty_terms_keep_link_counts_on_the_count_plan() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let (fluree, ledger) = import(
+        &[("claims.ttl", CLAIMS)],
+        "it/triple-term-links:novelty-count",
+    )
+    .await;
+    let ledger = change_claims_without_indexing(&fluree, ledger).await;
+    let count = || "SELECT (COUNT(*) AS ?n) WHERE { << ?s ?p ?o >> ex:source ?src }".to_string();
+    // Register the stamp callsite before this thread's subscriber reads it.
+    run_link_query(&fluree, &ledger, count()).await;
+    let (store, _guard) = support::span_capture::init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
+
+    let got = run_link_query(&fluree, &ledger, count()).await;
+    assert_eq!(got, vec![vec!["4".to_string()]], "{got:#?}");
+    let outcomes: Vec<String> = store
+        .find_events("fast-path outcome")
+        .iter()
+        .filter(|e| e.fields.get("site").map(String::as_str) == Some("count-plan"))
+        .filter_map(|e| e.fields.get("outcome").cloned())
+        .collect();
+    assert_eq!(outcomes, ["proceed"], "{outcomes:?}");
+}

@@ -515,14 +515,18 @@ fn encoded_term<'c, R: RowAccess>(
     let Some(store) = ctx.binary_store.as_deref() else {
         return Ok(None);
     };
-    let key = store
-        .resolve_term_key(*o_key)
-        .map_err(|e| QueryError::from_io("resolve_term_key", e))?
-        .ok_or_else(|| {
-            QueryError::Internal(format!(
-                "triple-term handle {o_key:#x} has no dictionary entry"
-            ))
-        })?;
+    let key = crate::binary_scan::term_key_for_handle(*o_key, store, ctx.dict_novelty.as_ref())
+        .map_err(|e| QueryError::from_io("resolve_term_key", e))?;
+    // A provisional handle whose components no dictionary encodes takes the
+    // value path through its novelty term.
+    if key.is_none() && fluree_db_core::triple_term::novelty_term_index(*o_key).is_some() {
+        return Ok(None);
+    }
+    let key = key.ok_or_else(|| {
+        QueryError::Internal(format!(
+            "triple-term handle {o_key:#x} has no dictionary entry"
+        ))
+    })?;
     Ok(Some((key, *t, ctx)))
 }
 
@@ -590,6 +594,17 @@ pub(crate) fn term_component_binding<R: RowAccess>(
                 val: fluree_db_core::FlakeValue::TripleTerm(term),
                 ..
             }) => term.as_ref().clone(),
+            Some(Binding::EncodedLit { o_kind, o_key, .. })
+                if *o_kind == fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8() =>
+            {
+                match fluree_db_core::triple_term::novelty_term_index(*o_key)
+                    .zip(ctx.and_then(|c| c.dict_novelty.as_ref()))
+                    .and_then(|(index, dn)| dn.terms.resolve(index))
+                {
+                    Some(term) => term.clone(),
+                    None => return Ok(None),
+                }
+            }
             _ => return Ok(None),
         },
         _ => match triple_term_arg(args, row, ctx, name)? {

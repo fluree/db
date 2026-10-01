@@ -35,6 +35,31 @@ pub const fn term_handle_seq(handle: u64) -> u32 {
     (handle & TERM_SEQ_MASK) as u32
 }
 
+/// First per-predicate sequence of a provisional handle: one dictionary
+/// novelty assigns to a term the index has not interned. Indexed sequences
+/// stay below it, so a provisional handle still falls in its predicate's
+/// interval and never collides with an indexed one.
+pub const NOVELTY_TERM_SEQ_BASE: u32 = 1 << 31;
+
+/// The provisional handle for dictionary-novelty term `index` under
+/// `inner_p_id`.
+#[inline]
+pub const fn novelty_term_handle(inner_p_id: u32, index: u32) -> u64 {
+    term_handle(inner_p_id, NOVELTY_TERM_SEQ_BASE | index)
+}
+
+/// The dictionary-novelty index of a provisional handle; `None` for an
+/// indexed one.
+#[inline]
+pub const fn novelty_term_index(handle: u64) -> Option<u32> {
+    let seq = term_handle_seq(handle);
+    if seq >= NOVELTY_TERM_SEQ_BASE {
+        Some(seq - NOVELTY_TERM_SEQ_BASE)
+    } else {
+        None
+    }
+}
+
 /// Inclusive `o_key` interval holding every term under `inner_p_id`.
 #[inline]
 pub const fn term_handle_range(inner_p_id: u32) -> (u64, u64) {
@@ -106,6 +131,19 @@ mod tests {
         assert!(lo <= h && h <= hi);
         assert!(term_handle(8, 0) > hi);
         assert!(term_handle(6, u32::MAX) < lo);
+    }
+
+    #[test]
+    fn provisional_handles_stay_in_their_predicate_interval() {
+        let h = novelty_term_handle(7, 3);
+        let (lo, hi) = term_handle_range(7);
+        assert!(lo <= h && h <= hi);
+        assert_eq!(term_handle_p_id(h), 7);
+        assert_eq!(novelty_term_index(h), Some(3));
+        assert_eq!(
+            novelty_term_index(term_handle(7, NOVELTY_TERM_SEQ_BASE - 1)),
+            None
+        );
     }
 
     #[test]

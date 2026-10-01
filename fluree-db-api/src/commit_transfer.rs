@@ -1479,11 +1479,19 @@ fn apply_pushed_commits_to_state(
         })?;
         Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(flakes);
         // Apply to novelty.
-        novelty
+        let links = novelty
             .apply_commit(flakes.clone(), *t, &reverse_graph)
             .map_err(|e| {
                 PushError::Internal(format!("novelty apply_commit failed at t={t}: {e}"))
             })?;
+        fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
+            Arc::make_mut(&mut dict_novelty),
+            store_opt,
+            links.iter(),
+        )
+        .map_err(|e| {
+            PushError::Internal(format!("populate_dict_novelty_safe failed at t={t}: {e}"))
+        })?;
     }
 
     base.novelty = Arc::new(novelty);
