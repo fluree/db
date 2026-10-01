@@ -4538,12 +4538,34 @@ fn encode_term_key_filter(
                     Some(tag.as_ref()),
                 ),
             };
-            let (ot, key) = value_to_otype_okey(value, &dt, lang, store, dict_novelty, None)?;
+            let (ot, key) = term_object_key(value, &dt, lang, store, dict_novelty)?;
             Some((ot.as_u16(), key))
         }
         None => None,
     };
     Ok(TermKeyFilter { s_id, o })
+}
+
+/// A term's object as a term key holds it. A decimal, big-integer or vector
+/// object is keyed by the persisted string id of its canonical form; a form
+/// the index never interned names no indexed term, so it is `NotFound`.
+pub(crate) fn term_object_key(
+    value: &FlakeValue,
+    dt: &Sid,
+    lang: Option<&str>,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<(OType, u64)> {
+    let Some((o_type, form)) = fluree_db_core::triple_term::lexical_term_object(value) else {
+        return value_to_otype_okey(value, dt, lang, store, dict_novelty, None);
+    };
+    match store.find_string_id(&form)? {
+        Some(id) => Ok((o_type, u64::from(id))),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "term object form is not interned",
+        )),
+    }
 }
 
 /// A constant triple term's handle: the term dictionary's, else the
@@ -4586,14 +4608,8 @@ fn persisted_term_handle(
         return Ok(None);
     };
     let s_id = resolve_subject_v3(&term.s, store, dict_novelty)?;
-    let (o_type, o_key) = value_to_otype_okey(
-        &term.o,
-        &term.dt,
-        term.lang.as_deref(),
-        store,
-        dict_novelty,
-        None,
-    )?;
+    let (o_type, o_key) =
+        term_object_key(&term.o, &term.dt, term.lang.as_deref(), store, dict_novelty)?;
     store.find_term_handle(&fluree_db_core::triple_term::TermKey {
         s_id,
         p_id,
@@ -4618,20 +4634,14 @@ pub(crate) fn term_key_for_handle(
         return Ok(None);
     };
     let encoded = resolve_subject_v3(&term.s, store, dict_novelty).and_then(|s_id| {
-        value_to_otype_okey(
-            &term.o,
-            &term.dt,
-            term.lang.as_deref(),
-            store,
-            dict_novelty,
-            None,
+        term_object_key(&term.o, &term.dt, term.lang.as_deref(), store, dict_novelty).map(
+            |(o_type, o_key)| TermKey {
+                s_id,
+                p_id: term_handle_p_id(handle),
+                o_type,
+                o_key,
+            },
         )
-        .map(|(o_type, o_key)| TermKey {
-            s_id,
-            p_id: term_handle_p_id(handle),
-            o_type,
-            o_key,
-        })
     });
     match encoded {
         Ok(key) => Ok(Some(key)),

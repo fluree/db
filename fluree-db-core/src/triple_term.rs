@@ -10,7 +10,8 @@
 //! The split is a deliberate constant: 32 bits of sequence per predicate,
 //! 32 bits of predicate id. Both limits are enforced at allocation.
 
-use crate::o_type::OType;
+use crate::o_type::{DecodeKind, OType};
+use crate::value::FlakeValue;
 
 /// Bits of per-predicate sequence in a handle.
 pub const TERM_SEQ_BITS: u32 = 32;
@@ -69,8 +70,85 @@ pub const fn term_handle_range(inner_p_id: u32) -> (u64, u64) {
     )
 }
 
+/// Whether a term key's object is keyed by [`lexical_term_object`]: an `o_key`
+/// that is a string-dictionary id, where the main index holds an arena handle.
+#[inline]
+pub const fn is_lexical_term_object(o_type: OType) -> bool {
+    matches!(
+        o_type.decode_kind(),
+        DecodeKind::NumBigArena | DecodeKind::VectorArena
+    )
+}
+
+/// The `o_type` and canonical form that key a decimal, big-integer or vector
+/// object in a term. The main index keys these by arena handles scoped to a
+/// graph and predicate, which name nothing across graphs, so a term keys them
+/// by the string-dictionary id of this form instead. `None` for every other
+/// object, and for an integer that fits `i64` (keyed inline).
+///
+/// Equal values share a form: a decimal is normalized as the main index's
+/// arena normalizes it, and a vector is read at the `f32` precision ingest
+/// quantizes it to. A decimal's form always carries an exponent and a big
+/// integer's never does, so the two cannot collide under one `o_type`.
+pub fn lexical_term_object(o: &FlakeValue) -> Option<(OType, String)> {
+    match o {
+        FlakeValue::Decimal(d) => {
+            let (unscaled, scale) = d.normalized().as_bigint_and_exponent();
+            Some((
+                OType::NUM_BIG_OVERFLOW,
+                format!("{unscaled}e{}", -i128::from(scale)),
+            ))
+        }
+        FlakeValue::BigInt(b) if num_traits::ToPrimitive::to_i64(b.as_ref()).is_none() => {
+            Some((OType::NUM_BIG_OVERFLOW, b.to_string()))
+        }
+        FlakeValue::Vector(v) => {
+            let elements: Vec<String> = v
+                .iter()
+                // -0.0 equals 0.0 as a vector element; one form for both.
+                .map(|x| (*x as f32 + 0.0).to_string())
+                .collect();
+            Some((OType::VECTOR, format!("[{}]", elements.join(","))))
+        }
+        _ => None,
+    }
+}
+
+/// The object a [`lexical_term_object`] form names; `None` for a malformed
+/// form or an `o_type` that is not keyed that way.
+pub fn parse_lexical_term_object(o_type: OType, form: &str) -> Option<FlakeValue> {
+    match o_type.decode_kind() {
+        DecodeKind::NumBigArena => match form.split_once('e') {
+            Some((unscaled, exp)) => {
+                let unscaled: num_bigint::BigInt = unscaled.parse().ok()?;
+                let exp: i128 = exp.parse().ok()?;
+                Some(FlakeValue::Decimal(Box::new(bigdecimal::BigDecimal::new(
+                    unscaled,
+                    i64::try_from(-exp).ok()?,
+                ))))
+            }
+            None => Some(FlakeValue::BigInt(Box::new(form.parse().ok()?))),
+        },
+        DecodeKind::VectorArena => {
+            let inner = form.strip_prefix('[')?.strip_suffix(']')?;
+            let elements = if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner
+                    .split(',')
+                    .map(|x| x.parse::<f32>().ok().map(f64::from))
+                    .collect::<Option<Vec<f64>>>()?
+            };
+            Some(FlakeValue::Vector(elements.into()))
+        }
+        _ => None,
+    }
+}
+
 /// The encoded identity of a triple term: the base edge\'s `(s_id, p_id,
-/// o_type, o_key)` as the main index stores it. No graph, no list index.
+/// o_type, o_key)` as the main index stores it, except that a decimal,
+/// big-integer or vector object is keyed by [`lexical_term_object`]. No graph,
+/// no list index.
 ///
 /// Its big-endian byte form is the reverse-tree key, ordered subject-first so
 /// a subject-bound reified-triple pattern is one key range.
@@ -144,6 +222,46 @@ mod tests {
             novelty_term_index(term_handle(7, NOVELTY_TERM_SEQ_BASE - 1)),
             None
         );
+    }
+
+    #[test]
+    fn lexical_forms_identify_values_and_round_trip() {
+        let decimal = |s: &str| FlakeValue::Decimal(Box::new(s.parse().unwrap()));
+        let form = |o: &FlakeValue| lexical_term_object(o).expect("arena kind").1;
+
+        assert_eq!(form(&decimal("1.5")), form(&decimal("1.50")));
+        assert_ne!(form(&decimal("1.5")), form(&decimal("15")));
+        let big: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
+        let big = FlakeValue::BigInt(Box::new(big));
+        let integral = decimal("123456789012345678901234567890");
+        assert_ne!(
+            form(&big),
+            form(&integral),
+            "decimal and integer stay apart"
+        );
+        assert!(lexical_term_object(&FlakeValue::BigInt(Box::new(7.into()))).is_none());
+        assert!(lexical_term_object(&FlakeValue::Long(7)).is_none());
+
+        let vector = |v: &[f64]| FlakeValue::Vector(v.to_vec().into());
+        assert_eq!(form(&vector(&[-0.0, 1.5])), form(&vector(&[0.0, 1.5])));
+
+        for o in [
+            decimal("1.50"),
+            decimal("-0.000123"),
+            decimal("1E+30"),
+            decimal("0"),
+            big,
+            vector(&[0.1f32 as f64, -2.5, 1e-30f32 as f64]),
+        ] {
+            let (o_type, s) = lexical_term_object(&o).unwrap();
+            assert!(is_lexical_term_object(o_type));
+            let back = parse_lexical_term_object(o_type, &s).unwrap();
+            assert_eq!(back, o, "{s}");
+            assert_eq!(std::mem::discriminant(&back), std::mem::discriminant(&o));
+            assert_eq!(lexical_term_object(&back).unwrap().1, s);
+        }
+        assert!(!is_lexical_term_object(OType::XSD_STRING));
+        assert!(parse_lexical_term_object(OType::XSD_STRING, "1").is_none());
     }
 
     #[test]

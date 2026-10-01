@@ -75,18 +75,6 @@ pub fn is_attachment_slot(p: &Sid) -> bool {
     is_reifies_subject(p) || is_reifies_predicate(p) || is_reifies_object(p)
 }
 
-/// Whether a term with this object can be interned. Objects keyed by a
-/// per-(graph, predicate) arena have no graph-independent identity, so the
-/// index build gives their attachments no link, and novelty must not either.
-#[inline]
-pub fn term_object_is_internable(o: &FlakeValue) -> bool {
-    match o {
-        FlakeValue::Decimal(_) | FlakeValue::Vector(_) => false,
-        FlakeValue::BigInt(b) => num_traits::ToPrimitive::to_i64(b.as_ref()).is_some(),
-        _ => true,
-    }
-}
-
 impl AttachmentSlots {
     /// The triple term a complete attachment names.
     pub fn term(&self) -> Option<TripleTermValue> {
@@ -95,9 +83,6 @@ impl AttachmentSlots {
         else {
             return None;
         };
-        if !term_object_is_internable(o) {
-            return None;
-        }
         Some(TripleTermValue {
             s: s.clone(),
             p: p.clone(),
@@ -339,19 +324,5 @@ mod tests {
         tagged.m = Some(FlakeMeta::with_lang("en"));
         flakes.push(tagged);
         assert_eq!(links(&mut state, &flakes, 0).len(), 1);
-    }
-
-    #[test]
-    fn arena_kind_objects_get_no_term() {
-        let state = AttachmentSlots {
-            subject: Some(sid("a")),
-            predicate: Some(sid("p")),
-            object: Some((
-                FlakeValue::Decimal(Box::new("1.5".parse().unwrap())),
-                Sid::new(2, "decimal"),
-                None,
-            )),
-        };
-        assert!(state.term().is_none());
     }
 }

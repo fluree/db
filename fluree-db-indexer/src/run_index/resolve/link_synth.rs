@@ -20,18 +20,19 @@ use super::global_dict::PredicateDict;
 use super::resolver::RebuildChunk;
 use fluree_db_binary_index::format::run_record::{RunRecord, LIST_INDEX_NONE};
 use fluree_db_core::commit::codec::raw_reader::{RawObject, RawOp};
-use fluree_db_core::o_type::{DecodeKind, OType};
+use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::triple_term::TermKey;
+use fluree_db_core::triple_term::{lexical_term_object, TermKey};
 use fluree_db_core::value_id::{ObjKey, ObjKind};
-use fluree_db_core::DatatypeDictId;
+use fluree_db_core::{DatatypeDictId, FlakeValue};
 use fluree_vocab::{db, fluree};
 use std::collections::HashMap;
 use std::io;
 
 /// The base edge's object, as the resolver saw it or as the base index
-/// stores it. The two compare through [`ObjectId::typed`].
+/// stores it. The two compare through [`ObjectId::typed`]; on both sides an
+/// arena kind's key is the string id of its canonical form.
 #[derive(Debug, Clone, Copy)]
 pub enum ObjectId {
     /// Kind, key, datatype and tag of a resolved op; the `o_type` needs the
@@ -128,7 +129,8 @@ impl AttachmentOp {
                 let kind = ObjKind::from_u8(*o_kind);
                 if kind == ObjKind::REF_ID {
                     *o_key = subject(*o_key)?;
-                } else if kind == ObjKind::LEX_ID || kind == ObjKind::JSON_ID {
+                } else if kind == ObjKind::LEX_ID || kind == ObjKind::JSON_ID || is_arena_kind(kind)
+                {
                     let local = ObjKey::from_u64(*o_key).decode_u32_id() as usize;
                     let global = *str_remap
                         .get(local)
@@ -238,12 +240,25 @@ impl LinkSynth {
                     .unwrap_or("");
                 SlotValue::Predicate(predicates.get_or_insert_parts(prefix, name))
             }
-            _ => SlotValue::Object(ObjectId::Raw {
-                o_kind: record.o_kind,
-                o_key: record.o_key,
-                dt: record.dt,
-                lang_id: record.lang_id,
-            }),
+            _ => {
+                let mut o_key = record.o_key;
+                if is_arena_kind(ObjKind::from_u8(record.o_kind)) {
+                    let Some((_, form)) = FlakeValue::try_from(raw.o.clone())
+                        .ok()
+                        .and_then(|o| lexical_term_object(&o))
+                    else {
+                        return;
+                    };
+                    o_key = ObjKey::encode_u32_id(chunk.strings.get_or_insert(form.as_bytes()))
+                        .as_u64();
+                }
+                SlotValue::Object(ObjectId::Raw {
+                    o_kind: record.o_kind,
+                    o_key,
+                    dt: record.dt,
+                    lang_id: record.lang_id,
+                })
+            }
         };
         if self.link.is_none() {
             let p_id = predicates.get_or_insert(fluree_vocab::rdf::REIFIES);
@@ -268,8 +283,6 @@ impl LinkSynth {
 }
 
 /// The term a complete attachment names, or `None` while a slot is missing.
-/// An object in a per-(graph, predicate) arena has no graph-independent
-/// identity and gets no term; import skips those edges too.
 fn term_of(state: &[Option<SlotValue>; 3], registry: &OTypeRegistry) -> Option<TermKey> {
     let (
         Some(SlotValue::Subject(s_id)),
@@ -280,19 +293,19 @@ fn term_of(state: &[Option<SlotValue>; 3], registry: &OTypeRegistry) -> Option<T
         return None;
     };
     let (o_type, o_key) = o.typed(registry);
-    let o_type = OType::from_u16(o_type);
-    if matches!(
-        o_type.decode_kind(),
-        DecodeKind::NumBigArena | DecodeKind::VectorArena
-    ) {
-        return None;
-    }
     Some(TermKey {
         s_id,
         p_id,
-        o_type,
+        o_type: OType::from_u16(o_type),
         o_key,
     })
+}
+
+/// Kinds whose `o_key` is an arena handle scoped to a graph and predicate. An
+/// attachment carries such an object as the string id of its canonical form
+/// ([`lexical_term_object`]), the key its term holds.
+fn is_arena_kind(kind: ObjKind) -> bool {
+    kind == ObjKind::NUM_BIG || kind == ObjKind::VECTOR_ID
 }
 
 /// Replay every reifier's attachment ops (ids global) and hand its link

@@ -162,6 +162,7 @@ pub struct RawOp<'a> {
 }
 
 /// Object value without allocation. Borrows from ops buffer or dicts.
+#[derive(Clone)]
 pub enum RawObject<'a> {
     /// IRI reference: namespace code + local name from object_ref dict.
     Ref { ns_code: u16, name: &'a str },

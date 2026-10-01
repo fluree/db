@@ -577,11 +577,11 @@ mod inner {
         /// base edge.
         ///
         /// The base edge becomes a pseudo-record in the chunk's term table,
-        /// resolved exactly as the base triple's own record was (the object
-        /// under the inner predicate, so per-predicate arena handles agree).
-        /// The link record's `o_key` is that entry's ordinal; the build remaps
-        /// the entry to global ids and interns it, replacing the ordinal with
-        /// the term handle.
+        /// resolved as the base triple's own record was, except that a
+        /// decimal, big-integer or vector object holds the string id of its
+        /// canonical form. The link record's `o_key` is that entry's ordinal;
+        /// the build remaps the entry to global ids and interns it, replacing
+        /// the ordinal with the term handle.
         ///
         /// `object` is the bundle's `f:reifiesObject` flake: its subject is
         /// the reifier and its object, datatype and tag are the base edge's.
@@ -596,17 +596,23 @@ mod inner {
             let s_id = self.assign_subject_id(s);
             let p_id = self.assign_predicate_id(p);
             let dt_id = self.assign_datatype_id(&object.dt)?;
-            let Some((o_kind, o_key)) = self.resolve_object_value(&object.o, p_id) else {
+            // An arena handle names a value only within one graph and
+            // predicate; a term keys the object by its canonical form.
+            let resolved = match fluree_db_core::triple_term::lexical_term_object(&object.o) {
+                Some((o_type, form)) => {
+                    let o_kind = if o_type == fluree_db_core::o_type::OType::VECTOR {
+                        ObjKind::VECTOR_ID
+                    } else {
+                        ObjKind::NUM_BIG
+                    };
+                    let id = self.assign_string_id(&form);
+                    Some((o_kind.as_u8(), ObjKey::encode_u32_id(id).as_u64()))
+                }
+                None => self.resolve_object_value(&object.o, p_id),
+            };
+            let Some((o_kind, o_key)) = resolved else {
                 return Ok(());
             };
-            // Per-(graph, predicate) arena handles are not a graph-independent
-            // object identity; rebuild skips these bundles too.
-            if matches!(
-                ObjKind::from_u8(o_kind),
-                ObjKind::NUM_BIG | ObjKind::VECTOR_ID
-            ) {
-                return Ok(());
-            }
             let lang_id = object
                 .m
                 .as_ref()

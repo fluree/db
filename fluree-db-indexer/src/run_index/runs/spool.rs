@@ -1290,10 +1290,14 @@ impl TermRemapCtx {
             lang_remap,
             Some(self),
         )?;
+        let o_type = fluree_db_core::o_type::OType::from_u16(term.o_type);
+        if fluree_db_core::triple_term::is_lexical_term_object(o_type) {
+            term.o_key = u64::from(string_remap.get(term.o_key as usize)?);
+        }
         let key = fluree_db_core::triple_term::TermKey {
             s_id: term.s_id.as_u64(),
             p_id: term.p_id,
-            o_type: fluree_db_core::o_type::OType::from_u16(term.o_type),
+            o_type,
             o_key: term.o_key,
         };
         self.builder
@@ -1815,9 +1819,18 @@ pub fn sort_remap_and_write_sorted_commit(
         }
     }
     // Term-table entries keep their ordinal order (link records address them
-    // by position), so they are remapped but never sorted.
+    // by position), so they are remapped but never sorted. A decimal,
+    // big-integer or vector object there holds a string id, not an arena
+    // handle.
+    use fluree_db_core::value_id::{ObjKey, ObjKind};
     for term in &mut terms {
         remap_record(term, &subject_remap, &string_remap)?;
+        let kind = ObjKind::from_u8(term.o_kind);
+        if kind == ObjKind::NUM_BIG || kind == ObjKind::VECTOR_ID {
+            let local = ObjKey::from_u64(term.o_key).decode_u32_id() as usize;
+            term.o_key =
+                ObjKey::encode_u32_id(StringRemap::get(&string_remap[..], local)?).as_u64();
+        }
     }
 
     // A.2 step 4: Sort records by the V2-native graph-prefixed SPOT key without

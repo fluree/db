@@ -218,13 +218,12 @@ impl TermComponentsOperator {
                         Some(tag.as_ref()),
                     ),
                 };
-                match missing(crate::binary_scan::value_to_otype_okey(
+                match missing(crate::binary_scan::term_object_key(
                     value,
                     &dt,
                     lang,
                     store,
                     dict_novelty,
-                    None,
                 ))? {
                     Some((ot, key)) => Some((ot.as_u16(), key)),
                     None => return Ok(None),

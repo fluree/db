@@ -1282,3 +1282,257 @@ async fn novelty_terms_keep_link_counts_on_the_count_plan() {
         .collect();
     assert_eq!(outcomes, ["proceed"], "{outcomes:?}");
 }
+
+const ARENA_CLAIMS: &str = r#"VERSION "1.2"
+@prefix ex: <http://example.org/> .
+@prefix f: <https://ns.flur.ee/db#> .
+
+ex:acct ex:balance 1.50 ~ ex:c1 {| ex:source ex:ledger |} .
+ex:acct ex:serial 123456789012345678901234567890 ~ ex:c2 {| ex:source ex:registry |} .
+ex:acct ex:embedding "[0.5, -1.25]"^^f:embeddingVector ~ ex:c3 {| ex:source ex:model |} .
+"#;
+
+/// Decimal, big-integer and vector objects, which the main index keys by
+/// per-graph arena handles: each annotated edge has a link, a constant term
+/// composes to it, and its object decomposes with its datatype; a decimal's
+/// joins the asserted edge.
+async fn assert_arena_links(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) {
+    let got = links(fluree, ledger).await;
+    let term = |reifier: &str| -> String {
+        got.iter()
+            .find(|r| r[0].ends_with(reifier))
+            .unwrap_or_else(|| panic!("no link for {reifier}: {got:#?}"))[1]
+            .clone()
+    };
+    assert!(term("c1").contains("1.5"), "{got:#?}");
+    assert!(
+        term("c2").contains("123456789012345678901234567890"),
+        "{got:#?}"
+    );
+    assert!(
+        term("c3").contains("0.5") && term("c3").contains("-1.25"),
+        "{got:#?}"
+    );
+
+    let run = |body: &str| run_link_query(fluree, ledger, body.to_string());
+    for (edge, source) in [
+        ("ex:acct ex:balance 1.5", "ledger"),
+        ("?s ex:balance 1.50", "ledger"),
+        (
+            "ex:acct ex:serial 123456789012345678901234567890",
+            "registry",
+        ),
+        (
+            "?s ex:embedding \"[0.5, -1.25]\"^^<https://ns.flur.ee/db#embeddingVector>",
+            "model",
+        ),
+    ] {
+        let got = run(&format!(
+            "SELECT ?src WHERE {{ << {edge} >> ex:source ?src }}"
+        ))
+        .await;
+        if edge.starts_with("ex:acct ") {
+            assert_eq!(got.len(), 1, "{edge}: {got:#?}");
+        }
+        assert!(
+            got.iter().any(|r| r[0].ends_with(source)),
+            "{edge}: {got:#?}"
+        );
+    }
+
+    for (p, dt) in [
+        ("balance", "decimal"),
+        ("serial", "integer"),
+        ("embedding", "embeddingVector"),
+    ] {
+        let got = run(&format!(
+            "SELECT (DATATYPE(?o) AS ?dt) WHERE {{ << ex:acct ex:{p} ?o >> ex:source ?src }}"
+        ))
+        .await;
+        assert_eq!(got.len(), 1, "{p}: {got:#?}");
+        assert!(got[0][0].ends_with(dt), "{p}: {got:#?}");
+    }
+    for body in [
+        "SELECT ?src WHERE { << ex:acct ex:balance ?o >> ex:source ?src . ex:acct ex:balance ?o }",
+        "SELECT ?src WHERE { ex:acct ex:balance ?o . << ex:acct ex:balance ?o >> ex:source ?src }",
+    ] {
+        let got = run(body).await;
+        assert_eq!(got, vec![vec!["ex:ledger".to_string()]], "{body}: {got:#?}");
+    }
+}
+
+/// Import interns these terms through the chunk term table, a rebuild
+/// through the resolver's attachment replay. The first file is its own chunk
+/// with strings that sort before the forms, so the second chunk's local
+/// string ids are not the global ones.
+#[tokio::test]
+async fn arena_kind_objects_link_through_import_and_reindex() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let alias = "it/triple-term-links:arena";
+    let pad = "@prefix ex: <http://example.org/> .\nex:pad ex:label \"!pad\" , \"0pad\" .\n";
+    let (fluree, ledger) = import(&[("a.ttl", pad), ("b.ttl", ARENA_CLAIMS)], alias).await;
+    assert_arena_links(&fluree, &ledger).await;
+
+    // A term only novelty holds whose object form the index already interned.
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+             ex:acct2 ex:balance 1.5 ~ ex:c4 {| ex:source ex:late |} .\n",
+        )
+        .await
+        .expect("unindexed claim")
+        .ledger;
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT ?src WHERE { << ?s ex:balance 1.5 >> ex:source ?src } ORDER BY ?src".to_string(),
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![vec!["ex:late".to_string()], vec!["ex:ledger".to_string()]],
+        "{got:#?}"
+    );
+
+    fluree
+        .reindex(alias, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(alias).await.expect("reload after reindex");
+    assert_eq!(ledger.t(), ledger.index_t());
+    assert_arena_links(&fluree, &ledger).await;
+    assert_eq!(links(&fluree, &ledger).await.len(), 4);
+}
+
+/// A ledger never indexed holds these links in novelty.
+#[tokio::test]
+async fn arena_kind_objects_link_in_novelty() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:arena-novelty");
+    let ledger = fluree
+        .insert_turtle(ledger, ARENA_CLAIMS)
+        .await
+        .expect("claims")
+        .ledger;
+    assert_eq!(ledger.index_t(), 0);
+    assert_arena_links(&fluree, &ledger).await;
+}
+
+/// Incremental builds over these objects, in the default graph and a named
+/// one. The base index holds each attachment's object as an arena handle;
+/// a re-point must still retract the term the base linked (an object
+/// change) and carry the base object into the new term (a subject change).
+#[tokio::test]
+async fn arena_kind_links_follow_incremental_repoints_in_every_graph() {
+    use fluree_db_indexer::IndexerConfig;
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/triple-term-links:arena-incremental";
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let trig = |body: &str| {
+        format!(
+            "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+             @prefix f: <https://ns.flur.ee/db#> .\n{body}\n"
+        )
+    };
+    let audit_links = |ledger: LedgerState| {
+        let fluree = &fluree;
+        async move {
+            let result = support::query_sparql_formatted(
+                fluree,
+                &ledger,
+                "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                 SELECT ?r ?t WHERE { GRAPH <http://example.org/audit> { ?r rdf:reifies ?t } }",
+            )
+            .await
+            .expect("named-graph link query");
+            rows(&result)
+        }
+    };
+
+    local
+        .run_until(async {
+            fluree.create_ledger(ledger_id).await.expect("create");
+            let commit = |body: String| {
+                let fluree = &fluree;
+                async move {
+                    fluree
+                        .graph(ledger_id)
+                        .transact()
+                        .upsert_turtle(&body)
+                        .commit()
+                        .await
+                        .expect("commit claims")
+                        .receipt
+                        .t
+                }
+            };
+            let first = commit(trig(
+                "ex:acct ex:balance 1.50 ~ ex:c1 {| ex:source ex:ledger |} .\n\
+                 ex:acct ex:embedding \"[0.5, -1.25]\"^^f:embeddingVector \
+                 ~ ex:c3 {| ex:source ex:model |} .\n\
+                 GRAPH ex:audit { ex:acct ex:balance 1.5 ~ ex:c2 {| ex:source ex:audit |} . }",
+            ))
+            .await;
+            support::trigger_index_and_wait(&handle, ledger_id, first).await;
+            support::wait_for_index_application(&fluree, ledger_id, first).await;
+            let ledger1 = fluree.ledger(ledger_id).await.expect("reload");
+            assert_eq!(ledger1.t(), ledger1.index_t());
+            let got = links(&fluree, &ledger1).await;
+            assert_eq!(got.len(), 2, "{got:#?}");
+            let got = audit_links(ledger1).await;
+            assert_eq!(got.len(), 1, "{got:#?}");
+            assert!(got[0][1].contains("1.5"), "{got:#?}");
+
+            let second = commit(trig(
+                "ex:acct ex:balance 2.25 ~ ex:c1 .\n\
+                 ex:other ex:embedding \"[0.5, -1.25]\"^^f:embeddingVector ~ ex:c3 .\n\
+                 GRAPH ex:audit { ex:acct ex:balance 3.75 ~ ex:c2 . }",
+            ))
+            .await;
+            support::trigger_index_and_wait(&handle, ledger_id, second).await;
+            support::wait_for_index_application(&fluree, ledger_id, second).await;
+            let ledger2 = fluree.ledger(ledger_id).await.expect("reload");
+            assert_eq!(ledger2.t(), ledger2.index_t());
+
+            let got = links(&fluree, &ledger2).await;
+            assert_eq!(got.len(), 2, "one live link per reifier: {got:#?}");
+            let term = |reifier: &str| -> String {
+                got.iter()
+                    .find(|r| r[0].ends_with(reifier))
+                    .unwrap_or_else(|| panic!("no link for {reifier}: {got:#?}"))[1]
+                    .clone()
+            };
+            assert!(
+                term("c1").contains("2.25") && !term("c1").contains("1.5"),
+                "{got:#?}"
+            );
+            assert!(
+                term("c3").contains("other") && term("c3").contains("-1.25"),
+                "{got:#?}"
+            );
+            let got = audit_links(ledger2.clone()).await;
+            assert_eq!(got.len(), 1, "{got:#?}");
+            assert!(
+                got[0][1].contains("3.75") && !got[0][1].contains("1.5"),
+                "{got:#?}"
+            );
+
+            let got = run_link_query(
+                &fluree,
+                &ledger2,
+                "SELECT ?src WHERE { << ex:other ex:embedding \
+                 \"[0.5, -1.25]\"^^<https://ns.flur.ee/db#embeddingVector> >> ex:source ?src }"
+                    .to_string(),
+            )
+            .await;
+            assert_eq!(got, vec![vec!["ex:model".to_string()]], "{got:#?}");
+        })
+        .await;
+}

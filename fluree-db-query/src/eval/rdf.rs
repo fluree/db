@@ -539,18 +539,21 @@ pub(crate) fn term_object_binding(
     ctx: &ExecutionContext<'_>,
 ) -> Result<Binding> {
     let o_type = key.o_type.as_u16();
-    if let Some(b) =
-        late_materialized_object_binding(o_type, key.o_key, key.p_id, t, u32::MAX, None)
-    {
-        return Ok(b);
+    // An arena kind's key is not the main index's, so it binds decoded.
+    if !fluree_db_core::triple_term::is_lexical_term_object(key.o_type) {
+        if let Some(b) =
+            late_materialized_object_binding(o_type, key.o_key, key.p_id, t, u32::MAX, None)
+        {
+            return Ok(b);
+        }
     }
     let store = ctx
         .binary_store
         .as_deref()
         .ok_or_else(|| QueryError::Internal("term object decode without a store".into()))?;
     let val = store
-        .decode_value_v3(o_type, key.o_key, key.p_id, ctx.binary_g_id)
-        .map_err(|e| QueryError::from_io("decode_value_v3", e))?;
+        .decode_term_object(key)
+        .map_err(|e| QueryError::from_io("decode_term_object", e))?;
     Ok(materialized_object_binding(
         store,
         o_type,

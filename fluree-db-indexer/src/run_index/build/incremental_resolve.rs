@@ -617,7 +617,7 @@ pub async fn resolve_incremental_commits_v6(
 
     // 7. Reconcile chunk-local IDs to global IDs (same algorithm as V5).
     let t_reconcile_start = Instant::now();
-    let reconcile = reconcile_chunk_to_global(
+    let mut reconcile = reconcile_chunk_to_global(
         &chunk,
         &subject_tree,
         &string_tree,
@@ -692,6 +692,11 @@ pub async fn resolve_incremental_commits_v6(
             &shared.predicates,
             shared.link_synth.slots(),
             &keys,
+            &mut WindowStrings {
+                new: &mut reconcile.new_strings,
+                watermark: &mut reconcile.updated_string_watermark,
+                index: None,
+            },
         )
         .await
         .map_err(IncrementalResolveError::Io)?
@@ -1287,10 +1292,12 @@ async fn base_attachment_states(
     predicates: &crate::run_index::resolve::global_dict::PredicateDict,
     slots: [Option<u32>; 3],
     keys: &[(u16, u64)],
+    strings: &mut WindowStrings<'_>,
 ) -> io::Result<HashMap<(u16, u64), [Option<SlotValue>; 3]>> {
     use crate::run_index::resolve::link_synth::ObjectId;
     use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
     use fluree_db_core::o_type::OType;
+    use fluree_db_core::triple_term::{is_lexical_term_object, lexical_term_object};
 
     let mut states = HashMap::new();
     if keys.is_empty() || slots.iter().all(Option::is_none) {
@@ -1347,6 +1354,25 @@ async fn base_attachment_states(
                         };
                         Some(SlotValue::Predicate(p_id))
                     }
+                    // An arena handle names the value only within this graph
+                    // and slot predicate; the window's ops carry the form.
+                    2 if is_lexical_term_object(OType::from_u16(o_type)) => {
+                        let value = store.decode_value_v3(o_type, o_key, p_id, g_id)?;
+                        let (_, form) = lexical_term_object(&value).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("reifier {ann}: arena object {value:?} has no term form"),
+                            )
+                        })?;
+                        let id = match store.find_string_id(&form)? {
+                            Some(id) => id,
+                            None => strings.intern(form),
+                        };
+                        Some(SlotValue::Object(ObjectId::Typed {
+                            o_type,
+                            o_key: u64::from(id),
+                        }))
+                    }
                     2 => Some(SlotValue::Object(ObjectId::Typed { o_type, o_key })),
                     _ => None,
                 };
@@ -1355,6 +1381,33 @@ async fn base_attachment_states(
         }
     }
     Ok(states)
+}
+
+/// The strings this window adds to the dictionary, which the canonical
+/// object form of a base attachment can still join after reconciliation.
+struct WindowStrings<'a> {
+    new: &'a mut Vec<(u32, Vec<u8>)>,
+    watermark: &'a mut u32,
+    index: Option<HashMap<Vec<u8>, u32>>,
+}
+
+impl WindowStrings<'_> {
+    /// The id `form` has in this window, allocating one above the watermark.
+    fn intern(&mut self, form: String) -> u32 {
+        let new = &*self.new;
+        let index = self
+            .index
+            .get_or_insert_with(|| new.iter().map(|(id, b)| (b.clone(), *id)).collect());
+        if let Some(&id) = index.get(form.as_bytes()) {
+            return id;
+        }
+        *self.watermark += 1;
+        let id = *self.watermark;
+        let bytes = form.into_bytes();
+        index.insert(bytes.clone(), id);
+        self.new.push((id, bytes));
+        id
+    }
 }
 
 /// Fetch one commit blob, honoring the optional artifact cache.
@@ -2211,5 +2264,21 @@ mod tests {
                 lang_rec(1, 1, 10, 2, 6, OP_RETRACT),
             ])
         );
+    }
+
+    #[test]
+    fn a_base_object_form_joins_the_window_strings() {
+        let mut new = vec![(11, b"15e-1".to_vec())];
+        let mut watermark = 11;
+        let mut strings = WindowStrings {
+            new: &mut new,
+            watermark: &mut watermark,
+            index: None,
+        };
+        assert_eq!(strings.intern("15e-1".into()), 11);
+        assert_eq!(strings.intern("225e-2".into()), 12);
+        assert_eq!(strings.intern("225e-2".into()), 12);
+        assert_eq!(watermark, 12);
+        assert_eq!(new, vec![(11, b"15e-1".to_vec()), (12, b"225e-2".to_vec())]);
     }
 }

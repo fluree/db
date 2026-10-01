@@ -2272,11 +2272,36 @@ impl BinaryIndexStore {
         }
     }
 
+    /// A term key's object. Every kind the main index keys graph-wide decodes
+    /// as it does there; a decimal, big-integer or vector object is keyed by
+    /// the string id of its canonical form instead of an arena handle.
+    pub fn decode_term_object(
+        &self,
+        key: &fluree_db_core::triple_term::TermKey,
+    ) -> io::Result<FlakeValue> {
+        use fluree_db_core::triple_term::{is_lexical_term_object, parse_lexical_term_object};
+        if !is_lexical_term_object(key.o_type) {
+            return self.decode_value_v3(
+                key.o_type.as_u16(),
+                key.o_key,
+                key.p_id,
+                fluree_db_core::DEFAULT_GRAPH_ID,
+            );
+        }
+        let form = self.resolve_string_value(key.o_key as u32)?;
+        parse_lexical_term_object(key.o_type, &form).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "term object form {form:?} is not a {:#06x} value",
+                    key.o_type.as_u16()
+                ),
+            )
+        })
+    }
+
     /// Materialize a triple-term handle: the base edge's subject, predicate
     /// and object as SIDs and a value, with the object's datatype and tag.
-    ///
-    /// Terms are graph-independent, so a per-graph object arena (NumBig) is
-    /// read through the default graph.
     fn decode_triple_term(&self, handle: u64) -> io::Result<FlakeValue> {
         let key = self.resolve_term_key(handle)?.ok_or_else(|| {
             io::Error::new(
@@ -2295,12 +2320,7 @@ impl BinaryIndexStore {
             )
         })?;
         let o_type = key.o_type.as_u16();
-        let o = self.decode_value_v3(
-            o_type,
-            key.o_key,
-            key.p_id,
-            fluree_db_core::DEFAULT_GRAPH_ID,
-        )?;
+        let o = self.decode_term_object(&key)?;
         let dt = self
             .resolve_datatype_sid_for_value(o_type, &o)
             .ok_or_else(|| {
