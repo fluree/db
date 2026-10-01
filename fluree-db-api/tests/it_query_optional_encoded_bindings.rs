@@ -363,6 +363,14 @@ impl Failures {
     }
 }
 
+/// `(label, SPARQL body, projected variables, expected rows)`.
+type SurfaceCase = (
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static [&'static str]],
+);
+
 struct OptionalCase {
     label: &'static str,
     body: &'static str,
@@ -588,7 +596,7 @@ async fn optional_binds_encoded_values_jsonld() {
 /// position) and a decoded `Sid` (VALUES) is one term on every equality surface.
 #[tokio::test(flavor = "current_thread")]
 async fn equality_surfaces_treat_encoded_forms_of_one_iri_as_one_term() {
-    let cases: &[(&str, &str, &[&str], &[&[&str]])] = &[
+    let cases: &[SurfaceCase] = &[
         (
             "DISTINCT",
             "SELECT DISTINCT ?x WHERE { { ex:s1 ?x ?o } UNION { ?x rdfs:label ?l } }",
