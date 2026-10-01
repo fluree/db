@@ -496,6 +496,23 @@ fn create_new_in_place(path: &Path, bytes: &[u8], policy: &WritePolicy) -> std::
     Ok(true)
 }
 
+/// Runs `f` on the blocking pool and returns its result.
+///
+/// A panic in `f` resumes on the caller.
+/// The only error is the task's cancellation, as during runtime shutdown.
+async fn run_blocking<T, F>(f: F) -> std::result::Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .or_else(|e| match e.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(e) => Err(e),
+        })
+}
+
 /// File-based storage backed by `tokio::fs`.
 #[derive(Debug, Clone)]
 pub struct FileStorage {
@@ -878,12 +895,9 @@ impl FileStorage {
     pub async fn recover_wal_async(&self) -> Result<()> {
         let root_gate = self.root_gate()?.write_owned().await;
         let storage = self.clone();
-        tokio::task::spawn_blocking(move || storage.recover_wal_locked(&root_gate))
+        run_blocking(move || storage.recover_wal_locked(&root_gate))
             .await
-            .unwrap_or_else(|e| match e.try_into_panic() {
-                Ok(payload) => std::panic::resume_unwind(payload),
-                Err(e) => Err(crate::error::Error::io(format!("WAL recovery join: {e}"))),
-            })
+            .map_err(|e| crate::error::Error::io(format!("WAL recovery join: {e}")))?
     }
 
     /// Replays the WAL under this root while `_root_gate` holds its root gate exclusively.
@@ -1986,10 +2000,10 @@ impl StorageCas for FileStorage {
         // An async task holding the root gate could need that thread to run.
         // Both would then wait forever.
         let storage = self.clone();
-        // `spawn_blocking` does not inherit the caller's span.
+        // The blocking task does not inherit the caller's span.
         // Entering it keeps the closure's events and "cas phases" under the caller's span.
         let span = tracing::Span::current();
-        tokio::task::spawn_blocking(move || {
+        run_blocking(move || {
             let _entered = span.enter();
             // Phase 1: take the key lock and read.
             let phase = std::time::Instant::now();
@@ -2014,11 +2028,7 @@ impl StorageCas for FileStorage {
             }
         })
         .await
-        .unwrap_or_else(|e| match e.try_into_panic() {
-            // A panic in `f` belongs to the caller, so it resumes on the caller's task.
-            Ok(payload) => std::panic::resume_unwind(payload),
-            Err(e) => Err(StorageExtError::io(format!("spawn_blocking join: {e}"))),
-        })
+        .map_err(|e| StorageExtError::io(format!("spawn_blocking join: {e}")))?
     }
 }
 
