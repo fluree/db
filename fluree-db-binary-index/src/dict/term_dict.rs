@@ -83,6 +83,20 @@ impl TermDictReader {
         })
     }
 
+    /// Pre-warm forward packs into the OS page cache, predicate by predicate,
+    /// up to `budget_bytes`; returns the bytes touched. Blocking, like
+    /// [`ForwardPackReader::prewarm`].
+    pub fn prewarm(&self, budget_bytes: u64) -> u64 {
+        let mut warmed = 0;
+        for reader in self.forward.values() {
+            if warmed >= budget_bytes {
+                break;
+            }
+            warmed += reader.prewarm(budget_bytes - warmed);
+        }
+        warmed
+    }
+
     /// Distinct terms in the dictionary.
     pub fn term_count(&self) -> u64 {
         self.term_count
@@ -360,6 +374,50 @@ mod tests {
         assert_eq!((term_handle_p_id(h3), term_handle_seq(h3)), (9, 0));
         assert_eq!(b.len(), 3);
         assert_eq!(b.watermarks(), vec![(5, 1), (9, 0)]);
+    }
+
+    /// The server's background warmer reaches term packs through this:
+    /// every predicate's stream, in order, within the budget.
+    #[test]
+    fn prewarm_covers_every_predicate_stream_within_the_budget() {
+        let stream = |p_id: u32, n: u64| {
+            let keys: Vec<[u8; TermKey::LEN]> =
+                (0..n).map(|i| key(i + 1, p_id, i).to_be_bytes()).collect();
+            let entries: Vec<(u64, &[u8])> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (i as u64, &k[..]))
+                .collect();
+            let packs = crate::dict::pack_builder::build_forward_packs_for_stream(
+                KIND_TERM_FWD,
+                pack_ns_code(p_id),
+                &entries,
+                DEFAULT_TARGET_PAGE_BYTES,
+                DEFAULT_TARGET_PACK_BYTES,
+            )
+            .unwrap()
+            .packs;
+            let len: u64 = packs.iter().map(|p| p.bytes.len() as u64).sum();
+            let reader = ForwardPackReader::from_memory(
+                packs
+                    .into_iter()
+                    .map(|p| Arc::from(p.bytes.into_boxed_slice()))
+                    .collect(),
+            )
+            .unwrap();
+            (reader, len)
+        };
+        let (a, len_a) = stream(5, 40);
+        let (b, len_b) = stream(9, 70);
+        let reader = TermDictReader {
+            forward: BTreeMap::from([(5, a), (9, b)]),
+            reverse: None,
+            watermarks: HashMap::new(),
+            term_count: 110,
+        };
+        assert_eq!(reader.prewarm(u64::MAX), len_a + len_b);
+        assert_eq!(reader.prewarm(len_a + len_b / 2), len_a + len_b / 2);
+        assert_eq!(reader.prewarm(0), 0);
     }
 
     #[test]

@@ -2632,16 +2632,16 @@ impl BinaryIndexStore {
         Ok(0)
     }
 
-    /// Pre-warm forward-dictionary pages (string + subject packs) into the OS
-    /// page cache, up to `budget_bytes` total across all packs. Returns the
-    /// number of bytes touched.
+    /// Pre-warm forward-dictionary pages (string, subject, then triple-term
+    /// packs) into the OS page cache, up to `budget_bytes` total across all
+    /// packs. Returns the number of bytes touched.
     ///
     /// The index root and reverse-dict tree readers are already resident after
     /// [`load_from_root_v6`](Self::load_from_root_v6); this targets the forward
     /// packs, which are opened lazily and otherwise load on the first query
     /// that resolves an IRI/string ID. String packs are warmed first (broadest
-    /// query impact), then per-namespace subject packs. Warming stops once the
-    /// budget is exhausted.
+    /// query impact), then per-namespace subject packs, then triple-term packs.
+    /// Warming stops once the budget is exhausted.
     ///
     /// Blocking (page faults / sequential reads) — call from a blocking context
     /// such as `tokio::task::spawn_blocking`, never on the hot async path.
@@ -2652,6 +2652,11 @@ impl BinaryIndexStore {
                 break;
             }
             warmed += reader.prewarm(budget_bytes - warmed);
+        }
+        if let Some(terms) = &self.dicts.term_dict {
+            if warmed < budget_bytes {
+                warmed += terms.prewarm(budget_bytes - warmed);
+            }
         }
         warmed
     }
