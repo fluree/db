@@ -236,6 +236,17 @@ impl<'a> FlakeGenerator<'a> {
         // they hit the index. Bails out the whole transaction.
         validate_value_dt_pair(&o, &dt)?;
 
+        // `rdf:reifies` takes a triple term on every write path. The surface
+        // checks see literal predicates; a predicate variable is resolved only
+        // here. Retracting a legacy row stays possible.
+        if op && fluree_db_core::is_rdf_reifies(&p) && !matches!(o, FlakeValue::TripleTerm(_)) {
+            return Err(TransactError::InvalidTerm(
+                "'rdf:reifies' takes a triple term as its object; write the reified \
+                 triple (`<< s p o >>` or `~ <reifier>`)"
+                    .to_string(),
+            ));
+        }
+
         // Create metadata if language tag or list_index is present
         let meta_lang = template_lang.or(bound_lang);
         let meta = FlakeMeta::from_parts(meta_lang.as_deref(), template.list_index);

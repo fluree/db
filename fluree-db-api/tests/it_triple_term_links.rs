@@ -709,6 +709,38 @@ async fn rdf_reifies_with_an_ordinary_object_is_refused() {
         .expect_err("SPARQL UPDATE of rdf:reifies with an IRI object must be refused");
     assert!(format!("{err}").contains("reifies"), "{err}");
 
+    // A predicate variable reaches the predicate only per solution row.
+    let err = fluree
+        .stage(&handle)
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+             INSERT { ex:r ?p ex:x } WHERE { VALUES ?p { rdf:reifies } }",
+        )
+        .execute()
+        .await
+        .expect_err("a predicate variable bound to rdf:reifies must be refused too");
+    assert!(format!("{err}").contains("reifies"), "{err}");
+    let ledger = fluree
+        .ledger("it/triple-term-links:reifies-firewall-sparql")
+        .await
+        .expect("reload");
+    let err = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                },
+                "where": [["values", ["?p", [{ "@type": "@id", "@value": "rdf:reifies" }]]]],
+                "insert": { "@id": "ex:r", "?p": { "@id": "ex:x" } }
+            }),
+        )
+        .await
+        .expect_err("a JSON-LD predicate variable bound to rdf:reifies must be refused");
+    assert!(format!("{err}").contains("reifies"), "{err}");
+
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
     std::fs::write(data_dir.path().join("bad.ttl"), bad).expect("write fixture");
