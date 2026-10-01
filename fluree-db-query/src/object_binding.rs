@@ -485,8 +485,11 @@ pub(crate) fn bind_unifies(
     let b = as_sid(computed);
     let a = a.as_ref().unwrap_or(existing);
     let b = b.as_ref().unwrap_or(computed);
-    normalize_for_key_cow(a, Some(store), None).as_ref()
-        == normalize_for_key_cow(b, Some(store), None).as_ref()
+    let gv = (is_numbig_encoded(a) || is_numbig_encoded(b))
+        .then(|| ctx.graph_view())
+        .flatten();
+    normalize_for_key_cow(a, Some(store), gv.as_ref()).as_ref()
+        == normalize_for_key_cow(b, Some(store), gv.as_ref()).as_ref()
 }
 
 /// True if this is an arena-backed (NUM_BIG) encoded literal.
