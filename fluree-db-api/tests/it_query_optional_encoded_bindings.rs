@@ -638,6 +638,68 @@ async fn equality_surfaces_treat_encoded_forms_of_one_iri_as_one_term() {
             &["p", "x"],
             &[&["derivedFrom", "s1"]],
         ),
+        (
+            "COUNT(DISTINCT)",
+            "SELECT (COUNT(DISTINCT ?x) AS ?n) WHERE { { ex:s1 ?x ?o } UNION { ?x rdfs:label ?l } }",
+            &["n"],
+            &[&["4"]],
+        ),
+        // Surfaces that already treated the forms as one term; pinned so the
+        // canonical form cannot break them.
+        (
+            "inner join on a predicate binding",
+            "SELECT ?p ?l WHERE { ex:s1 ?p ?o . ?p rdfs:label ?l }",
+            &["p", "l"],
+            &[&["derivedFrom", "derived from"], &["text", "text"]],
+        ),
+        (
+            "inner join on an object binding used as a predicate",
+            "SELECT ?q ?v WHERE { ex:s4 ex:usesPredicate ?q . ex:s1 ?q ?v }",
+            &["q", "v"],
+            &[&["text", "chunk one"]],
+        ),
+        (
+            "FILTER =",
+            "SELECT ?p ?q WHERE { ex:s1 ?p ?o . ?q rdfs:label ?l FILTER(?p = ?q) }",
+            &["p", "q"],
+            &[&["derivedFrom", "derivedFrom"], &["text", "text"]],
+        ),
+        (
+            "FILTER sameTerm",
+            "SELECT ?p ?q WHERE { ex:s1 ?p ?o . ?q rdfs:label ?l FILTER(sameTerm(?p, ?q)) }",
+            &["p", "q"],
+            &[&["derivedFrom", "derivedFrom"], &["text", "text"]],
+        ),
+        (
+            "leading VALUES",
+            "SELECT ?p ?o WHERE { VALUES ?p { ex:text ex:position } ex:s1 ?p ?o }",
+            &["p", "o"],
+            &[&["position", "1"], &["text", "chunk one"]],
+        ),
+        (
+            "subquery join",
+            "SELECT ?p ?l WHERE { ex:s1 ?p ?o . { SELECT ?p ?l WHERE { ?p rdfs:label ?l } } }",
+            &["p", "l"],
+            &[&["derivedFrom", "derived from"], &["text", "text"]],
+        ),
+        (
+            "group join",
+            "SELECT ?p ?l WHERE { { ex:s1 ?p ?o } { ?p rdfs:label ?l } }",
+            &["p", "l"],
+            &[&["derivedFrom", "derived from"], &["text", "text"]],
+        ),
+        (
+            "multi-pattern OPTIONAL",
+            "SELECT ?p ?l WHERE { ex:s1 ?p ?o . \
+             OPTIONAL { ?p rdfs:label ?l . FILTER(STRLEN(?l) > 0) } }",
+            &["p", "l"],
+            &[
+                &["derivedFrom", "derived from"],
+                &["mentions", "-"],
+                &["position", "-"],
+                &["text", "text"],
+            ],
+        ),
     ];
     let jsonld_cases = [
         (
@@ -675,6 +737,58 @@ async fn equality_surfaces_treat_encoded_forms_of_one_iri_as_one_term() {
                 ]
             }),
             rows(&[&["derivedFrom"], &["text"]]),
+        ),
+        (
+            "JSON-LD not-exists",
+            json!({
+                "@context": context(),
+                "select": ["?p"],
+                "where": [
+                    {"@id": "ex:s1", "?p": "?o"},
+                    ["not-exists", {"@id": "?p", "rdfs:label": "?l"}]
+                ]
+            }),
+            rows(&[&["mentions"], &["position"]]),
+        ),
+        (
+            "JSON-LD groupBy",
+            json!({
+                "@context": context(),
+                "select": ["?x", "(as (count ?x) ?n)"],
+                "where": [["union",
+                    {"@id": "ex:s1", "?x": "?o"},
+                    {"@id": "?x", "rdfs:label": "?l"}
+                ]],
+                "groupBy": ["?x"]
+            }),
+            rows(&[
+                &["derivedFrom", "2"],
+                &["mentions", "1"],
+                &["position", "1"],
+                &["text", "2"],
+            ]),
+        ),
+        (
+            "JSON-LD values",
+            json!({
+                "@context": context(),
+                "select": ["?p", "?o"],
+                "where": [{"@id": "ex:s1", "?p": "?o"}],
+                "values": ["?p", [{"@id": "ex:text"}, {"@id": "ex:position"}]]
+            }),
+            rows(&[&["position", "1"], &["text", "chunk one"]]),
+        ),
+        (
+            "JSON-LD inner join on a predicate binding",
+            json!({
+                "@context": context(),
+                "select": ["?p", "?l"],
+                "where": [
+                    {"@id": "ex:s1", "?p": "?o"},
+                    {"@id": "?p", "rdfs:label": "?l"}
+                ]
+            }),
+            rows(&[&["derivedFrom", "derived from"], &["text", "text"]]),
         ),
     ];
     let mut failures = Failures::default();
@@ -800,6 +914,23 @@ async fn cypher_optional_match_reverse_edge_over_encoded_values() {
             &label,
         );
         failures.bound_lookup(&store, before, "name: \"subjectOf\"", Slot::O, &label);
+
+        let counted = fluree
+            .query_cypher(
+                &db,
+                "MATCH (s)-[:derivedFrom]->(d:CDoc) OPTIONAL MATCH (c)-[:subjectOf]->(s) \
+                 RETURN s, count(c) AS n",
+            )
+            .await
+            .expect("cypher count")
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        failures.eq(
+            jsonld_rows(&counted),
+            rows(&[&["cs1", "1"], &["cs2", "0"]]),
+            &format!("{state:?} / Cypher count over OPTIONAL MATCH"),
+        );
     }
     failures.assert_none();
 }
