@@ -268,9 +268,9 @@ fn scans_naming(store: &SpanStore, before: usize, marker: &str) -> Vec<String> {
         .filter(|e| e.message() == "BinaryScanOperator::open")
         .filter_map(|e| {
             e.fields
-                .get("pattern")
-                .or_else(|| e.fields.get("self.pattern"))
-                .cloned()
+                .iter()
+                .find(|(k, _)| k.ends_with("pattern"))
+                .map(|(_, v)| v.clone())
         })
         .filter(|p| p.contains(marker))
         .collect()
@@ -800,6 +800,54 @@ async fn cypher_optional_match_reverse_edge_over_encoded_values() {
             &label,
         );
         failures.bound_lookup(&store, before, "name: \"subjectOf\"", Slot::O, &label);
+    }
+    failures.assert_none();
+}
+
+/// #1320: an EXISTS inside an expression (here one arm of `||`, which keeps it
+/// an `Expression::Exists` for `FilterOperator`) is answered from the cached
+/// subject set of its predicate on an overlay-free index. Rows whose subject
+/// arrives encoded used to decline that cache and seed one scan each.
+#[tokio::test(flavor = "current_thread")]
+async fn exists_in_an_expression_answers_encoded_subjects_from_the_cache() {
+    let mut failures = Failures::default();
+    for state in STATES {
+        let (fluree, handle) = ledger_in(state, "it/exists-encoded-cache:main").await;
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = sparql(
+            &fluree,
+            &handle,
+            "SELECT ?s WHERE { ?s ex:derivedFrom ex:doc1 . \
+             FILTER(EXISTS { ?s ex:mentions ?m } || ?s = ex:s3) }",
+        )
+        .await;
+        let label = format!("{state:?} / EXISTS in an expression");
+        failures.eq(
+            sparql_rows(&result, &["s"]),
+            rows(&[&["s1"], &["s3"]]),
+            &label,
+        );
+        if state != State::Novelty {
+            // The cache is built only with no live novelty. A row the cache
+            // declines is answered by planning and running the EXISTS body
+            // seeded with that row: a nested-loop join opened per row.
+            let per_row = store.all_events()[before..]
+                .iter()
+                .filter(|e| e.message() == "opened nested loop join")
+                .count();
+            if per_row != 0 {
+                failures.0.push(format!(
+                    "{label}: {per_row} row(s) declined the cache to a seeded EXISTS"
+                ));
+            }
+            let seen = stamps(&store, before, "exists_semijoin");
+            if !seen.iter().any(|o| o == "proceed") {
+                failures.0.push(format!(
+                    "{label}: the semijoin cache was not built: {seen:?}"
+                ));
+            }
+        }
     }
     failures.assert_none();
 }
