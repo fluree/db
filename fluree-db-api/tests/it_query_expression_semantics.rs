@@ -2245,3 +2245,41 @@ async fn sparql_stored_lang_equality_with_post_index_novelty() {
         "LANG() must see the novelty literal's tag"
     );
 }
+
+// =============================================================================
+// A BIND into a variable an earlier pattern bound is an equality check
+// =============================================================================
+
+/// The bind's expression waits on the last pattern (`ex:val`, the largest
+/// predicate), so the planner holds it back past the `ex:name` join; that
+/// join must keep `?a` although nothing else reads it, or the check binds
+/// afresh and the count becomes a cross product (6 here).
+#[tokio::test]
+async fn jsonld_bind_into_a_bound_variable_checks_it_when_only_counted() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprsem/bind-check:jsonld");
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:alice", "ex:age": 30, "ex:name": "Alice" },
+            { "@id": "ex:bob", "ex:age": 25, "ex:name": "Bob" },
+            { "@id": "ex:t1", "ex:val": 30 },
+            { "@id": "ex:t2", "ex:val": 40 },
+            { "@id": "ex:t3", "ex:val": 50 }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.expect("insert").ledger;
+    let where_ = json!([
+        { "@id": "?s", "ex:age": "?a" },
+        { "@id": "?s", "ex:name": "?n" },
+        { "@id": "?t", "ex:val": "?v" },
+        ["bind", "?a", "?v"]
+    ]);
+    let counted = json!({ "@context": ctx(), "select": ["(count ?s)"], "where": where_ });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &counted).await, json!([[1]]));
+    let listed = json!({ "@context": ctx(), "select": ["?s"], "where": where_ });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &listed).await,
+        json!([["ex:alice"]])
+    );
+}

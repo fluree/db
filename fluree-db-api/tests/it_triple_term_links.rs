@@ -822,3 +822,36 @@ async fn incremental_term_packs_are_compacted() {
         })
         .await;
 }
+
+const CHAINED_CLAIMS: &str = r#"VERSION "1.2"
+@prefix ex: <http://example.org/> .
+ex:a ex:p ex:b ~ ex:r1 {| ex:src ex:x |} .
+ex:b ex:q ex:c ~ ex:r2 {| ex:src ex:y |} .
+ex:d ex:q ex:e ~ ex:r3 {| ex:src ex:z |} .
+"#;
+
+/// Two quoted patterns joined through a component variable: the second
+/// edge's subject must be the first edge's object. Both positions lower to a
+/// `BIND` of the same variable, so the second is the join; the planner must
+/// carry the first one's column to it although only a count reads it.
+#[tokio::test]
+async fn link_lowering_joins_chained_edges_when_only_counted() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let (fluree, ledger) = import(
+        &[("chained.ttl", CHAINED_CLAIMS)],
+        "it/triple-term-links:chained",
+    )
+    .await;
+    let chain = "<< ex:a ex:p ?o1 >> ex:src ?s1 . << ?o1 ex:q ?o2 >> ex:src ?s2";
+    let count = |select: &str| format!("SELECT {select} WHERE {{ {chain} }}");
+    for select in ["(COUNT(*) AS ?n)", "(COUNT(DISTINCT ?o1) AS ?n)"] {
+        let got = run_link_query(&fluree, &ledger, count(select)).await;
+        assert_eq!(got, vec![vec!["1".to_string()]], "{select}: {got:#?}");
+    }
+    let got = run_link_query(&fluree, &ledger, count("?o1 ?o2")).await;
+    assert_eq!(
+        got,
+        vec![vec!["ex:b".to_string(), "ex:c".to_string()]],
+        "{got:#?}"
+    );
+}

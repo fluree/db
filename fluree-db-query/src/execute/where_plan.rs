@@ -1954,7 +1954,15 @@ fn build_sequential_join_block(
                     .iter()
                     .flat_map(|f| f.expr.referenced_vars()),
             );
-            live.extend(pending_binds.iter().flat_map(|b| b.expr.referenced_vars()));
+            // A pending bind reads its target too: once an earlier step binds
+            // that variable, the bind is an equality check against it (the
+            // reified-edge lowering joins component positions this way).
+            live.extend(pending_binds.iter().flat_map(|b| {
+                b.expr
+                    .referenced_vars()
+                    .into_iter()
+                    .chain(std::iter::once(b.var))
+            }));
             live.into_iter().collect::<Vec<VarId>>()
         });
 
