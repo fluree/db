@@ -412,6 +412,207 @@ pub struct UnifyInstruction {
     pub right_col: usize,
 }
 
+/// What [`substitute_binding`] did with one correlated value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Substitution {
+    /// The slot now holds the value.
+    Bound,
+    /// The slot stays a variable: the value constrains nothing (unbound or
+    /// poisoned — callers screen poisoned rows first), or it is an encoded id
+    /// and there is no graph view to decode it through.
+    Free,
+    /// No triple holds this value in this slot: a literal as a subject or
+    /// predicate, or a value that is not an RDF term (a list, map, path,
+    /// relationship or grouped value). The slot stays a variable.
+    Unmatchable,
+}
+
+/// Substitute one correlated left-row value into `pattern`'s `position`.
+///
+/// The one place a row's value becomes a scan constant, for every correlated
+/// scan — the nested-loop join's right side and OPTIONAL's per-row lookup —
+/// so a value binds the same way whichever operator carries the correlation
+/// and whichever form the row holds it in. Encoded (late-materialized) ids
+/// decode through `gv` (novelty-aware), into any position: an IRI that one
+/// pattern reaches as a predicate (`EncodedPid`) is a subject or object to
+/// another, and the reverse. Leaving an encoded value free instead would scan
+/// the whole slot and leave the match to a comparison between two encoded
+/// forms of one IRI, which `Binding`'s `PartialEq` answers `false`.
+///
+/// Literals keep the join's term rule: a string binding pushes its datatype or
+/// language tag down with its value; numeric and other values push the value
+/// alone, so they still match across numeric subtypes.
+pub(crate) fn substitute_binding(
+    pattern: &mut TriplePattern,
+    position: PatternPosition,
+    binding: &Binding,
+    gv: Option<&BinaryGraphView>,
+) -> Result<Substitution> {
+    let resolve_subject = |gv: &BinaryGraphView, s_id: u64| -> Result<Arc<str>> {
+        let iri = gv.resolve_subject_iri(s_id).map_err(|e| {
+            tracing::debug!(s_id, error = %e, "failed to resolve encoded subject binding");
+            QueryError::dictionary_lookup(format!(
+                "correlated binding: resolve subject IRI for s_id={s_id}: {e}"
+            ))
+        })?;
+        Ok(Arc::from(iri))
+    };
+    let resolve_predicate =
+        |gv: &BinaryGraphView, p_id: u32| gv.store().resolve_predicate_iri(p_id).map(Arc::from);
+
+    match position {
+        PatternPosition::Subject | PatternPosition::Predicate => {
+            let value = match binding {
+                Binding::Sid { sid, .. } => Ref::Sid(sid.clone()),
+                Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
+                    // Ref::Iri so the scan can encode it for each target ledger
+                    Ref::Iri(iri.clone())
+                }
+                Binding::EncodedSid { s_id, .. } => match gv {
+                    Some(gv) => Ref::Iri(resolve_subject(gv, *s_id)?),
+                    None => return Ok(Substitution::Free),
+                },
+                Binding::EncodedPid { p_id } => {
+                    match gv.and_then(|gv| resolve_predicate(gv, *p_id)) {
+                        Some(iri) => Ref::Iri(iri),
+                        None => return Ok(Substitution::Free),
+                    }
+                }
+                Binding::Unbound | Binding::Poisoned => return Ok(Substitution::Free),
+                Binding::Lit { .. }
+                | Binding::EncodedLit { .. }
+                | Binding::Grouped(_)
+                | Binding::Path { .. }
+                | Binding::Rel(_)
+                | Binding::List(_)
+                | Binding::Map(_) => return Ok(Substitution::Unmatchable),
+            };
+            if position == PatternPosition::Subject {
+                pattern.s = value;
+            } else {
+                pattern.p = value;
+            }
+        }
+        PatternPosition::Object => match binding {
+            Binding::Sid { sid, .. } => {
+                pattern.o = Term::Sid(sid.clone());
+            }
+            Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
+                // Term::Iri so the scan can encode it for each target ledger
+                pattern.o = Term::Iri(iri.clone());
+            }
+            Binding::Lit { val, dtc, .. } => {
+                pattern.o = Term::Value(val.clone());
+                // A string binding is one RDF term: `"bob"`, `"bob"@en`,
+                // `"bob"^^xsd:anyURI` and `"bob"^^ex:custom` share a
+                // dictionary key and must not probe each other's rows.
+                // Numeric/other constraints are left off so cross-subtype
+                // matching stays as before.
+                if crate::binding::is_string_dict_term(binding) {
+                    pattern.dtc = Some(dtc.clone());
+                }
+            }
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                ..
+            } => {
+                // Decode the encoded literal (novelty-aware via BinaryGraphView).
+                // Must use decode_value_from_kind with the correct (o_kind, dt_id,
+                // lang_id) — dt_id is a DatatypeDictId, NOT an o_type. p_id is
+                // needed for NUM_BIG per-predicate arena lookup.
+                let Some(gv) = gv else {
+                    return Ok(Substitution::Free);
+                };
+                let val = gv
+                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                    .map_err(|e| {
+                        tracing::debug!(
+                            o_kind,
+                            o_key,
+                            p_id,
+                            dt_id,
+                            lang_id,
+                            error = %e,
+                            "failed to decode encoded object binding"
+                        );
+                        QueryError::dictionary_lookup(format!(
+                            "correlated object binding decode: o_kind={o_kind}, o_key={o_key}, \
+                             p_id={p_id}, dt_id={dt_id}, lang_id={lang_id}: {e}"
+                        ))
+                    })?;
+                pattern.o = Term::Value(val);
+                // Same term-identity rule as the `Lit` arm: a string binding
+                // probes only rows with its exact tag / datatype.
+                //
+                // Read straight off the encoded triple: the datatype id already
+                // names the datatype, so this needs no `OTypeRegistry` (a
+                // 15-element `Vec`, and `decode_value_from_kind` above builds
+                // one already). Only the three reserved string-dictionary ids
+                // can appear here — `late_materialized_object_binding` keeps
+                // every other string datatype materialized, so those reach the
+                // `Lit` arm above instead.
+                let dt = DatatypeDictId::from_u16(*dt_id);
+                let dtc = if !crate::binding::is_string_dict_term(binding) {
+                    None
+                } else if dt == DatatypeDictId::LANG_STRING {
+                    gv.store()
+                        .lang_tag_for_id(*lang_id)
+                        .map(|tag| fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag)))
+                } else {
+                    let sid = crate::eval::rdf::reserved_datatype_sid(dt);
+                    // Unreachable fallback by the argument above: only the three
+                    // reserved ids can appear on an encoded string-dict binding,
+                    // and the two non-langString ones both have well-known Sids.
+                    // Loud when a future widening of the encoded set forgets
+                    // this probe site.
+                    debug_assert!(
+                        sid.is_some(),
+                        "encoded string-dict binding carries non-reserved \
+                         dt_id {dt_id}; late_materialized_object_binding \
+                         keeps those datatypes materialized"
+                    );
+                    sid.or_else(|| gv.store().dt_sids().get(*dt_id as usize).cloned())
+                        .map(fluree_db_core::DatatypeConstraint::Explicit)
+                };
+                if dtc.is_some() {
+                    pattern.dtc = dtc;
+                }
+            }
+            Binding::EncodedSid { s_id, .. } => match gv {
+                Some(gv) => pattern.o = Term::Iri(resolve_subject(gv, *s_id)?),
+                None => return Ok(Substitution::Free),
+            },
+            Binding::EncodedPid { p_id } => match gv.and_then(|gv| resolve_predicate(gv, *p_id)) {
+                // An encoded predicate IRI as an object IRI.
+                Some(iri) => pattern.o = Term::Iri(iri),
+                None => return Ok(Substitution::Free),
+            },
+            Binding::Unbound | Binding::Poisoned => return Ok(Substitution::Free),
+            Binding::Grouped(_) => {
+                // Grouped bindings shouldn't appear in join codepaths
+                debug_assert!(false, "Grouped binding in correlated substitution");
+                return Ok(Substitution::Unmatchable);
+            }
+            Binding::Path { .. } => {
+                // A path value is never a join key.
+                debug_assert!(false, "Path binding in correlated substitution");
+                return Ok(Substitution::Unmatchable);
+            }
+            // A list/map/relationship value can legitimately flow through a
+            // subquery boundary (e.g. `WITH collect(x) AS l`,
+            // `relationships(p)`). None is a valid triple term.
+            Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+                return Ok(Substitution::Unmatchable);
+            }
+        },
+    }
+    Ok(Substitution::Bound)
+}
+
 /// Identifies the source of a left row in `pending_output`.
 #[derive(Debug, Clone)]
 enum BatchRef {
@@ -974,7 +1175,9 @@ impl NestedLoopJoinOperator {
     /// Substitute left row bindings into right pattern.
     ///
     /// Uses a novelty-aware `BinaryGraphView` for encoded binding resolution
-    /// so that novelty-only subject/string IDs resolve correctly.
+    /// so that novelty-only subject/string IDs resolve correctly. A value that
+    /// cannot fill its slot leaves the slot a variable here; the unify check
+    /// (or the invalid-binding screen ahead of this call) settles those rows.
     fn substitute_pattern_with_store(
         &self,
         left_batch: &Batch,
@@ -982,237 +1185,10 @@ impl NestedLoopJoinOperator {
         gv: Option<&BinaryGraphView>,
     ) -> Result<TriplePattern> {
         let mut pattern = self.right_pattern.clone();
-
         for instr in &self.bind_instructions {
             let binding = left_batch.get_by_col(left_row, instr.left_col);
-
-            match instr.position {
-                PatternPosition::Subject => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.s = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Ref::Iri so scan can encode for each target ledger
-                            pattern.s = Ref::Iri(iri.clone());
-                        }
-                        Binding::EncodedSid { s_id, .. } => {
-                            // Resolve encoded s_id to IRI (novelty-aware via BinaryGraphView)
-                            if let Some(gv) = gv {
-                                let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
-                                    tracing::debug!(
-                                        s_id,
-                                        error = %e,
-                                        "join failed to resolve encoded subject binding"
-                                    );
-                                    QueryError::dictionary_lookup(format!(
-                                        "join subject binding: resolve subject IRI for s_id={s_id}: {e}"
-                                    ))
-                                })?;
-                                pattern.s = Ref::Iri(Arc::from(iri));
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::EncodedPid { p_id } => {
-                            // Predicates are IRIs; allow using an encoded predicate as a subject.
-                            if let Some(gv) = gv {
-                                if let Some(iri) = gv.store().resolve_predicate_iri(*p_id) {
-                                    pattern.s = Ref::Iri(Arc::from(iri));
-                                }
-                            }
-                            // Otherwise leave as variable
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
-                }
-                PatternPosition::Predicate => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.p = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Term::Iri so scan can encode for each target ledger
-                            pattern.p = Ref::Iri(iri.clone());
-                        }
-                        Binding::EncodedSid { s_id, .. } => {
-                            // Allow cross-position reuse: an IRI bound as a subject/object can
-                            // be used to bind a predicate position. Resolve via subject dict.
-                            if let Some(gv) = gv {
-                                let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
-                                    tracing::debug!(
-                                        s_id,
-                                        error = %e,
-                                        "join failed to resolve encoded predicate binding via subject dictionary"
-                                    );
-                                    QueryError::dictionary_lookup(format!(
-                                        "join predicate binding via subject lookup: s_id={s_id}: {e}"
-                                    ))
-                                })?;
-                                pattern.p = Ref::Iri(Arc::from(iri));
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::EncodedPid { p_id } => {
-                            // Resolve encoded p_id to IRI
-                            if let Some(gv) = gv {
-                                if let Some(iri) = gv.store().resolve_predicate_iri(*p_id) {
-                                    pattern.p = Ref::Iri(Arc::from(iri));
-                                }
-                            }
-                            // Otherwise leave as variable
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
-                }
-                PatternPosition::Object => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.o = Term::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Term::Iri so scan can encode for each target ledger
-                            pattern.o = Term::Iri(iri.clone());
-                        }
-                        Binding::Lit { val, dtc, .. } => {
-                            pattern.o = Term::Value(val.clone());
-                            // A string binding is one RDF term: `"bob"`,
-                            // `"bob"@en`, `"bob"^^xsd:anyURI` and
-                            // `"bob"^^ex:custom` share a dictionary key and
-                            // must not probe each other's rows. Numeric/other
-                            // constraints are left off so cross-subtype
-                            // matching stays as before.
-                            if crate::binding::is_string_dict_term(binding) {
-                                pattern.dtc = Some(dtc.clone());
-                            }
-                        }
-                        Binding::EncodedLit {
-                            o_kind,
-                            o_key,
-                            p_id,
-                            dt_id,
-                            lang_id,
-                            ..
-                        } => {
-                            // Decode encoded literal (novelty-aware via BinaryGraphView).
-                            // Must use decode_value_from_kind with the correct (o_kind, dt_id, lang_id)
-                            // — dt_id is a DatatypeDictId, NOT an o_type. p_id is needed for
-                            // NUM_BIG per-predicate arena lookup.
-                            if let Some(gv) = gv {
-                                let val = gv
-                                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
-                                    .map_err(|e| {
-                                        tracing::debug!(
-                                            o_kind,
-                                            o_key,
-                                            p_id,
-                                            dt_id,
-                                            lang_id,
-                                            error = %e,
-                                            "join failed to decode encoded object binding"
-                                        );
-                                        QueryError::dictionary_lookup(format!(
-                                            "join object binding decode: o_kind={o_kind}, o_key={o_key}, p_id={p_id}, dt_id={dt_id}, lang_id={lang_id}: {e}"
-                                        ))
-                                    })?;
-                                pattern.o = Term::Value(val);
-                                // Same term-identity rule as the `Lit` arm:
-                                // a string binding probes only rows with its
-                                // exact tag / datatype.
-                                //
-                                // Read straight off the encoded triple: the
-                                // datatype id already names the datatype, so
-                                // this needs no `OTypeRegistry` (a 15-element
-                                // `Vec`, and `decode_value_from_kind` above
-                                // builds one already). Only the three reserved
-                                // string-dictionary ids can appear here —
-                                // `late_materialized_object_binding` keeps
-                                // every other string datatype materialized, so
-                                // those reach the `Lit` arm above instead.
-                                let dt = DatatypeDictId::from_u16(*dt_id);
-                                let dtc = if !crate::binding::is_string_dict_term(binding) {
-                                    None
-                                } else if dt == DatatypeDictId::LANG_STRING {
-                                    gv.store().lang_tag_for_id(*lang_id).map(|tag| {
-                                        fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag))
-                                    })
-                                } else {
-                                    let sid = crate::eval::rdf::reserved_datatype_sid(dt);
-                                    // Unreachable fallback by the argument
-                                    // above: only the three reserved ids can
-                                    // appear on an encoded string-dict
-                                    // binding, and the two non-langString
-                                    // ones both have well-known Sids. Loud
-                                    // when a future widening of the encoded
-                                    // set forgets this probe site.
-                                    debug_assert!(
-                                        sid.is_some(),
-                                        "encoded string-dict binding carries non-reserved \
-                                         dt_id {dt_id}; late_materialized_object_binding \
-                                         keeps those datatypes materialized"
-                                    );
-                                    sid.or_else(|| {
-                                        gv.store().dt_sids().get(*dt_id as usize).cloned()
-                                    })
-                                    .map(fluree_db_core::DatatypeConstraint::Explicit)
-                                };
-                                if dtc.is_some() {
-                                    pattern.dtc = dtc;
-                                }
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::EncodedSid { s_id, .. } => {
-                            // Resolve encoded s_id to IRI (novelty-aware)
-                            if let Some(gv) = gv {
-                                let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
-                                    tracing::debug!(
-                                        s_id,
-                                        error = %e,
-                                        "join failed to resolve encoded object subject binding"
-                                    );
-                                    QueryError::dictionary_lookup(format!(
-                                        "join object subject lookup: s_id={s_id}: {e}"
-                                    ))
-                                })?;
-                                pattern.o = Term::Iri(Arc::from(iri));
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::EncodedPid { p_id } => {
-                            // Allow using an encoded predicate IRI as an object IRI.
-                            if let Some(gv) = gv {
-                                if let Some(iri) = gv.store().resolve_predicate_iri(*p_id) {
-                                    pattern.o = Term::Iri(Arc::from(iri));
-                                }
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::Unbound | Binding::Poisoned => {
-                            // Leave as variable (Poisoned vars from OPTIONAL also remain unbound)
-                        }
-                        Binding::Grouped(_) => {
-                            // Grouped bindings shouldn't appear in join codepaths
-                            debug_assert!(false, "Grouped binding in join bind");
-                            // Leave as variable
-                        }
-                        Binding::Path { .. } => {
-                            // A path value is never a join key — leave as variable.
-                            debug_assert!(false, "Path binding in join bind");
-                        }
-                        // A list/map/relationship value can legitimately flow
-                        // through a subquery boundary (e.g. `WITH collect(x) AS l`,
-                        // `relationships(p)`). None is a valid triple term, so leave
-                        // the slot as a variable (no match) rather than asserting.
-                        Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {}
-                    }
-                }
-            }
+            substitute_binding(&mut pattern, instr.position, binding, gv)?;
         }
-
         Ok(pattern)
     }
 

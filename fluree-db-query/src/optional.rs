@@ -32,8 +32,8 @@ use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::join::{
-    batched_subject_probe_binary, BindInstruction, PatternPosition, SubjectProbeParams,
-    UnifyInstruction,
+    batched_subject_probe_binary, substitute_binding, BindInstruction, PatternPosition,
+    SubjectProbeParams, Substitution, UnifyInstruction,
 };
 use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::flush::FlushSchedule;
@@ -328,152 +328,94 @@ impl PatternOptionalBuilder {
     /// True when the pattern's object variable is also a REQUIRED variable, so
     /// the per-row object substitution is load-bearing.
     ///
-    /// The batched probe keys on `(subject, predicate)` and reads the object
-    /// slot off the plan-time template, never off the row — sound while the
-    /// object variable is optional-only, wrong the moment the required side
-    /// carries values for it. Left in, it answered one bare existence row per
-    /// matching triple: a required row binding the variable was duplicated
-    /// instead of filtered, and a required row leaving it unbound was passed
-    /// through instead of extended. The per-row `build` path substitutes the
-    /// row's own object (and leaves an unbound one free), so it is exactly
-    /// right here; this shape declines the probe and takes it.
+    /// The subject-keyed batched probe keys on `(subject, predicate)` and reads
+    /// the object slot off the plan-time template, never off the row — sound
+    /// while the object variable is optional-only, wrong the moment the
+    /// required side carries values for it. Left in, it answered one bare
+    /// existence row per matching triple: a required row binding the variable
+    /// was duplicated instead of filtered, and a required row leaving it
+    /// unbound was passed through instead of extended. That shape takes the
+    /// bound-object probe instead when the object is a ref the subject of the
+    /// pattern is free for, and the per-row `build` path otherwise, which
+    /// substitutes the row's own object in whatever form it arrives (and
+    /// leaves an unbound one free).
     ///
     /// The alternative — widen the probe to materialise the object and let
     /// `unify_check` filter — was declined because `Binding`'s `PartialEq`
     /// answers `false`, not an error, across representations (`EncodedSid` vs
-    /// `Sid`, `Sid` vs `Iri`, `EncodedLit` vs `Lit`), so a cross-representation
-    /// object correlation would silently DROP rows; #1729 is a live instance on
-    /// the literal/datatype arm. Note this narrows the exposure rather than
-    /// removing it: `substitute_pattern` leaves a late-materialised
-    /// `EncodedSid`/`EncodedPid`/`EncodedLit` object free, and `unify_check`'s
-    /// `left_val == right_val` is then what enforces the correlation on the
-    /// per-row path too.
+    /// `Sid`, `EncodedPid` vs `EncodedSid`, `EncodedLit` vs `Lit`), so a
+    /// cross-representation object correlation would silently DROP rows; #1729
+    /// is a live instance on the literal/datatype arm.
     fn object_var_shared_with_required(&self) -> bool {
         matches!(&self.pattern.o, Term::Var(v) if !self.optional_only_vars.contains(v))
     }
 
-    /// Substitute required bindings into pattern
+    /// This row's correlated values bound into the pattern, through the
+    /// substitution every correlated scan shares ([`substitute_binding`]):
+    /// encoded values decode into their slot in any position, so the scan is
+    /// a bound lookup whichever form the row carries a term in. `None` when no
+    /// triple can match the row — a correlated value that can never fill its
+    /// slot (a literal as a subject or predicate, a list or map value).
     ///
-    /// For IriMatch bindings in subject/predicate positions, uses `Ref::Iri` to carry
-    /// the canonical IRI. For IriMatch bindings in object position, uses `Term::Iri`.
-    /// The scan operator will encode this IRI for each target ledger's namespace
-    /// table, enabling correct cross-ledger OPTIONAL matching.
+    /// An encoded value this context cannot decode is refused rather than left
+    /// free: the slot would then be correlated only by `unify_check`, comparing
+    /// the row's encoded form of the term with the scan's, and two encoded
+    /// forms of one IRI compare unequal.
     fn substitute_pattern(
         &self,
         required_batch: &Batch,
         row: usize,
         ctx: &ExecutionContext<'_>,
-    ) -> Result<TriplePattern> {
+    ) -> Result<Option<TriplePattern>> {
         let mut pattern = self.pattern.clone();
-
+        // Built only when a row carries an encoded value: decoded rows (the
+        // novelty lane) never need it.
+        let mut gv: Option<Option<fluree_db_binary_index::BinaryGraphView>> = None;
         for instr in &self.bind_instructions {
             let binding = required_batch.get_by_col(row, instr.left_col);
-
-            match instr.position {
-                PatternPosition::Subject => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.s = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Ref::Iri so scan can encode for each target ledger
-                            pattern.s = Ref::Iri(iri.clone());
-                        }
-                        Binding::EncodedSid { s_id, .. } => {
-                            // Late materialized subject ID: resolve to IRI for correlation.
-                            // Uses novelty-aware BinaryGraphView via ctx.graph_view().
-                            let gv = ctx.graph_view().ok_or_else(|| {
-                                QueryError::Internal(
-                                    "OPTIONAL correlation requires binary store for EncodedSid"
-                                        .into(),
-                                )
-                            })?;
-                            let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
-                                QueryError::Internal(format!("resolve subject iri: {e}"))
-                            })?;
-                            pattern.s = Ref::Iri(Arc::<str>::from(iri));
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
+            let encoded = matches!(
+                binding,
+                Binding::EncodedSid { .. }
+                    | Binding::EncodedPid { .. }
+                    | Binding::EncodedLit { .. }
+            );
+            let view = if encoded {
+                gv.get_or_insert_with(|| ctx.graph_view()).as_ref()
+            } else {
+                None
+            };
+            match substitute_binding(&mut pattern, instr.position, binding, view)? {
+                Substitution::Bound => {}
+                Substitution::Unmatchable => return Ok(None),
+                Substitution::Free if encoded => {
+                    return Err(QueryError::Internal(format!(
+                        "OPTIONAL correlation cannot decode the encoded {:?} value {binding:?}",
+                        instr.position
+                    )));
                 }
-                PatternPosition::Predicate => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.p = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Ref::Iri so scan can encode for each target ledger
-                            pattern.p = Ref::Iri(iri.clone());
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
-                }
-                PatternPosition::Object => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.o = Term::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Term::Iri so scan can encode for each target ledger
-                            pattern.o = Term::Iri(iri.clone());
-                        }
-                        Binding::Lit { val, dtc, .. } => {
-                            pattern.o = Term::Value(val.clone());
-                            // A string binding is one RDF term: `"bob"`,
-                            // `"bob"@en`, `"bob"^^xsd:anyURI` and
-                            // `"bob"^^ex:custom` share a dictionary key and
-                            // must not probe each other's rows. Numeric/other
-                            // constraints are left off so cross-subtype
-                            // matching stays as before.
-                            if crate::binding::is_string_dict_term(binding) {
-                                pattern.dtc = Some(dtc.clone());
-                            }
-                        }
-                        Binding::EncodedLit { .. } => {
-                            // Late materialized literal: no decode context here; leave unbound.
-                        }
-                        Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
-                            // Late materialized IRI: no decode context here; leave unbound.
-                        }
-                        Binding::Unbound | Binding::Poisoned => {
-                            // Leave as variable
-                        }
-                        Binding::Grouped(_) => {
-                            debug_assert!(
-                                false,
-                                "Grouped binding in optional pattern substitution"
-                            );
-                            // Leave as variable
-                        }
-                        Binding::Path { .. }
-                        | Binding::Rel(_)
-                        | Binding::List(_)
-                        | Binding::Map(_) => {
-                            // A path/list value is never substituted into a triple slot.
-                        }
-                    }
-                }
+                Substitution::Free => {}
             }
         }
-
-        Ok(pattern)
+        Ok(Some(pattern))
     }
 }
 
-/// Append one correlation binding to a cache key, or return `false` when it
-/// has no stable encoding (the caller then declines to cache).
+/// Append one correlation value to a cache key, or return `false` to leave the
+/// row uncached.
 ///
-/// The key is the SUBSTITUTED PATTERN, not the row: this mirrors
-/// [`PatternOptionalBuilder::substitute_pattern`] position by position, so a
-/// slot that substitution pushes a value into is keyed by that value, and a
-/// slot it leaves free gets the same `u` token whatever the row held. Two rows whose
-/// substituted patterns are identical then share one scan — which is what the
-/// cache is for, since `unify_check` re-applies the row's own correlation when
-/// the pending match is drained.
+/// Rows that key alike share one scan, so the key must determine the
+/// SUBSTITUTED PATTERN: every value [`substitute_binding`] binds into a slot is
+/// keyed by an identity that fixes what it binds, in every position. Encoded
+/// values key by their encoded identity, which is cheaper than decoding and
+/// determines the decode. A slot substitution leaves free (an unbound value)
+/// gets its own `u` token rather than colliding with any bound value;
+/// `unify_check` re-applies the row's own correlation when the pending match
+/// drains. Keying a bound value as free would hand one row's lookup to every
+/// row.
+///
+/// Rows with no scan to share are not keyed: a poisoned value, and a value
+/// substitution reports unmatchable (a literal as a subject or predicate, a
+/// list or map value), for which `build` answers no match.
 ///
 /// Every variable-length component is length-prefixed so two different
 /// correlation tuples can never concatenate to the same bytes.
@@ -488,16 +430,11 @@ fn push_cache_key_component(
         key.extend_from_slice(bytes);
     }
 
-    // `substitute_pattern` leaves the slot a variable, so "free here" is a
-    // correlation state in its own right and gets its own token rather than
-    // colliding with any bound value.
-    fn push_free(key: &mut Vec<u8>) -> bool {
-        key.push(b'u');
-        true
-    }
-
     match binding {
-        Binding::Poisoned => false,
+        Binding::Unbound => {
+            key.push(b'u');
+            true
+        }
         Binding::Sid { sid, .. } => {
             // Fallback stable key: namespace code + suffix bytes.
             key.push(b's');
@@ -509,22 +446,40 @@ fn push_cache_key_component(
             push_bytes(key, b'i', iri.as_bytes());
             true
         }
-        // Only the SUBJECT slot resolves an encoded id to an IRI and pushes it
-        // down; elsewhere substitution leaves the slot free.
-        Binding::EncodedSid { s_id, .. } if position == PatternPosition::Subject => {
+        Binding::EncodedSid { s_id, .. } => {
             key.push(b'S');
             key.extend_from_slice(&s_id.to_le_bytes());
+            true
+        }
+        Binding::EncodedPid { p_id } => {
+            key.push(b'P');
+            key.extend_from_slice(&p_id.to_le_bytes());
+            true
+        }
+        // The fields the decode reads; `i_val` and `t` are metadata.
+        Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        } if position == PatternPosition::Object => {
+            key.push(b'L');
+            key.push(*o_kind);
+            key.extend_from_slice(&o_key.to_le_bytes());
+            key.extend_from_slice(&p_id.to_le_bytes());
+            key.extend_from_slice(&dt_id.to_le_bytes());
+            key.extend_from_slice(&lang_id.to_le_bytes());
             true
         }
         // A literal OBJECT is pushed down by value (plus a string term
         // constraint), so rows carrying different literals must not share an
         // entry. Keying it would need a stable byte encoding of every
-        // `FlakeValue`/datatype pair — more than this fix is buying — so the
-        // row goes uncached instead. In every other slot a literal is left
-        // free, like any other unsubstitutable binding.
-        Binding::Lit { .. } if position == PatternPosition::Object => false,
-        // Everything else: substitution's own `_ => leave as variable` arms.
-        _ => push_free(key),
+        // `FlakeValue`/datatype pair, so the row goes uncached instead.
+        Binding::Lit { .. } => false,
+        // Poisoned, and values substitution reports unmatchable.
+        _ => false,
     }
 }
 
@@ -573,7 +528,9 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
 
         // Substitute bindings into pattern and create scan operator
-        let bound_pattern = self.substitute_pattern(required_batch, row, ctx)?;
+        let Some(bound_pattern) = self.substitute_pattern(required_batch, row, ctx)? else {
+            return Ok(None);
+        };
         Ok(Some(Box::new(
             crate::dataset_operator::DatasetOperator::scan(
                 bound_pattern,
@@ -4151,45 +4108,84 @@ mod tests {
         )));
     }
 
-    /// The cache key is the SUBSTITUTED PATTERN, so a slot substitution leaves
-    /// free keys as free whatever the row held, and two rows that would drive
-    /// the identical scan share one entry.
+    /// The cache key determines the SUBSTITUTED PATTERN. Substitution binds
+    /// every term value into its slot in every position, encoded or decoded,
+    /// so each keys by its own identity: keying a bound value as free would
+    /// hand one row's lookup to every row (the trap an encoded object used to
+    /// sit in, when substitution left it free). Only an unbound value keys as
+    /// free; rows with no scan to share are not keyed at all.
     #[test]
-    fn cache_key_keys_a_free_slot_as_free() {
+    fn cache_key_keys_every_bound_value_by_identity() {
         fn key(position: PatternPosition, binding: &Binding) -> Option<Vec<u8>> {
             let mut k = Vec::new();
             push_cache_key_component(&mut k, position, binding).then_some(k)
         }
-
-        let encoded = Binding::EncodedSid {
-            s_id: 42,
+        let sid = |s_id| Binding::EncodedSid {
+            s_id,
             t: None,
             op: None,
         };
-        // Object: substitution leaves a late-materialised IRI free, so this must
-        // key identically to an unbound object — N objects, ONE scan.
-        assert_eq!(
-            key(PatternPosition::Object, &encoded),
-            key(PatternPosition::Object, &Binding::Unbound),
+        let pid = |p_id| Binding::EncodedPid { p_id };
+        let lit = |o_key| Binding::EncodedLit {
+            o_kind: fluree_db_core::ObjKind::LEX_ID.as_u8(),
+            o_key,
+            p_id: 3,
+            dt_id: fluree_db_core::DatatypeDictId::STRING.as_u16(),
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+        };
+        let free = Some(vec![b'u']);
+        let positions = [
+            PatternPosition::Subject,
+            PatternPosition::Predicate,
+            PatternPosition::Object,
+        ];
+
+        for position in positions {
+            assert_eq!(key(position, &Binding::Unbound), free, "{position:?}");
+            assert_eq!(key(position, &Binding::Poisoned), None, "{position:?}");
+            for (a, b) in [
+                (sid(42), sid(43)),
+                (pid(7), pid(8)),
+                (
+                    Binding::sid(Sid::new(9, "a")),
+                    Binding::sid(Sid::new(9, "b")),
+                ),
+            ] {
+                let (ka, kb) = (key(position, &a), key(position, &b));
+                assert!(
+                    ka.is_some() && ka != free,
+                    "{position:?}: {a:?} keys by value"
+                );
+                assert_ne!(ka, kb, "{position:?}: {a:?} vs {b:?}");
+            }
+            // One IRI in two encoded forms decodes to the same constant, but
+            // the forms key apart: a cache miss, never a shared wrong entry.
+            assert_ne!(
+                key(position, &sid(7)),
+                key(position, &pid(7)),
+                "{position:?}"
+            );
+        }
+
+        // An encoded literal object keys by the fields its decode reads...
+        let (a, b) = (
+            key(PatternPosition::Object, &lit(1)),
+            key(PatternPosition::Object, &lit(2)),
         );
-        // Subject: substitution resolves it and pushes it down, so it keys by value.
-        assert_ne!(
-            key(PatternPosition::Subject, &encoded),
-            key(PatternPosition::Subject, &Binding::Unbound),
-        );
-        assert_ne!(
-            key(PatternPosition::Subject, &encoded),
-            key(
-                PatternPosition::Subject,
-                &Binding::EncodedSid {
-                    s_id: 43,
-                    t: None,
-                    op: None
-                }
-            ),
-        );
-        // A literal OBJECT is pushed down by value; declining to cache is how
-        // rows carrying different literals are kept apart.
+        assert!(a.is_some() && a != free);
+        assert_ne!(a, b);
+        // ...and not by list index or assertion time.
+        let mut c = lit(1);
+        if let Binding::EncodedLit { i_val, t, .. } = &mut c {
+            *i_val = 4;
+            *t = 9;
+        }
+        assert_eq!(key(PatternPosition::Object, &c), a);
+
+        // A decoded literal object is pushed down by value; declining to cache
+        // is how rows carrying different literals are kept apart.
         assert_eq!(
             key(
                 PatternPosition::Object,
@@ -4197,5 +4193,17 @@ mod tests {
             ),
             None
         );
+        // A literal as a subject or predicate cannot match: no scan to share.
+        for position in [PatternPosition::Subject, PatternPosition::Predicate] {
+            assert_eq!(key(position, &lit(1)), None, "{position:?}");
+            assert_eq!(
+                key(
+                    position,
+                    &Binding::lit(fluree_db_core::FlakeValue::Long(7), Sid::new(0, "integer"))
+                ),
+                None,
+                "{position:?}"
+            );
+        }
     }
 }
