@@ -570,11 +570,15 @@ const WAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2
 ///
 /// `durability` and `log` stay fixed while it is held. Fields drop in
 /// declaration order, so the key stripe is released before the root gate.
+///
+/// It is `!Send`, so it is released on the thread that took it.
+/// Its release never waits on an async task to be polled.
 struct OperationHold {
     _key_stripe: Option<KeyStripeGuard>,
     log: Option<Arc<Wal>>,
     durability: Durability,
     _root_gate: tokio::sync::OwnedRwLockReadGuard<()>,
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl FileStorage {
@@ -846,14 +850,19 @@ impl FileStorage {
         }
     }
 
-    /// Replay the WAL an earlier run left under this root, if any, so
-    /// state acknowledged before a crash is on disk before the first read.
+    /// Replays the WAL an earlier run left under this root, if any.
     ///
-    /// A startup action like [`Self::sweep_orphaned_staging`]: the connection
-    /// and builder paths call it, constructing a handle never does. Blocking.
-    /// Replays under any durability setting, so an operator who switched back
+    /// State acknowledged before a crash is then on disk before the first read.
+    /// The connection and builder paths call it at startup, like
+    /// [`Self::sweep_orphaned_staging`]. Constructing a handle does not call it.
+    ///
+    /// Blocking. It takes the root gate exclusively, so the calling thread
+    /// waits until every in-flight file operation on this root has finished.
+    /// The replay itself is synchronous file I/O on the calling thread.
+    ///
+    /// It replays under any durability setting. An operator who switched back
     /// to per-write flushing after a crash still sees the acknowledged tail.
-    /// Leaves no trace on a root that never journaled.
+    /// A root that never journaled is left untouched.
     pub fn recover_wal(&self) -> Result<()> {
         let _root = futures::executor::block_on(self.root_gate()?.write_owned());
         if self.durability == Durability::Wal {
@@ -1005,6 +1014,7 @@ impl FileStorage {
             log,
             durability,
             _root_gate: root,
+            _not_send: std::marker::PhantomData,
         })
     }
 
