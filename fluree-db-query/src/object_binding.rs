@@ -365,6 +365,7 @@ pub(crate) enum IriId {
 }
 
 impl IriId {
+    #[inline]
     fn into_binding(self, t: Option<i64>, op: Option<bool>) -> Binding {
         match self {
             IriId::Subject(s_id) => Binding::EncodedSid { s_id, t, op },
@@ -377,18 +378,25 @@ impl IriId {
 /// IRI with neither persisted id, or when the subject dictionary cannot be
 /// read. Blank-node policy is the caller's: this resolves any `Sid` it is
 /// given.
+#[inline]
 pub(crate) fn canonical_iri_id(binding: &Binding, store: &BinaryIndexStore) -> Option<IriId> {
-    let by_sid = |sid: &Sid| match store.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
-        Ok(Some(s_id)) => Some(IriId::Subject(s_id)),
-        Ok(None) => store.sid_to_p_id(sid).map(IriId::Predicate),
-        Err(_) => None,
+    let by_predicate = |p_id: u32| match store.predicate_subject_id(p_id) {
+        Some(s_id) => IriId::Subject(s_id),
+        None => IriId::Predicate(p_id),
+    };
+    // A decoded IRI that is a predicate keys as its predicate binding does.
+    // Asking the predicate table first (a namespace bit test, then a hash
+    // probe) spares a subject-dictionary lookup on each decoded predicate.
+    let by_sid = |sid: &Sid| match store.predicate_id_for_sid(sid) {
+        Some(p_id) => Some(by_predicate(p_id)),
+        None => match store.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+            Ok(Some(s_id)) => Some(IriId::Subject(s_id)),
+            _ => None,
+        },
     };
     match binding {
         Binding::EncodedSid { s_id, .. } => Some(IriId::Subject(*s_id)),
-        Binding::EncodedPid { p_id } => Some(match store.predicate_subject_id(*p_id) {
-            Some(s_id) => IriId::Subject(s_id),
-            None => IriId::Predicate(*p_id),
-        }),
+        Binding::EncodedPid { p_id } => Some(by_predicate(*p_id)),
         Binding::Sid { sid, .. } => by_sid(sid),
         Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
             by_sid(&store.encode_iri(iri.as_ref()))

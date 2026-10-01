@@ -268,6 +268,55 @@ impl std::ops::Deref for SharedLeafBytes {
     }
 }
 
+/// Predicate count up to which [`BinaryIndexStore::predicate_subject_id`]
+/// resolves every predicate on first use rather than one at a time.
+const PREDICATE_SUBJECT_TABLE_MAX: usize = 4096;
+
+/// Memo behind [`BinaryIndexStore::predicate_id_for_sid`]: the map, and which
+/// namespace codes any predicate uses, so an IRI in no predicate's namespace
+/// is answered without hashing its name.
+struct PredicateIdsBySid {
+    by_sid: rustc_hash::FxHashMap<Sid, u32>,
+    namespaces: Box<[u64]>,
+}
+
+impl PredicateIdsBySid {
+    fn new(sids: &[Sid]) -> Self {
+        let mut namespaces = vec![0u64; (usize::from(u16::MAX) + 1) / 64];
+        let mut by_sid = rustc_hash::FxHashMap::default();
+        by_sid.reserve(sids.len());
+        for (p_id, sid) in sids.iter().enumerate() {
+            let ns = usize::from(sid.namespace_code);
+            namespaces[ns / 64] |= 1 << (ns % 64);
+            by_sid.insert(sid.clone(), p_id as u32);
+        }
+        Self {
+            by_sid,
+            namespaces: namespaces.into(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, sid: &Sid) -> Option<u32> {
+        let ns = usize::from(sid.namespace_code);
+        if self.namespaces[ns / 64] & (1 << (ns % 64)) == 0 {
+            return None;
+        }
+        self.by_sid.get(sid).copied()
+    }
+}
+
+/// Memo behind [`BinaryIndexStore::predicate_subject_id`].
+enum PredicateSubjectIds {
+    /// No persisted predicate IRI is also a subject.
+    None,
+    /// Every persisted predicate, resolved.
+    Resolved(Box<[Option<u64>]>),
+    /// Resolved per predicate on first use (large predicate dictionaries, or
+    /// after a dictionary read failed).
+    Lazy(Box<[OnceLock<Option<u64>>]>),
+}
+
 /// Index store — reads FLI3/FBR3/FHS1 artifacts via FIR6 root.
 ///
 /// - Routing via `BranchManifest` (sidecar CIDs for history)
@@ -324,10 +373,12 @@ pub struct BinaryIndexStore {
     /// configuration (`set_ns_split_mode`, namespace augmentation), which
     /// cannot occur once the store is behind `Arc`.
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
-    /// Per persisted predicate, the subject id of its IRI (`None`: the IRI is
-    /// only ever a predicate), resolved on first use. See
+    /// Per persisted predicate, the subject id of its IRI. See
     /// [`Self::predicate_subject_id`].
-    pred_subject_ids: std::sync::OnceLock<Box<[std::sync::OnceLock<Option<u64>>]>>,
+    pred_subject_ids: std::sync::OnceLock<PredicateSubjectIds>,
+    /// Persisted `Sid → p_id`, built on first use from `p_sid_table`. See
+    /// [`Self::predicate_id_for_sid`].
+    p_id_by_sid: std::sync::OnceLock<PredicateIdsBySid>,
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
@@ -398,6 +449,7 @@ impl BinaryIndexStore {
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
             pred_subject_ids: std::sync::OnceLock::new(),
+            p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         }
     }
@@ -581,6 +633,7 @@ impl BinaryIndexStore {
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
             pred_subject_ids: std::sync::OnceLock::new(),
+            p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         })
     }
@@ -1903,28 +1956,76 @@ impl BinaryIndexStore {
     ///
     /// One IRI is encoded twice: as an `EncodedPid` where a pattern reaches it
     /// in predicate position, as an `EncodedSid` where it is a subject or
-    /// object. Equality surfaces map the first onto the second through this,
-    /// so it is memoized per predicate on first use — a key over predicate
-    /// bindings pays a load per row, not a dictionary lookup. A dictionary I/O
+    /// object. Equality surfaces map the first onto the second through this on
+    /// every predicate-valued key, so it must cost a load, not a dictionary
+    /// lookup. Up to [`PREDICATE_SUBJECT_TABLE_MAX`] predicates the whole table
+    /// is resolved on first use, which also tells whether ANY predicate is a
+    /// subject — usually none is, and then every call returns at once. Above
+    /// that each predicate resolves on its own first use. A dictionary I/O
     /// error is reported as `None` and not memoized.
+    #[inline]
     pub fn predicate_subject_id(&self, p_id: u32) -> Option<u64> {
-        let table = self.pred_subject_ids.get_or_init(|| {
-            (0..self.p_sid_table().len())
-                .map(|_| std::sync::OnceLock::new())
-                .collect()
-        });
-        let slot = table.get(p_id as usize)?;
-        if let Some(found) = slot.get() {
-            return *found;
+        match self.pred_subject_ids.get() {
+            Some(PredicateSubjectIds::None) => None,
+            Some(PredicateSubjectIds::Resolved(ids)) => ids.get(p_id as usize).copied().flatten(),
+            _ => self.predicate_subject_id_slow(p_id),
         }
-        let sid = &self.p_sid_table()[p_id as usize];
-        match self.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
-            Ok(found) => *slot.get_or_init(|| found),
-            Err(e) => {
-                tracing::debug!(p_id, error = %e, "predicate subject id lookup failed");
-                None
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn predicate_subject_id_slow(&self, p_id: u32) -> Option<u64> {
+        let table = self.pred_subject_ids.get_or_init(|| {
+            let sids = self.p_sid_table();
+            let lazy =
+                || PredicateSubjectIds::Lazy((0..sids.len()).map(|_| OnceLock::new()).collect());
+            if sids.len() > PREDICATE_SUBJECT_TABLE_MAX {
+                return lazy();
+            }
+            let mut ids = Vec::with_capacity(sids.len());
+            for sid in sids.iter() {
+                match self.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+                    Ok(found) => ids.push(found),
+                    // Resolve on demand instead, which memoizes only
+                    // successful lookups.
+                    Err(_) => return lazy(),
+                }
+            }
+            if ids.iter().all(Option::is_none) {
+                PredicateSubjectIds::None
+            } else {
+                PredicateSubjectIds::Resolved(ids.into())
+            }
+        });
+        match table {
+            PredicateSubjectIds::None => None,
+            PredicateSubjectIds::Resolved(ids) => ids.get(p_id as usize).copied().flatten(),
+            PredicateSubjectIds::Lazy(slots) => {
+                let slot = slots.get(p_id as usize)?;
+                if let Some(found) = slot.get() {
+                    return *found;
+                }
+                let sid = &self.p_sid_table()[p_id as usize];
+                match self.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+                    Ok(found) => *slot.get_or_init(|| found),
+                    Err(e) => {
+                        tracing::debug!(p_id, error = %e, "predicate subject id lookup failed");
+                        None
+                    }
+                }
             }
         }
+    }
+
+    /// The persisted `p_id` of a predicate IRI given as a canonical `Sid`,
+    /// without building its IRI string — the per-row form of
+    /// [`Self::sid_to_p_id`]. An IRI in no predicate's namespace answers on a
+    /// bit test.
+    #[inline]
+    pub fn predicate_id_for_sid(&self, sid: &Sid) -> Option<u32> {
+        self.p_id_by_sid
+            .get_or_init(|| PredicateIdsBySid::new(self.p_sid_table()))
+            .get(sid)
     }
 
     /// Lookup a predicate IRI → p_id.
