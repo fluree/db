@@ -1469,3 +1469,121 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
     }
     failures.assert_none();
 }
+
+// ---------------------------------------------------------------------------
+// Encoded values outside triple patterns: property-path endpoints and GRAPH.
+// ---------------------------------------------------------------------------
+
+/// A predicate bound in predicate position (`EncodedPid`) as a correlated
+/// property-path endpoint, and as a graph name. An endpoint the path cannot
+/// resolve falls into the full-closure branch and pairs the row with every
+/// closure pair. The graph name was already answered right (its binding
+/// reaches `GRAPH` materialized); it is pinned here alongside.
+#[tokio::test(flavor = "current_thread")]
+async fn predicate_bindings_as_path_endpoints_and_graph_names() {
+    let mut failures = Failures::default();
+    for novelty in [false, true] {
+        let ledger_id = if novelty {
+            "it/predicate-endpoints-novelty:main"
+        } else {
+            "it/predicate-endpoints:main"
+        };
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .create_ledger(ledger_id)
+            .await
+            .expect("create ledger");
+        let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+        let trig = r#"
+            @prefix ex: <http://example.org/> .
+            ex:s1 ex:text "one" ; ex:derivedFrom ex:doc1 .
+            ex:text ex:parentProp ex:content .
+            ex:content ex:parentProp ex:any .
+            ex:derivedFrom ex:parentProp ex:relation .
+            ex:s2 ex:graphNamed "g" .
+            GRAPH ex:graphNamed { ex:a ex:b ex:c . }
+        "#;
+        fluree
+            .stage(&handle)
+            .upsert_turtle(trig)
+            .execute()
+            .await
+            .expect("seed TriG");
+        rebuild_and_publish_index(&fluree, ledger_id).await;
+        fluree.disconnect_ledger(ledger_id).await;
+        let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
+        if novelty {
+            fluree
+                .stage(&handle)
+                .insert(&unrelated_write())
+                .execute()
+                .await
+                .expect("pending write");
+        }
+        let state = if novelty { "novelty" } else { "indexed" };
+        let cases: &[SurfaceCase] = &[
+            (
+                "path endpoint",
+                "SELECT ?p ?super WHERE { ex:s1 ?p ?o . ?p ex:parentProp+ ?super }",
+                &["p", "super"],
+                &[
+                    &["derivedFrom", "relation"],
+                    &["text", "any"],
+                    &["text", "content"],
+                ],
+            ),
+            (
+                "graph name",
+                "SELECT ?g ?a WHERE { ex:s2 ?g ?o . GRAPH ?g { ?a ex:b ?c } }",
+                &["g", "a"],
+                &[&["graphNamed", "a"]],
+            ),
+        ];
+        for (label, body, vars, expected) in cases {
+            let result = sparql(&fluree, &handle, body).await;
+            failures.eq(
+                sparql_rows(&result, vars),
+                rows(expected),
+                &format!("{state} / {label}"),
+            );
+        }
+    }
+    failures.assert_none();
+}
+
+/// A batched join binds a chunk minted since the last index by its novelty
+/// id; as a correlated path endpoint it must resolve through the novelty
+/// dictionary, not fall into the full closure.
+#[tokio::test(flavor = "current_thread")]
+async fn novelty_minted_subject_as_path_endpoint() {
+    let base = json!({"@context": context(), "@graph": [
+        {"@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "Doc 1"},
+        {"@id": "ex:s1", "ex:derivedFrom": {"@id": "ex:doc1"}, "ex:next": {"@id": "ex:s2"}},
+        {"@id": "ex:s2", "ex:next": {"@id": "ex:s3"}},
+        {"@id": "ex:t1", "ex:next": {"@id": "ex:t2"}}
+    ]});
+    let novelty = json!({"@context": context(), "@id": "ex:sN",
+        "ex:derivedFrom": {"@id": "ex:doc1"}, "ex:next": {"@id": "ex:s1"}});
+    let (fluree, handle) =
+        indexed_then_novelty("it/novelty-path-endpoint:main", &base, &novelty).await;
+    let mut failures = Failures::default();
+    let result = sparql(
+        &fluree,
+        &handle,
+        "SELECT ?s ?n WHERE { ?d a ex:Doc ; ex:title \"Doc 1\" . ?s ex:derivedFrom ?d . \
+         ?s ex:next+ ?n }",
+    )
+    .await;
+    failures.eq(
+        sparql_rows(&result, &["s", "n"]),
+        rows(&[
+            &["s1", "s2"],
+            &["s1", "s3"],
+            &["sN", "s1"],
+            &["sN", "s2"],
+            &["sN", "s3"],
+        ]),
+        "novelty-minted path endpoint",
+    );
+    failures.assert_none();
+}

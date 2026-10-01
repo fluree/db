@@ -222,6 +222,13 @@ impl GraphOperator {
             // (Subject/string dictionaries are store-global, so decoding
             // against the outer view is sound; when extraction DOES run in
             // the non-seeded UNION/OPTIONAL merge shape it is per inner row.)
+            // A predicate IRI bound in predicate position (`ex:s1 ?g ?o .
+            // GRAPH ?g { … }`).
+            Binding::EncodedPid { p_id } => ctx
+                .binary_store
+                .as_ref()?
+                .resolve_predicate_iri(*p_id)
+                .map(Arc::from),
             Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
                 let gv = ctx.graph_view()?;
                 match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
