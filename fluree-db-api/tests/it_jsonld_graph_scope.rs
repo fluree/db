@@ -721,6 +721,367 @@ async fn node_level_graph_in_where_resolves_names_like_templates() {
     );
 }
 
+/// The `ex:p` values in the default graph and in `ex:g`.
+async fn default_and_g(fluree: &Fluree, ledger: &LedgerState) -> (Vec<String>, Vec<String>) {
+    (
+        values(fluree, ledger, None, "p").await,
+        values(fluree, ledger, Some(G), "p").await,
+    )
+}
+
+/// A where node's `"@graph": "default"` names the ledger's default graph, as
+/// a template's does, also when the update's `graph` key or `from` gives its
+/// WHERE another default graph. So the natural move from the default graph
+/// into `ex:g` moves: the where and the delete read and retract in the
+/// default graph and the insert writes to `ex:g`, under a `graph` key and
+/// under `from` alike. The SPARQL spelling moves the same way.
+#[tokio::test]
+async fn where_default_is_the_ledger_default_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let seed = json!({"@context": ctx(), "@id": "ex:a", "ex:p": "moved"});
+    let expected = (Vec::<String>::new(), vec!["moved".to_string()]);
+
+    let ledger = insert(
+        &fluree,
+        genesis_ledger(&fluree, "it/scope-move-graph:main"),
+        &seed,
+    )
+    .await;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "graph": "ex:g",
+                "where": {"@id": "?s", "@graph": "default", "ex:p": "?o"},
+                "delete": {"@id": "?s", "@graph": "default", "ex:p": "?o"},
+                "insert": {"@id": "?s", "ex:p": "?o"}
+            }),
+        )
+        .await
+        .expect("the move under a graph key")
+        .ledger;
+    assert_eq!(default_and_g(&fluree, &ledger).await, expected, "graph key");
+
+    let ledger = insert(
+        &fluree,
+        genesis_ledger(&fluree, "it/scope-move-from:main"),
+        &seed,
+    )
+    .await;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "from": "ex:g2",
+                "where": {"@id": "?s", "@graph": "default", "ex:p": "?o"},
+                "delete": {"@id": "?s", "ex:p": "?o"},
+                "insert": {"@id": "?s", "@graph": "ex:g", "ex:p": "?o"}
+            }),
+        )
+        .await
+        .expect("the move under from")
+        .ledger;
+    assert_eq!(default_and_g(&fluree, &ledger).await, expected, "from");
+
+    let ledger = insert(
+        &fluree,
+        genesis_ledger(&fluree, "it/scope-move-sparql:main"),
+        &seed,
+    )
+    .await;
+    let ledger = sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             DELETE {{ ?s ex:p ?o }} INSERT {{ GRAPH <{G}> {{ ?s ex:p ?o }} }}
+             WHERE {{ ?s ex:p ?o }}"
+        ),
+    )
+    .await;
+    assert_eq!(default_and_g(&fluree, &ledger).await, expected, "SPARQL");
+}
+
+/// The move from the default graph into `ex:g`, under a `graph` key.
+fn move_into_g() -> Value {
+    json!({
+        "@context": ctx(),
+        "graph": "ex:g",
+        "where": {"@id": "?s", "@graph": "default", "ex:p": "?o"},
+        "delete": {"@id": "?s", "@graph": "default", "ex:p": "?o"},
+        "insert": {"@id": "?s", "ex:p": "?o"}
+    })
+}
+
+/// A graph registered under `@default` (a SPARQL `<@default>` without a BASE
+/// stays as written) is an ordinary named graph to an update whose where
+/// reads the ledger's default graph by name: the where reads it by its own
+/// name, `GRAPH ?g` lists it, and the move still moves.
+#[tokio::test]
+async fn where_default_leaves_a_graph_named_at_default_alone() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = insert(
+        &fluree,
+        genesis_ledger(&fluree, "it/scope-move-at-default:main"),
+        &json!({"@context": ctx(), "@id": "ex:a", "ex:p": "moved"}),
+    )
+    .await;
+    let ledger = sparql_update(
+        &fluree,
+        ledger,
+        "INSERT DATA { GRAPH <@default> { <http://example.org/b> <http://example.org/p> \"decoy\" } }",
+    )
+    .await;
+
+    // Read by its name, beside a where node that reads the default graph.
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "graph": "ex:g",
+                "where": [
+                    {"@id": "?a", "@graph": "default", "ex:p": "moved"},
+                    ["graph", "@default", {"@id": "?s", "ex:p": "?o"}]
+                ],
+                "insert": {"@id": "?s", "ex:byName": "?o"}
+            }),
+        )
+        .await
+        .expect("the graph read by its name")
+        .ledger;
+    assert_eq!(values(&fluree, &ledger, Some(G), "byName").await, ["decoy"]);
+
+    // Listed by `GRAPH ?g`, likewise.
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "graph": "ex:g",
+                "where": [
+                    {"@id": "?a", "@graph": "default", "ex:p": "moved"},
+                    ["graph", "?g", {"@id": "?s", "ex:p": "?o"}]
+                ],
+                "insert": {"@id": "?s", "ex:listed": "?o"}
+            }),
+        )
+        .await
+        .expect("the graph listed by GRAPH ?g")
+        .ledger;
+    assert_eq!(values(&fluree, &ledger, Some(G), "listed").await, ["decoy"]);
+
+    let ledger = fluree
+        .update(ledger, &move_into_g())
+        .await
+        .expect("the move beside a graph named @default")
+        .ledger;
+    assert_eq!(
+        default_and_g(&fluree, &ledger).await,
+        (Vec::<String>::new(), vec!["moved".to_string()])
+    );
+    assert_eq!(
+        values(&fluree, &ledger, Some("@default"), "p").await,
+        ["decoy"]
+    );
+}
+
+/// `urn:default`, written in the `where` of an update with a graph key, reads
+/// the default graph as `"default"` does: as a node's `@graph`, in a
+/// `["graph", …]` pattern (also when `fromNamed` lists `urn:default`), and as
+/// the value a VALUES row binds a graph variable to. A `fromNamed` alias
+/// spelled `urn:default` that names another graph could never be read (the
+/// name means the default graph), so it is refused, wherever it is listed.
+#[tokio::test]
+async fn where_reads_urn_default_as_the_default_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let in_g = json!({"@id": "?s", "ex:q": "?o"});
+    for (case, extra) in [
+        (
+            "node-level @graph",
+            json!({"where": {"@id": "?s", "@graph": "urn:default", "ex:p": "?o"}}),
+        ),
+        (
+            "[\"graph\", …]",
+            json!({"where": [["graph", "urn:default", {"@id": "?s", "ex:p": "?o"}]]}),
+        ),
+        (
+            "[\"graph\", …] with urn:default listed in fromNamed",
+            json!({
+                "fromNamed": ["urn:default"],
+                "where": [["graph", "urn:default", {"@id": "?s", "ex:p": "?o"}]]
+            }),
+        ),
+        (
+            "VALUES-bound graph",
+            json!({
+                "where": [
+                    ["values", ["?g", [{"@id": "urn:default"}]]],
+                    ["graph", "?g", {"@id": "?s", "ex:p": "?o"}]
+                ]
+            }),
+        ),
+    ] {
+        let ledger = insert(
+            &fluree,
+            genesis_ledger(
+                &fluree,
+                &format!("it/scope-urn-default-{}:main", case.len()),
+            ),
+            &json!({"@context": ctx(), "@id": "ex:a", "ex:p": "moved"}),
+        )
+        .await;
+        let mut update = json!({"@context": ctx(), "graph": "ex:g", "insert": in_g});
+        if let (Some(update), Some(extra)) = (update.as_object_mut(), extra.as_object()) {
+            update.extend(extra.clone());
+        }
+        let ledger = fluree
+            .update(ledger, &update)
+            .await
+            .unwrap_or_else(|e| panic!("{case}: {e}"))
+            .ledger;
+        assert_eq!(
+            values(&fluree, &ledger, Some(G), "q").await,
+            ["moved"],
+            "{case}"
+        );
+    }
+
+    let alias = json!({"alias": "urn:default", "graph": "ex:g2"});
+    for (i, from_named) in [
+        json!([alias]),
+        json!([alias, "urn:default"]),
+        json!(["urn:default", alias]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger = genesis_ledger(&fluree, &format!("it/scope-urn-default-alias-{i}:main"));
+        let err = fluree
+            .update(
+                ledger,
+                &json!({
+                    "@context": ctx(),
+                    "graph": "ex:g",
+                    "fromNamed": from_named,
+                    "where": [["graph", "urn:default", {"@id": "?s", "ex:p": "?o"}]],
+                    "insert": in_g
+                }),
+            )
+            .await
+            .expect_err("a fromNamed alias spelled urn:default for another graph")
+            .to_string();
+        assert!(
+            err.contains("reserved") && err.contains("http://example.org/g2"),
+            "{from_named}: {err}"
+        );
+    }
+}
+
+/// `fromNamed` restricts the named graphs an update's `where` sees, not the
+/// default graph a `"@graph": "default"` reads: the move under a graph key
+/// still moves when `fromNamed` lists only another graph, and when it lists
+/// `urn:default` as well.
+#[tokio::test]
+async fn where_default_reads_the_default_graph_under_from_named() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (ledger_id, from_named) in [
+        ("it/scope-move-from-named:main", json!(["ex:g2"])),
+        (
+            "it/scope-move-from-named-listed:main",
+            json!(["urn:default", "ex:g2"]),
+        ),
+    ] {
+        let ledger = insert(
+            &fluree,
+            genesis_ledger(&fluree, ledger_id),
+            &json!({"@context": ctx(), "@id": "ex:a", "ex:p": "moved"}),
+        )
+        .await;
+        let ledger = fluree
+            .update(
+                ledger,
+                &json!({"@context": ctx(), "graph": "ex:g2", "insert": {"@id": "ex:b", "ex:p": "in-g2"}}),
+            )
+            .await
+            .expect("seed ex:g2")
+            .ledger;
+        let mut update = move_into_g();
+        update["fromNamed"] = from_named.clone();
+        let ledger = fluree
+            .update(ledger, &update)
+            .await
+            .unwrap_or_else(|e| panic!("the move with fromNamed {from_named}: {e}"))
+            .ledger;
+        assert_eq!(
+            default_and_g(&fluree, &ledger).await,
+            (Vec::<String>::new(), vec!["moved".to_string()]),
+            "fromNamed {from_named}"
+        );
+        assert_eq!(values(&fluree, &ledger, Some(G2), "p").await, ["in-g2"]);
+    }
+}
+
+/// A graph an earlier version registered under the name `urn:default` (a
+/// write naming it is refused now, so the registry is rewritten here to stand
+/// in for such a ledger) does not take the name from the default graph: the
+/// move still reads the default graph, and that graph keeps its data.
+#[tokio::test]
+async fn where_default_is_not_a_graph_registered_as_urn_default() {
+    const LEGACY: &str = "http://example.org/legacy";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = insert(
+        &fluree,
+        genesis_ledger(&fluree, "it/scope-move-legacy:main"),
+        &json!({"@context": ctx(), "@id": "ex:a", "ex:p": "moved"}),
+    )
+    .await;
+    let mut ledger = fluree
+        .update(
+            ledger,
+            &json!({"@context": ctx(), "graph": LEGACY, "insert": {"@id": "ex:b", "ex:p": "legacy"}}),
+        )
+        .await
+        .expect("seed the graph")
+        .ledger;
+    let snapshot = std::sync::Arc::make_mut(&mut ledger.snapshot);
+    let entries: Vec<(fluree_db_core::GraphId, String)> = snapshot
+        .graph_registry
+        .iter_entries()
+        .map(|(g_id, iri)| {
+            let iri = if iri == LEGACY {
+                fluree_db_core::DEFAULT_GRAPH_IRI
+            } else {
+                iri
+            };
+            (g_id, iri.to_string())
+        })
+        .collect();
+    let entries: Vec<(fluree_db_core::GraphId, &str)> = entries
+        .iter()
+        .map(|(g_id, iri)| (*g_id, iri.as_str()))
+        .collect();
+    snapshot.graph_registry =
+        fluree_db_core::GraphRegistry::seed_from_entries(&entries).expect("registry");
+    let legacy = snapshot
+        .graph_registry
+        .graph_id_for_iri(fluree_db_core::DEFAULT_GRAPH_IRI)
+        .expect("a graph registered as urn:default");
+    assert!(legacy >= fluree_db_core::FIRST_USER_GRAPH_ID);
+
+    let ledger = fluree
+        .update(ledger, &move_into_g())
+        .await
+        .expect("the move beside a graph registered as urn:default")
+        .ledger;
+    assert_eq!(
+        default_and_g(&fluree, &ledger).await,
+        (Vec::<String>::new(), vec!["moved".to_string()])
+    );
+}
+
 /// D-B6: a node-level `@graph` in `where` scopes the pattern to the graph, as
 /// `["graph", g, …]` and SPARQL `GRAPH <g>` do. A query returns the graph's
 /// rows, and an update's WHERE matches: it used to match nothing, so the
@@ -774,4 +1135,292 @@ async fn node_level_graph_in_where_scopes_the_pattern() {
         "deleted in the graph"
     );
     assert_eq!(values(&fluree, &ledger, None, "p").await, ["in-default"]);
+}
+
+/// A `["query", …]` subquery is part of the `where` it sits in: it names
+/// graphs as that `where` does. Under a `graph` key its `"@graph": "default"`
+/// reads the ledger's default graph, so a move through a subquery moves, also
+/// under a restricting `fromNamed`; its `fromNamed` aliases are the update's;
+/// and inside a graph pattern its `"default"` is refused like the `where`'s.
+#[tokio::test]
+async fn subquery_names_graphs_as_its_where_does() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let subquery = |graph: &str| {
+        json!(["query", {
+            "@context": ctx(),
+            "select": ["?s", "?o"],
+            "where": {"@id": "?s", "@graph": graph, "ex:p": "?o"}
+        }])
+    };
+    let seeded = |ledger_id: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let ledger = insert(
+                fluree,
+                genesis_ledger(fluree, ledger_id),
+                &json!({"@context": ctx(), "@id": "ex:a", "ex:p": "moved"}),
+            )
+            .await;
+            let ledger = fluree
+                .update(
+                    ledger,
+                    &json!({"@context": ctx(), "graph": "ex:g", "insert": {"@id": "ex:b", "ex:p": "in-g"}}),
+                )
+                .await
+                .expect("seed ex:g")
+                .ledger;
+            fluree
+                .update(
+                    ledger,
+                    &json!({"@context": ctx(), "graph": "ex:g2", "insert": {"@id": "ex:c", "ex:p": "in-g2"}}),
+                )
+                .await
+                .expect("seed ex:g2")
+                .ledger
+        }
+    };
+
+    for (ledger_id, from_named) in [
+        ("it/scope-subquery-move:main", None),
+        (
+            "it/scope-subquery-move-from-named:main",
+            Some(json!(["ex:g2"])),
+        ),
+    ] {
+        let mut update = json!({
+            "@context": ctx(),
+            "graph": "ex:g",
+            "where": [subquery("default")],
+            "delete": {"@id": "?s", "@graph": "default", "ex:p": "?o"},
+            "insert": {"@id": "?s", "ex:p": "?o"}
+        });
+        if let Some(from_named) = &from_named {
+            update["fromNamed"] = from_named.clone();
+        }
+        let ledger = fluree
+            .update(seeded(ledger_id).await, &update)
+            .await
+            .unwrap_or_else(|e| panic!("the move through a subquery, {from_named:?}: {e}"))
+            .ledger;
+        assert!(
+            values(&fluree, &ledger, None, "p").await.is_empty(),
+            "{from_named:?}: moved out of the default graph"
+        );
+        assert_eq!(
+            values(&fluree, &ledger, Some(G), "p").await,
+            ["in-g", "moved"],
+            "{from_named:?}: moved into ex:g"
+        );
+    }
+
+    let ledger = fluree
+        .update(
+            seeded("it/scope-subquery-alias:main").await,
+            &json!({
+                "@context": ctx(),
+                "fromNamed": [{"alias": "two", "graph": "ex:g2"}],
+                "where": [subquery("two")],
+                "insert": {"@id": "ex:out", "ex:saw": "?o"}
+            }),
+        )
+        .await
+        .expect("a subquery naming a fromNamed alias")
+        .ledger;
+    assert_eq!(values(&fluree, &ledger, None, "saw").await, ["in-g2"]);
+
+    let err = fluree
+        .update(
+            seeded("it/scope-subquery-in-graph:main").await,
+            &json!({
+                "@context": ctx(),
+                "where": [["graph", "ex:g2", subquery("default")]],
+                "insert": {"@id": "ex:out", "ex:saw": "?o"}
+            }),
+        )
+        .await
+        .expect_err("a subquery's default inside a graph pattern")
+        .to_string();
+    assert!(err.contains("cannot leave the graph"), "{err}");
+}
+
+/// A `fromNamed` name must mean one graph across the list. Each entry
+/// names its graph by its IRI and by its alias (written, or the name it is
+/// listed by), and the `where` reads the first entry by a name while the
+/// templates write the last, so a move named by a doubled alias read g1,
+/// "retracted" in g2 and copied, leaving g1 as it was and reporting success.
+/// Such a list is refused, as a query's doubled dataset alias is; a graph
+/// listed twice under one name is not a collision.
+#[tokio::test]
+async fn from_named_names_must_each_mean_one_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = insert(
+        &fluree,
+        genesis_ledger(&fluree, "it/scope-from-named-names:main"),
+        &json!({"@context": ctx(), "@id": "ex:a", "ex:p": "seed"}),
+    )
+    .await;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({"@context": ctx(), "graph": "ex:g1", "insert": {"@id": "ex:b", "ex:p": "in-g1"}}),
+        )
+        .await
+        .expect("seed ex:g1")
+        .ledger;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({"@context": ctx(), "graph": "ex:g2", "insert": {"@id": "ex:c", "ex:p": "in-g2"}}),
+        )
+        .await
+        .expect("seed ex:g2")
+        .ledger;
+
+    for (case, from_named) in [
+        (
+            "one alias for two graphs",
+            json!([{"alias": "a", "graph": "ex:g1"}, {"alias": "a", "graph": "ex:g2"}]),
+        ),
+        (
+            "an alias spelled as another entry is listed",
+            json!([{"alias": "a", "graph": "ex:g1"}, {"alias": "ex:g2", "graph": "ex:g1"}, "ex:g2"]),
+        ),
+        (
+            "an alias spelled as another entry's IRI",
+            json!([{"alias": "http://example.org/g2", "graph": "ex:g1"}, "ex:g2"]),
+        ),
+    ] {
+        let name = from_named[0]["alias"].as_str().unwrap_or("a").to_string();
+        let err = fluree
+            .update(
+                ledger.clone(),
+                &json!({
+                    "@context": ctx(),
+                    "fromNamed": from_named,
+                    "where": [["graph", name, {"@id": "?s", "ex:p": "?o"}]],
+                    "delete": {"@id": "?s", "@graph": name, "ex:p": "?o"},
+                    "insert": {"@id": "?s", "@graph": "ex:g3", "ex:p": "?o"}
+                }),
+            )
+            .await
+            .expect_err(case)
+            .to_string();
+        assert!(err.contains("names two graphs"), "{case}: {err}");
+    }
+
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "fromNamed": ["ex:g2", {"alias": "two", "graph": "ex:g2"}, "ex:g2"],
+                "where": [["graph", "two", {"@id": "?s", "ex:p": "?o"}]],
+                "insert": {"@id": "ex:out", "ex:saw": "?o"}
+            }),
+        )
+        .await
+        .expect("one graph listed twice and aliased")
+        .ledger;
+    assert_eq!(values(&fluree, &ledger, None, "saw").await, ["in-g2"]);
+    assert_eq!(
+        values(&fluree, &ledger, Some("http://example.org/g1"), "p").await,
+        ["in-g1"]
+    );
+}
+
+/// What an update's where reads, by what lands in `ex:out`:
+/// - a `from` list holding the default graph (as `"default"` or as
+///   `urn:default`) and `ex:g1` reads both (`"default"` used to be dropped
+///   from the list, so it read `ex:g1` alone);
+/// - a node's `"@graph": "default"` beside such a list reads the default
+///   graph alone, not the merged default graph the list gives the where;
+/// - under a restricting `fromNamed`, the `urn:default` entry that a
+///   by-name `"default"` adds is not enumerated: `GRAPH ?g` ranges over
+///   the listed graphs only.
+#[tokio::test]
+async fn from_lists_and_by_name_reads() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let seeded = |ledger_id: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let ledger = insert(
+                fluree,
+                genesis_ledger(fluree, ledger_id),
+                &json!({"@context": ctx(), "@id": "ex:a", "ex:p": "in-default"}),
+            )
+            .await;
+            let ledger = fluree
+                .update(
+                    ledger,
+                    &json!({"@context": ctx(), "graph": "ex:g1", "insert": {"@id": "ex:a", "ex:p": "in-g1"}}),
+                )
+                .await
+                .expect("seed ex:g1")
+                .ledger;
+            fluree
+                .update(
+                    ledger,
+                    &json!({"@context": ctx(), "graph": "ex:g2", "insert": {"@id": "ex:a", "ex:p": "in-g2"}}),
+                )
+                .await
+                .expect("seed ex:g2")
+                .ledger
+        }
+    };
+    let read_into_out = json!({"@id": "ex:r", "@graph": "ex:out", "ex:read": "?o"});
+    let cases = [
+        (
+            "it/scope-from-list-default:main",
+            json!({"from": ["default", "ex:g1"], "where": {"@id": "?s", "ex:p": "?o"}}),
+            vec!["in-default", "in-g1"],
+        ),
+        (
+            "it/scope-from-list-urn-default:main",
+            json!({"from": ["urn:default", "ex:g1"], "where": {"@id": "?s", "ex:p": "?o"}}),
+            vec!["in-default", "in-g1"],
+        ),
+        (
+            "it/scope-from-list-by-name:main",
+            json!({
+                "from": ["urn:default", "ex:g1"],
+                "where": {"@id": "?s", "@graph": "default", "ex:p": "?o"}
+            }),
+            vec!["in-default"],
+        ),
+        (
+            "it/scope-from-list-keyword-by-name:main",
+            json!({
+                "from": ["default", "ex:g1"],
+                "where": {"@id": "?s", "@graph": "default", "ex:p": "?o"}
+            }),
+            vec!["in-default"],
+        ),
+        (
+            "it/scope-by-name-not-enumerated:main",
+            json!({
+                "graph": "ex:g1",
+                "fromNamed": ["ex:g2"],
+                "where": [
+                    {"@id": "?a", "@graph": "default", "ex:p": "in-default"},
+                    ["graph", "?g", {"@id": "?s", "ex:p": "?o"}]
+                ]
+            }),
+            vec!["in-g2"],
+        ),
+    ];
+    for (ledger_id, shape, expected) in cases {
+        let mut update = shape.clone();
+        update["@context"] = ctx();
+        update["insert"] = read_into_out.clone();
+        let ledger = fluree
+            .update(seeded(ledger_id).await, &update)
+            .await
+            .unwrap_or_else(|e| panic!("{shape}: {e}"))
+            .ledger;
+        assert_eq!(
+            values(&fluree, &ledger, Some("http://example.org/out"), "read").await,
+            expected,
+            "{shape}"
+        );
+    }
 }

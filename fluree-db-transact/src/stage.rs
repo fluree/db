@@ -2915,6 +2915,17 @@ async fn stream_where_into_accumulator(
                 named.push((alias.into(), g_id, false, iri));
             }
         }
+        // A where node's `"@graph": "default"` reads the default graph as
+        // `GRAPH <urn:default>`, which a restricting `fromNamed` does not
+        // take away.
+        if txn.update_where_names_ledger_default
+            && !named
+                .iter()
+                .any(|(name, ..)| name.as_ref() == fluree_db_core::DEFAULT_GRAPH_IRI)
+        {
+            let name: Arc<str> = fluree_db_core::DEFAULT_GRAPH_IRI.into();
+            named.push((name.clone(), 0, false, name));
+        }
     } else {
         // The ambient graph store. Reserved system graphs (txn-meta, config)
         // stay addressable by their full IRI — config maintenance reads

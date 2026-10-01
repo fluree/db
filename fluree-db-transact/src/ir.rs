@@ -156,6 +156,13 @@ pub struct Txn {
     /// added as additional named-graph keys, allowing `["graph", "<alias>", ...]` patterns.
     pub update_where_named_graphs: Option<Vec<UpdateNamedGraph>>,
 
+    /// The JSON-LD update's where reads the ledger's default graph by name, as
+    /// `GRAPH <urn:default>` (a `"@graph": "default"` while the WHERE reads
+    /// another default graph, a top-level `graph` or `from`). Staging keeps
+    /// `urn:default` in the WHERE dataset when `fromNamed` restricts its
+    /// named graphs.
+    pub update_where_names_ledger_default: bool,
+
     /// Transaction options
     pub opts: TxnOpts,
 
@@ -306,6 +313,7 @@ impl Txn {
             unmatched_optional: UnmatchedOptional::Unbound,
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
+            update_where_names_ledger_default: false,
             opts: TxnOpts::default(),
             vars: VarRegistry::new(),
             txn_meta: Vec::new(),

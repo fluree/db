@@ -125,6 +125,7 @@ fn parse_rooted(
     // and leaves the caller believing its data was checked. Whether they
     // apply is decided at staging (override control, policy scope).
     read_body_constraints(json, &mut opts)?;
+    refuse_query_only_opts(json)?;
 
     // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
     // `f:reifies*` system encoding before JSON-LD expansion, rejecting
@@ -183,6 +184,24 @@ fn parse_rooted(
         check_reifiers_match_edges(&txn.insert_templates)?;
     }
     Ok(txn)
+}
+
+/// Refuse a query option in a transaction's `opts`: `unionDefaultGraph`
+/// widens a query's default graph, and an update's `where` reads the default
+/// graph alone, so the option is refused rather than ignored, as a SPARQL
+/// update refuses the `union-default-graph` pragma.
+fn refuse_query_only_opts(json: &Value) -> Result<()> {
+    let union = json
+        .as_object()
+        .and_then(|m| m.get("opts"))
+        .and_then(Value::as_object)
+        .and_then(|o| o.get("unionDefaultGraph"));
+    if union.is_some() {
+        return Err(TransactError::Parse(
+            "opts.unionDefaultGraph applies to queries, not updates".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Fill `opts.shapes` and `opts.unique_properties` from the body's `opts`
@@ -547,6 +566,7 @@ fn parse_update(
         &context,
         strict,
     )?;
+    refuse_from_named_name_collisions(where_named_graphs.as_deref().unwrap_or_default())?;
     let from_named_aliases: HashMap<String, String> = where_named_graphs
         .as_ref()
         .map(|v| {
@@ -560,39 +580,6 @@ fn parse_update(
     let has_values = obj.get("values").is_some();
     let allow_object_vars = has_where || has_values;
     let object_var_parsing = allow_object_vars && opts.object_var_parsing.unwrap_or(true);
-
-    // Parse WHERE clause using the query parser
-    // This reuses full pattern support (OPTIONAL, UNION, FILTER, etc.)
-    // Variables remain as strings in UnresolvedPattern; they'll be assigned VarIds
-    // during lowering in stage.rs using the same VarRegistry as INSERT/DELETE.
-    let where_patterns = if let Some(where_val) = obj.get("where") {
-        let mut query = UnresolvedQuery::new(context.clone());
-        let mut subject_counter: u32 = 0;
-        let mut nested_counter: u32 = 0;
-        let parse_policy = JsonLdParsePolicy {
-            strict_compact_iri: strict,
-        };
-        // Graph names in the WHERE resolve as in the templates: this ledger's
-        // keywords and the same `fromNamed` aliases.
-        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
-            .with_graph_names(fluree_db_query::parse::GraphNameEnv {
-                ledger_id: Some(ledger_id.to_string()),
-                aliases: from_named_aliases.clone(),
-            });
-        parse_where_with_counters(
-            where_val,
-            &ctx,
-            &mut query,
-            &mut subject_counter,
-            &mut nested_counter,
-            object_var_parsing,
-        )
-        .map_err(|e| TransactError::Parse(format!("WHERE clause: {e}")))?;
-
-        query.patterns
-    } else {
-        Vec::new()
-    };
 
     // The template clauses and VALUES share one blank-node issuer; they are
     // parsed a second time only when a user `_:bN` label collided with an
@@ -621,6 +608,45 @@ fn parse_update(
         strict,
     )?
     .unwrap_or_else(|| clauses.template_root_iri.iter().cloned().collect());
+    // A where node's `"@graph": "default"` names the ledger's default graph,
+    // as a template's does. When the WHERE reads another default graph, the
+    // where reads it as `GRAPH <urn:default>`.
+    let default_by_name = !where_reads_ledger_default(&where_default_graph_iris, ledger_id);
+
+    // Parse WHERE clause using the query parser
+    // This reuses full pattern support (OPTIONAL, UNION, FILTER, etc.)
+    // Variables remain as strings in UnresolvedPattern; they'll be assigned VarIds
+    // during lowering in stage.rs using the same VarRegistry as INSERT/DELETE.
+    let (where_patterns, reads_ledger_default_by_name) = if let Some(where_val) = obj.get("where") {
+        let mut query = UnresolvedQuery::new(context.clone());
+        let mut subject_counter: u32 = 0;
+        let mut nested_counter: u32 = 0;
+        let parse_policy = JsonLdParsePolicy {
+            strict_compact_iri: strict,
+        };
+        // Graph names in the WHERE resolve as in the templates: this ledger's
+        // keywords, the same `fromNamed` aliases, and `default` for the
+        // ledger's default graph.
+        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
+            .with_graph_names(fluree_db_query::parse::GraphNameEnv {
+                ledger_id: Some(ledger_id.to_string()),
+                aliases: from_named_aliases.clone(),
+                default_by_name,
+            });
+        parse_where_with_counters(
+            where_val,
+            &ctx,
+            &mut query,
+            &mut subject_counter,
+            &mut nested_counter,
+            object_var_parsing,
+        )
+        .map_err(|e| TransactError::Parse(format!("WHERE clause: {e}")))?;
+
+        (query.patterns, ctx.reads_ledger_default())
+    } else {
+        (Vec::new(), false)
+    };
 
     let mut txn = Txn::update()
         .with_wheres(where_patterns)
@@ -633,10 +659,23 @@ fn parse_update(
     txn.template_default_graph = clauses.template_root_iri;
     txn.update_where_default_graph_iris = Some(where_default_graph_iris);
     txn.update_where_named_graphs = where_named_graphs;
+    txn.update_where_names_ledger_default = reads_ledger_default_by_name;
     if let Some(values) = clauses.values {
         txn = txn.with_values(values);
     }
     Ok(txn)
+}
+
+/// Whether an update's WHERE, reading `iris` as its default graph (empty:
+/// none named), reads the ledger's default graph and only it: no graph named,
+/// or each one naming that graph (`urn:default`, or this ledger's own
+/// address).
+fn where_reads_ledger_default(iris: &[String], ledger_id: &str) -> bool {
+    iris.is_empty()
+        || fluree_db_core::LedgerId::parse(ledger_id).is_ok_and(|ledger| {
+            iris.iter()
+                .all(|iri| crate::ir::names_default_graph(&ledger, iri))
+        })
 }
 
 /// The parts of an update that name blank nodes: the `graph` key's scope,
@@ -806,37 +845,29 @@ fn parse_update_where_default_graph_iris(
         return Ok(None);
     };
 
-    // Normalize a single graph selector value after alias resolution.
-    // Returns Ok(None) for "default" (skip), Ok(Some(iri)) for a real graph,
-    // or Err for "txn-meta".
-    let resolve_single = |item: &Value| -> Result<Option<String>> {
+    // Normalize a single graph selector value after alias resolution:
+    // `"default"` is the default graph by its name, `urn:default`, so a list
+    // reads it beside the graphs it names (it was dropped from the list);
+    // `"txn-meta"` is refused.
+    let resolve_single = |item: &Value| -> Result<String> {
         let resolved = resolve_graph_selector_value_for_update(item, from_named_aliases);
         match &resolved {
-            Value::String(s) if s == "default" => Ok(None),
+            Value::String(s) if s == "default" => Ok(fluree_db_core::DEFAULT_GRAPH_IRI.to_string()),
             Value::String(s) if s == "txn-meta" => Err(TransactError::Parse(
                 "from: \"txn-meta\" is not currently supported as a default graph selector in updates"
                     .to_string(),
             )),
-            _ => Ok(Some(expand_update_graph_iri(&resolved, context, strict)?)),
+            _ => expand_update_graph_iri(&resolved, context, strict),
         }
     };
 
     match v {
         // String shorthand
-        Value::String(_) => match resolve_single(v)? {
-            Some(iri) => Ok(Some(vec![iri])),
-            None => Ok(Some(Vec::new())),
-        },
+        Value::String(_) => Ok(Some(vec![resolve_single(v)?])),
         // Array form: multiple default graphs (merged for default-graph patterns).
-        Value::Array(arr) => {
-            let mut out: Vec<String> = Vec::new();
-            for item in arr {
-                if let Some(iri) = resolve_single(item)? {
-                    out.push(iri);
-                }
-            }
-            Ok(Some(out))
-        }
+        Value::Array(arr) => Ok(Some(
+            arr.iter().map(resolve_single).collect::<Result<Vec<_>>>()?,
+        )),
         // Object form: allow {"graph": ...} and ignore other dataset fields.
         Value::Object(obj) => {
             if let Some(graph) = obj.get("graph") {
@@ -863,6 +894,41 @@ fn resolve_graph_selector_value_for_update(
             .unwrap_or_else(|| Value::String(s.clone())),
         _ => v.clone(),
     }
+}
+
+/// Refuse a `fromNamed` list in which one name stands for two graphs. Each
+/// entry registers its IRI and its alias (written, or the name it is listed
+/// by) as names of its graph, and the `where` reads the first entry by a
+/// name while the templates write the last, so a name must mean one graph
+/// across the list, as a query dataset's aliases must. `urn:default` names
+/// the default graph before any entry: an alias spelled like it that names
+/// another graph could never be read, while listing `urn:default` itself
+/// gives it its own name.
+fn refuse_from_named_name_collisions(graphs: &[crate::ir::UpdateNamedGraph]) -> Result<()> {
+    let default = fluree_db_core::DEFAULT_GRAPH_IRI;
+    let mut names: HashMap<&str, &str> = HashMap::from([(default, default)]);
+    for graph in graphs {
+        for name in std::iter::once(graph.iri.as_str()).chain(graph.alias.as_deref()) {
+            let named = *names.entry(name).or_insert(graph.iri.as_str());
+            if named == graph.iri {
+                continue;
+            }
+            return Err(TransactError::Parse(if name == default {
+                format!(
+                    "fromNamed alias \"{default}\" is reserved: it names the default graph, \
+                     not <{}>",
+                    graph.iri
+                )
+            } else {
+                format!(
+                    "fromNamed name \"{name}\" names two graphs, <{named}> and <{}>; \
+                     give each graph its own name",
+                    graph.iri
+                )
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn parse_update_where_named_graphs(

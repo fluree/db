@@ -101,6 +101,7 @@ pub(crate) fn parse_query_ast(
         &mut subject_counter,
         &mut nested_counter,
         strict_override,
+        None,
     )
 }
 
@@ -193,11 +194,17 @@ fn scan_query_for_reifies_iris(
     Ok(())
 }
 
-fn parse_query_ast_internal(
+/// Parse a query object. A subquery passes the context of the `where` it is
+/// part of as `parent`: it then resolves graph names as that `where` does
+/// (an update's ledger, `fromNamed` aliases and `"default"` by name), inside
+/// the same enclosing graphs, and a read of the default graph by name in it
+/// is recorded on `parent`.
+pub(crate) fn parse_query_ast_internal(
     json: &JsonValue,
     subject_counter: &mut u32,
     nested_counter: &mut u32,
     strict_override: Option<bool>,
+    parent: Option<&JsonLdParseCtx>,
 ) -> Result<(UnresolvedQuery, SelectMode)> {
     let obj = json
         .as_object()
@@ -217,13 +224,53 @@ fn parse_query_ast_internal(
     let path_aliases = extract_path_aliases(context_val, &context, parse_policy)?;
     // A node-level `@graph` in `where` can name a `fromNamed` alias, which
     // must stay the alias rather than expand as an IRI.
-    let ctx = JsonLdParseCtx::new(context.clone(), path_aliases, parse_policy).with_graph_names(
-        GraphNameEnv {
-            ledger_id: None,
-            aliases: query_from_named_aliases(obj),
-        },
+    let mut graph_names = GraphNameEnv {
+        ledger_id: None,
+        aliases: query_from_named_aliases(obj),
+        default_by_name: false,
+    };
+    if let Some(parent) = parent {
+        let own = std::mem::replace(&mut graph_names, parent.graph_names.clone()).aliases;
+        for (alias, iri) in own {
+            graph_names.aliases.entry(alias).or_insert(iri);
+        }
+    }
+    let ctx = JsonLdParseCtx::new(context.clone(), path_aliases, parse_policy)
+        .with_graph_names(graph_names);
+    if let Some(parent) = parent {
+        ctx.enclosing_graphs.store(
+            parent
+                .enclosing_graphs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let parsed = parse_query_body(
+        obj,
+        context_val,
+        &context,
+        &ctx,
+        subject_counter,
+        nested_counter,
     );
+    if let Some(parent) = parent {
+        if ctx.reads_ledger_default() {
+            parent.note_reads_ledger_default();
+        }
+    }
+    parsed
+}
 
+/// The query object `obj` after its `@context`: select, `values`, `where`
+/// and options, parsed with `ctx`.
+fn parse_query_body(
+    obj: &serde_json::Map<String, JsonValue>,
+    context_val: &JsonValue,
+    context: &ParsedContext,
+    ctx: &JsonLdParseCtx,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+) -> Result<(UnresolvedQuery, SelectMode)> {
     let mut query = UnresolvedQuery::new(context.clone());
 
     // Store original context JSON for CONSTRUCT output (only if not null)
@@ -236,7 +283,7 @@ fn parse_query_ast_internal(
         return parse_construct_query(
             obj,
             construct_val,
-            &ctx,
+            ctx,
             query,
             subject_counter,
             nested_counter,
@@ -256,7 +303,7 @@ fn parse_query_ast_internal(
         let object_var_parsing = options::parse_object_var_parsing(obj);
         where_clause::parse_where_with_counters(
             ask_val,
-            &ctx,
+            ctx,
             &mut query,
             subject_counter,
             nested_counter,
@@ -270,8 +317,8 @@ fn parse_query_ast_internal(
         query.options.group_by = options::parse_group_by(obj)?;
         query.options.having = having;
         query.options.aggregates = having_aggregates;
-        parse_top_level_values(obj, &ctx, &mut query)?;
-        where_clause::resolve_atoms_outside_where(&mut query, &ctx);
+        parse_top_level_values(obj, ctx, &mut query)?;
+        where_clause::resolve_atoms_outside_where(&mut query, ctx);
         // `ask` is true when a solution remains after `offset` and `limit`
         // (`limit: 0` is false); one is enough, so the limit is at most 1.
         query.options.offset = options::parse_offset(obj)?;
@@ -313,7 +360,7 @@ fn parse_query_ast_internal(
     if select.as_str() == Some("*") {
         query.select = UnresolvedProjection::Wildcard;
     } else {
-        parse_select(select, &ctx, &mut query)?;
+        parse_select(select, ctx, &mut query)?;
     }
 
     // Parse depth parameter and apply to every hydration column.
@@ -326,7 +373,7 @@ fn parse_query_ast_internal(
         }
     }
 
-    parse_top_level_values(obj, &ctx, &mut query)?;
+    parse_top_level_values(obj, ctx, &mut query)?;
 
     // Parse where clause.
     //
@@ -336,7 +383,7 @@ fn parse_query_ast_internal(
     if let Some(where_clause) = obj.get("where") {
         where_clause::parse_where_with_counters(
             where_clause,
-            &ctx,
+            ctx,
             &mut query,
             subject_counter,
             nested_counter,
@@ -364,7 +411,7 @@ fn parse_query_ast_internal(
     query.options = opts;
     // SELECT computations and HAVING parse without the `@context`; give them
     // the same compact-IRI resolution the WHERE clause gets.
-    where_clause::resolve_atoms_outside_where(&mut query, &ctx);
+    where_clause::resolve_atoms_outside_where(&mut query, ctx);
 
     // GROUP BY without explicit ORDER BY defaults to ordering by the group key(s).
     if query.options.order_by.is_empty() && !query.options.group_by.is_empty() {

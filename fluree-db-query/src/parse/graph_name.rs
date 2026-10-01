@@ -19,6 +19,12 @@ pub struct GraphNameEnv {
     pub ledger_id: Option<String>,
     /// `fromNamed` aliases, alias -> graph IRI.
     pub aliases: HashMap<String, String>,
+    /// Whether `"default"` in a `where` reads the ledger's default graph by
+    /// name, as `GRAPH <urn:default>`: an update whose WHERE reads another
+    /// default graph (a top-level `graph`, or `from`). Otherwise `"default"`
+    /// is the where's own default graph: an update's, or a query's, which a
+    /// union default graph widens.
+    pub default_by_name: bool,
 }
 
 /// A graph name as written, classified by the one resolution order.
