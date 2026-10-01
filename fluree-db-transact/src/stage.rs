@@ -1477,7 +1477,7 @@ fn resolve_named_graph(
 /// datatypes, language tags, and list-index metadata are preserved exactly.
 async fn stage_graph_mgmt(
     ledger: LedgerState,
-    txn: Txn,
+    mut txn: Txn,
     mut ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
 ) -> Result<(
@@ -1485,6 +1485,37 @@ async fn stage_graph_mgmt(
     NamespaceRegistry,
     rustc_hash::FxHashMap<u16, String>,
 )> {
+    // An address of this ledger with a reserved keyword (`L#config`,
+    // `L#txn-meta`) names that reserved graph here too, as its `urn:fluree:`
+    // form does (`TargetLedger::reserved_graph_iri`), so the reserved-graph
+    // guards below see it. Any other IRI keeps registry semantics.
+    {
+        let graph_lookup = ledger_graph_lookup(&ledger);
+        let this_ledger = TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup);
+        let reserved = |iri: &mut String| {
+            if let Some(urn) = this_ledger.reserved_graph_iri(iri) {
+                *iri = urn;
+            }
+        };
+        match &mut txn.graph_mgmt {
+            Some(GraphMgmtOp::Clear(GraphTarget::Graph(iri))) => reserved(iri),
+            Some(GraphMgmtOp::Transfer { from, to, .. }) => {
+                for sel in [from, to] {
+                    if let GraphSel::Graph(iri) = sel {
+                        reserved(iri);
+                    }
+                }
+            }
+            _ => {}
+        }
+        txn.write_graphs = std::mem::take(&mut txn.write_graphs)
+            .into_iter()
+            .map(|mut iri| {
+                reserved(&mut iri);
+                iri
+            })
+            .collect();
+    }
     let op = txn
         .graph_mgmt
         .as_ref()

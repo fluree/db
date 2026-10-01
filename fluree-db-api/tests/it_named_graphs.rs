@@ -4101,6 +4101,199 @@ async fn test_query_and_update_list_the_address_graph_under_one_name() {
     );
 }
 
+/// The ledger's own address with a reserved keyword (`L#config`,
+/// `L#txn-meta`) names that reserved graph in every position, reads and
+/// writes alike, as its `urn:fluree:` form does: writes to `L#config` go to
+/// the config graph and register nothing, writes to `L#txn-meta` are refused
+/// as `#txn-meta` writes are, graph management refuses both, and an update's
+/// WHERE and a query's FROM read the config graph through it.
+#[tokio::test]
+async fn test_an_address_with_a_reserved_keyword_names_the_reserved_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "rk:main";
+    let ex = "PREFIX ex: <http://example.org/> ";
+    let ctx = json!({"ex": "http://example.org/"});
+    let mut ledger = run_sparql_update(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id),
+        &format!("{ex}INSERT DATA {{ ex:s ex:v \"default\" }}"),
+    )
+    .await
+    .ledger;
+
+    // Writes, in each graph position and each spelling of the address.
+    for sparql in [
+        format!("{ex}INSERT DATA {{ GRAPH <{ledger_id}#config> {{ ex:c ex:p \"quad\" }} }}"),
+        format!("{ex}INSERT {{ GRAPH <rk#config> {{ ex:c ex:p \"template\" }} }} WHERE {{ }}"),
+        format!("{ex}WITH <urn:fluree:rk#config> INSERT {{ ex:c ex:p \"with\" }} WHERE {{ }}"),
+        format!("CREATE GRAPH <{ledger_id}#config>"),
+    ] {
+        ledger = run_sparql_update(&fluree, ledger, &sparql).await.ledger;
+    }
+    for update in [
+        json!({"@context": ctx, "graph": "rk:main#config",
+               "insert": {"@id": "ex:c", "ex:p": "top-level graph"}}),
+        json!({"@context": ctx, "insert": {"@id": "ex:c", "@graph": "rk#config", "ex:p": "node graph"}}),
+        json!({"@context": ctx, "insert": [["graph", "rk:main#config", {"@id": "ex:c", "ex:p": "graph form"}]]}),
+    ] {
+        ledger = fluree
+            .update(ledger, &update)
+            .await
+            .unwrap_or_else(|e| panic!("{update}: {e}"))
+            .ledger;
+    }
+    let written = [
+        "graph form",
+        "node graph",
+        "quad",
+        "template",
+        "top-level graph",
+        "with",
+    ];
+    assert_eq!(
+        graph_values(
+            &fluree,
+            "rk:main#config",
+            "http://example.org/c",
+            "http://example.org/p"
+        )
+        .await,
+        written
+    );
+    assert!(
+        user_graph_iris(&fluree, ledger_id).await.is_empty(),
+        "nothing registered under the keyword addresses"
+    );
+
+    // An update's WHERE reads the config graph through the address.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "{ex}INSERT {{ ex:copy ex:p ?o }} WHERE {{ GRAPH <{ledger_id}#config> {{ ex:c ex:p ?o }} }}"
+        ),
+    )
+    .await
+    .ledger;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({"@context": ctx,
+                    "where": [["graph", "rk#config", {"@id": "ex:c", "ex:p": "?o"}]],
+                    "insert": {"@id": "ex:copy-jsonld", "ex:p": "?o"}}),
+        )
+        .await
+        .expect("JSON-LD WHERE through the keyword address")
+        .ledger;
+    for copy in ["http://example.org/copy", "http://example.org/copy-jsonld"] {
+        assert_eq!(
+            graph_values(&fluree, ledger_id, copy, "http://example.org/p").await,
+            written,
+            "{copy}"
+        );
+    }
+
+    // `#txn-meta` writes are refused, and graph management refuses both.
+    for sparql in [
+        format!("{ex}INSERT DATA {{ GRAPH <{ledger_id}#txn-meta> {{ ex:t ex:p 1 }} }}"),
+        format!("{ex}INSERT {{ GRAPH <rk#txn-meta> {{ ex:t ex:p 1 }} }} WHERE {{ }}"),
+        format!("CREATE GRAPH <{ledger_id}#txn-meta>"),
+        format!("ADD DEFAULT TO <{ledger_id}#config>"),
+        "COPY DEFAULT TO <rk#txn-meta>".to_string(),
+        format!("CLEAR GRAPH <{ledger_id}#config>"),
+    ] {
+        let err = try_sparql_update(&fluree, ledger.clone(), &sparql)
+            .await
+            .expect_err(&sparql);
+        assert_eq!(err.status_code(), 400, "{sparql}: {err}");
+        assert!(err.to_string().contains("reserved"), "{sparql}: {err}");
+    }
+    for update in [
+        json!({"@context": ctx, "insert": {"@id": "ex:t", "@graph": "rk:main#txn-meta", "ex:p": 1}}),
+        json!({"@context": ctx, "graph": "rk#txn-meta", "insert": {"@id": "ex:t", "ex:p": 1}}),
+    ] {
+        let err = fluree
+            .update(ledger.clone(), &update)
+            .await
+            .expect_err(&update.to_string());
+        assert_eq!(err.status_code(), 400, "{update}: {err}");
+        assert!(err.to_string().contains("reserved"), "{update}: {err}");
+    }
+    assert!(user_graph_iris(&fluree, ledger_id).await.is_empty());
+}
+
+/// A graph an earlier version registered under the address with a reserved
+/// keyword stays reachable, and is listed, as `L#<address>#config`, while the
+/// address itself names the config graph in a query's `GRAPH` and `FROM`. As
+/// in [`legacy_address_branch`], the graph is built on a branch whose source
+/// wrote it under the branch's address.
+#[tokio::test]
+async fn test_a_graph_registered_under_a_reserved_keyword_address_is_reached_through_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .stage_owned(genesis_ledger(&fluree, "rkl:main"))
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:v \"default\" .\n\
+             GRAPH <rkl:dev#config> { ex:a ex:v \"legacy\" . }\n",
+        )
+        .execute()
+        .await
+        .expect("fixture upsert");
+    fluree
+        .create_branch("rkl", "dev", None, None)
+        .await
+        .expect("create the branch");
+    let ledger = fluree.ledger("rkl:dev").await.expect("load the branch");
+    let values = |sparql: String| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            let result = crate::support::query_sparql(fluree, ledger, &sparql)
+                .await
+                .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+            let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let mut out: Vec<String> = json
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|row| {
+                    let cell = row.as_array().and_then(|r| r.first()).unwrap_or(row);
+                    cell.as_str()
+                        .or_else(|| cell.get("@id").and_then(|v| v.as_str()))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| cell.to_string())
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+    let ex = "PREFIX ex: <http://example.org/> ";
+    assert_eq!(
+        values(format!(
+            "{ex}SELECT ?o WHERE {{ GRAPH <rkl:dev#rkl:dev#config> {{ ?s ex:v ?o }} }}"
+        ))
+        .await,
+        ["legacy"]
+    );
+    assert_eq!(
+        values(format!(
+            "{ex}SELECT ?g WHERE {{ GRAPH ?g {{ ?s ex:v ?o }} }}"
+        ))
+        .await,
+        ["rkl:dev#rkl:dev#config"]
+    );
+    for sparql in [
+        format!("{ex}SELECT ?o WHERE {{ GRAPH <rkl:dev#config> {{ ?s ex:v ?o }} }}"),
+        format!("{ex}SELECT ?o FROM <rkl:dev#config> WHERE {{ ?s ex:v ?o }}"),
+    ] {
+        assert!(
+            !values(sparql.clone()).await.contains(&"legacy".to_string()),
+            "{sparql} read the graph registered under the literal text"
+        );
+    }
+}
+
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| (*v).to_string()).collect()
 }

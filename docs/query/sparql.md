@@ -1231,7 +1231,9 @@ that graph. See [the ledger's own address in a graph
 position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)
 for the full table, and for a graph an earlier version registered under the
 address. The reserved graphs keep their own IRIs, such as
-`urn:fluree:mydb:main#config`.
+`urn:fluree:mydb:main#config`, and `mydb:main#config` names the config graph
+in these positions too: it writes the config graph, and `mydb:main#txn-meta`
+is refused as a write target like any name of `#txn-meta`.
 
 ### Graph variables in templates
 
@@ -1247,7 +1249,7 @@ WHERE  { GRAPH ?g { ?s ex:status "old" } }
 
 `DELETE WHERE { GRAPH ?g { ... } }` works the same way.
 
-- In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>`.
+- In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>` or `GRAPH <<ledger>#config>`.
 - The template writes the graph `?g` names in the ledger (see [the ledger's own address in a graph position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)), which is the graph the `WHERE` read: a `?g` bound to the ledger's own address writes the default graph.
 - `?g` may name a graph that does not exist yet, for example one built with `BIND(IRI(...) AS ?g)`. The commit registers it.
 - A solution that leaves `?g` unbound writes nothing for that block. A `?g` bound to a literal or a blank node is an error, as is a `?g` that names `#txn-meta`.

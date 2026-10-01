@@ -50,15 +50,16 @@ Wherever a query or an update names a graph of the ledger it reads or writes, on
 | The name | reads | writes |
 |---|---|---|
 | the ledger's own address, in any spelling: `mydb`, `mydb:main`, `urn:fluree:mydb:main` | the default graph | the default graph |
+| the address with a reserved keyword: `mydb:main#config`, `mydb#txn-meta` | that reserved graph, as `urn:fluree:mydb:main#config` reads it | the config graph; a `#txn-meta` write is refused |
 | the address with a graph IRI: `mydb:main#http://example.org/g` | the graph `http://example.org/g` | the graph `http://example.org/g` |
 | a registered graph IRI | that graph | that graph |
 | any other IRI | nothing | a new graph by that IRI |
 
 - No write registers a graph under the ledger's own address, and the graph-management verbs (`CREATE`, `COPY`, `MOVE`, `ADD`) do not create one there. The address with a time (`mydb:main@t:5`) names no graph in these positions.
 - A `GRAPH ?g` template writes the graph its binding names in this table, which is the graph the `WHERE` read: `DELETE { GRAPH ?g { ?s ?p ?o } } USING NAMED <mydb:main> WHERE { GRAPH ?g { ?s ?p ?o } }` deletes from the default graph.
-- The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
+- The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`, and the address with a reserved keyword is the same graph in every position. `CLEAR`, `DROP`, `ADD`, `COPY` and `MOVE` refuse both reserved graphs, by either name.
 
-A graph registered under the ledger's address by an earlier version (for instance by a TriG block `GRAPH <mydb:main> { … }`) keeps its data and is reached as `<mydb:main#mydb:main>`: the address, `#`, and the IRI it is registered under. `GRAPH ?g` lists it under that name, in queries and updates alike, so a `?g` binding reads it back. The graph-management verbs name registered graphs exactly, so they still reach it by the address itself; to move its data into the default graph:
+A graph registered under the ledger's address by an earlier version (for instance by a TriG block `GRAPH <mydb:main> { … }`) keeps its data and is reached as `<mydb:main#mydb:main>`: the address, `#`, and the IRI it is registered under. One registered under the address with a keyword is reached the same way, as `<mydb:main#mydb:main#config>`. `GRAPH ?g` lists it under that name, in queries and updates alike, so a `?g` binding reads it back. The graph-management verbs name registered graphs exactly, so they still reach it by the address itself; to move its data into the default graph:
 
 ```sparql
 ADD GRAPH <mydb:main> TO DEFAULT ;

@@ -1055,3 +1055,105 @@ async fn ledger_route_dataset_references_resolve_in_the_paths_ledger() {
 
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// On the ledger routes the ledger's own address with a reserved keyword
+/// names that reserved graph, in writes and reads alike, as its `urn:fluree:`
+/// form does: `L#config` writes and reads the config graph, a write to
+/// `L#txn-meta` is refused, and no write registers a graph under either name.
+/// SPARQL and JSON-LD.
+#[tokio::test]
+async fn ledger_route_reserved_keyword_addresses_name_the_reserved_graphs() {
+    let (_tmp, app) = scoped_app().await;
+    let update = format!("/v1/fluree/update/{SCOPED_LEDGER}");
+    let query = format!("/v1/fluree/query/{SCOPED_LEDGER}");
+    let prefix = "PREFIX ex: <http://ex.org/> ";
+    let ctx = serde_json::json!({"ex": "http://ex.org/"});
+    let mut failures = Vec::new();
+
+    for (case, content_type, body) in [
+        (
+            "SPARQL write",
+            "application/sparql-update",
+            format!("{prefix}INSERT DATA {{ GRAPH <{SCOPED_LEDGER}#config> {{ ex:c1 ex:name \"C1\" }} }}"),
+        ),
+        (
+            "JSON-LD write",
+            "application/json",
+            serde_json::json!({"@context": ctx, "graph": "dscope#config",
+                               "insert": {"@id": "ex:c2", "ex:name": "C2"}})
+            .to_string(),
+        ),
+    ] {
+        let (status, json) = post(&app, &update, content_type, body).await;
+        if status != StatusCode::OK {
+            failures.push(format!("{case}: {status} {json}"));
+        }
+    }
+    let config = ["C1", "C2"];
+    for from in [
+        format!("{SCOPED_LEDGER}#config"),
+        format!("urn:fluree:{SCOPED_LEDGER}#config"),
+    ] {
+        let (status, json) = post(
+            &app,
+            &query,
+            "application/sparql-query",
+            format!("{prefix}SELECT ?n FROM <{from}> WHERE {{ ?s ex:name ?n }}"),
+        )
+        .await;
+        if status != StatusCode::OK || names(&json) != config {
+            failures.push(format!("SPARQL read {from}: {status} {json}"));
+        }
+        let (status, json) = post(
+            &app,
+            &query,
+            "application/json",
+            serde_json::json!({"@context": ctx, "from": from, "select": "?n",
+                               "where": {"@id": "?s", "ex:name": "?n"}})
+            .to_string(),
+        )
+        .await;
+        if status != StatusCode::OK || names(&json) != config {
+            failures.push(format!("JSON-LD read {from}: {status} {json}"));
+        }
+    }
+
+    for (case, content_type, body) in [
+        (
+            "SPARQL txn-meta write",
+            "application/sparql-update",
+            format!("{prefix}INSERT DATA {{ GRAPH <{SCOPED_LEDGER}#txn-meta> {{ ex:t ex:name \"T\" }} }}"),
+        ),
+        (
+            "JSON-LD txn-meta write",
+            "application/json",
+            serde_json::json!({"@context": ctx,
+                               "insert": {"@id": "ex:t", "@graph": "dscope#txn-meta", "ex:name": "T"}})
+            .to_string(),
+        ),
+    ] {
+        let (status, json) = post(&app, &update, content_type, body).await;
+        if status != StatusCode::BAD_REQUEST || !json.to_string().contains("reserved") {
+            failures.push(format!("{case}: {status} {json}"));
+        }
+    }
+
+    // No graph is registered under either keyword address.
+    let (status, json) = post(
+        &app,
+        &query,
+        "application/sparql-query",
+        "SELECT DISTINCT ?n WHERE { GRAPH ?n { ?s ?p ?o } }".to_string(),
+    )
+    .await;
+    let graphs = names(&json);
+    if status != StatusCode::OK
+        || graphs
+            .iter()
+            .any(|g| g.ends_with("#config") || g.ends_with("#txn-meta"))
+    {
+        failures.push(format!("graphs: {status} {graphs:?}"));
+    }
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
