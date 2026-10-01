@@ -27,13 +27,16 @@ use crate::binding::{Batch, Binding, UnmatchedOptional};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
-use crate::fast_path_common::{subject_probe_lane_plan, ProbeLanePlan, ProbeOps};
+use crate::fast_path_common::{
+    object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
+};
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::join::{
-    batched_subject_probe_binary, substitute_binding, BindInstruction, PatternPosition,
-    SubjectProbeParams, Substitution, UnifyInstruction,
+    batched_subject_probe_binary, charge_probe_rows, for_each_object_probe_match,
+    substitute_binding, BindInstruction, PatternPosition, SubjectProbeParams, Substitution,
+    UnifyInstruction,
 };
 use crate::object_binding::{equality_norm, same_term, EqualityNorm};
 use crate::operator::flush::FlushSchedule;
@@ -45,8 +48,9 @@ use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::clock::Instant;
-use fluree_db_core::StatsView;
+use fluree_db_core::{Sid, StatsView};
 use lru::LruCache;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -54,6 +58,10 @@ use std::sync::Arc;
 /// Keep OPTIONAL diagnostics concise during perf captures by surfacing only
 /// expensive batches or obvious cache/planning churn at debug level.
 const OPTIONAL_DEBUG_MIN_WORK: usize = 8;
+/// Routing stamp of the bound-object lane (`?x <p> ?o`, `?o` from the
+/// required side), so a test can pin that the lane answered rather than the
+/// per-row lookups it replaces.
+pub(crate) const OBJECT_PROBE_SITE: &str = "optional_object_probe";
 const OPTIONAL_DEBUG_MIN_MS: u64 = 25;
 
 /// Per-row result of a batched optional build: `(row_index, batches)`.
@@ -350,6 +358,158 @@ impl PatternOptionalBuilder {
         matches!(&self.pattern.o, Term::Var(v) if !self.optional_only_vars.contains(v))
     }
 
+    /// The required column of a pattern the bound-object lane can answer:
+    /// `?x <p> ?o` correlated on its object alone — `?o` comes from the
+    /// required side, `?x` is optional-only, `<p>` is not correlated, and no
+    /// datatype constraint narrows the object.
+    fn object_probe_column(&self) -> Option<usize> {
+        if self.pattern.dtc.is_some() {
+            return None;
+        }
+        let Ref::Var(subject) = &self.pattern.s else {
+            return None;
+        };
+        if !self.optional_only_vars.contains(subject) {
+            return None;
+        }
+        let mut object_col = None;
+        for instr in &self.bind_instructions {
+            match instr.position {
+                PatternPosition::Object => object_col = Some(instr.left_col),
+                PatternPosition::Subject | PatternPosition::Predicate => return None,
+            }
+        }
+        object_col
+    }
+
+    /// Runtime admission of the bound-object lane: single-ledger binary
+    /// execution that may emit encoded subjects (the lane answers with
+    /// `EncodedSid`, as the join's bound-object lane does), a constant
+    /// predicate, and an overlay the probe can merge.
+    fn object_probe_plan(
+        &self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<
+        Option<(
+            Arc<fluree_db_binary_index::BinaryIndexStore>,
+            Sid,
+            ProbeLanePlan,
+        )>,
+    > {
+        if ctx.is_multi_ledger() || ctx.eager_materialization {
+            return Ok(None);
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return Ok(None);
+        };
+        let Some(pred_sid) = try_normalize_pred_sid(store, &self.pattern.p) else {
+            return Ok(None);
+        };
+        Ok(match object_probe_lane_plan(ctx, store, &pred_sid)? {
+            ProbeLanePlan::Decline => None,
+            plan => Some((Arc::clone(store), pred_sid, plan)),
+        })
+    }
+
+    /// The bound-object lane: one sorted OPST pass over every required row's
+    /// object answers the whole batch, binding the optional-only subject.
+    /// Without it each row ran its own lookup, and before the substitution
+    /// covered encoded objects, its own scan of the whole predicate (#1973).
+    ///
+    /// Declines — to the per-row path, which handles every form — when the
+    /// lane is not admitted, or when a row's object is not a ref with an id:
+    /// an unbound object (the triple's object is then free), a literal (the
+    /// OPST ref probe cannot see literal objects), or an IRI the dictionaries
+    /// do not hold.
+    fn build_object_probe_batch(
+        &self,
+        required_batch: &Batch,
+        start_row: usize,
+        object_left_col: usize,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Vec<OptionalBatchRow>>> {
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        let declined = || {
+            stamp_fast_path(
+                OBJECT_PROBE_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
+            Ok(None)
+        };
+        let Some((store, pred_sid, lane_plan)) = self.object_probe_plan(ctx)? else {
+            return declined();
+        };
+        let Ref::Var(subject_var) = self.pattern.s else {
+            return declined();
+        };
+
+        let slots = required_batch.len() - start_row;
+        let mut object_slots: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        for row in start_row..required_batch.len() {
+            if self.has_poisoned_binding(required_batch, row) {
+                // A poisoned correlation value matches nothing.
+                continue;
+            }
+            let Some(o_id) =
+                resolve_subject_id(required_batch.get_by_col(row, object_left_col), ctx)?
+            else {
+                return declined();
+            };
+            object_slots.entry(o_id).or_default().push(row - start_row);
+        }
+
+        let mut objects: Vec<u64> = object_slots.keys().copied().collect();
+        objects.sort_unstable();
+        let mut values: Vec<Vec<Binding>> = vec![Vec::new(); slots];
+        let mut matched = 0usize;
+        let branch =
+            store.branch_for_order(ctx.binary_g_id, fluree_db_binary_index::RunSortOrder::Opst);
+        if let (Some(p_id), Some(branch)) = (store.sid_to_p_id(&pred_sid), branch) {
+            let slots_by_object: Vec<&[usize]> =
+                objects.iter().map(|o| object_slots[o].as_slice()).collect();
+            let mut probe_ops = match &lane_plan {
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+                _ => None,
+            };
+            for_each_object_probe_match(
+                ctx,
+                &store,
+                branch,
+                p_id,
+                &objects,
+                probe_ops.as_mut(),
+                |obj_idx, s_id| {
+                    for &slot in slots_by_object[obj_idx] {
+                        values[slot].push(Binding::encoded_sid(s_id));
+                        matched += 1;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        // Lanes that read leaflets directly pay their rows' fuel here.
+        charge_probe_rows(ctx, matched)?;
+        stamp_fast_path(OBJECT_PROBE_SITE, FastPathOutcome::Proceed);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![subject_var].into_boxed_slice());
+        let mut pending = Vec::with_capacity(slots);
+        for (slot, subjects) in values.into_iter().enumerate() {
+            let optional_batches = if subjects.is_empty() {
+                Vec::new()
+            } else {
+                vec![Batch::new(schema.clone(), vec![subjects])?]
+            };
+            pending.push((start_row + slot, optional_batches));
+        }
+        tracing::debug!(
+            rows = pending.len(),
+            objects = objects.len(),
+            matched,
+            "optional bound-object probe complete"
+        );
+        Ok(Some(pending))
+    }
+
     /// This row's correlated values bound into the pattern, through the
     /// substitution every correlated scan shares ([`substitute_binding`]):
     /// encoded values decode into their slot in any position, so the scan is
@@ -496,6 +656,9 @@ impl OptionalBuilder for PatternOptionalBuilder {
     /// True only when `build_batch`'s own admission gates hold, so the
     /// operator never buffers the driving side just to fall back per-row.
     fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if self.object_probe_column().is_some() {
+            return matches!(self.object_probe_plan(ctx), Ok(Some(_)));
+        }
         if ctx.is_multi_ledger()
             || self.pattern.dtc.is_some()
             || self.subject_left_col().is_none()
@@ -549,10 +712,13 @@ impl OptionalBuilder for PatternOptionalBuilder {
         start_row: usize,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<Vec<OptionalBatchRow>>> {
-        if start_row >= required_batch.len()
-            || ctx.is_multi_ledger()
-            || self.object_var_shared_with_required()
-        {
+        if start_row >= required_batch.len() {
+            return Ok(None);
+        }
+        if let Some(object_left_col) = self.object_probe_column() {
+            return self.build_object_probe_batch(required_batch, start_row, object_left_col, ctx);
+        }
+        if ctx.is_multi_ledger() || self.object_var_shared_with_required() {
             return Ok(None);
         }
         let Some(store) = ctx.binary_store.as_ref() else {
