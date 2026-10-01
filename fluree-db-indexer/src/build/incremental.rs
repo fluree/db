@@ -3352,31 +3352,35 @@ pub async fn incremental_index(
                     }
                 }
 
-                // Seed from base root per-graph class entries.
-                if let Some(ref base_stats) = base_root.stats {
-                    if let Some(ref graphs) = base_stats.graphs {
-                        for g in graphs {
-                            if let Some(ref classes) = g.classes {
-                                for entry in classes {
-                                    // Try to resolve class Sid → sid64 via store.
-                                    base_class_sid_lookups.fetch_add(1, Ordering::Relaxed);
-                                    let sid64 = store_opt
-                                        .as_ref()
-                                        .and_then(|s| {
-                                            s.find_subject_id_by_parts(
-                                                entry.class_sid.namespace_code,
-                                                &entry.class_sid.name,
-                                            )
-                                            .ok()
-                                            .flatten()
-                                        })
-                                        .unwrap_or(0);
-                                    if sid64 != 0 {
-                                        base_class_sid_hits.fetch_add(1, Ordering::Relaxed);
-                                        entries_by_key.insert((g.g_id, sid64), entry.clone());
-                                    }
-                                }
-                            }
+                // Seed from base root per-graph class entries, resolving every
+                // class Sid → sid64 in one batched reverse-tree pass (a lookup
+                // per class rereads a whole leaf).
+                if let (Some(store), Some(graphs)) = (
+                    store_opt.as_ref(),
+                    base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()),
+                ) {
+                    let entries: Vec<(u16, &is::ClassStatEntry)> = graphs
+                        .iter()
+                        .filter_map(|g| g.classes.as_ref().map(|c| (g.g_id, c)))
+                        .flat_map(|(g_id, classes)| classes.iter().map(move |e| (g_id, e)))
+                        .collect();
+                    let parts: Vec<(u16, &str)> = entries
+                        .iter()
+                        .map(|(_, e)| (e.class_sid.namespace_code, e.class_sid.name.as_ref()))
+                        .collect();
+                    base_class_sid_lookups.fetch_add(parts.len(), Ordering::Relaxed);
+                    // A failed read would drop the class from the published
+                    // stats; recompute them in a full rebuild instead.
+                    let sid64s = store.find_subject_ids_by_parts(&parts).map_err(|e| {
+                        IndexerError::IncrementalAbort(format!(
+                            "Phase 3b base class Sid lookup failed: {e} (deferring \
+                             class-stat recompute to full rebuild)"
+                        ))
+                    })?;
+                    for ((g_id, entry), sid64) in entries.into_iter().zip(sid64s) {
+                        if let Some(sid64) = sid64.filter(|&s| s != 0) {
+                            base_class_sid_hits.fetch_add(1, Ordering::Relaxed);
+                            entries_by_key.insert((g_id, sid64), entry.clone());
                         }
                     }
                 }

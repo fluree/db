@@ -2332,6 +2332,23 @@ impl BinaryIndexStore {
         }
     }
 
+    /// [`Self::find_subject_id_by_parts`] for many subjects, reading each
+    /// reverse-tree leaf once.
+    pub fn find_subject_ids_by_parts(&self, parts: &[(u16, &str)]) -> io::Result<Vec<Option<u64>>> {
+        match &self.dicts.subject_reverse_tree {
+            Some(tree) => {
+                let keys: Vec<Vec<u8>> = parts
+                    .iter()
+                    .map(|&(ns_code, suffix)| {
+                        crate::dict::reverse_leaf::subject_reverse_key(ns_code, suffix.as_bytes())
+                    })
+                    .collect();
+                tree.reverse_lookup_many(keys.iter().map(Vec::as_slice))
+            }
+            None => Ok(vec![None; parts.len()]),
+        }
+    }
+
     /// Find all subject IDs whose suffix starts with `prefix` within a namespace.
     ///
     /// Uses a range scan on the reverse subject tree: scans the key range
