@@ -850,7 +850,8 @@ fn write_page_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// Reads `path`. A missing or empty file reads as `None`.
+pub(super) fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) if bytes.is_empty() => Ok(None),
         Ok(bytes) => Ok(Some(bytes)),

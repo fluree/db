@@ -1845,18 +1845,8 @@ impl FileStorage {
             .key_lock(&path)
             .map_err(|e| StorageExtError::io(format!("lock {}: {}", path.display(), e)))?;
 
-        let current = match std::fs::read(&path) {
-            Ok(buf) if buf.is_empty() => None,
-            Ok(buf) => Some(buf),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(StorageExtError::io(format!(
-                    "read {}: {}",
-                    path.display(),
-                    e
-                )))
-            }
-        };
+        let current = wal::read_opt(&path)
+            .map_err(|e| StorageExtError::io(format!("read {}: {}", path.display(), e)))?;
 
         Ok((
             current,
