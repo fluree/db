@@ -1333,7 +1333,7 @@ async fn build_s3_storage_from_config(
 
 /// Build a local (memory/file) storage instance from a StorageConfig.
 #[cfg(feature = "native")]
-fn build_local_storage_from_config(
+async fn build_local_storage_from_config(
     storage_config: &fluree_db_connection::config::StorageConfig,
 ) -> Result<Arc<dyn Storage>> {
     use fluree_db_connection::config::StorageType;
@@ -1352,7 +1352,7 @@ fn build_local_storage_from_config(
             // is startup, so the startup sweep of crash-orphaned staging
             // files is taken here explicitly.
             storage.sweep_orphaned_staging();
-            storage.recover_wal()?;
+            storage.recover_wal_async().await?;
             encrypt_storage_from_config(Arc::new(storage), storage_config)
         }
         StorageType::S3(_) => Err(ApiError::config(
@@ -1366,7 +1366,7 @@ fn build_local_storage_from_config(
 
 /// Build a memory storage instance from a StorageConfig (non-native fallback).
 #[cfg(not(feature = "native"))]
-fn build_local_storage_from_config(
+async fn build_local_storage_from_config(
     storage_config: &fluree_db_connection::config::StorageConfig,
 ) -> Result<Arc<dyn Storage>> {
     use fluree_db_connection::config::StorageType;
@@ -2476,22 +2476,48 @@ impl FlureeBuilder {
     /// appropriate). When indexing is enabled, a `BackgroundIndexerWorker` is
     /// spawned on the tokio runtime, so `build()` must be called within a
     /// tokio context.
+    ///
+    /// It recovers the storage root's WAL on the calling thread.
+    /// From async code, use [`Self::build_async`].
     #[cfg(feature = "native")]
     pub fn build(mut self) -> Result<Fluree> {
+        let storage = self.open_file_storage()?;
+        // Writes a crash left unflushed are applied before anything reads this tree.
+        storage.recover_wal()?;
+        Ok(self.build_file(storage))
+    }
+
+    /// Build a file-backed Fluree instance, recovering the storage root's WAL
+    /// without blocking the caller.
+    ///
+    /// It builds the same instance as [`Self::build`].
+    #[cfg(feature = "native")]
+    pub async fn build_async(mut self) -> Result<Fluree> {
+        let storage = self.open_file_storage()?;
+        // Writes a crash left unflushed are applied before anything reads this tree.
+        storage.recover_wal_async().await?;
+        Ok(self.build_file(storage))
+    }
+
+    /// Takes the builder's storage path and opens its file storage.
+    ///
+    /// Building an instance is startup, so this starts the sweep of staging
+    /// files a crash left behind. The sweep runs once per base path per
+    /// process. The file nameservice shares the tree and needs no sweep of its own.
+    #[cfg(feature = "native")]
+    fn open_file_storage(&mut self) -> Result<FileStorage> {
         let path = self
             .storage_path
             .take()
             .ok_or_else(|| ApiError::config("File storage requires a path"))?;
-
         let storage = self.file_storage(&path);
-        // Building the instance is startup: reclaim staging files a crash
-        // left behind. Explicit here rather than a side effect of `new`, and
-        // once per base path per process — the nameservice below shares this
-        // tree and needs no sweep of its own.
         storage.sweep_orphaned_staging();
-        // Likewise the WAL: acknowledged writes a crash left unflushed
-        // are applied before anything reads this tree.
-        storage.recover_wal()?;
+        Ok(storage)
+    }
+
+    /// Assembles a file-backed instance over `storage`, whose WAL is already recovered.
+    #[cfg(feature = "native")]
+    fn build_file(self, storage: FileStorage) -> Fluree {
         let nameservice = FileNameService::with_storage(storage.clone());
         let event_bus = self.resolve_event_bus();
         let notifying =
@@ -2502,7 +2528,7 @@ impl FlureeBuilder {
         let attachment_provider_cell = Self::new_attachment_provider_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
-        Ok(Self::finalize_with_backend(
+        Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
@@ -2517,7 +2543,7 @@ impl FlureeBuilder {
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
             self.secret_resolver,
-        ))
+        )
     }
 
     /// Build a Fluree instance with custom storage and nameservice.
@@ -3216,8 +3242,8 @@ impl FlureeBuilder {
 
         // --- Local (memory/filesystem) ---
         match &self.config.index_storage.storage_type {
-            StorageType::Memory => self.build_client_memory(nameservice),
-            StorageType::File => self.build_client_file(nameservice),
+            StorageType::Memory => self.build_client_memory(nameservice).await,
+            StorageType::File => self.build_client_file(nameservice).await,
             StorageType::S3(_) => Err(ApiError::config(
                 "S3 storage requires the 'aws' feature on fluree-db-api",
             )),
@@ -3231,11 +3257,16 @@ impl FlureeBuilder {
     /// is `Some`, it replaces the default `MemoryNameService` (and
     /// the notifying wrapper + background indexer that ride along
     /// with it).
-    fn build_client_memory(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
+    async fn build_client_memory(
+        self,
+        nameservice: Option<NameServiceMode>,
+    ) -> Result<FlureeClient> {
         let base_storage = self.encrypt_if_configured(Arc::new(MemoryStorage::new()));
 
         // Wrap with address identifier routing if configured
-        let storage = self.wrap_address_identifiers(base_storage)?;
+        let storage = self
+            .wrap_address_identifiers(base_storage, &self.config)
+            .await?;
         let backend = StorageBackend::Managed(storage);
         let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
@@ -3277,7 +3308,7 @@ impl FlureeBuilder {
     /// is `Some`, it replaces the default `FileNameService` (and
     /// the notifying wrapper + background indexer that ride along
     /// with it).
-    fn build_client_file(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
+    async fn build_client_file(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
         #[cfg(not(feature = "native"))]
         {
             let _ = nameservice;
@@ -3307,12 +3338,14 @@ impl FlureeBuilder {
             // Client build is startup: take the explicit sweep of
             // crash-orphaned staging files here, where startup is known.
             file_storage.sweep_orphaned_staging();
-            file_storage.recover_wal()?;
+            file_storage.recover_wal_async().await?;
             let ns_storage = file_storage.clone();
             let base_storage = self.encrypt_if_configured(Arc::new(file_storage));
 
             // Wrap with address identifier routing if configured
-            let storage = self.wrap_address_identifiers(base_storage)?;
+            let storage = self
+                .wrap_address_identifiers(base_storage, &self.config)
+                .await?;
             let backend = StorageBackend::Managed(storage);
             let event_bus = self.resolve_event_bus();
             let index_config = self.derive_indexing();
@@ -3384,7 +3417,7 @@ impl FlureeBuilder {
 
         // Wrap with address identifier routing if configured
         let storage = self
-            .wrap_address_identifiers_aws(base_storage, aws_handle.config())
+            .wrap_address_identifiers(base_storage, aws_handle.config())
             .await?;
         let backend = StorageBackend::Managed(storage);
         let event_bus = self.resolve_event_bus();
@@ -3420,26 +3453,11 @@ impl FlureeBuilder {
         ))
     }
 
-    /// Wrap base storage with address identifier routing for local backends.
-    fn wrap_address_identifiers(&self, base_storage: Arc<dyn Storage>) -> Result<Arc<dyn Storage>> {
-        if let Some(addr_ids) = &self.config.address_identifiers {
-            let mut identifier_map = std::collections::HashMap::new();
-            for (identifier, storage_config) in addr_ids {
-                let id_storage = build_local_storage_from_config(storage_config)?;
-                identifier_map.insert(identifier.to_string(), id_storage);
-            }
-            Ok(Arc::new(AddressIdentifierResolverStorage::new(
-                base_storage,
-                identifier_map,
-            )))
-        } else {
-            Ok(base_storage)
-        }
-    }
-
-    /// Wrap base storage with address identifier routing for AWS backends.
-    #[cfg(feature = "aws")]
-    async fn wrap_address_identifiers_aws(
+    /// Wrap base storage with routing for `config`'s address identifiers, if it has any.
+    ///
+    /// An S3 identifier needs the `aws` feature.
+    /// Without it, the identifier is rejected with a configuration error.
+    async fn wrap_address_identifiers(
         &self,
         base_storage: Arc<dyn Storage>,
         config: &ConnectionConfig,
@@ -3448,8 +3466,9 @@ impl FlureeBuilder {
             let mut identifier_map = std::collections::HashMap::new();
             for (identifier, storage_config) in addr_ids {
                 let id_storage: Arc<dyn Storage> = match &storage_config.storage_type {
+                    #[cfg(feature = "aws")]
                     StorageType::S3(_) => build_s3_storage_from_config(storage_config).await?,
-                    _ => build_local_storage_from_config(storage_config)?,
+                    _ => build_local_storage_from_config(storage_config).await?,
                 };
                 identifier_map.insert(identifier.to_string(), id_storage);
             }
