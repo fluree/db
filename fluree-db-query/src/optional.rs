@@ -48,7 +48,7 @@ use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::clock::Instant;
-use fluree_db_core::{Sid, StatsView};
+use fluree_db_core::{ObjKind, Sid, StatsView};
 use lru::LruCache;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -506,7 +506,10 @@ impl PatternOptionalBuilder {
     /// subject. The scan is then already a seek on that subject, and decoding
     /// the object (a dictionary lookup per row) would only narrow a lookup
     /// that is already narrow; `unify_check` compares it with `same_term`,
-    /// which treats the encoded and decoded forms of one term as one.
+    /// which treats the encoded and decoded forms of one term as one. That is
+    /// the substitution's own match for every encoded value but a numeric
+    /// one: a substituted numeric matches by value across numeric datatypes,
+    /// and `same_term` would not, so numerics are still substituted.
     /// [`Self::substitute_pattern`] and the cache key both follow this, so a
     /// row keys its object as free exactly when its scan leaves it free.
     fn object_left_to_unify(&self, required_batch: &Batch, row: usize) -> bool {
@@ -528,10 +531,16 @@ impl PatternOptionalBuilder {
                 | Binding::Iri(_)
                 | Binding::EncodedSid { .. }
                 | Binding::EncodedPid { .. }
-        ) && matches!(
-            required_batch.get_by_col(row, object_col),
-            Binding::EncodedSid { .. } | Binding::EncodedPid { .. } | Binding::EncodedLit { .. }
-        )
+        ) && match required_batch.get_by_col(row, object_col) {
+            Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => true,
+            Binding::EncodedLit { o_kind, .. } => ![
+                ObjKind::NUM_INT.as_u8(),
+                ObjKind::NUM_F64.as_u8(),
+                ObjKind::NUM_BIG.as_u8(),
+            ]
+            .contains(o_kind),
+            _ => false,
+        }
     }
 
     /// This row's correlated values bound into the pattern, through the
@@ -682,6 +691,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
             return matches!(self.object_probe_plan(ctx), Ok(Some(_)));
         }
         if ctx.is_multi_ledger()
+            || ctx.eager_materialization
             || self.pattern.dtc.is_some()
             || self.subject_left_col().is_none()
             || self.object_var_shared_with_required()
@@ -740,7 +750,10 @@ impl OptionalBuilder for PatternOptionalBuilder {
         if let Some(object_left_col) = self.object_probe_column() {
             return self.build_object_probe_batch(required_batch, start_row, object_left_col, ctx);
         }
-        if ctx.is_multi_ledger() || self.object_var_shared_with_required() {
+        if ctx.is_multi_ledger()
+            || ctx.eager_materialization
+            || self.object_var_shared_with_required()
+        {
             return Ok(None);
         }
         let Some(store) = ctx.binary_store.as_ref() else {

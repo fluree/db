@@ -1807,3 +1807,45 @@ async fn optional_lane_under_a_non_root_policy() {
     }
     failures.assert_none();
 }
+
+/// A numeric object correlated alongside a bound subject keeps the
+/// substitution's rule, which matches a numeric by value across numeric
+/// datatypes: the same answer whichever lane correlates the object.
+#[tokio::test(flavor = "current_thread")]
+async fn numeric_object_correlated_with_a_bound_subject_matches_by_value() {
+    let ledger_id = "it/optional-numeric-object:main";
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .insert(&json!({
+            "@context": context(),
+            "@id": "ex:s1",
+            "ex:position": 1,
+            "ex:rankLong": {"@value": "1", "@type": "http://www.w3.org/2001/XMLSchema#long"},
+            "ex:note": "1"
+        }))
+        .execute()
+        .await
+        .expect("seed");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
+    let mut failures = Failures::default();
+    let result = sparql(
+        &fluree,
+        &handle,
+        "SELECT ?s ?p WHERE { ?s ex:position ?n . OPTIONAL { ?s ?p ?n } }",
+    )
+    .await;
+    failures.eq(
+        sparql_rows(&result, &["s", "p"]),
+        rows(&[&["s1", "position"], &["s1", "rankLong"]]),
+        "subject bound, numeric object",
+    );
+    failures.assert_none();
+}
