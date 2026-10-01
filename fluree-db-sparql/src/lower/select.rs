@@ -25,6 +25,28 @@ use std::collections::{HashMap, HashSet};
 
 use super::{LowerError, LoweringContext, Result};
 
+/// The variables a query level binds before grouping: its WHERE, its trailing
+/// VALUES (joined there, see [`LoweringContext::lower_select_level`]) and the
+/// binds its GROUP BY keys and aggregate inputs lowered to.
+///
+/// Collected only by a stage that reads it — a HAVING or ORDER BY to sample, a
+/// SELECT expression to place — so the common level with none of those
+/// (`SELECT (COUNT(?s) AS ?n) WHERE { … }`) never collects it.
+fn pre_group_vars(
+    where_patterns: &[Pattern],
+    trailing_values: Option<&Pattern>,
+    pre_group_binds: &[Pattern],
+) -> HashSet<VarId> {
+    let mut vars = produced_vars_of(where_patterns);
+    vars.extend(
+        trailing_values
+            .into_iter()
+            .chain(pre_group_binds)
+            .flat_map(Pattern::produced_vars),
+    );
+    vars
+}
+
 /// The SELECT expressions of one query level, placed.
 pub(super) struct SelectExtends {
     /// WHERE `BIND`s, appended to the level's patterns: every SELECT
@@ -178,18 +200,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         patterns: &mut Vec<Pattern>,
         trailing_values: Option<&Pattern>,
     ) -> Result<LoweredSelectLevel> {
-        let mut where_vars = produced_vars_of(patterns);
-        let values_vars = trailing_values
-            .map(Pattern::produced_vars)
-            .unwrap_or_default();
-        let having_unbound: HashSet<VarId> = values_vars
-            .iter()
-            .copied()
-            .filter(|v| !where_vars.contains(v))
-            .collect();
-        where_vars.extend(values_vars);
         let mut lowered =
-            self.lower_solution_modifiers(modifiers, select, &where_vars, &having_unbound)?;
+            self.lower_solution_modifiers(modifiers, select, patterns, trailing_values)?;
         // One definition of "groups": validation (V4) reads it off the AST,
         // lowering off the lowered keys and aggregates.
         debug_assert_eq!(
@@ -197,8 +209,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             modifiers.level_groups(&select.variables),
             "lowering and validation disagree on whether the level groups"
         );
-        where_vars.extend(produced_vars_of(&lowered.pre_group_binds));
-        let extends = self.lower_select_extends(select, &mut lowered, where_vars)?;
+        let extends = self.lower_select_extends(select, &mut lowered, patterns, trailing_values)?;
 
         // HAVING on a level that does not group: a Filter over its solutions
         // (§18.2.4.2), which cannot see the SELECT expressions.
@@ -270,26 +281,19 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// alias is a group key (the `GROUP BY (LCASE(?a))` shortcut), which has
     /// to exist before grouping.
     ///
-    /// `where_vars` are the variables the level's pre-group pipeline binds.
+    /// `where_patterns` and `trailing_values` are the level's WHERE and
+    /// trailing VALUES (see [`Self::lower_select_level`]).
     pub(super) fn lower_select_extends(
         &mut self,
         select: &SelectClause,
         lowered: &mut LoweredModifiers,
-        where_vars: HashSet<VarId>,
+        where_patterns: &[Pattern],
+        trailing_values: Option<&Pattern>,
     ) -> Result<SelectExtends> {
         let mut pre = Vec::new();
         let mut extends = Vec::new();
         let SelectVariables::Explicit(items) = &select.variables else {
             return Ok(SelectExtends { pre, extends });
-        };
-        let placer = if lowered.groups() {
-            SelectExprPlacer::grouped(
-                lowered.group_by.iter().copied(),
-                &lowered.aggregates,
-                where_vars,
-            )
-        } else {
-            SelectExprPlacer::ungrouped()
         };
         // (alias, expression, contains an aggregate), in SELECT order.
         let mut computed: Vec<(VarId, Expression, bool)> = Vec::new();
@@ -307,6 +311,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             computed.push((var, self.lower_expression(expr)?, false));
         }
+        if computed.is_empty() {
+            return Ok(SelectExtends { pre, extends });
+        }
+        let placer = if lowered.groups() {
+            SelectExprPlacer::grouped(
+                lowered.group_by.iter().copied(),
+                &lowered.aggregates,
+                pre_group_vars(where_patterns, trailing_values, &lowered.pre_group_binds),
+            )
+        } else {
+            SelectExprPlacer::ungrouped()
+        };
         let placements = placer.place_all(
             &computed
                 .iter()
@@ -324,16 +340,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     /// Lower solution modifiers (DISTINCT, LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING)
     ///
-    /// `where_vars` are the variables the level binds before grouping: its
-    /// WHERE and its trailing VALUES, which joins there. `having_unbound` are
-    /// the trailing VALUES variables its WHERE does not bind (see
+    /// `where_patterns` and `trailing_values` are the level's WHERE and
+    /// trailing VALUES, which joins before grouping (see
     /// [`Self::lower_select_level`]).
     pub(super) fn lower_solution_modifiers(
         &mut self,
         modifiers: &SolutionModifiers,
         select: &SelectClause,
-        where_vars: &HashSet<VarId>,
-        having_unbound: &HashSet<VarId>,
+        where_patterns: &[Pattern],
+        trailing_values: Option<&Pattern>,
     ) -> Result<LoweredModifiers> {
         let distinct = select.modifier == Some(SelectModifier::Distinct);
         let mut group_by: Vec<VarId> = Vec::new();
@@ -474,12 +489,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // itself: in the WHERE (the caller left those out), as a key or as an
         // aggregate. This runs before the SAMPLE rewrite below, which they
         // would otherwise reach: Fluree joins VALUES before grouping.
-        if let Some(having) = having.as_mut() {
-            let unbound: HashSet<VarId> = having_unbound
-                .iter()
-                .copied()
+        if let (Some(having), Some(values)) = (having.as_mut(), trailing_values) {
+            let where_bound = produced_vars_of(where_patterns);
+            let unbound: HashSet<VarId> = values
+                .produced_vars()
+                .into_iter()
                 .filter(|v| {
-                    !group_by.contains(v) && !aggregates.iter().any(|spec| spec.output_var == *v)
+                    !where_bound.contains(v)
+                        && !group_by.contains(v)
+                        && !aggregates.iter().any(|spec| spec.output_var == *v)
                 })
                 .collect();
             let vars = &mut self.vars;
@@ -492,8 +510,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // means SAMPLE(?v) (§18.2.4.1). The level's variables bound before
         // grouping include the GROUP BY / aggregate-input binds lowered above.
         if !group_by.is_empty() || !aggregates.is_empty() {
-            let mut where_vars = where_vars.clone();
-            where_vars.extend(produced_vars_of(&pre_group_binds));
             let vars = &mut self.vars;
             sample_ungrouped_reads(
                 &group_by,
@@ -501,7 +517,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 having.as_mut(),
                 &mut base.order_binds,
                 &mut base.ordering,
-                &where_vars,
+                || pre_group_vars(where_patterns, trailing_values, &pre_group_binds),
                 &mut |_| vars.get_or_insert(&format!("?__sample_{}", vars.len())),
             );
         }

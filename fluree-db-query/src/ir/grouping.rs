@@ -373,7 +373,7 @@ impl Grouping {
     /// fail-closed check for everything else.
     pub fn first_ungrouped_read(
         &self,
-        where_vars: &HashSet<VarId>,
+        where_vars: &[VarId],
         order_binds: &[(VarId, Expression)],
         ordering: &[crate::sort::SortSpec],
         projection: Option<&[VarId]>,
@@ -381,42 +381,58 @@ impl Grouping {
     ) -> Option<UngroupedRead> {
         /// The first of `vars` the WHERE binds that is not produced by grouping.
         fn find(
-            where_vars: &HashSet<VarId>,
-            grouped: &HashSet<VarId>,
             mut vars: impl Iterator<Item = VarId>,
+            where_vars: &[VarId],
+            grouped: impl Fn(VarId) -> bool,
         ) -> Option<VarId> {
-            vars.find(|v| where_vars.contains(v) && !grouped.contains(v))
+            vars.find(|v| where_vars.contains(v) && !grouped(*v))
         }
-        let mut grouped: HashSet<VarId> = self.group_by_vars().collect();
-        grouped.extend(self.aggregates().map(|spec| spec.output_var));
+        let binds = self.bind_list();
+        // What grouping has produced when a stage runs: the keys, the aggregate
+        // outputs, and the outputs of the grouping's first `binds_done` binds and
+        // the first `order_binds_done` ORDER BY binds. Scanned rather than
+        // collected: every grouped plan runs this check, over a few variables.
+        let grouped = |v: VarId, binds_done: usize, order_binds_done: usize| {
+            self.group_by_vars().any(|k| k == v)
+                || self.aggregates().any(|spec| spec.output_var == v)
+                || binds[..binds_done].iter().any(|(out, _)| *out == v)
+                || order_binds[..order_binds_done]
+                    .iter()
+                    .any(|(out, _)| *out == v)
+        };
 
         if let Some(having) = self.having() {
-            if let Some(var) = find(where_vars, &grouped, having.referenced_vars().into_iter()) {
+            if let Some(var) = find(having.referenced_vars().into_iter(), where_vars, |v| {
+                grouped(v, 0, 0)
+            }) {
                 return Some(UngroupedRead {
                     var,
                     stage: ReadStage::Having,
                 });
             }
         }
-        for (out, expr) in self.binds() {
-            if let Some(var) = find(where_vars, &grouped, expr.referenced_vars().into_iter()) {
+        for (i, (out, expr)) in binds.iter().enumerate() {
+            if let Some(var) = find(expr.referenced_vars().into_iter(), where_vars, |v| {
+                grouped(v, i, 0)
+            }) {
                 return Some(UngroupedRead {
                     var,
                     stage: ReadStage::Bind(*out),
                 });
             }
-            grouped.insert(*out);
         }
-        for (out, expr) in order_binds {
-            if let Some(var) = find(where_vars, &grouped, expr.referenced_vars().into_iter()) {
+        for (j, (out, expr)) in order_binds.iter().enumerate() {
+            if let Some(var) = find(expr.referenced_vars().into_iter(), where_vars, |v| {
+                grouped(v, binds.len(), j)
+            }) {
                 return Some(UngroupedRead {
                     var,
                     stage: ReadStage::OrderBind(*out),
                 });
             }
-            grouped.insert(*out);
         }
-        if let Some(var) = find(where_vars, &grouped, ordering.iter().map(|s| s.var)) {
+        let after_binds = |v| grouped(v, binds.len(), order_binds.len());
+        if let Some(var) = find(ordering.iter().map(|s| s.var), where_vars, after_binds) {
             return Some(UngroupedRead {
                 var,
                 stage: ReadStage::OrderBy,
@@ -424,7 +440,7 @@ impl Grouping {
         }
         if policy == super::query::UngroupedProjection::Reject {
             if let Some(var) =
-                projection.and_then(|p| find(where_vars, &grouped, p.iter().copied()))
+                projection.and_then(|p| find(p.iter().copied(), where_vars, after_binds))
             {
                 return Some(UngroupedRead {
                     var,
@@ -642,7 +658,8 @@ impl UngroupedRead {
 /// Sample(V)").
 ///
 /// A read of `?v` is rewritten when the level's pre-group pipeline binds `?v`
-/// (`where_vars`) and `?v` is not a group key. Everything else is left alone:
+/// (`where_vars`, called at most once, and only when HAVING or ORDER BY reads a
+/// non-key variable) and `?v` is not a group key. Everything else is left alone:
 /// a key (`SAMPLE(key)` is the key), an aggregate output, a per-group `Extend`
 /// output (HAVING reads it unbound, §18.2.4.2; ORDER BY reads the Extend), and a
 /// variable nothing binds (unbound either way). The rewrite reuses a `SAMPLE(?v)`
@@ -658,13 +675,14 @@ pub fn sample_ungrouped_reads(
     having: Option<&mut Expression>,
     order_binds: &mut [(VarId, Expression)],
     ordering: &mut [crate::sort::SortSpec],
-    where_vars: &HashSet<VarId>,
+    where_vars: impl FnOnce() -> HashSet<VarId>,
     mint: &mut dyn FnMut(VarId) -> VarId,
 ) {
-    let ungrouped = |v: &VarId| where_vars.contains(v) && !keys.contains(v);
+    // The non-key reads first: a level without HAVING or ORDER BY has none,
+    // and then never collects `where_vars`.
     let mut reads: Vec<VarId> = Vec::new();
     let mut note = |v: VarId| {
-        if ungrouped(&v) && !reads.contains(&v) {
+        if !keys.contains(&v) && !reads.contains(&v) {
             reads.push(v);
         }
     };
@@ -680,6 +698,8 @@ pub fn sample_ungrouped_reads(
     if reads.is_empty() {
         return;
     }
+    let where_vars = where_vars();
+    reads.retain(|v| where_vars.contains(v));
 
     let mut having = having;
     for v in reads {
@@ -958,7 +978,7 @@ mod tests {
             Some(&mut having),
             &mut order_binds,
             &mut ordering,
-            &where_vars,
+            || where_vars.clone(),
             &mut mint,
         );
 
@@ -991,7 +1011,7 @@ mod tests {
             Some(&mut having),
             &mut order_binds,
             &mut ordering,
-            &where_vars,
+            || where_vars.clone(),
             &mut mint,
         );
         assert_eq!(aggregates.len(), aggregates_before);
@@ -1013,11 +1033,36 @@ mod tests {
             None,
             &mut [],
             &mut ordering,
-            &[a, e].into_iter().collect(),
+            || [a, e].into_iter().collect(),
             &mut |_| panic!("an existing SAMPLE(?e) is reused"),
         );
         assert_eq!(aggregates.len(), 1);
         assert_eq!(ordering[0].var, s);
+    }
+
+    #[test]
+    fn sample_ungrouped_reads_collects_where_vars_only_for_a_non_key_read() {
+        use crate::sort::SortSpec;
+        let (a, n) = (VarId(0), VarId(1));
+        let mut aggregates = vec![AggregateSpec {
+            function: AggregateFn::CountAll,
+            output_var: n,
+        }];
+        // No HAVING or ORDER BY, or an ORDER BY of a key: nothing to sample,
+        // so the level's variables are never collected (every grouped query
+        // lowers through here).
+        for mut ordering in [vec![], vec![SortSpec::asc(a)]] {
+            sample_ungrouped_reads(
+                &[a],
+                &mut aggregates,
+                None,
+                &mut [],
+                &mut ordering,
+                || panic!("where_vars collected without a non-key read"),
+                &mut |_| panic!("nothing to sample"),
+            );
+        }
+        assert_eq!(aggregates.len(), 1);
     }
 
     #[test]
@@ -1067,7 +1112,7 @@ mod tests {
         // ?k key, ?n aggregate output, ?b an earlier bind, ?w a non-key WHERE
         // variable, ?u a variable nothing binds before grouping.
         let (k, n, b, w, u, out) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4), VarId(5));
-        let where_vars: HashSet<VarId> = [k, w].into_iter().collect();
+        let where_vars = [k, w];
         let count = AggregateSpec {
             function: AggregateFn::Count(w),
             output_var: n,
@@ -1212,7 +1257,7 @@ mod tests {
     fn sample_rewrite_then_predicate() {
         use crate::ir::UngroupedProjection::Reject;
         let (a, e, g, iri) = (VarId(0), VarId(1), VarId(2), VarId(3));
-        let where_vars: HashSet<VarId> = [a, e].into_iter().collect();
+        let where_vars = [a, e];
         let concat = AggregateSpec {
             function: AggregateFn::GroupConcat {
                 input: e,
@@ -1242,7 +1287,7 @@ mod tests {
             Some(&mut rewritten),
             &mut [],
             &mut [],
-            &where_vars,
+            || where_vars.into_iter().collect(),
             &mut |_| VarId(9),
         );
         let sampled = Grouping::assemble(vec![a], aggregates, vec![], Some(rewritten))

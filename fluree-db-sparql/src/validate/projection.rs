@@ -276,45 +276,52 @@ pub(super) fn check_aggregate_over_select_alias(
     let SelectVariables::Explicit(items) = variables else {
         return;
     };
-    let aliases: HashSet<&str> = items
+    if !items
         .iter()
-        .filter_map(|item| match item {
-            SelectVariable::Expr { alias, .. } => Some(alias.name.as_ref()),
-            SelectVariable::Var(_) => None,
-        })
-        .collect();
-    if aliases.is_empty() {
+        .any(|item| matches!(item, SelectVariable::Expr { .. }))
+    {
         return;
     }
+    // Every query runs this check, so it allocates nothing until it reports:
+    // a SELECT clause is short enough to scan for an alias.
+    let is_alias = |name: &str| {
+        items.iter().any(
+            |item| matches!(item, SelectVariable::Expr { alias, .. } if alias.name.as_ref() == name),
+        )
+    };
 
     let mut reported: HashSet<String> = HashSet::new();
     let mut check = |expr: &Expression| {
         expr.walk(&mut |e| {
-            if let Expression::Aggregate {
+            let Expression::Aggregate {
                 expr: Some(arg), ..
             } = e
-            {
-                for v in arg.variables() {
-                    let name: &str = v.name.as_ref();
-                    if aliases.contains(name) && reported.insert(name.to_string()) {
-                        diagnostics.push(
-                            Diagnostic::error(
-                                DiagCode::AggregateOverSelectAlias,
-                                format!(
-                                    "?{name} is assigned by this SELECT clause, after \
-                                     aggregation, so it cannot be aggregated at the same level"
-                                ),
-                                v.span,
-                            )
-                            .with_help(
-                                "Aggregate the expression itself (e.g. COUNT(IF(...)) \
-                                 instead of COUNT(?alias)), or compute the alias in a \
-                                 sub-SELECT and aggregate over its result.",
+            else {
+                return;
+            };
+            arg.walk(&mut |e| {
+                let Expression::Var(v) = e else {
+                    return;
+                };
+                let name: &str = v.name.as_ref();
+                if is_alias(name) && reported.insert(name.to_string()) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            DiagCode::AggregateOverSelectAlias,
+                            format!(
+                                "?{name} is assigned by this SELECT clause, after \
+                                 aggregation, so it cannot be aggregated at the same level"
                             ),
-                        );
-                    }
+                            v.span,
+                        )
+                        .with_help(
+                            "Aggregate the expression itself (e.g. COUNT(IF(...)) \
+                             instead of COUNT(?alias)), or compute the alias in a \
+                             sub-SELECT and aggregate over its result.",
+                        ),
+                    );
                 }
-            }
+            });
         });
     };
 
