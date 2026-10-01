@@ -230,11 +230,7 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
         Binding::Iri(_) | Binding::IriMatch { .. } => {
             Some(canonical_iri_id(binding, store)?.into_binding(None, None))
         }
-        // Canonical already unless its IRI is also a subject.
-        Binding::EncodedPid { .. } => match canonical_iri_id(binding, store)? {
-            id @ IriId::Subject(_) => Some(id.into_binding(None, None)),
-            IriId::Predicate(_) => None,
-        },
+        Binding::EncodedPid { .. } => encoded_iri_canonical(binding, store).flatten(),
         Binding::Lit {
             val,
             dtc,
@@ -374,6 +370,27 @@ impl IriId {
     }
 }
 
+/// The canonical form of an encoded IRI, without the decoded arms of
+/// [`encoded_equivalent`]: `Some(Some(b))` replaces the binding with `b`,
+/// `Some(None)` keeps it, `None` when the binding is not an encoded IRI. The
+/// keyed surfaces ask this first, so an all-`EncodedSid` key returns at once
+/// and an `EncodedPid` key costs the store's per-predicate load.
+#[inline]
+pub(crate) fn encoded_iri_canonical(
+    binding: &Binding,
+    store: &BinaryIndexStore,
+) -> Option<Option<Binding>> {
+    match binding {
+        Binding::EncodedSid { .. } => Some(None),
+        // Canonical already unless its IRI is also a subject.
+        Binding::EncodedPid { .. } => Some(match canonical_iri_id(binding, store) {
+            Some(id @ IriId::Subject(_)) => Some(id.into_binding(None, None)),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 /// [`IriId`] of an IRI-valued binding; `None` for any other binding, for an
 /// IRI with neither persisted id, or when the subject dictionary cannot be
 /// read. Blank-node policy is the caller's: this resolves any `Sid` it is
@@ -474,6 +491,12 @@ pub(crate) fn normalize_for_key_cow<'a>(
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
 ) -> std::borrow::Cow<'a, Binding> {
     use std::borrow::Cow;
+    if let Some(canonical) = store.and_then(|s| encoded_iri_canonical(binding, s)) {
+        return match canonical {
+            Some(b) => Cow::Owned(b),
+            None => Cow::Borrowed(binding),
+        };
+    }
     // Arena-keyed NUM_BIG values normalize by DECODING: handles are scoped
     // per (graph, predicate), so the encoded form is not a canonical key for
     // one value across predicates or against decoded rows (VALUES, BIND,

@@ -475,6 +475,11 @@ pub(crate) fn binding_to_group_key_normalized(
     store: Option<&fluree_db_binary_index::BinaryIndexStore>,
     gv: Option<&BinaryGraphView>,
 ) -> GroupKeyOwned {
+    if let Some(canonical) =
+        store.and_then(|s| crate::object_binding::encoded_iri_canonical(binding, s))
+    {
+        return binding_to_group_key_owned(canonical.as_ref().unwrap_or(binding));
+    }
     if crate::object_binding::is_numbig_encoded(binding) {
         if let Some(gv) = gv {
             let materialized = materialize_encoded(binding, Some(gv));
