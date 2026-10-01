@@ -6,7 +6,6 @@ use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_vocab::xsd_names;
-use rustc_hash::FxHashMap;
 use std::sync::{Arc, OnceLock};
 
 fn encoded_i_val(o_i: u32) -> i32 {
@@ -362,10 +361,57 @@ pub(crate) struct TermDicts<'a> {
     /// pending never probes it.
     novel_subjects: Option<&'a SubjectDictNovelty>,
     novel_strings: Option<&'a StringDictNovelty>,
-    /// The persisted predicates whose IRI is a subject minted in novelty,
-    /// found once for the holder's lifetime ([`EqualityNorm`]) instead of a
-    /// novelty probe per predicate key. `None`: probe per key.
-    novel_predicate_subjects: Option<&'a OnceLock<FxHashMap<u32, u64>>>,
+    /// Per persisted predicate, whether its IRI is a subject minted in
+    /// novelty, each found on the predicate's first key for the holder's
+    /// lifetime ([`EqualityNorm`]) instead of a novelty probe per key.
+    /// `None`: probe per key.
+    novel_predicate_subjects: Option<&'a NovelPredicateSubjects>,
+}
+
+/// [`TermDicts`]' per-predicate memo of novelty subject ids: one slot per
+/// persisted predicate, allocated on the first predicate key that needs it
+/// and filled one predicate at a time, so a query probes the novelty
+/// dictionary once per predicate it meets, never once per predicate the
+/// index holds.
+#[derive(Default)]
+pub(crate) struct NovelPredicateSubjects(OnceLock<Box<[std::sync::atomic::AtomicU64]>>);
+
+impl NovelPredicateSubjects {
+    /// A slot not yet resolved.
+    const UNRESOLVED: u64 = u64::MAX;
+    /// A predicate whose IRI is no novelty subject.
+    const NONE: u64 = u64::MAX - 1;
+
+    fn get(
+        &self,
+        store: &BinaryIndexStore,
+        subjects: &SubjectDictNovelty,
+        p_id: u32,
+    ) -> Option<u64> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let slots = self.0.get_or_init(|| {
+            (0..store.p_sid_table().len())
+                .map(|_| AtomicU64::new(Self::UNRESOLVED))
+                .collect()
+        });
+        let slot = slots.get(p_id as usize)?;
+        match slot.load(Ordering::Relaxed) {
+            Self::NONE => None,
+            Self::UNRESOLVED => {
+                let sid = &store.p_sid_table()[p_id as usize];
+                let found = subjects.find_subject(sid.namespace_code, &sid.name);
+                match found {
+                    None => slot.store(Self::NONE, Ordering::Relaxed),
+                    // A subject id sits below both sentinels; one that does
+                    // not is answered unmemoized.
+                    Some(s_id) if s_id < Self::NONE => slot.store(s_id, Ordering::Relaxed),
+                    Some(_) => {}
+                }
+                found
+            }
+            s_id => Some(s_id),
+        }
+    }
 }
 
 impl<'a> TermDicts<'a> {
@@ -443,10 +489,7 @@ impl<'a> TermDicts<'a> {
         // last index has a novelty subject id.
         if let Some(subjects) = self.novel_subjects {
             let novel = match self.novel_predicate_subjects {
-                Some(found) => found
-                    .get_or_init(|| novel_predicate_subjects(self.store, subjects))
-                    .get(&p_id)
-                    .copied(),
+                Some(memo) => memo.get(self.store, subjects, p_id),
                 None => self
                     .store
                     .p_sid_table()
@@ -480,23 +523,6 @@ impl<'a> TermDicts<'a> {
                 .map(IriId::Subject),
         }
     }
-}
-
-/// The persisted predicates whose IRI is a subject minted in novelty
-/// (usually none), by predicate id: one novelty probe per predicate.
-fn novel_predicate_subjects(
-    store: &BinaryIndexStore,
-    subjects: &SubjectDictNovelty,
-) -> FxHashMap<u32, u64> {
-    store
-        .p_sid_table()
-        .iter()
-        .enumerate()
-        .filter_map(|(p_id, sid)| {
-            let s_id = subjects.find_subject(sid.namespace_code, &sid.name)?;
-            Some((p_id as u32, s_id))
-        })
-        .collect()
 }
 
 /// Whether an initialized novelty dictionary holds subjects, and strings.
@@ -590,7 +616,7 @@ pub(crate) struct EqualityNorm {
     novel_subjects: bool,
     novel_strings: bool,
     /// See [`TermDicts`]'s field of the same name.
-    novel_predicate_subjects: OnceLock<FxHashMap<u32, u64>>,
+    novel_predicate_subjects: NovelPredicateSubjects,
     gv: Option<fluree_db_binary_index::BinaryGraphView>,
 }
 
@@ -643,7 +669,7 @@ pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Optio
         novelty: ctx.dict_novelty.clone(),
         novel_subjects,
         novel_strings,
-        novel_predicate_subjects: OnceLock::new(),
+        novel_predicate_subjects: NovelPredicateSubjects::default(),
         gv: ctx.graph_view(),
     })
 }
