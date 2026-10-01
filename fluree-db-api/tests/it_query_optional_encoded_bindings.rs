@@ -376,7 +376,9 @@ struct OptionalCase {
     body: &'static str,
     vars: &'static [&'static str],
     expected: &'static [&'static [&'static str]],
-    marker: &'static str,
+    /// A constant only the OPTIONAL's scans name, to check their correlated
+    /// slot; `None` when the scan is a subject seek by design.
+    marker: Option<&'static str>,
     slot: Slot,
     /// A ref-valued object correlation the batched lane must answer.
     object_probe: bool,
@@ -388,7 +390,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         body: "SELECT ?s ?c WHERE { ?s ex:derivedFrom ex:doc1 . OPTIONAL { ?c ex:subjectOf ?s } }",
         vars: &["s", "c"],
         expected: &[&["s1", "c1"], &["s2", "c2"], &["s2", "c3"], &["s3", "-"]],
-        marker: "name: \"subjectOf\"",
+        marker: Some("name: \"subjectOf\""),
         slot: Slot::O,
         object_probe: true,
     },
@@ -400,7 +402,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
                OPTIONAL { ?c ex:subjectOf ?s } }",
         vars: &["s", "c"],
         expected: &[&["s1", "c1"], &["s2", "c2"], &["s2", "c3"], &["s3", "-"]],
-        marker: "name: \"subjectOf\"",
+        marker: Some("name: \"subjectOf\""),
         slot: Slot::O,
         object_probe: true,
     },
@@ -414,7 +416,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
             &["position", "-"],
             &["text", "text"],
         ],
-        marker: "name: \"label\"",
+        marker: Some("name: \"label\""),
         slot: Slot::S,
         object_probe: false,
     },
@@ -428,7 +430,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
             &["position", "-"],
             &["text", "-"],
         ],
-        marker: "name: \"mentions\"",
+        marker: Some("name: \"mentions\""),
         slot: Slot::O,
         object_probe: false,
     },
@@ -437,7 +439,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         body: "SELECT ?q ?v WHERE { ex:s4 ex:usesPredicate ?q . OPTIONAL { ex:s1 ?q ?v } }",
         vars: &["q", "v"],
         expected: &[&["text", "chunk one"]],
-        marker: "name: \"s1\"",
+        marker: Some("name: \"s1\""),
         slot: Slot::P,
         object_probe: false,
     },
@@ -446,7 +448,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         body: "SELECT ?s ?c WHERE { ?s ex:text ?t . OPTIONAL { ?c ex:alias ?t } }",
         vars: &["s", "c"],
         expected: &[&["s1", "c1"], &["s2", "-"], &["s3", "-"], &["s4", "-"]],
-        marker: "name: \"alias\"",
+        marker: Some("name: \"alias\""),
         slot: Slot::O,
         object_probe: false,
     },
@@ -455,7 +457,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         body: "SELECT ?s ?c WHERE { ?s ex:position ?n . OPTIONAL { ?c ex:rank ?n } }",
         vars: &["s", "c"],
         expected: &[&["s1", "c1"], &["s2", "-"], &["s3", "c3"], &["s4", "-"]],
-        marker: "name: \"rank\"",
+        marker: Some("name: \"rank\""),
         slot: Slot::O,
         object_probe: false,
     },
@@ -475,8 +477,41 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
             &["doc1", "s3"],
             &["doc2", "s4"],
         ],
-        marker: "name: \"derivedFrom\"",
+        marker: Some("name: \"derivedFrom\""),
         slot: Slot::O,
+        object_probe: false,
+    },
+    OptionalCase {
+        // Subject and object both come from the required side: the scan seeks
+        // the subject and `unify_check` matches the encoded object.
+        label: "subject and object both correlated",
+        body: "SELECT ?s ?o ?p WHERE { ?s ex:derivedFrom ?o . OPTIONAL { ?s ?p ?o } }",
+        vars: &["s", "o", "p"],
+        expected: &[
+            &["s1", "doc1", "derivedFrom"],
+            &["s2", "doc1", "derivedFrom"],
+            &["s3", "doc1", "derivedFrom"],
+            &["s4", "doc2", "derivedFrom"],
+        ],
+        marker: None,
+        slot: Slot::S,
+        object_probe: false,
+    },
+    OptionalCase {
+        // With novelty pending the batched joins emit `?s` and `?c` encoded
+        // while the OPTIONAL's own scan decodes `?s`: the unify compares two
+        // forms of one IRI.
+        label: "both correlated, object matched across forms",
+        body: "SELECT ?s ?c ?p WHERE { ?d a ex:Doc ; ex:title \"Doc 1\" . \
+               ?s ex:derivedFrom ?d . ?c ex:subjectOf ?s . OPTIONAL { ?c ?p ?s } }",
+        vars: &["s", "c", "p"],
+        expected: &[
+            &["s1", "c1", "subjectOf"],
+            &["s2", "c2", "subjectOf"],
+            &["s2", "c3", "subjectOf"],
+        ],
+        marker: None,
+        slot: Slot::S,
         object_probe: false,
     },
     OptionalCase {
@@ -485,7 +520,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
                OPTIONAL { ?child skos:broader ?c } }",
         vars: &["c", "child"],
         expected: &[&["k0", "k10"], &["k0", "k11"], &["k1", "k12"], &["k2", "-"]],
-        marker: "name: \"broader\"",
+        marker: Some("name: \"broader\""),
         slot: Slot::O,
         object_probe: true,
     },
@@ -502,7 +537,9 @@ async fn optional_binds_encoded_values_in_every_position() {
             let before = store.all_events().len();
             let result = sparql(&fluree, &handle, case.body).await;
             failures.eq(sparql_rows(&result, case.vars), rows(case.expected), &label);
-            failures.bound_lookup(&store, before, case.marker, case.slot, &label);
+            if let Some(marker) = case.marker {
+                failures.bound_lookup(&store, before, marker, case.slot, &label);
+            }
             if case.object_probe {
                 failures.object_probe_fired(&store, before, &label);
             }

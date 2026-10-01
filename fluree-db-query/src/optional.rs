@@ -510,6 +510,39 @@ impl PatternOptionalBuilder {
         Ok(Some(pending))
     }
 
+    /// Whether this row's object value is left to `unify_check` instead of
+    /// decoded into the scan: an encoded object when the row also binds the
+    /// subject. The scan is then already a seek on that subject, and decoding
+    /// the object (a dictionary lookup per row) would only narrow a lookup
+    /// that is already narrow; `unify_check` compares it with `same_term`,
+    /// which treats the encoded and decoded forms of one term as one.
+    /// [`Self::substitute_pattern`] and the cache key both follow this, so a
+    /// row keys its object as free exactly when its scan leaves it free.
+    fn object_left_to_unify(&self, required_batch: &Batch, row: usize) -> bool {
+        let Some(subject_col) = self.subject_left_col() else {
+            return false;
+        };
+        let Some(object_col) = self
+            .bind_instructions
+            .iter()
+            .find(|instr| instr.position == PatternPosition::Object)
+            .map(|instr| instr.left_col)
+        else {
+            return false;
+        };
+        matches!(
+            required_batch.get_by_col(row, subject_col),
+            Binding::Sid { .. }
+                | Binding::IriMatch { .. }
+                | Binding::Iri(_)
+                | Binding::EncodedSid { .. }
+                | Binding::EncodedPid { .. }
+        ) && matches!(
+            required_batch.get_by_col(row, object_col),
+            Binding::EncodedSid { .. } | Binding::EncodedPid { .. } | Binding::EncodedLit { .. }
+        )
+    }
+
     /// This row's correlated values bound into the pattern, through the
     /// substitution every correlated scan shares ([`substitute_binding`]):
     /// encoded values decode into their slot in any position, so the scan is
@@ -531,7 +564,11 @@ impl PatternOptionalBuilder {
         // Built only when a row carries an encoded value: decoded rows (the
         // novelty lane) never need it.
         let mut gv: Option<Option<fluree_db_binary_index::BinaryGraphView>> = None;
+        let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
+            if object_to_unify && instr.position == PatternPosition::Object {
+                continue;
+            }
             let binding = required_batch.get_by_col(row, instr.left_col);
             let encoded = matches!(
                 binding,
@@ -847,12 +884,18 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
 
         let mut key = Vec::with_capacity(16 * self.bind_instructions.len());
+        let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
             key.push(match instr.position {
                 PatternPosition::Subject => b'0',
                 PatternPosition::Predicate => b'1',
                 PatternPosition::Object => b'2',
             });
+            if object_to_unify && instr.position == PatternPosition::Object {
+                // Left free by the scan: rows sharing the subject share it.
+                key.push(b'u');
+                continue;
+            }
             let binding = required_batch.get_by_col(row, instr.left_col);
             if !push_cache_key_component(&mut key, instr.position, binding) {
                 return Ok(None);
