@@ -6399,6 +6399,86 @@ fn local_query_reads_the_graph_or_branch_its_dataset_names() {
         .stdout(predicate::str::contains("in-default").not());
 }
 
+/// Locally, the ledger's own address with a reserved keyword names that
+/// reserved graph in writes and reads alike, as its `urn:fluree:` form does:
+/// `L#config` writes and reads the config graph, a write to `L#txn-meta` is
+/// refused, and no write registers a graph under either name. SPARQL and
+/// JSON-LD.
+#[test]
+fn local_reserved_keyword_addresses_name_the_reserved_graphs() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "kwdb"]).assert().success();
+    let update = |body: &str| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args(["update", "-l", "kwdb", "--direct", "-e", body]);
+        cmd
+    };
+    update(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { GRAPH <kwdb:main#config> { ex:c1 ex:p \"cfg-sparql\" } }",
+    )
+    .assert()
+    .success();
+    update(
+        r#"{"@context": {"ex": "http://example.org/"}, "graph": "kwdb#config",
+            "insert": {"@id": "ex:c2", "ex:p": "cfg-jsonld"}}"#,
+    )
+    .assert()
+    .success();
+
+    let query = |args: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args(["query", "-l", "kwdb", "--format", "json"]);
+        cmd.args(args);
+        cmd
+    };
+    for read in [
+        query(&[
+            "--sparql",
+            "-e",
+            "SELECT ?o FROM <kwdb:main#config> WHERE { ?s <http://example.org/p> ?o }",
+        ]),
+        query(&[
+            "-e",
+            r#"{"from": "kwdb#config", "select": "?o",
+                "where": {"@id": "?s", "http://example.org/p": "?o"}}"#,
+        ]),
+    ] {
+        let mut read = read;
+        read.assert()
+            .success()
+            .stdout(predicate::str::contains("cfg-sparql"))
+            .stdout(predicate::str::contains("cfg-jsonld"));
+    }
+
+    update(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { GRAPH <kwdb:main#txn-meta> { ex:t ex:p \"tm\" } }",
+    )
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("reserved"));
+    update(
+        r#"{"@context": {"ex": "http://example.org/"},
+            "insert": {"@id": "ex:t", "@graph": "kwdb#txn-meta", "ex:p": "tm"}}"#,
+    )
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("reserved"));
+
+    // No graph is registered under either keyword address.
+    query(&[
+        "--sparql",
+        "-e",
+        "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("#config").not())
+    .stdout(predicate::str::contains("#txn-meta").not());
+}
+
 /// A dataset naming only named graphs has an empty default graph; a query that
 /// also matches outside `GRAPH` is told so on stderr, on the view path and on
 /// the connection path, and the rows are unchanged (none).
