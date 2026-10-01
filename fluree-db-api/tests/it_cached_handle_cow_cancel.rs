@@ -18,13 +18,10 @@
 //! sees `t = 0` and that the commit still lands.
 
 use crate::support;
+use crate::support::hooked_storage::{HookedStorage, StorageHooks};
 use async_trait::async_trait;
 use fluree_db_api::{Fluree, FlureeBuilder, LedgerHandle, NameServiceMode};
-use fluree_db_core::content_kind::ContentKind;
-use fluree_db_core::storage::ContentWriteResult;
-use fluree_db_core::{
-    ContentAddressedWrite, MemoryStorage, StorageMethod, StorageRead, StorageWrite,
-};
+use fluree_db_core::ContentKind;
 use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,28 +37,18 @@ fn person(id: &str) -> serde_json::Value {
     })
 }
 
-/// Storage that parks the next commit-blob write once armed, until released.
+/// Storage hooks that park the next commit-blob write once armed, until released.
 ///
 /// The commit blob is written inside the detached window, under the ledger's
 /// write lock. A parked commit-blob write therefore holds the commit in flight.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 struct CommitGate {
-    inner: MemoryStorage,
-    armed: Arc<AtomicBool>,
-    parked: Arc<Notify>,
-    release: Arc<Notify>,
+    armed: AtomicBool,
+    parked: Notify,
+    release: Notify,
 }
 
 impl CommitGate {
-    fn new() -> Self {
-        Self {
-            inner: MemoryStorage::new(),
-            armed: Arc::new(AtomicBool::new(false)),
-            parked: Arc::new(Notify::new()),
-            release: Arc::new(Notify::new()),
-        }
-    }
-
     /// Park the next commit-blob write.
     fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
@@ -84,61 +71,12 @@ impl CommitGate {
 }
 
 #[async_trait]
-impl StorageRead for CommitGate {
-    fn permits_plaintext_cache(&self) -> bool {
-        self.inner.permits_plaintext_cache()
-    }
-
-    fn encryption_admin(&self) -> Option<Arc<dyn fluree_db_core::EncryptionAdmin>> {
-        self.inner.encryption_admin()
-    }
-
-    async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
-        self.inner.read_bytes(address).await
-    }
-
-    async fn exists(&self, address: &str) -> fluree_db_core::Result<bool> {
-        self.inner.exists(address).await
-    }
-
-    async fn list_prefix(&self, prefix: &str) -> fluree_db_core::Result<Vec<String>> {
-        self.inner.list_prefix(prefix).await
-    }
-}
-
-#[async_trait]
-impl StorageWrite for CommitGate {
-    async fn write_bytes(&self, address: &str, bytes: &[u8]) -> fluree_db_core::Result<()> {
-        self.inner.write_bytes(address, bytes).await
-    }
-
-    async fn delete(&self, address: &str) -> fluree_db_core::Result<()> {
-        self.inner.delete(address).await
-    }
-}
-
-#[async_trait]
-impl ContentAddressedWrite for CommitGate {
-    async fn content_write_bytes_with_hash(
-        &self,
-        kind: ContentKind,
-        ledger_id: &str,
-        content_hash_hex: &str,
-        bytes: &[u8],
-    ) -> fluree_db_core::Result<ContentWriteResult> {
+impl StorageHooks for CommitGate {
+    async fn before_content_write(&self, kind: ContentKind) {
         if kind == ContentKind::Commit && self.armed.swap(false, Ordering::SeqCst) {
             self.parked.notify_one();
             self.release.notified().await;
         }
-        self.inner
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
-            .await
-    }
-}
-
-impl StorageMethod for CommitGate {
-    fn storage_method(&self) -> &str {
-        self.inner.storage_method()
     }
 }
 
@@ -159,9 +97,10 @@ async fn wait_for_t(handle: &LedgerHandle, want: i64) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_commit_never_exposes_the_empty_cache_slot() {
-    let gate = CommitGate::new();
+    let storage = HookedStorage::new(CommitGate::default());
+    let gate = storage.hooks();
     let fluree: Fluree = FlureeBuilder::memory().build_with(
-        gate.clone(),
+        storage.clone(),
         NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new())),
     );
 
