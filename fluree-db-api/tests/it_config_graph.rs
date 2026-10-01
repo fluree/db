@@ -452,6 +452,320 @@ async fn config_guard_refuses_a_group_split_across_transactions() {
     let _ = ledger;
 }
 
+// -----------------------------------------------------------------------------
+// The guard on branch operations: they re-check the target's config groups.
+// -----------------------------------------------------------------------------
+
+/// The message of a branch operation the guard refused: a parse error, like a
+/// transaction's, naming the group and the repair.
+fn branch_op_refusal(err: fluree_db_api::ApiError, group: &str) -> String {
+    let message = config_guard_refusal(err);
+    assert!(message.contains(group), "{message}");
+    assert!(
+        message.contains("Repairing a config split across graphs"),
+        "{message}"
+    );
+    message
+}
+
+/// A ledger `name` with one data node, and a `dev` branch of it.
+async fn ledger_with_branch(
+    fluree: &fluree_db_api::Fluree,
+    name: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    let main = fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:seed", "ex:p": 1}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    main
+}
+
+/// A config linking the SHACL group `urn:config:shacl`, which has no fields
+/// yet.
+fn config_linking_the_shacl_group() -> serde_json::Value {
+    json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@id": "urn:config:main",
+        "@type": "f:LedgerConfig",
+        "@graph": "config",
+        "f:shaclDefaults": {"@id": "urn:config:shacl"}
+    })
+}
+
+/// `urn:config:shacl f:shaclEnabled true`, written to the default graph.
+fn shacl_group_field_in_the_default_graph() -> serde_json::Value {
+    json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@id": "urn:config:shacl",
+        "f:shaclEnabled": true
+    })
+}
+
+/// A merge may not split one of the target's config groups. After the fork
+/// the target links a group from its config graph, and the branch writes the
+/// group's field in the default graph (through JSON-LD, or SPARQL). Each
+/// write is accepted where it is made; the merge that would bring them
+/// together is refused, naming the group and the repair, and its preview
+/// says so.
+#[tokio::test]
+async fn config_guard_refuses_a_merge_that_splits_a_group() {
+    for (i, sparql) in [false, true].into_iter().enumerate() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let name = format!("it-config-guard-merge-split-{i}");
+        let main = ledger_with_branch(&fluree, &name).await;
+        fluree
+            .insert(main, &config_linking_the_shacl_group())
+            .await
+            .expect("the target links the group");
+        let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+        if sparql {
+            sparql_update(
+                &fluree,
+                dev,
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 INSERT DATA { <urn:config:shacl> f:shaclEnabled true }",
+            )
+            .await
+            .expect("the branch writes the field");
+        } else {
+            fluree
+                .insert(dev, &shacl_group_field_in_the_default_graph())
+                .await
+                .expect("the branch writes the field");
+        }
+
+        let preview = fluree
+            .merge_preview(&name, "dev", None)
+            .await
+            .expect("preview");
+        assert!(!preview.fast_forward);
+        assert!(!preview.mergeable);
+        let validation = preview.validation.expect("the merge validates");
+        assert!(!validation.conforms);
+        let report = validation.report.unwrap_or_default();
+        assert!(report.contains("urn:config:shacl"), "{report}");
+
+        let err = fluree
+            .merge_branch(
+                &name,
+                "dev",
+                None,
+                fluree_db_api::ConflictStrategy::default(),
+            )
+            .await
+            .expect_err("the merge would split the group");
+        branch_op_refusal(err, "urn:config:shacl");
+    }
+}
+
+/// A fast-forward may not split one of the target's config groups either. The
+/// target links a group before the fork; the branch carries the group's field
+/// in the default graph from before these checks (seeded unchecked, as that
+/// history reaches a ledger). The fast-forward is refused until the config is
+/// repaired, and its preview says so.
+#[tokio::test]
+async fn config_guard_refuses_a_fast_forward_carrying_a_split_group() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-guard-ff-split";
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    fluree
+        .insert(ledger, &config_linking_the_shacl_group())
+        .await
+        .expect("the target links the group");
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+    commit_unchecked(&fluree, dev, &shacl_group_field_in_the_default_graph()).await;
+
+    let preview = fluree
+        .merge_preview(name, "dev", None)
+        .await
+        .expect("preview");
+    assert!(preview.fast_forward);
+    assert!(!preview.mergeable);
+    let validation = preview
+        .validation
+        .expect("a fast-forward carrying config settings is checked");
+    assert!(!validation.conforms);
+
+    let err = fluree
+        .merge_branch(
+            name,
+            "dev",
+            None,
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect_err("the fast-forward would split the group");
+    branch_op_refusal(err, "urn:config:shacl");
+}
+
+/// A revert may not split a config group: undoing the repair of a split config
+/// (the #1979 state, seeded unchecked, then repaired with the recipe that moves
+/// the fields into the config graph) would put the field back where the reader
+/// does not look. The revert is refused, and its preview says so.
+#[tokio::test]
+async fn config_guard_refuses_a_revert_that_undoes_a_repair() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-guard-revert-repair";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    let ledger = commit_unchecked(
+        &fluree,
+        ledger,
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {
+                    "@id": "urn:config:main",
+                    "@type": "f:LedgerConfig",
+                    "@graph": "config",
+                    "f:shaclDefaults": {"@id": "urn:config:shacl"}
+                },
+                {"@id": "urn:config:shacl", "f:shaclEnabled": true}
+            ]
+        }),
+    )
+    .await;
+    let repair = sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#>
+             DELETE {{ ?n ?p ?o }}
+             INSERT {{ GRAPH <{cfg}> {{ ?n ?p ?o }} }}
+             WHERE {{ GRAPH <{cfg}> {{ ?parent f:shaclDefaults ?n }} ?n ?p ?o . }}"
+        ),
+    )
+    .await
+    .expect("the repair commits");
+    let commit = fluree_db_api::CommitRef::Exact(repair.receipt.commit_id.clone());
+
+    let preview = fluree
+        .revert_commit_preview(name, "main", commit.clone())
+        .await
+        .expect("preview");
+    assert!(!preview.revertable);
+    let validation = preview.validation.expect("the revert validates");
+    assert!(!validation.conforms);
+
+    let err = fluree
+        .revert_commit(name, "main", commit, fluree_db_api::ConflictStrategy::Abort)
+        .await
+        .expect_err("the revert would split the group again");
+    branch_op_refusal(err, "urn:config:shacl");
+}
+
+/// The re-check does not stand in the way of a merge that leaves the target's
+/// config groups whole: the target changes its config after the fork while
+/// the branch writes data, an `f:enforceUnique` annotation among it, which
+/// the guard looks at and accepts. The merge commits.
+#[tokio::test]
+async fn config_guard_merges_a_branch_while_the_target_changes_its_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-guard-merge-clean";
+    let main = ledger_with_branch(&fluree, name).await;
+    fluree
+        .insert(
+            main,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:transactDefaults": {"@id": "urn:config:transact", "f:uniqueEnabled": true}
+            }),
+        )
+        .await
+        .expect("the target changes its config");
+    let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@graph": [
+                    {"@id": "ex:email", "f:enforceUnique": true},
+                    {"@id": "ex:u1", "ex:email": "a@x"}
+                ]
+            }),
+        )
+        .await
+        .expect("the branch writes data");
+
+    let preview = fluree
+        .merge_preview(name, "dev", None)
+        .await
+        .expect("preview");
+    assert!(!preview.fast_forward);
+    assert!(preview.mergeable);
+    fluree
+        .merge_branch(
+            name,
+            "dev",
+            None,
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect("the merge leaves the config groups whole");
+}
+
+/// A revert that leaves the config groups whole is accepted: switching SHACL
+/// off and reverting that brings the setting back, with one value.
+#[tokio::test]
+async fn config_guard_accepts_a_revert_of_a_config_change() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-guard-revert-clean";
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:shaclDefaults": {"@id": "urn:config:shacl", "f:shaclEnabled": true}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let change = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:shacl",
+                "@graph": "config",
+                "f:shaclEnabled": false
+            }),
+        )
+        .await
+        .expect("switch SHACL off");
+    fluree
+        .revert_commit(
+            name,
+            "main",
+            fluree_db_api::CommitRef::Exact(change.receipt.commit_id),
+            fluree_db_api::ConflictStrategy::Abort,
+        )
+        .await
+        .expect("the revert leaves one value");
+    let view = fluree.db(&format!("{name}:main")).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.clone())
+            .and_then(|s| s.enabled),
+        Some(true)
+    );
+}
+
 /// A config typed outside the config graph is never read, so the write is
 /// refused: the JSON-LD shape `concepts/reasoning.md` showed (no graph, so the
 /// default graph), and the same config through Turtle insert.

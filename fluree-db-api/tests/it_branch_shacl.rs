@@ -726,10 +726,9 @@ async fn fast_forward_into_an_ungoverned_target_is_not_validated() {
 
 /// The adopted commits are checked against the config the target has before
 /// the merge, whatever they do to it, as a transaction's own config writes do
-/// not apply to that transaction. A branch that switches SHACL off in its
-/// config and then writes what main's shapes reject is refused; one that
-/// writes that data and then switches SHACL on fast-forwards into an
-/// ungoverned main unvalidated (the setting governs the next write).
+/// not apply to that transaction: a branch that switches SHACL off in its
+/// config and then writes what main's shapes reject is refused. Into a target
+/// whose config enables nothing, the same data fast-forwards unvalidated.
 #[tokio::test]
 async fn fast_forward_is_validated_against_the_config_it_merges_into() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -771,20 +770,21 @@ async fn fast_forward_is_validated_against_the_config_it_merges_into() {
         .await
         .unwrap();
     let dev = fluree.ledger("mydb:dev").await.unwrap();
-    let dev = fluree
+    fluree
         .insert(dev, &insert_name("ex:alice", "B"))
         .await
-        .unwrap()
-        .ledger;
-    fluree
-        .insert(dev, &support::shacl_enabled_config_node())
+        .unwrap();
+    let preview = fluree
+        .merge_preview("mydb", "dev", None)
         .await
-        .expect("dev switches SHACL on");
-    fluree
+        .expect("preview");
+    assert!(preview.fast_forward);
+    assert!(preview.validation.is_none(), "{:?}", preview.validation);
+    let report = fluree
         .merge_branch("mydb", "dev", None, ConflictStrategy::default())
         .await
         .expect("main's pre-merge config governs nothing");
-    assert_eq!(names(&fluree, "mydb:main").await, ["A", "B"]);
+    assert!(report.fast_forward);
 }
 
 /// Seed `mydb:main` with `ex:email f:enforceUnique true`, the config that

@@ -232,6 +232,8 @@ A transaction that writes ledger config is checked before it commits, and refuse
 
 Writing the same value again is not refused. The checks read only the transaction, the current config graph, and (for a new link to a group) that group's statements in the other graphs.
 
+Merges (fast-forwards included), rebases and reverts re-check the integrity of the target's config groups: a result that would leave a setting group's fields outside the config graph, or a single-valued setting with two values, is refused with the same `Parse error`, naming the group. A branch that carries a split config from before these checks is refused until the config is repaired ([Repairing a config split across graphs](#repairing-a-config-split-across-graphs)).
+
 A transaction that writes only the config graph is never validated against SHACL shapes or uniqueness constraints, and never needs a shapes, schema or constraints source to be available: you can always turn SHACL or uniqueness off, or point a source somewhere else, even when the source it names is gone. Policy is the exception. A config write is still subject to the ledger's policy, including a policy source in another ledger, because policy decides who may change the config.
 
 ## Repairing a config split across graphs

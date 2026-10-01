@@ -4,9 +4,11 @@
 //! their commits on a path parallel to the transaction pipeline, staging
 //! flakes straight into a [`StagedLedger`]. This module runs the checks the
 //! transaction path runs on a staged view (`check_staged_write`: SHACL and
-//! uniqueness under the target's configuration), so a branch operation whose
-//! resulting state the ledger's configuration rejects fails exactly as a
-//! transaction producing that state would.
+//! uniqueness under the target's configuration, and the staged-config
+//! guard), so a branch operation whose resulting state the ledger's
+//! configuration rejects fails exactly as a transaction producing that state
+//! would. R2 is enforced when the data is written; branch operations
+//! re-check the integrity of the target's config groups (R1/R3).
 //!
 //! A branch operation is authoring, not replay: the combination it stages
 //! onto the target is new state nobody has validated. So, unlike commit
@@ -26,7 +28,8 @@ use std::collections::{BTreeSet, HashMap};
 ///
 /// Warn-mode violations are logged by the validator and never surface here,
 /// matching the transaction path. Only a rejection produces an outcome: a
-/// SHACL violation report, or a uniqueness violation.
+/// SHACL violation report, a uniqueness violation, or a refusal of the
+/// staged-config guard.
 #[derive(Debug, Default)]
 pub(crate) struct BranchOpValidation {
     /// The error a transaction producing the same state would fail with,
@@ -40,7 +43,8 @@ impl BranchOpValidation {
     }
 
     /// The rejection as a report for a preview: the SHACL violation report,
-    /// or the uniqueness violation's message. `None` when the view conforms.
+    /// or the uniqueness violation's or config refusal's message. `None` when
+    /// the view conforms.
     pub(crate) fn report(&self) -> Option<String> {
         self.rejection.as_ref().map(|rejection| match rejection {
             #[cfg(feature = "shacl")]
@@ -57,8 +61,8 @@ impl BranchOpValidation {
 
     /// Like [`Self::into_result`], with `describe` wrapping a SHACL report in
     /// the operation's own context (which commit a rebase stopped on, say).
-    /// A uniqueness violation already names the values that collide and is
-    /// returned as it is.
+    /// A uniqueness violation or config refusal already names what it refuses
+    /// and is returned as it is.
     pub(crate) fn into_result_with(self, describe: impl FnOnce(String) -> String) -> Result<()> {
         match self.rejection {
             None => Ok(()),
@@ -149,7 +153,7 @@ impl crate::Fluree {
             .map(|(g_id, (_, iri))| (g_id, iri))
             .collect();
         let outcome = self
-            .validate_branch_op_view(&mut view, namespace_delta, &new_graph_iris)
+            .validate_branch_op_view(&mut view, namespace_delta, &new_graph_iris, op)
             .await?;
         Ok((view, outcome))
     }
@@ -200,21 +204,20 @@ impl crate::Fluree {
             .map(Some)
     }
 
-    /// The target's state before a fast-forward, when its configuration
-    /// governs writes ([`governs_writes`]); `None` for an ungoverned target,
-    /// which fast-forwards without validation as before.
+    /// The target's state before a fast-forward, and whether its
+    /// configuration governs writes ([`governs_writes`]).
     ///
-    /// A fast-forward adopts the source's commits as they are, so a governed
-    /// target validates them first, against its configuration as it is
-    /// before the merge, exactly as it would a transaction writing the same
-    /// change. The state comes from the ledger cache when it holds the target
-    /// at `record`'s head, else from storage.
-    pub(crate) async fn governed_fast_forward_base<C>(
+    /// A fast-forward adopts the source's commits as they are, so the target
+    /// checks them first ([`Self::validate_fast_forward`]), against its
+    /// configuration as it is before the merge, exactly as it would a
+    /// transaction writing the same change. The state comes from the ledger
+    /// cache when it holds the target at `record`'s head, else from storage.
+    pub(crate) async fn fast_forward_base<C>(
         &self,
         target_id: &fluree_db_core::LedgerId,
         target_store: &C,
         record: &fluree_db_nameservice::NsRecord,
-    ) -> Result<Option<LedgerState>>
+    ) -> Result<FastForwardBase>
     where
         C: fluree_db_core::ContentStore + Clone + 'static,
     {
@@ -232,46 +235,56 @@ impl crate::Fluree {
             }
         };
         let config = crate::tx::load_transaction_config(&state).await?;
-        Ok(config.is_some_and(|c| governs_writes(&c)).then_some(state))
+        let governed = config.is_some_and(|c| governs_writes(&c));
+        Ok(FastForwardBase { state, governed })
     }
 
-    /// Validate a fast-forward onto `base` (from
-    /// [`Self::governed_fast_forward_base`]): stage the adopted commits' net
-    /// change (the source's line since the target's head) onto it and run the
-    /// transaction checks under its configuration.
+    /// Check a fast-forward onto `base` (from [`Self::fast_forward_base`]):
+    /// stage the adopted commits' net change (the source's line since the
+    /// target's head) onto it and run the transaction checks under its
+    /// configuration. `None` when there is nothing to check: the target
+    /// governs no writes and the change carries no config settings, so it
+    /// fast-forwards as before.
     pub(crate) async fn validate_fast_forward(
         &self,
-        base: LedgerState,
+        base: FastForwardBase,
         source_store: &impl fluree_db_core::ContentStore,
         diff: &fluree_db_core::BranchDiff,
-    ) -> Result<BranchOpValidation> {
+    ) -> Result<Option<BranchOpValidation>> {
         let (data, _keys) =
             crate::merge::collect_commit_data(source_store, &diff.source.commits, &diff.source.own)
                 .await?;
+        if !base.governed && !carries_config_settings(&data.flakes) {
+            return Ok(None);
+        }
         let (_view, outcome) = self
             .stage_validated(
-                base,
+                base.state,
                 data.flakes,
                 &data.namespace_delta,
                 &data.graph_iris,
                 "merge",
             )
             .await?;
-        Ok(outcome)
+        Ok(Some(outcome))
     }
 
     /// Run the checks a transaction runs on its staged view
     /// ([`crate::tx::check_staged_write`]) against the target's
     /// configuration: SHACL and uniqueness, under the target's pre-operation
-    /// config. `new_graph_iris` names graphs the incoming commits create,
-    /// which the target's registry does not know yet.
+    /// config, and the staged-config guard's re-check of the target's config
+    /// groups. `new_graph_iris` names graphs the incoming commits create,
+    /// which the target's registry does not know yet; `op` names the
+    /// operation in refusals.
     async fn validate_branch_op_view(
         &self,
         view: &mut StagedLedger,
         namespace_delta: &HashMap<u16, String>,
         new_graph_iris: &HashMap<GraphId, String>,
+        op: &'static str,
     ) -> Result<BranchOpValidation> {
-        use crate::tx::{check_staged_write, WriteChecks};
+        use crate::config_guard::GuardScope;
+        use crate::tx::{check_staged_write, StagedWriteError, WriteChecks};
         use fluree_db_transact::NamespaceRegistry;
 
         if !view.has_staged() {
@@ -321,18 +334,41 @@ impl crate::Fluree {
             view,
             &mut staged_ns,
             &graph_delta,
-            WriteChecks::default(),
+            WriteChecks::new(GuardScope::BranchOperation(op)),
             &mut resolve_ctx,
         )
         .await
         {
             Ok(_governed) => Ok(BranchOpValidation::default()),
-            Err(rejection) if is_rejection(&rejection) => Ok(BranchOpValidation {
+            Err(StagedWriteError::Rejected(rejection)) => Ok(BranchOpValidation {
                 rejection: Some(rejection),
             }),
-            Err(e) => Err(e.into()),
+            Err(StagedWriteError::Failed(e)) => Err(e.into()),
         }
     }
+}
+
+/// A fast-forward target's state before the merge.
+pub(crate) struct FastForwardBase {
+    /// The target's state at the merge's head.
+    pub(crate) state: LedgerState,
+    /// Whether its configuration governs writes ([`governs_writes`]).
+    pub(crate) governed: bool,
+}
+
+/// Whether `flakes` carry anything the staged-config guard checks on a branch
+/// operation: an `f:` setting, or a type in the `f:` vocabulary. Every
+/// refusal it can make needs one of them, so a change without any is
+/// accepted unchecked.
+fn carries_config_settings(flakes: &[Flake]) -> bool {
+    use fluree_vocab::namespaces::{FLUREE_DB, RDF};
+    flakes.iter().any(|flake| {
+        flake.p.namespace_code == FLUREE_DB
+            || (flake.p.namespace_code == RDF
+                && &*flake.p.name == fluree_vocab::rdf_names::TYPE
+                && matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o)
+                    if o.namespace_code == FLUREE_DB))
+    })
 }
 
 /// Whether a ledger configuration governs writes: SHACL or uniqueness
@@ -357,16 +393,4 @@ pub(crate) fn governs_writes(config: &fluree_db_core::ledger_config::LedgerConfi
             .graph_overrides
             .iter()
             .any(|graph| shacl(&graph.shacl) || unique(&graph.transact))
-}
-
-/// Whether `error` is a validation rejection (the staged state breaks the
-/// ledger's shapes or uniqueness constraints) rather than a failure to
-/// validate at all.
-fn is_rejection(error: &TransactError) -> bool {
-    match error {
-        TransactError::UniqueConstraintViolation { .. } => true,
-        #[cfg(feature = "shacl")]
-        TransactError::ShaclViolation(_) => true,
-        _ => false,
-    }
 }

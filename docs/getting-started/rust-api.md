@@ -1147,9 +1147,10 @@ async fn main() -> Result<()> {
 
 `validation` is present for every non-fast-forward preview unless
 `MergePreviewOpts::include_validation` is `false`, and for a fast-forward
-when the target's config enables SHACL or uniqueness: the merge validates
-the commits it adopts against the target's config as it is before the merge.
-A fast-forward into a target that enables neither carries none.
+when the target's config enables SHACL or uniqueness, or the commits it
+adopts carry config settings (`f:` predicates): the merge checks them
+against the target's config as it is before the merge. Any other
+fast-forward carries none.
 
 #### Tuning the preview
 

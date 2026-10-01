@@ -8,11 +8,18 @@
 //! never read, and of two values for one setting the reader picks one. Each
 //! is refused here instead, with a message saying how to write it.
 //!
+//! The checks: R1, a config group split across graphs (in one transaction or
+//! across two); R2, an `f:LedgerConfig`/`f:GraphConfig` typed outside the
+//! config graph; R3, a second value for a single-valued setting or a second
+//! `f:LedgerConfig` subject; and unrecognized `f:reasoningModes` values.
+//!
 //! The guard reads only the staged flakes and the pre-transaction config
 //! graph. It resolves no shapes, schema, constraints or policy artifact, so a
-//! config repair is judged by it alone. It runs where transactions are
-//! authored (JSON-LD and SPARQL transactions, Turtle insert); commit replay and
-//! bulk import carry already-authored history and skip it.
+//! config repair is judged by it alone. It runs every check where transactions
+//! are authored (JSON-LD and SPARQL transactions, Turtle insert). R2 is
+//! enforced when the data is written; branch operations (merge, rebase,
+//! revert) re-check the integrity of the target's config groups (R1/R3).
+//! Commit replay and bulk import carry already-authored history and skip it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -100,9 +107,57 @@ const SINGLE_VALUED: &[&str] = &[
 /// collection — a malformed cyclic list must not spin.
 const MAX_STAGED_REASONING_LIST_LEN: usize = 64;
 
+/// Which checks the guard runs, by what is writing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GuardScope {
+    /// A transaction authoring the write: every check.
+    Authoring,
+    /// A branch operation (`merge`, `rebase`, `revert`, named here for
+    /// messages) staging commits onto its target. R2 is enforced when the
+    /// data is written; branch operations re-check the integrity of the
+    /// target's config groups (R1/R3).
+    BranchOperation(&'static str),
+}
+
+/// Why the guard did not accept a staged write.
+#[derive(Debug)]
+pub(crate) enum GuardError {
+    /// The staged state breaks a config rule; the message says which.
+    Refused(String),
+    /// The guard could not read what it checks against.
+    Failed(TransactError),
+}
+
+impl From<TransactError> for GuardError {
+    fn from(error: TransactError) -> Self {
+        GuardError::Failed(error)
+    }
+}
+
+/// What a branch operation is told when it would split one of the target's
+/// config groups: the group, and the repair. Never the graph the fields would
+/// land in.
+fn split_group_for_branch_op(
+    names: &Names<'_>,
+    op: &str,
+    node: &Sid,
+    edge: &Sid,
+    fields: &str,
+) -> String {
+    format!(
+        "config group {} (the value of {} in the config graph) would have fields {} outside \
+         the config graph, where they are not read; a {op} may not split a config group: \
+         repair the configuration first (see \"Repairing a config split across graphs\" in \
+         the ledger config docs)",
+        names.term(node),
+        names.term(edge),
+        fields,
+    )
+}
+
 /// Check what a staged transaction writes into the ledger config.
 ///
-/// Refuses, with `TransactError::Parse`:
+/// Refuses (a transaction gets the message as a `Parse error`):
 /// - a config group split across graphs: a config edge written into the
 ///   config graph whose target node gets its `f:` fields in another graph,
 ///   in this transaction or across two;
@@ -117,12 +172,16 @@ const MAX_STAGED_REASONING_LIST_LEN: usize = 64;
 /// a user graph: one pass over the staged flakes establishes that, and
 /// nothing else is read.
 ///
-/// `ns` and `graph_delta` name terms and graphs in messages.
+/// `scope` picks the checks: a branch operation runs R1 and R3 only, and its
+/// messages name the target's config group and the repair. `ns` and
+/// `graph_delta` name terms and graphs in messages.
 pub(crate) async fn validate_staged_config(
     view: &StagedLedger,
     ns: &NamespaceRegistry,
     graph_delta: &FxHashMap<u16, String>,
-) -> Result<(), TransactError> {
+    scope: GuardScope,
+) -> Result<(), GuardError> {
+    let authoring = scope == GuardScope::Authoring;
     let rdf_type = Sid::new(RDF, fluree_vocab::rdf_names::TYPE);
     let modes_p = fluree_sid(config_iris::REASONING_MODES);
     let (mut writes_config, mut types_config, mut asserts_modes) = (false, false, false);
@@ -137,6 +196,7 @@ pub(crate) async fn validate_staged_config(
             && flake.p.namespace_code == FLUREE_DB
             && !crate::export::is_system_graph(g_id);
     }
+    let (types_config, asserts_modes) = (authoring && types_config, authoring && asserts_modes);
     if !(writes_config || types_config || asserts_modes || writes_fields_elsewhere) {
         return Ok(());
     }
@@ -146,11 +206,11 @@ pub(crate) async fn validate_staged_config(
         refuse_config_typed_outside_config_graph(view, &names, &rdf_type)?;
     }
     if writes_config {
-        refuse_split_groups(view, &names)?;
-        refuse_second_values(view, &names, &rdf_type).await?;
+        refuse_split_groups(view, &names, scope)?;
+        refuse_second_values(view, &names, &rdf_type, scope).await?;
     }
     if writes_config || writes_fields_elsewhere {
-        refuse_groups_split_across_transactions(view, &names).await?;
+        refuse_groups_split_across_transactions(view, &names, scope).await?;
     }
     if asserts_modes {
         validate_reasoning_modes(view, &modes_p)?;
@@ -172,7 +232,7 @@ fn refuse_config_typed_outside_config_graph(
     view: &StagedLedger,
     names: &Names<'_>,
     rdf_type: &Sid,
-) -> Result<(), TransactError> {
+) -> Result<(), GuardError> {
     let config_types = [
         fluree_sid(config_iris::LEDGER_CONFIG),
         fluree_sid(config_iris::GRAPH_CONFIG),
@@ -183,7 +243,7 @@ fn refuse_config_typed_outside_config_graph(
         }
         if let FlakeValue::Ref(class) = &flake.o {
             if config_types.contains(class) {
-                return Err(TransactError::Parse(format!(
+                return Err(GuardError::Refused(format!(
                     "{} is typed {} in {}, where it has no effect: ledger configuration is \
                      read only from the config graph <{}>; write it into that graph",
                     names.term(&flake.s),
@@ -199,7 +259,11 @@ fn refuse_config_typed_outside_config_graph(
 
 /// A config edge written into the config graph whose target node gets `f:`
 /// fields in another graph: the reader sees the group without them.
-fn refuse_split_groups(view: &StagedLedger, names: &Names<'_>) -> Result<(), TransactError> {
+fn refuse_split_groups(
+    view: &StagedLedger,
+    names: &Names<'_>,
+    scope: GuardScope,
+) -> Result<(), GuardError> {
     let edges: Vec<Sid> = CONFIG_EDGES.iter().map(|iri| fluree_sid(iri)).collect();
     let mut groups: HashMap<&Sid, &Sid> = HashMap::new();
     for (g_id, flake) in view.staged_flakes_by_graph() {
@@ -226,16 +290,22 @@ fn refuse_split_groups(view: &StagedLedger, names: &Names<'_>) -> Result<(), Tra
         None => Ok(()),
         Some(((node, g_id), fields)) => {
             let fields: BTreeSet<String> = fields.into_iter().map(|p| names.term(p)).collect();
-            Err(TransactError::Parse(format!(
-                "config group {} (the value of {} in the config graph) has its fields {} in {}; \
-                 a group is read only from the config graph <{}>, so write its fields into \
-                 that graph too",
-                names.term(node),
-                names.term(groups[node]),
-                fields.into_iter().collect::<Vec<_>>().join(", "),
-                names.graph(g_id),
-                names.config_graph,
-            )))
+            let fields = fields.into_iter().collect::<Vec<_>>().join(", ");
+            Err(GuardError::Refused(match scope {
+                GuardScope::Authoring => format!(
+                    "config group {} (the value of {} in the config graph) has its fields {} in \
+                     {}; a group is read only from the config graph <{}>, so write its fields \
+                     into that graph too",
+                    names.term(node),
+                    names.term(groups[node]),
+                    fields,
+                    names.graph(g_id),
+                    names.config_graph,
+                ),
+                GuardScope::BranchOperation(op) => {
+                    split_group_for_branch_op(names, op, node, groups[node], &fields)
+                }
+            }))
         }
     }
 }
@@ -256,7 +326,8 @@ fn refuse_split_groups(view: &StagedLedger, names: &Names<'_>) -> Result<(), Tra
 async fn refuse_groups_split_across_transactions(
     view: &StagedLedger,
     names: &Names<'_>,
-) -> Result<(), TransactError> {
+    scope: GuardScope,
+) -> Result<(), GuardError> {
     let edges: Vec<Sid> = CONFIG_EDGES.iter().map(|iri| fluree_sid(iri)).collect();
     let mut new_edges: BTreeMap<&Sid, &Sid> = BTreeMap::new();
     let mut retracted_edges: BTreeSet<(&Sid, &Sid, &Sid)> = BTreeSet::new();
@@ -306,16 +377,21 @@ async fn refuse_groups_split_across_transactions(
         }
         for ((node, g_id), fields) in &fields_elsewhere {
             if let Some(edge) = pointed_at.get(*node) {
-                return Err(TransactError::Parse(format!(
-                    "config group {} (the value of {} in the config graph) would get its fields \
-                     {} in {}; a group is read only from the config graph <{}>, so write its \
-                     fields into that graph",
-                    names.term(node),
-                    names.term(edge),
-                    fields_list(fields),
-                    names.graph(*g_id),
-                    names.config_graph,
-                )));
+                return Err(GuardError::Refused(match scope {
+                    GuardScope::Authoring => format!(
+                        "config group {} (the value of {} in the config graph) would get its \
+                         fields {} in {}; a group is read only from the config graph <{}>, so \
+                         write its fields into that graph",
+                        names.term(node),
+                        names.term(edge),
+                        fields_list(fields),
+                        names.graph(*g_id),
+                        names.config_graph,
+                    ),
+                    GuardScope::BranchOperation(op) => {
+                        split_group_for_branch_op(names, op, node, edge, &fields_list(fields))
+                    }
+                }));
             }
         }
     }
@@ -349,16 +425,21 @@ async fn refuse_groups_split_across_transactions(
                 .map(|f| &f.p)
                 .collect();
             if !fields.is_empty() {
-                return Err(TransactError::Parse(format!(
-                    "config group {} (the value of {} written into the config graph) already has \
-                     fields {} in {}; a group is read only from the config graph <{}>, so move \
-                     them into that graph in the same transaction",
-                    names.term(node),
-                    names.term(edge),
-                    fields_list(&fields),
-                    names.graph(g_id),
-                    names.config_graph,
-                )));
+                return Err(GuardError::Refused(match scope {
+                    GuardScope::Authoring => format!(
+                        "config group {} (the value of {} written into the config graph) \
+                         already has fields {} in {}; a group is read only from the config \
+                         graph <{}>, so move them into that graph in the same transaction",
+                        names.term(node),
+                        names.term(edge),
+                        fields_list(&fields),
+                        names.graph(g_id),
+                        names.config_graph,
+                    ),
+                    GuardScope::BranchOperation(op) => {
+                        split_group_for_branch_op(names, op, node, edge, &fields_list(&fields))
+                    }
+                }));
             }
         }
     }
@@ -371,7 +452,8 @@ async fn refuse_second_values(
     view: &StagedLedger,
     names: &Names<'_>,
     rdf_type: &Sid,
-) -> Result<(), TransactError> {
+    scope: GuardScope,
+) -> Result<(), GuardError> {
     let single: Vec<Sid> = SINGLE_VALUED.iter().map(|iri| fluree_sid(iri)).collect();
     let ledger_config = fluree_sid(config_iris::LEDGER_CONFIG);
     type Value = (FlakeValue, Sid);
@@ -428,9 +510,17 @@ async fn refuse_second_values(
             }
         }
         if values.len() > 1 {
-            return Err(TransactError::Parse(format!(
-                "{} would have {} values for {}, which takes one; use upsert, or delete the old \
-                 value in the same transaction",
+            let remedy = match scope {
+                GuardScope::Authoring => {
+                    "use upsert, or delete the old value in the same transaction".to_string()
+                }
+                GuardScope::BranchOperation(op) => format!(
+                    "a {op} may not leave a setting with two values: keep one first (see \
+                     \"What a config write is checked for\" in the ledger config docs)"
+                ),
+            };
+            return Err(GuardError::Refused(format!(
+                "{} would have {} values for {}, which takes one; {remedy}",
                 names.term(subject),
                 values.len(),
                 names.term(predicate),
@@ -445,16 +535,27 @@ async fn refuse_second_values(
             base.t(),
         )
         .await
-        .map_err(|e| TransactError::Parse(format!("failed to load ledger config: {e}")))?
+        .map_err(|e| {
+            GuardError::Failed(TransactError::Parse(format!(
+                "failed to load ledger config: {e}"
+            )))
+        })?
         .into_iter()
         .filter(|s| !untyped.contains(s))
         .collect();
         subjects.extend(typed.into_iter().cloned());
         if subjects.len() > 1 {
             let listed: Vec<String> = subjects.iter().map(|s| names.term(s)).collect();
-            return Err(TransactError::Parse(format!(
+            let remedy = match scope {
+                GuardScope::Authoring => "so add settings to the existing subject".to_string(),
+                GuardScope::BranchOperation(op) => format!(
+                    "and a {op} may not add a second one: keep one first (see \"What a config \
+                     write is checked for\" in the ledger config docs)"
+                ),
+            };
+            return Err(GuardError::Refused(format!(
                 "the config graph would hold {} f:LedgerConfig subjects ({}); a ledger has one, \
-                 so add settings to the existing subject",
+                 {remedy}",
                 subjects.len(),
                 listed.join(", "),
             )));
@@ -503,7 +604,7 @@ async fn graph_flakes(
 /// with no signal. Handles the same value shapes as the config reader — a
 /// direct string literal, a direct mode IRI, and an RDF collection of either —
 /// collected from this transaction's own staged flakes.
-fn validate_reasoning_modes(view: &StagedLedger, modes_p: &Sid) -> Result<(), TransactError> {
+fn validate_reasoning_modes(view: &StagedLedger, modes_p: &Sid) -> Result<(), GuardError> {
     let snapshot = &view.base().snapshot;
     let flakes = view.staged_flakes();
 
@@ -572,7 +673,7 @@ fn validate_reasoning_modes(view: &StagedLedger, modes_p: &Sid) -> Result<(), Tr
     }
 
     fluree_db_query::ir::ReasoningModes::validate_mode_names(&candidates).map_err(|e| {
-        TransactError::Parse(format!("invalid f:reasoningModes in ledger #config: {e}"))
+        GuardError::Refused(format!("invalid f:reasoningModes in ledger #config: {e}"))
     })
 }
 

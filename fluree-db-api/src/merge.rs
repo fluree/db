@@ -301,16 +301,16 @@ impl crate::Fluree {
         // its own, so its `t` keeps rising.
         let is_fast_forward = diff.as_ref().is_none_or(|d| d.fast_forward);
 
-        // A fast-forward into a target whose configuration governs writes
-        // (SHACL or uniqueness) validates the adopted commits first, against
-        // that configuration as it is before the merge
-        // (`governed_fast_forward_base`). Read now, while the ledger cache may
-        // still hold the target.
+        // A fast-forward checks the adopted commits first, against the
+        // target's configuration as it is before the merge, when that
+        // configuration governs writes (SHACL or uniqueness) or the commits
+        // carry config settings (`fast_forward_base`). Read now, while the
+        // ledger cache may still hold the target.
         let fast_forward_base = match (&diff, is_fast_forward) {
-            (Some(_), true) => {
-                self.governed_fast_forward_base(&target_id, &target_store, &target_record)
-                    .await?
-            }
+            (Some(_), true) => Some(
+                self.fast_forward_base(&target_id, &target_store, &target_record)
+                    .await?,
+            ),
             _ => None,
         };
 
@@ -511,11 +511,10 @@ impl crate::Fluree {
         })
     }
 
-    /// Fast-forward merge: validate the adopted commits when the target is
-    /// governed (`base` is its pre-merge state, from
-    /// [`Self::governed_fast_forward_base`]), copy commits from source to
-    /// target, and return a `StagedMerge` whose apply step just advances the
-    /// target's HEAD ref.
+    /// Fast-forward merge: check the adopted commits (`base` is the target's
+    /// pre-merge state, from [`Self::fast_forward_base`]), copy commits from
+    /// source to target, and return a `StagedMerge` whose apply step just
+    /// advances the target's HEAD ref.
     #[allow(clippy::too_many_arguments)]
     async fn build_merge_ff(
         &self,
@@ -526,7 +525,7 @@ impl crate::Fluree {
         source_record: &NsRecord,
         source_store: &impl ContentStore,
         diff: Option<&BranchDiff>,
-        base: Option<LedgerState>,
+        base: Option<crate::branch_validation::FastForwardBase>,
         source_head_id: ContentId,
         source_head_t: i64,
         rollback_snapshot: NsRecordSnapshot,
@@ -539,9 +538,9 @@ impl crate::Fluree {
         // lands on the target in between fails the merge rather than slipping
         // past the validation.
         if let (Some(base), Some(diff)) = (base, diff) {
-            self.validate_fast_forward(base, source_store, diff)
-                .await?
-                .into_result()?;
+            if let Some(outcome) = self.validate_fast_forward(base, source_store, diff).await? {
+                outcome.into_result()?;
+            }
         }
         // A target with no commits of its own takes the source's whole
         // history, newest `t` last. Otherwise it takes what the diff says it

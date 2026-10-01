@@ -1649,8 +1649,7 @@ async fn enforce_unique_after_staging(
 }
 
 /// What a write brings to the checks on its staged view. A write with no
-/// request surface (a branch operation) takes the default.
-#[derive(Default)]
+/// request surface (a branch operation) brings only its guard scope.
 pub(crate) struct WriteChecks<'a> {
     /// The request's SHACL inputs (inline shapes, requested mode, identity,
     /// policy).
@@ -1661,26 +1660,89 @@ pub(crate) struct WriteChecks<'a> {
     pub(crate) tracker: Option<&'a Tracker>,
     /// The request's `@context`, to compact violation reports against.
     pub(crate) txn_context: Option<&'a JsonValue>,
-    /// Whether the staged-config guard runs: on every authoring lane. Branch
-    /// operations do not run it here.
-    pub(crate) config_guard: bool,
+    /// Which staged-config checks run: all of them where a transaction is
+    /// authored. R2 is enforced when the data is written; branch operations
+    /// re-check the integrity of the target's config groups (R1/R3).
+    pub(crate) guard: crate::config_guard::GuardScope,
+}
+
+impl WriteChecks<'_> {
+    /// No request surface, the guard in `guard`'s scope.
+    pub(crate) fn new(guard: crate::config_guard::GuardScope) -> Self {
+        Self {
+            #[cfg(feature = "shacl")]
+            shacl_request: ShaclRequest::default(),
+            unique_properties: None,
+            tracker: None,
+            txn_context: None,
+            guard,
+        }
+    }
+}
+
+/// Why a staged write may not commit.
+#[derive(Debug)]
+pub(crate) enum StagedWriteError {
+    /// The staged state breaks the ledger's shapes, uniqueness constraints or
+    /// config rules: the error a write producing it fails with, and what a
+    /// branch operation's preview reports.
+    Rejected(fluree_db_transact::TransactError),
+    /// The checks could not run.
+    Failed(fluree_db_transact::TransactError),
+}
+
+impl StagedWriteError {
+    /// A SHACL or uniqueness check's error: a violation rejects the state;
+    /// anything else is a failure to check it.
+    fn from_check(error: fluree_db_transact::TransactError) -> Self {
+        use fluree_db_transact::TransactError;
+        match error {
+            #[cfg(feature = "shacl")]
+            e @ TransactError::ShaclViolation(_) => StagedWriteError::Rejected(e),
+            e @ TransactError::UniqueConstraintViolation { .. } => StagedWriteError::Rejected(e),
+            e => StagedWriteError::Failed(e),
+        }
+    }
+}
+
+impl From<crate::config_guard::GuardError> for StagedWriteError {
+    fn from(error: crate::config_guard::GuardError) -> Self {
+        use crate::config_guard::GuardError;
+        match error {
+            GuardError::Refused(message) => {
+                StagedWriteError::Rejected(fluree_db_transact::TransactError::Parse(message))
+            }
+            GuardError::Failed(e) => StagedWriteError::Failed(e),
+        }
+    }
+}
+
+impl From<StagedWriteError> for fluree_db_transact::TransactError {
+    fn from(error: StagedWriteError) -> Self {
+        match error {
+            StagedWriteError::Rejected(e) | StagedWriteError::Failed(e) => e,
+        }
+    }
 }
 
 /// The checks every write runs on its staged view before it may commit, in
 /// one place so write lanes cannot drift apart: one pre-transaction config
-/// read ([`enforcement_config`]), then SHACL, uniqueness, and (for authoring
-/// lanes) the staged-config guard. `ns` is the staged namespace registry
-/// (its delta holds the codes the write introduces) and `graph_delta` the
-/// staged named graphs' IRIs. Returns whether a governance check ran, which
-/// commit provenance records.
+/// read ([`enforcement_config`]), then SHACL, uniqueness, and the
+/// staged-config guard in the lane's scope. `ns` is the staged namespace
+/// registry (its delta holds the codes the write introduces) and
+/// `graph_delta` the staged named graphs' IRIs. Returns whether a governance
+/// check ran, which commit provenance records; a rejection is told apart from
+/// a failure to check.
 pub(crate) async fn check_staged_write(
     view: &mut StagedLedger,
     ns: &mut NamespaceRegistry,
     graph_delta: &FxHashMap<u16, String>,
     checks: WriteChecks<'_>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
-) -> std::result::Result<bool, fluree_db_transact::TransactError> {
-    let config = enforcement_config(view).await?;
+) -> std::result::Result<bool, StagedWriteError> {
+    let config = enforcement_config(view)
+        .await
+        .map_err(StagedWriteError::Failed)?;
 
     #[cfg(feature = "shacl")]
     let validated = Box::pin(validate_staged_shacl(
@@ -1693,7 +1755,8 @@ pub(crate) async fn check_staged_write(
         checks.tracker,
         checks.txn_context,
     ))
-    .await?;
+    .await
+    .map_err(StagedWriteError::from_check)?;
     #[cfg(not(feature = "shacl"))]
     let validated = {
         let _ = (checks.tracker, checks.txn_context);
@@ -1708,10 +1771,9 @@ pub(crate) async fn check_staged_write(
         ns,
         config.as_deref(),
     )
-    .await?;
-    if checks.config_guard {
-        crate::config_guard::validate_staged_config(view, ns, graph_delta).await?;
-    }
+    .await
+    .map_err(StagedWriteError::from_check)?;
+    crate::config_guard::validate_staged_config(view, ns, graph_delta, checks.guard).await?;
     Ok(validated || unique_enforced)
 }
 
@@ -2708,7 +2770,7 @@ impl crate::Fluree {
                 unique_properties: inline_unique_properties.as_deref(),
                 tracker,
                 txn_context,
-                config_guard: true,
+                guard: crate::config_guard::GuardScope::Authoring,
             },
             &mut resolve_ctx,
         ))
@@ -3956,13 +4018,12 @@ impl crate::Fluree {
             &rustc_hash::FxHashMap::default(),
             WriteChecks {
                 tracker,
-                config_guard: true,
-                ..WriteChecks::default()
+                ..WriteChecks::new(crate::config_guard::GuardScope::Authoring)
             },
             &mut resolve_ctx,
         )
         .await
-        .map_err(ApiError::from)?;
+        .map_err(|e| ApiError::from(fluree_db_transact::TransactError::from(e)))?;
 
         // Plain Turtle doesn't support named graphs or txn-meta extraction (TriG support handles these)
         Ok(StageResult {
