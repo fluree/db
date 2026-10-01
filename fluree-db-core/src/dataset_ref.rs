@@ -882,6 +882,26 @@ impl<'a> TargetLedger<'a> {
         self.reserved_urn(address.graph())
     }
 
+    /// The registry IRI a graph-management verb (CLEAR, DROP, ADD, COPY,
+    /// MOVE) reads `iri` as, when `iri` is this ledger's own address with no
+    /// time and a graph after `#`: `L#<g>` is the graph `<g>`, as in every
+    /// other update position, and the address with a reserved keyword is that
+    /// reserved graph ([`Self::reserved_graph_iri`]). `None` for anything
+    /// else, the address itself (`L`, `L#default`) included: the verbs name
+    /// graphs by their registry IRI, so `DROP GRAPH <L>` is the graph
+    /// registered under `L`, never the default graph.
+    pub fn graph_management_iri(&self, iri: &str) -> Option<String> {
+        let address = self.own_address_reading(iri)?;
+        if address.at().is_some() {
+            return None;
+        }
+        match address.graph() {
+            GraphSel::Named(graph) => Some(graph.as_str().to_string()),
+            GraphSel::Default => None,
+            reserved => self.reserved_urn(reserved),
+        }
+    }
+
     /// This ledger's `urn:fluree:` IRI for a reserved graph keyword.
     fn reserved_urn(&self, graph: &GraphSel) -> Option<String> {
         match graph {
@@ -1452,6 +1472,32 @@ mod tests {
             target.graph_position("L:main@t:1#config"),
             GraphPosition::NotAGraph
         );
+        // Graph management reads `L#<g>` as `<g>` and the address with a
+        // keyword as the reserved graph; the address alone stays as written.
+        for (written, registry_iri) in [
+            ("L:main#L:main#config", "L:main#config"),
+            ("urn:fluree:L#http://ex.org/g", "http://ex.org/g"),
+            ("L#txn-meta", "urn:fluree:L:main#txn-meta"),
+        ] {
+            assert_eq!(
+                target.graph_management_iri(written).as_deref(),
+                Some(registry_iri),
+                "{written}"
+            );
+        }
+        for as_written in [
+            "L:main",
+            "L",
+            "L:main#default",
+            "L:main@t:1#http://ex.org/g",
+            "http://ex.org/g",
+        ] {
+            assert_eq!(
+                target.graph_management_iri(as_written),
+                None,
+                "{as_written}"
+            );
+        }
     }
 
     /// `GRAPH ?g` lists a registered graph under a name that reads it back:

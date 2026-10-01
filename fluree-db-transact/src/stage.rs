@@ -1485,24 +1485,25 @@ async fn stage_graph_mgmt(
     NamespaceRegistry,
     rustc_hash::FxHashMap<u16, String>,
 )> {
-    // An address of this ledger with a reserved keyword (`L#config`,
-    // `L#txn-meta`) names that reserved graph here too, as its `urn:fluree:`
-    // form does (`TargetLedger::reserved_graph_iri`), so the reserved-graph
-    // guards below see it. Any other IRI keeps registry semantics.
+    // A graph named through this ledger's address reads as it does in every
+    // other update position (`TargetLedger::graph_management_iri`): `L#<g>`
+    // is the graph `<g>`, and the address with a reserved keyword is that
+    // reserved graph, which the guards below refuse. Any other IRI, the
+    // address itself included, keeps registry semantics.
     {
         let graph_lookup = ledger_graph_lookup(&ledger);
         let this_ledger = TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup);
-        let reserved = |iri: &mut String| {
-            if let Some(urn) = this_ledger.reserved_graph_iri(iri) {
-                *iri = urn;
+        let registry_iri = |iri: &mut String| {
+            if let Some(named) = this_ledger.graph_management_iri(iri) {
+                *iri = named;
             }
         };
         match &mut txn.graph_mgmt {
-            Some(GraphMgmtOp::Clear(GraphTarget::Graph(iri))) => reserved(iri),
+            Some(GraphMgmtOp::Clear(GraphTarget::Graph(iri))) => registry_iri(iri),
             Some(GraphMgmtOp::Transfer { from, to, .. }) => {
                 for sel in [from, to] {
                     if let GraphSel::Graph(iri) = sel {
-                        reserved(iri);
+                        registry_iri(iri);
                     }
                 }
             }
@@ -1511,7 +1512,7 @@ async fn stage_graph_mgmt(
         txn.write_graphs = std::mem::take(&mut txn.write_graphs)
             .into_iter()
             .map(|mut iri| {
-                reserved(&mut iri);
+                registry_iri(&mut iri);
                 iri
             })
             .collect();

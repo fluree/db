@@ -4294,6 +4294,86 @@ async fn test_a_graph_registered_under_a_reserved_keyword_address_is_reached_thr
     }
 }
 
+/// The graph-management verbs read a graph named through the ledger's address,
+/// `L#<g>`, as the graph `<g>`, so `ADD`, `COPY`, `MOVE` and `DROP` act on a
+/// graph an earlier version registered under `L#config` or `L#txn-meta`
+/// (built here, as in [`legacy_address_branch`], on a branch whose source
+/// wrote it under the branch's address), as a source and as a destination.
+/// `DROP GRAPH <L>` still names the graph registered under the address itself
+/// and leaves the default graph alone.
+#[tokio::test]
+async fn test_graph_management_reads_a_graph_named_through_the_address() {
+    let branch = "rkm:dev";
+    let copy = "http://example.org/copy";
+    let moved = "http://example.org/moved";
+    for keyword in ["config", "txn-meta"] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .stage_owned(genesis_ledger(&fluree, "rkm:main"))
+            .upsert_turtle(&format!(
+                "@prefix ex: <http://example.org/> .\n\
+                 ex:a ex:v \"default\" .\n\
+                 GRAPH <rkm:dev#{keyword}> {{ ex:a ex:v \"legacy\" . }}\n\
+                 GRAPH <rkm:dev> {{ ex:a ex:v \"legacy address\" . }}\n"
+            ))
+            .execute()
+            .await
+            .expect("fixture upsert");
+        fluree
+            .create_branch("rkm", "dev", None, None)
+            .await
+            .expect("create the branch");
+        let legacy = format!("{branch}#{keyword}");
+        let update = |sparql: String| commit_sparql(&fluree, branch, sparql);
+        let values = |graph: Option<&str>| {
+            let graph = graph.map(str::to_string);
+            let fluree = &fluree;
+            async move { ex_v_values(fluree, branch, graph.as_deref()).await }
+        };
+        assert_eq!(values(Some(&legacy)).await, ["legacy"]);
+        assert_eq!(values(Some(branch)).await, ["legacy address"]);
+
+        update(format!("ADD GRAPH <{branch}#{legacy}> TO DEFAULT")).await;
+        assert_eq!(values(None).await, ["default", "legacy"], "{keyword}: ADD");
+        update(format!(
+            "COPY GRAPH <{branch}#{legacy}> TO <{branch}#{copy}>"
+        ))
+        .await;
+        assert_eq!(values(Some(copy)).await, ["legacy"], "{keyword}: COPY");
+        update(format!("MOVE GRAPH <{branch}#{legacy}> TO <{moved}>")).await;
+        assert_eq!(values(Some(moved)).await, ["legacy"], "{keyword}: MOVE");
+        assert!(values(Some(&legacy)).await.is_empty(), "{keyword}: MOVE");
+        // Back in, naming the legacy graph as the destination.
+        update(format!("MOVE GRAPH <{moved}> TO <{branch}#{legacy}>")).await;
+        assert_eq!(
+            values(Some(&legacy)).await,
+            ["legacy"],
+            "{keyword}: MOVE TO"
+        );
+
+        update(format!("DROP GRAPH <{branch}#{legacy}>")).await;
+        assert!(values(Some(&legacy)).await.is_empty(), "{keyword}: DROP");
+        update(format!("DROP GRAPH <{branch}#{copy}>")).await;
+        assert!(values(Some(copy)).await.is_empty(), "{keyword}: DROP");
+        // The address alone: the graph registered under it, not the default graph.
+        update(format!("DROP GRAPH <{branch}>")).await;
+        assert!(values(Some(branch)).await.is_empty(), "{keyword}: DROP");
+        assert_eq!(values(None).await, ["default", "legacy"], "{keyword}");
+    }
+}
+
+/// Commit one SPARQL update on `ledger_id`, panicking with the update's text
+/// on an error.
+async fn commit_sparql(fluree: &fluree_db_api::Fluree, ledger_id: &str, sparql: String) {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(&sparql)
+        .commit()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+}
+
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| (*v).to_string()).collect()
 }
