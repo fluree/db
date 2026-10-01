@@ -349,10 +349,23 @@ impl Failures {
 
     /// The batched bound-object lane fired and never declined.
     fn object_probe_fired(&mut self, store: &SpanStore, before: usize, label: &str) {
+        self.object_probe(store, before, Probe::Fires, label);
+    }
+
+    /// The batched bound-object lane did what `want` says since `before`.
+    fn object_probe(&mut self, store: &SpanStore, before: usize, want: Probe, label: &str) {
         let seen = stamps(store, before, OBJECT_PROBE_SITE);
-        if !seen.iter().any(|o| o == "proceed") || seen.iter().any(|o| o != "proceed") {
+        let proceeded = seen.iter().any(|o| o == "proceed");
+        let declined = seen.iter().any(|o| o != "proceed");
+        let ok = match want {
+            Probe::Fires => proceeded && !declined,
+            Probe::Declines => declined && !proceeded,
+            Probe::DeclinesSome => declined,
+            Probe::Absent => seen.is_empty(),
+        };
+        if !ok {
             self.0.push(format!(
-                "{label}: `{OBJECT_PROBE_SITE}` must fire and never decline; stamps: {seen:?}"
+                "{label}: `{OBJECT_PROBE_SITE}` must be {want:?}; stamps: {seen:?}"
             ));
         }
     }
@@ -365,6 +378,22 @@ impl Failures {
             self.0.join("\n")
         );
     }
+}
+
+/// What OPTIONAL's batched bound-object lane must do for a query.
+#[derive(Clone, Copy, Debug)]
+enum Probe {
+    /// Answer every window: `proceed`, never a fallback.
+    Fires,
+    /// Decline and never answer: every window holds an object it cannot
+    /// probe (a literal), or the lane is not admitted.
+    Declines,
+    /// Decline each window holding an object it cannot probe (a literal, an
+    /// IRI bound as a predicate) and answer the others: at least one decline.
+    DeclinesSome,
+    /// Never consulted: the OPTIONAL's object is not its only correlation, or
+    /// the lane is not admitted.
+    Absent,
 }
 
 /// `(label, SPARQL body, projected variables, expected rows)`.
@@ -384,8 +413,8 @@ struct OptionalCase {
     /// slot; `None` when the scan is a subject seek by design.
     marker: Option<&'static str>,
     slot: Slot,
-    /// A ref-valued object correlation the batched lane must answer.
-    object_probe: bool,
+    /// What the batched bound-object lane must do.
+    probe: Probe,
 }
 
 const OPTIONAL_CASES: &[OptionalCase] = &[
@@ -396,7 +425,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         expected: &[&["s1", "c1"], &["s2", "c2"], &["s2", "c3"], &["s3", "-"]],
         marker: Some("name: \"subjectOf\""),
         slot: Slot::O,
-        object_probe: true,
+        probe: Probe::Fires,
     },
     OptionalCase {
         // The chunks come out of a batched join, which emits `EncodedSid` even
@@ -408,7 +437,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         expected: &[&["s1", "c1"], &["s2", "c2"], &["s2", "c3"], &["s3", "-"]],
         marker: Some("name: \"subjectOf\""),
         slot: Slot::O,
-        object_probe: true,
+        probe: Probe::Fires,
     },
     OptionalCase {
         label: "subject EncodedPid",
@@ -422,7 +451,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         ],
         marker: Some("name: \"label\""),
         slot: Slot::S,
-        object_probe: false,
+        probe: Probe::Absent,
     },
     OptionalCase {
         label: "object EncodedPid",
@@ -436,7 +465,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         ],
         marker: Some("name: \"mentions\""),
         slot: Slot::O,
-        object_probe: false,
+        probe: Probe::DeclinesSome,
     },
     OptionalCase {
         label: "predicate EncodedSid",
@@ -445,7 +474,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         expected: &[&["text", "chunk one"]],
         marker: Some("name: \"s1\""),
         slot: Slot::P,
-        object_probe: false,
+        probe: Probe::Absent,
     },
     OptionalCase {
         label: "object EncodedLit (string)",
@@ -454,7 +483,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         expected: &[&["s1", "c1"], &["s2", "-"], &["s3", "-"], &["s4", "-"]],
         marker: Some("name: \"alias\""),
         slot: Slot::O,
-        object_probe: false,
+        probe: Probe::Declines,
     },
     OptionalCase {
         label: "object EncodedLit (integer)",
@@ -463,7 +492,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         expected: &[&["s1", "c1"], &["s2", "-"], &["s3", "c3"], &["s4", "-"]],
         marker: Some("name: \"rank\""),
         slot: Slot::O,
-        object_probe: false,
+        probe: Probe::Declines,
     },
     OptionalCase {
         // Literal and ref values of one variable: the batched lane declines and
@@ -483,7 +512,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         ],
         marker: Some("name: \"derivedFrom\""),
         slot: Slot::O,
-        object_probe: false,
+        probe: Probe::DeclinesSome,
     },
     OptionalCase {
         // Subject and object both come from the required side: the scan seeks
@@ -499,7 +528,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         ],
         marker: None,
         slot: Slot::S,
-        object_probe: false,
+        probe: Probe::Absent,
     },
     OptionalCase {
         // With novelty pending the batched joins emit `?s` and `?c` encoded
@@ -516,7 +545,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         ],
         marker: None,
         slot: Slot::S,
-        object_probe: false,
+        probe: Probe::Absent,
     },
     OptionalCase {
         label: "#1973: skos:broader reverse OPTIONAL",
@@ -526,7 +555,7 @@ const OPTIONAL_CASES: &[OptionalCase] = &[
         expected: &[&["k0", "k10"], &["k0", "k11"], &["k1", "k12"], &["k2", "-"]],
         marker: Some("name: \"broader\""),
         slot: Slot::O,
-        object_probe: true,
+        probe: Probe::Fires,
     },
 ];
 
@@ -544,9 +573,7 @@ async fn optional_binds_encoded_values_in_every_position() {
             if let Some(marker) = case.marker {
                 failures.bound_lookup(&store, before, marker, case.slot, &label);
             }
-            if case.object_probe {
-                failures.object_probe_fired(&store, before, &label);
-            }
+            failures.object_probe(&store, before, case.probe, &label);
         }
     }
     failures.assert_none();
@@ -568,6 +595,7 @@ async fn optional_binds_encoded_values_jsonld() {
             rows(&[&["s1", "c1"], &["s2", "c2"], &["s2", "c3"], &["s3", "-"]]),
             "name: \"subjectOf\"",
             Slot::O,
+            Probe::Fires,
         ),
         (
             "subject EncodedPid",
@@ -587,6 +615,7 @@ async fn optional_binds_encoded_values_jsonld() {
             ]),
             "name: \"label\"",
             Slot::S,
+            Probe::Absent,
         ),
         (
             "predicate EncodedSid",
@@ -601,6 +630,7 @@ async fn optional_binds_encoded_values_jsonld() {
             rows(&[&["text", "chunk one"]]),
             "name: \"s1\"",
             Slot::P,
+            Probe::Absent,
         ),
         (
             // #1973's own JSON-LD spelling.
@@ -616,18 +646,20 @@ async fn optional_binds_encoded_values_jsonld() {
             rows(&[&["k0", "k10"], &["k0", "k11"], &["k1", "k12"], &["k2", "-"]]),
             "name: \"broader\"",
             Slot::O,
+            Probe::Fires,
         ),
     ];
     let mut failures = Failures::default();
     for state in STATES {
         let (fluree, handle) = ledger_in(state, "it/optional-encoded-jsonld:main").await;
         let (store, _guard) = init_test_tracing();
-        for (label, query, expected, marker, slot) in &cases {
+        for (label, query, expected, marker, slot, probe) in &cases {
             let label = format!("{state:?} / JSON-LD {label}");
             let before = store.all_events().len();
             let result = jsonld(&fluree, &handle, query).await;
             failures.eq(jsonld_rows(&result), expected.clone(), &label);
             failures.bound_lookup(&store, before, marker, *slot, &label);
+            failures.object_probe(&store, before, *probe, &label);
         }
     }
     failures.assert_none();
@@ -884,6 +916,7 @@ async fn update_where_optional_over_encoded_values() {
             .expect("delete document");
         let label = format!("{state:?} / UPDATE reverse OPTIONAL");
         failures.bound_lookup(&store, before, "name: \"subjectOf\"", Slot::O, &label);
+        failures.object_probe(&store, before, update_where_probe(state), &label);
         let links = sparql(
             &fluree,
             &handle,
@@ -937,6 +970,17 @@ async fn update_where_optional_over_encoded_values() {
     failures.assert_none();
 }
 
+/// The bound-object lane inside an UPDATE's WHERE: a transaction evaluates
+/// its WHERE over a one-member dataset, which the batched probe lanes'
+/// shared admission declines once novelty is pending. The per-row lookups
+/// answer then, bound as the test's other checks require.
+fn update_where_probe(state: State) -> Probe {
+    match state {
+        State::Fresh | State::Drained => Probe::Fires,
+        State::Novelty => Probe::Declines,
+    }
+}
+
 /// Cypher's OPTIONAL MATCH over a reverse edge is the same correlated OPTIONAL.
 #[tokio::test(flavor = "current_thread")]
 async fn cypher_optional_match_reverse_edge_over_encoded_values() {
@@ -963,6 +1007,7 @@ async fn cypher_optional_match_reverse_edge_over_encoded_values() {
             &label,
         );
         failures.bound_lookup(&store, before, "name: \"subjectOf\"", Slot::O, &label);
+        failures.object_probe_fired(&store, before, &label);
 
         let counted = fluree
             .query_cypher(
@@ -1585,5 +1630,180 @@ async fn novelty_minted_subject_as_path_endpoint() {
         ]),
         "novelty-minted path endpoint",
     );
+    failures.assert_none();
+}
+
+/// The lane's novelty merge: with a base link retracted and links asserted
+/// since the last index, the lane drops the retracted row and injects the
+/// asserted ones.
+#[tokio::test(flavor = "current_thread")]
+async fn optional_lane_merges_pending_retracts_and_asserts() {
+    let ledger_id = "it/optional-lane-merge:main";
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .insert(&chunks_base(false, false))
+        .execute()
+        .await
+        .expect("seed");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
+    fluree
+        .stage(&handle)
+        .sparql_update(&format!(
+            "{PREFIXES} DELETE DATA {{ ex:c1 ex:subjectOf ex:s1 }} ; \
+             INSERT DATA {{ ex:c9 ex:subjectOf ex:s3 . ex:c2 ex:subjectOf ex:s1 }}"
+        ))
+        .execute()
+        .await
+        .expect("pending update");
+    assert!(
+        !handle.snapshot().await.novelty.is_empty(),
+        "novelty pending"
+    );
+    let (store, _guard) = init_test_tracing();
+    let before = store.all_events().len();
+    let mut failures = Failures::default();
+    let result = sparql(
+        &fluree,
+        &handle,
+        "SELECT ?s ?c WHERE { ?s ex:derivedFrom ex:doc1 . OPTIONAL { ?c ex:subjectOf ?s } }",
+    )
+    .await;
+    let label = "retract c1->s1, assert c2->s1 and c9->s3";
+    failures.eq(
+        sparql_rows(&result, &["s", "c"]),
+        rows(&[&["s1", "c2"], &["s2", "c2"], &["s3", "c9"]]),
+        label,
+    );
+    failures.object_probe_fired(&store, before, label);
+    failures.assert_none();
+}
+
+/// An UPDATE's DELETE template instantiated from a `?c` the lane binds by its
+/// novelty id, in SPARQL and as a JSON-LD transaction.
+#[tokio::test(flavor = "current_thread")]
+async fn update_template_from_a_novelty_minted_optional_value() {
+    let mut failures = Failures::default();
+    for jsonld_txn in [false, true] {
+        let ledger_id = if jsonld_txn {
+            "it/update-template-novelty-jsonld:main"
+        } else {
+            "it/update-template-novelty:main"
+        };
+        let (fluree, handle) =
+            indexed_then_novelty(ledger_id, &chunks_base(false, false), &novelty_concept()).await;
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let label = if jsonld_txn {
+            "JSON-LD transaction"
+        } else {
+            "SPARQL UPDATE"
+        };
+        if jsonld_txn {
+            let txn = json!({
+                "@context": context(),
+                "where": [
+                    {"@id": "?s", "ex:derivedFrom": {"@id": "ex:doc1"}},
+                    ["optional", {"@id": "?c", "ex:subjectOf": "?s"}]
+                ],
+                "delete": {"@id": "?c", "ex:subjectOf": "?s"}
+            });
+            fluree
+                .stage(&handle)
+                .update(&txn)
+                .execute()
+                .await
+                .expect("JSON-LD update");
+        } else {
+            fluree
+                .stage(&handle)
+                .sparql_update(&format!(
+                    "{PREFIXES} DELETE {{ ?c ex:subjectOf ?s }} \
+                     WHERE {{ ?s ex:derivedFrom ex:doc1 . OPTIONAL {{ ?c ex:subjectOf ?s }} }}"
+                ))
+                .execute()
+                .await
+                .expect("SPARQL update");
+        }
+        failures.object_probe(&store, before, update_where_probe(State::Novelty), label);
+        let links = sparql(
+            &fluree,
+            &handle,
+            "SELECT ?c ?s WHERE { ?c ex:subjectOf ?s }",
+        )
+        .await;
+        failures.eq(
+            sparql_rows(&links, &["c", "s"]),
+            rows(&[]),
+            &format!("{label}: every link into doc1's chunks deleted, cN's included"),
+        );
+    }
+    failures.assert_none();
+}
+
+/// The lane reads its predicate's index rows raw, so a policy that can touch
+/// the predicate must keep it out (the filtered path answers), while a policy
+/// that cannot touch it leaves the lane on. Same ledger, both outcomes.
+#[tokio::test(flavor = "current_thread")]
+async fn optional_lane_under_a_non_root_policy() {
+    let ledger_id = "it/optional-lane-policy:main";
+    let (fluree, _handle) = ledger_in(State::Fresh, ledger_id).await;
+    let (store, _guard) = init_test_tracing();
+    let deny = |property: &str| {
+        json!([{
+            "@id": format!("{EX}deny-{property}"),
+            "f:action": "f:view",
+            "f:required": true,
+            "f:onProperty": [{"@id": format!("{EX}{property}")}],
+            "f:allow": false
+        }])
+    };
+    let query = format!(
+        "{PREFIXES} SELECT ?s ?c WHERE {{ ?s ex:derivedFrom ex:doc1 . \
+         OPTIONAL {{ ?c ex:subjectOf ?s }} }}"
+    );
+    let mut failures = Failures::default();
+    for (property, probe, expected) in [
+        (
+            "alias",
+            Probe::Fires,
+            rows(&[&["s1", "c1"], &["s2", "c2"], &["s2", "c3"], &["s3", "-"]]),
+        ),
+        (
+            "subjectOf",
+            Probe::Declines,
+            rows(&[&["s1", "-"], &["s2", "-"], &["s3", "-"]]),
+        ),
+    ] {
+        let view = fluree
+            .db_with_policy(
+                ledger_id,
+                &fluree_db_api::GovernanceOptions {
+                    policy: Some(deny(property)),
+                    default_allow: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("db_with_policy");
+        assert!(!view.is_root(), "an enforcing view");
+        let label = format!("policy denying ex:{property}");
+        let before = store.all_events().len();
+        let result = view
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        failures.eq(sparql_rows(&result, &["s", "c"]), expected, &label);
+        failures.object_probe(&store, before, probe, &label);
+    }
     failures.assert_none();
 }
