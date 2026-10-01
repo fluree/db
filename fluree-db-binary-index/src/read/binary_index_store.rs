@@ -2001,7 +2001,7 @@ impl BinaryIndexStore {
                 match found {
                     None => slot.store(PREDICATE_NOT_A_SUBJECT, Ordering::Relaxed),
                     Some(s_id) if s_id < PREDICATE_NOT_A_SUBJECT => {
-                        slot.store(s_id, Ordering::Relaxed)
+                        slot.store(s_id, Ordering::Relaxed);
                     }
                     Some(_) => {}
                 }

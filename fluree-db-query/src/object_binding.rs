@@ -703,14 +703,46 @@ pub(crate) fn normalize_for_key_cow<'a>(
 /// only a pair of different forms pays for canonicalization, through the same
 /// [`normalize_for_key_cow`] the keyed equality surfaces use. `norm` is the
 /// caller's, built once ([`equality_norm`]).
+///
+/// The commonest mixed pair, an encoded subject against a decoded one (a
+/// batched lane's row against a scan with novelty pending), compares by
+/// decoding the encoded side instead: the graph view memoizes that per
+/// subject, where encoding the decoded side costs a dictionary lookup each
+/// time.
 pub(crate) fn same_term(a: &Binding, b: &Binding, norm: &Option<EqualityNorm>) -> bool {
     match one_form_answer(a, b) {
         Some(same) => same,
         None => {
+            if let Some(same) = norm
+                .as_ref()
+                .and_then(|n| n.gv.as_ref())
+                .and_then(|gv| encoded_against_decoded_subject(a, b, gv))
+            {
+                return same;
+            }
             let (dicts, gv) = EqualityNorm::parts(norm);
             normalize_for_key_cow(a, dicts, gv) == normalize_for_key_cow(b, dicts, gv)
         }
     }
+}
+
+/// [`same_term`] for an `EncodedSid` against a decoded `Sid`, through the
+/// view's decode (the one a scan binds the decoded form with). `None` for any
+/// other pair, or when the id cannot be decoded.
+#[inline]
+fn encoded_against_decoded_subject(
+    a: &Binding,
+    b: &Binding,
+    gv: &fluree_db_binary_index::BinaryGraphView,
+) -> Option<bool> {
+    let (s_id, sid) = match (a, b) {
+        (Binding::EncodedSid { s_id, .. }, Binding::Sid { sid, .. })
+        | (Binding::Sid { sid, .. }, Binding::EncodedSid { s_id, .. }) => (*s_id, sid),
+        _ => return None,
+    };
+    gv.resolve_subject_sid(s_id)
+        .ok()
+        .map(|decoded| decoded == *sid)
 }
 
 /// [`same_term`] for a caller without an [`EqualityNorm`]: IRIs and
