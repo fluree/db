@@ -843,6 +843,262 @@ async fn a_permitted_delete_of_an_absent_value_commits_nothing() {
 }
 
 // =============================================================================
+// Modify policy judges a restated value the identity cannot view
+// =============================================================================
+
+/// `ex:alice` with a plain value, a language-tagged one and a list.
+fn restate_seed() -> JsonValue {
+    json!({
+        "@id": "ex:alice",
+        "ex:name": "Alice",
+        "ex:salary": 100,
+        "ex:label": {"@value": "Al", "@language": "en"},
+        "ex:scores": {"@list": [1, 2, 3]}
+    })
+}
+
+/// The identity may view everything and modify only `ex:name`.
+async fn view_all_modify_name(ledger: &LedgerState) -> PolicyContext {
+    policy(
+        ledger,
+        GovernanceOptions {
+            policy: Some(json!([
+                {
+                    "@id": "http://example.org/ns/viewAll",
+                    "@type": "f:AccessPolicy",
+                    "f:action": "f:view",
+                    "f:allow": true
+                },
+                {
+                    "@id": "http://example.org/ns/modifyName",
+                    "@type": "f:AccessPolicy",
+                    "f:onProperty": [{"@id": "http://example.org/ns/name"}],
+                    "f:action": "f:modify",
+                    "f:allow": true
+                }
+            ])),
+            default_allow: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Upserts that restate a stored value, and their twins that write a value
+/// that is not stored.
+fn restating_upserts() -> Vec<(&'static str, JsonValue)> {
+    vec![
+        (
+            "plain, stored",
+            json!({"@id": "ex:alice", "ex:salary": 100}),
+        ),
+        (
+            "plain, not stored",
+            json!({"@id": "ex:alice", "ex:salary": 999}),
+        ),
+        (
+            "language-tagged, stored",
+            json!({"@id": "ex:alice", "ex:label": {"@value": "Al", "@language": "en"}}),
+        ),
+        (
+            "language-tagged, not stored",
+            json!({"@id": "ex:alice", "ex:label": {"@value": "Bo", "@language": "en"}}),
+        ),
+        (
+            "list, stored",
+            json!({"@id": "ex:alice", "ex:scores": {"@list": [1, 2, 3]}}),
+        ),
+        (
+            "list, not stored",
+            json!({"@id": "ex:alice", "ex:scores": {"@list": [1, 2, 4]}}),
+        ),
+    ]
+}
+
+async fn upsert_as(
+    fluree: &Fluree,
+    ledger: LedgerState,
+    mut doc: JsonValue,
+    policy: Option<PolicyContext>,
+) -> Result<TransactResult, fluree_db_api::ApiError> {
+    doc["@context"] = ctx();
+    let builder = fluree.stage_owned(ledger).upsert(&doc);
+    match policy {
+        Some(policy) => builder.policy(policy).execute().await,
+        None => builder.execute().await,
+    }
+}
+
+/// `None` when `result` is the modify-policy refusal, else what happened.
+fn not_refused(
+    result: Result<TransactResult, fluree_db_api::ApiError>,
+    what: &str,
+) -> Option<String> {
+    match result {
+        Ok(r) => Some(format!(
+            "{what}: committed {} flakes",
+            r.receipt.flake_count
+        )),
+        Err(e)
+            if e.to_string()
+                .contains("Policy enforcement prevents modification") =>
+        {
+            None
+        }
+        Err(e) => Some(format!("{what}: {e}")),
+    }
+}
+
+/// An upsert the identity may not perform is refused with one answer
+/// whether it restates a stored value or writes one that is not stored:
+/// plain, language-tagged and list values, on JSON-LD and Turtle. The
+/// identity may neither view nor modify them.
+#[tokio::test]
+async fn upsert_refused_by_policy_regardless_of_stored_value() {
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        for (what, doc) in restating_upserts() {
+            let (_d, fluree, ledger) = seeded("restate-upsert", restate_seed(), indexed).await;
+            let policy = name_only(&ledger).await;
+            let r = upsert_as(&fluree, ledger, doc, Some(policy)).await;
+            failures.extend(not_refused(
+                r,
+                &format!("JSON-LD {what}, indexed={indexed}"),
+            ));
+        }
+        for salary in [100, 999] {
+            let (_d, fluree, ledger) = seeded("restate-turtle", restate_seed(), indexed).await;
+            let policy = name_only(&ledger).await;
+            let ttl = format!("@prefix ex: <{EX}> .\nex:alice ex:salary {salary} .\n");
+            let r = fluree
+                .stage_owned(ledger)
+                .upsert_turtle(&ttl)
+                .policy(policy)
+                .execute()
+                .await;
+            failures.extend(not_refused(
+                r,
+                &format!("Turtle {salary}, indexed={indexed}"),
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A DELETE and INSERT of one value is refused with one answer whether or
+/// not the value is stored, on SPARQL and JSON-LD; so is a graph sync whose
+/// payload restates a graph the identity cannot view.
+#[tokio::test]
+async fn delete_insert_of_one_value_refused_by_policy_regardless_of_stored_value() {
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        for salary in [100, 999] {
+            let (_d, fluree, ledger) = seeded("restate-sparql", restate_seed(), indexed).await;
+            let policy = name_only(&ledger).await;
+            let body = format!(
+                "DELETE {{ ?s ex:salary {salary} }} INSERT {{ ?s ex:salary {salary} }} \
+                 WHERE {{ ?s ex:name \"Alice\" }}"
+            );
+            let r = sparql_update_as(&fluree, ledger, &body, policy).await;
+            failures.extend(not_refused(
+                r,
+                &format!("SPARQL {salary}, indexed={indexed}"),
+            ));
+
+            let (_d, fluree, ledger) = seeded("restate-jsonld", restate_seed(), indexed).await;
+            let policy = name_only(&ledger).await;
+            let txn = json!({
+                "@context": ctx(),
+                "where": {"@id": "?s", "ex:name": "Alice"},
+                "delete": {"@id": "?s", "ex:salary": salary},
+                "insert": {"@id": "?s", "ex:salary": salary}
+            });
+            let r = fluree
+                .stage_owned(ledger)
+                .update(&txn)
+                .policy(policy)
+                .execute()
+                .await;
+            failures.extend(not_refused(
+                r,
+                &format!("JSON-LD {salary}, indexed={indexed}"),
+            ));
+        }
+    }
+    for salary in [100, 999] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = fluree
+            .create_ledger("it/delete-stored-restate-sync:main")
+            .await
+            .expect("create");
+        let payload = |salary: i64| {
+            json!({
+                "@context": ctx(),
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice", "ex:salary": salary}]
+            })
+        };
+        let seed = payload(100);
+        let ledger = fluree
+            .stage_owned(ledger)
+            .sync_graph(G1, &seed)
+            .execute()
+            .await
+            .expect("seed the graph")
+            .ledger;
+        let policy = name_only(&ledger).await;
+        let next = payload(salary);
+        let r = fluree
+            .stage_owned(ledger)
+            .sync_graph(G1, &next)
+            .policy(policy)
+            .execute()
+            .await;
+        failures.extend(not_refused(r, &format!("graph sync {salary}")));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Restating a value the identity can view commits nothing, without modify
+/// permission, as it did before; a changed value is still refused. As root,
+/// a restatement commits nothing either.
+#[tokio::test]
+async fn restating_a_viewable_value_commits_nothing_without_modify() {
+    for indexed in [false, true] {
+        for (what, doc) in restating_upserts() {
+            let stored = what.ends_with(", stored");
+            let (_d, fluree, ledger) = seeded("restate-viewable", restate_seed(), indexed).await;
+            let t = ledger.t();
+            let policy = view_all_modify_name(&ledger).await;
+            let r = upsert_as(&fluree, ledger, doc.clone(), Some(policy)).await;
+            let what = format!("{what}, indexed={indexed}");
+            if stored {
+                no_commit(&r.expect(&what), t, &what);
+            } else {
+                assert_eq!(not_refused(r, &what), None);
+            }
+            if stored {
+                let (_d, fluree, ledger) = seeded("restate-root", restate_seed(), indexed).await;
+                let t = ledger.t();
+                let r = upsert_as(&fluree, ledger, doc, None).await;
+                no_commit(&r.expect(&what), t, &format!("root, {what}"));
+            }
+        }
+        let (_d, fluree, ledger) = seeded("restate-viewable-sparql", restate_seed(), indexed).await;
+        let t = ledger.t();
+        let policy = view_all_modify_name(&ledger).await;
+        let r = sparql_update_as(
+            &fluree,
+            ledger,
+            "DELETE { ?s ex:salary 100 } INSERT { ?s ex:salary 100 } WHERE { ?s ex:name \"Alice\" }",
+            policy,
+        )
+        .await
+        .expect("restating a viewable value");
+        no_commit(&r, t, &format!("SPARQL, indexed={indexed}"));
+    }
+}
+
+// =============================================================================
 // A witness reads the graph its template writes
 // =============================================================================
 

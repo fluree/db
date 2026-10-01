@@ -918,6 +918,11 @@ pub async fn stage_with_graph_delta(
         let retraction_count = stream_stats.retraction_count;
         let assertion_count = stream_stats.assertion_count;
         let total_inputs = acc.input_count();
+        // Under a policy, the stored facts the write restates as they are
+        // (retracted and asserted again, so they cancel) go to the modify
+        // check below. Without one, cancellation keeps nothing.
+        let restricted = options.policy_ctx.is_some_and(|p| !p.wrapper().is_root());
+        let mut restated: Vec<(Flake, Flake)> = Vec::new();
         let mut flakes = if pure_delete {
             let _span =
                 tracing::debug_span!("dedup_retractions", retraction_count = retraction_count)
@@ -939,7 +944,13 @@ pub async fn stage_with_graph_delta(
                 assertion_count = assertion_count,
             )
             .entered();
-            let f = acc.finalize();
+            let f = if restricted {
+                let (f, pairs) = acc.finalize_with_restated();
+                restated = pairs;
+                f
+            } else {
+                acc.finalize()
+            };
             if f.len() as u64 != total_inputs {
                 tracing::debug!(
                     before = total_inputs,
@@ -1060,15 +1071,22 @@ pub async fn stage_with_graph_delta(
         // Modify policy judges every delete the transaction asked for,
         // including DELETE intents that named no stored fact and stage
         // nothing: a delete the identity may not perform is refused the same
-        // way whether or not its target is stored.
+        // way whether or not its target is stored. Likewise a stored value
+        // the write restates as it is, which stages nothing, is judged on
+        // both sides when the identity cannot view it, so whether restating
+        // a value it cannot see succeeds does not depend on what is stored.
         if let Some(policy) = options.policy_ctx {
             if !policy.wrapper().is_root() {
+                let hidden =
+                    hidden_restatements(&ledger, policy, restated, &reverse_graph, options.tracker)
+                        .await?;
                 let judged: std::borrow::Cow<'_, [Flake]> =
-                    if stream_stats.unmatched_intents.is_empty() {
+                    if stream_stats.unmatched_intents.is_empty() && hidden.is_empty() {
                         std::borrow::Cow::Borrowed(&flakes)
                     } else {
                         let mut all = flakes.clone();
                         all.extend(stream_stats.unmatched_intents.iter().cloned());
+                        all.extend(hidden);
                         std::borrow::Cow::Owned(all)
                     };
                 let policy_span = tracing::debug_span!("policy_enforce");
@@ -2168,6 +2186,60 @@ struct SubjectDelta {
     asserted_classes: Vec<Sid>,
     /// (p, o, dt) of this subject's retractions, for full-removal detection.
     retracts: Vec<(Sid, FlakeValue, Sid)>,
+}
+
+/// Both sides of each restated pair (see
+/// [`FlakeAccumulator::finalize_with_restated`]) whose stored fact `policy`
+/// does not let the identity view, for the modify check. Builds a view
+/// enforcer only when there is a pair to look at.
+async fn hidden_restatements(
+    ledger: &LedgerState,
+    policy: &PolicyContext,
+    restated: Vec<(Flake, Flake)>,
+    reverse_graph: &HashMap<Sid, GraphId>,
+    tracker: Option<&Tracker>,
+) -> Result<Vec<Flake>> {
+    if restated.is_empty() {
+        return Ok(Vec::new());
+    }
+    let enforcer = QueryPolicyEnforcer::new(Arc::new(policy.clone()));
+    let disabled;
+    let tracker = match tracker {
+        Some(tracker) => tracker,
+        None => {
+            disabled = Tracker::disabled();
+            &disabled
+        }
+    };
+    let mut by_graph: HashMap<GraphId, Vec<(Flake, Flake)>> = HashMap::new();
+    for pair in restated {
+        let g_id = resolve_flake_graph_id(&pair.0, reverse_graph)?;
+        by_graph.entry(g_id).or_default().push(pair);
+    }
+    let mut hidden = Vec::new();
+    for (g_id, pairs) in by_graph {
+        let db = ledger.as_graph_db_ref(g_id);
+        if policy.wrapper().has_class_policies() {
+            let mut subjects: Vec<Sid> = pairs.iter().map(|(r, _)| r.s.clone()).collect();
+            subjects.sort();
+            subjects.dedup();
+            enforcer
+                .populate_class_cache_for_graph(db, &subjects)
+                .await
+                .map_err(TransactError::Query)?;
+        }
+        for (retraction, assertion) in pairs {
+            let visible = enforcer
+                .allow_flake_for_graph(db.snapshot, g_id, db.overlay, db.t, tracker, &retraction)
+                .await
+                .map_err(TransactError::Query)?;
+            if !visible {
+                hidden.push(retraction);
+                hidden.push(assertion);
+            }
+        }
+    }
+    Ok(hidden)
 }
 
 /// Enforce modify policies on staged flakes

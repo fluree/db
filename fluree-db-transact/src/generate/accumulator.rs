@@ -186,6 +186,18 @@ impl FlakeAccumulator {
     /// For mixed: per fact, `cancel = min(assert_count, retract_count)` pairs
     /// cancel; surplus on either side contributes one survivor of that op.
     pub fn finalize(self) -> Vec<Flake> {
+        self.drain(false).0
+    }
+
+    /// [`finalize`](Self::finalize), plus one `(retraction, assertion)` pair
+    /// for each fact the transaction retracted and asserted again: a stored
+    /// fact restated as it is, which stages nothing.
+    pub fn finalize_with_restated(self) -> (Vec<Flake>, Vec<(Flake, Flake)>) {
+        self.drain(true)
+    }
+
+    fn drain(self, keep_restated: bool) -> (Vec<Flake>, Vec<(Flake, Flake)>) {
+        let mut restated = Vec::new();
         let mut out: Vec<Flake> = match self.inner {
             AccInner::PureRetract(graphs) => graphs
                 .into_values()
@@ -196,6 +208,11 @@ impl FlakeAccumulator {
                 for inner in graphs.into_values() {
                     for (_key, b) in inner {
                         let cancel = b.assert_count.min(b.retract_count);
+                        if keep_restated && cancel > 0 {
+                            if let (Some(r), Some(a)) = (&b.retraction, &b.assertion) {
+                                restated.push((r.clone(), a.clone()));
+                            }
+                        }
                         if b.assert_count > cancel {
                             if let Some(a) = b.assertion {
                                 v.push(a);
@@ -212,7 +229,7 @@ impl FlakeAccumulator {
             }
         };
         out.sort_by(|a, b| IndexType::Spot.compare(a, b));
-        out
+        (out, restated)
     }
 }
 
