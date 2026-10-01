@@ -9,6 +9,8 @@
 //! - Graphs sorted by `g_id`, properties by `p_id`
 //! - Aggregate properties sorted by `(ns_code, suffix)`
 //! - Classes sorted by `(ns_code, suffix)`, properties within classes likewise
+//! - The ledger-wide class list is written only when no graph carries classes;
+//!   otherwise decoders derive it as the union of the graphs' lists
 //! - Historical tail entries sorted by sid / `(g_id, p_id)`, tags sorted
 //!
 //! An optional historical-datatypes tail follows the classes section — see
@@ -199,8 +201,14 @@ pub fn encode_stats(stats: &IndexStats) -> Vec<u8> {
         encode_datatypes(&mut buf, &p.datatypes);
     }
 
-    // Classes
-    let classes = stats.classes.as_deref().unwrap_or(&[]);
+    // Classes. The ledger-wide table is the union of the graphs' tables
+    // (`union_per_graph_classes`), so once graphs carry classes it is derived
+    // on decode rather than stored a second time.
+    let graphs_carry_classes = graphs.iter().any(|g| g.classes.is_some());
+    let classes = match stats.classes.as_deref() {
+        Some(classes) if !graphs_carry_classes => classes,
+        _ => &[],
+    };
     let mut sorted_classes: Vec<&ClassStatEntry> = classes.iter().collect();
     sorted_classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
 
@@ -868,7 +876,7 @@ pub fn decode_stats_with_len(data: &[u8]) -> io::Result<(IndexStats, usize)> {
             Some(agg_props)
         },
         classes: if classes.is_empty() {
-            None
+            fluree_db_core::index_stats::union_per_graph_classes(&graphs)
         } else {
             Some(classes)
         },
@@ -1147,6 +1155,63 @@ mod tests {
 
         assert_eq!(classes[0].properties[1].property_sid, sid(5, "name"));
         assert_eq!(classes[0].properties[1].ref_classes.len(), 0);
+    }
+
+    /// The ledger-wide class list is the union of the graphs' lists, so a root
+    /// does not store it twice: the bytes are those of a root without it, and
+    /// both decoders hand back the union, also for an import root that never
+    /// set it.
+    #[test]
+    fn the_ledger_wide_class_list_is_derived_from_the_graphs() {
+        let class = |name: &str, count: u64| ClassStatEntry {
+            class_sid: sid(5, name),
+            count,
+            properties: vec![ClassPropertyUsage {
+                property_sid: sid(5, "knows"),
+                datatypes: vec![(1, count)],
+                langs: vec![],
+                ref_classes: vec![ClassRefCount {
+                    class_sid: sid(5, "Person"),
+                    count,
+                }],
+            }],
+        };
+        let graph = |g_id: u16, classes: Vec<ClassStatEntry>| GraphStatsEntry {
+            g_id,
+            flakes: 10,
+            size: 0,
+            properties: vec![],
+            classes: Some(classes),
+        };
+        let graphs = vec![
+            graph(0, vec![class("Org", 2), class("Person", 3)]),
+            graph(1, vec![class("Person", 4)]),
+        ];
+        let union = fluree_db_core::index_stats::union_per_graph_classes(&graphs);
+        let built = IndexStats {
+            flakes: 20,
+            size: 0,
+            properties: None,
+            classes: union.clone(),
+            graphs: Some(graphs),
+            historical_since_t: None,
+        };
+        let imported = IndexStats {
+            classes: None,
+            ..built.clone()
+        };
+
+        let bytes = encode_stats(&built);
+        assert_eq!(bytes, encode_stats(&imported), "the union is not stored");
+        let want = format!("{union:?}");
+        assert!(
+            want.contains("count: 7"),
+            "Person summed across graphs: {want}"
+        );
+        assert_eq!(format!("{:?}", decode_stats(&bytes).unwrap().classes), want);
+        let (via_core, consumed) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(format!("{:?}", via_core.classes), want);
     }
 
     #[test]

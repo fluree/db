@@ -417,8 +417,9 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
         } else {
             Some(agg_props)
         },
+        // Not stored when graphs carry classes; see the binary-index encoder.
         classes: if classes.is_empty() {
-            None
+            crate::index_stats::union_per_graph_classes(&graphs)
         } else {
             Some(classes)
         },
