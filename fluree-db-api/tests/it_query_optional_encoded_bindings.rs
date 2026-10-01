@@ -347,6 +347,34 @@ impl Failures {
         }
     }
 
+    /// Every scan of the triple naming `marker` since `before` decoded its
+    /// arena-backed literals (`want`), or none did.
+    fn arena_decoding(
+        &mut self,
+        store: &SpanStore,
+        before: usize,
+        marker: &str,
+        want: bool,
+        label: &str,
+    ) {
+        let flags: Vec<String> = store.all_events()[before..]
+            .iter()
+            .filter(|e| e.message() == "BinaryScanOperator::open")
+            .filter(|e| {
+                e.fields
+                    .iter()
+                    .any(|(k, v)| k.ends_with("pattern") && v.contains(marker))
+            })
+            .filter_map(|e| e.fields.get("arena_literals_decoded").cloned())
+            .collect();
+        let want = want.to_string();
+        if flags.is_empty() || flags.iter().any(|f| *f != want) {
+            self.0.push(format!(
+                "{label}: scans of {marker} must have arena_literals_decoded={want}; saw {flags:?}"
+            ));
+        }
+    }
+
     /// The batched bound-object lane fired and never declined.
     fn object_probe_fired(&mut self, store: &SpanStore, before: usize, label: &str) {
         self.object_probe(store, before, Probe::Fires, label);
@@ -1396,8 +1424,9 @@ async fn optional_unify_matches_a_novelty_minted_object() {
 // every row.
 // ---------------------------------------------------------------------------
 
-/// Chunks and concepts spread over two named graphs, and two `xsd:decimal`
-/// amounts (arena-backed literals) in the first, indexed.
+/// Chunks and concepts spread over two named graphs, and `xsd:decimal`
+/// amounts (arena-backed literals) in both, indexed. An arena handle counts
+/// from 0 per graph and predicate, so g1's 1.5 and g2's 9.5 share a handle.
 async fn two_graph_ledger(ledger_id: &str) -> (Fluree, LedgerHandle) {
     let fluree = FlureeBuilder::memory().build_memory();
     fluree
@@ -1410,11 +1439,12 @@ async fn two_graph_ledger(ledger_id: &str) -> (Fluree, LedgerHandle) {
         ex:root ex:note "default graph" .
         GRAPH <urn:g1> {
             ex:s1 ex:derivedFrom ex:doc1 . ex:c1 ex:subjectOf ex:s1 .
-            ex:x1 ex:amount 1.5 . ex:x2 ex:amount 2.5 .
+            ex:x1 ex:amount 1.5 . ex:x2 ex:amount 9.5 .
         }
         GRAPH <urn:g2> {
             ex:s2 ex:derivedFrom ex:doc1 . ex:c2 ex:subjectOf ex:s2 .
             ex:s3 ex:derivedFrom ex:doc1 .
+            ex:y1 ex:amount 9.5 .
         }
     "#;
     fluree
@@ -1474,15 +1504,57 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
             None,
         ),
         (
-            // An arena-backed literal's handle names its value only within its
-            // own graph, so with no graph view it cannot become a constant: the
-            // join scans the slot free and must still pair each row with its
-            // own amount, not with every amount.
+            // Arena-backed literals (big numbers) are bound decoded by the
+            // member scans: their handles name a value only within one graph,
+            // and g1's 1.5 shares a handle with g2's 9.5.
+            "projection of an arena-backed literal",
+            "SELECT ?x ?v FROM <urn:g1> FROM <urn:g2> WHERE { ?x ex:amount ?v }",
+            &["x", "v"],
+            &[&["x1", "1.5"], &["x2", "9.5"], &["y1", "9.5"]],
+            None,
+        ),
+        (
             "join on an arena-backed literal",
             "SELECT ?x ?y FROM <urn:g1> FROM <urn:g2> WHERE { ?x ex:amount ?v . \
              ?y ex:amount ?v }",
             &["x", "y"],
-            &[&["x1", "x1"], &["x2", "x2"]],
+            &[
+                &["x1", "x1"],
+                &["x2", "x2"],
+                &["x2", "y1"],
+                &["y1", "x2"],
+                &["y1", "y1"],
+            ],
+            None,
+        ),
+        (
+            "OPTIONAL on an arena-backed literal",
+            "SELECT ?x ?y FROM <urn:g1> FROM <urn:g2> WHERE { ?x ex:amount ?v . \
+             OPTIONAL { ?y ex:amount ?v } }",
+            &["x", "y"],
+            &[
+                &["x1", "x1"],
+                &["x2", "x2"],
+                &["x2", "y1"],
+                &["y1", "x2"],
+                &["y1", "y1"],
+            ],
+            None,
+        ),
+        (
+            "MINUS on an arena-backed literal",
+            "SELECT ?x FROM <urn:g1> FROM <urn:g2> WHERE { ?x ex:amount ?v \
+             MINUS { ex:y1 ex:amount ?v } }",
+            &["x"],
+            &[&["x1"]],
+            None,
+        ),
+        (
+            "GROUP BY an arena-backed literal",
+            "SELECT ?v (COUNT(*) AS ?n) FROM <urn:g1> FROM <urn:g2> \
+             WHERE { ?x ex:amount ?v } GROUP BY ?v",
+            &["v", "n"],
+            &[&["1.5", "1"], &["9.5", "2"]],
             None,
         ),
         (
@@ -1511,7 +1583,28 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
         if let Some((marker, slot)) = bound {
             failures.bound_lookup(&store, before, marker, *slot, label);
         }
+        if label.contains("arena-backed") {
+            failures.arena_decoding(&store, before, "name: \"amount\"", true, label);
+        }
     }
+
+    // One graph: its scan keeps binding arena handles, decoded nowhere.
+    let before = store.all_events().len();
+    let query = format!("{PREFIXES} SELECT ?x ?v FROM <urn:g1> WHERE {{ ?x ex:amount ?v }}");
+    let result = db(&handle)
+        .await
+        .query(&fluree)
+        .sparql(&query)
+        .execute_formatted()
+        .await
+        .expect("single-graph query");
+    let label = "projection of an arena-backed literal, one graph";
+    failures.eq(
+        sparql_rows(&result, &["x", "v"]),
+        rows(&[&["x1", "1.5"], &["x2", "9.5"]]),
+        label,
+    );
+    failures.arena_decoding(&store, before, "name: \"amount\"", false, label);
     failures.assert_none();
 }
 
