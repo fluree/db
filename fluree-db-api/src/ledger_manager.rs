@@ -27,13 +27,14 @@ use std::time::Duration;
 
 use std::path::PathBuf;
 
+use fluree_db_binary_index::IndexRoot;
 use fluree_db_binary_index::{BinaryIndexStore, LeafletCache};
-use fluree_db_core::db::{LedgerSnapshot, LedgerSnapshotMetadata};
+use fluree_db_core::db::LedgerSnapshot;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::trace_first_parent_commits_by_id;
 use fluree_db_core::{ContentId, ContentStore, LedgerId, Sid, StorageBackend};
-use fluree_db_ledger::{LedgerState, LoadedIndexRoot, TypeErasedStore};
+use fluree_db_ledger::{DecodedIndexRoot, LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
 use rustc_hash::FxHashSet;
 use std::collections::VecDeque;
@@ -718,23 +719,10 @@ impl LedgerHandle {
         drop(prev_store);
 
         // Build metadata-only LedgerSnapshot from FIR6 root.
-        let meta = LedgerSnapshotMetadata {
-            ledger_id: LedgerId::parse(&root.ledger_id)
-                .map_err(|e| ApiError::internal(format!("index root ledger id: {e}")))?,
-            t: root.index_t,
-            base_t: root.base_t,
-            namespace_codes: root.namespace_codes.into_iter().collect(),
-            ns_split_mode: root.ns_split_mode,
-            stats: root.stats.map(Arc::new),
-            schema: root.schema,
-            subject_watermarks: root.subject_watermarks,
-            string_watermark: root.string_watermark,
-            graph_iris: root.graph_iris,
-            has_annotations: root.has_annotations,
-            annotation_index: root.annotation_index.clone(),
-            had_annotation_arena: root.had_annotation_arena,
-            has_list_meta: root.has_list_meta,
-        };
+        let mut root = root;
+        let meta = root
+            .take_snapshot_metadata()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
         tracing::Span::current().record("index_t", meta.t);
         let db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;
@@ -1145,7 +1133,22 @@ async fn prefetch_novelty_translation(
 ///
 /// `prev` is the store this load replaces, if any (a reload of a cached
 /// ledger); artifacts the new root shares with it are carried over. `root` is
-/// the index root the state load already read, if any.
+/// the index root the state load already decoded ([`decode_index_root`]), if
+/// any.
+/// Decode an index root once for both consumers: the snapshot's metadata
+/// (stats and schema move into it) and, kept, the rest of the root for
+/// [`load_and_attach_binary_store`].
+pub(crate) fn decode_index_root(
+    bytes: Vec<u8>,
+) -> fluree_db_ledger::Result<(LedgerSnapshot, IndexRoot)> {
+    let invalid = |e: std::io::Error| {
+        fluree_db_core::Error::invalid_index(format!("index root: FIR6 decode: {e}"))
+    };
+    let mut root = IndexRoot::decode(&bytes).map_err(invalid)?;
+    let meta = root.take_snapshot_metadata().map_err(invalid)?;
+    Ok((LedgerSnapshot::new_meta(meta)?, root))
+}
+
 pub(crate) async fn load_and_attach_binary_store(
     backend: &StorageBackend,
     nameservice: &dyn fluree_db_nameservice::NameServiceLookup,
@@ -1153,7 +1156,7 @@ pub(crate) async fn load_and_attach_binary_store(
     cache_dir: &std::path::Path,
     leaflet_cache: Option<Arc<LeafletCache>>,
     prev: Option<&BinaryIndexStore>,
-    root: Option<LoadedIndexRoot>,
+    root: Option<DecodedIndexRoot<IndexRoot>>,
 ) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
     let record = match state.ns_record.as_ref() {
         Some(r) => r,
@@ -1172,30 +1175,29 @@ pub(crate) async fn load_and_attach_binary_store(
     let cs: Arc<dyn ContentStore> =
         fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
             .await?;
-    let root_started = Instant::now();
-    let bytes = match root {
-        Some(root) if root.id == index_cid => root.bytes,
-        _ => cs
-            .get(&index_cid)
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?,
+    let root = match root {
+        Some((id, root)) if id == index_cid => root,
+        _ => {
+            let root_started = Instant::now();
+            let bytes = cs
+                .get(&index_cid)
+                .await
+                .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
+            let root_read_us = root_started.elapsed().as_micros() as u64;
+            let decode_started = Instant::now();
+            let root = IndexRoot::decode(&bytes)
+                .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+            tracing::debug!(
+                target: "fluree::open",
+                ledger = %record.ledger_id,
+                bytes = bytes.len(),
+                root_read_us,
+                root_decode_us = decode_started.elapsed().as_micros() as u64,
+                "binary index root loaded"
+            );
+            root
+        }
     };
-    let root_read_us = root_started.elapsed().as_micros() as u64;
-    let decode_started = Instant::now();
-
-    // Decode FIR6 root metadata to populate snapshot watermarks.
-    // `LedgerSnapshot::from_root_bytes` only parses the header; watermarks are needed for
-    // DictNovelty/DictOverlay correctness (especially bound-object filters and overlay merges).
-    let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
-        .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
-    tracing::debug!(
-        target: "fluree::open",
-        ledger = %record.ledger_id,
-        bytes = bytes.len(),
-        root_read_us,
-        root_decode_us = decode_started.elapsed().as_micros() as u64,
-        "binary index root loaded"
-    );
 
     let mut store = BinaryIndexStore::load_from_root_v6_reusing(
         Arc::clone(&cs),
@@ -1650,10 +1652,14 @@ impl LedgerManager {
         // ledger cache into a global mutex for the duration of any cold load.
         // Note: we pass the original address to nameservice (it handles
         // resolution), but cache under the canonical address.
-        let load_result =
-            LedgerState::load_with_root(&self.nameservice_mode, ledger_id, &self.backend)
-                .await
-                .map_err(ApiError::from); // Convert LedgerError to ApiError
+        let load_result = LedgerState::load_decoding_root(
+            &self.nameservice_mode,
+            ledger_id,
+            &self.backend,
+            decode_index_root,
+        )
+        .await
+        .map_err(ApiError::from); // Convert LedgerError to ApiError
         tracing::debug!(
             alias = %canonical_alias,
             ok = load_result.is_ok(),
@@ -1935,10 +1941,14 @@ impl LedgerManager {
                 // not held over any of this and is acquired after the swap, so
                 // the two locks never overlap (avoids the entries↔state ordering
                 // hazard with `current_t`).
-                let loaded =
-                    LedgerState::load_with_root(&self.nameservice_mode, ledger_id, &self.backend)
-                        .await
-                        .map_err(ApiError::from);
+                let loaded = LedgerState::load_decoding_root(
+                    &self.nameservice_mode,
+                    ledger_id,
+                    &self.backend,
+                    decode_index_root,
+                )
+                .await
+                .map_err(ApiError::from);
                 let result = match loaded {
                     Ok((mut new_state, root)) => {
                         // Attempt to load binary index store (v2 only) — still off-lock.

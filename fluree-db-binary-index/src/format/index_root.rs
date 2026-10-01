@@ -890,6 +890,41 @@ impl IndexRoot {
         buf
     }
 
+    /// The snapshot metadata this root carries, so a caller holding the
+    /// decoded root does not decode the bytes a second time for the snapshot.
+    /// The large sections (stats and schema) move out; everything the binary
+    /// index store reads stays in place.
+    pub fn take_snapshot_metadata(
+        &mut self,
+    ) -> io::Result<fluree_db_core::db::LedgerSnapshotMetadata> {
+        let ledger_id = fluree_db_core::LedgerId::parse(&self.ledger_id).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("index root ledger id: {e}"),
+            )
+        })?;
+        Ok(fluree_db_core::db::LedgerSnapshotMetadata {
+            ledger_id,
+            t: self.index_t,
+            base_t: self.base_t,
+            namespace_codes: self
+                .namespace_codes
+                .iter()
+                .map(|(&code, prefix)| (code, prefix.clone()))
+                .collect(),
+            ns_split_mode: self.ns_split_mode,
+            stats: self.stats.take().map(std::sync::Arc::new),
+            schema: self.schema.take(),
+            subject_watermarks: self.subject_watermarks.clone(),
+            string_watermark: self.string_watermark,
+            graph_iris: self.graph_iris.clone(),
+            has_annotations: self.has_annotations,
+            annotation_index: self.annotation_index.clone(),
+            had_annotation_arena: self.had_annotation_arena,
+            has_list_meta: self.has_list_meta,
+        })
+    }
+
     /// Decode from FIR6 binary bytes.
     pub fn decode(data: &[u8]) -> io::Result<Self> {
         if data.len() < Self::HEADER_LEN {
@@ -1598,6 +1633,84 @@ mod tests {
         assert!(snap.has_annotations, "snapshot path also sees sticky bit");
         let snap_ann = snap.annotation_index.expect("metadata path roundtrip");
         assert_eq!(snap_ann, ann);
+    }
+
+    /// A caller holding the decoded root builds the snapshot from it instead
+    /// of decoding the bytes again; that snapshot must be the one the
+    /// metadata-only decoder builds from the same bytes.
+    #[test]
+    fn snapshot_metadata_from_the_decoded_root_matches_the_metadata_decoder() {
+        use fluree_db_core::index_stats::{ClassStatEntry, GraphStatsEntry};
+        use fluree_db_core::sid::Sid;
+        use fluree_db_core::LedgerSnapshot;
+
+        let mut root = minimal_root_v6();
+        root.base_t = 7;
+        root.graph_iris = vec!["urn:g:txn".into(), "urn:g:config".into(), "urn:g:a".into()];
+        root.subject_watermarks = vec![5, 9];
+        root.string_watermark = 11;
+        root.has_annotations = true;
+        root.had_annotation_arena = true;
+        root.has_list_meta = Some(true);
+        root.stats = Some(IndexStats {
+            flakes: 3,
+            size: 30,
+            properties: None,
+            classes: None,
+            graphs: Some(vec![GraphStatsEntry {
+                g_id: 0,
+                flakes: 3,
+                size: 30,
+                properties: vec![],
+                classes: Some(vec![ClassStatEntry {
+                    class_sid: Sid::new(0, "Person"),
+                    count: 2,
+                    properties: vec![],
+                }]),
+            }]),
+            historical_since_t: Some(0),
+        });
+        root.schema = Some(IndexSchema {
+            t: 4,
+            ..Default::default()
+        });
+        let bytes = root.encode();
+
+        let view = |s: &LedgerSnapshot| {
+            let namespaces: BTreeMap<_, _> = s.namespaces().iter().collect();
+            let graphs: Vec<_> = s.graph_registry.iter_entries().collect();
+            format!(
+                "{:?}",
+                (
+                    &s.ledger_id,
+                    s.t,
+                    s.base_t,
+                    namespaces,
+                    s.ns_split_mode(),
+                    &s.stats,
+                    &s.schema,
+                    &s.subject_watermarks,
+                    s.string_watermark,
+                    graphs,
+                    (
+                        s.has_annotations,
+                        &s.annotation_index,
+                        s.had_annotation_arena
+                    ),
+                    s.has_list_meta,
+                )
+            )
+        };
+        let from_bytes = LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+        let mut decoded = IndexRoot::decode(&bytes).unwrap();
+        let from_root =
+            LedgerSnapshot::new_meta(decoded.take_snapshot_metadata().unwrap()).unwrap();
+        assert_eq!(view(&from_root), view(&from_bytes));
+        assert!(from_root.stats.is_some() && from_root.schema.is_some());
+        assert!(
+            decoded.stats.is_none() && decoded.schema.is_none(),
+            "stats and schema move into the snapshot rather than being copied"
+        );
     }
 
     #[test]
