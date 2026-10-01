@@ -16,8 +16,8 @@ use crate::fast_path_common::{
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{
-    equality_norm, late_materialized_object_binding, materialized_object_binding, same_term,
-    EqualityNorm, TermDicts,
+    equality_norm, is_arena_encoded, late_materialized_object_binding, materialized_object_binding,
+    same_term, EqualityNorm, TermDicts,
 };
 use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
@@ -1231,15 +1231,22 @@ impl NestedLoopJoinOperator {
         right_batch: &Batch,
         right_row: usize,
         shared: &[(usize, usize)],
-    ) -> bool {
-        shared.iter().all(|&(left_col, right_col)| {
+    ) -> Result<bool> {
+        for &(left_col, right_col) in shared {
             let left_val = left_batch.get_by_col(left_row, left_col);
             if left_val.is_unbound_or_poisoned() {
-                return true;
+                continue;
             }
             let right_val = right_batch.get_by_col(right_row, right_col);
-            left_val.eq_for_join(right_val) || same_term(left_val, right_val, &self.norm)
-        })
+            // An arena handle is never compared structurally here: across
+            // graphs equal handles can name different values.
+            let same = (!is_arena_encoded(left_val) && left_val.eq_for_join(right_val))
+                || same_term(left_val, right_val, &self.norm)?;
+            if !same {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Combine left row with right row into output row
@@ -1833,7 +1840,7 @@ impl NestedLoopJoinOperator {
             let mut right_row = self.pending_right_row;
             while right_row < right_batch_len && rows_added < batch_size {
                 // Unification check: shared vars must match
-                if self.unify_check(left_batch, left_row, right_batch, right_row, &shared) {
+                if self.unify_check(left_batch, left_row, right_batch, right_row, &shared)? {
                     // Combine and add to output
                     let mut combined =
                         self.combine_rows(left_batch, left_row, right_batch, right_row);

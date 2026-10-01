@@ -667,6 +667,12 @@ pub(crate) fn normalize_for_key_cow<'a>(
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
 ) -> std::borrow::Cow<'a, Binding> {
     use std::borrow::Cow;
+    // A key over an arena handle with no view to decode it would key by a
+    // graph-scoped handle; member scans of a union of graphs decode them.
+    debug_assert!(
+        gv.is_some() || !is_arena_encoded(binding),
+        "arena-backed literal keyed with no graph view: {binding:?}"
+    );
     if let Some(canonical) = dicts.and_then(|d| encoded_iri_canonical(binding, d)) {
         return match canonical {
             Some(b) => Cow::Owned(b),
@@ -709,21 +715,44 @@ pub(crate) fn normalize_for_key_cow<'a>(
 /// decoding the encoded side instead: the graph view memoizes that per
 /// subject, where encoding the decoded side costs a dictionary lookup each
 /// time.
-pub(crate) fn same_term(a: &Binding, b: &Binding, norm: &Option<EqualityNorm>) -> bool {
-    match one_form_answer(a, b) {
+///
+/// An arena-backed literal (a big number or a vector) is only comparable
+/// through a graph view: its handle names a value within one graph, so with
+/// none this refuses rather than answer either way. Member scans of a union
+/// of graphs bind those literals decoded, so no query reaches that refusal.
+pub(crate) fn same_term(
+    a: &Binding,
+    b: &Binding,
+    norm: &Option<EqualityNorm>,
+) -> crate::error::Result<bool> {
+    let gv = norm.as_ref().and_then(|n| n.gv.as_ref());
+    if gv.is_none() && (is_arena_encoded(a) || is_arena_encoded(b)) {
+        return Err(undecodable_arena_literal(a, b));
+    }
+    Ok(match one_form_answer(a, b) {
         Some(same) => same,
         None => {
-            if let Some(same) = norm
-                .as_ref()
-                .and_then(|n| n.gv.as_ref())
-                .and_then(|gv| encoded_against_decoded_subject(a, b, gv))
-            {
-                return same;
+            if let Some(same) = gv.and_then(|gv| encoded_against_decoded_subject(a, b, gv)) {
+                return Ok(same);
             }
             let (dicts, gv) = EqualityNorm::parts(norm);
             normalize_for_key_cow(a, dicts, gv) == normalize_for_key_cow(b, dicts, gv)
         }
-    }
+    })
+}
+
+/// The refusal [`same_term`] answers an arena-backed literal with when no
+/// graph view can decode it.
+#[cold]
+fn undecodable_arena_literal(a: &Binding, b: &Binding) -> crate::error::QueryError {
+    debug_assert!(
+        false,
+        "arena-backed literal compared with no graph view: {a:?} vs {b:?}"
+    );
+    crate::error::QueryError::Internal(format!(
+        "cannot compare an arena-backed literal without a graph view to decode it: \
+         {a:?} vs {b:?}"
+    ))
 }
 
 /// [`same_term`] for an `EncodedSid` against a decoded `Sid`, through the
@@ -745,14 +774,25 @@ fn encoded_against_decoded_subject(
         .map(|decoded| decoded == *sid)
 }
 
-/// [`same_term`] for a caller without an [`EqualityNorm`]: IRIs and
-/// dictionary literals canonicalize through `dicts`; NUM_BIG literals, which
-/// need a graph view to decode, compare structurally.
-pub(crate) fn same_term_by_dicts(a: &Binding, b: &Binding, dicts: Option<TermDicts<'_>>) -> bool {
-    match one_form_answer(a, b) {
-        Some(same) => same,
-        None => normalize_for_key_cow(a, dicts, None) == normalize_for_key_cow(b, dicts, None),
+/// [`same_term`] for a caller that holds only the context, such as an inline
+/// BIND: a pair that needs no canonicalization answers at once, an IRI or
+/// dictionary literal canonicalizes through the context's dictionaries, and
+/// an arena-backed literal builds the context's normalization to decode it.
+pub(crate) fn same_term_in(
+    a: &Binding,
+    b: &Binding,
+    ctx: Option<&crate::context::ExecutionContext<'_>>,
+) -> crate::error::Result<bool> {
+    if is_arena_encoded(a) || is_arena_encoded(b) {
+        return same_term(a, b, &ctx.and_then(equality_norm));
     }
+    Ok(match one_form_answer(a, b) {
+        Some(same) => same,
+        None => {
+            let dicts = ctx.and_then(equality_dicts);
+            normalize_for_key_cow(a, dicts, None) == normalize_for_key_cow(b, dicts, None)
+        }
+    })
 }
 
 /// The answer [`same_term`] gives without canonicalizing: `true` for equal
@@ -767,6 +807,19 @@ fn one_form_answer(a: &Binding, b: &Binding) -> Option<bool> {
         return Some(false);
     }
     None
+}
+
+/// True if this is an encoded literal whose key is a handle into a per-graph,
+/// per-predicate arena (a big number or a vector): the handle names a value
+/// only within the graph that bound it.
+#[inline]
+pub(crate) fn is_arena_encoded(binding: &Binding) -> bool {
+    matches!(
+        binding,
+        Binding::EncodedLit { o_kind, .. }
+            if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
+                || *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8()
+    )
 }
 
 /// True if this is an arena-backed (NUM_BIG) encoded literal.

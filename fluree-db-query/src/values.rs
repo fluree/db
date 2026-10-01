@@ -126,7 +126,7 @@ impl ValuesOperator {
         norm: &Option<crate::object_binding::EqualityNorm>,
         input_row: &[&Binding],
         value_row: &[Binding],
-    ) -> bool {
+    ) -> Result<bool> {
         for (val_idx, overlap_pos) in self.overlap_positions.iter().enumerate() {
             if let Some(child_pos) = overlap_pos {
                 // This value var exists in child schema - check compatibility
@@ -145,12 +145,12 @@ impl ValuesOperator {
                 // while dataset execution can produce `IriMatch` bindings. We treat
                 // Sid vs IriMatch/Iri as comparable by decoding the SID using the
                 // primary db in the execution context.
-                if !bindings_compatible_for_values(ctx, norm, child_val, values_val) {
-                    return false;
+                if !bindings_compatible_for_values(ctx, norm, child_val, values_val)? {
+                    return Ok(false);
                 }
             }
         }
-        true
+        Ok(true)
     }
 
     /// Inside a cross-ledger SERVICE body every reference binding is
@@ -333,14 +333,16 @@ impl Operator for ValuesOperator {
                 )
             });
 
-            let check_and_merge = |value_row: &[Binding], columns: &mut Vec<Vec<Binding>>| {
-                if self.is_compatible(ctx, &norm, &input_row, value_row) {
-                    let merged = self.merge_rows(&input_row, value_row);
-                    for (col_idx, binding) in merged.into_iter().enumerate() {
-                        columns[col_idx].push(binding);
+            let check_and_merge =
+                |value_row: &[Binding], columns: &mut Vec<Vec<Binding>>| -> Result<()> {
+                    if self.is_compatible(ctx, &norm, &input_row, value_row)? {
+                        let merged = self.merge_rows(&input_row, value_row);
+                        for (col_idx, binding) in merged.into_iter().enumerate() {
+                            columns[col_idx].push(binding);
+                        }
                     }
-                }
-            };
+                    Ok(())
+                };
 
             if let Some(bucket) = bucket {
                 // Emit candidates in original value-row order (bucket and
@@ -353,11 +355,11 @@ impl Operator for ValuesOperator {
                     .collect();
                 idxs.sort_unstable();
                 for i in idxs {
-                    check_and_merge(&self.value_rows[i], &mut columns);
+                    check_and_merge(&self.value_rows[i], &mut columns)?;
                 }
             } else {
                 for value_row in &self.value_rows {
-                    check_and_merge(value_row, &mut columns);
+                    check_and_merge(value_row, &mut columns)?;
                 }
             }
         }
@@ -388,15 +390,15 @@ fn bindings_compatible_for_values(
     norm: &Option<crate::object_binding::EqualityNorm>,
     a: &Binding,
     b: &Binding,
-) -> bool {
+) -> Result<bool> {
     // Encoded scan output vs decoded VALUES constants, and arena-backed
     // NUM_BIG scan output vs a decoded decimal/bigint constant: one term in
     // two forms, compared the way every equality surface compares them.
-    if crate::object_binding::same_term(a, b, norm) {
-        return true;
+    if crate::object_binding::same_term(a, b, norm)? {
+        return Ok(true);
     }
 
-    match (a, b) {
+    Ok(match (a, b) {
         // Compare SID to IRI-bearing bindings by decoding SID via primary db.
         (Binding::Sid { sid, .. }, Binding::Iri(iri) | Binding::IriMatch { iri, .. })
         | (Binding::Iri(iri) | Binding::IriMatch { iri, .. }, Binding::Sid { sid, .. }) => ctx
@@ -405,7 +407,7 @@ fn bindings_compatible_for_values(
             .map(|decoded| decoded == iri.as_ref())
             .unwrap_or(false),
         _ => false,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -493,41 +495,47 @@ mod tests {
         // Compatible: child has 10, values has 10
         let binding_10 = Binding::lit(FlakeValue::Long(10), xsd_long());
         let input_row = vec![&binding_10];
-        assert!(op.is_compatible(
-            &ctx,
-            &None,
-            &input_row,
-            &[
-                Binding::lit(FlakeValue::Long(10), xsd_long()),
-                Binding::lit(FlakeValue::Long(20), xsd_long())
-            ]
-        ));
+        assert!(op
+            .is_compatible(
+                &ctx,
+                &None,
+                &input_row,
+                &[
+                    Binding::lit(FlakeValue::Long(10), xsd_long()),
+                    Binding::lit(FlakeValue::Long(20), xsd_long())
+                ]
+            )
+            .unwrap());
 
         // Incompatible: child has 10, values has 99
         let binding_10 = Binding::lit(FlakeValue::Long(10), xsd_long());
         let input_row = vec![&binding_10];
-        assert!(!op.is_compatible(
-            &ctx,
-            &None,
-            &input_row,
-            &[
-                Binding::lit(FlakeValue::Long(99), xsd_long()),
-                Binding::lit(FlakeValue::Long(20), xsd_long())
-            ]
-        ));
+        assert!(!op
+            .is_compatible(
+                &ctx,
+                &None,
+                &input_row,
+                &[
+                    Binding::lit(FlakeValue::Long(99), xsd_long()),
+                    Binding::lit(FlakeValue::Long(20), xsd_long())
+                ]
+            )
+            .unwrap());
 
         // Compatible: child is Unbound (matches anything)
         let unbound = Binding::Unbound;
         let input_row = vec![&unbound];
-        assert!(op.is_compatible(
-            &ctx,
-            &None,
-            &input_row,
-            &[
-                Binding::lit(FlakeValue::Long(99), xsd_long()),
-                Binding::lit(FlakeValue::Long(20), xsd_long())
-            ]
-        ));
+        assert!(op
+            .is_compatible(
+                &ctx,
+                &None,
+                &input_row,
+                &[
+                    Binding::lit(FlakeValue::Long(99), xsd_long()),
+                    Binding::lit(FlakeValue::Long(20), xsd_long())
+                ]
+            )
+            .unwrap());
     }
 
     // Helper struct for testing: an operator with a specific schema that returns empty

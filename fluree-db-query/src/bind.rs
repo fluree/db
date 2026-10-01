@@ -267,7 +267,7 @@ impl Operator for BindOperator {
                                     existing_val,
                                     &computed,
                                     &self.norm,
-                                )
+                                )?
                         }
                     }
                 };

@@ -86,15 +86,7 @@ pub fn apply_inline(
                         (_, Binding::Unbound) => continue,
                         // A scan's encoded value and the expression's decoded
                         // one can be one term.
-                        (a, b)
-                            if crate::object_binding::same_term_by_dicts(
-                                a,
-                                b,
-                                ctx.and_then(crate::object_binding::equality_dicts),
-                            ) =>
-                        {
-                            continue
-                        }
+                        (a, b) if crate::object_binding::same_term_in(a, b, ctx)? => continue,
                         _ => return Ok(false),
                     },
                 }

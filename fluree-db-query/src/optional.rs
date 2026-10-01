@@ -2669,35 +2669,32 @@ impl OptionalOperator {
         required_row: usize,
         optional_batch: &Batch,
         optional_row: usize,
-    ) -> bool {
+    ) -> Result<bool> {
         // Unification must be resilient to optional operator schemas that do not
         // include substituted correlation vars.
         //
         // If the optional-side batch doesn't have the shared var column, we treat
         // it as already enforced by correlation/substitution and skip the check.
-        self.optional_builder
-            .unify_instructions()
-            .iter()
-            .all(|instr| {
-                let var = self.required_schema[instr.left_col];
-                let opt_col = optional_batch.schema().iter().position(|v| *v == var);
-                if let Some(opt_col) = opt_col {
-                    let left_val = required_batch.get_by_col(required_row, instr.left_col);
-                    let right_val = optional_batch.get_by_col(optional_row, opt_col);
+        for instr in self.optional_builder.unify_instructions() {
+            let var = self.required_schema[instr.left_col];
+            let Some(opt_col) = optional_batch.schema().iter().position(|v| *v == var) else {
+                continue;
+            };
+            let left_val = required_batch.get_by_col(required_row, instr.left_col);
+            let right_val = optional_batch.get_by_col(optional_row, opt_col);
 
-                    // Poisoned blocks matching; Unbound is compatible with anything.
-                    if left_val.is_poisoned() || right_val.is_poisoned() {
-                        return false;
-                    }
-                    if matches!(left_val, Binding::Unbound) || matches!(right_val, Binding::Unbound)
-                    {
-                        return true;
-                    }
-                    same_term(left_val, right_val, &self.norm)
-                } else {
-                    true
-                }
-            })
+            // Poisoned blocks matching; Unbound is compatible with anything.
+            if left_val.is_poisoned() || right_val.is_poisoned() {
+                return Ok(false);
+            }
+            if matches!(left_val, Binding::Unbound) || matches!(right_val, Binding::Unbound) {
+                continue;
+            }
+            if !same_term(left_val, right_val, &self.norm)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Combine required row with optional row into output row
@@ -2902,7 +2899,7 @@ impl Operator for OptionalOperator {
                                 required_row,
                                 &self.pending_output.front().unwrap().optional_batches[batch_idx],
                                 opt_row,
-                            ) {
+                            )? {
                                 continue;
                             }
 

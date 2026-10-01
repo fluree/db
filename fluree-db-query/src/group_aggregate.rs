@@ -476,6 +476,11 @@ pub(crate) fn binding_to_group_key_normalized(
     dicts: Option<crate::object_binding::TermDicts<'_>>,
     gv: Option<&BinaryGraphView>,
 ) -> GroupKeyOwned {
+    // See `normalize_for_key_cow`: an arena handle is never keyed unviewed.
+    debug_assert!(
+        gv.is_some() || !crate::object_binding::is_arena_encoded(binding),
+        "arena-backed literal keyed with no graph view: {binding:?}"
+    );
     if let Some(canonical) =
         dicts.and_then(|d| crate::object_binding::encoded_iri_canonical(binding, d))
     {

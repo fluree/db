@@ -377,6 +377,12 @@ pub struct ExecutionContext<'a> {
     /// (config resolution, policy loading) that call `binding.as_sid()` /
     /// `binding.as_lit()` directly.
     pub eager_materialization: bool,
+    /// Whether this context scans one graph of a union of several (a dataset
+    /// member, see [`Self::with_graph_ref`]). An arena-backed literal's handle
+    /// (a big number's or a vector's) names its value only within this graph,
+    /// so a scan here decodes those literals rather than binding the handle:
+    /// the rows leave for a context with no single graph to decode them in.
+    pub graph_union_member: bool,
     /// Whether any reasoning/entailment mode (RDFS, OWL2-QL, OWL2-RL, datalog)
     /// is active for this query.
     ///
@@ -515,6 +521,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: false,
+            graph_union_member: false,
             reasoning_active: false,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
@@ -575,6 +582,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: db.eager,
+            graph_union_member: false,
             reasoning_active: false,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
@@ -639,6 +647,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: db.eager,
+            graph_union_member: false,
             reasoning_active: false,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
@@ -692,6 +701,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: false,
+            graph_union_member: false,
             reasoning_active: false,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
@@ -744,6 +754,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: false,
+            graph_union_member: false,
             reasoning_active: false,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
@@ -798,6 +809,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: false,
+            graph_union_member: false,
             reasoning_active: false,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
@@ -1435,6 +1447,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
             multi_ledger,
             eager_materialization: self.eager_materialization,
+            graph_union_member: self.graph_union_member,
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
@@ -1498,6 +1511,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
+            graph_union_member: self.graph_union_member,
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
@@ -1557,6 +1571,8 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
+            graph_union_member: self.graph_union_member
+                || matches!(self.active_graphs(), ActiveGraphs::Many(graphs) if graphs.len() > 1),
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             // A fresh per-graph scope: dataset members are stamped at the
