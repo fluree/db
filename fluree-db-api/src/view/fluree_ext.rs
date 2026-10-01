@@ -425,6 +425,26 @@ impl Fluree {
                         .augment_namespace_codes(view.snapshot.namespaces())
                         .map_err(|e| ApiError::internal(format!("augment namespace codes: {e}")))?;
                     store.set_ns_split_mode(view.snapshot.ns_split_mode());
+                    let store = Arc::new(store);
+                    if view.snapshot.has_annotations {
+                        if let Some(novelty) = view.novelty.as_mut() {
+                            let base = fluree_db_novelty::LinkBase::new(
+                                Arc::new(fluree_db_query::IndexAttachments::new(Arc::clone(
+                                    &store,
+                                ))),
+                                view.snapshot.t,
+                            );
+                            Arc::make_mut(novelty)
+                                .set_attachment_base(base)
+                                .map_err(|e| {
+                                    ApiError::internal(format!("derive reification links: {e}"))
+                                })?;
+                            // The view reads novelty through `overlay`, which
+                            // still holds the copy without links.
+                            view.overlay =
+                                Arc::clone(novelty) as Arc<dyn fluree_db_core::OverlayProvider>;
+                        }
+                    }
 
                     // Populate dict novelty safely (persisted dict wins).
                     populate_dict_novelty_from_view(
@@ -433,7 +453,7 @@ impl Fluree {
                         view.novelty.as_ref(),
                     )?;
                     view.dict_novelty = Some(Arc::new(dict_novelty));
-                    view.binary_store = Some(Arc::new(store));
+                    view.binary_store = Some(store);
 
                     // Historical views loaded from an index root are metadata-only by default
                     // (`LedgerSnapshot::from_root_bytes` sets `range_provider = None`).

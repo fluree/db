@@ -3736,6 +3736,8 @@ pub(crate) fn translate_one_flake_v3_pub(
     }
 
     // Object value → (o_type, o_key), using flake.dt + lang for proper OType.
+    // A term novelty derived has no handle until the index interns it; it is
+    // an ordinary novelty-only value, so it takes the raw-flake lane.
     let (o_type, o_key) = value_to_otype_okey(
         &flake.o,
         &flake.dt,
@@ -3743,7 +3745,16 @@ pub(crate) fn translate_one_flake_v3_pub(
         store,
         dict_novelty,
         Some((g_id, p_id)),
-    )?;
+    )
+    .map_err(|e| match (&flake.o, e.kind()) {
+        (fluree_db_core::FlakeValue::TripleTerm(_), std::io::ErrorKind::NotFound) => {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "triple term not interned (novelty-only); use raw flake path",
+            )
+        }
+        _ => e,
+    })?;
 
     // List index
     let o_i = flake

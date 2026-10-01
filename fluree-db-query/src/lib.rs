@@ -115,7 +115,7 @@ pub mod vector;
 // Re-exports
 pub use aggregate::AggregateOperator;
 pub use binary_history::BinaryHistoryScanOperator;
-pub use binary_range::BinaryRangeProvider;
+pub use binary_range::{BinaryRangeProvider, IndexAttachments};
 pub use binary_scan::BinaryScanOperator;
 pub use bind::BindOperator;
 pub use binding::{

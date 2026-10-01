@@ -967,3 +967,289 @@ async fn link_lowering_drives_chained_edges_through_their_subjects() {
         assert_eq!(components["details"]["access"], "subject", "{plan:#}");
     }
 }
+
+/// What every link query below must answer once the claims are imported and
+/// three unindexed transactions have changed them: a new annotated edge, a
+/// partial re-point of `ex:claim2`'s object, a second edge out of `ex:bob`,
+/// and a retract of `ex:alice ex:knows ex:carol`, whose annotation the
+/// retract cascades away.
+async fn assert_novelty_links(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) {
+    let got = links(fluree, ledger).await;
+    assert_eq!(got.len(), 5, "{got:#?}");
+    let term = |reifier: &str| -> String {
+        got.iter()
+            .find(|r| r[0].ends_with(reifier))
+            .unwrap_or_else(|| panic!("no link for {reifier}: {got:#?}"))[1]
+            .clone()
+    };
+    assert!(
+        term("claim2").contains("43") && !term("claim2").contains("42"),
+        "the link follows an unindexed re-point: {got:#?}"
+    );
+    assert!(
+        term("claim9").contains("erin") && term("claim9").contains("frank"),
+        "{got:#?}"
+    );
+    assert!(
+        !got.iter()
+            .any(|r| r[1].contains("carol") && r[1].contains("knows")),
+        "the cascade retracts the link: {got:#?}"
+    );
+
+    let got = run_link_query(
+        fluree,
+        ledger,
+        "SELECT ?s ?o WHERE { << ?s ex:knows ?o >> ex:source ?src } ORDER BY ?s ?o".to_string(),
+    )
+    .await;
+    let pairs: Vec<(String, String)> = got.iter().map(|r| (r[0].clone(), r[1].clone())).collect();
+    assert_eq!(
+        pairs,
+        [
+            ("ex:alice", "ex:bob"),
+            ("ex:bob", "ex:dave"),
+            ("ex:bob", "ex:erin"),
+            ("ex:erin", "ex:frank"),
+        ]
+        .map(|(s, o)| (s.to_string(), o.to_string())),
+        "{got:#?}"
+    );
+
+    let got = run_link_query(
+        fluree,
+        ledger,
+        "SELECT ?o WHERE { << ex:erin ex:knows ?o >> ex:source ?src }".to_string(),
+    )
+    .await;
+    assert_eq!(got, vec![vec!["ex:frank".to_string()]], "{got:#?}");
+
+    let got = run_link_query(
+        fluree,
+        ledger,
+        "SELECT ?age WHERE { ?r rdf:reifies <<( ex:carol ex:age ?age )>> }".to_string(),
+    )
+    .await;
+    assert_eq!(got, vec![vec!["43".to_string()]], "{got:#?}");
+
+    // The second edge's subject is bound by the first: one indexed term and
+    // one only novelty holds.
+    let got = run_link_query(
+        fluree,
+        ledger,
+        "SELECT ?x WHERE { << ex:alice ex:knows ?y >> ex:source ?s1 . \
+         << ?y ex:knows ?x >> ex:source ?s2 } ORDER BY ?x"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![vec!["ex:dave".to_string()], vec!["ex:erin".to_string()]],
+        "{got:#?}"
+    );
+}
+
+async fn change_claims_without_indexing(
+    fluree: &fluree_db_api::Fluree,
+    ledger: LedgerState,
+) -> LedgerState {
+    let turtle =
+        |body: &str| format!("VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n{body}\n");
+    let ledger = fluree
+        .upsert_turtle(
+            ledger,
+            &turtle(
+                "ex:erin ex:knows ex:frank ~ ex:claim9 {| ex:source ex:web |} .\n\
+                 ex:carol ex:age 43 ~ ex:claim2 .",
+            ),
+        )
+        .await
+        .expect("new claim and re-point")
+        .ledger;
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            &turtle("ex:bob ex:knows ex:erin {| ex:source ex:web |} ."),
+        )
+        .await
+        .expect("second edge out of bob")
+        .ledger;
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "delete": { "@id": "ex:alice", "ex:knows": { "@id": "ex:carol" } }
+            }),
+        )
+        .await
+        .expect("retract an annotated edge")
+        .ledger
+}
+
+/// Links for commits no index covers come from novelty: new annotations, a
+/// partial re-point and a cascaded retract show in link queries before any
+/// index build, and again after a reload rebuilds novelty from the commits,
+/// where the links wait for the index store before they can be derived.
+#[tokio::test]
+async fn novelty_carries_links_until_the_index_covers_them() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let alias = "it/triple-term-links:novelty";
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    std::fs::write(data_dir.path().join("claims.ttl"), CLAIMS).expect("write fixture");
+    let open = || {
+        FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("build file-backed Fluree")
+    };
+    let fluree = open();
+    fluree
+        .create(alias)
+        .import(data_dir.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+    let ledger = fluree.ledger(alias).await.expect("load ledger");
+    let ledger = change_claims_without_indexing(&fluree, ledger).await;
+    assert!(
+        ledger.t() > ledger.index_t(),
+        "the changes must stay unindexed"
+    );
+    assert_novelty_links(&fluree, &ledger).await;
+    drop(ledger);
+    drop(fluree);
+
+    let fluree = open();
+    let ledger = fluree.ledger(alias).await.expect("reload");
+    assert!(
+        ledger.t() > ledger.index_t(),
+        "the reload must replay novelty"
+    );
+    assert_novelty_links(&fluree, &ledger).await;
+
+    // Time travel to the first change replays novelty on its own.
+    let view = fluree
+        .db_at_t(alias, ledger.index_t() + 1)
+        .await
+        .expect("historical view");
+    let result = fluree
+        .query(
+            &view,
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+             SELECT ?r ?t WHERE { ?r rdf:reifies ?t } ORDER BY ?r",
+        )
+        .await
+        .expect("historical link query");
+    let got = rows(
+        &result
+            .to_jsonld_async(view.as_graph_db_ref())
+            .await
+            .expect("format"),
+    );
+    assert_eq!(got.len(), 5, "{got:#?}");
+    assert!(
+        got.iter()
+            .any(|r| r[1].contains("carol") && r[1].contains("knows")),
+        "the retract comes later: {got:#?}"
+    );
+    assert!(
+        got.iter()
+            .any(|r| r[0].ends_with("claim2") && r[1].contains("43")),
+        "{got:#?}"
+    );
+}
+
+/// A ledger that was never indexed holds every link in novelty and has no
+/// term dictionary at all.
+#[tokio::test]
+async fn novelty_carries_links_on_a_ledger_never_indexed() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:never-indexed");
+    let ledger = fluree
+        .insert_turtle(ledger, CLAIMS)
+        .await
+        .expect("claims")
+        .ledger;
+    assert_eq!(ledger.index_t(), 0);
+    let ledger = change_claims_without_indexing(&fluree, ledger).await;
+    assert_novelty_links(&fluree, &ledger).await;
+}
+
+/// An index publish in the middle of unindexed re-points: novelty's links
+/// must then derive from the new index. Against the old one, the next
+/// re-point would retract a term the new index never linked and leave the
+/// published link live beside the new one. Every write and read goes through
+/// the cached handle, which is what the publish updates in place.
+#[tokio::test]
+async fn novelty_links_follow_the_index_they_were_published_over() {
+    use fluree_db_indexer::IndexerConfig;
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/triple-term-links:novelty-over-publish";
+    let (local, indexer) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let claim = |age: u32| {
+        format!(
+            "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:age {age} ~ ex:claim1 {{| ex:source ex:hr |}} .\n"
+        )
+    };
+
+    local
+        .run_until(async {
+            fluree.create_ledger(ledger_id).await.expect("create");
+            let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+            let upsert = |age: u32| {
+                let fluree = &fluree;
+                let handle = &handle;
+                let turtle = claim(age);
+                async move {
+                    fluree
+                        .stage(handle)
+                        .upsert_turtle(&turtle)
+                        .execute()
+                        .await
+                        .expect("upsert through the cached handle")
+                        .receipt
+                        .t
+                }
+            };
+            let live = || async {
+                let state = handle.snapshot().await.to_ledger_state();
+                let got = links(&fluree, &state).await;
+                (state.t(), state.index_t(), got)
+            };
+            let assert_age = |got: &Vec<Vec<String>>, age: u32| {
+                assert_eq!(got.len(), 1, "one live link: {got:#?}");
+                assert!(got[0][1].contains(&age.to_string()), "{got:#?}");
+            };
+
+            let t1 = upsert(41).await;
+            support::trigger_index_and_wait(&indexer, ledger_id, t1).await;
+            support::wait_for_index_application(&fluree, ledger_id, t1).await;
+
+            let t2 = upsert(42).await;
+            let (t, index_t, got) = live().await;
+            assert_eq!((t, index_t), (t2, t1));
+            assert_age(&got, 42);
+            support::trigger_index_and_wait(&indexer, ledger_id, t2).await;
+            support::wait_for_index_application(&fluree, ledger_id, t2).await;
+
+            let t3 = upsert(43).await;
+            let (t, index_t, got) = live().await;
+            assert_eq!(
+                (t, index_t),
+                (t3, t2),
+                "the publish must reach the cached handle"
+            );
+            assert_age(&got, 43);
+        })
+        .await;
+}

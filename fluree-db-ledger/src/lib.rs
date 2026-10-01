@@ -46,6 +46,20 @@ use fluree_db_novelty::{
 use futures::StreamExt;
 use std::sync::Arc;
 
+/// Install an empty attachment base when the index never held an annotation,
+/// so novelty derives reification links without waiting for the binary store.
+/// An index with annotations gets its base when the store attaches. Returns
+/// the links of commits that were waiting on it.
+pub(crate) fn link_base_without_annotations(
+    novelty: &mut Novelty,
+    snapshot: &LedgerSnapshot,
+) -> Result<Vec<Flake>> {
+    if snapshot.has_annotations {
+        return Ok(Vec::new());
+    }
+    Ok(novelty.set_attachment_base(fluree_db_novelty::LinkBase::empty(snapshot.t))?)
+}
+
 /// Type-erased binary index store for query engine access.
 ///
 /// Allows `LedgerState` to carry a `BinaryIndexStore` without
@@ -334,7 +348,7 @@ impl LedgerState {
         // Load novelty from commits since index_t
         let head_commit_id = match &record.commit_head_id {
             Some(head_cid) if record.commit_t > snapshot.t => {
-                let (novelty_overlay, head_id, head_temporal) = Self::load_novelty(
+                let (mut novelty_overlay, head_id, head_temporal) = Self::load_novelty(
                     store,
                     head_cid,
                     snapshot.t,
@@ -343,6 +357,8 @@ impl LedgerState {
                     &mut dict_novelty,
                 )
                 .await?;
+                let links = link_base_without_annotations(&mut novelty_overlay, &snapshot)?;
+                dict_novelty.populate_from_flakes(&links);
                 let head_index_id = record.index_head_id.clone();
                 let mut runtime_small_dicts = RuntimeSmallDicts::new();
                 runtime_small_dicts.populate_from_flakes_iter(
@@ -369,10 +385,11 @@ impl LedgerState {
         };
 
         let head_index_id = record.index_head_id.clone();
-        let novelty_t = snapshot.t;
+        let mut novelty = Novelty::new(snapshot.t);
+        link_base_without_annotations(&mut novelty, &snapshot)?;
         Ok(Self {
             snapshot: Arc::new(snapshot),
-            novelty: Arc::new(Novelty::new(novelty_t)),
+            novelty: Arc::new(novelty),
             dict_novelty: Arc::new(dict_novelty),
             schema_hierarchy_cache: Arc::new(fluree_db_core::SchemaHierarchyCache::default()),
             shacl_compile_cache: Arc::new(parking_lot::RwLock::new(None)),
@@ -529,11 +546,14 @@ impl LedgerState {
     }
 
     /// Create a new ledger state from components
-    pub fn new(snapshot: LedgerSnapshot, novelty: Novelty) -> Self {
-        let dict_novelty = DictNovelty::with_watermarks(
+    pub fn new(snapshot: LedgerSnapshot, mut novelty: Novelty) -> Self {
+        let links = link_base_without_annotations(&mut novelty, &snapshot)
+            .expect("an empty attachment base derives links without reading anything");
+        let mut dict_novelty = DictNovelty::with_watermarks(
             snapshot.subject_watermarks.clone(),
             snapshot.string_watermark,
         );
+        dict_novelty.populate_from_flakes(&links);
         let mut runtime_small_dicts = RuntimeSmallDicts::new();
         runtime_small_dicts
             .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
@@ -680,6 +700,7 @@ impl LedgerState {
         // Clear novelty up to new index_t
         let mut new_novelty = (*self.novelty).clone();
         new_novelty.clear_up_to(new_snapshot.t);
+        link_base_without_annotations(&mut new_novelty, &new_snapshot)?;
 
         // Reset dict_novelty with new watermarks from the index root
         let mut new_dict_novelty = DictNovelty::with_watermarks(
@@ -756,6 +777,7 @@ impl LedgerState {
         // Clear novelty up to new index_t
         let mut new_novelty = (*self.novelty).clone();
         new_novelty.clear_up_to(new_snapshot.t);
+        let links = link_base_without_annotations(&mut new_novelty, &new_snapshot)?;
         // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
         // holds dead flakes, but `size` tracks only active bytes.
         let has_remaining_novelty = new_novelty.size > 0;
@@ -831,6 +853,9 @@ impl LedgerState {
             &self.snapshot.subject_watermarks,
             self.snapshot.string_watermark,
         );
+        if retired.is_some() && !links.is_empty() {
+            Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&links);
+        }
         let new_runtime_small_dicts = match retired {
             Some(_) => Arc::clone(&self.runtime_small_dicts),
             None => {

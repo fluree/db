@@ -14,6 +14,9 @@
 //! `BIND` clobber check applies. Dictionary membership says nothing about a
 //! live, visible annotation: the link `?r rdf:reifies ?t` that follows keeps
 //! the graph, time, policy and novelty checks.
+//!
+//! Terms the index has not interned yet appear only in novelty's links; they
+//! are collected once per open and offered alongside the dictionary's.
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
@@ -27,7 +30,7 @@ use fluree_db_core::o_type::OType;
 use fluree_db_core::triple_term::TermKey;
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid, TripleTermValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::sync::Arc;
 
@@ -47,6 +50,13 @@ struct EncodedConstants {
     o: Option<(u16, u64)>,
 }
 
+/// A term only novelty's links name, with its subject's id when a dictionary
+/// holds one.
+struct NoveltyTerm {
+    term: Box<TripleTermValue>,
+    s_id: Option<u64>,
+}
+
 pub struct TermComponentsOperator {
     child: BoxedOperator,
     pattern: TermComponentsPattern,
@@ -56,6 +66,7 @@ pub struct TermComponentsOperator {
     store: Option<Arc<BinaryIndexStore>>,
     constants: Option<EncodedConstants>,
     reifies_p_id: u32,
+    novelty_terms: Vec<NoveltyTerm>,
 }
 
 impl TermComponentsOperator {
@@ -76,6 +87,85 @@ impl TermComponentsOperator {
             store: None,
             constants: None,
             reifies_p_id: 0,
+            novelty_terms: Vec::new(),
+        }
+    }
+
+    /// The terms novelty's links assert that the dictionary does not hold.
+    fn collect_novelty_terms(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<NoveltyTerm>> {
+        let reifies = fluree_db_core::rdf_reifies_sid();
+        let (first, rhs) = crate::fast_path_common::predicate_walk_bounds(reifies);
+        let mut seen: HashSet<TripleTermValue> = HashSet::new();
+        let mut visit = |overlay: &dyn fluree_db_core::OverlayProvider, g_id, to_t| {
+            overlay.for_each_overlay_flake(
+                g_id,
+                fluree_db_core::IndexType::Post,
+                Some(&first),
+                Some(&rhs),
+                false,
+                to_t,
+                &mut |f| {
+                    if f.op && f.p == *reifies {
+                        if let FlakeValue::TripleTerm(term) = &f.o {
+                            seen.insert((**term).clone());
+                        }
+                    }
+                },
+            );
+        };
+        match ctx.active_graphs() {
+            crate::dataset::ActiveGraphs::Single => {
+                visit(ctx.overlay(), ctx.binary_g_id, ctx.to_t);
+            }
+            crate::dataset::ActiveGraphs::Many(graphs) => {
+                for g in graphs {
+                    visit(g.overlay, g.g_id, g.to_t);
+                }
+            }
+        }
+        let dict_novelty = ctx.dict_novelty.as_ref();
+        let mut out = Vec::new();
+        for term in seen {
+            let s_id = match &self.store {
+                Some(store) => {
+                    match missing(crate::binary_scan::compose_term_handle(
+                        &term,
+                        store,
+                        dict_novelty,
+                    ))
+                    .map_err(|e| QueryError::from_io("term components: novelty", e))?
+                    {
+                        // The dictionary offers it already.
+                        Some(_) => continue,
+                        None => missing(crate::binary_scan::resolve_subject_v3(
+                            &term.s,
+                            store,
+                            dict_novelty,
+                        ))
+                        .map_err(|e| QueryError::from_io("term components: novelty", e))?,
+                    }
+                }
+                None => None,
+            };
+            out.push(NoveltyTerm {
+                term: Box::new(term),
+                s_id,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Whether a novelty term can match the row's subject anchor. A cheap
+    /// filter only: `apply` still checks every component.
+    fn novelty_anchor_matches(&self, row: &[Binding], nt: &NoveltyTerm) -> bool {
+        match &self.pattern.subject {
+            Component::Node(sid) => nt.term.s == *sid,
+            Component::Var(v) => match self.value(row, *v) {
+                Some(Binding::EncodedSid { s_id, .. }) => nt.s_id == Some(*s_id),
+                Some(Binding::Sid { sid, .. }) => nt.term.s == *sid,
+                _ => true,
+            },
+            _ => true,
         }
     }
 
@@ -244,15 +334,14 @@ impl TermComponentsOperator {
                 }
             }
         }
-        // A materialized candidate comes only from a bound term variable.
-        if let Candidate::Encoded { handle, .. } = candidate {
-            let term_pos = self
-                .schema
-                .iter()
-                .position(|x| *x == self.pattern.term)
-                .expect("term variable is in the schema");
-            if matches!(row[term_pos], Binding::Unbound | Binding::Poisoned) {
-                row[term_pos] = Binding::EncodedLit {
+        let term_pos = self
+            .schema
+            .iter()
+            .position(|x| *x == self.pattern.term)
+            .expect("term variable is in the schema");
+        if matches!(row[term_pos], Binding::Unbound | Binding::Poisoned) {
+            row[term_pos] = match candidate {
+                Candidate::Encoded { handle, .. } => Binding::EncodedLit {
                     o_kind: ObjKind::TRIPLE_TERM.as_u8(),
                     o_key: *handle,
                     p_id: self.reifies_p_id,
@@ -260,8 +349,18 @@ impl TermComponentsOperator {
                     lang_id: 0,
                     i_val: i32::MIN,
                     t,
-                };
-            }
+                },
+                // As a scan binds a link object novelty holds.
+                Candidate::Materialized(term) => Binding::Lit {
+                    val: FlakeValue::TripleTerm(term.clone()),
+                    dtc: DatatypeConstraint::Explicit(
+                        fluree_db_core::triple_term_datatype_sid().clone(),
+                    ),
+                    t: None,
+                    op: None,
+                    p_id: None,
+                },
+            };
         }
         Ok(true)
     }
@@ -361,6 +460,7 @@ impl Operator for TermComponentsOperator {
                 ))
                 .unwrap_or(0);
         }
+        self.novelty_terms = self.collect_novelty_terms(ctx)?;
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -393,83 +493,100 @@ impl Operator for TermComponentsOperator {
                         }
                     })
                     .collect();
-                let (candidates, t): (Vec<Candidate>, i64) =
-                    match self.value(&row, self.pattern.term).cloned() {
-                        Some(Binding::EncodedLit {
-                            o_kind, o_key, t, ..
-                        }) if o_kind == ObjKind::TRIPLE_TERM.as_u8() => {
-                            let Some(store) = &self.store else {
-                                continue;
-                            };
-                            let key = store
-                                .resolve_term_key(o_key)
-                                .map_err(|e| QueryError::from_io("resolve_term_key", e))?
-                                .ok_or_else(|| {
-                                    QueryError::Internal(format!(
-                                        "triple-term handle {o_key:#x} has no dictionary entry"
-                                    ))
-                                })?;
-                            (vec![Candidate::Encoded { handle: o_key, key }], t)
-                        }
-                        Some(Binding::Lit {
-                            val: FlakeValue::TripleTerm(term),
-                            ..
-                        }) => (vec![Candidate::Materialized(term)], 0),
-                        // Bound to something that is not a term.
-                        Some(_) => continue,
-                        None => {
-                            let Some(store) = self.store.clone() else {
-                                continue;
-                            };
-                            let Some(terms) = store.term_dict() else {
-                                continue;
-                            };
-                            let p_id = self.fixed_predicate(&row, &store);
-                            let found = match self.anchor_subject(&row, &store, ctx)? {
-                                Some(Ok(s_id)) => match by_prefix.get(&(s_id, p_id)) {
-                                    Some(found) => Arc::clone(found),
-                                    None => {
-                                        let found = Arc::new(
-                                            terms.terms_with_subject(s_id, p_id).map_err(|e| {
-                                                QueryError::from_io("term components: subject", e)
-                                            })?,
-                                        );
-                                        by_prefix.insert((s_id, p_id), Arc::clone(&found));
-                                        found
-                                    }
-                                },
-                                Some(Err(())) => continue,
-                                None => match by_predicate.get(&p_id) {
-                                    Some(found) => Arc::clone(found),
-                                    None => {
-                                        let predicates: Vec<u32> = match p_id {
-                                            Some(p) => vec![p],
-                                            None => terms.predicates().collect(),
-                                        };
-                                        let mut all = Vec::new();
-                                        for p in predicates {
-                                            all.extend(terms.terms_of_predicate(p).map_err(
-                                                |e| QueryError::from_io("term components: scan", e),
-                                            )?);
+                let (candidates, t): (Vec<Candidate>, i64) = match self
+                    .value(&row, self.pattern.term)
+                    .cloned()
+                {
+                    Some(Binding::EncodedLit {
+                        o_kind, o_key, t, ..
+                    }) if o_kind == ObjKind::TRIPLE_TERM.as_u8() => {
+                        let Some(store) = &self.store else {
+                            continue;
+                        };
+                        let key = store
+                            .resolve_term_key(o_key)
+                            .map_err(|e| QueryError::from_io("resolve_term_key", e))?
+                            .ok_or_else(|| {
+                                QueryError::Internal(format!(
+                                    "triple-term handle {o_key:#x} has no dictionary entry"
+                                ))
+                            })?;
+                        (vec![Candidate::Encoded { handle: o_key, key }], t)
+                    }
+                    Some(Binding::Lit {
+                        val: FlakeValue::TripleTerm(term),
+                        ..
+                    }) => (vec![Candidate::Materialized(term)], 0),
+                    // Bound to something that is not a term.
+                    Some(_) => continue,
+                    None => {
+                        let mut candidates = Vec::new();
+                        if let Some(store) = self.store.clone() {
+                            if let Some(terms) = store.term_dict() {
+                                let p_id = self.fixed_predicate(&row, &store);
+                                let found = match self.anchor_subject(&row, &store, ctx)? {
+                                    Some(Ok(s_id)) => match by_prefix.get(&(s_id, p_id)) {
+                                        Some(found) => Some(Arc::clone(found)),
+                                        None => {
+                                            let found = Arc::new(
+                                                terms.terms_with_subject(s_id, p_id).map_err(
+                                                    |e| {
+                                                        QueryError::from_io(
+                                                            "term components: subject",
+                                                            e,
+                                                        )
+                                                    },
+                                                )?,
+                                            );
+                                            by_prefix.insert((s_id, p_id), Arc::clone(&found));
+                                            Some(found)
                                         }
-                                        let found = Arc::new(all);
-                                        by_predicate.insert(p_id, Arc::clone(&found));
-                                        found
-                                    }
-                                },
-                            };
-                            (
-                                found
-                                    .iter()
-                                    .map(|(key, handle)| Candidate::Encoded {
-                                        handle: *handle,
-                                        key: *key,
-                                    })
-                                    .collect(),
-                                0,
-                            )
+                                    },
+                                    // No interned subject: only novelty can match.
+                                    Some(Err(())) => None,
+                                    None => match by_predicate.get(&p_id) {
+                                        Some(found) => Some(Arc::clone(found)),
+                                        None => {
+                                            let predicates: Vec<u32> = match p_id {
+                                                Some(p) => vec![p],
+                                                None => terms.predicates().collect(),
+                                            };
+                                            let mut all = Vec::new();
+                                            for p in predicates {
+                                                all.extend(terms.terms_of_predicate(p).map_err(
+                                                    |e| {
+                                                        QueryError::from_io(
+                                                            "term components: scan",
+                                                            e,
+                                                        )
+                                                    },
+                                                )?);
+                                            }
+                                            let found = Arc::new(all);
+                                            by_predicate.insert(p_id, Arc::clone(&found));
+                                            Some(found)
+                                        }
+                                    },
+                                };
+                                if let Some(found) = found {
+                                    candidates.extend(found.iter().map(|(key, handle)| {
+                                        Candidate::Encoded {
+                                            handle: *handle,
+                                            key: *key,
+                                        }
+                                    }));
+                                }
+                            }
                         }
-                    };
+                        candidates.extend(
+                            self.novelty_terms
+                                .iter()
+                                .filter(|nt| self.novelty_anchor_matches(&row, nt))
+                                .map(|nt| Candidate::Materialized(nt.term.clone())),
+                        );
+                        (candidates, 0)
+                    }
+                };
                 for candidate in &candidates {
                     let mut out = row.clone();
                     if self.apply(candidate, t, &mut out, ctx)? {

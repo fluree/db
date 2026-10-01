@@ -39,6 +39,7 @@ mod commit_flakes;
 pub mod delta;
 mod error;
 mod fact_state;
+mod links;
 mod runtime_stats;
 mod stats;
 
@@ -61,6 +62,7 @@ pub use fluree_db_core::commit::codec::envelope::{MAX_GRAPH_DELTA_ENTRIES, MAX_G
 pub use fluree_db_core::commit::codec::format::{CommitSignature, ALGO_ED25519};
 pub use fluree_db_core::commit::codec::verify_commit_blob;
 pub use fluree_db_credential::SigningKey;
+pub use links::LinkBase;
 pub use runtime_stats::{
     assemble_fast_stats, assemble_fast_stats_with, assemble_full_stats, assemble_full_stats_with,
     assemble_planner_stats, merge_is_identity, resolve_runtime_predicate_id, stats_merge_site,
@@ -569,6 +571,12 @@ pub struct Novelty {
     /// identity, per graph, within this novelty window). Persistent map, so it
     /// clones in O(1). The dedup oracle behind the seam; see [`fact_state`].
     fact_state: NoveltyFactState,
+
+    /// The index's attachments, which reification links are derived against
+    /// (see [`links`]); `None` until the ledger installs it.
+    link_base: Option<LinkBase>,
+    /// Every commit at or before this `t` has its links in novelty.
+    links_through: i64,
 }
 
 #[inline]
@@ -592,6 +600,8 @@ impl Novelty {
             config_write_t: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
+            link_base: None,
+            links_through: t,
         }
     }
 
@@ -901,8 +911,21 @@ impl Novelty {
             }
         }
 
+        // Links read the index, so they are derived before any mutation too.
+        let links_current = self.current_link_base().is_some();
+        if let Some(base) = self.current_link_base() {
+            let touched = links::touched_reifiers(routed.iter().map(|(f, g)| (*g, f)));
+            if !touched.is_empty() {
+                let links = self.derive_links(base, &touched, self.t)?;
+                routed.extend(links.into_iter().map(|(g_id, f)| (f, g_id)));
+            }
+        }
+
         // From here on every step is infallible.
         self.t = self.t.max(commit_t);
+        if links_current {
+            self.links_through = self.t;
+        }
         self.epoch += 1; // Bump epoch once per commit
         self.refresh_content_version();
 
@@ -1046,6 +1069,24 @@ impl Novelty {
             }
         }
 
+        let links_current = self.current_link_base().is_some();
+        if let Some(base) = self.current_link_base() {
+            let touched = links::touched_reifiers(
+                per_graph
+                    .iter()
+                    .flat_map(|(g_id, flakes)| flakes.iter().map(move |f| (*g_id, f))),
+            );
+            if !touched.is_empty() {
+                let links = self.derive_links(base, &touched, self.t)?;
+                for (g_id, flake) in links {
+                    per_graph.entry(g_id).or_default().push(flake);
+                }
+            }
+        }
+        if links_current {
+            self.links_through = max_t;
+        }
+
         if per_graph.is_empty() {
             self.t = max_t;
             self.epoch += 1;
@@ -1182,6 +1223,9 @@ impl Novelty {
     /// after each index rebuild rather than mutated in-place, so this is rarely
     /// the hot path.
     pub fn clear_up_to(&mut self, cutoff_t: i64) {
+        // Commits at or before the cutoff have their links in the index now.
+        self.trim_link_base(cutoff_t);
+        self.links_through = self.links_through.max(cutoff_t.min(self.t));
         if self.flake_count == 0 {
             return;
         }

@@ -773,6 +773,15 @@ impl LedgerHandle {
             let sync_ns_us = phase.elapsed().as_micros() as u64;
             let phase = Instant::now();
             let arc_store = Arc::new(store);
+            let links = install_link_base(&mut state, &arc_store)?;
+            if !links.is_empty() {
+                fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
+                    Arc::make_mut(&mut state.dict_novelty),
+                    Some(&arc_store),
+                    links.iter(),
+                )
+                .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
+            }
             crate::runtime_dicts::reseed_runtime_small_dicts_from_previous(&mut state, &arc_store);
             let reseed_us = phase.elapsed().as_micros() as u64;
 
@@ -1230,6 +1239,9 @@ pub(crate) async fn load_and_attach_binary_store(
     // Sync namespace codes between store and snapshot (bimap validation).
     crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, Arc::make_mut(&mut state.snapshot))?;
 
+    let arc_store = Arc::new(store);
+    install_link_base(state, &arc_store)?;
+
     // Re-populate DictNovelty from already-loaded novelty flakes, but *only* for
     // entries not present in the persisted dictionaries (canonical IDs must win).
     //
@@ -1239,13 +1251,12 @@ pub(crate) async fn load_and_attach_binary_store(
         let dn = Arc::make_mut(&mut state.dict_novelty);
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             dn,
-            Some(&store),
+            Some(&arc_store),
             novelty.iter_flakes(fluree_db_core::IndexType::Post),
         )
         .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
     }
 
-    let arc_store = Arc::new(store);
     crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);
     let ns_fallback = Some(state.snapshot.shared_namespaces());
     let provider = BinaryRangeProvider::new(
@@ -1276,6 +1287,25 @@ pub(crate) async fn load_and_attach_binary_store(
     state.binary_store = Some(TypeErasedStore(te_store));
 
     Ok(Some(arc_store))
+}
+
+/// Point novelty's reification links at the index `store` serves, deriving
+/// the links of commits applied before it was known. A ledger whose index
+/// never held an annotation already has its base.
+fn install_link_base(
+    state: &mut LedgerState,
+    store: &Arc<BinaryIndexStore>,
+) -> Result<Vec<fluree_db_core::Flake>> {
+    if !state.snapshot.has_annotations {
+        return Ok(Vec::new());
+    }
+    let base = fluree_db_novelty::LinkBase::new(
+        Arc::new(fluree_db_query::IndexAttachments::new(Arc::clone(store))),
+        state.snapshot.t,
+    );
+    Arc::make_mut(&mut state.novelty)
+        .set_attachment_base(base)
+        .map_err(|e| ApiError::internal(format!("derive reification links: {e}")))
 }
 
 // ============================================================================

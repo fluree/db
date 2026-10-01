@@ -1372,6 +1372,8 @@ async fn scan_graph_flakes(
             return Err(TransactError::WholeGraphScanTooLarge { limit: l });
         }
     }
+    // Links are derived from the bundles this rewrites, never written.
+    flakes.retain(|f| !fluree_db_core::is_rdf_reifies(&f.p));
     for f in &mut flakes {
         f.g = g_sid.cloned();
     }
@@ -2491,6 +2493,8 @@ async fn classify_subject_lifecycle(
     delta: &SubjectDelta,
     pre_classes: &[Sid],
 ) -> Result<WriteVerb> {
+    // A reifier's link is derived and never retracted by a transaction, so
+    // it would make every full delete of a reifier look partial.
     let scan_pre_state = || async move {
         let rm = fluree_db_core::RangeMatch::new().with_subject(subject.clone());
         let opts = fluree_db_core::RangeOptions::new().with_to_t(ledger.t());
@@ -2504,6 +2508,10 @@ async fn classify_subject_lifecycle(
             opts,
         )
         .await
+        .map(|mut flakes| {
+            flakes.retain(|f| !fluree_db_core::is_rdf_reifies(&f.p));
+            flakes
+        })
     };
 
     if delta.has_assert {
