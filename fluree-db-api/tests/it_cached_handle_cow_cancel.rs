@@ -30,7 +30,7 @@ use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 fn person(id: &str) -> serde_json::Value {
     json!({
@@ -40,19 +40,16 @@ fn person(id: &str) -> serde_json::Value {
     })
 }
 
-/// Parks the next commit-blob write once armed, until released.
+/// Storage that parks the next commit-blob write once armed, until released.
 ///
-/// The commit blob is written inside the detached window, under the write
-/// lock. Parking it there holds the commit in flight for as long as the test
-/// needs. Polling `is_locked` for the window instead is a race the poller can
-/// lose: the optimistic path holds the lock only for the commit itself, which
-/// can start and finish between two polls.
+/// The commit blob is written inside the detached window, under the ledger's
+/// write lock. A parked commit-blob write therefore holds the commit in flight.
 #[derive(Debug, Clone)]
 struct CommitGate {
     inner: MemoryStorage,
     armed: Arc<AtomicBool>,
     parked: Arc<Notify>,
-    release: Arc<Semaphore>,
+    release: Arc<Notify>,
 }
 
 impl CommitGate {
@@ -61,7 +58,7 @@ impl CommitGate {
             inner: MemoryStorage::new(),
             armed: Arc::new(AtomicBool::new(false)),
             parked: Arc::new(Notify::new()),
-            release: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Notify::new()),
         }
     }
 
@@ -82,7 +79,7 @@ impl CommitGate {
 
     /// Let the parked write proceed.
     fn release(&self) {
-        self.release.add_permits(1);
+        self.release.notify_one();
     }
 }
 
@@ -106,10 +103,6 @@ impl StorageRead for CommitGate {
 
     async fn list_prefix(&self, prefix: &str) -> fluree_db_core::Result<Vec<String>> {
         self.inner.list_prefix(prefix).await
-    }
-
-    fn resolve_local_path(&self, address: &str) -> Option<std::path::PathBuf> {
-        self.inner.resolve_local_path(address)
     }
 }
 
@@ -135,11 +128,7 @@ impl ContentAddressedWrite for CommitGate {
     ) -> fluree_db_core::Result<ContentWriteResult> {
         if kind == ContentKind::Commit && self.armed.swap(false, Ordering::SeqCst) {
             self.parked.notify_one();
-            self.release
-                .acquire()
-                .await
-                .expect("gate semaphore is never closed")
-                .forget();
+            self.release.notified().await;
         }
         self.inner
             .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
@@ -223,8 +212,7 @@ async fn cancelled_commit_never_exposes_the_empty_cache_slot() {
     tokio::time::sleep(Duration::from_millis(5)).await;
 
     committer.abort();
-    // Only now let the commit finish. Before the commit was shielded, the
-    // abort alone released the lock, and the reader saw the empty slot.
+    // The commit finishes only after its caller is cancelled.
     gate.release();
 
     let observed = reader.await.expect("reader task");

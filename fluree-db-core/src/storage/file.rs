@@ -3691,13 +3691,10 @@ mod wal_tests {
             rt.block_on(async {
                 let dir = tempfile::tempdir().unwrap();
                 let storage = FileStorage::new(dir.path());
-                let cas = tokio::spawn({
-                    let storage = storage.clone();
-                    async move {
-                        storage
-                            .compare_and_swap(HEAD, |_| Ok(CasAction::<()>::Write(b"x".to_vec())))
-                            .await
-                    }
+                let cas = tokio::spawn(async move {
+                    storage
+                        .compare_and_swap(HEAD, |_| Ok(CasAction::<()>::Write(b"x".to_vec())))
+                        .await
                 });
                 // Yield so the compare-and-swap task starts its blocking task.
                 // Then block the runtime thread until the read has finished.
