@@ -1973,7 +1973,11 @@ impl StorageCas for FileStorage {
             }
         })
         .await
-        .map_err(|e| StorageExtError::io(format!("spawn_blocking join: {e}")))?
+        .unwrap_or_else(|e| match e.try_into_panic() {
+            // A panic in `f` belongs to the caller, so it resumes on the caller's task.
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(e) => Err(StorageExtError::io(format!("spawn_blocking join: {e}"))),
+        })
     }
 }
 
