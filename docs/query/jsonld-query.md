@@ -601,9 +601,9 @@ Apply conditions to filter results:
 
 **Comparing against IRIs:**
 
-An unquoted prefixed name or `<...>` IRI is an IRI operand wherever RDF terms
-are compared — `=`, `!=`, `in`, `not-in`, `sameTerm` — and compares by
-identity, so `(= ?p ex:knows)` matches the predicate `ex:knows` — never the
+An unquoted prefixed name or `<...>` IRI is an IRI operand wherever an
+operator reads RDF terms — `=`, `!=`, `in`, `not-in`, `sameTerm`, and `triple`
+— and compares by identity, so `(= ?p ex:knows)` matches the predicate `ex:knows` — never the
 string `"ex:knows"`. In every other position it is the string it has always
 been:
 
@@ -1268,6 +1268,31 @@ Function names are case-insensitive. See [Vector Search](../indexing-and-search/
 - `(isIRI ?x)` - Is an IRI
 - `(isBlank ?x)` - Is a blank node
 - `(isLiteral ?x)` - Is a literal
+- `(isTriple ?x)` - Is a triple term
+
+### Triple-Term Functions
+
+The RDF 1.2 functions over triple terms, the JSON-LD names for SPARQL's
+`TRIPLE`, `SUBJECT`, `PREDICATE` and `OBJECT`. A reifier's `rdf:reifies` value
+is a triple term:
+
+- `(triple ex:alice ex:knows ex:bob)` - The triple term `<<( ex:alice ex:knows ex:bob )>>`
+- `(subject ?t)`, `(predicate ?t)`, `(object ?t)` - A triple term's components
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  },
+  "select": ["?r", "?s", "?o"],
+  "where": [
+    { "@id": "?r", "rdf:reifies": "?t" },
+    ["filter", "(sameTerm (predicate ?t) ex:knows)"],
+    ["bind", "?s", "(subject ?t)", "?o", "(object ?t)"]
+  ]
+}
+```
 
 ## Query Modifiers
 

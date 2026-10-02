@@ -2306,3 +2306,61 @@ async fn link_reads_refuse_an_index_built_before_links() {
         .expect("a rebuilt index answers");
     assert_eq!(rows(&result), strings(&[&["ex:claim1"], &["ex:claim2"]]));
 }
+
+/// The JSON-LD twin of `triple_constructs_the_terms_links_hold`: the
+/// triple-term functions under their JSON-LD names, in `bind` and `filter`.
+#[tokio::test]
+async fn jsonld_triple_term_functions() {
+    let (fluree, ledger) =
+        import(&[("claims.ttl", CLAIMS)], "it/triple-term-links:jsonld-fns").await;
+    let ctx = json!({
+        "ex": "http://example.org/",
+        "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    });
+    let run = |query: JsonValue| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            let result = support::query_jsonld_formatted(fluree, ledger, &query)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e:?}"));
+            rows(&result)
+        }
+    };
+
+    let built = run(json!({
+        "@context": ctx,
+        "select": ["?r"],
+        "where": [
+            ["bind", "?t", "(triple ex:alice ex:knows ex:bob)"],
+            {"@id": "?r", "rdf:reifies": "?t"}
+        ]
+    }))
+    .await;
+    assert_eq!(built, strings(&[&["ex:claim1"]]));
+
+    let decomposed = run(json!({
+        "@context": ctx,
+        "select": ["?s", "?p", "?o"],
+        "where": [
+            {"@id": "ex:claim1", "rdf:reifies": "?t"},
+            ["bind", "?s", "(subject ?t)"],
+            ["bind", "?p", "(predicate ?t)"],
+            ["bind", "?o", "(object ?t)"]
+        ]
+    }))
+    .await;
+    assert_eq!(decomposed, strings(&[&["ex:alice", "ex:knows", "ex:bob"]]));
+
+    let filtered = run(json!({
+        "@context": ctx,
+        "select": ["?r"],
+        "where": [
+            {"@id": "?r", "rdf:reifies": "?t"},
+            ["filter", "(isTriple ?t)"],
+            ["filter", "(sameTerm (predicate ?t) ex:age)"]
+        ]
+    }))
+    .await;
+    assert_eq!(filtered, strings(&[&["ex:claim2"]]));
+}

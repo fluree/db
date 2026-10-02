@@ -1816,6 +1816,12 @@ fn lower_function_name(name: &str) -> Function {
         "datatype" => Function::Datatype { strict: false },
         "langmatches" => Function::LangMatches,
         "sameterm" => Function::SameTerm,
+        // RDF 1.2 triple terms (SPARQL's TRIPLE, SUBJECT, PREDICATE, OBJECT, isTRIPLE)
+        "triple" => Function::Triple,
+        "subject" => Function::TripleSubject,
+        "predicate" => Function::TriplePredicate,
+        "object" => Function::TripleObject,
+        "istriple" | "is-triple" => Function::IsTriple,
         // Fluree-specific: transaction time
         "t" => Function::T,
         "op" => Function::Op,
