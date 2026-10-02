@@ -704,13 +704,23 @@ mod inner {
                 };
                 let bundle = crate::generate::flakes::reified_triple_bundle(
                     Some(graph_sid.clone()),
-                    s,
-                    p,
+                    s.clone(),
+                    p.clone(),
                     o,
                     &dtc,
                     &ann,
                     new_t,
                 )?;
+                // The RDF 1.2 link rides alongside the bundle, as on the
+                // default-graph path.
+                if let (Some(sc), Some(object)) = (
+                    spool_ctx.as_mut(),
+                    bundle
+                        .iter()
+                        .find(|f| fluree_db_core::is_reifies_object(&f.p)),
+                ) {
+                    sc.push_named_graph_link(g_id, &s, &p, object, new_t)?;
+                }
                 for flake in bundle {
                     if let Some(sc) = spool_ctx.as_mut() {
                         sc.push_named_graph_record(

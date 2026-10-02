@@ -2364,3 +2364,26 @@ async fn jsonld_triple_term_functions() {
     .await;
     assert_eq!(filtered, strings(&[&["ex:claim2"]]));
 }
+
+/// TriG import writes an annotation inside a `GRAPH` block through its own
+/// named-graph loop; that loop spools the link as the default-graph sink does.
+#[tokio::test]
+async fn trig_import_links_named_graph_annotations() {
+    const TRIG: &str = r#"@prefix ex: <http://example.org/> .
+ex:alice ex:name "Alice" .
+GRAPH <http://example.org/graphs/audit> {
+    ex:event1 ex:actor ex:alice {| ex:confidence "high" |} .
+    ex:event2 ex:actor ex:alice ~ ex:claim2 {| ex:confidence "low"@en |} .
+}
+"#;
+    let (fluree, ledger) = import(&[("data.trig", TRIG)], "it/triple-term-links:trig").await;
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT ?s WHERE { GRAPH <http://example.org/graphs/audit> \
+         { ?r rdf:reifies ?t BIND(SUBJECT(?t) AS ?s) } } ORDER BY ?s"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(got, strings(&[&["ex:event1"], &["ex:event2"]]));
+}

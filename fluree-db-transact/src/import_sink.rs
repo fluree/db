@@ -696,6 +696,23 @@ mod inner {
             self.g_id = saved;
             result
         }
+
+        /// Spool the `rdf:reifies` link of a reified edge in an explicit named
+        /// graph (`g_id`); see [`Self::write_link_record`].
+        pub fn push_named_graph_link(
+            &mut self,
+            g_id: GraphId,
+            s: &Sid,
+            p: &Sid,
+            object: &Flake,
+            t: i64,
+        ) -> Result<(), CommitCodecError> {
+            let saved = self.g_id;
+            self.g_id = g_id;
+            let result = self.write_link_record(s, p, object, t);
+            self.g_id = saved;
+            result
+        }
     }
 
     // -----------------------------------------------------------------------
