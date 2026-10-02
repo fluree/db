@@ -857,6 +857,64 @@ pub(crate) fn is_numbig_encoded(binding: &Binding) -> bool {
     )
 }
 
+/// What an arena-backed literal needs to cross between a context and a scope
+/// that reads another graph (a GRAPH scope): a handle names its value only
+/// within the graph that bound it, so one crossing in either direction is
+/// decoded through that graph. Nothing is decoded when both sides read the
+/// same single graph, where a handle means the same value on either side.
+pub(crate) struct ArenaCrossing {
+    /// The outer graph: decodes the handles the seeding row carries in.
+    enter: Option<fluree_db_binary_index::BinaryGraphView>,
+    /// The scope's graph: decodes the handles its rows carry out.
+    leave: Option<fluree_db_binary_index::BinaryGraphView>,
+}
+
+impl ArenaCrossing {
+    /// The crossing between `outer` and a `scope` derived from it. An outer
+    /// context that spans several graphs (a union) has no graph to decode a
+    /// handle through, so everything leaving the scope for it is decoded.
+    pub(crate) fn between(
+        outer: &crate::context::ExecutionContext<'_>,
+        scope: &crate::context::ExecutionContext<'_>,
+    ) -> Self {
+        let same_graph = outer.has_binary_store()
+            && scope.has_binary_store()
+            && outer.binary_g_id == scope.binary_g_id;
+        if same_graph {
+            return Self {
+                enter: None,
+                leave: None,
+            };
+        }
+        Self {
+            enter: outer.graph_view(),
+            leave: scope.graph_view(),
+        }
+    }
+
+    /// Decode, through the outer graph, the arena handles in a row that seeds
+    /// the scope.
+    pub(crate) fn enter(&self, row: &mut [Binding]) {
+        let Some(gv) = self.enter.as_ref() else {
+            return;
+        };
+        for binding in row.iter_mut().filter(|b| is_arena_encoded(b)) {
+            *binding = crate::group_aggregate::materialize_encoded(binding, Some(gv));
+        }
+    }
+
+    /// `binding`, bound inside the scope, decoded through the scope's graph
+    /// when it is an arena handle.
+    pub(crate) fn leave(&self, binding: Binding) -> Binding {
+        match &self.leave {
+            Some(gv) if is_arena_encoded(&binding) => {
+                crate::group_aggregate::materialize_encoded(&binding, Some(gv))
+            }
+            _ => binding,
+        }
+    }
+}
+
 /// Build a materialized object binding for the binary scan path.
 ///
 /// `op` mirrors the meaning in `late_materialized_object_binding`: it is
