@@ -3073,7 +3073,8 @@ pub(crate) fn with_graph_lookup<R>(
     }
 }
 
-/// The path ledger's [`ScopeRegistry`], read from its cached head. It peeks:
+/// The path ledger's [`ScopeRegistry`], found by the path's id as parsed and
+/// read from its cached head. It peeks:
 /// the query's own load runs the read-side compaction check, which costs a
 /// visit to every graph in novelty, so a second one here is pure overhead.
 pub(crate) async fn scope_registry(
@@ -3083,7 +3084,7 @@ pub(crate) async fn scope_registry(
     if state.config.is_proxy_storage_mode() {
         return None;
     }
-    match state.fluree.ledger_cached(target.as_str()).await {
+    match state.fluree.ledger_handle(target).await {
         Ok(handle) => Some(ScopeRegistry::Ledger(Box::new(handle.peek().await))),
         Err(e) if e.is_not_found() => Some(ScopeRegistry::Empty),
         Err(_) => None,

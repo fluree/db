@@ -4744,23 +4744,43 @@ impl Fluree {
     /// `FlureeBuilder::without_ledger_caching()`, returns an ephemeral
     /// handle that wraps a fresh load.
     pub async fn ledger_cached(&self, ledger_id: &str) -> Result<LedgerHandle> {
+        // Not a call to `ledger_handle`: awaiting it would nest one more future
+        // in every caller's, and some test futures sit at the type-layout
+        // depth limit.
         let ledger_id = LedgerId::parse(ledger_id)?;
         match &self.ledger_manager {
             Some(mgr) => mgr.get_or_load(&ledger_id).await,
-            None => {
-                // Caching disabled: load fresh, wrap in ephemeral handle.
-                // Note: This handle is NOT cached; each call loads fresh.
-                // Extract the concrete BinaryIndexStore from the state's TypeErasedStore
-                // so the handle's binary_store stays coherent with db.range_provider.
-                let state = self.ledger(&ledger_id).await?;
-                let binary_store = state.binary_store.as_ref().and_then(|te| {
-                    te.0.clone()
-                        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
-                        .ok()
-                });
-                Ok(LedgerHandle::new(ledger_id, state, binary_store))
-            }
+            None => Ok(Self::ephemeral_handle(
+                &ledger_id,
+                self.ledger(&ledger_id).await?,
+            )),
         }
+    }
+
+    /// [`ledger_cached`](Self::ledger_cached) for an id the caller has
+    /// already parsed (a route's path ledger): the handle is found by the id
+    /// as it stands, with no second parse.
+    pub async fn ledger_handle(&self, ledger_id: &LedgerId) -> Result<LedgerHandle> {
+        match &self.ledger_manager {
+            Some(mgr) => mgr.get_or_load(ledger_id).await,
+            None => Ok(Self::ephemeral_handle(
+                ledger_id,
+                self.ledger(ledger_id).await?,
+            )),
+        }
+    }
+
+    /// Caching disabled: a fresh load wrapped in an ephemeral handle, which is
+    /// NOT cached (each call loads fresh). The concrete `BinaryIndexStore` is
+    /// taken from the state's type-erased store, so the handle's binary store
+    /// stays coherent with the snapshot's range provider.
+    fn ephemeral_handle(ledger_id: &LedgerId, state: LedgerState) -> LedgerHandle {
+        let binary_store = state.binary_store.as_ref().and_then(|te| {
+            te.0.clone()
+                .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+                .ok()
+        });
+        LedgerHandle::new(ledger_id.clone(), state, binary_store)
     }
 
     /// Disconnect a ledger from the connection cache
