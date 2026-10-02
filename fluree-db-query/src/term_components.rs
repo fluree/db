@@ -21,6 +21,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::ir::{Component, TermComponentsPattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
@@ -252,6 +253,27 @@ impl TermComponentsOperator {
         }
     }
 
+    /// The object's `(o_type, o_key)` for an anchored lookup, from a constant
+    /// or a bound node or literal; `Err(())` when the bound value names no
+    /// interned object.
+    fn anchor_object(
+        &self,
+        row: &[Binding],
+        store: &BinaryIndexStore,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<std::result::Result<(u16, u64), ()>>> {
+        match &self.pattern.object {
+            Component::Node(_) | Component::Literal(..) => {
+                Ok(self.constants.and_then(|c| c.o).map(Ok))
+            }
+            Component::Var(v) => match self.value(row, *v) {
+                Some(binding) => object_key(binding, store, ctx),
+                None => Ok(None),
+            },
+            Component::Any => Ok(None),
+        }
+    }
+
     /// The predicate's `p_id` when it is fixed for this row.
     fn fixed_predicate(&self, row: &[Binding], store: &BinaryIndexStore) -> Option<u32> {
         match &self.pattern.predicate {
@@ -366,6 +388,10 @@ impl TermComponentsOperator {
     }
 }
 
+/// Routing stamp for the object-first term lookup; a dictionary without the
+/// object tree falls back to the predicate scan.
+const OBJECT_SITE: &str = "term-object";
+
 /// A component no dictionary can name is a miss, not an error.
 fn missing<T>(r: std::io::Result<T>) -> std::io::Result<Option<T>> {
     match r {
@@ -389,6 +415,47 @@ fn materialized_matches(component: &Component, position: usize, term: &TripleTer
                 }
         }
         _ => false,
+    }
+}
+
+/// A bound object's term-key encoding: `None` for a binding no term key can
+/// be read from here (the lookup falls back to a scan), `Err(())` for one no
+/// indexed term can carry.
+fn object_key(
+    binding: &Binding,
+    store: &BinaryIndexStore,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<std::result::Result<(u16, u64), ()>>> {
+    let iri_ref = OType::IRI_REF.as_u16();
+    match binding {
+        Binding::EncodedSid { s_id, .. } => Ok(Some(Ok((iri_ref, *s_id)))),
+        Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_) => Ok(Some(
+            subject_id(binding, store, ctx)?
+                .map(|id| (iri_ref, id))
+                .ok_or(()),
+        )),
+        Binding::Lit { val, dtc, .. } => {
+            let (dt, lang) = match dtc {
+                DatatypeConstraint::Explicit(dt) => (dt.clone(), None),
+                DatatypeConstraint::LangTag(tag) => (
+                    Sid::new(
+                        fluree_vocab::namespaces::RDF,
+                        fluree_vocab::rdf_names::LANG_STRING,
+                    ),
+                    Some(tag.as_ref()),
+                ),
+            };
+            let key = missing(crate::binary_scan::term_object_key(
+                val,
+                &dt,
+                lang,
+                store,
+                ctx.dict_novelty.as_ref(),
+            ))
+            .map_err(|e| QueryError::from_io("term components: object", e))?;
+            Ok(Some(key.map(|(ot, k)| (ot.as_u16(), k)).ok_or(())))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -429,14 +496,17 @@ impl Operator for TermComponentsOperator {
 
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
         let bound = self.child.schema();
+        let anchors = |c: &Component| match c {
+            Component::Node(_) | Component::Literal(..) => true,
+            Component::Var(v) => bound.contains(v),
+            Component::Any => false,
+        };
         let access = if bound.contains(&self.pattern.term) {
             "term"
-        } else if match &self.pattern.subject {
-            Component::Node(_) => true,
-            Component::Var(v) => bound.contains(v),
-            _ => false,
-        } {
+        } else if anchors(&self.pattern.subject) {
             "subject"
+        } else if anchors(&self.pattern.object) {
+            "object"
         } else {
             "scan"
         };
@@ -483,6 +553,8 @@ impl Operator for TermComponentsOperator {
             let mut by_prefix: HashMap<(u64, Option<u32>), Arc<Vec<(TermKey, u64)>>> =
                 HashMap::new();
             let mut by_predicate: HashMap<Option<u32>, Arc<Vec<(TermKey, u64)>>> = HashMap::new();
+            let mut by_object: HashMap<(u16, u64, Option<u32>), Arc<Vec<(TermKey, u64)>>> =
+                HashMap::new();
             for row_idx in 0..input.len() {
                 let mut row: Vec<Binding> = (0..self.schema.len())
                     .map(|col| {
@@ -558,29 +630,74 @@ impl Operator for TermComponentsOperator {
                                     },
                                     // No interned subject: only novelty can match.
                                     Some(Err(())) => None,
-                                    None => match by_predicate.get(&p_id) {
-                                        Some(found) => Some(Arc::clone(found)),
-                                        None => {
-                                            let predicates: Vec<u32> = match p_id {
-                                                Some(p) => vec![p],
-                                                None => terms.predicates().collect(),
-                                            };
-                                            let mut all = Vec::new();
-                                            for p in predicates {
-                                                all.extend(terms.terms_of_predicate(p).map_err(
-                                                    |e| {
-                                                        QueryError::from_io(
-                                                            "term components: scan",
-                                                            e,
-                                                        )
-                                                    },
-                                                )?);
+                                    None => {
+                                        let by_obj = match self.anchor_object(&row, &store, ctx)? {
+                                            Some(Err(())) => Some(Arc::new(Vec::new())),
+                                            Some(Ok((o_type, o_key))) => {
+                                                match by_object.get(&(o_type, o_key, p_id)) {
+                                                    Some(found) => Some(Arc::clone(found)),
+                                                    None => {
+                                                        let found = terms
+                                                            .terms_with_object(o_type, o_key, p_id)
+                                                            .map_err(|e| {
+                                                                QueryError::from_io(
+                                                                    "term components: object",
+                                                                    e,
+                                                                )
+                                                            })?;
+                                                        stamp_fast_path(
+                                                            OBJECT_SITE,
+                                                            match found {
+                                                                Some(_) => FastPathOutcome::Proceed,
+                                                                None => FastPathOutcome::Fallback(
+                                                                    FastPathFallback::GateDeclined,
+                                                                ),
+                                                            },
+                                                        );
+                                                        found.map(|found| {
+                                                            let found = Arc::new(found);
+                                                            by_object.insert(
+                                                                (o_type, o_key, p_id),
+                                                                Arc::clone(&found),
+                                                            );
+                                                            found
+                                                        })
+                                                    }
+                                                }
                                             }
-                                            let found = Arc::new(all);
-                                            by_predicate.insert(p_id, Arc::clone(&found));
-                                            Some(found)
+                                            None => None,
+                                        };
+                                        match by_obj {
+                                            Some(found) => Some(found),
+                                            // No object anchor, or a dictionary
+                                            // without the object tree: scan.
+                                            None => match by_predicate.get(&p_id) {
+                                                Some(found) => Some(Arc::clone(found)),
+                                                None => {
+                                                    let predicates: Vec<u32> = match p_id {
+                                                        Some(p) => vec![p],
+                                                        None => terms.predicates().collect(),
+                                                    };
+                                                    let mut all = Vec::new();
+                                                    for p in predicates {
+                                                        all.extend(
+                                                            terms.terms_of_predicate(p).map_err(
+                                                                |e| {
+                                                                    QueryError::from_io(
+                                                                        "term components: scan",
+                                                                        e,
+                                                                    )
+                                                                },
+                                                            )?,
+                                                        );
+                                                    }
+                                                    let found = Arc::new(all);
+                                                    by_predicate.insert(p_id, Arc::clone(&found));
+                                                    Some(found)
+                                                }
+                                            },
                                         }
-                                    },
+                                    }
                                 };
                                 if let Some(found) = found {
                                     candidates.extend(found.iter().map(|(key, handle)| {

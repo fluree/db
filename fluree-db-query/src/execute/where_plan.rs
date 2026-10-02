@@ -2380,9 +2380,14 @@ pub(crate) fn elide_unread_term_binds(
                     }
                 }
                 // Constant components are also the link scan's filters; the
-                // pattern stays for a variable to bind or a subject to anchor.
+                // pattern stays for a variable to bind or an endpoint to
+                // anchor.
                 let keep = tc.components().into_iter().any(|c| c.var().is_some())
-                    || matches!(tc.subject, crate::ir::Component::Node(_));
+                    || matches!(tc.subject, crate::ir::Component::Node(_))
+                    || matches!(
+                        tc.object,
+                        crate::ir::Component::Node(_) | crate::ir::Component::Literal(..)
+                    );
                 if !keep {
                     changed = true;
                 }

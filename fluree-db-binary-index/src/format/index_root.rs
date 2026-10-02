@@ -1319,13 +1319,15 @@ impl IndexRoot {
             ids.push(ann.reverse_branch_cid.clone());
         }
 
-        // Triple-term dictionary: forward packs + reverse branch and leaves.
+        // Triple-term dictionary: forward packs + both reverse trees.
         if let Some(ref td) = self.term_dict {
             for (_, packs) in &td.forward_packs {
                 ids.extend(packs.iter().map(|e| e.pack_cid.clone()));
             }
-            ids.push(td.reverse.branch.clone());
-            ids.extend(td.reverse.leaves.iter().cloned());
+            for tree in std::iter::once(&td.reverse).chain(&td.object_reverse) {
+                ids.push(tree.branch.clone());
+                ids.extend(tree.leaves.iter().cloned());
+            }
         }
 
         ids.sort();
@@ -1562,6 +1564,46 @@ mod tests {
         assert_eq!(decoded.named_graphs.len(), 0);
         assert!(decoded.stats.is_none());
         assert!(decoded.annotation_index.is_none());
+    }
+
+    /// The term dictionary section round-trips with both reverse trees, the
+    /// core metadata decoder walks past it, and GC sees every tree CID.
+    #[test]
+    fn fir6_round_trip_with_term_dict_trees() {
+        let cid = |tag: &[u8]| ContentId::new(fluree_db_core::ContentKind::Commit, tag);
+        let tree = |tag: &str| crate::format::wire_helpers::DictTreeRefs {
+            branch: cid(format!("{tag}-branch").as_bytes()),
+            leaves: vec![cid(format!("{tag}-leaf").as_bytes())],
+        };
+        let mut root = minimal_root_v6();
+        root.term_dict = Some(crate::format::wire_helpers::TermDictRefs {
+            forward_packs: vec![(
+                7,
+                vec![crate::format::wire_helpers::PackBranchEntry {
+                    first_id: 0,
+                    last_id: 3,
+                    pack_cid: cid(b"pack"),
+                }],
+            )],
+            reverse: tree("subject"),
+            watermarks: vec![(7, 3)],
+            term_count: 4,
+            object_reverse: Some(tree("object")),
+        });
+        let bytes = root.encode();
+        let decoded = IndexRoot::decode(&bytes).unwrap();
+        assert_eq!(decoded.term_dict, root.term_dict);
+        fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).expect("core metadata decode");
+
+        let ids = root.all_cas_ids();
+        for c in [
+            "object-branch",
+            "object-leaf",
+            "subject-branch",
+            "subject-leaf",
+        ] {
+            assert!(ids.contains(&cid(c.as_bytes())), "{c} unreachable");
+        }
     }
 
     #[test]

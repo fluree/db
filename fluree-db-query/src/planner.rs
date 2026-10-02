@@ -1160,15 +1160,16 @@ pub fn estimate_pattern(
             row_count: estimate_branch_cardinality(patterns, stats),
         },
 
-        // A bound term is one dictionary decode; a bound subject is a reverse-
-        // tree prefix range. Otherwise the link scan should bind the term
-        // first, so this ranks after any real scan.
+        // A bound term is one dictionary decode; a bound subject or object is
+        // a reverse-tree prefix range. Otherwise the link scan should bind the
+        // term first, so this ranks after any real scan.
         Pattern::TermComponents(tc) => {
-            let anchored = match &tc.subject {
+            let anchors = |c: &crate::ir::Component| match c {
                 crate::ir::Component::Var(v) => bound_vars.contains(v),
-                crate::ir::Component::Node(_) => true,
-                _ => false,
+                crate::ir::Component::Node(_) | crate::ir::Component::Literal(..) => true,
+                crate::ir::Component::Any => false,
             };
+            let anchored = anchors(&tc.subject) || anchors(&tc.object);
             let row_count = if bound_vars.contains(&tc.term) {
                 HIGHLY_SELECTIVE
             } else if anchored {

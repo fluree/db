@@ -1310,53 +1310,66 @@ pub async fn incremental_index(
             }
         } else {
             let base_count = base_terms.as_ref().map_or(0, |b| b.term_count);
-            let updated_tree = match &base_terms {
-                Some(base) => {
-                    super::dicts::upload_incremental_reverse_tree_async_terms(
-                        content_store.as_ref(),
-                        &base.reverse,
-                        &novelty.new_terms,
-                        warm_cache.as_deref(),
-                    )
-                    .await?
-                }
-                // No base dictionary (the ledger's first terms meet an index
-                // that has none): a fresh tree, as a full build writes it.
-                None => {
-                    let mut entries: Vec<_> = novelty
-                        .new_terms
-                        .iter()
-                        .map(|(p_id, seq, key)| {
-                            fluree_db_binary_index::dict::reverse_leaf::ReverseEntry {
-                                key: key.clone(),
-                                id: fluree_db_core::triple_term::term_handle(*p_id, *seq),
-                            }
-                        })
-                        .collect();
-                    entries.sort_by(|a, b| a.key.cmp(&b.key));
-                    super::types::UpdatedReverseTree {
-                        tree_refs: fluree_db_binary_index::dict::term_dict::upload_reverse_tree(
-                            content_store.as_ref(),
-                            entries,
-                        )
-                        .await
-                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?,
-                        replaced_cids: Vec::new(),
+            // Each reverse tree is updated copy-on-write over the base's, or
+            // written fresh when there is no base dictionary (the ledger's
+            // first terms meet an index that has none). A base dictionary
+            // that predates the object tree keeps none until a rebuild.
+            let update_tree = |base: Option<fluree_db_binary_index::DictTreeRefs>,
+                               object_first: bool| {
+                let content_store = content_store.as_ref();
+                let new_terms = &novelty.new_terms;
+                let warm_cache = warm_cache.as_deref();
+                async move {
+                    match base {
+                        Some(base) => {
+                            super::dicts::upload_incremental_reverse_tree_async_terms(
+                                content_store,
+                                &base,
+                                new_terms,
+                                object_first,
+                                warm_cache,
+                            )
+                            .await
+                        }
+                        None => Ok(super::types::UpdatedReverseTree {
+                            tree_refs:
+                                fluree_db_binary_index::dict::term_dict::upload_reverse_tree(
+                                    content_store,
+                                    super::dicts::term_reverse_entries(new_terms, object_first)?,
+                                )
+                                .await
+                                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?,
+                            replaced_cids: Vec::new(),
+                        }),
                     }
                 }
             };
+            let updated_tree =
+                update_tree(base_terms.as_ref().map(|b| b.reverse.clone()), false).await?;
+            let object_tree = match &base_terms {
+                Some(base) => match &base.object_reverse {
+                    Some(tree) => Some(update_tree(Some(tree.clone()), true).await?),
+                    None => None,
+                },
+                None => Some(update_tree(None, true).await?),
+            };
+            let mut replaced = updated_tree.replaced_cids;
+            let object_reverse = object_tree.map(|tree| {
+                replaced.extend(tree.replaced_cids);
+                tree.tree_refs
+            });
             let refs = fluree_db_binary_index::TermDictRefs {
                 forward_packs,
                 reverse: updated_tree.tree_refs,
                 watermarks: novelty.term_watermarks.clone(),
                 term_count: base_count + novelty.new_terms.len() as u64,
+                object_reverse,
             };
             tracing::debug!(
                 new_terms = novelty.new_terms.len(),
                 term_count = refs.term_count,
                 "V6 Phase 3: triple-term dictionary updated"
             );
-            let mut replaced = updated_tree.replaced_cids;
             replaced.extend(consumed);
             root_builder.set_term_dict(Some(refs), replaced);
         }
@@ -5154,6 +5167,7 @@ mod compaction_tests {
             },
             watermarks: vec![(7, 26), (9, 2)],
             term_count: 30,
+            object_reverse: None,
         };
 
         let mut cycle = CompactionBudget::new();

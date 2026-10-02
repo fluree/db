@@ -61,25 +61,45 @@ pub(crate) async fn upload_incremental_reverse_tree_async_strings(
 
 /// Core async reverse tree upload: pre-fetch affected leaves, spawn_blocking
 /// for CoW update, async-upload new artifacts.
-/// Triple-term reverse tree append: entries are `(encoded TermKey, handle)`.
+/// Reverse-tree entries for this window's new terms, `(p_id, seq,
+/// subject-first TermKey bytes)`, keyed subject-first or object-first, sorted.
+pub(crate) fn term_reverse_entries(
+    new_terms: &[(u32, u32, Vec<u8>)],
+    object_first: bool,
+) -> Result<Vec<fluree_db_binary_index::dict::reverse_leaf::ReverseEntry>> {
+    use fluree_db_binary_index::dict::reverse_leaf::ReverseEntry;
+    use fluree_db_core::triple_term::{term_handle, TermKey};
+
+    let mut entries = new_terms
+        .iter()
+        .map(|(p_id, seq, key)| {
+            let key = if object_first {
+                TermKey::from_be_bytes(key)
+                    .ok_or_else(|| IndexerError::StorageWrite("malformed term key".into()))?
+                    .to_object_first_bytes()
+                    .to_vec()
+            } else {
+                key.clone()
+            };
+            Ok(ReverseEntry {
+                key,
+                id: term_handle(*p_id, *seq),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(entries)
+}
+
+/// Triple-term reverse tree append, in either key order.
 pub(crate) async fn upload_incremental_reverse_tree_async_terms(
     content_store: &dyn ContentStore,
     existing_refs: &DictTreeRefs,
     new_terms: &[(u32, u32, Vec<u8>)],
+    object_first: bool,
     warm_cache: Option<&LeafletCache>,
 ) -> Result<UpdatedReverseTree> {
-    use fluree_db_binary_index::dict::reverse_leaf::ReverseEntry;
-    use fluree_db_core::triple_term::term_handle;
-
-    let mut entries: Vec<ReverseEntry> = new_terms
-        .iter()
-        .map(|(p_id, seq, key)| ReverseEntry {
-            key: key.clone(),
-            id: term_handle(*p_id, *seq),
-        })
-        .collect();
-    entries.sort_by(|a, b| a.key.cmp(&b.key));
-
+    let entries = term_reverse_entries(new_terms, object_first)?;
     upload_incremental_reverse_tree_core(
         content_store,
         fluree_db_core::DictKind::TermReverse,

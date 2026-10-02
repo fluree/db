@@ -194,6 +194,33 @@ impl TermKey {
     pub fn subject_prefix(s_id: u64) -> [u8; 8] {
         s_id.to_be_bytes()
     }
+
+    /// Big-endian object-first key bytes: `o_type, o_key, p_id, s_id`, the
+    /// object reverse tree's order, so an object-bound reified-triple
+    /// pattern is one key range.
+    #[inline]
+    pub fn to_object_first_bytes(&self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..2].copy_from_slice(&self.o_type.as_u16().to_be_bytes());
+        b[2..10].copy_from_slice(&self.o_key.to_be_bytes());
+        b[10..14].copy_from_slice(&self.p_id.to_be_bytes());
+        b[14..22].copy_from_slice(&self.s_id.to_be_bytes());
+        b
+    }
+
+    /// Decode a key written by [`Self::to_object_first_bytes`].
+    #[inline]
+    pub fn from_object_first_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN {
+            return None;
+        }
+        Some(Self {
+            o_type: OType::from_u16(u16::from_be_bytes(b[0..2].try_into().ok()?)),
+            o_key: u64::from_be_bytes(b[2..10].try_into().ok()?),
+            p_id: u32::from_be_bytes(b[10..14].try_into().ok()?),
+            s_id: u64::from_be_bytes(b[14..22].try_into().ok()?),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -281,5 +308,15 @@ mod tests {
         };
         assert!(k2.to_be_bytes() > b);
         assert!(TermKey::from_be_bytes(&b[..10]).is_none());
+
+        let o = k.to_object_first_bytes();
+        assert_eq!(TermKey::from_object_first_bytes(&o), Some(k));
+        let other_object = TermKey {
+            o_key: 78,
+            s_id: 0,
+            ..k
+        };
+        assert!(other_object.to_object_first_bytes() > o, "object first");
+        assert!(TermKey::from_object_first_bytes(&o[..10]).is_none());
     }
 }

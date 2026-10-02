@@ -845,10 +845,11 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
 
     /// Skip the triple-term dictionary section. Matches
     /// `write_term_dict_refs` in binary-index: version, per-predicate forward
-    /// packs, reverse tree refs, per-predicate watermarks, term count.
+    /// packs, reverse tree refs, per-predicate watermarks, term count, and
+    /// from version 2 the optional object reverse tree.
     fn skip_term_dict_refs(bytes: &[u8], pos: &mut usize) -> std::io::Result<()> {
         let version = read_u8(bytes, pos)?;
-        if version != 1 {
+        if !(1..=2).contains(&version) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("FIR6: unsupported term dict section version {version}"),
@@ -871,6 +872,9 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
             let _wm = read_u32(bytes, pos)?;
         }
         let _term_count = read_u64(bytes, pos)?;
+        if version >= 2 && read_u8(bytes, pos)? != 0 {
+            skip_dict_tree_refs(bytes, pos)?;
+        }
         Ok(())
     }
 

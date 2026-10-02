@@ -1672,3 +1672,161 @@ async fn first_annotation_after_an_index_without_terms() {
         fallbacks.iter().map(|e| &e.fields).collect::<Vec<_>>()
     );
 }
+
+/// Object-bound reified triples answered by the object-first tree, with
+/// what each object lookup stamped.
+async fn object_bound_answers(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+) -> (Vec<Vec<Vec<String>>>, Vec<Vec<String>>) {
+    let queries = [
+        "SELECT ?s ?src WHERE { << ?s ex:knows ex:bob >> ex:source ?src } ORDER BY ?s",
+        "SELECT (COUNT(*) AS ?n) WHERE { << ?s ?p ex:bob >> ex:source ?src }",
+        "SELECT ?src WHERE { << ?s ex:size 5 >> ex:source ?src }",
+        "SELECT ?o ?src WHERE { ex:alice ex:knows ?o . << ?s ex:knows ?o >> ex:source ?src } \
+         ORDER BY ?o ?src",
+    ];
+    // Register the stamp callsite before this thread's subscriber reads it.
+    run_link_query(fluree, ledger, queries[0].to_string()).await;
+    let (store, _guard) = support::span_capture::init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
+    let stamps = || -> Vec<String> {
+        store
+            .find_events("fast-path outcome")
+            .iter()
+            .filter(|e| e.fields.get("site").map(String::as_str) == Some("term-object"))
+            .filter_map(|e| e.fields.get("outcome").cloned())
+            .collect()
+    };
+    let mut answers = Vec::new();
+    let mut outcomes = Vec::new();
+    for q in queries {
+        let before = stamps().len();
+        answers.push(run_link_query(fluree, ledger, q.to_string()).await);
+        outcomes.push(stamps().split_off(before));
+    }
+    (answers, outcomes)
+}
+
+fn strings(rows: &[&[&str]]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|r| r.iter().map(std::string::ToString::to_string).collect())
+        .collect()
+}
+
+/// A constant or bound term object reads its terms from the object-first
+/// reverse tree (a range on the object, and the predicate when fixed), after
+/// import, beside novelty, after a reindex and after an incremental build.
+#[tokio::test(flavor = "current_thread")]
+async fn object_bound_terms_read_the_object_tree() {
+    use fluree_db_indexer::IndexerConfig;
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let expected = |extra: bool| {
+        let mut knows_bob = vec![vec!["ex:alice".to_string(), "ex:hr".to_string()]];
+        if extra {
+            knows_bob.push(vec!["ex:erin".to_string(), "ex:web".to_string()]);
+        }
+        vec![
+            knows_bob,
+            vec![vec![if extra { "2" } else { "1" }.to_string()]],
+            strings(&[&["ex:integer"]]),
+            if extra {
+                strings(&[
+                    &["ex:bob", "ex:hr"],
+                    &["ex:bob", "ex:web"],
+                    &["ex:carol", "ex:linkedin"],
+                ])
+            } else {
+                strings(&[&["ex:bob", "ex:hr"], &["ex:carol", "ex:linkedin"]])
+            },
+        ]
+    };
+    let erin = "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+                ex:erin ex:knows ex:bob {| ex:source ex:web |} .\n";
+    let all_proceed = |outcomes: &[Vec<String>]| {
+        for (i, per_query) in outcomes.iter().enumerate() {
+            assert!(
+                !per_query.is_empty(),
+                "query {i} never read the object tree"
+            );
+            assert!(
+                per_query.iter().all(|o| o == "proceed"),
+                "query {i}: {per_query:?}"
+            );
+        }
+    };
+
+    // Enough knows links elsewhere that the object range, not the
+    // predicate's link interval, drives.
+    let padding: String = std::iter::once("@prefix ex: <http://example.org/> .\n".to_string())
+        .chain((0..50).map(|i| {
+            format!(
+                "ex:p{i} ex:knows ex:q{i} {{| ex:source ex:pad |}} .\n\
+                 ex:p{i} ex:size {} {{| ex:source ex:pad |}} .\n",
+                i + 100
+            )
+        }))
+        .collect();
+    let alias = "it/triple-term-links:object-tree";
+    let (fluree, ledger) = import(
+        &[
+            ("claims.ttl", CLAIMS),
+            ("literals.ttl", LITERAL_CLAIMS),
+            ("padding.ttl", &padding),
+        ],
+        alias,
+    )
+    .await;
+    let (answers, outcomes) = object_bound_answers(&fluree, &ledger).await;
+    assert_eq!(answers, expected(false));
+    all_proceed(&outcomes);
+
+    let ledger = fluree
+        .insert_turtle(ledger, erin)
+        .await
+        .expect("novelty")
+        .ledger;
+    let (answers, outcomes) = object_bound_answers(&fluree, &ledger).await;
+    assert_eq!(answers, expected(true), "novelty terms beside the tree");
+    all_proceed(&outcomes);
+
+    fluree
+        .reindex(alias, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(alias).await.expect("reload");
+    let (answers, outcomes) = object_bound_answers(&fluree, &ledger).await;
+    assert_eq!(answers, expected(true), "after reindex");
+    all_proceed(&outcomes);
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/triple-term-links:object-tree-incremental";
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    local
+        .run_until(async {
+            // The first build sees no annotation, so the next one writes the
+            // term dictionary over a base that has none.
+            let plain = "@prefix ex: <http://example.org/> .\nex:zed ex:knows ex:bob .\n";
+            let mut ledger = support::genesis_ledger(&fluree, ledger_id);
+            for body in [plain, CLAIMS, LITERAL_CLAIMS, &padding, erin] {
+                ledger = fluree
+                    .insert_turtle(ledger, body)
+                    .await
+                    .expect("insert")
+                    .ledger;
+                let t = ledger.t();
+                support::trigger_index_and_wait(&handle, ledger_id, t).await;
+                support::wait_for_index_application(&fluree, ledger_id, t).await;
+                ledger = fluree.ledger(ledger_id).await.expect("reload");
+                assert_eq!(ledger.index_t(), t);
+            }
+        })
+        .await;
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let (answers, outcomes) = object_bound_answers(&fluree, &ledger).await;
+    assert_eq!(answers, expected(true), "after incremental builds");
+    all_proceed(&outcomes);
+}
