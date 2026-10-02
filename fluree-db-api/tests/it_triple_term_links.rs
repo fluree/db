@@ -1830,3 +1830,87 @@ async fn object_bound_terms_read_the_object_tree() {
     assert_eq!(answers, expected(true), "after incremental builds");
     all_proceed(&outcomes);
 }
+
+/// `TRIPLE(s, p, o)` builds the term a link holds: it joins, filters and
+/// groups with links whether the index or novelty holds them, a literal
+/// component keeps its datatype or tag, and a component of the wrong kind
+/// leaves the result unbound.
+#[tokio::test]
+async fn triple_constructs_the_terms_links_hold() {
+    let (fluree, ledger) = import(
+        &[("claims.ttl", CLAIMS), ("literals.ttl", LITERAL_CLAIMS)],
+        "it/triple-term-links:triple-fn",
+    )
+    .await;
+    let check = |ledger: LedgerState| {
+        let fluree = &fluree;
+        async move {
+            let run = |body: &str| run_link_query(fluree, &ledger, body.to_string());
+            for body in [
+                "SELECT ?r WHERE { BIND(TRIPLE(ex:alice, ex:knows, ex:bob) AS ?t) ?r rdf:reifies ?t }",
+                "SELECT ?r WHERE { ?r rdf:reifies ?t FILTER(?t = TRIPLE(ex:alice, ex:knows, ex:bob)) }",
+                "SELECT ?r WHERE { BIND(<<( ex:alice ex:knows ex:bob )>> AS ?t) ?r rdf:reifies ?t }",
+            ] {
+                assert_eq!(run(body).await, strings(&[&["ex:claim1"]]), "{body}");
+            }
+            for (object, source) in [
+                ("\"5\"^^xsd:int", "ex:int"),
+                ("5", "ex:integer"),
+                ("\"chat\"@fr", "ex:fr"),
+            ] {
+                let body = format!(
+                    "SELECT ?src WHERE {{ BIND(TRIPLE(ex:doc, ?p, {object}) AS ?t) \
+                     ?r rdf:reifies ?t ; ex:source ?src \
+                     VALUES ?p {{ ex:size ex:title }} }}"
+                );
+                assert_eq!(run(&body).await, strings(&[&[source]]), "{object}");
+            }
+            // The constructed term and the link's are one group.
+            let got = run(
+                "SELECT (COUNT(*) AS ?n) WHERE { { ?r rdf:reifies ?t } UNION \
+                 { BIND(TRIPLE(ex:alice, ex:knows, ex:bob) AS ?t) } } \
+                 GROUP BY ?t HAVING (COUNT(*) > 1)",
+            )
+            .await;
+            assert_eq!(got, strings(&[&["2"]]), "{got:?}");
+        }
+    };
+    check(ledger.clone()).await;
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+             ex:erin ex:knows ex:frank ~ ex:claim9 {| ex:source ex:web |} .\n",
+        )
+        .await
+        .expect("novelty")
+        .ledger;
+    check(ledger.clone()).await;
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT ?r WHERE { BIND(TRIPLE(ex:erin, ex:knows, ex:frank) AS ?t) ?r rdf:reifies ?t }"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(got, strings(&[&["ex:claim9"]]), "a term only novelty holds");
+
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT (isTRIPLE(?t) AS ?is) (SUBJECT(?t) AS ?s) (DATATYPE(OBJECT(?t)) AS ?dt) \
+         (isTRIPLE(OBJECT(?n)) AS ?nested) (BOUND(?bad1) AS ?b1) (BOUND(?bad2) AS ?b2) \
+         (BOUND(?bad3) AS ?b3) WHERE { \
+         BIND(TRIPLE(ex:a, ex:b, \"5\"^^xsd:int) AS ?t) \
+         BIND(TRIPLE(ex:r, ex:says, ?t) AS ?n) \
+         BIND(TRIPLE(\"lit\", ex:b, ex:c) AS ?bad1) \
+         BIND(TRIPLE(ex:a, \"x\", ex:c) AS ?bad2) \
+         BIND(TRIPLE(ex:a, BNODE(), ex:c) AS ?bad3) }"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(
+        got,
+        strings(&[&["true", "ex:a", "xsd:int", "true", "false", "false", "false"]])
+    );
+}

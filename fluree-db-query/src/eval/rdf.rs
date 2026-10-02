@@ -681,6 +681,115 @@ pub fn eval_triple_object<R: RowAccess>(
     eval_term_accessor(Function::TripleObject, args, row, ctx, "OBJECT")
 }
 
+/// SPARQL 1.2 `TRIPLE(s, p, o)` as a binding: the triple term, or `None`
+/// when a component is unbound or of the wrong kind (a subject that is not an
+/// IRI or blank node, a predicate that is not an IRI). Each component keeps
+/// its binding's identity, so an object keeps its datatype or language tag.
+pub(crate) fn triple_binding<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<Binding>> {
+    check_arity(args, 3, "TRIPLE")?;
+    let mut parts = Vec::with_capacity(3);
+    for arg in args {
+        let binding = match arg {
+            Expression::Var(v) => row.get(*v).cloned().unwrap_or(Binding::Unbound),
+            other => other.try_eval_to_binding(row, ctx)?,
+        };
+        parts.push(materialized_component(binding, ctx)?);
+    }
+    let node = |b: &Binding| -> Option<Sid> {
+        match b {
+            Binding::Sid { sid, .. } => Some(sid.clone()),
+            Binding::IriMatch { primary_sid, .. } => Some(primary_sid.clone()),
+            Binding::Iri(iri) => ctx.and_then(|c| c.encode_iri(iri)),
+            _ => None,
+        }
+    };
+    let Some(s) = node(&parts[0]) else {
+        return Ok(None);
+    };
+    let Some(p) =
+        node(&parts[1]).filter(|p| p.namespace_code != fluree_vocab::namespaces::BLANK_NODE)
+    else {
+        return Ok(None);
+    };
+    let (o, dt, lang) = match &parts[2] {
+        Binding::Lit { val, dtc, .. } => match dtc {
+            fluree_db_core::DatatypeConstraint::Explicit(dt) => (val.clone(), dt.clone(), None),
+            fluree_db_core::DatatypeConstraint::LangTag(tag) => (
+                val.clone(),
+                Sid::new(
+                    fluree_vocab::namespaces::RDF,
+                    fluree_vocab::rdf_names::LANG_STRING,
+                ),
+                Some(tag.to_string()),
+            ),
+        },
+        other => match node(other) {
+            Some(sid) => (
+                fluree_db_core::FlakeValue::Ref(sid),
+                fluree_db_core::edge::id_datatype_sid(),
+                None,
+            ),
+            None => return Ok(None),
+        },
+    };
+    let term = fluree_db_core::TripleTermValue { s, p, o, dt, lang };
+    Ok(Some(Binding::Lit {
+        val: fluree_db_core::FlakeValue::TripleTerm(Box::new(term)),
+        dtc: fluree_db_core::DatatypeConstraint::Explicit(
+            fluree_db_core::triple_term_datatype_sid().clone(),
+        ),
+        t: None,
+        op: None,
+        p_id: None,
+    }))
+}
+
+/// A component binding in decoded form: an encoded term through the
+/// dictionaries, any other encoded value through the graph view.
+fn materialized_component(binding: Binding, ctx: Option<&ExecutionContext<'_>>) -> Result<Binding> {
+    match &binding {
+        Binding::EncodedLit { o_kind, .. }
+            if *o_kind == fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8() =>
+        {
+            Ok(match super::binding_to_comparable(Some(&binding), ctx)? {
+                Some(ComparableValue::TypedLiteral { val, .. }) => Binding::Lit {
+                    val,
+                    dtc: fluree_db_core::DatatypeConstraint::Explicit(
+                        fluree_db_core::triple_term_datatype_sid().clone(),
+                    ),
+                    t: None,
+                    op: None,
+                    p_id: None,
+                },
+                _ => Binding::Unbound,
+            })
+        }
+        Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
+            let gv = ctx.and_then(ExecutionContext::graph_view);
+            Ok(crate::group_aggregate::materialize_encoded(
+                &binding,
+                gv.as_ref(),
+            ))
+        }
+        _ => Ok(binding),
+    }
+}
+
+pub fn eval_triple<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    match triple_binding(args, row, ctx)? {
+        Some(binding) => super::binding_to_comparable(Some(&binding), ctx),
+        None => Ok(None),
+    }
+}
+
 pub fn eval_is_triple<R: RowAccess>(
     args: &[Expression],
     row: &R,

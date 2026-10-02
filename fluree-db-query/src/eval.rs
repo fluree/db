@@ -292,6 +292,14 @@ impl Expression {
             return Ok((**b).clone());
         }
 
+        if let Expression::Call {
+            func: Function::Triple,
+            args,
+        } = self
+        {
+            return Ok(rdf::triple_binding(args, row, ctx)?.unwrap_or(Binding::Unbound));
+        }
+
         // A term accessor on a late-materialized handle binds the component
         // encoded, without materializing the term.
         if let Expression::Call {

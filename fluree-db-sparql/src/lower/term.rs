@@ -229,7 +229,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Like [`Self::lower_literal`] but also returns the
     /// datatype/language constraint that pins the lexical value to a
     /// specific RDF datatype or language tag.
-    fn lower_literal_with_constraint(
+    pub(super) fn lower_literal_with_constraint(
         &mut self,
         lit: &Literal,
     ) -> Result<(Term, Option<DatatypeConstraint>)> {

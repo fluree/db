@@ -343,6 +343,12 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
                         0,
                     )
                 }
+                // A link scan binds a term as its handle.
+                (FlakeValue::TripleTerm(term), _) => {
+                    let (_, handle) =
+                        crate::binary_scan::compose_term_handle(term, store, None).ok()?;
+                    (ObjKind::TRIPLE_TERM.as_u8(), handle, 0, 0)
+                }
                 _ => return None,
             };
             Some(Binding::EncodedLit {

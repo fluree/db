@@ -117,6 +117,7 @@ impl Function {
             Function::TriplePredicate => rdf::eval_triple_predicate(args, row, ctx),
             Function::TripleObject => rdf::eval_triple_object(args, row, ctx),
             Function::IsTriple => rdf::eval_is_triple(args, row, ctx),
+            Function::Triple => rdf::eval_triple(args, row, ctx),
             Function::Iri => rdf::eval_iri(args, row, ctx),
             Function::Bnode => rdf::eval_bnode(args, row, ctx),
 

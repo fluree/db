@@ -983,6 +983,8 @@ pub enum Function {
     TripleObject,
     /// SPARQL 1.2 `isTRIPLE(term)`.
     IsTriple,
+    /// SPARQL 1.2 `TRIPLE(s, p, o)`: the triple term with those components.
+    Triple,
 
     // =========================================================================
     // Fluree-specific functions
