@@ -1826,6 +1826,37 @@ async fn graph_scope_big_number_joined_with_a_union_led_by_its_graph() {
     failures.assert_none();
 }
 
+/// A same-ledger SERVICE inside a GRAPH scope reads the dataset's default
+/// graph (g2) while the scope around it reads g3: it is the same crossing.
+#[tokio::test(flavor = "current_thread")]
+async fn service_reading_another_graph_keeps_arena_values() {
+    let ledger_id = "it/service-arena-crossing:main";
+    let (fluree, handle) = graph_scope_arena_ledger(ledger_id).await;
+    let mut failures = Failures::default();
+    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[
+        (
+            "a vector projected out of a SERVICE that reads another graph",
+            format!(
+                "SELECT ?t ?e FROM <urn:g2> FROM NAMED <urn:g3> WHERE {{ GRAPH <urn:g3> {{ \
+                 ?s ex:emb ?x SERVICE <fluree:ledger:{ledger_id}> {{ ?t ex:emb ?e }} }} }}"
+            ),
+            &["t", "e"],
+            &[&["y1", "[0.0,1.0]"]],
+        ),
+        (
+            "a vector carried into a SERVICE that reads another graph",
+            format!(
+                "SELECT ?s ?t FROM <urn:g2> FROM NAMED <urn:g3> WHERE {{ GRAPH <urn:g3> {{ \
+                 ?s ex:emb ?e SERVICE <fluree:ledger:{ledger_id}> {{ ?t ex:emb ?e }} }} }}"
+            ),
+            &["s", "t"],
+            &[],
+        ),
+    ];
+    check_sparql_cases(&fluree, &handle, cases, &mut failures).await;
+    failures.assert_none();
+}
+
 // ---------------------------------------------------------------------------
 // Encoded values outside triple patterns: property-path endpoints and GRAPH.
 // ---------------------------------------------------------------------------
