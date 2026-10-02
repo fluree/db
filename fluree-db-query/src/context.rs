@@ -1436,7 +1436,10 @@ impl<'a> ExecutionContext<'a> {
     /// the graph `<g>`, and any other IRI the graph registered by it. `None`
     /// when the query names a dataset, whose members are the named graphs (a
     /// union default graph names graphs as no dataset does).
-    fn single_db_graph_position(&self, iri: &str) -> Option<fluree_db_core::GraphPosition> {
+    fn single_db_graph_position<'i>(
+        &self,
+        iri: &'i str,
+    ) -> Option<fluree_db_core::GraphPosition<'i>> {
         if self.explicit_dataset().is_some() {
             return None;
         }
