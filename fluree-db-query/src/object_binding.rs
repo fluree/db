@@ -693,6 +693,11 @@ pub(crate) fn normalize_for_key_cow<'a>(
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
 ) -> std::borrow::Cow<'a, Binding> {
     use std::borrow::Cow;
+    // An encoded subject id is its own canonical key: the commonest key pays
+    // nothing else.
+    if let Binding::EncodedSid { .. } = binding {
+        return Cow::Borrowed(binding);
+    }
     // A key over an arena handle with no view to decode it would key by a
     // graph-scoped handle; member scans of a union of graphs decode them.
     debug_assert!(
@@ -845,6 +850,16 @@ pub(crate) fn is_arena_encoded(binding: &Binding) -> bool {
         Binding::EncodedLit { o_kind, .. }
             if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
                 || *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8()
+    )
+}
+
+/// True if a stored object of `o_type` late-materializes as an arena handle
+/// ([`is_arena_encoded`]), decided before any binding is built.
+#[inline]
+pub(crate) fn is_arena_o_type(o_type: u16) -> bool {
+    matches!(
+        OType::from_u16(o_type).decode_kind(),
+        DecodeKind::NumBigArena | DecodeKind::VectorArena
     )
 }
 

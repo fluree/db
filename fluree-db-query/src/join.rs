@@ -1571,10 +1571,10 @@ impl Operator for NestedLoopJoinOperator {
                     // novelty s_id — the same id space the overlay ops are
                     // translated into — so novelty-only left subjects stay on
                     // the batched lane (the merge injects their facts) instead
-                    // of each paying a per-row fallback scan.
-                    let dicts = TermDicts::of(ctx);
+                    // of each paying a per-row fallback scan. The dictionaries
+                    // are read only for a decoded subject.
                     let resolve_subject = |sid: &Sid| -> Option<u64> {
-                        dicts?
+                        TermDicts::of(ctx)?
                             .subject_id(sid.namespace_code, &sid.name)
                             .ok()
                             .flatten()

@@ -476,6 +476,10 @@ pub(crate) fn binding_to_group_key_normalized(
     dicts: Option<crate::object_binding::TermDicts<'_>>,
     gv: Option<&BinaryGraphView>,
 ) -> GroupKeyOwned {
+    // An encoded subject id is its own canonical key.
+    if let Binding::EncodedSid { s_id, .. } = binding {
+        return GroupKeyOwned::Sid(*s_id);
+    }
     // See `normalize_for_key_cow`: an arena handle is never keyed unviewed.
     debug_assert!(
         gv.is_some() || !crate::object_binding::is_arena_encoded(binding),

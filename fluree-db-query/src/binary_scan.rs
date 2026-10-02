@@ -35,7 +35,7 @@ use crate::fast_path_common::{contiguous_id_range, subject_ref_to_s_id};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function};
 use crate::object_binding::{
-    is_arena_encoded, late_materialized_object_binding, materialized_object_binding,
+    is_arena_o_type, late_materialized_object_binding, materialized_object_binding,
 };
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{Operator, OperatorState};
@@ -1532,10 +1532,11 @@ impl BinaryScanOperator {
                 let binding = if needs_o_decode || !late_materialize {
                     let val = decoded_o.expect("decoded object required");
                     materialized_object_binding(self.store(), o_type, p_id, val, t_opt, None)
-                } else if let Some(encoded) =
+                } else if let Some(encoded) = if decode_arena_literals && is_arena_o_type(o_type) {
+                    None
+                } else {
                     late_materialized_object_binding(o_type, o_key, p_id, t_enc, o_i, None)
-                        .filter(|b| !decode_arena_literals || !is_arena_encoded(b))
-                {
+                } {
                     encoded
                 } else {
                     // Fallback: decode if we don't have a safe encoded representation.

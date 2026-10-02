@@ -16,7 +16,7 @@ use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
 use crate::object_binding::{
-    equality_norm, normalize_for_key, normalize_for_key_cow, EqualityNorm,
+    equality_norm, normalize_for_key, normalize_for_key_cow, EqualityNorm, TermDicts,
 };
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::temporal_mode::PlanningContext;
@@ -126,11 +126,14 @@ impl MinusOperator {
 
     #[cfg(test)]
     fn input_row_eliminated(&self, input_batch: &Batch, row_idx: usize) -> bool {
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
         self.row_eliminated(
             input_batch,
             row_idx,
             &mut Vec::new(),
             &mut MinusKey(Vec::new()),
+            dicts,
+            gv,
         )
     }
 
@@ -147,8 +150,11 @@ impl MinusOperator {
     fn keep_mask(&self, batch: &Batch) -> Vec<bool> {
         let mut input_bindings = Vec::with_capacity(self.shared_vars.len());
         let mut probe = MinusKey(Vec::with_capacity(self.shared_vars.len()));
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
         (0..batch.len())
-            .map(|row_idx| !self.row_eliminated(batch, row_idx, &mut input_bindings, &mut probe))
+            .map(|row_idx| {
+                !self.row_eliminated(batch, row_idx, &mut input_bindings, &mut probe, dicts, gv)
+            })
             .collect()
     }
 
@@ -171,6 +177,7 @@ impl MinusOperator {
             // bound domain and therefore cannot eliminate any left row.
             return;
         }
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
         for row_idx in 0..batch.len() {
             let mut key_bindings = Vec::with_capacity(self.shared_vars.len());
             let mut has_wildcard = false;
@@ -179,10 +186,7 @@ impl MinusOperator {
                 let binding = batch.column(var).map(|col| &col[row_idx]);
                 match binding {
                     Some(b) if b.is_matchable() => {
-                        key_bindings.push(Some({
-                            let (dicts, gv) = EqualityNorm::parts(&self.norm);
-                            normalize_for_key(b, dicts, gv)
-                        }));
+                        key_bindings.push(Some(normalize_for_key(b, dicts, gv)));
                     }
                     _ => {
                         key_bindings.push(None);
@@ -218,21 +222,26 @@ impl MinusOperator {
     /// with linear scan fallback for wildcard rows.
     ///
     /// `input_bindings` and `probe` are scratch buffers reused across rows.
+    #[allow(clippy::too_many_arguments)]
     fn row_eliminated(
         &self,
         input_batch: &Batch,
         row_idx: usize,
         input_bindings: &mut Vec<Option<Binding>>,
         probe: &mut MinusKey,
+        dicts: Option<TermDicts<'_>>,
+        gv: Option<&fluree_db_binary_index::BinaryGraphView>,
     ) -> bool {
         if let [var] = self.shared_vars.as_slice() {
             let Some(binding) = input_batch.column(*var).map(|col| &col[row_idx]) else {
                 return false;
             };
+            if let Binding::EncodedSid { s_id, .. } = binding {
+                return self.minus_subjects.contains(s_id);
+            }
             if !binding.is_matchable() {
                 return false;
             }
-            let (dicts, gv) = EqualityNorm::parts(&self.norm);
             let key = normalize_for_key_cow(binding, dicts, gv);
             if let Binding::EncodedSid { s_id, .. } = key.as_ref() {
                 return self.minus_subjects.contains(s_id);
@@ -249,10 +258,7 @@ impl MinusOperator {
             let binding = input_batch.column(var).map(|col| &col[row_idx]);
             match binding {
                 Some(b) if b.is_matchable() => {
-                    input_bindings.push(Some({
-                        let (dicts, gv) = EqualityNorm::parts(&self.norm);
-                        normalize_for_key(b, dicts, gv)
-                    }));
+                    input_bindings.push(Some(normalize_for_key(b, dicts, gv)));
                 }
                 _ => {
                     input_bindings.push(None);

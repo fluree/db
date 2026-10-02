@@ -178,16 +178,17 @@ pub trait OptionalBuilder: Send + Sync {
 /// Encoded id of a subject binding, for the batched probes; `None` when the
 /// binding has none.
 fn resolve_subject_id(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
-    let Some(dicts) = TermDicts::of(ctx) else {
-        return Ok(None);
-    };
     match binding {
-        Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
+        Binding::EncodedSid { s_id, .. } => Ok(ctx.binary_store.is_some().then_some(*s_id)),
         // Subjects minted after the last index resolve to novelty s_ids, the
-        // same id space the overlay ops are translated into.
-        Binding::Sid { sid, .. } => dicts
-            .subject_id(sid.namespace_code, &sid.name)
-            .map_err(|e| QueryError::execution(format!("subject id lookup: {e}"))),
+        // same id space the overlay ops are translated into. The dictionaries
+        // are read only for a decoded subject.
+        Binding::Sid { sid, .. } => match TermDicts::of(ctx) {
+            Some(dicts) => dicts
+                .subject_id(sid.namespace_code, &sid.name)
+                .map_err(|e| QueryError::execution(format!("subject id lookup: {e}"))),
+            None => Ok(None),
+        },
         _ => Ok(None),
     }
 }
@@ -3127,9 +3128,10 @@ impl Operator for OptionalOperator {
         // drained, so its batches hold a row or a few. Columns sized for
         // `batch_size` would keep ~1,000 slots per column per required row
         // alive in every consumer that buffers the output (#1973: 160+ KB
-        // per required row). Size those to their rows; a batch at least an
-        // eighth full keeps its columns.
-        if rows_added < batch_size / 8 {
+        // per required row). Size those to their rows; a batch at least half
+        // full keeps its columns. (Keeping the columns of batches down to an
+        // eighth full cost more, not less: measured on the hash-join lane.)
+        if rows_added < batch_size / 2 {
             for column in &mut output_columns {
                 column.shrink_to_fit();
             }
