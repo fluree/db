@@ -381,8 +381,8 @@ async fn put(cs: &dyn ContentStore, kind: ContentKind, bytes: &[u8]) -> io::Resu
     cs.put(kind, bytes).await.map_err(io::Error::other)
 }
 
-/// Build, upload and finalize a reverse tree from key-sorted entries.
-async fn upload_reverse_tree(
+/// Build, upload and finalize a term reverse tree from key-sorted entries.
+pub async fn upload_reverse_tree(
     cs: &dyn ContentStore,
     entries: Vec<ReverseEntry>,
 ) -> io::Result<DictTreeRefs> {

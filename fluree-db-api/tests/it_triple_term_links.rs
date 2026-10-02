@@ -1624,3 +1624,51 @@ async fn link_counts_follow_every_build() {
         })
         .await;
 }
+
+/// A ledger indexed before its first annotation: the incremental build that
+/// meets it starts the term dictionary over a base that has none.
+#[tokio::test]
+async fn first_annotation_after_an_index_without_terms() {
+    use fluree_db_indexer::IndexerConfig;
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/triple-term-links:first-annotation-incremental";
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (store, _guard) = support::span_capture::init_test_tracing();
+    local
+        .run_until(async {
+            let ledger = fluree
+                .insert_turtle(
+                    support::genesis_ledger(&fluree, ledger_id),
+                    "@prefix ex: <http://example.org/> .\nex:alice ex:knows ex:bob .\n",
+                )
+                .await
+                .expect("plain data")
+                .ledger;
+            support::trigger_index_and_wait(&handle, ledger_id, ledger.t()).await;
+            support::wait_for_index_application(&fluree, ledger_id, ledger.t()).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+            let ledger = fluree
+                .insert_turtle(ledger, CLAIMS)
+                .await
+                .expect("claims")
+                .ledger;
+            let t = ledger.t();
+            support::trigger_index_and_wait(&handle, ledger_id, t).await;
+            support::wait_for_index_application(&fluree, ledger_id, t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+            assert_eq!(ledger.index_t(), t);
+            assert_eq!(links(&fluree, &ledger).await.len(), 4);
+        })
+        .await;
+    let fallbacks = store.find_events("incremental indexing failed, falling back to full rebuild");
+    assert!(
+        fallbacks.is_empty(),
+        "{:?}",
+        fallbacks.iter().map(|e| &e.fields).collect::<Vec<_>>()
+    );
+}

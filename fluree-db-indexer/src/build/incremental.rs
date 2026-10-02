@@ -1309,39 +1309,41 @@ pub async fn incremental_index(
                 root_builder.set_term_dict(Some(refs), consumed);
             }
         } else {
-            let empty_tree = fluree_db_binary_index::DictTreeRefs {
-                branch: fluree_db_core::ContentId::from_hex_digest(
-                    fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
-                    &fluree_db_core::sha256_hex(b""),
-                )
-                .expect("valid digest"),
-                leaves: Vec::new(),
-            };
-            let (base_reverse, base_count) = match &base_terms {
-                Some(b) => (b.reverse.clone(), b.term_count),
-                None => (empty_tree, 0),
-            };
-            let updated_tree = if base_terms.is_some() {
-                super::dicts::upload_incremental_reverse_tree_async_terms(
-                    content_store.as_ref(),
-                    &base_reverse,
-                    &novelty.new_terms,
-                    warm_cache.as_deref(),
-                )
-                .await?
-            } else {
-                // No base dictionary: build the tree from scratch through the
-                // same core, against an empty existing tree.
-                super::dicts::upload_incremental_reverse_tree_async_terms(
-                    content_store.as_ref(),
-                    &fluree_db_binary_index::DictTreeRefs {
-                        branch: base_reverse.branch.clone(),
-                        leaves: Vec::new(),
-                    },
-                    &novelty.new_terms,
-                    warm_cache.as_deref(),
-                )
-                .await?
+            let base_count = base_terms.as_ref().map_or(0, |b| b.term_count);
+            let updated_tree = match &base_terms {
+                Some(base) => {
+                    super::dicts::upload_incremental_reverse_tree_async_terms(
+                        content_store.as_ref(),
+                        &base.reverse,
+                        &novelty.new_terms,
+                        warm_cache.as_deref(),
+                    )
+                    .await?
+                }
+                // No base dictionary (the ledger's first terms meet an index
+                // that has none): a fresh tree, as a full build writes it.
+                None => {
+                    let mut entries: Vec<_> = novelty
+                        .new_terms
+                        .iter()
+                        .map(|(p_id, seq, key)| {
+                            fluree_db_binary_index::dict::reverse_leaf::ReverseEntry {
+                                key: key.clone(),
+                                id: fluree_db_core::triple_term::term_handle(*p_id, *seq),
+                            }
+                        })
+                        .collect();
+                    entries.sort_by(|a, b| a.key.cmp(&b.key));
+                    super::types::UpdatedReverseTree {
+                        tree_refs: fluree_db_binary_index::dict::term_dict::upload_reverse_tree(
+                            content_store.as_ref(),
+                            entries,
+                        )
+                        .await
+                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?,
+                        replaced_cids: Vec::new(),
+                    }
+                }
             };
             let refs = fluree_db_binary_index::TermDictRefs {
                 forward_packs,
