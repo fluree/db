@@ -1655,12 +1655,14 @@ async fn graph_scope_arena_ledger(ledger_id: &str) -> (Fluree, LedgerHandle) {
     (fluree, handle)
 }
 
-/// Run each `(label, SPARQL body, projected variables, expected rows)` case,
-/// recording a mismatch or a query error.
+/// `(label, SPARQL body, projected variables, expected rows)`.
+type SparqlCase<'a> = (&'a str, String, &'a [&'a str], &'a [&'a [&'a str]]);
+
+/// Run each case, recording a mismatch or a query error.
 async fn check_sparql_cases(
     fluree: &Fluree,
     handle: &LedgerHandle,
-    cases: &[(&str, String, &[&str], &[&[&str]])],
+    cases: &[SparqlCase<'_>],
     failures: &mut Failures,
 ) {
     for (label, body, vars, expected) in cases {
@@ -1682,7 +1684,7 @@ async fn check_sparql_cases(
 async fn vector_leaving_a_graph_scope_keeps_its_graphs_value() {
     let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-vector-exit:main").await;
     let mut failures = Failures::default();
-    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[
+    let cases: &[SparqlCase<'_>] = &[
         (
             "a default-graph vector (control)",
             "SELECT ?s ?e WHERE { ?s ex:emb ?e }".into(),
@@ -1723,7 +1725,7 @@ async fn arena_literals_entering_a_graph_scope_keep_their_graphs_value() {
     let mut failures = Failures::default();
     // The OPTIONAL runs after the row that seeds it, so its GRAPH scope
     // receives x1's handles; no graph-2 value equals x1's.
-    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[
+    let cases: &[SparqlCase<'_>] = &[
         (
             "a default-graph vector carried into a GRAPH scope",
             "SELECT ?b WHERE { ex:x1 ex:emb ?e . OPTIONAL { GRAPH <urn:g2> { ?b ex:emb ?e } } }"
@@ -1762,7 +1764,7 @@ async fn arena_literals_entering_a_graph_scope_keep_their_graphs_value() {
 async fn graph_scope_vector_projected_inside_a_union() {
     let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-vector-union-proj:main").await;
     let mut failures = Failures::default();
-    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[(
+    let cases: &[SparqlCase<'_>] = &[(
         "a vector projected out of GRAPH inside a union",
         "SELECT ?s ?e FROM <urn:g2> FROM <urn:g3> FROM NAMED <urn:g3> \
          WHERE { GRAPH <urn:g3> { ?s ex:emb ?e } }"
@@ -1778,7 +1780,7 @@ async fn graph_scope_vector_projected_inside_a_union() {
 async fn graph_scope_vector_joined_with_a_union() {
     let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-vector-union-join:main").await;
     let mut failures = Failures::default();
-    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[(
+    let cases: &[SparqlCase<'_>] = &[(
         "a GRAPH-scope vector joined with a union",
         "SELECT ?s ?t FROM <urn:g2> FROM <urn:g3> FROM NAMED <urn:g3> \
          WHERE { GRAPH <urn:g3> { ?s ex:emb ?e } ?t ex:emb ?e }"
@@ -1797,7 +1799,7 @@ async fn graph_scope_vector_joined_with_a_union() {
 async fn graph_scope_vector_joined_with_a_union_led_by_its_graph() {
     let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-vector-union-led:main").await;
     let mut failures = Failures::default();
-    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[(
+    let cases: &[SparqlCase<'_>] = &[(
         "a GRAPH-scope vector joined with a union led by its graph",
         "SELECT ?s ?t FROM <urn:g3> FROM <urn:g2> FROM NAMED <urn:g3> \
          WHERE { GRAPH <urn:g3> { ?s ex:emb ?e } ?t ex:emb ?e }"
@@ -1814,7 +1816,7 @@ async fn graph_scope_vector_joined_with_a_union_led_by_its_graph() {
 async fn graph_scope_big_number_joined_with_a_union_led_by_its_graph() {
     let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-numbig-union-led:main").await;
     let mut failures = Failures::default();
-    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[(
+    let cases: &[SparqlCase<'_>] = &[(
         "a GRAPH-scope big number joined with a union led by its graph",
         "SELECT ?s ?t FROM <urn:g3> FROM <urn:g2> FROM NAMED <urn:g3> \
          WHERE { GRAPH <urn:g3> { ?s ex:amount ?v } ?t ex:amount ?v }"
@@ -1833,7 +1835,7 @@ async fn service_reading_another_graph_keeps_arena_values() {
     let ledger_id = "it/service-arena-crossing:main";
     let (fluree, handle) = graph_scope_arena_ledger(ledger_id).await;
     let mut failures = Failures::default();
-    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[
+    let cases: &[SparqlCase<'_>] = &[
         (
             "a vector projected out of a SERVICE that reads another graph",
             format!(
