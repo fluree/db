@@ -78,6 +78,14 @@ pub trait Operator: Send + Sync {
         false
     }
 
+    /// Schema variables bound in every row this operator emits, when it can see
+    /// its rows. A plan seeded by this operator holds a BIND or FILTER reading
+    /// any other schema variable until the triples that could still bind it
+    /// have run. `None` plans every schema variable as bound.
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        None
+    }
+
     /// Extract the input of a DISTINCT wrapper during planning, before `open()`.
     /// The caller must prove that its consumer cannot observe input duplicates.
     /// A successful extraction leaves the wrapper closed; discard it immediately.

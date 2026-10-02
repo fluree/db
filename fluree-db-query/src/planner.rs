@@ -1365,8 +1365,9 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
         .any(|v| bound_vars.contains(v))
 }
 
-/// Collect the variables that a slice of patterns guarantees to bind.
-fn collect_guaranteed_vars(patterns: &[Pattern]) -> HashSet<VarId> {
+/// Variables some pattern of `patterns` may bind (see [`must_bind_vars`] for
+/// the ones bound on every row).
+fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
     patterns
         .iter()
         .flat_map(super::ir::Pattern::produced_vars)
@@ -1385,14 +1386,13 @@ fn collect_guaranteed_vars(patterns: &[Pattern]) -> HashSet<VarId> {
 /// parent scope and available inside each branch, so only the UNION-specific
 /// variables need the intersection check.
 ///
-/// For Graph and Service all inner variables are guaranteed, so the deferred
-/// pattern is nested unconditionally.
+/// For Graph and Service the deferred pattern is nested unconditionally.
 fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool {
     match compound {
         Pattern::Union(branches) => {
-            let guaranteed_vars = branches
+            let produced_in_every_branch = branches
                 .iter()
-                .map(|b| collect_guaranteed_vars(b))
+                .map(|b| produced_vars_of(b))
                 .reduce(|mut union_vars, branch_vars| {
                     union_vars.retain(|v| branch_vars.contains(v));
                     union_vars
@@ -1401,7 +1401,7 @@ fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool
             if !deferred
                 .required_vars
                 .iter()
-                .any(|v| guaranteed_vars.contains(v))
+                .any(|v| produced_in_every_branch.contains(v))
             {
                 return false;
             }
@@ -1474,8 +1474,8 @@ struct DeferredPattern {
     /// `?b` otherwise drains the VALUES before the OPTIONAL that introduces `?b`
     /// is placed at all. Empty for every dependency-placed deferral.
     after_indices: Vec<usize>,
-    /// For FILTER, EXISTS and NOT EXISTS: who binds each variable the pattern
-    /// reads (see [`attach_filter_binders`]). Empty for everything else.
+    /// For FILTER, EXISTS, NOT EXISTS and BIND: who binds each variable the
+    /// pattern reads (see [`attach_filter_binders`]). Empty for everything else.
     binders: Vec<VarBinders>,
 }
 
@@ -1499,32 +1499,46 @@ impl VarBinders {
     }
 }
 
-/// Fill [`DeferredPattern::binders`] for each deferred FILTER, EXISTS and NOT
-/// EXISTS: one [`VarBinders`] per variable it reads that another pattern in the
-/// group binds, by original index. SPARQL applies a FILTER to its group
-/// wherever it is written (§18.2.2.6), so binders written after it count too.
+/// Fill [`DeferredPattern::binders`] for each deferred FILTER, EXISTS, NOT
+/// EXISTS, BIND and UNWIND: one [`VarBinders`] per variable it reads that
+/// another pattern in the group binds, by original index. SPARQL applies a
+/// FILTER to its group wherever it is written (§18.2.2.6), so binders written
+/// after it count too. BIND and UNWIND are placed by their dependencies rather
+/// than where they are written, so they wait on the same binders; otherwise a
+/// VALUES UNDEF column lets them run before the triple that actually binds the
+/// variable.
+///
+/// `seed_bound_in_every_row` are the seed variables no pattern can change;
+/// any other seed variable may be unbound on some rows and gets binders too.
 fn attach_filter_binders(
     deferred: &mut [DeferredPattern],
     patterns: &[Pattern],
-    initial_bound_vars: &HashSet<VarId>,
+    seed_bound_in_every_row: &HashSet<VarId>,
 ) {
-    let is_filter = |p: &Pattern| {
+    let waits_for_binders = |p: &Pattern| {
         matches!(
             p,
-            Pattern::Filter(_) | Pattern::Exists(_) | Pattern::NotExists(_)
+            Pattern::Filter(_)
+                | Pattern::Exists(_)
+                | Pattern::NotExists(_)
+                | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
         )
     };
-    if !deferred.iter().any(|dp| is_filter(&dp.pattern)) {
+    if !deferred.iter().any(|dp| waits_for_binders(&dp.pattern)) {
         return;
     }
     let produced: Vec<Vec<VarId>> = patterns.iter().map(Pattern::produced_vars).collect();
     let mut every_row_vars: Vec<Option<HashSet<VarId>>> = vec![None; patterns.len()];
-    for dp in deferred.iter_mut().filter(|dp| is_filter(&dp.pattern)) {
+    for dp in deferred
+        .iter_mut()
+        .filter(|dp| waits_for_binders(&dp.pattern))
+    {
         let mut reads = dp.pattern.referenced_vars();
         reads.sort_unstable();
         reads.dedup();
         for v in reads {
-            if initial_bound_vars.contains(&v) {
+            if seed_bound_in_every_row.contains(&v) {
                 continue;
             }
             let any: Vec<usize> = (0..patterns.len())
@@ -1538,13 +1552,23 @@ fn attach_filter_binders(
                 .copied()
                 .filter(|&j| {
                     every_row_vars[j]
-                        .get_or_insert_with(|| must_bind_vars(&patterns[j]))
+                        .get_or_insert_with(|| must_bind_vars(&patterns[j], BindTargets::Bound))
                         .contains(&v)
                 })
                 .collect();
             dp.binders.push(VarBinders { every_row, any });
         }
     }
+}
+
+/// How [`must_bind_vars`] counts the target of a BIND.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindTargets {
+    /// Bound on every row. Subquery correlation needs this: a variable a
+    /// WITH-pipeline BIND produces is the subquery's own, not an input.
+    Bound,
+    /// Unbound on a row whose expression errors, so not bound on every row.
+    MayBeUnbound,
 }
 
 /// Variables `pattern` binds in **every** solution it emits.
@@ -1557,28 +1581,27 @@ fn attach_filter_binders(
 /// genuinely introduces it — the barrier stopped firing and #1690 came back one
 /// UNION away from the shape it was written for.
 ///
-/// **`Bind` is a known may-bind variant this function deliberately counts, so
-/// the contract above is not unconditional.** `Pattern::Bind` binds nothing on
-/// a row whose expression errors — `bind.rs` yields `Binding::Unbound` — and a
-/// BIND-then-OPTIONAL lead can therefore fabricate exactly as a UNION lead
-/// does. It is counted anyway because [`subquery_correlation_vars`] needs it
-/// counted: a variable the subquery produces through a WITH-pipeline binder
-/// must not be read as an external correlation, or the subquery is deferred on
-/// a variable only it can bind. That is the one concept where the two call
-/// sites genuinely want different answers, and it is resolved in the
-/// correlation site's favour — so tightening `Bind` here on the strength of the
-/// stated contract would quietly break subquery correlation. It needs a fix at
-/// both sites or at neither.
+/// **`Bind` is the one may-bind variant, so callers choose ([`BindTargets`]).**
+/// `Pattern::Bind` binds nothing on a row whose expression errors — `bind.rs`
+/// yields `Binding::Unbound`. [`subquery_correlation_vars`] counts it anyway: a
+/// variable the subquery produces through a WITH-pipeline binder must not be
+/// read as an external correlation, or the subquery is deferred on a variable
+/// only it can bind. Join-chain placement does not count it (see
+/// `where_plan::build_where_operators_seeded_with_needed`). The barrier and
+/// binder sites here still count it, so a BIND-then-OPTIONAL lead can fabricate
+/// exactly as a UNION lead does; tightening them changes placement and wants
+/// its own tests.
 ///
 /// Shared with [`subquery_correlation_vars`], which needs the same rule to
 /// decide whether a shared SELECT-list variable is a join key or a correlation
-/// input — it used to state it as an inline `matches!` allow-list. One relation
-/// over one concept, with `Bind` above as the single knowing exception.
-///
-/// Note `collect_guaranteed_vars` is NOT this function despite the name: it is
-/// plain `produced_vars`, with the branch intersection done at its
-/// `try_nest_deferred` call site.
-fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
+/// input — it used to state it as an inline `matches!` allow-list.
+pub(crate) fn must_bind_vars(pattern: &Pattern, bind_targets: BindTargets) -> HashSet<VarId> {
+    let all = |patterns: &[Pattern]| -> HashSet<VarId> {
+        patterns
+            .iter()
+            .flat_map(|p| must_bind_vars(p, bind_targets))
+            .collect()
+    };
     match pattern {
         // A left join binds nothing unconditionally.
         Pattern::Optional(_) => HashSet::new(),
@@ -1589,12 +1612,7 @@ fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
         // A UNION guarantees only what EVERY branch guarantees.
         Pattern::Union(branches) => branches
             .iter()
-            .map(|branch| {
-                branch
-                    .iter()
-                    .flat_map(must_bind_vars)
-                    .collect::<HashSet<_>>()
-            })
+            .map(|branch| all(branch))
             .reduce(|mut acc, branch_vars| {
                 acc.retain(|v| branch_vars.contains(v));
                 acc
@@ -1603,20 +1621,18 @@ fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
         // Containers: whatever their body guarantees. A `GRAPH ?g` that emits a
         // row has always bound `?g`.
         Pattern::Graph { name, patterns } => {
-            let mut vars: HashSet<VarId> = patterns.iter().flat_map(must_bind_vars).collect();
+            let mut vars = all(patterns);
             if let crate::ir::GraphName::Var(v) = name {
                 vars.insert(*v);
             }
             vars
         }
-        Pattern::DefaultGraphSource { patterns } => {
-            patterns.iter().flat_map(must_bind_vars).collect()
-        }
-        Pattern::Service(sp) => sp.patterns.iter().flat_map(must_bind_vars).collect(),
+        Pattern::DefaultGraphSource { patterns } => all(patterns),
+        Pattern::Service(sp) => all(&sp.patterns),
         // A subquery exposes only its SELECT list, and only the members of it
         // its own body binds unconditionally.
         Pattern::Subquery(sq) => {
-            let body: HashSet<VarId> = sq.patterns.iter().flat_map(must_bind_vars).collect();
+            let body = all(&sq.patterns);
             sq.select
                 .iter()
                 .copied()
@@ -1637,7 +1653,7 @@ fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
             if let Ref::Var(v) = annotation {
                 vars.insert(*v);
             }
-            vars.extend(body.iter().flat_map(must_bind_vars));
+            vars.extend(all(body));
             vars
         }
         // A constant table guarantees only the columns with no UNDEF cell. Both
@@ -1655,18 +1671,14 @@ fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
         // and `empty_path_result` are both this). Cypher's WITH-pipeline
         // binders never emit `Unbound`, so this narrowing cannot reach the
         // `self_produced` set [`subquery_correlation_vars`] builds for them.
-        Pattern::Values { vars, rows } => vars
-            .iter()
-            .enumerate()
-            .filter(|(col, _)| {
-                rows.iter().all(|row| {
-                    row.get(*col)
-                        .is_some_and(|cell| !matches!(cell, crate::binding::Binding::Unbound))
-                })
-            })
-            .map(|(_, v)| *v)
-            .collect(),
-        // Triples, property paths, BIND/UNWIND, search adapters: every solution
+        Pattern::Values { vars, rows } => {
+            crate::ir::pattern::values_bound_in_every_row(vars, rows).collect()
+        }
+        Pattern::Bind { var, .. } => match bind_targets {
+            BindTargets::Bound => HashSet::from([*var]),
+            BindTargets::MayBeUnbound => HashSet::new(),
+        },
+        // Triples, property paths, UNWIND, search adapters: every solution
         // they emit carries their produced vars.
         other => other.produced_vars().into_iter().collect(),
     }
@@ -1709,7 +1721,7 @@ fn left_join_introduced_vars(pattern: &Pattern, out: &mut HashSet<VarId>) {
             }
         }
         Pattern::Subquery(sq) => {
-            let body = must_bind_vars(pattern);
+            let body = must_bind_vars(pattern, BindTargets::Bound);
             out.extend(sq.select.iter().copied().filter(|v| !body.contains(v)));
         }
         Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
@@ -1756,7 +1768,7 @@ fn left_join_introduced_vars(pattern: &Pattern, out: &mut HashSet<VarId>) {
 fn values_optional_barrier_indices(
     values_vars: &[VarId],
     preceding: &[Pattern],
-    initial_bound_vars: &HashSet<VarId>,
+    seed_bound_in_every_row: &HashSet<VarId>,
 ) -> Vec<usize> {
     let mut blockers = Vec::new();
     if values_vars.is_empty() {
@@ -1764,7 +1776,7 @@ fn values_optional_barrier_indices(
     }
     let wanted: HashSet<VarId> = values_vars.iter().copied().collect();
     // Variables bound REQUIREDLY before the pattern under test.
-    let mut required_before: HashSet<VarId> = initial_bound_vars.clone();
+    let mut required_before: HashSet<VarId> = seed_bound_in_every_row.clone();
     for (i, p) in preceding.iter().enumerate() {
         let mut introduced = HashSet::new();
         left_join_introduced_vars(p, &mut introduced);
@@ -1774,7 +1786,7 @@ fn values_optional_barrier_indices(
         {
             blockers.push(i);
         }
-        required_before.extend(must_bind_vars(p));
+        required_before.extend(must_bind_vars(p, BindTargets::Bound));
     }
     blockers
 }
@@ -1817,7 +1829,7 @@ fn values_optional_barrier_indices(
 /// preceding binding-producing patterns.
 fn left_join_order_barriers(
     patterns: &[Pattern],
-    initial_bound_vars: &HashSet<VarId>,
+    seed_bound_in_every_row: &HashSet<VarId>,
 ) -> Vec<Vec<usize>> {
     let mut barriers: Vec<Vec<usize>> = vec![Vec::new(); patterns.len()];
     if !patterns.iter().any(|p| matches!(p, Pattern::Optional(_))) {
@@ -1827,7 +1839,7 @@ fn left_join_order_barriers(
         .iter()
         .map(|p| p.referenced_vars().into_iter().collect())
         .collect();
-    let mut certain_before: HashSet<VarId> = initial_bound_vars.clone();
+    let mut certain_before: HashSet<VarId> = seed_bound_in_every_row.clone();
     for (i, earlier) in patterns.iter().enumerate() {
         if !matches!(
             earlier,
@@ -1846,7 +1858,7 @@ fn left_join_order_barriers(
                 }
             }
         }
-        certain_before.extend(must_bind_vars(earlier));
+        certain_before.extend(must_bind_vars(earlier, BindTargets::Bound));
     }
     barriers
 }
@@ -1890,11 +1902,45 @@ pub fn reorder_patterns(
     stats: Option<&StatsView>,
     initial_bound_vars: &HashSet<VarId>,
 ) -> Vec<Pattern> {
+    reorder_patterns_with_seed(
+        patterns,
+        stats,
+        &SeedVars::all_bound(initial_bound_vars.clone()),
+    )
+}
+
+/// The variables a seed operator hands to the group planned on top of it.
+#[derive(Clone, Debug, Default)]
+pub struct SeedVars {
+    /// Every variable of the seed's schema: available to join on and to cost.
+    pub schema: HashSet<VarId>,
+    /// The ones bound on every row. Any other may be unbound on some rows, and
+    /// a pattern of the group can still bind it, so it settles nothing: not a
+    /// FILTER or BIND reading it, and not a left-join barrier.
+    pub bound_in_every_row: HashSet<VarId>,
+}
+
+impl SeedVars {
+    /// A seed that binds every variable of `schema` on every row.
+    pub fn all_bound(schema: HashSet<VarId>) -> Self {
+        Self {
+            bound_in_every_row: schema.clone(),
+            schema,
+        }
+    }
+}
+
+/// [`reorder_patterns`] for a group planned on top of `seed`.
+pub fn reorder_patterns_with_seed(
+    patterns: &[Pattern],
+    stats: Option<&StatsView>,
+    seed: &SeedVars,
+) -> Vec<Pattern> {
     if patterns.len() <= 1 {
         return patterns.to_vec();
     }
 
-    let mut bound_vars = initial_bound_vars.clone();
+    let mut bound_vars = seed.schema.clone();
 
     // PIPELINE outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
     // producers). A pattern consuming one of these must be placed AFTER the
@@ -1950,14 +1996,15 @@ pub fn reorder_patterns(
     let mut seed_anchor_vars: HashSet<VarId> = subquery_output_vars.clone();
     for (i, p) in patterns.iter().enumerate() {
         if let Pattern::Values { vars, .. } = p {
-            if values_optional_barrier_indices(vars, &patterns[..i], initial_bound_vars).is_empty()
+            if values_optional_barrier_indices(vars, &patterns[..i], &seed.bound_in_every_row)
+                .is_empty()
             {
                 seed_anchor_vars.extend(vars.iter().copied());
             }
         }
     }
 
-    let barriers = left_join_order_barriers(patterns, initial_bound_vars);
+    let barriers = left_join_order_barriers(patterns, &seed.bound_in_every_row);
 
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
@@ -2032,7 +2079,7 @@ pub fn reorder_patterns(
         // them.
         if let Pattern::Values { vars, .. } = pattern {
             let blockers =
-                values_optional_barrier_indices(vars, &patterns[..i], initial_bound_vars);
+                values_optional_barrier_indices(vars, &patterns[..i], &seed.bound_in_every_row);
             if !blockers.is_empty() {
                 deferred.push(DeferredPattern {
                     orig_index: i,
@@ -2177,7 +2224,7 @@ pub fn reorder_patterns(
             }
         }
     }
-    attach_filter_binders(&mut deferred, patterns, initial_bound_vars);
+    attach_filter_binders(&mut deferred, patterns, &seed.bound_in_every_row);
 
     let mut result: Vec<Pattern> = Vec::with_capacity(patterns.len());
     // Original indices already emitted into `result`, for the positional
@@ -2947,7 +2994,10 @@ fn subquery_correlation_vars(
     // but was flat (no Graph/Service recursion) and treated UNION as wholly
     // absent rather than intersecting its branches.
     let self_produced: HashSet<VarId> = if sq.limit.is_none() && sq.offset.is_none() {
-        sq.patterns.iter().flat_map(must_bind_vars).collect()
+        sq.patterns
+            .iter()
+            .flat_map(|p| must_bind_vars(p, BindTargets::Bound))
+            .collect()
     } else {
         HashSet::new()
     };
@@ -3097,6 +3147,60 @@ mod tests {
         ];
         let barriers = left_join_order_barriers(&patterns, &HashSet::new());
         assert_eq!(barriers, vec![vec![], vec![0], vec![1]]);
+    }
+
+    /// A seed variable unbound on some rows settles nothing: the OPTIONAL can
+    /// still introduce `?org` on those rows, so the triple reading it stays
+    /// behind the OPTIONAL. Only a seed binding `?org` on every row frees it.
+    #[test]
+    fn left_join_barrier_ignores_a_seed_var_unbound_on_some_rows() {
+        let (p, y, org) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![optional(p, "worksFor", org), triple(y, "worksFor", org)];
+        let schema: HashSet<VarId> = [p, org].into_iter().collect();
+
+        let partly_bound = SeedVars {
+            schema: schema.clone(),
+            bound_in_every_row: [p].into_iter().collect(),
+        };
+        let reordered = reorder_patterns_with_seed(&patterns, None, &partly_bound);
+        assert!(
+            matches!(reordered.first(), Some(Pattern::Optional(_))),
+            "{reordered:?}"
+        );
+
+        let barriers = left_join_order_barriers(&patterns, &schema);
+        assert_eq!(barriers, vec![Vec::<usize>::new(), vec![]]);
+    }
+
+    /// #1690 under a seed: the trailing VALUES stays behind the OPTIONAL that
+    /// introduces `?f` when the seed leaves `?f` unbound on some rows.
+    #[test]
+    fn values_barrier_ignores_a_seed_var_unbound_on_some_rows() {
+        let (s, n, f) = (VarId(0), VarId(1), VarId(2));
+        let values = Pattern::Values {
+            vars: vec![f],
+            rows: vec![vec![crate::binding::Binding::iri("ex:alice")]],
+        };
+        let patterns = vec![triple(s, "name", n), optional(s, "friend", f), values];
+        let is_values = |p: &Pattern| matches!(p, Pattern::Values { .. });
+        let is_optional = |p: &Pattern| matches!(p, Pattern::Optional(_));
+
+        let partly_bound = SeedVars {
+            schema: [f].into_iter().collect(),
+            bound_in_every_row: HashSet::new(),
+        };
+        let reordered = reorder_patterns_with_seed(&patterns, None, &partly_bound);
+        assert!(
+            reordered.iter().position(is_optional) < reordered.iter().position(is_values),
+            "{reordered:?}"
+        );
+
+        let all_bound = SeedVars::all_bound([f].into_iter().collect());
+        let reordered = reorder_patterns_with_seed(&patterns, None, &all_bound);
+        assert!(
+            reordered.iter().position(is_values) < reordered.iter().position(is_optional),
+            "with `?f` bound on every row the VALUES may seed: {reordered:?}"
+        );
     }
 
     /// #1925: two OPTIONALs sharing `?f` keep their written order, even though

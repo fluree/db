@@ -18,7 +18,10 @@ use fluree_db_core::{
     RuntimeSmallDicts, Sid,
 };
 
-use crate::binary_scan::{encode_bound_object_prefilter, index_type_to_sort_order};
+use crate::binary_scan::{
+    encode_bound_object_prefilter, index_type_to_sort_order, object_slice_filters,
+    untyped_numeric_slices,
+};
 
 /// Result of translating overlay flakes into V3 `OverlayOp`s.
 ///
@@ -467,6 +470,7 @@ fn binary_range_eq_v3(
             }
         }
     }
+    let mut object_slices = Vec::new();
     if let Some(o_val) = &match_val.o {
         match o_val {
             fluree_db_core::FlakeValue::Ref(sid) => {
@@ -521,18 +525,30 @@ fn binary_range_eq_v3(
                 filter.o_type = Some(OType::RDF_JSON.as_u16());
                 filter.o_key = Some(str_id as u64);
             }
+            // A bare number matches every numeric datatype holding an equal
+            // value: seek each, as `BinaryScanOperator` does. A non-finite
+            // value stays unnarrowed under the row-level equality check.
+            fluree_db_core::FlakeValue::Long(_) | fluree_db_core::FlakeValue::Double(_)
+                if match_val.dt.is_none() =>
+            {
+                let arena_is_current =
+                    !opts.history_mode && opts.to_t.is_none_or(|t| t >= store.max_t());
+                if let Some(slices) =
+                    untyped_numeric_slices(store, g_id, filter.p_id, None, o_val, arena_is_current)
+                {
+                    object_slices = slices;
+                }
+            }
             _ => {
-                // Use the same bound-object prefilter semantics as BinaryScanOperator:
-                // preserve untyped numeric family matching by not forcing an exact o_type.
-                if let Ok(prefilter) = encode_bound_object_prefilter(
+                if let Ok((o_type, o_key)) = encode_bound_object_prefilter(
                     o_val,
                     match_val.dt.as_ref(),
                     None,
                     store,
                     Some(dict_novelty),
                 ) {
-                    filter.o_type = prefilter.o_type.map(OType::as_u16);
-                    filter.o_key = Some(prefilter.o_key);
+                    filter.o_type = Some(o_type.as_u16());
+                    filter.o_key = Some(o_key);
                 }
             }
         }
@@ -567,55 +583,64 @@ fn binary_range_eq_v3(
     // Create cursor: use range-narrowed scan when any filter field is bound,
     // matching the pattern in BinaryScanOperator::open. For novelty-only subjects
     // this yields an empty leaf_range, so the cursor drains overlay ops directly
-    // with zero leaf I/O.
+    // with zero leaf I/O. A bare number's slices each get a cursor, drained in
+    // turn.
     let projection = ColumnProjection::all();
-    let use_range = filter.s_id.is_some()
-        || filter.p_id.is_some()
-        || filter.o_type.is_some()
-        || filter.o_key.is_some();
-
-    let mut range_keys: Option<(RunRecordV2, RunRecordV2)> = None;
-    let mut cursor = if use_range {
-        let min_key = RunRecordV2 {
-            s_id: SubjectId(filter.s_id.unwrap_or(0)),
-            o_key: filter.o_key.unwrap_or(0),
-            p_id: filter.p_id.unwrap_or(0),
-            t: 0,
-            o_i: 0,
-            o_type: filter.o_type.unwrap_or(0),
-            g_id,
-        };
-        let max_key = RunRecordV2 {
-            s_id: SubjectId(filter.s_id.unwrap_or(u64::MAX)),
-            o_key: filter.o_key.unwrap_or(u64::MAX),
-            p_id: filter.p_id.unwrap_or(u32::MAX),
-            t: u32::MAX,
-            o_i: u32::MAX,
-            o_type: filter.o_type.unwrap_or(u16::MAX),
-            g_id,
-        };
-        let cursor = BinaryCursor::new(
-            Arc::clone(store),
-            order,
-            branch,
-            &min_key,
-            &max_key,
-            filter,
-            projection,
-        );
-        range_keys = Some((min_key, max_key));
-        cursor
-    } else {
-        BinaryCursor::scan_all(Arc::clone(store), order, branch, filter, projection)
-    };
-
-    if let Some(t) = tracker {
-        cursor = cursor.with_tracker(t.clone());
-    }
-
-    // Apply overlay.
     let effective_to_t = opts.to_t.unwrap_or_else(|| store.max_t());
-    cursor.set_to_t(effective_to_t);
+    let mut cursors: Vec<(BinaryCursor, Option<(RunRecordV2, RunRecordV2)>)> =
+        object_slice_filters(order, filter, &object_slices)
+            .into_iter()
+            .map(|filter| {
+                let use_range = filter.s_id.is_some()
+                    || filter.p_id.is_some()
+                    || filter.o_type.is_some()
+                    || filter.o_key.is_some();
+                let (mut cursor, range_keys) = if use_range {
+                    let min_key = RunRecordV2 {
+                        s_id: SubjectId(filter.s_id.unwrap_or(0)),
+                        o_key: filter.o_key.unwrap_or(0),
+                        p_id: filter.p_id.unwrap_or(0),
+                        t: 0,
+                        o_i: 0,
+                        o_type: filter.o_type.unwrap_or(0),
+                        g_id,
+                    };
+                    let max_key = RunRecordV2 {
+                        s_id: SubjectId(filter.s_id.unwrap_or(u64::MAX)),
+                        o_key: filter.o_key.unwrap_or(u64::MAX),
+                        p_id: filter.p_id.unwrap_or(u32::MAX),
+                        t: u32::MAX,
+                        o_i: u32::MAX,
+                        o_type: filter.o_type.unwrap_or(u16::MAX),
+                        g_id,
+                    };
+                    let cursor = BinaryCursor::new(
+                        Arc::clone(store),
+                        order,
+                        Arc::clone(&branch),
+                        &min_key,
+                        &max_key,
+                        filter,
+                        projection,
+                    );
+                    (cursor, Some((min_key, max_key)))
+                } else {
+                    let cursor = BinaryCursor::scan_all(
+                        Arc::clone(store),
+                        order,
+                        Arc::clone(&branch),
+                        filter,
+                        projection,
+                    );
+                    (cursor, None)
+                };
+                if let Some(t) = tracker {
+                    cursor = cursor.with_tracker(t.clone());
+                }
+                cursor.set_to_t(effective_to_t);
+                (cursor, range_keys)
+            })
+            .collect();
 
     // Overlay translation. Unfiltered translations are served from the
     // cross-call LRU when the overlay reports a content version (raw
@@ -697,17 +722,19 @@ fn binary_range_eq_v3(
         // and carrying them costs an O(overlay) merge walk per call while
         // defeating leaflet pre-skips (same pattern as
         // `BinaryScanOperator::open`).
-        let (start, end) = match &range_keys {
-            Some((min_key, max_key)) => fluree_db_binary_index::overlay_window_for_range(
-                &overlay_ops,
-                min_key,
-                max_key,
-                order,
-            ),
-            None => (0, overlay_ops.len()),
-        };
-        if start < end {
-            cursor.set_overlay_ops_window(overlay_ops, start, end);
+        for (cursor, range_keys) in &mut cursors {
+            let (start, end) = match range_keys {
+                Some((min_key, max_key)) => fluree_db_binary_index::overlay_window_for_range(
+                    &overlay_ops,
+                    min_key,
+                    max_key,
+                    order,
+                ),
+                None => (0, overlay_ops.len()),
+            };
+            if start < end {
+                cursor.set_overlay_ops_window(Arc::clone(&overlay_ops), start, end);
+            }
         }
     }
 
@@ -737,7 +764,14 @@ fn binary_range_eq_v3(
     let mut flakes = Vec::new();
     let mut skipped = 0usize;
 
-    while let Some(batch) = cursor.next_batch()? {
+    // Drain each slice's cursor in turn.
+    let mut cursors = cursors.into_iter().map(|(cursor, _)| cursor);
+    let mut cursor = cursors.next();
+    while let Some(current) = cursor.as_mut() {
+        let Some(batch) = current.next_batch()? else {
+            cursor = cursors.next();
+            continue;
+        };
         for i in 0..batch.row_count {
             let p_id = batch.p_id.get_or(i, 0);
 

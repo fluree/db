@@ -926,8 +926,7 @@ impl SubqueryOperator {
             Box::new(EmptyOperator::new())
         } else {
             let seed_schema: Arc<[VarId]> = Arc::from(self.join_keys.clone().into_boxed_slice());
-            let seed_row = vec![Binding::Unbound; self.join_keys.len()];
-            Box::new(SeedOperator::from_row(seed_schema, seed_row))
+            Box::new(SeedOperator::placeholder(seed_schema))
         };
 
         self.build_inner_plan(seed)

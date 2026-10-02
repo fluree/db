@@ -78,8 +78,9 @@ Use a top-level `graph` key to scope the update to a named graph **as the defaul
 ```
 
 This is the JSON-LD UPDATE analog of SPARQL UPDATE `WITH <iri>`:
-- WHERE patterns are evaluated against the named graph
+- WHERE patterns are evaluated against the named graph (unless `from` is also given)
 - DELETE/INSERT templates without an explicit graph are written to that named graph
+- A graph that doesn't exist reads as empty, so the WHERE matches nothing; it never falls back to the ledger's default graph
 
 ### Writing templates to specific graphs
 
@@ -107,6 +108,7 @@ There are two ways to target graphs in `insert` / `delete` templates:
 
 Notes:
 - `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`)
+- The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in a top-level `graph` and in `from`: the update reads and writes the default graph and never creates a named graph called by the address. A per-node `@graph` or a `["graph", …]` template resolves the address like any other graph IRI. `urn:fluree:mydb:main#config` is the config graph, not the address.
 - Named-graph reads are available after indexing completes (see `docs/query/datasets.md`)
 
 ## Dataset scoping for WHERE (`from` / `fromNamed`)
@@ -130,6 +132,7 @@ Notes:
   - a string graph IRI (shorthand for `{"graph": "<iri>"}`)
   - an object with `{"graph": "<iri>"}` (or `{"graph": ["<iri1>", "<iri2>"]}`)
   - an array of graph IRIs/selectors (multiple graphs are evaluated as a merged default graph)
+- A `from` graph that doesn't exist contributes nothing, so a lone unknown `from` graph gives the `where` an empty default graph.
 - If your `insert` / `delete` templates write into the same graph as the top-level `graph`, you can omit per-template graph selection. The top-level `graph` becomes the default target for templates that don't specify `@graph` (or `["graph", ...]` sugar).
 - If you want to write to **multiple** graphs in one update, keep a top-level `graph` as the default (optional) and use per-template `["graph", ...]` for the exceptions.
 

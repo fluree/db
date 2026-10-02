@@ -3966,3 +3966,285 @@ async fn jsonld_blocks_route_like_their_sparql_twins() {
 
     assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
 }
+
+// ---------------------------------------------------------------------------
+// The capability probe and IRIs that name no source
+// ---------------------------------------------------------------------------
+
+/// `docs:main`: one default-graph triple, one in `<urn:ex:doc:1>`, one commit.
+async fn docs_ledger(fluree: &Fluree) {
+    let ledger = fluree
+        .create_ledger("docs:main")
+        .await
+        .expect("docs ledger");
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/> .
+               ex:d ex:title "default graph title" .
+               GRAPH <urn:ex:doc:1> { ex:ep1 ex:title "episode one" . }"#,
+        )
+        .execute()
+        .await
+        .expect("seed docs:main");
+}
+
+/// The outcomes `SITE` stamped since event `from`.
+fn lane_outcomes(store: &span_capture::SpanStore, from: usize) -> Vec<String> {
+    store.find_events("fast-path outcome")[from..]
+        .iter()
+        .filter(|e| e.fields.get("site").map(String::as_str) == Some(SITE))
+        .filter_map(|e| e.fields.get("outcome").cloned())
+        .collect()
+}
+
+/// A GRAPH IRI that addresses a ledger's own graph is not a graph-source id,
+/// and the lane's capability probe must decline it rather than fail the query.
+///
+/// The probe sees every constant `GRAPH <iri>` that names a dataset member,
+/// and `ledger#graph` members (any spelling, `#txn-meta` included) do not
+/// parse as source ids. v4.2.2 turned that parse failure into a 400 ("Invalid
+/// ID format ... branch cannot contain '#'"), which broke the form
+/// `docs/query/datasets.md` documents. Each case also checks that the block
+/// reached the lane's gate, so it keeps exercising the probe.
+#[tokio::test]
+async fn a_ledgers_own_graphs_are_not_sources_to_the_lane() {
+    assert!(
+        std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+        "unset FLUREE_DISABLE_QUERY_FAST_PATHS: the lane would never probe"
+    );
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let fluree = FlureeBuilder::memory().build_memory();
+    docs_ledger(&fluree).await;
+
+    let ep1 = "e=http://example.org/ep1 t=episode one";
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "a named graph as ledger#graph",
+            "SELECT ?e ?t FROM NAMED <docs:main#urn:ex:doc:1> \
+             WHERE { GRAPH <docs:main#urn:ex:doc:1> { ?e ex:title ?t } }",
+            &[ep1],
+        ),
+        (
+            "a named graph as urn:fluree:ledger#graph",
+            "SELECT ?e ?t FROM NAMED <urn:fluree:docs:main#urn:ex:doc:1> \
+             WHERE { GRAPH <urn:fluree:docs:main#urn:ex:doc:1> { ?e ex:title ?t } }",
+            &[ep1],
+        ),
+        (
+            "txn-meta beside the default graph (datasets.md, Mixed Patterns)",
+            "SELECT ?title ?t FROM <docs:main> FROM NAMED <docs:main#txn-meta> \
+             WHERE { ?d ex:title ?title . \
+                     GRAPH <docs:main#txn-meta> { ?c <https://ns.flur.ee/db#t> ?t } }",
+            &["t=1 title=default graph title"],
+        ),
+        (
+            "a well-formed id that is not a source is looked up and declined",
+            "SELECT ?d ?t FROM NAMED <docs:main> \
+             WHERE { GRAPH <docs:main> { ?d ex:title ?t } }",
+            &["d=http://example.org/d t=default graph title"],
+        ),
+    ];
+
+    let (store, tracing_guard) = span_capture::init_test_tracing();
+    let mut failures: Vec<String> = Vec::new();
+    for (name, body, expected) in cases {
+        let before = store.find_events("fast-path outcome").len();
+        match fluree
+            .query_from()
+            .sparql(&format!("{PREFIX}{body}"))
+            .execute_formatted()
+            .await
+        {
+            Ok(v) if rows_of(&v) == *expected => {}
+            Ok(v) => failures.push(format!("{name}: rows {:?}", rows_of(&v))),
+            Err(e) => failures.push(format!("{name}: query failed: {e}")),
+        }
+        let outcomes = lane_outcomes(&store, before);
+        if outcomes.is_empty() || outcomes.iter().any(|o| o == "proceed") {
+            failures.push(format!(
+                "{name}: expected `{SITE}` declined, got {outcomes:?}"
+            ));
+        }
+    }
+
+    // The JSON-LD twin of the first case reaches the same probe.
+    let before = store.find_events("fast-path outcome").len();
+    let q = json!({
+        "fromNamed": ["docs:main#urn:ex:doc:1"],
+        "select": ["?e", "?t"],
+        "where": [[
+            "graph",
+            "docs:main#urn:ex:doc:1",
+            {"@id": "?e", "http://example.org/title": "?t"}
+        ]],
+    });
+    match fluree.query_from().jsonld(&q).execute_formatted().await {
+        Ok(v) if jsonld_rows_of(&v, &["?e", "?t"]) == [ep1] => {}
+        Ok(v) => failures.push(format!("json-ld fromNamed: rows {v}")),
+        Err(e) => failures.push(format!("json-ld fromNamed: query failed: {e}")),
+    }
+    if lane_outcomes(&store, before).is_empty() {
+        failures.push("json-ld fromNamed: the block never reached the lane".to_string());
+    }
+
+    // No dataset: a GRAPH IRI the ledger does not hold is probed too, and
+    // matches nothing.
+    let before = store.find_events("fast-path outcome").len();
+    match fluree
+        .graph("docs:main")
+        .query()
+        .with_r2rml()
+        .sparql(&format!(
+            "{PREFIX}SELECT ?e ?t WHERE {{ GRAPH <urn:ex:doc:404> {{ ?e ex:title ?t }} }}"
+        ))
+        .execute_formatted()
+        .await
+    {
+        Ok(v) if rows_of(&v).is_empty() => {}
+        Ok(v) => failures.push(format!("graph(): rows {:?}", rows_of(&v))),
+        Err(e) => failures.push(format!("graph(): query failed: {e}")),
+    }
+    if lane_outcomes(&store, before).is_empty() {
+        failures.push("graph(): the block never reached the lane".to_string());
+    }
+    drop(tracing_guard);
+
+    // An id that names nothing still fails at dataset resolution, as before.
+    let err = fluree
+        .query_from()
+        .sparql("SELECT ?s FROM NAMED <nosuch:main> WHERE { GRAPH <nosuch:main> { ?s ?p ?o } }")
+        .execute_formatted()
+        .await
+        .expect_err("an unknown source must not resolve");
+    if !err.is_not_found() {
+        failures.push(format!("unknown source: expected not-found, got {err}"));
+    }
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A nameservice whose graph-source lookups fail, as an unreachable backend's
+/// would. Every other read goes to the real nameservice.
+#[derive(Debug)]
+struct SourceLookupsFail(std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher>);
+
+const INJECTED: &str = "injected graph-source lookup failure";
+
+mod source_lookups_fail {
+    use super::SourceLookupsFail;
+    use async_trait::async_trait;
+    use fluree_db_nameservice::{
+        ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord, LedgerHeads,
+        NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup,
+        RefValue, Result, StatusLookup, StatusValue,
+    };
+
+    #[async_trait]
+    impl GraphSourceLookup for SourceLookupsFail {
+        async fn lookup_graph_source(&self, _: &str) -> Result<Option<GraphSourceRecord>> {
+            Err(NameServiceError::storage(super::INJECTED))
+        }
+        async fn lookup_any(&self, id: &str) -> Result<NsLookupResult> {
+            self.0.lookup_any(id).await
+        }
+        async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+            self.0.all_graph_source_records().await
+        }
+    }
+
+    #[async_trait]
+    impl RefLookup for SourceLookupsFail {
+        async fn get_ref(&self, id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+            self.0.get_ref(id, kind).await
+        }
+    }
+
+    #[async_trait]
+    impl StatusLookup for SourceLookupsFail {
+        async fn get_status(&self, id: &str) -> Result<Option<StatusValue>> {
+            self.0.get_status(id).await
+        }
+    }
+
+    #[async_trait]
+    impl ConfigLookup for SourceLookupsFail {
+        async fn get_config(&self, id: &str) -> Result<Option<ConfigValue>> {
+            self.0.get_config(id).await
+        }
+    }
+
+    #[async_trait]
+    impl NameServiceLookup for SourceLookupsFail {
+        async fn lookup(&self, id: &str) -> Result<Option<NsRecord>> {
+            self.0.lookup(id).await
+        }
+        async fn all_records(&self) -> Result<Vec<NsRecord>> {
+            self.0.all_records().await
+        }
+        async fn list_branches(&self, name: &str) -> Result<Vec<NsRecord>> {
+            self.0.list_branches(name).await
+        }
+        async fn heads(&self, id: &str) -> Result<Option<LedgerHeads>> {
+            self.0.heads(id).await
+        }
+    }
+}
+
+/// Declining an IRI that names no source is not swallowing a failure: when
+/// the nameservice cannot answer for a well-formed id, the probe fails the
+/// query rather than quietly plan a possible SQL source as a native graph. A
+/// ledger's own graph needs no lookup, and with the lane off the same query
+/// answers, which pins the failure on the probe.
+#[tokio::test]
+async fn a_failed_source_lookup_still_fails_the_query() {
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let fluree = FlureeBuilder::memory().build_memory();
+    docs_ledger(&fluree).await;
+    let real = fluree
+        .nameservice_mode()
+        .publisher_arc()
+        .expect("read-write nameservice");
+    let down = Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        fluree_db_api::NameServiceMode::ReadOnly(std::sync::Arc::new(SourceLookupsFail(real))),
+    );
+
+    let well_formed = format!(
+        "{PREFIX}SELECT ?d ?t FROM NAMED <docs:main> WHERE {{ GRAPH <docs:main> {{ ?d ex:title ?t }} }}"
+    );
+    let lane_on = down
+        .query_from()
+        .sparql(&well_formed)
+        .execute_formatted()
+        .await;
+    let own = format!(
+        "{PREFIX}SELECT ?e ?t FROM NAMED <docs:main#urn:ex:doc:1> \
+         WHERE {{ GRAPH <docs:main#urn:ex:doc:1> {{ ?e ex:title ?t }} }}"
+    );
+    let own_graph = down.query_from().sparql(&own).execute_formatted().await;
+    set_fast_paths_disabled(true);
+    let lane_off = down
+        .query_from()
+        .sparql(&well_formed)
+        .execute_formatted()
+        .await;
+    set_fast_paths_disabled(false);
+
+    let err = lane_on.expect_err("a failed lookup must fail the query");
+    assert!(
+        err.to_string().contains(INJECTED),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        rows_of(&own_graph.expect("a ledger's own graph needs no lookup")),
+        ["e=http://example.org/ep1 t=episode one"]
+    );
+    assert_eq!(
+        rows_of(&lane_off.expect("with the lane off nothing asks for the source")),
+        ["d=http://example.org/d t=default graph title"]
+    );
+}
