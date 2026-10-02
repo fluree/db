@@ -204,6 +204,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     edge,
                     annotation,
                     body,
+                    ..
                 } => {
                     let triple = out.push_pattern(edge.clone(), None);
                     out.push_reification(triple, annotation.clone());

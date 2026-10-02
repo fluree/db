@@ -397,6 +397,39 @@ pub async fn prepare_execution_with_config(
                 .collect()
         }
 
+        // Annotation edges become links at planning, which encodes no IRIs;
+        // encoding theirs here lets a constant edge narrow the link scan.
+        fn encode_annotation_edges(
+            snapshot: &LedgerSnapshot,
+            patterns: &[Pattern],
+        ) -> Vec<Pattern> {
+            patterns
+                .iter()
+                .map(|p| match p {
+                    Pattern::EdgeAnnotation {
+                        edge,
+                        annotation,
+                        body,
+                        term,
+                    } => Pattern::EdgeAnnotation {
+                        edge: TriplePattern {
+                            s: encode_ref(snapshot, &edge.s),
+                            p: encode_ref(snapshot, &edge.p),
+                            o: encode_term(snapshot, &edge.o),
+                            dtc: edge.dtc.clone(),
+                        },
+                        annotation: encode_ref(snapshot, annotation),
+                        body: encode_annotation_edges(snapshot, body),
+                        term: *term,
+                    },
+                    Pattern::Service(_) => p.clone(),
+                    other => other
+                        .clone()
+                        .map_subpatterns(&mut |xs| encode_annotation_edges(snapshot, &xs)),
+                })
+                .collect()
+        }
+
         let rewritten_query = {
             let _rewrite_span = tracing::debug_span!(
                 "pattern_rewrite",
@@ -410,6 +443,12 @@ pub async fn prepare_execution_with_config(
             } else {
                 query.query.patterns.clone()
             };
+            let patterns_for_rewrite =
+                if super::where_plan::pattern_tree_has_edge_annotation(&patterns_for_rewrite) {
+                    encode_annotation_edges(db.snapshot, &patterns_for_rewrite)
+                } else {
+                    patterns_for_rewrite
+                };
             let (rewritten_patterns, _diag) = rewrite_query_patterns(
                 &patterns_for_rewrite,
                 hierarchy.clone(),

@@ -8,7 +8,7 @@ use crate::format::iri::IriCompactor;
 use crate::query::helpers::{parse_jsonld_query, parse_sparql_to_ir};
 use fluree_db_core::{is_rdf_type, StatsView};
 use fluree_db_query::{
-    expand_edge_annotation_patterns, explain_execution_hints, parse_query, ExplainPlan,
+    expand_edge_annotation_patterns_for, explain_execution_hints, parse_query, ExplainPlan,
     OptimizationStatus, Pattern, Query, Ref, Term, TriplePattern, VarId, VarRegistry,
 };
 use serde_json::{json, Map, Value as JsonValue};
@@ -516,12 +516,11 @@ fn explain_from_parsed(
                 Pattern::Subquery(sq) => {
                     collect_triples_in_order(out, &sq.patterns, normalize_ref, normalize_term);
                 }
-                // The `DefaultGraphSource` wrapper is introduced by
-                // `expand_edge_annotation_patterns` to keep `f:reifies*`
-                // lookups per-source-correlated in multi-graph default
-                // contexts. For explain purposes the triples inside it
-                // are the ones the optimizer sees, so recurse like
-                // `Graph` does.
+                // The `DefaultGraphSource` wrapper is introduced by the
+                // edge-annotation expansion to keep a chain per-source-
+                // correlated under a default-graph union. For explain
+                // purposes the triples inside it are the ones the optimizer
+                // sees, so recurse like `Graph` does.
                 Pattern::DefaultGraphSource { patterns, .. } => {
                     collect_triples_in_order(out, patterns, normalize_ref, normalize_term);
                 }
@@ -532,12 +531,12 @@ fn explain_from_parsed(
         }
     }
 
-    // Expand edge-annotation IR into the same triple chain the
-    // executor uses (`Pattern::EdgeAnnotation` → base edge + 3
-    // `f:reifies*` lookups + body). Without this, edge-annotation queries appear as empty
-    // in `/explain` output because `collect_triples_in_order` doesn't
-    // descend into those container patterns.
-    let expanded_patterns = expand_edge_annotation_patterns(&parsed.patterns);
+    // Expand edge-annotation IR into the same chain the executor uses
+    // (`Pattern::EdgeAnnotation` → body + the reifier's link + base edge).
+    // Without this, edge-annotation queries appear as empty in `/explain`
+    // output because `collect_triples_in_order` doesn't descend into those
+    // container patterns. A single ledger's default graph is one graph.
+    let expanded_patterns = expand_edge_annotation_patterns_for(&parsed.patterns, false);
 
     let mut triples_in_order = Vec::new();
     collect_triples_in_order(

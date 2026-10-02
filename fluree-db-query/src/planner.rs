@@ -1815,11 +1815,13 @@ pub(crate) fn must_bind_vars(pattern: &Pattern, bind_targets: BindTargets) -> Ha
             edge,
             annotation,
             body,
+            term,
         } => {
             let mut vars: HashSet<VarId> = edge.produced_vars().into_iter().collect();
             if let Ref::Var(v) = annotation {
                 vars.insert(*v);
             }
+            vars.insert(*term);
             vars.extend(all(body));
             vars
         }

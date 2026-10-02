@@ -450,6 +450,7 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 edge: lowered_edge,
                 annotation: lowered_annotation,
                 body: lowered_body,
+                term: crate::ir::term_components::fresh_term_var(vars),
             }])
         }
         UnresolvedPattern::AnnotationTarget {

@@ -503,8 +503,7 @@ pub enum Pattern {
     /// # Execution
     ///
     /// Planning expands this variant into the base edge plus the
-    /// corresponding `f:reifies*` lookup chain before operator-tree
-    /// assembly.
+    /// annotation's `rdf:reifies` link to it before operator-tree assembly.
     EdgeAnnotation {
         /// The annotated edge (base triple).
         edge: TriplePattern,
@@ -512,6 +511,9 @@ pub enum Pattern {
         annotation: Ref,
         /// Patterns about the annotation subject.
         body: Vec<Pattern>,
+        /// The variable the link binds to the edge's triple term, reserved
+        /// at lowering because planning cannot mint one.
+        term: VarId,
     },
 }
 
@@ -580,10 +582,12 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
+                term,
             } => Pattern::EdgeAnnotation {
                 edge,
                 annotation,
                 body: f(body),
+                term,
             },
             Pattern::DefaultGraphSource { patterns } => Pattern::DefaultGraphSource {
                 patterns: f(patterns),
@@ -687,11 +691,13 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
+                term,
             } => {
                 edge.substitute_var(old, new);
                 if let Ref::Var(v) = annotation {
                     rename(v);
                 }
+                rename(term);
                 for p in body {
                     p.substitute_var(old, new);
                 }
@@ -766,11 +772,13 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
+                term,
             } => {
                 let mut vars = edge.referenced_vars();
                 if let Ref::Var(v) = annotation {
                     vars.push(*v);
                 }
+                vars.push(*term);
                 vars.extend(body.iter().flat_map(Pattern::referenced_vars));
                 vars
             }
@@ -822,11 +830,13 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
+                term,
             } => {
                 let mut vars = edge.produced_vars();
                 if let Ref::Var(v) = annotation {
                     vars.push(*v);
                 }
+                vars.push(*term);
                 vars.extend(body.iter().flat_map(Pattern::produced_vars));
                 vars
             }

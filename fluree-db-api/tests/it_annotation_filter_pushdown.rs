@@ -1,47 +1,21 @@
 //! A threshold on an annotation body must reduce scan work.
 //!
-//! `expand_edge_annotation_patterns` wraps the expanded chain in
-//! `Pattern::DefaultGraphSource`, and `collect_inner_join_block` breaks on that
-//! wrapper — it collects `Filter` alongside `Triple`, `Values` and `Bind`, and
-//! stops only on its `_` arm. A `FILTER` written beside the annotation
-//! therefore started a block with no triples in it,
-//! `extract_bounds_from_filters` returned early on an empty `object_vars`, and
-//! the threshold ran as a `FilterOperator`
-//! *above* the wrapper — after every annotation had been read and
-//! materialized. Filtering by confidence cost exactly what not filtering cost:
-//! on a 60k-edge ledger, `?c > 0.7` (18,317 rows) and `?c > 0.97` (1,148 rows)
-//! both burned 321.03 fuel, the same as no filter at all.
+//! `expand_edge_annotation_patterns` wraps an annotated edge (the base triple,
+//! the reifier's `rdf:reifies` link and its term components) in
+//! `Pattern::DefaultGraphSource`, and `collect_inner_join_block` breaks on
+//! that wrapper. A `FILTER` written beside the annotation therefore started a
+//! block with no triples in it, `extract_bounds_from_filters` returned early,
+//! and the threshold ran *above* the wrapper — after every annotation had been
+//! read. On a 60k-edge ledger `?c > 0.7` and `?c > 0.97` both burned the same
+//! fuel as no filter at all. The expansion now copies such a filter into the
+//! wrapper (pinned structurally by the `sink_*` unit tests in `where_plan.rs`).
 //!
-//! Two stamps, because a test that only checked row counts would pass against
-//! the bug it is meant to pin — the bug never changed an answer.
-//!
-//! 1. **Structural**: `--explain` must report `body-filters: 1` on the
-//!    `DefaultGraphSourceOperator`, i.e. the threshold is *inside* the chain
-//!    where the block builder can see it. Before the rewrite this is 0.
-//! 2. **Effect**: with the lane pinned to `chain`, a tighter threshold must
-//!    burn strictly less fuel than no threshold. Fuel charges rows the scan
-//!    emits and never charges rows an encoded pre-filter drops inside the
-//!    cursor (`binary_scan.rs`), so it measures the thing under test, is
-//!    bit-identical across runs, and cannot be moved by load on the build box.
-//!    Before the rewrite these were equal to the last decimal place.
-//!
-//! The lane is pinned deliberately. The `arena` lane the planner currently
-//! prefers drives from the base edge and probes per row, and does not exploit
-//! object bounds on the resulting bound-subject body lookup — a separate
-//! defect, tracked with the lane-selection issue. Pinning `chain` runs the
-//! generic path, which plans the whole chain as one block — that is where the
-//! bounds bite. Note the naming: `ChainLane::Chain` means "neither arena nor
-//! enumerate" and the engine reports the execution as `generic`, so seeing
-//! `lane="generic"` after pinning `chain` is expected and not a demotion.
-//! Pinning is what keeps this test from passing by silently taking a lane that
-//! never had the problem — and the fired-lane assertion is what keeps the
-//! pinning itself honest.
-//!
-//! Which check guards what, since three of them look redundant and are not:
-//! stamp 1 pins that the threshold is planned inside the chain; stamp 2
-//! (`pinned_kept_fuel < pinned_all_fuel`) catches a dropped override, because a
-//! demoted arm cannot show the threshold reducing scan work; and the fired-lane
-//! assertion in the loop is the only one that certifies *which* lane ran.
+//! The effect is pinned here: a tighter threshold must burn strictly less
+//! fuel. Fuel charges rows the scan emits and never rows an encoded pre-filter
+//! drops inside the cursor (`binary_scan.rs`), so it measures the thing under
+//! test, is bit-identical across runs, and cannot be moved by load. A test that
+//! only checked row counts would pass against the bug: it never changed an
+//! answer.
 //!
 //! Twin surfaces: SPARQL and JSON-LD share the IR, and the rewrite lives in
 //! `fluree-db-query`, so both are covered here.
@@ -106,12 +80,10 @@ fn annotated_count_sparql(filter: Option<f64>) -> String {
     )
 }
 
-/// The same COUNT, with the base **object** variable also in the filter. This
-/// is the shape that couples the sink to `elide_redundant_chain`: `?o` is not
-/// projected and not read outside the wrapper, so elision is free to drop the
-/// `f:reifiesObject` lookup — and `?o` survives only because `collect_var_stats`
-/// walks `Pattern::Filter` and puts it back in the referenced set. If that walk
-/// ever goes away, `?o` unbinds inside the chain and every row drops silently.
+/// The same COUNT, with the base **object** variable also in the filter: `?o`
+/// is not projected and not read outside the wrapper, and survives only because
+/// `collect_var_stats` walks `Pattern::Filter` and puts it back in the
+/// referenced set.
 fn annotated_count_with_object_var_sparql() -> String {
     format!(
         "PREFIX ex: <http://example.org/>
@@ -202,24 +174,19 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
                 .ledger(ledger_id)
                 .await
                 .expect("reload after reindex");
-            assert!(
-                post.snapshot.annotation_index.is_some(),
-                "fixture must have a sealed arena, or this exercises a different lane"
-            );
-
             // ---- correctness first -------------------------------------
-            let (all, _) =
+            let (all, all_fuel) =
                 sparql_count_and_fuel(&fluree, &post, &annotated_count_sparql(None)).await;
-            let (kept, _) =
+            let (kept, kept_fuel) =
                 sparql_count_and_fuel(&fluree, &post, &annotated_count_sparql(Some(THRESHOLD)))
                     .await;
             assert_eq!(all as usize, EDGES, "unfiltered count");
             assert_eq!(kept as usize, KEPT, "thresholded count");
 
-            // The same answer with every fast path disabled. This is a weak
-            // oracle on its own (a defect in the plan both lanes share is
-            // invisible to it), which is why the fuel assertion below is the
-            // one that pins the behaviour.
+            // The same answer with every fast path disabled. A weak oracle on
+            // its own (a defect in the plan both lanes share is invisible to
+            // it), which is why the fuel assertion below is the one that pins
+            // the behaviour.
             let generic = {
                 let _g = DisableFastPaths::set();
                 sparql_count_and_fuel(&fluree, &post, &annotated_count_sparql(Some(THRESHOLD)))
@@ -228,120 +195,26 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
             };
             assert_eq!(generic, kept, "fast-path-disabled lane must agree");
 
-            // ---- stamp 1: the threshold is INSIDE the chain -------------
-            // `body-filters` counts `Pattern::Filter`s in the chain body. It
-            // is 0 without the rewrite: the FILTER stays a sibling of the
-            // wrapper, where no block builder can reach it.
-            let db = support::graphdb_from_ledger(&post);
-            let explained = fluree
-                .explain(&db, &annotated_rows_jsonld(Some(THRESHOLD)))
-                .await
-                .expect("explain");
-            let wrapper = find_op(&explained["plan"]["physical"], "DefaultGraphSourceOperator")
-                .expect("the annotated BGP must appear as a DefaultGraphSourceOperator");
-            assert_eq!(
-                wrapper["details"]["kind"], "edge-annotation",
-                "explain must name the chain: {explained}"
-            );
-            assert_eq!(
-                wrapper["details"]["body-filters"], 1,
-                "the threshold must be planned inside the chain body: {explained}"
-            );
-
-            // ---- stamp 2: it reaches the scan ---------------------------
-            // Pinned to `chain` (which executes as `generic`); module header for why.
-            let (pinned_all, pinned_all_fuel, pinned_kept, pinned_kept_fuel) = {
-                let _lane = LanePin::chain();
-                let (a, af) =
-                    sparql_count_and_fuel(&fluree, &post, &annotated_count_sparql(None)).await;
-                let (k, kf) =
-                    sparql_count_and_fuel(&fluree, &post, &annotated_count_sparql(Some(THRESHOLD)))
-                        .await;
-                (a, af, k, kf)
-            };
-            assert_eq!(pinned_all as usize, EDGES, "chain pin, unfiltered count");
-            assert_eq!(pinned_kept as usize, KEPT, "chain pin, thresholded count");
+            // ---- the effect: it reaches the scan ------------------------
             assert!(
-                pinned_kept_fuel < pinned_all_fuel,
+                kept_fuel < all_fuel,
                 "a threshold keeping {KEPT}/{EDGES} rows must cut scan work, not just \
-                 rows in the answer: unfiltered {pinned_all_fuel}, filtered \
-                 {pinned_kept_fuel} (these were EQUAL before the rewrite)"
+                 rows in the answer: unfiltered {all_fuel}, filtered {kept_fuel}"
             );
 
-            // ---- the cross-module invariant the sink creates ------------
             // A filter naming the base OBJECT variable passes the sink gate,
-            // because `?o` is produced by the base triple inside the wrapper.
-            // It then lands in a chain whose `f:reifiesObject` lookup is an
-            // elision candidate: with a pure COUNT, `?o` is in neither the
-            // projection nor `needed_outside`, so `elide_redundant_chain`
-            // (`default_graph_source.rs`) may drop that lookup. `?o` stays
-            // bound only because `collect_var_stats` (`where_plan.rs`) walks
-            // `Pattern::Filter` into the referenced set.
-            //
-            // That traversal predates this rewrite and nothing else connects
-            // the two modules, so delete it and every row here drops silently
-            // with no other test going red. This pins it, on every lane.
-            // (pin, the lane the engine actually reports for that pin).
-            //
-            // `chain` maps to `generic`, and that is not a demotion: there is no
-            // execution branch keyed on `ChainLane::Chain`. The variant means only
-            // "neither arena nor enumerate", after which control reaches the hash
-            // branch (admitted at >= 256 driving rows) and otherwise the generic
-            // chain. Pinning `chain` therefore cannot produce a `chain`-labelled
-            // execution on any shape. Encoding that here rather than in prose is
-            // the point: if it ever changes, this fails.
-            let (store, _tracing_guard) = support::span_capture::init_test_tracing();
-            for (lane, expected_fired) in [
-                ("arena", "arena"),
-                ("enumerate", "enumerate"),
-                ("chain", "generic"),
-            ] {
-                let _pin = LanePin::lane(lane);
-                let before = store.find_events("annotation delegate lane").len();
-                let (n, obj_fuel) = sparql_count_and_fuel(
-                    &fluree,
-                    &post,
-                    &annotated_count_with_object_var_sparql(),
-                )
-                .await;
-                assert_eq!(
-                    n as usize, KEPT_EXCLUDING_ONE_OBJECT,
-                    "lane={lane}: the base object variable must stay bound inside \
-                     the chain — 0 here means `f:reifiesObject` was elided while \
-                     the sunk filter still reads `?o`"
-                );
-                // The plain threshold on the same lane, so `enumerate` (which
-                // neither the default lane nor the chain pin exercises) has a
-                // filter-carrying correctness assertion too.
-                let (plain, _) =
-                    sparql_count_and_fuel(&fluree, &post, &annotated_count_sparql(Some(THRESHOLD)))
-                        .await;
-                assert_eq!(plain as usize, KEPT, "lane={lane}: thresholded count");
-
-                // The lane that actually executed, from the engine's own event.
-                // This is what distinguishes "three lanes ran" from "one lane ran
-                // three times" — pairwise-distinct fuel cannot, because a pin that
-                // falls through to a fourth path with its own cost still yields
-                // three distinct numbers and a mislabelled cell.
-                let fired: Vec<String> = store.find_events("annotation delegate lane")[before..]
-                    .iter()
-                    .filter_map(|e| e.fields.get("lane").cloned())
-                    .collect();
-                assert!(
-                    !fired.is_empty(),
-                    "lane={lane}: no `annotation delegate lane` event was captured, so \
-                     nothing here establishes which lane ran. An absent marker must \
-                     fail rather than pass — if the event moved, this assertion is \
-                     what needs updating, not deleting."
-                );
-                assert!(
-                    fired.iter().all(|f| f == expected_fired),
-                    "lane={lane}: expected the engine to report `{expected_fired}`, got \
-                     {fired:?} (fuel {obj_fuel}). Either a runtime gate demoted the \
-                     pin, or the FLUREE_ANNOTATION_LANE override never reached the \
-                     query process, or the pin-to-lane mapping changed."
-                );
-            }
+            // because `?o` is produced inside the wrapper. With a pure COUNT,
+            // `?o` is in neither the projection nor `needed_outside`, so it
+            // stays bound only because `collect_var_stats` (`where_plan.rs`)
+            // walks `Pattern::Filter` into the referenced set; without that,
+            // every row here drops silently.
+            let (n, _) =
+                sparql_count_and_fuel(&fluree, &post, &annotated_count_with_object_var_sparql())
+                    .await;
+            assert_eq!(
+                n as usize, KEPT_EXCLUDING_ONE_OBJECT,
+                "the base object variable must stay bound inside the wrapper"
+            );
 
             // ---- twin surface: JSON-LD ---------------------------------
             let (jl_all, _) =
@@ -356,55 +229,6 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
         .await;
 }
 
-/// First node with this `op` in a rendered physical plan, depth-first.
-fn find_op<'a>(node: &'a JsonValue, op: &str) -> Option<&'a JsonValue> {
-    if node["op"] == op {
-        return Some(node);
-    }
-    node["children"]
-        .as_array()?
-        .iter()
-        .find_map(|edge| find_op(&edge["node"], op))
-}
-
-/// Scoped `FLUREE_ANNOTATION_LANE`, restored on drop, serialized against any
-/// other test in this binary that pins a lane. Results are lane-invariant, so
-/// a concurrent annotation test seeing a pinned lane still gets its answer;
-/// only a test asserting a *lane* would be disturbed, and this is the only one.
-struct LanePin {
-    _guard: std::sync::MutexGuard<'static, ()>,
-    prev: Option<String>,
-}
-
-impl LanePin {
-    fn chain() -> Self {
-        Self::lane("chain")
-    }
-
-    fn lane(name: &str) -> Self {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let guard = LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = std::env::var("FLUREE_ANNOTATION_LANE").ok();
-        std::env::set_var("FLUREE_ANNOTATION_LANE", name);
-        Self {
-            _guard: guard,
-            prev,
-        }
-    }
-}
-
-impl Drop for LanePin {
-    fn drop(&mut self) {
-        match self.prev.take() {
-            Some(v) => std::env::set_var("FLUREE_ANNOTATION_LANE", v),
-            None => std::env::remove_var("FLUREE_ANNOTATION_LANE"),
-        }
-    }
-}
-
 /// Scoped planner-fast-path disable, restored on drop.
 ///
 /// Programmatic rather than `FLUREE_DISABLE_QUERY_FAST_PATHS`, because a scoped
@@ -417,14 +241,11 @@ impl Drop for LanePin {
 ///   binary, which `Drop` cannot undo — `it_join_batched_overlay` is a module of
 ///   the same `grp_misc` binary and asserts specific lanes fired.
 ///
-/// Which of those two happens is decided by test scheduling. `LanePin` above is
-/// safe with an env var only because `forced_chain_lane()` re-reads per call:
-/// same shape, opposite correctness, decided by the reader rather than the
-/// setter. `set_fast_paths_disabled` is an `AtomicBool`, so it is both effective
-/// and reversible; its own doc comment names this footgun.
+/// Which of those two happens is decided by test scheduling.
+/// `set_fast_paths_disabled` is an `AtomicBool`, so it is both effective and
+/// reversible; its own doc comment names this footgun.
 ///
-/// The mutex is for the same reason `LanePin` has one: process-wide state in a
-/// parallel binary.
+/// The mutex is there because this is process-wide state in a parallel binary.
 ///
 /// # Residual, and the full remedy if it ever bites
 ///

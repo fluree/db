@@ -63,6 +63,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 edge: edge.clone(),
                 annotation: annotation_ref,
                 body,
+                term: fluree_db_query::ir::term_components::fresh_term_var(self.vars),
             });
         }
         Ok(())

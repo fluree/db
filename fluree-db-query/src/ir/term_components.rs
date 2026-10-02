@@ -80,8 +80,27 @@ pub fn lower_reified_link<E: IriEncoder + ?Sized>(
     vars: &mut VarRegistry,
     out: &mut Vec<Pattern>,
 ) {
-    let reifies = encoder.encode_ref(fluree_vocab::rdf::REIFIES);
+    link_patterns(
+        annotation_ref,
+        edge,
+        encoder.encode_ref(fluree_vocab::rdf::REIFIES),
+        || fresh_term_var(vars),
+        &|iri| encoder.encode_iri(iri),
+        out,
+    );
+}
 
+/// The patterns of [`lower_reified_link`], given the `rdf:reifies` ref, the
+/// term variable (asked for only when the edge is not constant), and how to
+/// encode an IRI.
+pub(crate) fn link_patterns(
+    annotation_ref: Ref,
+    edge: TriplePattern,
+    reifies: Ref,
+    term_var: impl FnOnce() -> VarId,
+    encode_iri: &dyn Fn(&str) -> Option<Sid>,
+    out: &mut Vec<Pattern>,
+) {
     // Fully constant edge: compose the term itself.
     if let Some(term) = constant_term(&edge) {
         out.push(Pattern::Triple(TriplePattern {
@@ -93,7 +112,7 @@ pub fn lower_reified_link<E: IriEncoder + ?Sized>(
         return;
     }
 
-    let t = fresh_term_var(vars);
+    let t = term_var();
     out.push(Pattern::Triple(TriplePattern {
         s: annotation_ref,
         p: reifies,
@@ -122,7 +141,7 @@ pub fn lower_reified_link<E: IriEncoder + ?Sized>(
             ));
             Component::Node(sid)
         }
-        Term::Iri(iri) => match encoder.encode_iri(&iri) {
+        Term::Iri(iri) => match encode_iri(&iri) {
             Some(sid) => {
                 out.push(same_term(
                     func,
@@ -130,12 +149,16 @@ pub fn lower_reified_link<E: IriEncoder + ?Sized>(
                 ));
                 Component::Node(sid)
             }
-            // An IRI in no registered namespace names nothing in this
-            // ledger, so the pattern cannot match.
+            // Not encodable here (no ledger at hand, or not this one's):
+            // compared as the query runs, against the ledger it reads.
             None => {
-                out.push(Pattern::Filter(Expression::Const(FlakeValue::Boolean(
-                    false,
-                ))));
+                out.push(same_term(
+                    func,
+                    Expression::call(
+                        Function::Iri,
+                        vec![Expression::Const(FlakeValue::String(iri.to_string()))],
+                    ),
+                ));
                 Component::Any
             }
         },
@@ -178,7 +201,7 @@ pub fn lower_reified_link<E: IriEncoder + ?Sized>(
 }
 
 /// A `?__term_N` variable no pattern uses yet.
-fn fresh_term_var(vars: &mut VarRegistry) -> VarId {
+pub fn fresh_term_var(vars: &mut VarRegistry) -> VarId {
     let name = (vars.len()..)
         .map(|n| format!("?__term_{n}"))
         .find(|name| vars.get(name).is_none())

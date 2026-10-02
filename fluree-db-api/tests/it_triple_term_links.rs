@@ -2365,29 +2365,6 @@ async fn jsonld_triple_term_functions() {
     assert_eq!(filtered, strings(&[&["ex:claim2"]]));
 }
 
-/// TriG import writes an annotation inside a `GRAPH` block through its own
-/// named-graph loop; that loop spools the link as the default-graph sink does.
-#[tokio::test]
-async fn trig_import_links_named_graph_annotations() {
-    const TRIG: &str = r#"@prefix ex: <http://example.org/> .
-ex:alice ex:name "Alice" .
-GRAPH <http://example.org/graphs/audit> {
-    ex:event1 ex:actor ex:alice {| ex:confidence "high" |} .
-    ex:event2 ex:actor ex:alice ~ ex:claim2 {| ex:confidence "low"@en |} .
-}
-"#;
-    let (fluree, ledger) = import(&[("data.trig", TRIG)], "it/triple-term-links:trig").await;
-    let got = run_link_query(
-        &fluree,
-        &ledger,
-        "SELECT ?s WHERE { GRAPH <http://example.org/graphs/audit> \
-         { ?r rdf:reifies ?t BIND(SUBJECT(?t) AS ?s) } } ORDER BY ?s"
-            .to_string(),
-    )
-    .await;
-    assert_eq!(got, strings(&[&["ex:event1"], &["ex:event2"]]));
-}
-
 /// A reifier re-pointed, over an index, at an edge to a subject only novelty
 /// holds: the term's object is that subject's provisional id while the edge's
 /// scan binds the subject by name, and the two must still join.
@@ -2414,6 +2391,7 @@ async fn links_join_a_subject_only_novelty_holds() {
         .expect("re-point to carol");
     let ledger = fluree.ledger(ledger_id).await.expect("load");
     for body in [
+        "SELECT ?o ?r WHERE { ex:alice ex:knows ?o ~ ?r }",
         "SELECT ?o ?r WHERE { ex:alice ex:knows ?o . ?r rdf:reifies <<( ex:alice ex:knows ?o )>> }",
     ] {
         assert_eq!(
@@ -2424,3 +2402,25 @@ async fn links_join_a_subject_only_novelty_holds() {
     }
 }
 
+/// TriG import writes an annotation inside a `GRAPH` block through its own
+/// named-graph loop; that loop spools the link as the default-graph sink does.
+#[tokio::test]
+async fn trig_import_links_named_graph_annotations() {
+    const TRIG: &str = r#"@prefix ex: <http://example.org/> .
+ex:alice ex:name "Alice" .
+GRAPH <http://example.org/graphs/audit> {
+    ex:event1 ex:actor ex:alice {| ex:confidence "high" |} .
+    ex:event2 ex:actor ex:alice ~ ex:claim2 {| ex:confidence "low"@en |} .
+}
+"#;
+    let (fluree, ledger) = import(&[("data.trig", TRIG)], "it/triple-term-links:trig").await;
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT ?s WHERE { GRAPH <http://example.org/graphs/audit> \
+         { ?r rdf:reifies ?t BIND(SUBJECT(?t) AS ?s) } } ORDER BY ?s"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(got, strings(&[&["ex:event1"], &["ex:event2"]]));
+}
