@@ -5378,6 +5378,78 @@ async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
     );
 }
 
+/// A link `r rdf:reifies <<( s p o )>>` names its triple, so a policy hiding
+/// the triple hides the link on every route to it, not only `@reifies`:
+/// SPARQL's quoted pattern and a plain `rdf:reifies` scan.
+#[tokio::test]
+async fn policy_hiding_base_edge_hides_its_link() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:policy-hides-link";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp-A", "ex:role": "Engineer" }
+        }
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+
+    let opts = fluree_db_api::GovernanceOptions {
+        policy: Some(json!([{
+            "@id": "ex:hide-worksFor",
+            "f:required": true,
+            "f:onProperty": [{"@id": "http://example.org/worksFor"}],
+            "f:action": "f:view",
+            "f:query": serde_json::to_string(&json!({
+                "where": {"@id": "?$identity", "@type": "http://example.org/NeverMatches"}
+            })).unwrap()
+        }])),
+        default_allow: Some(true),
+        ..Default::default()
+    };
+    let policy = fluree_db_api::policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &opts,
+        &[0],
+    )
+    .await
+    .expect("policy context");
+
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    for sparql in [
+        format!(
+            "SELECT ?person ?org WHERE {{ ?r {reifies} \
+             <<( ?person <http://example.org/worksFor> ?org )>> }}"
+        ),
+        format!("SELECT ?r ?t WHERE {{ ?r {reifies} ?t }}"),
+    ] {
+        let count = |db: fluree_db_api::GraphDb| {
+            let fluree = &fluree;
+            let ledger = &ledger;
+            let sparql = sparql.clone();
+            async move {
+                let result = fluree.query(&db, sparql.as_str()).await.expect("query");
+                let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+                rows.as_array().map_or(0, Vec::len)
+            }
+        };
+        assert_eq!(
+            count(support::graphdb_from_ledger(&ledger)).await,
+            1,
+            "{sparql}"
+        );
+        let policed =
+            support::graphdb_from_ledger(&ledger).with_policy(std::sync::Arc::new(policy.clone()));
+        assert_eq!(count(policed).await, 0, "the hidden edge's link: {sparql}");
+    }
+}
+
 // =====================================================================
 // #1467 — reification-aware COPY/MOVE/ADD re-homing (named-source cases)
 // =====================================================================
