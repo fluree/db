@@ -100,7 +100,8 @@ pub(super) fn instantiate_construct_graph(
         Ref::Var(v) => Ok(terms_slot(template, *v)),
         constant => terms.constant_ref(constant, position).map(Slot::Const),
     };
-    // Each pattern's slots, graph, and the reifiers attached to it.
+    // Each pattern's slots, graph, the reifiers attached to it, and the
+    // components of a constant triple-term object.
     let mut patterns = Vec::with_capacity(template.patterns().len());
     for (i, pattern) in template.patterns().iter().enumerate() {
         let s = slot_of(&mut terms, &pattern.s, Position::Subject)?;
@@ -109,11 +110,15 @@ pub(super) fn instantiate_construct_graph(
             Term::Var(v) => terms_slot(template, *v),
             constant => Slot::Const(terms.constant_object(constant, pattern.dtc.as_ref())?),
         };
+        let const_term = match &pattern.o {
+            Term::Value(FlakeValue::TripleTerm(term)) => terms.term_components(term)?,
+            _ => None,
+        };
         let graph = match template.graph(i) {
             Some(g) => Some(slot_of(&mut terms, g, Position::Graph)?),
             None => None,
         };
-        patterns.push(([s, p, o], graph, Vec::new()));
+        patterns.push(([s, p, o], graph, Vec::new(), const_term));
     }
     for r in template.reifications() {
         let reifier = slot_of(&mut terms, &r.reifier, Position::Subject)?;
@@ -153,37 +158,38 @@ pub(super) fn instantiate_construct_graph(
                         },
                     })
                 };
-            'pattern: for (slots, graph_slot, reifier_slots) in &patterns {
-                // `?r rdf:reifies ?t` with a triple term bound to ?t writes
-                // what `?r rdf:reifies <<( s p o )>>` does: the term's triple
-                // and ?r's reification of it.
-                if let Slot::Var(v) = &slots[2] {
-                    if let Some(components) = batch
+            'pattern: for (slots, graph_slot, reifier_slots, const_term) in &patterns {
+                // `?r rdf:reifies ?t` with a triple term bound to ?t (or a
+                // constant one) writes what `?r rdf:reifies <<( s p o )>>`
+                // does: the term's triple and ?r's reification of it.
+                let components = match &slots[2] {
+                    Slot::Var(v) => batch
                         .get(row, *v)
                         .map(|b| terms.triple_term(b))
                         .transpose()?
-                        .flatten()
-                    {
-                        let (Some(reifier), Some(p)) = (
-                            resolve(&mut terms, &slots[0], Position::Subject)?,
-                            resolve(&mut terms, &slots[1], Position::Predicate)?,
-                        ) else {
-                            continue 'pattern;
+                        .flatten(),
+                    _ => const_term.clone(),
+                };
+                if let Some(components) = components {
+                    let (Some(reifier), Some(p)) = (
+                        resolve(&mut terms, &slots[0], Position::Subject)?,
+                        resolve(&mut terms, &slots[1], Position::Predicate)?,
+                    ) else {
+                        continue 'pattern;
+                    };
+                    if matches!(&p, IrTerm::Iri(iri) if &**iri == rdf::REIFIES) {
+                        let graph = match graph_slot {
+                            Some(slot) => match resolve(&mut terms, slot, Position::Graph)? {
+                                Some(name) => Some(name),
+                                None => continue 'pattern,
+                            },
+                            None => None,
                         };
-                        if matches!(&p, IrTerm::Iri(iri) if &**iri == rdf::REIFIES) {
-                            let graph = match graph_slot {
-                                Some(slot) => match resolve(&mut terms, slot, Position::Graph)? {
-                                    Some(name) => Some(name),
-                                    None => continue 'pattern,
-                                },
-                                None => None,
-                            };
-                            let [ts, tp, to] = components;
-                            let g = dataset.graph_mut(graph.as_ref());
-                            g.add_reification(ts.clone(), tp.clone(), to.clone(), reifier);
-                            g.add(Triple::new(ts, tp, to));
-                            continue 'pattern;
-                        }
+                        let [ts, tp, to] = components;
+                        let g = dataset.graph_mut(graph.as_ref());
+                        g.add_reification(ts.clone(), tp.clone(), to.clone(), reifier);
+                        g.add(Triple::new(ts, tp, to));
+                        continue 'pattern;
                     }
                 }
                 let mut triple: [Option<IrTerm>; 3] = [None, None, None];
@@ -384,8 +390,7 @@ impl TermResolver<'_> {
     }
 
     /// A binding's triple term as the IR terms of its subject, predicate and
-    /// object, when it holds one whose object the graph IR can carry (any
-    /// term but a nested triple term).
+    /// object (see [`Self::term_components`]).
     fn triple_term(&mut self, binding: &Binding) -> Result<Option<[IrTerm; 3]>> {
         if binding.is_encoded() {
             let materialized = super::materialize::materialize_binding(self.result, binding)?;
@@ -398,6 +403,15 @@ impl TermResolver<'_> {
         else {
             return Ok(None);
         };
+        self.term_components(term)
+    }
+
+    /// A triple term as the IR terms of its subject, predicate and object,
+    /// when the graph IR can carry its object (any term but a nested one).
+    fn term_components(
+        &mut self,
+        term: &fluree_db_core::TripleTermValue,
+    ) -> Result<Option<[IrTerm; 3]>> {
         if matches!(term.o, FlakeValue::TripleTerm(_)) {
             return Ok(None);
         }

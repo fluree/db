@@ -513,32 +513,6 @@ pub enum Pattern {
         /// Patterns about the annotation subject.
         body: Vec<Pattern>,
     },
-
-    /// Annotation-rooted pattern — reverse direction of [`Pattern::EdgeAnnotation`].
-    ///
-    /// Lowered from JSON-LD `@reifies`. The enclosing node-map is the
-    /// annotation subject; `@reifies` names the base triple it reifies.
-    ///
-    /// # Semantics
-    ///
-    /// One row per `(annotation, base_edge)` pair. The base edge must be
-    /// **currently asserted and policy-visible** before a row is emitted
-    /// (M1 enforcement) — otherwise this operator would leak hidden
-    /// edges via annotation existence.
-    ///
-    /// # Execution
-    ///
-    /// Planning expands this variant into the base edge plus the
-    /// corresponding `f:reifies*` lookup chain before operator-tree
-    /// assembly.
-    AnnotationTarget {
-        /// The annotation subject — variable or constant ref.
-        annotation: Ref,
-        /// The base edge being reified.
-        edge: TriplePattern,
-        /// Patterns about the annotation subject.
-        body: Vec<Pattern>,
-    },
 }
 
 /// Columns of a VALUES table that bind their variable on every row: those with
@@ -609,15 +583,6 @@ impl Pattern {
             } => Pattern::EdgeAnnotation {
                 edge,
                 annotation,
-                body: f(body),
-            },
-            Pattern::AnnotationTarget {
-                annotation,
-                edge,
-                body,
-            } => Pattern::AnnotationTarget {
-                annotation,
-                edge,
                 body: f(body),
             },
             Pattern::DefaultGraphSource { patterns } => Pattern::DefaultGraphSource {
@@ -722,11 +687,6 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
-            }
-            | Pattern::AnnotationTarget {
-                annotation,
-                edge,
-                body,
             } => {
                 edge.substitute_var(old, new);
                 if let Ref::Var(v) = annotation {
@@ -806,11 +766,6 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
-            }
-            | Pattern::AnnotationTarget {
-                annotation,
-                edge,
-                body,
             } => {
                 let mut vars = edge.referenced_vars();
                 if let Ref::Var(v) = annotation {
@@ -867,11 +822,6 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
-            }
-            | Pattern::AnnotationTarget {
-                annotation,
-                edge,
-                body,
             } => {
                 let mut vars = edge.produced_vars();
                 if let Ref::Var(v) = annotation {
@@ -908,7 +858,7 @@ impl Pattern {
                 .any(|branch| branch.iter().any(|p| p.contains_function(target))),
             Pattern::Graph { patterns, .. } => patterns.iter().any(|p| p.contains_function(target)),
             Pattern::Subquery(sq) => sq.patterns.iter().any(|p| p.contains_function(target)),
-            Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+            Pattern::EdgeAnnotation { body, .. } => {
                 body.iter().any(|p| p.contains_function(target))
             }
             Pattern::DefaultGraphSource { patterns, .. } => {

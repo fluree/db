@@ -287,8 +287,14 @@ pub async fn resolve_incremental_commits_v6(
 
     // 4. Seed SharedResolverState from V6 root.
     let mut shared = SharedResolverState::from_index_root(&root)?;
-    // Incremental builds resolve term ordinals in step 9a, so links are synthesized.
-    shared.link_synth.enable();
+    // Incremental builds resolve term ordinals in step 9a, so links are
+    // synthesized — except over an annotated index built before links, whose
+    // earlier annotations only a full rebuild links: a term dictionary started
+    // here would cover the window alone, and readers take its presence to mean
+    // every annotation is linked.
+    if !(root.has_annotations && root.term_dict.is_none()) {
+        shared.link_synth.enable();
+    }
 
     // Enable spatial hook for non-POINT geometry detection.
     shared.spatial_hook = Some(crate::spatial_hook::SpatialHook::new());

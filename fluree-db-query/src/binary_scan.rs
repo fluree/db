@@ -2111,6 +2111,9 @@ impl Operator for BinaryScanOperator {
             return Err(QueryError::OperatorAlreadyOpened);
         }
 
+        if matches!(&self.pattern.p, Ref::Sid(p) if fluree_db_core::is_rdf_reifies(p)) {
+            crate::term_components::require_indexed_links(ctx)?;
+        }
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;

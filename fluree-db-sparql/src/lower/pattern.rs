@@ -130,8 +130,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             } => self.lower_property_path(subject, path, object, *span),
 
             // RDF 1.2 reifier-rooted annotation pattern.
-            // `?ann rdf:reifies <<( s p o )>>` →
-            // `Pattern::AnnotationTarget` IR with empty body. Sibling
+            // `?ann rdf:reifies <<( s p o )>>` → the link and its term
+            // components (`lower_reified_link`). Sibling
             // triples about the reifier in surrounding scope join on
             // the bound annotation var via the standard executor.
             //

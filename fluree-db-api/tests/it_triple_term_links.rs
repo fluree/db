@@ -255,13 +255,12 @@ async fn incremental_index_appends_new_terms_and_reuses_existing_handles() {
         .await;
 }
 
-/// The link-based lowering (`FLUREE_ANNOTATION_TERMS=1`): reified-triple
-/// patterns scan `rdf:reifies` and decompose or constrain the term instead
-/// of walking the bundle chain. Every shape the design doc's access-path
-/// table names, on the same imported claims.
+/// The link lowering: reified-triple patterns scan `rdf:reifies` and
+/// decompose or constrain the term instead of walking the bundle chain.
+/// Every shape the design doc's access-path table names, on the same
+/// imported claims.
 #[tokio::test]
 async fn link_lowering_answers_reified_triple_shapes() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let (fluree, ledger) = import(&[("claims.ttl", CLAIMS)], "it/triple-term-links:lowering").await;
     let q = |body: &str| {
         format!(
@@ -376,7 +375,6 @@ async fn run_link_query(
 /// keeps the tag and datatype too.
 #[tokio::test]
 async fn link_lowering_matches_literal_objects_by_term() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let (fluree, ledger) = import(
         &[("literals.ttl", LITERAL_CLAIMS)],
         "it/triple-term-links:literals",
@@ -426,7 +424,6 @@ async fn link_lowering_matches_literal_objects_by_term() {
 /// already holds may be in any representation.
 #[tokio::test]
 async fn link_lowering_joins_component_variables_in_every_scope() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let (fluree, ledger) = import(&[("claims.ttl", CLAIMS)], "it/triple-term-links:scopes").await;
     let run = |body: &str| run_link_query(&fluree, &ledger, body.to_string());
 
@@ -478,7 +475,6 @@ async fn link_lowering_joins_component_variables_in_every_scope() {
 /// predicates admit no handle: the second filter stays in the plan.
 #[tokio::test]
 async fn link_lowering_keeps_contradictory_predicate_filters() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let (fluree, ledger) = import(
         &[("claims.ttl", CLAIMS)],
         "it/triple-term-links:contradiction",
@@ -500,7 +496,6 @@ async fn link_lowering_keeps_contradictory_predicate_filters() {
 /// still the count of matching links.
 #[tokio::test]
 async fn link_lowering_counts_without_decomposing_unread_positions() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let (fluree, ledger) = import(&[("claims.ttl", CLAIMS)], "it/triple-term-links:count").await;
     let got = run_link_query(
         &fluree,
@@ -672,7 +667,6 @@ async fn assert_object_types_survive(fluree: &fluree_db_api::Fluree, ledger: &Le
 /// path once an unrelated unindexed commit turns late materialization off.
 #[tokio::test]
 async fn link_lowering_keeps_object_types_through_accessors_and_novelty() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let (fluree, ledger) = import(
         &[("literals.ttl", LITERAL_CLAIMS)],
         "it/triple-term-links:accessor-types",
@@ -889,7 +883,6 @@ ex:d ex:q ex:e ~ ex:r3 {| ex:src ex:z |} .
 /// carry the first one's column to it although only a count reads it.
 #[tokio::test]
 async fn link_lowering_joins_chained_edges_when_only_counted() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let (fluree, ledger) = import(
         &[("chained.ttl", CHAINED_CLAIMS)],
         "it/triple-term-links:chained",
@@ -916,7 +909,6 @@ async fn link_lowering_joins_chained_edges_when_only_counted() {
 /// links the first edge's scan is cheapest.)
 #[tokio::test]
 async fn link_lowering_drives_chained_edges_through_their_subjects() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let alias = "it/triple-term-links:chained-plan";
     let (fluree, _ledger) = import(&[("chained.ttl", CHAINED_CLAIMS)], alias).await;
     let view = fluree.db(alias).await.expect("view");
@@ -1092,7 +1084,6 @@ async fn change_claims_without_indexing(
 /// where the links wait for the index store before they can be derived.
 #[tokio::test]
 async fn novelty_carries_links_until_the_index_covers_them() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let alias = "it/triple-term-links:novelty";
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
@@ -1166,7 +1157,6 @@ async fn novelty_carries_links_until_the_index_covers_them() {
 /// term dictionary at all.
 #[tokio::test]
 async fn novelty_carries_links_on_a_ledger_never_indexed() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:never-indexed");
     let ledger = fluree
@@ -1187,7 +1177,6 @@ async fn novelty_carries_links_on_a_ledger_never_indexed() {
 #[tokio::test]
 async fn novelty_links_follow_the_index_they_were_published_over() {
     use fluree_db_indexer::IndexerConfig;
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
 
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
@@ -1259,7 +1248,6 @@ async fn novelty_links_follow_the_index_they_were_published_over() {
 /// overlay instead of the raw-flake lane the plan declines on.
 #[tokio::test(flavor = "current_thread")]
 async fn novelty_terms_keep_link_counts_on_the_count_plan() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let (fluree, ledger) = import(
         &[("claims.ttl", CLAIMS)],
         "it/triple-term-links:novelty-count",
@@ -1367,7 +1355,6 @@ async fn assert_arena_links(fluree: &fluree_db_api::Fluree, ledger: &LedgerState
 /// string ids are not the global ones.
 #[tokio::test]
 async fn arena_kind_objects_link_through_import_and_reindex() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let alias = "it/triple-term-links:arena";
     let pad = "@prefix ex: <http://example.org/> .\nex:pad ex:label \"!pad\" , \"0pad\" .\n";
     let (fluree, ledger) = import(&[("a.ttl", pad), ("b.ttl", ARENA_CLAIMS)], alias).await;
@@ -1408,7 +1395,6 @@ async fn arena_kind_objects_link_through_import_and_reindex() {
 /// A ledger never indexed holds these links in novelty.
 #[tokio::test]
 async fn arena_kind_objects_link_in_novelty() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:arena-novelty");
     let ledger = fluree
@@ -1427,7 +1413,6 @@ async fn arena_kind_objects_link_in_novelty() {
 #[tokio::test]
 async fn arena_kind_links_follow_incremental_repoints_in_every_graph() {
     use fluree_db_indexer::IndexerConfig;
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
 
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
@@ -1575,7 +1560,6 @@ async fn link_scan_estimate(fluree: &fluree_db_api::Fluree, ledger: &LedgerState
 #[tokio::test]
 async fn link_counts_follow_every_build() {
     use fluree_db_indexer::IndexerConfig;
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let expected = |knows: u64| Some(vec![("age".to_string(), 1), ("knows".to_string(), knows)]);
 
     let alias = "it/triple-term-links:link-counts";
@@ -1630,7 +1614,6 @@ async fn link_counts_follow_every_build() {
 #[tokio::test]
 async fn first_annotation_after_an_index_without_terms() {
     use fluree_db_indexer::IndexerConfig;
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
 
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
@@ -1720,7 +1703,6 @@ fn strings(rows: &[&[&str]]) -> Vec<Vec<String>> {
 #[tokio::test(flavor = "current_thread")]
 async fn object_bound_terms_read_the_object_tree() {
     use fluree_db_indexer::IndexerConfig;
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let expected = |extra: bool| {
         let mut knows_bob = vec![vec!["ex:alice".to_string(), "ex:hr".to_string()]];
         if extra {
@@ -1920,7 +1902,6 @@ async fn triple_constructs_the_terms_links_hold() {
 #[cfg(feature = "shacl")]
 #[tokio::test]
 async fn shacl_sparql_constraints_see_the_transactions_links() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:shacl-staged");
     let ledger = fluree
@@ -1960,7 +1941,6 @@ ex:noMallory sh:message "no claim may say alice knows mallory" ;
 /// annotations, over an index and over a ledger never indexed.
 #[tokio::test]
 async fn previews_read_the_links_of_their_own_annotations() {
-    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
     let (fluree, indexed) = import(&[("claims.ttl", CLAIMS)], "it/triple-term-links:preview").await;
     let memory = FlureeBuilder::memory().build_memory();
     let never_indexed = memory
@@ -2125,6 +2105,7 @@ async fn triple_terms_render_in_every_result_format() {
 /// is written as its N-Triples text.
 #[tokio::test]
 async fn construct_writes_triple_terms_as_reifications() {
+    const REIFIES: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
     use fluree_db_api::format::{format_results_string, FormatterConfig};
     let (fluree, ledger) = import(
         &[("claims.ttl", CLAIMS), ("literals.ttl", LITERAL_CLAIMS)],
@@ -2188,6 +2169,28 @@ async fn construct_writes_triple_terms_as_reifications() {
         json!([{"@id": "ex:alice", "ex:knows": [{"@id": "ex:bob", "@annotation": {"@id": "ex:claim1"}}]}])
     );
 
+    // The shorthand's template is the WHERE clause: a constant quoted triple
+    // lowers to a link with a constant term, written the same way.
+    let sparql = "PREFIX ex: <http://example.org/>\n\
+                  CONSTRUCT WHERE { << ex:alice ex:knows ex:bob ~ ?r >> ex:source ?src }";
+    let shorthand = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("construct where");
+    let ex = |l: &str| format!("<http://example.org/{l}>");
+    let mut expected = vec![
+        format!("{} {} {} .", ex("alice"), ex("knows"), ex("bob")),
+        format!(
+            "{} {REIFIES} <<( {} {} {} )>> .",
+            ex("claim1"),
+            ex("alice"),
+            ex("knows"),
+            ex("bob")
+        ),
+        format!("{} {} {} .", ex("claim1"), ex("source"), ex("hr")),
+    ];
+    expected.sort();
+    assert_eq!(sorted(&shorthand), expected);
+
     let about = construct("?r ex:about ?t", "?r rdf:reifies ?t ; ex:source ex:fr").await;
     let nt = render(&about, FormatterConfig::ntriples());
     assert!(
@@ -2196,4 +2199,110 @@ async fn construct_writes_triple_terms_as_reifications() {
         ),
         "{nt}"
     );
+}
+
+/// An annotated ledger whose index predates links (simulated by dropping the
+/// root's term dictionary) refuses link reads until a full rebuild links its
+/// annotations. An incremental build in between does not start a term
+/// dictionary, which would cover its window alone and lift the refusal.
+#[tokio::test]
+async fn link_reads_refuse_an_index_built_before_links() {
+    use fluree_db_binary_index::format::index_root::IndexRoot;
+    use fluree_db_core::{ContentKind, ContentStore};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/triple-term-links:pre-link";
+    let claim = |n: u32| {
+        format!(
+            "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+             ex:s{n} ex:knows ex:o{n} ~ ex:claim{n} {{| ex:src ex:x |}} .\n"
+        )
+    };
+    let current_root = || async {
+        let record = fluree
+            .nameservice()
+            .lookup(ledger_id)
+            .await
+            .expect("ns lookup")
+            .expect("ns record");
+        let cid = record.index_head_id.clone().expect("index root");
+        let bytes = fluree
+            .content_store(ledger_id)
+            .get(&cid)
+            .await
+            .expect("root");
+        (IndexRoot::decode(&bytes).expect("decode"), record.index_t)
+    };
+    let query = "PREFIX ex: <http://example.org/>\n\
+                 SELECT ?r WHERE { << ?s ex:knows ?o ~ ?r >> ex:src ex:x } ORDER BY ?r";
+
+    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    fluree
+        .upsert_turtle(ledger, &claim(1))
+        .await
+        .expect("claim 1");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    let (mut root, index_t) = current_root().await;
+    assert!(root.has_annotations && root.term_dict.is_some());
+    root.term_dict = None;
+    let cid = fluree
+        .content_store(ledger_id)
+        .put(ContentKind::IndexRoot, &root.encode())
+        .await
+        .expect("put root");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index_allow_equal(ledger_id, index_t, &cid)
+        .await
+        .expect("publish root");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    let err = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect_err("a pre-link index refuses link reads");
+    assert!(err.to_string().contains("fluree reindex"), "{err}");
+
+    fluree
+        .upsert_turtle(ledger, &claim(2))
+        .await
+        .expect("claim 2");
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let (root, _) = current_root().await;
+    assert!(
+        root.term_dict.is_none(),
+        "an incremental build over a pre-link index must not start a term dictionary"
+    );
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert!(support::query_sparql(&fluree, &ledger, query)
+        .await
+        .is_err());
+
+    // Same `t` as the incremental root, so it publishes with allow-equal.
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("ns lookup")
+        .expect("ns record");
+    let rebuilt = fluree_db_indexer::rebuild_index_from_commits(
+        fluree.content_store(ledger_id),
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("rebuild");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index_allow_equal(ledger_id, rebuilt.index_t, &rebuilt.root_id)
+        .await
+        .expect("publish rebuild");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    let result = support::query_sparql_formatted(&fluree, &ledger, query)
+        .await
+        .expect("a rebuilt index answers");
+    assert_eq!(rows(&result), strings(&[&["ex:claim1"], &["ex:claim2"]]));
 }

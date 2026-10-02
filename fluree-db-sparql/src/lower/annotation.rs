@@ -3,19 +3,18 @@
 //! Translates the AST shapes (`TriplePattern.annotation`,
 //! `GraphPattern::AnnotationTarget`, and reified-triple terms
 //! `SubjectTerm::QuotedTriple` / `Term::QuotedTriple`) into the
-//! existing query IR (`Pattern::EdgeAnnotation` and
-//! `Pattern::AnnotationTarget`). The IR's
-//! `expand_edge_annotation_patterns` step (in `fluree-db-query`)
-//! handles the f:reifies* fan-out from there.
+//! query IR: annotation syntax to `Pattern::EdgeAnnotation`, whose
+//! `f:reifies*` fan-out `expand_edge_annotation_patterns` (in
+//! `fluree-db-query`) handles, and reified triples to the `rdf:reifies`
+//! link (`fluree_db_query::ir::lower_reified_link`).
 //!
 //! Reified triples desugar exactly per SPARQL 1.2: a `<< s p o ~ r? >>`
 //! term denotes its reifier node `r` (fresh when unnamed) and adds the
 //! pattern `r rdf:reifies <<( s p o )>>` — emitted here as a sibling
-//! `Pattern::AnnotationTarget`. Nested reified triples recurse.
+//! link. Nested reified triples recurse.
 //!
-//! Sibling triples about a reifier variable are NOT folded into
-//! `body` — they sit in the surrounding scope and join via the
-//! standard executor on the bound reifier var. See
+//! Sibling triples about a reifier variable sit in the surrounding
+//! scope and join via the standard executor on the bound reifier var. See
 //! `docs/concepts/edge-annotations.md` "SPARQL 1.2 / RDF 1.2 surface"
 //! for the rationale.
 
@@ -25,7 +24,7 @@ use crate::span::SourceSpan;
 
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_query::ir::triple::{Ref, Term as IrTerm, TriplePattern as IrTriplePattern};
-use fluree_db_query::ir::Pattern;
+use fluree_db_query::ir::{lower_reified_link, Pattern};
 use fluree_db_query::parse::encode::IriEncoder;
 
 use std::collections::HashMap;
@@ -71,10 +70,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     /// Lower a `GraphPattern::AnnotationTarget` (the
     /// `?ann rdf:reifies <<( s p o )>>` form and the standalone
-    /// reified-triple statement it desugars from) into
-    /// `Pattern::AnnotationTarget` IR (plus any sibling targets from
-    /// nested reified triples inside the triple term). Emits an empty
-    /// body — surrounding sibling triples about the reifier join
+    /// reified-triple statement it desugars from) into the link (plus
+    /// sibling links from nested reified triples inside the triple
+    /// term). Surrounding sibling triples about the reifier join
     /// through the standard executor.
     pub(super) fn lower_annotation_target_pattern(
         &mut self,
@@ -84,21 +82,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let mut out = Vec::new();
         let annotation_ref = self.lower_subject(reifier)?;
         let edge = self.lower_triple_term(triple_term, &mut out)?;
-        if link_terms_enabled() {
-            self.lower_reified_link(annotation_ref, edge, &mut out);
-            return Ok(out);
-        }
-        out.push(Pattern::AnnotationTarget {
-            annotation: annotation_ref,
-            edge,
-            body: Vec::new(),
-        });
+        lower_reified_link(annotation_ref, edge, self.encoder, self.vars, &mut out);
         Ok(out)
     }
 
     /// Desugar an RDF 1.2 reified triple `<< s p o ~ r? >>` used as a
-    /// term: emit `r rdf:reifies <<( s p o )>>` (as
-    /// `Pattern::AnnotationTarget`) into `out` and return the reifier
+    /// term: emit the link `r rdf:reifies <<( s p o )>>` into `out` and
+    /// return the reifier
     /// ref that stands in the reified triple's position. Nested
     /// reified triples in `s`/`o` recurse; repeated occurrences (same
     /// source span) reuse the memoized reifier.
@@ -122,19 +112,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let p = self.lower_predicate(&qt.predicate)?;
         let (o, dtc) = self.lower_object_desugared(&qt.object, cache, out, true)?;
 
-        if link_terms_enabled() {
-            self.lower_reified_link(
-                annotation_ref.clone(),
-                IrTriplePattern { s, p, o, dtc },
-                out,
-            );
-        } else {
-            out.push(Pattern::AnnotationTarget {
-                annotation: annotation_ref.clone(),
-                edge: IrTriplePattern { s, p, o, dtc },
-                body: Vec::new(),
-            });
-        }
+        lower_reified_link(
+            annotation_ref.clone(),
+            IrTriplePattern { s, p, o, dtc },
+            self.encoder,
+            self.vars,
+            out,
+        );
         cache.insert(qt.span, annotation_ref.clone());
         Ok(annotation_ref)
     }
@@ -198,8 +182,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Lower the `{| verb obj ; verb obj |}` body to a flat list of
     /// patterns whose subject is the reifier: `Pattern::Triple` for
     /// simple predicates, property-path patterns for path verbs
-    /// (`{| :r/:q 'x' |}`), plus sibling `Pattern::AnnotationTarget`s
-    /// for reified-triple objects.
+    /// (`{| :r/:q 'x' |}`), plus sibling links for reified-triple objects.
     ///
     /// Each entry's object is lowered through
     /// `lower_object_with_constraint` so literal objects pin the scan
@@ -268,166 +251,4 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let (o, dtc) = self.lower_object_desugared(&term.object, &mut cache, out, true)?;
         Ok(IrTriplePattern { s, p, o, dtc })
     }
-}
-
-/// `FLUREE_ANNOTATION_TERMS=1` routes reified-triple patterns through the
-/// `rdf:reifies` link flake and the term dictionary instead of the
-/// `f:reifies*` bundle chain. Read per lowering so tests can flip it.
-pub(super) fn link_terms_enabled() -> bool {
-    std::env::var("FLUREE_ANNOTATION_TERMS").is_ok_and(|v| v == "1")
-}
-
-impl<E: IriEncoder> LoweringContext<'_, E> {
-    /// Lower a reified-triple pattern to the link form: one
-    /// `annotation rdf:reifies ?__term` triple whose object is a triple-term
-    /// handle, and `TermComponents(?__term, s, p, o)` relating the term to its
-    /// components. A variable component is bound by that relation, which joins
-    /// on it when another pattern bound it first, in every scope, without the
-    /// lowering tracking who binds what; a bound subject lets the planner
-    /// drive the relation through the dictionary's subject prefix. A constant
-    /// component is also a filter on the link
-    /// (`FILTER(sameTerm(PREDICATE(?__term), <p>))`), which the planner turns
-    /// into the scan's handle interval and key check when the link leads. A
-    /// fully constant edge composes to a constant term the scan looks up
-    /// directly.
-    pub(super) fn lower_reified_link(
-        &mut self,
-        annotation_ref: Ref,
-        edge: IrTriplePattern,
-        out: &mut Vec<Pattern>,
-    ) {
-        use fluree_db_core::FlakeValue;
-        use fluree_db_query::binding::Binding;
-        use fluree_db_query::ir::{Component, Expression, Function, TermComponentsPattern};
-
-        let reifies = self.encoder.encode_ref(fluree_vocab::rdf::REIFIES);
-
-        // Fully constant edge: compose the term itself.
-        if let Some(term) = constant_term(&edge) {
-            out.push(Pattern::Triple(IrTriplePattern {
-                s: annotation_ref,
-                p: reifies,
-                o: IrTerm::Value(FlakeValue::TripleTerm(Box::new(term))),
-                dtc: None,
-            }));
-            return;
-        }
-
-        let name = format!("?__term_{}", self.term_counter);
-        self.term_counter += 1;
-        let t = self.vars.get_or_insert(&name);
-        out.push(Pattern::Triple(IrTriplePattern {
-            s: annotation_ref,
-            p: reifies,
-            o: IrTerm::Var(t),
-            dtc: None,
-        }));
-
-        let accessor = |f: Function| Expression::call(f, vec![Expression::Var(t)]);
-        let same_term = |f: Function, constant: Expression| {
-            Pattern::Filter(Expression::call(
-                Function::SameTerm,
-                vec![accessor(f), constant],
-            ))
-        };
-        let IrTriplePattern { s, p, o, dtc } = edge;
-        // Constant positions are filters on the link (the scan narrows on
-        // them) and constants of the components relation (a constant subject
-        // anchors it). Variable positions are bound by the components relation,
-        // which joins on them when another pattern bound them first.
-        let component = |func: Function, term: IrTerm, out: &mut Vec<Pattern>| match term {
-            IrTerm::Var(v) => Component::Var(v),
-            IrTerm::Sid(sid) => {
-                out.push(same_term(
-                    func,
-                    Expression::Const(FlakeValue::Ref(sid.clone())),
-                ));
-                Component::Node(sid)
-            }
-            IrTerm::Iri(iri) => match self.encoder.encode_iri(&iri) {
-                Some(sid) => {
-                    out.push(same_term(
-                        func,
-                        Expression::Const(FlakeValue::Ref(sid.clone())),
-                    ));
-                    Component::Node(sid)
-                }
-                // An IRI in no registered namespace names nothing in this
-                // ledger, so the pattern cannot match.
-                None => {
-                    out.push(Pattern::Filter(Expression::Const(FlakeValue::Boolean(
-                        false,
-                    ))));
-                    Component::Any
-                }
-            },
-            // A literal matches by term identity: its datatype or language
-            // tag is part of what `<< ?s :p "chat"@fr >>` asks for.
-            IrTerm::Value(v) => match &dtc {
-                Some(dtc) => {
-                    out.push(same_term(
-                        func,
-                        Expression::Resolved(Box::new(Binding::Lit {
-                            val: v.clone(),
-                            dtc: dtc.clone(),
-                            t: None,
-                            op: None,
-                            p_id: None,
-                        })),
-                    ));
-                    Component::Literal(v, dtc.clone())
-                }
-                None => {
-                    out.push(Pattern::Filter(Expression::call(
-                        Function::Eq,
-                        vec![accessor(func), Expression::Const(v)],
-                    )));
-                    Component::Any
-                }
-            },
-        };
-        let tc = TermComponentsPattern {
-            term: t,
-            subject: component(Function::TripleSubject, IrTerm::from(s), out),
-            predicate: component(Function::TriplePredicate, IrTerm::from(p), out),
-            object: component(Function::TripleObject, o, out),
-        };
-        if tc.components().into_iter().any(|c| c.var().is_some())
-            || matches!(tc.subject, Component::Node(_))
-        {
-            out.push(Pattern::TermComponents(tc));
-        }
-    }
-}
-
-/// The materialized term for an edge whose three positions are constants
-/// and whose object datatype is known; `None` otherwise.
-fn constant_term(edge: &IrTriplePattern) -> Option<fluree_db_core::TripleTermValue> {
-    use fluree_db_core::FlakeValue;
-    let s = match &edge.s {
-        Ref::Sid(s) => s.clone(),
-        _ => return None,
-    };
-    let p = match &edge.p {
-        Ref::Sid(p) => p.clone(),
-        _ => return None,
-    };
-    let (o, dt, lang) = match (&edge.o, &edge.dtc) {
-        (IrTerm::Sid(sid), _) => (
-            FlakeValue::Ref(sid.clone()),
-            fluree_db_core::edge::id_datatype_sid(),
-            None,
-        ),
-        (IrTerm::Value(v), Some(DatatypeConstraint::Explicit(dt))) => (v.clone(), dt.clone(), None),
-        (IrTerm::Value(v), Some(DatatypeConstraint::LangTag(tag))) => (
-            v.clone(),
-            fluree_db_core::Sid::new(
-                fluree_vocab::namespaces::RDF,
-                fluree_vocab::rdf_names::LANG_STRING,
-            ),
-            Some(tag.to_string()),
-        ),
-        _ => return None,
-    };
-    Some(fluree_db_core::TripleTermValue { s, p, o, dt, lang })
 }

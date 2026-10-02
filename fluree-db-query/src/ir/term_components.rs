@@ -6,7 +6,11 @@
 //! is a join the planner sees, and a bound subject can drive the term
 //! dictionary's subject-first reverse tree instead of reading every link.
 
-use crate::var_registry::VarId;
+use crate::binding::Binding;
+use crate::ir::triple::{Ref, Term, TriplePattern};
+use crate::ir::{Expression, Function, Pattern};
+use crate::parse::encode::IriEncoder;
+use crate::var_registry::{VarId, VarRegistry};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 
 /// One component position of a [`TermComponentsPattern`].
@@ -55,4 +59,160 @@ impl TermComponentsPattern {
     pub fn produced_vars(&self) -> Vec<VarId> {
         self.referenced_vars()
     }
+}
+
+/// Lower a reified-triple pattern to the link form: one
+/// `annotation rdf:reifies ?__term` triple whose object is a triple-term
+/// handle, and `TermComponents(?__term, s, p, o)` relating the term to its
+/// components. A variable component is bound by that relation, which joins
+/// on it when another pattern bound it first, in every scope, without the
+/// lowering tracking who binds what; a bound subject lets the planner
+/// drive the relation through the dictionary's subject prefix. A constant
+/// component is also a filter on the link
+/// (`FILTER(sameTerm(PREDICATE(?__term), <p>))`), which the planner turns
+/// into the scan's handle interval and key check when the link leads. A
+/// fully constant edge composes to a constant term the scan looks up
+/// directly.
+pub fn lower_reified_link<E: IriEncoder + ?Sized>(
+    annotation_ref: Ref,
+    edge: TriplePattern,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut Vec<Pattern>,
+) {
+    let reifies = encoder.encode_ref(fluree_vocab::rdf::REIFIES);
+
+    // Fully constant edge: compose the term itself.
+    if let Some(term) = constant_term(&edge) {
+        out.push(Pattern::Triple(TriplePattern {
+            s: annotation_ref,
+            p: reifies,
+            o: Term::Value(FlakeValue::TripleTerm(Box::new(term))),
+            dtc: None,
+        }));
+        return;
+    }
+
+    let t = fresh_term_var(vars);
+    out.push(Pattern::Triple(TriplePattern {
+        s: annotation_ref,
+        p: reifies,
+        o: Term::Var(t),
+        dtc: None,
+    }));
+
+    let accessor = |f: Function| Expression::call(f, vec![Expression::Var(t)]);
+    let same_term = |f: Function, constant: Expression| {
+        Pattern::Filter(Expression::call(
+            Function::SameTerm,
+            vec![accessor(f), constant],
+        ))
+    };
+    let TriplePattern { s, p, o, dtc } = edge;
+    // Constant positions are filters on the link (the scan narrows on
+    // them) and constants of the components relation (a constant subject
+    // anchors it). Variable positions are bound by the components relation,
+    // which joins on them when another pattern bound them first.
+    let component = |func: Function, term: Term, out: &mut Vec<Pattern>| match term {
+        Term::Var(v) => Component::Var(v),
+        Term::Sid(sid) => {
+            out.push(same_term(
+                func,
+                Expression::Const(FlakeValue::Ref(sid.clone())),
+            ));
+            Component::Node(sid)
+        }
+        Term::Iri(iri) => match encoder.encode_iri(&iri) {
+            Some(sid) => {
+                out.push(same_term(
+                    func,
+                    Expression::Const(FlakeValue::Ref(sid.clone())),
+                ));
+                Component::Node(sid)
+            }
+            // An IRI in no registered namespace names nothing in this
+            // ledger, so the pattern cannot match.
+            None => {
+                out.push(Pattern::Filter(Expression::Const(FlakeValue::Boolean(
+                    false,
+                ))));
+                Component::Any
+            }
+        },
+        // A literal matches by term identity: its datatype or language
+        // tag is part of what `<< ?s :p "chat"@fr >>` asks for.
+        Term::Value(v) => match &dtc {
+            Some(dtc) => {
+                out.push(same_term(
+                    func,
+                    Expression::Resolved(Box::new(Binding::Lit {
+                        val: v.clone(),
+                        dtc: dtc.clone(),
+                        t: None,
+                        op: None,
+                        p_id: None,
+                    })),
+                ));
+                Component::Literal(v, dtc.clone())
+            }
+            None => {
+                out.push(Pattern::Filter(Expression::call(
+                    Function::Eq,
+                    vec![accessor(func), Expression::Const(v)],
+                )));
+                Component::Any
+            }
+        },
+    };
+    let tc = TermComponentsPattern {
+        term: t,
+        subject: component(Function::TripleSubject, Term::from(s), out),
+        predicate: component(Function::TriplePredicate, Term::from(p), out),
+        object: component(Function::TripleObject, o, out),
+    };
+    if tc.components().into_iter().any(|c| c.var().is_some())
+        || matches!(tc.subject, Component::Node(_))
+    {
+        out.push(Pattern::TermComponents(tc));
+    }
+}
+
+/// A `?__term_N` variable no pattern uses yet.
+fn fresh_term_var(vars: &mut VarRegistry) -> VarId {
+    let name = (vars.len()..)
+        .map(|n| format!("?__term_{n}"))
+        .find(|name| vars.get(name).is_none())
+        .expect("an unused name");
+    vars.get_or_insert(&name)
+}
+
+/// The materialized term for an edge whose three positions are constants
+/// and whose object datatype is known; `None` otherwise.
+fn constant_term(edge: &TriplePattern) -> Option<fluree_db_core::TripleTermValue> {
+    let s = match &edge.s {
+        Ref::Sid(s) => s.clone(),
+        _ => return None,
+    };
+    let p = match &edge.p {
+        Ref::Sid(p) => p.clone(),
+        _ => return None,
+    };
+    let (o, dt, lang) = match (&edge.o, &edge.dtc) {
+        (Term::Sid(sid), _) => (
+            FlakeValue::Ref(sid.clone()),
+            fluree_db_core::edge::id_datatype_sid(),
+            None,
+        ),
+        (Term::Value(v), Some(DatatypeConstraint::Explicit(dt))) => (v.clone(), dt.clone(), None),
+        (Term::Value(v), Some(DatatypeConstraint::LangTag(tag))) => (
+            v.clone(),
+            fluree_db_core::Sid::new(
+                fluree_vocab::namespaces::RDF,
+                fluree_vocab::rdf_names::LANG_STRING,
+            ),
+            Some(tag.to_string()),
+        ),
+        _ => return None,
+    };
+    Some(fluree_db_core::TripleTermValue { s, p, o, dt, lang })
 }

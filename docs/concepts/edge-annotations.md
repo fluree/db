@@ -185,7 +185,7 @@ When you start from the metadata — "find every employment with `role = Enginee
 }
 ```
 
-`@reifies` is the same idea as `rdf:reifies` in RDF 1.2 — given an annotation subject, walk to the edge it reifies. Fluree resolves it through the reverse attachment index, so it's cheap regardless of how many annotations exist in the ledger.
+`@reifies` is the same idea as `rdf:reifies` in RDF 1.2 — given an annotation subject, walk to the edge it reifies. Fluree reads it, as it reads SPARQL's `?r rdf:reifies <<( s p o )>>` and `<< s p o ~ ?r >>`, from the reifier's `rdf:reifies` link, whose object is a triple term the index resolves through its term dictionary, so it's cheap regardless of how many annotations exist in the ledger. A policy that hides an edge hides its link too: the link is visible only when the triple it names would be.
 
 ### Subject expansion
 
@@ -566,8 +566,7 @@ Today's surface covers the common LPG / RDF-star use cases. The following are no
 - **Annotations on list-occurrence triples.** `@list` membership is in scope as a future extension; the on-disk format already reserves space for it. Today, annotating a list element is rejected at parse time.
 - **Reifiers for unasserted triples.** `@reifies` must point at an asserted edge. Pure-proposition reification (claims about triples that are not in the graph) is deferred.
 - **Reifiers for multiple triples.** One annotation subject corresponds to one edge. Reifying several unrelated triples from a single annotation isn't allowed.
-- **Triple terms as values.** `ex:doc ex:mentions <<( ex:s ex:p ex:o )>>` is not a representable value on any surface (JSON-LD, SPARQL, Turtle): the only accepted position for `<<( ... )>>` is the object of `rdf:reifies`, where it names an edge rather than storing a triple. Binding a whole triple to a variable (`BIND(<<( ?s ?p ?o )>> AS ?t)`, `VALUES ?t { <<( ... )>> }`) and returning one in a result set are the same gap. Use a separate annotation subject.
-- **SPARQL 1.2 triple-term functions and constructor.** `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` triple-term constructor parse (with arity checks) but fail at lowering with a `not_implemented` error — they presuppose triple terms as first-class values, which v1's LPG model does not represent.
+- **Triple terms as stored values.** `ex:doc ex:mentions <<( ex:s ex:p ex:o )>>` is not a representable value on any write surface (JSON-LD, SPARQL, Turtle): the only accepted position for `<<( ... )>>` is the object of `rdf:reifies`, where it names an edge rather than storing a triple. Use a separate annotation subject. A SPARQL query can still build and return one: `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE` and `BIND(<<( ?s ?p ?o )>> AS ?t)` work on terms, and a bound term renders in every result format (see [Output formats](../query/output-formats.md#triple-terms)). JSON-LD queries have no syntax for these functions yet.
 - **SPARQL UPDATE annotations inside named graphs.** Annotation tails under `GRAPH { }` / `WITH <g>` in SPARQL UPDATE are rejected; write named-graph annotations with JSON-LD `@annotation` or TriG-star.
 - **Unasserted reified triples.** RDF 1.2's `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do not assert `s p o`; Fluree's do (the reifier is lifecycle-coupled to a live edge). A W3C test that depends on a reifier existing for a triple that is *not* in the graph therefore diverges.
 
@@ -580,6 +579,7 @@ The mandated SPARQL 1.2 `VERSION "1.2"` prologue declaration is **accepted** (le
 - Annotation properties are stored as ordinary RDF facts. Time travel, policy, history, export, and reasoning all work on them without special cases.
 - Retraction cascade has a fast path: when both the index root and current novelty know the ledger has no annotations, base-edge retracts skip the attachment lookup entirely.
 - Branch fork, pack/sync, and ledger drop all walk annotation arena artifacts as part of the index reachability set, so annotated ledgers round-trip cleanly across these operations.
+- Reified-triple patterns read the `rdf:reifies` links an index build derives from each annotation. An index built by an earlier Fluree version has none, so on an annotated ledger those queries fail with an error asking for a rebuild until it is reindexed (`fluree reindex <ledger>`); an incremental build does not add them.
 
 For the index format, sidecar layout, sort orders, and garbage-collection treatment, see the [Edge annotations design doc](../design/edge-annotations.md).
 

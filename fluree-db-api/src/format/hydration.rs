@@ -1369,8 +1369,8 @@ impl<'a> HydrationFormatter<'a> {
                 //
                 // Explicitly-listed levels can still reach these via
                 // a `Pattern::Triple` lookup at the planner layer
-                // (which is what the `Pattern::EdgeAnnotation` /
-                // `AnnotationTarget` IR expansion does), but those
+                // (which is what the `Pattern::EdgeAnnotation` IR
+                // expansion and the `rdf:reifies` link lowering do), but those
                 // patterns don't go through hydration.
                 if fluree_db_core::is_scan_hidden_predicate(&pred) {
                     continue;

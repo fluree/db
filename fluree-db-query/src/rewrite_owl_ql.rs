@@ -552,7 +552,6 @@ fn rewrite_owl_ql_single_pattern(
         | Pattern::Graph { .. }
         | Pattern::Service(_)
         | Pattern::EdgeAnnotation { .. }
-        | Pattern::AnnotationTarget { .. }
         | Pattern::DefaultGraphSource { .. } => {
             rewrite_subpatterns(pattern.clone(), diag, |xs, diag| {
                 rewrite_owl_ql_patterns_internal(&xs, ontology, ctx, diag, total_expansions)

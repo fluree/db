@@ -840,8 +840,8 @@ async fn non_annotation_ledger_skips_inject_annotations() {
 
 #[tokio::test]
 async fn explain_tags_annotation_role_and_uses_arena_stats() {
-    // M3.2: `/explain` must (a) expand `@annotation` / `@reifies`
-    // patterns the same way the executor does, (b) tag the resulting
+    // M3.2: `/explain` must (a) expand `@annotation` patterns the same
+    // way the executor does, (b) tag the resulting
     // `f:reifies*` triples with their slot name so the chosen ordering
     // is observable, and (c) report stats as available when the
     // annotation arena is sealed even if no other property stats
@@ -876,18 +876,18 @@ async fn explain_tags_annotation_role_and_uses_arena_stats() {
                 "arena must be sealed for the explain test to exercise M3.1 stats"
             );
 
-            // `@reifies`-rooted query: filter by annotation metadata,
-            // ask for the edge it reifies. Lowering produces a
-            // `Pattern::AnnotationTarget` which `/explain` should now
-            // expand into a base edge triple + 3 `f:reifies*` lookups.
+            // Edge-rooted query filtered by annotation metadata. Lowering
+            // produces a `Pattern::EdgeAnnotation`, which `/explain`
+            // expands into a base edge triple + 3 `f:reifies*` lookups.
+            // (`@reifies` reads the `rdf:reifies` link instead.)
             let query = json!({
                 "@context": ctx(),
                 "select": ["?person", "?org"],
                 "where": {
-                    "ex:role": "Engineer",
-                    "@reifies": {
-                        "@id": "?person",
-                        "ex:worksFor": { "@id": "?org" }
+                    "@id": "?person",
+                    "ex:worksFor": {
+                        "@id": "?org",
+                        "@annotation": { "ex:role": "Engineer" }
                     }
                 }
             });

@@ -305,8 +305,7 @@ fn collect_predicates(patterns: &[Pattern], out: &mut Vec<Sid>) {
                     }
                 }
             }
-            Pattern::EdgeAnnotation { edge, body, .. }
-            | Pattern::AnnotationTarget { edge, body, .. } => {
+            Pattern::EdgeAnnotation { edge, body, .. } => {
                 if let Ref::Sid(p) = &edge.p {
                     if !out.contains(p) {
                         out.push(p.clone());

@@ -345,10 +345,6 @@ fn logical_node(
             node.insert("kind".into(), json!("edge-annotation"));
             node.insert("patterns".into(), children(body));
         }
-        Pattern::AnnotationTarget { body, .. } => {
-            node.insert("kind".into(), json!("annotation-target"));
-            node.insert("patterns".into(), children(body));
-        }
     }
     JsonValue::Object(node)
 }
@@ -537,9 +533,8 @@ fn explain_from_parsed(
     }
 
     // Expand edge-annotation IR into the same triple chain the
-    // executor uses (`Pattern::EdgeAnnotation` /
-    // `Pattern::AnnotationTarget` → base edge + 3 `f:reifies*` lookups
-    // + body). Without this, edge-annotation queries appear as empty
+    // executor uses (`Pattern::EdgeAnnotation` → base edge + 3
+    // `f:reifies*` lookups + body). Without this, edge-annotation queries appear as empty
     // in `/explain` output because `collect_triples_in_order` doesn't
     // descend into those container patterns.
     let expanded_patterns = expand_edge_annotation_patterns(&parsed.patterns);

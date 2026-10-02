@@ -393,6 +393,26 @@ impl TermComponentsOperator {
 const OBJECT_SITE: &str = "term-object";
 
 /// A component no dictionary can name is a miss, not an error.
+/// Refuse to read links from an index built before them. Such an index holds
+/// an annotated ledger's annotations only as `f:reifies*` bundles, so a link
+/// read would answer as if they did not exist.
+pub(crate) fn require_indexed_links(ctx: &ExecutionContext<'_>) -> Result<()> {
+    let pre_link = ctx.active_snapshot.has_annotations
+        && ctx
+            .binary_store
+            .as_ref()
+            .is_some_and(|store| !store.has_term_dict());
+    if pre_link {
+        return Err(QueryError::UnsupportedFeature(
+            "this ledger's index predates RDF 1.2 triple-term links, so it cannot answer \
+             reified-triple patterns over its annotations; rebuild the index \
+             (`fluree reindex <ledger>`)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn missing<T>(r: std::io::Result<T>) -> std::io::Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
@@ -517,6 +537,7 @@ impl Operator for TermComponentsOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        require_indexed_links(ctx)?;
         self.child.open(ctx).await?;
         self.store = ctx.binary_store.clone();
         if let Some(store) = self.store.clone() {

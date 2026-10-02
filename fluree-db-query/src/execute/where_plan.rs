@@ -50,18 +50,16 @@ use super::pushdown::extract_bounds_from_filters;
 // Edge-annotation IR expansion (M1b)
 // ============================================================================
 //
-// `Pattern::EdgeAnnotation { edge, annotation, body }` and
-// `Pattern::AnnotationTarget { annotation, edge, body }` are flattened
+// `Pattern::EdgeAnnotation { edge, annotation, body }` is flattened
 // at planner time into the equivalent triple chain over the
 // `f:reifies*` system predicates. The standard scan / join machinery
 // handles the rest. This avoids a custom operator and exercises the
 // existing visibility / policy / dedup paths automatically — the
-// base edge triple's standard scan provides the visibility check for
-// the reverse direction "for free".
+// base edge triple's standard scan provides the visibility check
+// "for free".
 
-/// Expand every `Pattern::EdgeAnnotation` / `Pattern::AnnotationTarget`
-/// in `patterns` into its triple-chain equivalent, recursing through
-/// every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
+/// Expand every `Pattern::EdgeAnnotation` in `patterns` into its
+/// triple-chain equivalent, recursing through every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
 /// `NotExists`, `Graph`, `Service`, `Subquery`).
 ///
 /// Each expanded triple chain is wrapped in
@@ -84,15 +82,15 @@ pub fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
     out
 }
 
-/// Cheap, allocation-free check for any `Pattern::EdgeAnnotation` /
-/// `Pattern::AnnotationTarget` anywhere in the tree. Lets the WHERE
+/// Cheap, allocation-free check for any `Pattern::EdgeAnnotation`
+/// anywhere in the tree. Lets the WHERE
 /// planner skip the `expand_edge_annotation_patterns` clone+rebuild on
 /// the common non-RDF-1.2 path. Exhaustive over `Pattern` so a new
 /// container variant forces a decision here rather than silently hiding
 /// an annotation from expansion.
 pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
     patterns.iter().any(|p| match p {
-        Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => true,
+        Pattern::EdgeAnnotation { .. } => true,
         Pattern::Optional(inner)
         | Pattern::Minus(inner)
         | Pattern::Exists(inner)
@@ -124,11 +122,6 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
             edge,
             annotation,
             body,
-        }
-        | Pattern::AnnotationTarget {
-            annotation,
-            edge,
-            body,
         } => {
             // Build the triple chain (base edge + three f:reifies*
             // triples + recursively expanded body) into a local
@@ -139,10 +132,9 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
             // which provides graph correlation by construction.
             let mut chain: Vec<Pattern> = Vec::new();
 
-            // 1. Base edge triple: provides visibility for both
-            //    directions. The standard scan applies snapshot rules
-            //    + policy filters here, so an `AnnotationTarget`
-            //    operator-style visibility check is redundant.
+            // 1. Base edge triple: provides visibility. The standard
+            //    scan applies snapshot rules + policy filters here, so
+            //    an operator-style visibility check is redundant.
             chain.push(Pattern::Triple(edge.clone()));
 
             // 2. Three required `f:reifies*` lookup triples that bind
@@ -533,9 +525,7 @@ fn has_outer_correlated_graph_var(patterns: &[Pattern], outer: &HashSet<VarId>) 
         // re-opened the #1443 cross-encoding hash mismatch this fallback
         // exists to close.
         Pattern::Service(sp) => has_outer_correlated_graph_var(&sp.patterns, outer),
-        Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
-            has_outer_correlated_graph_var(body, outer)
-        }
+        Pattern::EdgeAnnotation { body, .. } => has_outer_correlated_graph_var(body, outer),
         Pattern::Filter(expr) => expr_embeds(expr, outer),
         Pattern::Bind { expr, .. } => expr_embeds(expr, outer),
         Pattern::Unwind { var: _, list } => expr_embeds(list, outer),
@@ -819,7 +809,7 @@ pub fn collect_var_stats(
                 // positions, the reifier and the body: the chain elision
                 // treats a variable they miss as unread and drops the
                 // `f:reifies*` lookup that binds it.
-                Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+                Pattern::EdgeAnnotation { .. } => {
                     for v in p.referenced_vars() {
                         bump_count(counts, v);
                         vars.insert(v);
@@ -2642,15 +2632,13 @@ pub fn build_where_operators_seeded_with_needed(
         return Ok(seed.unwrap_or_else(|| Box::new(EmptyOperator::new())));
     }
 
-    // Edge-annotation expansion (M1b): Pattern::EdgeAnnotation /
-    // Pattern::AnnotationTarget are flattened into the equivalent base
-    // edge plus four `f:reifies*` triple lookups plus the body. The
-    // standard scan/join machinery handles the rest. The base-edge
-    // triple is always emitted, which gives the
-    // `Pattern::AnnotationTarget` reverse direction its required
-    // visibility check for free: the base edge must be currently
-    // asserted under the snapshot's normal policy/visibility rules,
-    // or no row survives the join.
+    // Edge-annotation expansion (M1b): Pattern::EdgeAnnotation is
+    // flattened into the equivalent base edge plus the `f:reifies*`
+    // triple lookups plus the body. The standard scan/join machinery
+    // handles the rest. The base-edge triple is always emitted, which
+    // gives the annotation its visibility check for free: the base edge
+    // must be currently asserted under the snapshot's normal
+    // policy/visibility rules, or no row survives the join.
     // Skip the clone+rebuild entirely when the block has no edge-annotation
     // patterns (the overwhelmingly common, non-RDF-1.2 case): borrow the
     // original slice instead of allocating an expanded copy. The presence
@@ -3476,7 +3464,7 @@ pub fn build_where_operators_seeded_with_needed(
             // dispatch arm is unreachable from any standard entry
             // point. Keep the guard for safety in case a future
             // caller bypasses the expansion pass.
-            Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+            Pattern::EdgeAnnotation { .. } => {
                 return Err(QueryError::Internal(
                     "edge-annotation pattern reached the operator dispatch \
                      without being flattened by expand_edge_annotation_patterns"

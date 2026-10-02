@@ -7,8 +7,7 @@
 //!    triple plus BIND expressions extracting the metadata.
 //! 2. **RDF 1.2 reified triple** — everything else. The term denotes
 //!    its reifier node; the desugaring in `lower/annotation.rs` emits
-//!    `r rdf:reifies <<( s p o )>>` as `Pattern::AnnotationTarget` and
-//!    substitutes the reifier ref into the enclosing position.
+//!    the link `r rdf:reifies <<( s p o )>>` and substitutes the reifier ref into the enclosing position.
 
 use crate::ast::term::{ObjectTerm, PredicateTerm, SubjectTerm, Term as SparqlTerm};
 use crate::ast::TriplePattern as SparqlTriplePattern;
@@ -48,7 +47,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ///
     /// Becomes (conceptually):
     /// ```text
-    /// ?r rdf:reifies <<( ex:a ex:b ex:c )>> .   (AnnotationTarget)
+    /// ?r rdf:reifies <<( ex:a ex:b ex:c )>> .   (the link)
     /// ?doc ex:cites ?r .                        (triple pattern)
     /// ```
     pub(super) fn lower_bgp_with_rdf_star(
@@ -86,7 +85,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
 
             // RDF 1.2 reading: reified-triple terms denote their
-            // reifier node (desugared as sibling AnnotationTargets).
+            // reifier node (desugared as sibling links).
             let s = match &tp.subject {
                 SubjectTerm::QuotedTriple(qt) => {
                     self.lower_reified_triple(qt, &mut reified_cache, &mut result)?

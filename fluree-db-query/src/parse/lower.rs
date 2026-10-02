@@ -459,12 +459,16 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
         } => {
             let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
             let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
-            let lowered_body = lower_unresolved_patterns(body, encoder, vars, pp_counter)?;
-            Ok(vec![Pattern::AnnotationTarget {
-                annotation: lowered_annotation,
-                edge: lowered_edge,
-                body: lowered_body,
-            }])
+            let mut out = Vec::new();
+            crate::ir::lower_reified_link(
+                lowered_annotation,
+                lowered_edge,
+                encoder,
+                vars,
+                &mut out,
+            );
+            out.extend(lower_unresolved_patterns(body, encoder, vars, pp_counter)?);
+            Ok(out)
         }
     }
 }

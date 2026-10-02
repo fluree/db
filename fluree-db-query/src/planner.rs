@@ -1232,11 +1232,9 @@ pub fn estimate_pattern(
         // wrapped edge's cardinality as a first approximation. Real
         // cost-based selection between edge-first and annotation-first
         // scans arrives in M3 alongside `AnnotationStats`.
-        Pattern::EdgeAnnotation { edge, .. } | Pattern::AnnotationTarget { edge, .. } => {
-            PatternEstimate::Source {
-                row_count: estimate_triple_row_count(edge, bound_vars, stats),
-            }
-        }
+        Pattern::EdgeAnnotation { edge, .. } => PatternEstimate::Source {
+            row_count: estimate_triple_row_count(edge, bound_vars, stats),
+        },
 
         // DefaultGraphSource wraps an expanded edge-annotation chain and
         // runs it once per default-graph source. The chain has its own
@@ -1817,11 +1815,6 @@ pub(crate) fn must_bind_vars(pattern: &Pattern, bind_targets: BindTargets) -> Ha
             edge,
             annotation,
             body,
-        }
-        | Pattern::AnnotationTarget {
-            annotation,
-            edge,
-            body,
         } => {
             let mut vars: HashSet<VarId> = edge.produced_vars().into_iter().collect();
             if let Ref::Var(v) = annotation {
@@ -1898,7 +1891,7 @@ fn left_join_introduced_vars(pattern: &Pattern, out: &mut HashSet<VarId>) {
             let body = must_bind_vars(pattern, BindTargets::Bound);
             out.extend(sq.select.iter().copied().filter(|v| !body.contains(v)));
         }
-        Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+        Pattern::EdgeAnnotation { body, .. } => {
             for p in body {
                 left_join_introduced_vars(p, out);
             }
