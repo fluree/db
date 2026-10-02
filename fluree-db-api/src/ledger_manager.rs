@@ -40,7 +40,7 @@ use std::collections::VecDeque;
 use tokio::sync::{oneshot, RwLock};
 
 use crate::error::{ApiError, Result};
-use crate::ledger_view::LedgerView;
+use crate::ledger_view::{GraphNames, LedgerView};
 
 // ============================================================================
 // Monotonic Clock for Eviction
@@ -546,17 +546,9 @@ impl LedgerHandle {
     /// IMPORTANT: Queries must NOT execute while holding the internal lock.
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
+        self.touch();
         // Read-side compaction trigger (policy: query/maintenance path only).
         self.compact_if_needed().await;
-        self.peek().await
-    }
-
-    /// The cached head as [`snapshot`](Self::snapshot) returns it, without
-    /// its read-side compaction check, which visits every graph in novelty.
-    /// For a lookup ahead of a query on the same request (a route resolving
-    /// the query's dataset references): the query's own load runs the check.
-    pub async fn peek(&self) -> LedgerView {
-        self.touch();
         let state = self.inner.state.read().await;
         let binary_store = self.inner.binary_store.read().await.clone();
         let mut snap = LedgerView::from_state(&state);
@@ -566,6 +558,21 @@ impl LedgerHandle {
             "range_provider and binary_store must be coherent"
         );
         snap
+        // Locks released here
+    }
+
+    /// The cached head's graph names, for resolving a request's dataset
+    /// references ahead of its query: no [`LedgerView`] is built, and the
+    /// read-side compaction check [`snapshot`](Self::snapshot) runs, which
+    /// visits every graph in novelty, is left to the query's own load.
+    pub async fn graph_names(&self) -> GraphNames {
+        self.touch();
+        let state = self.inner.state.read().await;
+        let binary_store = self.inner.binary_store.read().await.clone();
+        GraphNames {
+            snapshot: Arc::clone(&state.snapshot),
+            binary_store,
+        }
         // Locks released here
     }
 

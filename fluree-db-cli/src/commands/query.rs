@@ -1773,9 +1773,9 @@ fn print_footer(total_rows: usize, limit: Option<usize>, elapsed: std::time::Dur
 
 /// The endpoint ledger's graph registry, as the router can read it.
 enum EndpointGraphs {
-    /// A ledger the local store holds: its cached head, where each reference
-    /// is one lookup (nothing is copied).
-    Ledger(Box<fluree_db_api::LedgerView>),
+    /// A ledger the local store holds: its cached head's graph names, where
+    /// each reference is one lookup (nothing is copied).
+    Ledger(fluree_db_api::GraphNames),
     /// An endpoint with no named graphs (a graph source).
     Empty,
     /// Nothing to read here: a remote ledger, a query that names no dataset,
@@ -1786,15 +1786,15 @@ enum EndpointGraphs {
 impl EndpointGraphs {
     async fn of_local(fluree: &fluree_db_api::Fluree, alias: &str) -> Self {
         match fluree.ledger_cached(alias).await {
-            // Peek: the query's own load runs the read-side compaction check.
-            Ok(handle) => Self::Ledger(Box::new(handle.peek().await)),
+            // Only the graph names: the query's own load reads the rest.
+            Ok(handle) => Self::Ledger(handle.graph_names().await),
             Err(_) => Self::Unknown,
         }
     }
 
     fn with_lookup<R>(&self, f: impl FnOnce(Option<fluree_db_api::GraphLookup<'_>>) -> R) -> R {
         match self {
-            Self::Ledger(view) => f(Some(&|iri: &str| view.graph_id_for_iri(iri))),
+            Self::Ledger(names) => f(Some(&|iri: &str| names.graph_id_for_iri(iri))),
             Self::Empty => f(Some(&|_: &str| None)),
             Self::Unknown => f(None),
         }
