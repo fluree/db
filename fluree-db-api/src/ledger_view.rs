@@ -107,6 +107,37 @@ impl CommitRef {
     }
 }
 
+/// The graph id registered under `iri`: the snapshot's graph registry, then
+/// the binary index store's, the order every read path resolves a graph name
+/// in. A borrowed lookup: a request pays O(1) per reference however many
+/// graphs the ledger holds.
+fn graph_id_in(
+    snapshot: &LedgerSnapshot,
+    binary_store: Option<&BinaryIndexStore>,
+    iri: &str,
+) -> Option<fluree_db_core::GraphId> {
+    snapshot
+        .graph_registry
+        .graph_id_for_iri(iri)
+        .or_else(|| binary_store.and_then(|store| store.graph_id_for_iri(iri)))
+}
+
+/// A ledger head's graph names, read as [`LedgerView::graph_id_for_iri`]
+/// reads them, without the rest of a view: two shared handles, so taking one
+/// copies nothing ([`LedgerHandle::graph_names`](crate::LedgerHandle::graph_names)).
+#[derive(Clone)]
+pub struct GraphNames {
+    pub(crate) snapshot: Arc<LedgerSnapshot>,
+    pub(crate) binary_store: Option<Arc<BinaryIndexStore>>,
+}
+
+impl GraphNames {
+    /// The graph id registered under `iri`, if any.
+    pub fn graph_id_for_iri(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
+        graph_id_in(&self.snapshot, self.binary_store.as_deref(), iri)
+    }
+}
+
 /// Read-only view of a ledger at a point in time.
 ///
 /// Holds no locks. Safe to clone, pass to subtasks, or keep across `.await`
@@ -180,14 +211,7 @@ impl LedgerView {
     /// graph name in. A borrowed lookup: nothing is copied, so a request pays
     /// O(1) per reference however many graphs the ledger holds.
     pub fn graph_id_for_iri(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
-        self.snapshot
-            .graph_registry
-            .graph_id_for_iri(iri)
-            .or_else(|| {
-                self.binary_store
-                    .as_ref()
-                    .and_then(|store| store.graph_id_for_iri(iri))
-            })
+        graph_id_in(&self.snapshot, self.binary_store.as_deref(), iri)
     }
 
     /// Get the ledger name (without branch suffix)

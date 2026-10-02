@@ -3039,8 +3039,8 @@ async fn execute_query_proxy(
 /// the view path and updates use. Each reference is one lookup in the cached
 /// head the route already reads; nothing is copied per request.
 pub(crate) enum ScopeRegistry {
-    /// The ledger's cached head.
-    Ledger(Box<fluree_db_api::LedgerView>),
+    /// The ledger's cached head: its graph names.
+    Ledger(fluree_db_api::GraphNames),
     /// A graph source, or a ledger that does not exist: no named graphs.
     Empty,
     /// A fixed table, for unit tests.
@@ -3052,7 +3052,7 @@ impl ScopeRegistry {
     /// The graph `iri` names in the ledger, if the ledger registers it.
     pub(crate) fn graph_id(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
         match self {
-            Self::Ledger(view) => view.graph_id_for_iri(iri),
+            Self::Ledger(names) => names.graph_id_for_iri(iri),
             Self::Empty => None,
             #[cfg(test)]
             Self::Fixed(ids) => ids.get(iri).copied(),
@@ -3073,10 +3073,9 @@ pub(crate) fn with_graph_lookup<R>(
     }
 }
 
-/// The path ledger's [`ScopeRegistry`], found by the path's id as parsed and
-/// read from its cached head. It peeks:
-/// the query's own load runs the read-side compaction check, which costs a
-/// visit to every graph in novelty, so a second one here is pure overhead.
+/// The path ledger's [`ScopeRegistry`]: its cached head's graph names, found
+/// by the path's id as parsed. Nothing else of the head is read here; the
+/// query's own load reads the rest.
 pub(crate) async fn scope_registry(
     state: &AppState,
     target: &fluree_db_api::LedgerId,
@@ -3085,7 +3084,7 @@ pub(crate) async fn scope_registry(
         return None;
     }
     match state.fluree.ledger_handle(target).await {
-        Ok(handle) => Some(ScopeRegistry::Ledger(Box::new(handle.peek().await))),
+        Ok(handle) => Some(ScopeRegistry::Ledger(handle.graph_names().await)),
         Err(e) if e.is_not_found() => Some(ScopeRegistry::Empty),
         Err(_) => None,
     }
