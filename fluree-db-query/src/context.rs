@@ -1386,7 +1386,10 @@ impl<'a> ExecutionContext<'a> {
     /// the ledger's own address in any spelling is its default graph, `L#<g>`
     /// the graph `<g>`, and any other IRI the graph registered by it. `None`
     /// in dataset mode, where the dataset's members are the named graphs.
-    fn single_db_graph_position(&self, iri: &str) -> Option<fluree_db_core::GraphPosition> {
+    fn single_db_graph_position<'i>(
+        &self,
+        iri: &'i str,
+    ) -> Option<fluree_db_core::GraphPosition<'i>> {
         if self.dataset.is_some() {
             return None;
         }

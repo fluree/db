@@ -688,17 +688,20 @@ pub enum TargetError {
 }
 
 /// What an IRI names in a graph position of a ledger
-/// ([`TargetLedger::graph_position`]).
+/// ([`TargetLedger::graph_position`]). An IRI it carries borrows the text it
+/// was asked about (the whole text, or the `<g>` of `L#<g>`), so reading a
+/// position copies nothing; only a reserved graph's `urn:fluree:` IRI, which
+/// the text does not contain, is owned.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GraphPosition {
+pub enum GraphPosition<'a> {
     /// The ledger's default graph: its own address.
     Default,
     /// A graph the ledger has registered, by the IRI it is registered under
     /// (the text as written, or `<g>` for `L#<g>`) and its id.
-    Registered { g_id: GraphId, iri: Arc<str> },
+    Registered { g_id: GraphId, iri: Cow<'a, str> },
     /// No graph the ledger has. Nothing to read; a write creates the graph
     /// under this IRI (the text as written, or `<g>` for `L#<g>`).
-    New(Arc<str>),
+    New(Cow<'a, str>),
     /// This ledger's address with a time, or `L#<g>` where `<g>` is itself an
     /// address of this ledger and no graph is registered under it. Nothing to
     /// read, and no name a write may create a graph under.
@@ -784,7 +787,15 @@ impl<'a> TargetLedger<'a> {
                 }
             }
         }
-        if let Some(found) = self.registered(written) {
+        if let Some(found) = self.registered(written, || {
+            let held = match member {
+                MemberRef::Dataset(reference) => reference.graph_iri_reading(),
+                MemberRef::Keyword(_) => None,
+            };
+            held.filter(|iri| iri.as_str() == written)
+                .cloned()
+                .unwrap_or_else(|| GraphIri(written.into()))
+        }) {
             return Ok(found);
         }
         match member {
@@ -813,15 +824,19 @@ impl<'a> TargetLedger<'a> {
     /// this ledger's own `urn:fluree:<id>#config` / `#txn-meta`.
     pub fn graph(&self, sel: &GraphSel) -> Result<TargetGraph, TargetError> {
         match sel {
-            GraphSel::Named(iri) => self.registered(iri).map(Ok).unwrap_or_else(|| {
-                if **iri == crate::graph_registry::config_graph_iri(self.id) {
-                    Ok(self.reserved(GraphSel::Config))
-                } else if **iri == crate::graph_registry::txn_meta_graph_iri(self.id) {
-                    Ok(self.reserved(GraphSel::TxnMeta))
-                } else {
-                    Err(TargetError::GraphNotFound(iri.to_string()))
-                }
-            }),
+            GraphSel::Named(iri) => {
+                self.registered(iri, || iri.clone())
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        if **iri == crate::graph_registry::config_graph_iri(self.id) {
+                            Ok(self.reserved(GraphSel::Config))
+                        } else if **iri == crate::graph_registry::txn_meta_graph_iri(self.id) {
+                            Ok(self.reserved(GraphSel::TxnMeta))
+                        } else {
+                            Err(TargetError::GraphNotFound(iri.to_string()))
+                        }
+                    })
+            }
             reserved => Ok(self.reserved(reserved.clone())),
         }
     }
@@ -848,29 +863,33 @@ impl<'a> TargetLedger<'a> {
     ///
     /// Only an IRI that starts with the ledger's name can be its address, so
     /// the common case is one registry lookup with nothing parsed.
-    pub fn graph_position(&self, iri: &str) -> GraphPosition {
+    pub fn graph_position<'i>(&self, iri: &'i str) -> GraphPosition<'i> {
         if let Some(address) = self.own_address_reading(iri) {
             if address.at().is_some() {
                 return GraphPosition::NotAGraph;
             }
             return match address.graph() {
                 GraphSel::Default => GraphPosition::Default,
-                GraphSel::Named(graph) => match self.registered_under(graph) {
-                    Some(found) => found,
-                    None if self.own_address_reading(graph).is_some() => GraphPosition::NotAGraph,
-                    None => GraphPosition::New(graph.as_arc().clone()),
-                },
-                reserved => {
-                    let urn = self
-                        .reserved_urn(reserved)
-                        .expect("a keyword other than default names a reserved graph");
-                    self.registered_under(&urn)
-                        .unwrap_or_else(|| GraphPosition::New(urn.into()))
+                GraphSel::Named(graph) => {
+                    // `<g>` as it stands in `iri`, after the address's `#`.
+                    let graph = match iri.split_once('#') {
+                        Some((_, text)) if text == graph.as_str() => Cow::Borrowed(text),
+                        _ => Cow::Owned(graph.as_str().to_owned()),
+                    };
+                    match self.registered_under(graph) {
+                        GraphPosition::New(graph) if self.own_address_reading(&graph).is_some() => {
+                            GraphPosition::NotAGraph
+                        }
+                        found => found,
+                    }
                 }
+                reserved => self.registered_under(Cow::Owned(
+                    self.reserved_urn(reserved)
+                        .expect("a keyword other than default names a reserved graph"),
+                )),
             };
         }
-        self.registered_under(iri)
-            .unwrap_or_else(|| GraphPosition::New(iri.into()))
+        self.registered_under(Cow::Borrowed(iri))
     }
 
     /// The IRI of the reserved graph `iri` names when it is this ledger's own
@@ -916,13 +935,14 @@ impl<'a> TargetLedger<'a> {
         }
     }
 
-    /// The graph registered under exactly `iri`, keeping that IRI.
-    fn registered_under(&self, iri: &str) -> Option<GraphPosition> {
-        let g_id = (self.lookup)(iri)?;
-        Some(GraphPosition::Registered {
-            g_id,
-            iri: iri.into(),
-        })
+    /// The graph registered under exactly `iri`, else a new graph by it: one
+    /// registry lookup, and `iri` moves into the position as it came (a
+    /// borrow stays a borrow).
+    fn registered_under<'i>(&self, iri: Cow<'i, str>) -> GraphPosition<'i> {
+        match (self.lookup)(&iri) {
+            Some(g_id) => GraphPosition::Registered { g_id, iri },
+            None => GraphPosition::New(iri),
+        }
     }
 
     /// The name `GRAPH ?g` lists the registered graph `iri` (id `g_id`)
@@ -959,7 +979,11 @@ impl<'a> TargetLedger<'a> {
             .filter(|address| address.id() == self.id)
     }
 
-    fn registered(&self, iri: &str) -> Option<TargetGraph> {
+    /// The graph registered under exactly `iri`: a reserved slot as its
+    /// keyword, any other graph named by `named`, which hands back the
+    /// caller's own [`GraphIri`] for `iri` when it holds one, so a hit copies
+    /// nothing.
+    fn registered(&self, iri: &str, named: impl FnOnce() -> GraphIri) -> Option<TargetGraph> {
         let g_id = (self.lookup)(iri)?;
         Some(match g_id {
             DEFAULT_GRAPH_ID => self.reserved(GraphSel::Default),
@@ -967,7 +991,7 @@ impl<'a> TargetLedger<'a> {
             CONFIG_GRAPH_ID => self.reserved(GraphSel::Config),
             g_id => TargetGraph {
                 g_id,
-                graph: GraphSel::Named(GraphIri(iri.into())),
+                graph: GraphSel::Named(named()),
             },
         })
     }
@@ -1321,7 +1345,43 @@ mod tests {
         assert_eq!(g_id("urn:fluree:L:main#resolution-config"), 4);
     }
 
-    fn position(iri: &str) -> GraphPosition {
+    /// Reading a graph position or resolving a member copies no IRI: a
+    /// position borrows the text it was asked about, and a resolved graph
+    /// shares the member's own `GraphIri`.
+    #[test]
+    fn graph_positions_and_resolved_graphs_copy_no_iri() {
+        let id = LedgerId::parse("L:feature").unwrap();
+        let target = TargetLedger::new(&id, &feature_registry);
+        let borrows = |text: &str, part: &str| match target.graph_position(text) {
+            GraphPosition::Registered {
+                iri: Cow::Borrowed(iri),
+                ..
+            }
+            | GraphPosition::New(Cow::Borrowed(iri)) => std::ptr::eq(iri, part),
+            _ => false,
+        };
+        for text in ["http://ex.org/g", "http://ex.org/new"] {
+            assert!(borrows(text, text), "{text}");
+        }
+        let through = "L:feature#http://ex.org/g";
+        assert!(borrows(through, &through["L:feature#".len()..]));
+
+        let written = "http://ex.org/g";
+        let member = MemberRef::parse(written).unwrap();
+        let held = match &member {
+            MemberRef::Dataset(reference) => reference.graph_iri_reading().unwrap().clone(),
+            MemberRef::Keyword(_) => unreachable!("{written} is no keyword"),
+        };
+        let shares = |graph: &GraphSel| matches!(graph, GraphSel::Named(iri) if Arc::ptr_eq(iri.as_arc(), held.as_arc()));
+        assert!(shares(
+            &target.resolve(written, &member, false).unwrap().graph
+        ));
+        assert!(shares(
+            &target.graph(&GraphSel::Named(held.clone())).unwrap().graph
+        ));
+    }
+
+    fn position(iri: &str) -> GraphPosition<'_> {
         let id = LedgerId::parse("L:feature").unwrap();
         TargetLedger::new(&id, &feature_registry).graph_position(iri)
     }
