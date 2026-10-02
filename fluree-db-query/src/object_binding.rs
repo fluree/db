@@ -907,6 +907,12 @@ impl ArenaCrossing {
         }
     }
 
+    /// Nothing crosses that needs decoding: both sides read one single graph,
+    /// or neither has a graph to decode through.
+    pub(crate) fn is_noop(&self) -> bool {
+        self.enter.is_none() && self.leave.is_none()
+    }
+
     /// Decode, through the outer graph, the arena handles in a row that seeds
     /// the scope.
     pub(crate) fn enter(&self, row: &mut [Binding]) {

@@ -548,6 +548,15 @@ impl GraphOperator {
             ));
         }
 
+        // The whole parent batch seeds the source undecoded: sound only
+        // because nothing crosses graphs here. This path runs without a
+        // dataset, where the source scope inherits the outer graph id, so the
+        // arena crossing is a no-op both ways.
+        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        debug_assert!(
+            crossing.is_noop(),
+            "batched R2RML GRAPH scope crosses graphs: {graph_iri}"
+        );
         let seed = BatchSeedOperator::from_batch(parent_batch.clone());
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
@@ -581,9 +590,7 @@ impl GraphOperator {
 
         // As at the per-row exit, only the columns this scope binds leave
         // through the crossing; the parent columns threaded through keep the
-        // outer graph's handles. (Without a dataset the scope inherits the
-        // outer graph id, so here the crossing decodes nothing.)
-        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        // outer graph's handles.
         let parent_len = self.child.schema().len();
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
