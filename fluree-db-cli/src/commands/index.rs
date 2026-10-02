@@ -18,7 +18,7 @@ pub struct IndexOutcome {
 /// a full rebuild when incremental isn't possible.
 pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(ledger, dirs)?;
-    let fluree = build_fluree(dirs)?;
+    let fluree = build_fluree(dirs).await?;
     let ledger_id = context::to_ledger_id(&alias)?;
 
     // Verify ledger exists

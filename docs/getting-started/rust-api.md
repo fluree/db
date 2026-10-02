@@ -72,7 +72,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     // Use file-backed storage for persistence
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Create a new ledger (or load an existing one)
     let ledger = fluree.create_ledger("mydb").await?;
@@ -84,6 +84,9 @@ async fn main() -> Result<()> {
 }
 ```
 
+`build_async()` replays the storage's write-ahead log without blocking the async runtime.
+`build()` builds the same instance from synchronous code, replaying the log on the calling thread.
+
 ### Bulk import (high throughput)
 
 For initial ledger bootstraps (large Turtle or JSON-LD datasets), Fluree exposes a bulk import
@@ -94,7 +97,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // `chunks_dir` can be:
     // - a directory containing *.ttl, *.trig, or *.jsonld files (sorted lexicographically), OR
@@ -423,7 +426,7 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = Arc::new(FlureeBuilder::file("./data").build()?);
+    let fluree = Arc::new(FlureeBuilder::file("./data").build_async().await?);
 
     // Plan against a borrowed GraphDb, then move the owned LedgerState into the
     // spawned producer (GraphDb borrows the state, so plan first).
@@ -540,7 +543,7 @@ use fluree_db_api::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Get a cached ledger handle
     let handle = fluree.ledger_cached("mydb:main").await?;
@@ -660,7 +663,7 @@ use std::fs::File;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Export as Turtle to a file
     let file = File::create("backup.ttl").unwrap();
@@ -751,7 +754,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     // Caching is on by default — no extra call needed
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // First call loads from storage
     let ledger = fluree.ledger("mydb:main").await?;
@@ -780,7 +783,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Load and use ledger
     let ledger = fluree.ledger("mydb:main").await?;
@@ -814,7 +817,7 @@ use fluree_db_api::{FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Check if ledger exists (lightweight nameservice lookup)
     if fluree.ledger_exists("mydb:main").await? {
@@ -850,7 +853,7 @@ use fluree_db_api::{FlureeBuilder, DropMode, DropStatus, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Soft drop: retract every branch in the nameservice, preserve artifacts
     let report = fluree.drop_ledger("mydb", DropMode::Soft).await?;
@@ -949,7 +952,7 @@ use fluree_db_api::{FlureeBuilder, NotifyResult, RefreshOpts, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Load ledger into cache
     let _ledger = fluree.ledger_cached("mydb:main").await?;
@@ -1022,7 +1025,7 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
     let handle = fluree.ledger_cached("mydb:main").await?;
 
     // Transaction returns the commit's t value
@@ -1399,7 +1402,7 @@ async fn main() -> Result<()> {
             "https://acme-fluree.example.com",
             Some("eyJhbG...".to_string()),
         )
-        .build()?;
+        .build_async().await?;
 
     let db = fluree.view("local-ledger:main").await?;
 
@@ -1468,7 +1471,7 @@ use tokio::time::{sleep, Duration};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = Arc::new(FlureeBuilder::file("./data").build()?);
+    let fluree = Arc::new(FlureeBuilder::file("./data").build_async().await?);
 
     // Start background indexer
     let indexer = BackgroundIndexerWorker::new(
@@ -1718,7 +1721,7 @@ async fn test_persistence() -> Result<()> {
 
     // Create ledger and write data
     {
-        let fluree = FlureeBuilder::file(path).build()?;
+        let fluree = FlureeBuilder::file(path).build_async().await?;
         let ledger = fluree.create_ledger("test").await?;
 
         let data = json!({"@context": {}, "@graph": [{"@id": "ex:test"}]});
@@ -1731,7 +1734,7 @@ async fn test_persistence() -> Result<()> {
 
     // Verify persistence by reopening
     {
-        let fluree = FlureeBuilder::file(path).build()?;
+        let fluree = FlureeBuilder::file(path).build_async().await?;
         let ledger = fluree.ledger("test:main").await?;
 
         assert!(ledger.t() > 0);
@@ -2021,7 +2024,7 @@ use serde_json::json;
 #[tokio::main]
 async fn main() -> Result<()> {
     // Caching is on by default (required for stage)
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Get a cached handle
     let handle = fluree.ledger_cached("mydb:main").await?;
@@ -2150,7 +2153,7 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Get ledger info with optional context for IRI compaction
     let context = json!({
@@ -2225,7 +2228,7 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = FlureeBuilder::file("./data").build()?;
+    let fluree = FlureeBuilder::file("./data").build_async().await?;
 
     // Find all ledgers on main branch
     let query = json!({

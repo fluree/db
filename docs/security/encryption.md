@@ -58,11 +58,12 @@ let client = FlureeBuilder::from_json_ld(&config)?
 // and the id that encrypts new writes.
 let fluree = FlureeBuilder::file("/data/fluree")
     .with_encryption_keys(vec![(1, old_key), (2, new_key)], 2)?
-    .build()?;
+    .build_async()
+    .await?;
 ```
 
 A key set on the builder (`with_encryption_key*()`, `with_encryption_keys()`,
-or `AES256Key` / `AES256Keys` in JSON-LD) is applied by every terminal build method — `build()`, `build_memory()`, `build_s3()`,
+or `AES256Key` / `AES256Keys` in JSON-LD) is applied by every terminal build method: `build()`, `build_async()`, `build_memory()`, `build_s3()`,
 `build_client()` and friends — on every backend. The `build_*_encrypted()` methods
 remain for callers that want the key to be an explicit argument;
 `build_encrypted(key)` replaces any configured key set with that one key, as

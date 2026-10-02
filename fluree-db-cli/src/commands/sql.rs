@@ -172,7 +172,7 @@ pub async fn run_sql_check(name: &str, dirs: &FlureeDir) -> CliResult<()> {
 
 #[cfg(feature = "sql")]
 async fn run_sql_check_local(name: &str, dirs: &FlureeDir) -> CliResult<()> {
-    let fluree = crate::context::build_fluree(dirs)?;
+    let fluree = crate::context::build_fluree(dirs).await?;
     let id = if name.contains(':') {
         name.to_string()
     } else {
@@ -208,7 +208,7 @@ async fn run_sql_check_local(_name: &str, _dirs: &FlureeDir) -> CliResult<()> {
 async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> {
     use fluree_db_api::{SqlAuthConfig, SqlConfigValue, SqlDialect, WireProtocol};
 
-    let fluree = crate::context::build_fluree(dirs)?;
+    let fluree = crate::context::build_fluree(dirs).await?;
     let mapping = read_mapping(&args)?;
     let mut config = fluree_db_api::SqlCreateConfig::new(&args.name, &args.endpoint, mapping);
     config.branch = args.branch.clone();
