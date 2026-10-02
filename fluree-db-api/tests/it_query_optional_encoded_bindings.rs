@@ -1609,6 +1609,224 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
 }
 
 // ---------------------------------------------------------------------------
+// Arena-backed literals crossing a GRAPH scope.
+//
+// A GRAPH scope's scans bind big numbers and vectors as handles into its own
+// graph's arenas, counted from 0 per graph and predicate. A handle that
+// crosses the scope's boundary, out with its rows or in with the row that
+// seeds it, must be decoded through the graph that bound it: otherwise it is
+// printed or matched as another graph's value, or reaches a union of graphs
+// that has no single graph to decode it in.
+// ---------------------------------------------------------------------------
+
+/// One vector per graph, each handle 0 of its own arena: x1's in the default
+/// graph, y1's in g2, z1's in g3. One big number per graph, each handle 0 too:
+/// x1's 1.5, y1's 7.5, z1's 9.5. Indexed.
+async fn graph_scope_arena_ledger(ledger_id: &str) -> (Fluree, LedgerHandle) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        @prefix f: <https://ns.flur.ee/db#> .
+        ex:x1 ex:emb "[1.0, 0.0]"^^f:embeddingVector ; ex:amount 1.5 .
+        GRAPH <urn:g2> {
+            ex:y1 ex:emb "[0.0, 1.0]"^^f:embeddingVector ; ex:amount 7.5 .
+        }
+        GRAPH <urn:g3> {
+            ex:z1 ex:emb "[0.5, 0.5]"^^f:embeddingVector ; ex:amount 9.5 .
+        }
+    "#;
+    fluree
+        .stage(&handle)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("seed TriG");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
+    let view = handle.snapshot().await;
+    assert!(view.binary_store.is_some(), "indexed");
+    assert!(view.novelty.is_empty(), "no novelty");
+    (fluree, handle)
+}
+
+/// Run each `(label, SPARQL body, projected variables, expected rows)` case,
+/// recording a mismatch or a query error.
+async fn check_sparql_cases(
+    fluree: &Fluree,
+    handle: &LedgerHandle,
+    cases: &[(&str, String, &[&str], &[&[&str]])],
+    failures: &mut Failures,
+) {
+    for (label, body, vars, expected) in cases {
+        let query = format!("{PREFIXES}{body}");
+        let result = db(handle)
+            .await
+            .query(fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await;
+        match result {
+            Ok(json) => failures.eq(sparql_rows(&json, vars), rows(expected), label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vector_leaving_a_graph_scope_keeps_its_graphs_value() {
+    let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-vector-exit:main").await;
+    let mut failures = Failures::default();
+    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[
+        (
+            "a default-graph vector (control)",
+            "SELECT ?s ?e WHERE { ?s ex:emb ?e }".into(),
+            &["s", "e"],
+            &[&["x1", "[1.0,0.0]"]],
+        ),
+        (
+            "a vector projected out of GRAPH",
+            "SELECT ?s ?e WHERE { GRAPH <urn:g2> { ?s ex:emb ?e } }".into(),
+            &["s", "e"],
+            &[&["y1", "[0.0,1.0]"]],
+        ),
+        (
+            "a default-graph vector joined against a GRAPH scope",
+            "SELECT ?a ?b WHERE { ?a ex:emb ?e . GRAPH <urn:g2> { ?b ex:emb ?e } }".into(),
+            &["a", "b"],
+            &[],
+        ),
+    ];
+    check_sparql_cases(&fluree, &handle, cases, &mut failures).await;
+
+    let query = json!({
+        "@context": context(),
+        "select": ["?s", "?e"],
+        "where": [["graph", "urn:g2", {"@id": "?s", "ex:emb": "?e"}]]
+    });
+    failures.eq(
+        jsonld_rows(&jsonld(&fluree, &handle, &query).await),
+        rows(&[&["y1", "[0.0,1.0]"]]),
+        "a vector projected out of GRAPH (JSON-LD)",
+    );
+    failures.assert_none();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn arena_literals_entering_a_graph_scope_keep_their_graphs_value() {
+    let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-arena-entry:main").await;
+    let mut failures = Failures::default();
+    // The OPTIONAL runs after the row that seeds it, so its GRAPH scope
+    // receives x1's handles; no graph-2 value equals x1's.
+    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[
+        (
+            "a default-graph vector carried into a GRAPH scope",
+            "SELECT ?b WHERE { ex:x1 ex:emb ?e . OPTIONAL { GRAPH <urn:g2> { ?b ex:emb ?e } } }"
+                .into(),
+            &["b"],
+            &[&["-"]],
+        ),
+        (
+            "a default-graph big number carried into a GRAPH scope",
+            "SELECT ?y WHERE { ex:x1 ex:amount ?v . \
+             OPTIONAL { GRAPH <urn:g2> { ?y ex:amount ?v } } }"
+                .into(),
+            &["y"],
+            &[&["-"]],
+        ),
+    ];
+    check_sparql_cases(&fluree, &handle, cases, &mut failures).await;
+
+    let query = json!({
+        "@context": context(),
+        "select": ["?b"],
+        "where": [
+            {"@id": "ex:x1", "ex:emb": "?e"},
+            ["optional", ["graph", "urn:g2", {"@id": "?b", "ex:emb": "?e"}]]
+        ]
+    });
+    failures.eq(
+        jsonld_rows(&jsonld(&fluree, &handle, &query).await),
+        rows(&[&["-"]]),
+        "a default-graph vector carried into a GRAPH scope (JSON-LD)",
+    );
+    failures.assert_none();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn graph_scope_vector_projected_inside_a_union() {
+    let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-vector-union-proj:main").await;
+    let mut failures = Failures::default();
+    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[(
+        "a vector projected out of GRAPH inside a union",
+        "SELECT ?s ?e FROM <urn:g2> FROM <urn:g3> FROM NAMED <urn:g3> \
+         WHERE { GRAPH <urn:g3> { ?s ex:emb ?e } }"
+            .into(),
+        &["s", "e"],
+        &[&["z1", "[0.5,0.5]"]],
+    )];
+    check_sparql_cases(&fluree, &handle, cases, &mut failures).await;
+    failures.assert_none();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn graph_scope_vector_joined_with_a_union() {
+    let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-vector-union-join:main").await;
+    let mut failures = Failures::default();
+    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[(
+        "a GRAPH-scope vector joined with a union",
+        "SELECT ?s ?t FROM <urn:g2> FROM <urn:g3> FROM NAMED <urn:g3> \
+         WHERE { GRAPH <urn:g3> { ?s ex:emb ?e } ?t ex:emb ?e }"
+            .into(),
+        &["s", "t"],
+        &[&["z1", "z1"]],
+    )];
+    check_sparql_cases(&fluree, &handle, cases, &mut failures).await;
+    failures.assert_none();
+}
+
+/// The union's first graph is the scope's own, so the context its rows return
+/// to starts on the scope's graph id, yet spans two graphs and decodes in
+/// neither.
+#[tokio::test(flavor = "current_thread")]
+async fn graph_scope_vector_joined_with_a_union_led_by_its_graph() {
+    let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-vector-union-led:main").await;
+    let mut failures = Failures::default();
+    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[(
+        "a GRAPH-scope vector joined with a union led by its graph",
+        "SELECT ?s ?t FROM <urn:g3> FROM <urn:g2> FROM NAMED <urn:g3> \
+         WHERE { GRAPH <urn:g3> { ?s ex:emb ?e } ?t ex:emb ?e }"
+            .into(),
+        &["s", "t"],
+        &[&["z1", "z1"]],
+    )];
+    check_sparql_cases(&fluree, &handle, cases, &mut failures).await;
+    failures.assert_none();
+}
+
+/// The big-number twin of the case above.
+#[tokio::test(flavor = "current_thread")]
+async fn graph_scope_big_number_joined_with_a_union_led_by_its_graph() {
+    let (fluree, handle) = graph_scope_arena_ledger("it/graph-scope-numbig-union-led:main").await;
+    let mut failures = Failures::default();
+    let cases: &[(&str, String, &[&str], &[&[&str]])] = &[(
+        "a GRAPH-scope big number joined with a union led by its graph",
+        "SELECT ?s ?t FROM <urn:g3> FROM <urn:g2> FROM NAMED <urn:g3> \
+         WHERE { GRAPH <urn:g3> { ?s ex:amount ?v } ?t ex:amount ?v }"
+            .into(),
+        &["s", "t"],
+        &[&["z1", "z1"]],
+    )];
+    check_sparql_cases(&fluree, &handle, cases, &mut failures).await;
+    failures.assert_none();
+}
+
+// ---------------------------------------------------------------------------
 // Encoded values outside triple patterns: property-path endpoints and GRAPH.
 // ---------------------------------------------------------------------------
 
