@@ -186,3 +186,71 @@ async fn unwind_bound_list_variable() {
         .collect();
     assert_eq!(nums, vec![1, 2, 3]);
 }
+
+/// Rows of a JSON-LD query, sorted.
+async fn sorted_rows(
+    fluree: &MemoryFluree,
+    ledger: &fluree_db_api::LedgerState,
+    q: &JsonValue,
+) -> Vec<JsonValue> {
+    let db = graphdb_from_ledger(ledger);
+    let result = fluree.query(&db, q).await.expect("query");
+    let rows = result
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("rows");
+    let mut rows = rows.as_array().expect("array").clone();
+    rows.sort_by_key(ToString::to_string);
+    rows
+}
+
+/// UNWIND binds its variable before a triple that reads it, so the triple
+/// matches only the unwound values. Held behind that triple, the UNWIND
+/// overwrote the year the triple matched, and every order came back once per
+/// element of the range.
+#[tokio::test]
+async fn unwind_binds_the_variable_a_later_triple_matches() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = seed_orders(&fluree, "it/unwind:later-triple").await;
+
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?o", "?year"],
+        "where": [
+            ["unwind", "?year", "(range 2020 2021)"],
+            {"@id": "?o", "ex:orderYear": "?year"}
+        ]
+    });
+    assert_eq!(
+        sorted_rows(&fluree, &ledger, &q).await,
+        vec![json!(["ex:o2", 2020]), json!(["ex:o3", 2020])]
+    );
+}
+
+/// An update's WHERE is planned the same way, so it decides which orders the
+/// update writes to.
+#[tokio::test]
+async fn update_where_unwind_matches_only_the_unwound_values() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = seed_orders(&fluree, "it/unwind:update-where").await;
+
+    let txn = json!({
+        "@context": ctx(),
+        "where": [
+            ["unwind", "?year", "(range 2020 2021)"],
+            {"@id": "?o", "ex:orderYear": "?year"}
+        ],
+        "insert": {"@id": "?o", "ex:flagged": true}
+    });
+    let ledger = fluree.update(ledger, &txn).await.expect("update").ledger;
+
+    let flagged = json!({
+        "@context": ctx(),
+        "select": ["?o"],
+        "where": {"@id": "?o", "ex:flagged": true}
+    });
+    assert_eq!(
+        sorted_rows(&fluree, &ledger, &flagged).await,
+        vec![json!(["ex:o2"]), json!(["ex:o3"])]
+    );
+}
