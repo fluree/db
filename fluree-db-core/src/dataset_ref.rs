@@ -123,6 +123,16 @@ pub enum GraphSel {
 }
 
 impl GraphSel {
+    /// The text that names this graph: its keyword, or its IRI.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Default => "default",
+            Self::TxnMeta => "txn-meta",
+            Self::Config => "config",
+            Self::Named(iri) => iri.as_str(),
+        }
+    }
+
     /// The keyword spellings, in the order [`GraphSel::keyword`] matches them.
     pub const KEYWORDS: [&'static str; 3] = ["default", "txn-meta", "config"];
 
@@ -170,12 +180,7 @@ impl GraphSel {
 
 impl fmt::Display for GraphSel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Default => f.write_str("default"),
-            Self::TxnMeta => f.write_str("txn-meta"),
-            Self::Config => f.write_str("config"),
-            Self::Named(iri) => f.write_str(iri),
-        }
+        f.write_str(self.as_str())
     }
 }
 

@@ -224,7 +224,8 @@ impl DatasetSpec {
 /// Two fields stay public for callers that read which ledgers a query names
 /// before running it (an authorizer, for one): [`GraphSource::identifier`] and
 /// [`GraphSource::policy_override`]. Both are derived from the parse, and
-/// resolution reads the typed reference, never them.
+/// resolution reads the typed reference, never them. Read them; do not set
+/// them.
 #[derive(Debug, Clone)]
 pub struct GraphSource {
     /// The reference as the query named it, with an address's `@` time pin
@@ -235,7 +236,10 @@ pub struct GraphSource {
     /// The per-source policy the object form's `policy` names, applied to this
     /// source in place of the request's policy.
     pub policy_override: Option<SourcePolicyOverride>,
-    written: Arc<str>,
+    /// The text as written, kept only when it differs from `identifier` (a
+    /// `urn:fluree:` or pinned spelling, an object's `@id`): usually the two
+    /// agree, and the text is stored once.
+    written: Option<Arc<str>>,
     /// What `written` names. An address here carries no pin: the pin lives in
     /// `at`, where a JSON-LD `t` / `at` key or a path pin also lands.
     reference: MemberRef,
@@ -274,21 +278,35 @@ impl GraphSource {
     pub fn parse(s: &str) -> Result<Self, DatasetParseError> {
         let reference = MemberRef::parse(s)
             .map_err(|e| DatasetParseError::InvalidGraphSource(format!("'{s}': {e}")))?;
-        Ok(Self::from_member(s.into(), reference))
+        Ok(Self::from_member(s, reference))
     }
 
     /// A member for an already-parsed ledger address: its graph, and its pin
-    /// as the member's time.
+    /// as the member's time. Its text, `name:branch[#graph]`, is built once,
+    /// at its final length, and is its identifier too.
     pub fn ledger(address: LedgerRef) -> Self {
-        let written: Arc<str> = if address.graph().is_default() {
-            address.id().as_str().into()
-        } else {
-            format!("{}#{}", address.id(), address.graph()).into()
-        };
-        Self::from_member(written, MemberRef::Dataset(DatasetRef::Address(address)))
+        let id = address.id().as_str();
+        let graph = (!address.graph().is_default()).then(|| address.graph().as_str());
+        let mut text = String::with_capacity(id.len() + graph.map_or(0, |g| 1 + g.len()));
+        text.push_str(id);
+        if let Some(graph) = graph {
+            text.push('#');
+            text.push_str(graph);
+        }
+        let reference = MemberRef::Dataset(DatasetRef::Address(address));
+        debug_assert_eq!(identifier_of(&text, &reference), text);
+        Self::from_parts(text, None, reference)
     }
 
-    fn from_member(written: Arc<str>, reference: MemberRef) -> Self {
+    /// A member written `written`: its identifier, and the text itself only
+    /// where the two differ.
+    fn from_member(written: &str, reference: MemberRef) -> Self {
+        let identifier = identifier_of(written, &reference);
+        let written = (identifier != written).then(|| written.into());
+        Self::from_parts(identifier, written, reference)
+    }
+
+    fn from_parts(identifier: String, written: Option<Arc<str>>, reference: MemberRef) -> Self {
         let (reference, at) = match reference {
             MemberRef::Dataset(DatasetRef::Address(address)) => {
                 let at = address.at().cloned();
@@ -300,7 +318,7 @@ impl GraphSource {
             other => (other, None),
         };
         Self {
-            identifier: identifier_of(&written, &reference),
+            identifier,
             policy_override: None,
             written,
             reference,
@@ -311,7 +329,7 @@ impl GraphSource {
 
     /// The text as written.
     pub fn written(&self) -> &str {
-        &self.written
+        self.written.as_deref().unwrap_or(&self.identifier)
     }
 
     /// What the text names (an address here carries no pin; see
@@ -339,7 +357,7 @@ impl GraphSource {
     /// The name `GRAPH <name>` matches and `GRAPH ?g` binds for a named member:
     /// the alias, else the text as written.
     pub fn name(&self) -> &str {
-        self.alias.as_deref().unwrap_or(&self.written)
+        self.alias.as_deref().unwrap_or_else(|| self.written())
     }
 
     /// Per-source policy override.
@@ -371,9 +389,10 @@ impl GraphSource {
     /// still matches. `None` for a member with no pin in its text.
     pub(crate) fn unpinned_name(&self) -> Option<String> {
         self.address()?;
-        let (before_graph, graph) = match self.written.split_once('#') {
+        let written = self.written();
+        let (before_graph, graph) = match written.split_once('#') {
             Some((before, graph)) => (before, Some(graph)),
-            None => (&*self.written, None),
+            None => (written, None),
         };
         let (base, _pin) = before_graph.split_once('@')?;
         Some(match graph {
@@ -1020,9 +1039,10 @@ fn parse_object_source(
         }
     }
 
-    let mut source = GraphSource::ledger(address);
-    source.identifier = identifier_of(raw_identifier, &source.reference);
-    source.written = raw_identifier.into();
+    let reference = MemberRef::Dataset(DatasetRef::Address(address));
+    let identifier = identifier_of(raw_identifier, &reference);
+    let written = (identifier != raw_identifier).then(|| raw_identifier.into());
+    let mut source = GraphSource::from_parts(identifier, written, reference);
     if let Some(policy_val) = obj.get("policy") {
         source = source.with_policy(parse_source_policy_override(policy_val)?);
     }
@@ -1263,6 +1283,30 @@ mod tests {
         assert_eq!(spec.num_graphs(), 3);
         assert_eq!(spec.default_graphs.len(), 2);
         assert_eq!(spec.named_graphs.len(), 1);
+    }
+
+    /// A member keeps its text once where the text is its identifier (an
+    /// address `GraphSource::ledger` builds, a canonical address, a graph IRI,
+    /// a keyword), and apart only where the two differ.
+    #[test]
+    fn a_member_keeps_its_text_once_unless_it_differs_from_its_identifier() {
+        let once =
+            |source: &GraphSource| std::ptr::eq(source.written(), source.identifier.as_str());
+        let address = LedgerRef::parse("mydb:main#http://ex.org/g").unwrap();
+        assert!(once(&GraphSource::ledger(address)));
+        for s in [
+            "mydb:main",
+            "mydb:main#txn-meta",
+            "http://ex.org/g",
+            "config",
+        ] {
+            assert!(once(&GraphSource::parse(s).unwrap()), "{s}");
+        }
+        for s in ["urn:fluree:mydb:main", "mydb:main@t:1"] {
+            let source = GraphSource::parse(s).unwrap();
+            assert!(!once(&source), "{s}");
+            assert_eq!(source.written(), s);
+        }
     }
 
     #[test]
