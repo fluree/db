@@ -494,8 +494,21 @@ pub(crate) fn bind_unifies(
     let gv = (is_numbig_encoded(a) || is_numbig_encoded(b))
         .then(|| ctx.graph_view())
         .flatten();
-    normalize_for_key_cow(a, Some(store), gv.as_ref()).as_ref()
+    if normalize_for_key_cow(a, Some(store), gv.as_ref()).as_ref()
         == normalize_for_key_cow(b, Some(store), gv.as_ref()).as_ref()
+    {
+        return true;
+    }
+    // An id novelty assigned (a subject or string no index holds yet) has no
+    // store form to normalize to, so compare what the two name.
+    if !(a.is_encoded() || b.is_encoded()) {
+        return false;
+    }
+    let Some(view) = ctx.graph_view() else {
+        return false;
+    };
+    crate::group_aggregate::materialize_encoded(a, Some(&view))
+        == crate::group_aggregate::materialize_encoded(b, Some(&view))
 }
 
 /// True if this is an arena-backed (NUM_BIG) encoded literal.

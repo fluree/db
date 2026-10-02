@@ -2387,3 +2387,40 @@ GRAPH <http://example.org/graphs/audit> {
     .await;
     assert_eq!(got, strings(&[&["ex:event1"], &["ex:event2"]]));
 }
+
+/// A reifier re-pointed, over an index, at an edge to a subject only novelty
+/// holds: the term's object is that subject's provisional id while the edge's
+/// scan binds the subject by name, and the two must still join.
+#[tokio::test]
+async fn links_join_a_subject_only_novelty_holds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/triple-term-links:novelty-subject";
+    let ttl = |o: &str| {
+        format!(
+            "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:knows ex:{o} ~ ex:claim1 {{| ex:confidence 0.9 |}} .\n"
+        )
+    };
+    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    fluree
+        .upsert_turtle(ledger, &ttl("bob"))
+        .await
+        .expect("bob");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    fluree
+        .upsert_turtle(ledger, &ttl("carol"))
+        .await
+        .expect("re-point to carol");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    for body in [
+        "SELECT ?o ?r WHERE { ex:alice ex:knows ?o . ?r rdf:reifies <<( ex:alice ex:knows ?o )>> }",
+    ] {
+        assert_eq!(
+            run_link_query(&fluree, &ledger, body.to_string()).await,
+            strings(&[&["ex:carol", "ex:claim1"]]),
+            "{body}"
+        );
+    }
+}
+
