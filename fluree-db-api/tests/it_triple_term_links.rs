@@ -1999,3 +1999,201 @@ async fn previews_read_the_links_of_their_own_annotations() {
         assert_eq!(got, strings(&[&["ex:erin"]]));
     }
 }
+
+/// A triple term renders as SPARQL 1.2's `triple` term in the SPARQL result
+/// formats, as `<<( s p o )>>` in delimited text, and as a JSON-LD-star
+/// embedded node in the JSON-LD formats, whichever writer (DOM or streaming)
+/// produces it.
+#[tokio::test]
+async fn triple_terms_render_in_every_result_format() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+    let (fluree, ledger) = import(
+        &[("claims.ttl", CLAIMS), ("literals.ttl", LITERAL_CLAIMS)],
+        "it/triple-term-links:formats",
+    )
+    .await;
+    let select = "PREFIX ex: <http://example.org/>\n\
+                  PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                  SELECT ?src ?t WHERE { ?r rdf:reifies ?t ; ex:source ?src \
+                  VALUES ?src { ex:hr ex:fr ex:int } } ORDER BY ?src";
+    let result = support::query_sparql(&fluree, &ledger, select)
+        .await
+        .expect("link query");
+    let string = |config: FormatterConfig| {
+        format_results_string(&result, &result.context, &ledger.snapshot, &config).expect("format")
+    };
+    let parsed = |config: FormatterConfig| -> JsonValue {
+        serde_json::from_str(&string(config)).expect("JSON output")
+    };
+
+    let iri = |l: &str| json!({"type": "uri", "value": format!("http://example.org/{l}")});
+    let triple = |s: &str, p: &str, o: JsonValue| json!({"type": "triple", "value": {"subject": iri(s), "predicate": iri(p), "object": o}});
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("SPARQL JSON");
+    let terms: Vec<&JsonValue> = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| &b["t"])
+        .collect();
+    assert_eq!(
+        terms,
+        [
+            &triple(
+                "doc",
+                "title",
+                json!({"type": "literal", "value": "chat", "xml:lang": "fr"})
+            ),
+            &triple("alice", "knows", iri("bob")),
+            &triple(
+                "doc",
+                "size",
+                json!({"type": "literal", "value": "5",
+                       "datatype": "http://www.w3.org/2001/XMLSchema#int"})
+            ),
+        ]
+    );
+    assert_eq!(parsed(FormatterConfig::sparql_json()), sparql_json);
+
+    let xml = string(FormatterConfig::sparql_xml());
+    for term in [
+        "<triple><subject><uri>http://example.org/doc</uri></subject>\
+         <predicate><uri>http://example.org/title</uri></predicate>\
+         <object><literal xml:lang=\"fr\">chat</literal></object></triple>",
+        "<triple><subject><uri>http://example.org/alice</uri></subject>\
+         <predicate><uri>http://example.org/knows</uri></predicate>\
+         <object><uri>http://example.org/bob</uri></object></triple>",
+        "<object><literal datatype=\"http://www.w3.org/2001/XMLSchema#int\">5</literal></object>",
+    ] {
+        assert!(xml.contains(term), "{term} in {xml}");
+    }
+
+    let tsv = result.to_tsv(&ledger.snapshot).expect("TSV");
+    assert!(
+        tsv.contains(
+            "\t<<( http://example.org/alice http://example.org/knows http://example.org/bob )>>\n"
+        ),
+        "{tsv}"
+    );
+    assert!(
+        tsv.contains("\t<<( http://example.org/doc http://example.org/title \"chat\"@fr )>>\n"),
+        "{tsv}"
+    );
+    let csv = result.to_csv(&ledger.snapshot).expect("CSV");
+    assert!(
+        csv.contains(
+            ",\"<<( http://example.org/doc http://example.org/title \"\"chat\"\"@fr )>>\""
+        ),
+        "{csv}"
+    );
+
+    let node = |s: &str, p: &str, o: JsonValue| json!({"@id": {"@id": s, p: o}});
+    let int = json!({"@value": 5, "@type": "http://www.w3.org/2001/XMLSchema#int"});
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("JSON-LD");
+    assert_eq!(
+        jsonld,
+        json!([
+            [
+                "ex:fr",
+                node(
+                    "ex:doc",
+                    "ex:title",
+                    json!({"@value": "chat", "@language": "fr"})
+                )
+            ],
+            [
+                "ex:hr",
+                node("ex:alice", "ex:knows", json!({"@id": "ex:bob"}))
+            ],
+            ["ex:int", node("ex:doc", "ex:size", int.clone())],
+        ])
+    );
+    assert_eq!(parsed(FormatterConfig::jsonld()), jsonld);
+    let typed = result.to_typed_json(&ledger.snapshot).expect("typed JSON");
+    assert_eq!(
+        typed[1]["?t"],
+        node("ex:alice", "ex:knows", json!({"@id": "ex:bob"}))
+    );
+    assert_eq!(typed[2]["?t"], node("ex:doc", "ex:size", int));
+    assert_eq!(parsed(FormatterConfig::typed_json()), typed);
+}
+
+/// `?r rdf:reifies ?t` in a CONSTRUCT template, with a triple term bound to
+/// ?t, writes what the explicit `<<( s p o )>>` template writes. Under any
+/// other predicate the term (which the graph model cannot hold as an object)
+/// is written as its N-Triples text.
+#[tokio::test]
+async fn construct_writes_triple_terms_as_reifications() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+    let (fluree, ledger) = import(
+        &[("claims.ttl", CLAIMS), ("literals.ttl", LITERAL_CLAIMS)],
+        "it/triple-term-links:construct",
+    )
+    .await;
+    let render = |result: &fluree_db_api::QueryResult, config: FormatterConfig| {
+        format_results_string(result, &result.context, &ledger.snapshot, &config).expect("format")
+    };
+    let construct = |template: &'static str, filter: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            let sparql = format!(
+                "PREFIX ex: <http://example.org/>\n\
+                 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                 CONSTRUCT {{ {template} }} WHERE {{ {filter} }}"
+            );
+            support::query_sparql(fluree, ledger, &sparql)
+                .await
+                .expect("construct")
+        }
+    };
+    let sorted = |result: &fluree_db_api::QueryResult| {
+        let mut lines: Vec<String> = render(result, FormatterConfig::ntriples())
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        lines
+    };
+
+    for (term_form, template_form) in [
+        (
+            "?r rdf:reifies ?t ; ex:source ex:hr",
+            "?r rdf:reifies <<( ?s ?p ?o )>> ; ex:source ex:hr",
+        ),
+        (
+            "?r rdf:reifies ?t ; ex:source ex:fr",
+            "?r rdf:reifies <<( ?s ?p ?o )>> ; ex:source ex:fr",
+        ),
+    ] {
+        let by_term = construct("?r rdf:reifies ?t", term_form).await;
+        let by_template = construct("?r rdf:reifies <<( ?s ?p ?o )>>", template_form).await;
+        let lines = sorted(&by_term);
+        assert_eq!(
+            lines.len(),
+            2,
+            "the base triple and its reification: {lines:#?}"
+        );
+        assert_eq!(lines, sorted(&by_template), "{term_form}");
+        assert_eq!(
+            by_term.to_construct(&ledger.snapshot).expect("JSON-LD"),
+            by_template.to_construct(&ledger.snapshot).expect("JSON-LD"),
+            "{term_form}"
+        );
+    }
+    let hr = construct("?r rdf:reifies ?t", "?r rdf:reifies ?t ; ex:source ex:hr").await;
+    assert_eq!(
+        hr.to_construct(&ledger.snapshot).expect("JSON-LD")["@graph"],
+        json!([{"@id": "ex:alice", "ex:knows": [{"@id": "ex:bob", "@annotation": {"@id": "ex:claim1"}}]}])
+    );
+
+    let about = construct("?r ex:about ?t", "?r rdf:reifies ?t ; ex:source ex:fr").await;
+    let nt = render(&about, FormatterConfig::ntriples());
+    assert!(
+        nt.contains(
+            r#" <http://example.org/about> "<<( <http://example.org/doc> <http://example.org/title> \"chat\"@fr )>>"^^"#
+        ),
+        "{nt}"
+    );
+}

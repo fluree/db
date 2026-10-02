@@ -636,7 +636,26 @@ fn write_flake_value(cell: &mut Vec<u8>, val: &FlakeValue, compactor: &IriCompac
         }
         FlakeValue::Json(json_str) => cell.extend_from_slice(json_str.as_bytes()),
         FlakeValue::GeoPoint(v) => cell.extend_from_slice(v.to_string().as_bytes()),
-        FlakeValue::TripleTerm(_) => cell.extend_from_slice(val.to_string().as_bytes()),
+        FlakeValue::TripleTerm(term) => {
+            cell.extend_from_slice(b"<<( ");
+            write_flake_value(cell, &FlakeValue::Ref(term.s.clone()), compactor);
+            cell.push(b' ');
+            write_flake_value(cell, &FlakeValue::Ref(term.p.clone()), compactor);
+            cell.push(b' ');
+            match &term.o {
+                // Quoted, so a string's spaces cannot run into the term's end.
+                FlakeValue::String(s) => {
+                    let quoted = serde_json::to_string(s).unwrap_or_default();
+                    cell.extend_from_slice(quoted.as_bytes());
+                    if let Some(lang) = &term.lang {
+                        cell.push(b'@');
+                        cell.extend_from_slice(lang.as_bytes());
+                    }
+                }
+                other => write_flake_value(cell, other, compactor),
+            }
+            cell.extend_from_slice(b" )>>");
+        }
     }
 }
 

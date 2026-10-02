@@ -351,6 +351,29 @@ All formats use the same representation:
 {"type": "uri", "value": "http://example.org/ns/alice"}
 ```
 
+### Triple Terms
+
+A triple term (an `rdf:reifies` object, or the result of `TRIPLE(...)`) is written in SPARQL
+JSON as a `triple` term
+([SPARQL 1.2 Query Results JSON Format](https://www.w3.org/TR/sparql12-results-json/)):
+
+```json
+{"type": "triple", "value": {
+  "subject": {"type": "uri", "value": "http://example.org/ns/alice"},
+  "predicate": {"type": "uri", "value": "http://example.org/ns/knows"},
+  "object": {"type": "uri", "value": "http://example.org/ns/bob"}}}
+```
+
+SPARQL XML uses the matching `<triple>` element, with `<subject>`, `<predicate>` and `<object>`
+children. JSON-LD 1.1 has no triple terms. JSON-LD and Typed JSON write one as an embedded
+node, the form of the JSON-LD-star community group report:
+
+```json
+{"@id": {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}}}
+```
+
+TSV and CSV write `<<( s p o )>>`.
+
 ## Rust API
 
 Use `FormatterConfig` to control output format via the query builder API:

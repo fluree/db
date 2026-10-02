@@ -365,7 +365,9 @@ details of each.
 - `?r rdf:reifies <<( s p o )>>` in a template also writes `s p o`, the same as the annotation
   tail `s p o ~ ?r`. Fluree reifies asserted edges only, as every write form does (see
   [Edge annotations](../concepts/edge-annotations.md)), so a result never carries a reifier
-  without its triple.
+  without its triple. `?r rdf:reifies ?t`, with `?t` bound to a triple term, writes the same.
+  Under any other predicate, a bound triple term is written as a literal holding its N-Triples
+  text: a result graph holds triple terms only as reifications.
 - A SPARQL datalog rule whose head (the template) annotates an edge or writes into a named
   graph is rejected: rules infer default-graph triples only.
 

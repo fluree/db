@@ -210,6 +210,25 @@ fn write_term(
         Binding::Sid { sid, .. } => write_sid_ref(out, compactor, sid)?,
         Binding::IriMatch { iri, .. } => write_iri_ref(out, iri.as_ref()),
         Binding::Iri(iri) => write_iri_ref(out, iri.as_ref()),
+        Binding::Lit {
+            val: FlakeValue::TripleTerm(term),
+            ..
+        } => {
+            out.push_str("<triple>");
+            for (name, component) in ["subject", "predicate", "object"]
+                .into_iter()
+                .zip(super::triple_term_components(term))
+            {
+                out.push('<');
+                out.push_str(name);
+                out.push('>');
+                write_term(out, result, &component, compactor, gv)?;
+                out.push_str("</");
+                out.push_str(name);
+                out.push('>');
+            }
+            out.push_str("</triple>");
+        }
         Binding::Lit { val, dtc, .. } => write_literal(out, compactor, val, dtc)?,
 
         // Encoded subject/predicate refs resolve directly to their full IRI —
