@@ -181,31 +181,6 @@ impl ServiceOperator {
                 .then(|| Arc::clone(&gref.ledger_id))
         });
 
-        // Build seed operator from parent row (like EXISTS/Subquery). Across a
-        // ledger boundary the parent's raw `Sid`s are stamped in the
-        // REQUESTER's ledger first: a body `BIND(?parent AS ?x)` would
-        // otherwise copy a requester-encoded `Sid` into a column the boundary
-        // stamp then decodes through the target's table.
-        let seed = match &cross_ledger {
-            Some(_) => {
-                let schema: Arc<[VarId]> =
-                    Arc::from(parent_batch.schema().to_vec().into_boxed_slice());
-                let row = parent_batch
-                    .row_view(row_idx)
-                    .expect("row_idx must be valid for parent batch")
-                    .to_vec();
-                SeedOperator::from_row(schema, crate::dataset_operator::stamp_seed_row(row, ctx))
-            }
-            None => SeedOperator::from_batch_row(parent_batch, row_idx),
-        };
-        let mut inner = build_where_operators_seeded(
-            Some(Box::new(seed)),
-            &self.service.patterns,
-            None,
-            None,
-            &self.planning,
-        )?;
-
         // Create execution context for the target ledger
         // If graph_ref is Some, create a new context; otherwise use the current context (self-reference)
         //
@@ -239,6 +214,37 @@ impl ServiceOperator {
         } else {
             ctx
         };
+
+        // Build seed operator from parent row (like EXISTS/Subquery). Across a
+        // ledger boundary the parent's raw `Sid`s are stamped in the
+        // REQUESTER's ledger first: a body `BIND(?parent AS ?x)` would
+        // otherwise copy a requester-encoded `Sid` into a column the boundary
+        // stamp then decodes through the target's table.
+        //
+        // A target graph other than the parent's also reads other arenas: the
+        // parent row's arena handles (big numbers, vectors) are decoded
+        // through the parent's graph on the way in, and the body's through
+        // the target's on the way out.
+        let crossing = crate::object_binding::ArenaCrossing::between(ctx, ctx_to_use);
+        let mut row: Vec<Binding> = parent_batch
+            .row_view(row_idx)
+            .expect("row_idx must be valid for parent batch")
+            .to_vec();
+        crossing.enter(&mut row);
+        let schema: Arc<[VarId]> = Arc::from(parent_batch.schema().to_vec().into_boxed_slice());
+        let seed = match &cross_ledger {
+            Some(_) => {
+                SeedOperator::from_row(schema, crate::dataset_operator::stamp_seed_row(row, ctx))
+            }
+            None => SeedOperator::from_row(schema, row),
+        };
+        let mut inner = build_where_operators_seeded(
+            Some(Box::new(seed)),
+            &self.service.patterns,
+            None,
+            None,
+            &self.planning,
+        )?;
 
         match inner.open(ctx_to_use).await {
             Ok(()) => {}
@@ -324,7 +330,7 @@ impl ServiceOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
-                        merged_row.push(binding);
+                        merged_row.push(crossing.leave(binding));
                     }
                 }
 
