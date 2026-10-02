@@ -49,6 +49,22 @@ pub fn resolve_in_target(
     graphs: Option<GraphLookup<'_>>,
     written: &str,
 ) -> Result<InTarget> {
+    // The target's id exactly as it stands is its own address with no pin and
+    // no graph: its default graph, whatever the registry holds (resolution's
+    // step 0). Recognized as is, so the id is not parsed a second time. An id
+    // has exactly one `:`; one stored before the current grammar may also
+    // hold `@`, `#` or `://`, which a dataset position reads otherwise, so
+    // such an id takes the full parse.
+    if written == target.as_str() && !written.contains(['@', '#']) && !written.contains("://") {
+        debug_assert!(MemberRef::parse(written).is_ok_and(|member| member
+            .address()
+            .is_some_and(|a| a.id() == target && a.at().is_none() && a.graph().is_default())));
+        return Ok(InTarget {
+            graph: GraphSel::Default,
+            at: None,
+            own_address: true,
+        });
+    }
     let member = MemberRef::parse(written).map_err(|e| {
         ApiError::invalid_query(format!("<{written}> is not a graph of this ledger: {e}"))
     })?;
@@ -525,6 +541,44 @@ mod tests {
         assert_eq!(
             jsonld_view_ledger(&json!({"from": "a:main", "opts": {"from": "b:main@t:1"}})),
             None
+        );
+    }
+
+    /// The target's id as it stands reads exactly as every other spelling of
+    /// its address does: its default graph, even where a graph is registered
+    /// under that text, with or without a registry.
+    #[test]
+    fn the_targets_own_id_reads_as_its_other_spellings() {
+        let target = id("books:main");
+        let lookup = graphs(&["books:main"]);
+        let lookup: GraphLookup<'_> = &lookup;
+        for graphs in [Some(lookup), None] {
+            for written in [
+                "books:main",
+                "books",
+                "urn:fluree:books:main",
+                "books:main#default",
+            ] {
+                let resolved = resolve_in_target(&target, graphs, written).unwrap();
+                assert!(matches!(resolved.graph, GraphSel::Default), "{written}");
+                assert_eq!(resolved.at, None, "{written}");
+                assert!(resolved.own_address, "{written}");
+            }
+        }
+        // A stored id from before the current grammar, with `@` in its name,
+        // is not the plain address its text spells: it takes the full parse.
+        let legacy = LedgerId::parse_persisted("old@db:main").unwrap();
+        let resolved = resolve_in_target(&legacy, None, legacy.as_str());
+        assert!(
+            !matches!(
+                resolved,
+                Ok(InTarget {
+                    graph: GraphSel::Default,
+                    own_address: true,
+                    ..
+                })
+            ),
+            "{resolved:?}"
         );
     }
 
