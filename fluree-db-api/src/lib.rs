@@ -2482,7 +2482,6 @@ impl FlureeBuilder {
     #[cfg(feature = "native")]
     pub fn build(mut self) -> Result<Fluree> {
         let storage = self.open_file_storage()?;
-        // Writes a crash left unflushed are applied before anything reads this tree.
         storage.recover_wal()?;
         Ok(self.build_file(storage))
     }
@@ -2494,7 +2493,6 @@ impl FlureeBuilder {
     #[cfg(feature = "native")]
     pub async fn build_async(mut self) -> Result<Fluree> {
         let storage = self.open_file_storage()?;
-        // Writes a crash left unflushed are applied before anything reads this tree.
         storage.recover_wal_async().await?;
         Ok(self.build_file(storage))
     }
