@@ -6883,6 +6883,21 @@ where
                 }
             }
 
+            let reifies = fluree_db_core::rdf_reifies_sid();
+            let reifies_p_id = predicate_sids_v6
+                .iter()
+                .position(|(ns, name)| *ns == reifies.namespace_code && *name == *reifies.name)
+                .map(|p_id| p_id as u32);
+            let links = fluree_db_indexer::stats::link_stat_entries(
+                &id_stats.term_rows,
+                reifies_p_id,
+                |p_id| {
+                    predicate_sids_v6
+                        .get(p_id as usize)
+                        .cloned()
+                        .unwrap_or((0u16, String::new()))
+                },
+            );
             let mut stats = is::IndexStats {
                 flakes: id_stats.total_flakes,
                 size: 0,
@@ -6894,6 +6909,7 @@ where
                 // record at every `t` — historical coverage is complete from
                 // genesis.
                 historical_since_t: Some(0),
+                links: Some(links),
             };
             // Wire `total_commit_size` into `stats.size` and per-graph sizes,
             // mirroring `root_assembly::compose_root_v6` for the normal indexing

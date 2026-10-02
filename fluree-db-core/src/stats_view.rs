@@ -101,6 +101,9 @@ pub struct StatsView {
     /// query stats-cache builder; defaults `false` so any caller that does not
     /// explicitly vouch for current-state exactness never triggers elision.
     pub class_coverage_trustworthy: bool,
+    /// Inner predicate SID -> live `rdf:reifies` links whose triple term has
+    /// it. `None` when the stats carry no link counts.
+    pub links: Option<HashMap<Sid, u64>>,
 }
 
 /// Per-property statistics within a graph, keyed by numeric IDs.
@@ -219,6 +222,13 @@ impl StatsView {
             }
         }
 
+        view.links = stats.links.as_ref().map(|links| {
+            links
+                .iter()
+                .map(|l| (Sid::new(l.sid.0, &l.sid.1), l.count))
+                .collect()
+        });
+
         if let Some(ref graphs) = stats.graphs {
             for g_entry in graphs {
                 let mut prop_map = HashMap::new();
@@ -290,6 +300,14 @@ impl StatsView {
         view.source = Some(Arc::clone(stats));
         view.iri_encoder = Some(StatsIriEncoder::from_snapshot(snapshot));
         view
+    }
+
+    /// Live `rdf:reifies` links whose triple term has inner predicate `p`;
+    /// `None` when the stats carry no link counts.
+    pub fn link_count(&self, p: &Sid) -> Option<u64> {
+        self.links
+            .as_ref()
+            .map(|links| links.get(p).copied().unwrap_or(0))
     }
 
     /// The per-class stats entry for `class_sid`, by binary search over the
@@ -615,6 +633,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         }
     }
 
@@ -660,6 +679,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
         let view = StatsView::from_db_stats(&stats);
         assert!(!view.has_property_stats());
@@ -684,6 +704,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
         let view = StatsView::from_db_stats(&stats);
         assert!(view.has_property_stats());
@@ -1027,6 +1048,7 @@ mod tests {
             }]),
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
         let view = StatsView::from_db_stats(&stats);
         assert!(view.has_class_stats());

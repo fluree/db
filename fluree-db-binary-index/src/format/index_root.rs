@@ -1669,6 +1669,7 @@ mod tests {
                 }]),
             }]),
             historical_since_t: Some(0),
+            links: None,
         });
         root.schema = Some(IndexSchema {
             t: 4,

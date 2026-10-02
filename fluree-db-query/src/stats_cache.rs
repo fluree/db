@@ -423,6 +423,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         }));
 
         let mut novelty = Novelty::new(1);
@@ -615,6 +616,7 @@ mod tests {
                 classes: None,
                 graphs: None,
                 historical_since_t: since,
+                links: None,
             }));
             snapshot
         };

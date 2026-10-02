@@ -8,7 +8,7 @@
 use crate::index_schema::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
 use crate::index_stats::{
     ClassPropertyUsage, ClassRefCount, ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry,
-    IndexStats, PropertyStatEntry,
+    IndexStats, LinkStatEntry, PropertyStatEntry,
 };
 use crate::sid::Sid;
 use std::io;
@@ -369,6 +369,56 @@ pub fn encode_class_tail(buf: &mut Vec<u8>, graphs: &[&GraphStatsEntry]) {
     }
 }
 
+/// Wire tag identifying the reification-link tail.
+const LINK_TAIL_TAG: u8 = 3;
+
+/// Append the live `rdf:reifies` link counts per inner predicate. Written
+/// after the historical and class tails, which a reader that predates it
+/// still parses; such a reader stops at this tag.
+///
+/// ```text
+/// [tag: u8 = 3]
+/// [entry_count: varint]
+///   per entry, by Sid: [ns_code: u16 LE][name_len: varint][name][count: varint]
+/// ```
+pub fn encode_link_tail(buf: &mut Vec<u8>, links: &[LinkStatEntry]) {
+    use crate::commit::codec::varint::encode_varint;
+    let mut sorted: Vec<&LinkStatEntry> = links.iter().collect();
+    sorted.sort_by(|a, b| a.sid.cmp(&b.sid));
+    buf.push(LINK_TAIL_TAG);
+    encode_varint(sorted.len() as u64, buf);
+    for entry in sorted {
+        buf.extend_from_slice(&entry.sid.0.to_le_bytes());
+        encode_varint(entry.sid.1.len() as u64, buf);
+        buf.extend_from_slice(entry.sid.1.as_bytes());
+        encode_varint(entry.count, buf);
+    }
+}
+
+/// Decode the link tail written by [`encode_link_tail`] (tag already consumed).
+fn decode_link_tail(data: &[u8], pos: &mut usize) -> io::Result<Vec<LinkStatEntry>> {
+    let (n, cap) = read_count(data, pos)?;
+    let mut links = Vec::with_capacity(cap);
+    for _ in 0..n {
+        let ns_code = read_u16(data, pos)?;
+        let len = read_varint(data, pos)? as usize;
+        ensure_len(data, *pos, len, "link tail sid")?;
+        let name = std::str::from_utf8(&data[*pos..*pos + len]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "link tail: sid name is not UTF-8",
+            )
+        })?;
+        *pos += len;
+        let count = read_varint(data, pos)?;
+        links.push(LinkStatEntry {
+            sid: (ns_code, name.to_string()),
+            count,
+        });
+    }
+    Ok(links)
+}
+
 /// Decode the class tail written by [`encode_class_tail`] (tag already
 /// consumed): each graph's class table. Decoded Sids share their names.
 fn decode_class_tail(data: &[u8], pos: &mut usize) -> io::Result<Vec<(u16, Vec<ClassStatEntry>)>> {
@@ -632,9 +682,14 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
     // Appended sections, each led by its tag; an unknown tag ends the parse
     // (the root length-prefixes the stats section, so the rest is skipped).
     let mut tail = None;
+    let mut links = None;
     while pos < data.len() {
         match data[pos] {
             HISTORICAL_TAIL_TAG => tail = decode_historical_tail(data, &mut pos)?,
+            LINK_TAIL_TAG => {
+                pos += 1;
+                links = Some(decode_link_tail(data, &mut pos)?);
+            }
             CLASS_TAIL_TAG => {
                 pos += 1;
                 for (g_id, classes) in decode_class_tail(data, &mut pos)? {
@@ -671,6 +726,7 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
             Some(graphs)
         },
         historical_since_t: None,
+        links,
     };
     apply_historical_tail(&mut stats, tail);
 

@@ -10,7 +10,7 @@
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{CompareOp, Function, Grouping, Pattern, SubqueryPattern};
 use crate::var_registry::VarId;
-use fluree_db_core::{FlakeValue, PropertyStatData, StatsView};
+use fluree_db_core::{FlakeValue, PropertyStatData, Sid, StatsView};
 use std::collections::{HashMap, HashSet};
 
 // =============================================================================
@@ -1519,6 +1519,97 @@ struct RankedPattern {
     /// left-join ordering barrier (see [`left_join_order_barriers`]). Empty
     /// unless an OPTIONAL in the group shares a not-yet-certain variable with it.
     after_indices: Vec<usize>,
+    /// The inner predicate a sibling filter pins on this link triple's term
+    /// (see [`link_triple_pin`]).
+    link_pin: Option<Sid>,
+}
+
+impl RankedPattern {
+    fn estimate(&self, bound_vars: &HashSet<VarId>, stats: Option<&StatsView>) -> PatternEstimate {
+        estimate_pinned(&self.pattern, self.link_pin.as_ref(), bound_vars, stats)
+    }
+}
+
+/// [`estimate_pattern`], except that a link scan `?r rdf:reifies ?t` whose
+/// term a filter pins to inner predicate `pin` reads only that predicate's
+/// handle interval: its live links, not every link.
+fn estimate_pinned(
+    pattern: &Pattern,
+    pin: Option<&Sid>,
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> PatternEstimate {
+    if let (Some(pin), Some(stats), Pattern::Triple(tp)) = (pin, stats, pattern) {
+        if classify_pattern(tp, bound_vars) == PatternType::PropertyScan {
+            if let Some(links) = stats.link_count(pin) {
+                return PatternEstimate::Source {
+                    row_count: links as f64,
+                };
+            }
+        }
+    }
+    estimate_pattern(pattern, bound_vars, stats)
+}
+
+/// The inner predicates a group's filters pin on its term variables.
+pub fn link_pins(patterns: &[Pattern]) -> HashMap<VarId, Sid> {
+    patterns
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::Filter(expr) => term_predicate_pin(expr),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`estimate_pattern`] for a pattern of a group whose filters pin `pins`.
+pub fn estimate_in_group(
+    pattern: &Pattern,
+    pins: &HashMap<VarId, Sid>,
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> PatternEstimate {
+    estimate_pinned(
+        pattern,
+        link_triple_pin(pattern, pins).as_ref(),
+        bound_vars,
+        stats,
+    )
+}
+
+/// The inner predicate `sameTerm(PREDICATE(?t), <p>)` pins on term variable
+/// `?t`, as the link lowering writes it.
+fn term_predicate_pin(filter: &Expression) -> Option<(VarId, Sid)> {
+    let Expression::Call { args, .. } = filter else {
+        return None;
+    };
+    let var = args.iter().find_map(|arg| match arg {
+        Expression::Call {
+            func: Function::TriplePredicate,
+            args,
+        } => match args.as_slice() {
+            [Expression::Var(v)] => Some(*v),
+            _ => None,
+        },
+        _ => None,
+    })?;
+    term_component_constraint(filter, var)?
+        .term_predicate
+        .map(|p| (var, p))
+}
+
+/// The pinned inner predicate of a link triple `?r rdf:reifies ?t`.
+fn link_triple_pin(pattern: &Pattern, pins: &HashMap<VarId, Sid>) -> Option<Sid> {
+    let Pattern::Triple(tp) = pattern else {
+        return None;
+    };
+    let Ref::Sid(p) = &tp.p else {
+        return None;
+    };
+    if !fluree_db_core::is_rdf_reifies(p) {
+        return None;
+    }
+    pins.get(&tp.o.as_var()?).cloned()
 }
 
 /// A deferred pattern (FILTER/BIND) with pre-computed input variables.
@@ -2023,6 +2114,7 @@ pub fn reorder_patterns_with_seed(
     }
 
     let mut bound_vars = seed.schema.clone();
+    let link_pins = link_pins(patterns);
 
     // PIPELINE outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
     // producers). A pattern consuming one of these must be placed AFTER the
@@ -2236,21 +2328,25 @@ pub fn reorder_patterns_with_seed(
             }
         }
 
-        match estimate_pattern(pattern, &bound_vars, stats) {
+        let link_pin = link_triple_pin(pattern, &link_pins);
+        match estimate_pinned(pattern, link_pin.as_ref(), &bound_vars, stats) {
             PatternEstimate::Source { .. } => sources.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
                 after_indices: barriers[i].clone(),
+                link_pin,
             }),
             PatternEstimate::Reducer { .. } => reducers.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
                 after_indices: barriers[i].clone(),
+                link_pin,
             }),
             PatternEstimate::Expander { .. } => expanders.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
                 after_indices: barriers[i].clone(),
+                link_pin,
             }),
             PatternEstimate::Deferred => {
                 let mut required_vars: HashSet<VarId> =
@@ -2491,8 +2587,8 @@ fn try_place_reducer(
         .enumerate()
         .filter(|(_, rp)| pattern_shares_variables(&rp.pattern, bound_vars))
         .min_by(|(_, a), (_, b)| {
-            let ca = estimate_pattern(&a.pattern, bound_vars, stats);
-            let cb = estimate_pattern(&b.pattern, bound_vars, stats);
+            let ca = a.estimate(bound_vars, stats);
+            let cb = b.estimate(bound_vars, stats);
             ca.multiplier()
                 .partial_cmp(&cb.multiplier())
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -2689,8 +2785,8 @@ fn rank_seed_candidates(
         | Pattern::S2Search(_) => 0_u8,
         _ => 1_u8,
     };
-    let ci = estimate_pattern(&remaining[i].pattern, bound_vars, stats);
-    let cj = estimate_pattern(&remaining[j].pattern, bound_vars, stats);
+    let ci = remaining[i].estimate(bound_vars, stats);
+    let cj = remaining[j].estimate(bound_vars, stats);
 
     // 1. Search sources seed first — but only before anything is bound.
     let by_search = if has_bound {
@@ -2934,8 +3030,8 @@ fn try_place_expander(
         .enumerate()
         .filter(|(_, rp)| pattern_shares_variables(&rp.pattern, bound_vars))
         .min_by(|(_, a), (_, b)| {
-            let ca = estimate_pattern(&a.pattern, bound_vars, stats);
-            let cb = estimate_pattern(&b.pattern, bound_vars, stats);
+            let ca = a.estimate(bound_vars, stats);
+            let cb = b.estimate(bound_vars, stats);
             ca.multiplier()
                 .partial_cmp(&cb.multiplier())
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -3838,16 +3934,19 @@ mod tests {
                 orig_index: 0,
                 pattern: Pattern::Triple(make_pattern(product, "vendor", vendor)),
                 after_indices: Vec::new(),
+                link_pin: None,
             },
             RankedPattern {
                 orig_index: 1,
                 pattern: Pattern::Triple(make_pattern(product, "numeric", numeric)),
                 after_indices: Vec::new(),
+                link_pin: None,
             },
             RankedPattern {
                 orig_index: 2,
                 pattern: Pattern::Triple(make_pattern(VarId(3), "reviewer", vendor)),
                 after_indices: Vec::new(),
+                link_pin: None,
             },
         ];
         let bound = HashSet::from([product]);
@@ -7296,5 +7395,63 @@ mod tests {
         // producer estimate does not apply, so it is not a trustworthy seed.
         let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body()).with_distinct();
         assert!(!subquery_output_estimate_is_bounded(&sq));
+    }
+
+    /// S7's shape: a link scan whose term a filter pins to a rare inner
+    /// predicate drives the join once the stats count that predicate's live
+    /// links; ranked at every link, it loses to a smaller scan.
+    #[test]
+    fn a_pinned_link_scan_is_ranked_by_its_inner_predicates_links() {
+        let (source, ty, ann, term) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let reifies = fluree_db_core::rdf_reifies_sid().clone();
+        let part_of = Sid::new(100, "PART_OF");
+        let patterns = vec![
+            triple(source, "type", ty),
+            triple(ann, "derives_from", source),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(ann),
+                Ref::Sid(reifies.clone()),
+                Term::Var(term),
+            )),
+            Pattern::Filter(Expression::Call {
+                func: Function::SameTerm,
+                args: vec![
+                    Expression::Call {
+                        func: Function::TriplePredicate,
+                        args: vec![Expression::Var(term)],
+                    },
+                    Expression::Const(FlakeValue::Ref(part_of.clone())),
+                ],
+            }),
+        ];
+        let mut stats = stats_with(&[("type", 600_000, 100), ("derives_from", 3_000_000, 1_000)]);
+        stats.properties.insert(
+            reifies.clone(),
+            PropertyStatData {
+                count: 2_000_000,
+                ndv_values: 2_000_000,
+                ndv_subjects: 2_000_000,
+            },
+        );
+        let first =
+            |stats: &StatsView| match &reorder_patterns(&patterns, Some(stats), &HashSet::new())[0]
+            {
+                Pattern::Triple(tp) => tp.p.clone(),
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(first(&stats), Ref::Sid(Sid::new(100, "type")));
+
+        stats.links = Some(HashMap::from([(part_of.clone(), 120_000)]));
+        assert_eq!(first(&stats), Ref::Sid(reifies));
+        let pins = link_pins(&patterns);
+        assert_eq!(
+            estimate_in_group(&patterns[2], &pins, &HashSet::new(), Some(&stats)).row_count(),
+            120_000.0
+        );
+        // Once the reifier is bound the scan is a probe, pinned or not.
+        assert!(
+            estimate_in_group(&patterns[2], &pins, &HashSet::from([ann]), Some(&stats)).row_count()
+                < 10.0
+        );
     }
 }

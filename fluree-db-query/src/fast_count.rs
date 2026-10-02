@@ -2305,6 +2305,7 @@ mod tests {
                 classes: None,
             }]),
             historical_since_t: None,
+            links: None,
         }
     }
 
@@ -2363,6 +2364,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
         assert_eq!(count_literal_rows_from_stats(&no_graphs, 0), None);
     }

@@ -1160,6 +1160,16 @@ where
 
                 let root_classes =
                     fluree_db_core::index_stats::union_per_graph_classes(&final_graphs);
+                let links = crate::stats::link_stat_entries(
+                    &id_stats_result.term_rows,
+                    shared.predicates.get(fluree_vocab::rdf::REIFIES),
+                    |p_id| {
+                        predicate_sids
+                            .get(p_id as usize)
+                            .cloned()
+                            .unwrap_or_default()
+                    },
+                );
 
                 is::IndexStats {
                     flakes: id_stats_result.total_flakes,
@@ -1173,6 +1183,7 @@ where
                     // hook, so the historical tag sets cover every `t` the
                     // ledger has ever had.
                     historical_since_t: Some(0),
+                    links: Some(links),
                 }
             };
 

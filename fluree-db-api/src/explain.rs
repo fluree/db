@@ -172,12 +172,13 @@ fn logical_node(
     vars: &VarRegistry,
     compactor: &IriCompactor,
     stats: Option<&StatsView>,
+    pins: &std::collections::HashMap<VarId, fluree_db_core::Sid>,
     bound_vars: &HashSet<VarId>,
 ) -> JsonValue {
-    use fluree_db_query::planner::{estimate_pattern, PatternEstimate};
+    use fluree_db_query::planner::{estimate_in_group, PatternEstimate};
 
     let mut node = Map::new();
-    let category = match estimate_pattern(p, bound_vars, stats) {
+    let category = match estimate_in_group(p, pins, bound_vars, stats) {
         PatternEstimate::Source { row_count } => {
             node.insert(
                 "estimate".into(),
@@ -202,10 +203,11 @@ fn logical_node(
     // sees it). A fresh local per list means UNION branches each start from `bound_vars`.
     let children = |ps: &[Pattern]| -> JsonValue {
         let mut local = bound_vars.clone();
+        let pins = fluree_db_query::planner::link_pins(ps);
         JsonValue::Array(
             ps.iter()
                 .map(|c| {
-                    let n = logical_node(c, vars, compactor, stats, &local);
+                    let n = logical_node(c, vars, compactor, stats, &pins, &local);
                     local.extend(c.produced_vars());
                     n
                 })
@@ -591,11 +593,12 @@ fn explain_from_parsed(
         // Thread the evolving bound-var set through the ordered plan so each node's
         // estimate is context-aware (a bound-subject scan, not a full predicate scan).
         let mut bound: HashSet<VarId> = HashSet::new();
+        let pins = fluree_db_query::planner::link_pins(&ordered);
         JsonValue::Array(
             ordered
                 .iter()
                 .map(|p| {
-                    let n = logical_node(p, vars, &compactor, stats_view.as_ref(), &bound);
+                    let n = logical_node(p, vars, &compactor, stats_view.as_ref(), &pins, &bound);
                     bound.extend(p.produced_vars());
                     n
                 })

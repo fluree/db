@@ -197,6 +197,9 @@ pub fn encode_stats(stats: &IndexStats) -> Vec<u8> {
     if graphs_carry_classes {
         fluree_db_core::stats_wire::encode_class_tail(&mut buf, &sorted_graphs);
     }
+    if let Some(links) = &stats.links {
+        fluree_db_core::stats_wire::encode_link_tail(&mut buf, links);
+    }
 
     buf
 }
@@ -584,6 +587,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
 
         let bytes = encode_stats(&stats);
@@ -641,6 +645,7 @@ mod tests {
                 },
             ]),
             historical_since_t: None,
+            links: None,
         };
 
         let bytes = encode_stats(&stats);
@@ -689,6 +694,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
 
         let bytes = encode_stats(&stats);
@@ -736,6 +742,7 @@ mod tests {
             }]),
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
 
         let bytes = encode_stats(&stats);
@@ -859,6 +866,7 @@ mod tests {
             classes: None,
             graphs: Some(graphs.clone()),
             historical_since_t: Some(0),
+            links: None,
         };
         let bytes = encode_stats(&stats);
         let (via_core, consumed) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
@@ -894,6 +902,7 @@ mod tests {
             classes: None,
             graphs: Some(class_tables()),
             historical_since_t: Some(0),
+            links: None,
         };
         let mut without = with.clone();
         for g in without.graphs.iter_mut().flatten() {
@@ -985,6 +994,7 @@ mod tests {
             classes: union.clone(),
             graphs: Some(graphs),
             historical_since_t: None,
+            links: None,
         };
         let imported = IndexStats {
             classes: None,
@@ -1034,6 +1044,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
 
         let bytes1 = encode_stats(&stats);
@@ -1056,6 +1067,7 @@ mod tests {
                 classes: None,
             }]),
             historical_since_t: None,
+            links: None,
         };
 
         let bytes = encode_stats(&stats);
@@ -1096,6 +1108,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
+            links: None,
         };
         let bytes = encode_stats(&stats);
         let expected = vec![1u8, 7];
@@ -1161,6 +1174,7 @@ mod tests {
                 classes: None,
             }]),
             historical_since_t: Some(2),
+            links: None,
         }
     }
 
@@ -1245,6 +1259,49 @@ mod tests {
             &old_encoding[..],
             "the historical tail changed bytes an old reader parses"
         );
+    }
+
+    /// Link counts round-trip in both decoders beside the other tails, and a
+    /// blob without them reads as unknown.
+    #[test]
+    fn link_tail_round_trips_after_the_other_tails() {
+        let mut stats = stats_with_historical();
+        stats.links = Some(vec![
+            fluree_db_core::LinkStatEntry {
+                sid: (15, "SEMNET_PART_OF".to_string()),
+                count: 231_170,
+            },
+            fluree_db_core::LinkStatEntry {
+                sid: (15, "SEMNET_CAUSES".to_string()),
+                count: 0,
+            },
+        ]);
+        let bytes = encode_stats(&stats);
+        let expected = vec![
+            fluree_db_core::LinkStatEntry {
+                sid: (15, "SEMNET_CAUSES".to_string()),
+                count: 0,
+            },
+            fluree_db_core::LinkStatEntry {
+                sid: (15, "SEMNET_PART_OF".to_string()),
+                count: 231_170,
+            },
+        ];
+        let (decoded, consumed) = decode_stats_with_len(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.links.as_ref(), Some(&expected));
+        assert_eq!(decoded.historical_since_t, Some(2), "historical tail kept");
+        let (via_core, _) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        assert_eq!(via_core.links, Some(expected));
+
+        let without = encode_stats(&stats_with_historical());
+        assert_eq!(
+            &bytes[..without.len()],
+            &without[..],
+            "appended, not interleaved"
+        );
+        let (decoded, _) = decode_stats_with_len(&without).unwrap();
+        assert_eq!(decoded.links, None);
     }
 
     /// Forward evolution: a tail carrying an unknown future tag reads as

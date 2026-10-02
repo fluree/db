@@ -1536,3 +1536,91 @@ async fn arena_kind_links_follow_incremental_repoints_in_every_graph() {
         })
         .await;
 }
+
+/// Live links per inner predicate, as the index root's stats carry them.
+fn link_counts(ledger: &LedgerState) -> Option<Vec<(String, u64)>> {
+    let links = ledger.snapshot.stats.as_ref()?.links.as_ref()?;
+    Some(links.iter().map(|l| (l.sid.1.clone(), l.count)).collect())
+}
+
+/// The link scan's planner estimate, read from the explain plan.
+async fn link_scan_estimate(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) -> i64 {
+    let db = fluree_db_api::GraphDb::from_ledger_state(ledger);
+    let plan = fluree
+        .explain_sparql(
+            &db,
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT ?src WHERE { << ?s ex:knows ?o >> ex:source ?src }",
+        )
+        .await
+        .expect("explain");
+    plan["plan"]["logical"]
+        .as_array()
+        .expect("logical plan")
+        .iter()
+        .find(|n| {
+            n["pattern"]["property"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("#reifies"))
+        })
+        .unwrap_or_else(|| panic!("no link scan: {plan:#}"))["estimate"]["row-count"]
+        .as_i64()
+        .expect("row count")
+}
+
+/// Every build publishes live links per inner predicate, and the planner
+/// ranks a link scan pinned to an inner predicate by its count: import and
+/// reindex count from the whole history, an incremental build moves the
+/// base's counts by the window's link asserts and retracts.
+#[tokio::test]
+async fn link_counts_follow_every_build() {
+    use fluree_db_indexer::IndexerConfig;
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let expected = |knows: u64| Some(vec![("age".to_string(), 1), ("knows".to_string(), knows)]);
+
+    let alias = "it/triple-term-links:link-counts";
+    // A second file restates claim1: the merge collapses the duplicate link
+    // row, and the count must not keep it.
+    let restated = "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+                    ex:alice ex:knows ex:bob ~ ex:claim1 .\n";
+    let (fluree, ledger) = import(&[("a.ttl", CLAIMS), ("b.ttl", restated)], alias).await;
+    assert_eq!(link_counts(&ledger), expected(3));
+    assert_eq!(link_scan_estimate(&fluree, &ledger).await, 3);
+    fluree
+        .reindex(alias, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(alias).await.expect("reload");
+    assert_eq!(link_counts(&ledger), expected(3));
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/triple-term-links:link-counts-incremental";
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    local
+        .run_until(async {
+            let ledger = fluree
+                .insert_turtle(support::genesis_ledger(&fluree, ledger_id), CLAIMS)
+                .await
+                .expect("claims")
+                .ledger;
+            support::trigger_index_and_wait(&handle, ledger_id, ledger.t()).await;
+            support::wait_for_index_application(&fluree, ledger_id, ledger.t()).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+            assert_eq!(link_counts(&ledger), expected(3));
+
+            // +2 knows (claim9, bob knows erin), -1 knows (the cascaded
+            // retract), and an age re-point that keeps age at one.
+            let ledger = change_claims_without_indexing(&fluree, ledger).await;
+            let t = ledger.t();
+            support::trigger_index_and_wait(&handle, ledger_id, t).await;
+            support::wait_for_index_application(&fluree, ledger_id, t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+            assert_eq!(ledger.index_t(), t);
+            assert_eq!(link_counts(&ledger), expected(4));
+            assert_eq!(link_scan_estimate(&fluree, &ledger).await, 4);
+        })
+        .await;
+}

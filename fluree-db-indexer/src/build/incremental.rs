@@ -2348,6 +2348,27 @@ pub async fn incremental_index(
         stats_hook.set_rdf_type_p_id(rdf_type_p_id);
         stats_hook.set_track_ref_targets(true);
 
+        // Live link counts carry forward from the base. A base that predates
+        // them leaves them unknown: a count of only this window's links would
+        // read as the ledger's.
+        let reifies_p_id = novelty.shared.predicates.get(fluree_vocab::rdf::REIFIES);
+        let base_links = base_root.stats.as_ref().and_then(|s| s.links.as_ref());
+        if let (Some(reifies), Some(links)) = (reifies_p_id, base_links) {
+            for link in links {
+                let prefix = novelty
+                    .shared
+                    .ns_prefixes
+                    .get(&link.sid.0)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let iri = format!("{prefix}{}", link.sid.1);
+                if let Some(inner) = novelty.shared.predicates.get(&iri) {
+                    stats_hook.seed_term_rows(reifies, inner, link.count);
+                }
+            }
+        }
+        let links_known = base_links.is_some();
+
         // Seed per-graph flake totals from base root stats.
         if let Some(ref base_stats) = base_root.stats {
             if let Some(ref graphs) = base_stats.graphs {
@@ -3786,6 +3807,15 @@ pub async fn incremental_index(
             }
 
             let root_classes = fluree_db_core::index_stats::union_per_graph_classes(&final_graphs);
+            let links = links_known.then(|| {
+                crate::stats::link_stat_entries(&id_stats_result.term_rows, reifies_p_id, |p_id| {
+                    let iri = novelty.shared.predicates.resolve(p_id).unwrap_or("");
+                    match trie.longest_match(iri) {
+                        Some((code, prefix_len)) => (code, iri[prefix_len..].to_string()),
+                        None => (0u16, iri.to_string()),
+                    }
+                })
+            });
 
             is::IndexStats {
                 flakes: id_stats_result.total_flakes,
@@ -3794,6 +3824,7 @@ pub async fn incremental_index(
                 classes: root_classes,
                 graphs: Some(final_graphs),
                 historical_since_t,
+                links,
             }
         };
 

@@ -453,7 +453,7 @@ impl fmt::Display for PatternDisplay {
 // Generalized explain for all pattern types
 // =============================================================================
 
-use crate::planner::{estimate_pattern, reorder_patterns, PatternEstimate};
+use crate::planner::{reorder_patterns, PatternEstimate};
 
 /// Display information for any pattern type (generalized)
 #[derive(Debug, Clone)]
@@ -490,15 +490,16 @@ pub fn explain_all_patterns(patterns: &[Pattern], stats: Option<&StatsView>) -> 
         .map(|s| s.has_property_stats() || s.has_class_stats())
         .unwrap_or(false);
 
+    let pins = crate::planner::link_pins(patterns);
     let original_patterns: Vec<GeneralPatternDisplay> = patterns
         .iter()
-        .map(|p| build_general_pattern_display(p, stats))
+        .map(|p| build_general_pattern_display(p, &pins, stats))
         .collect();
 
     let reordered = reorder_patterns(patterns, stats, &HashSet::new());
     let optimized_patterns: Vec<GeneralPatternDisplay> = reordered
         .iter()
-        .map(|p| build_general_pattern_display(p, stats))
+        .map(|p| build_general_pattern_display(p, &pins, stats))
         .collect();
 
     let optimization = if patterns.len() <= 1 {
@@ -526,9 +527,10 @@ pub fn explain_all_patterns(patterns: &[Pattern], stats: Option<&StatsView>) -> 
 /// Build display info for any pattern type
 fn build_general_pattern_display(
     pattern: &Pattern,
+    pins: &std::collections::HashMap<crate::var_registry::VarId, fluree_db_core::Sid>,
     stats: Option<&StatsView>,
 ) -> GeneralPatternDisplay {
-    let cardinality = estimate_pattern(pattern, &HashSet::new(), stats);
+    let cardinality = crate::planner::estimate_in_group(pattern, pins, &HashSet::new(), stats);
     let variables = pattern.produced_vars();
 
     let triple_detail = if let Pattern::Triple(tp) = pattern {

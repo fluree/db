@@ -1262,8 +1262,8 @@ pub fn build_indexes_from_commits(
         // commits, so cross-chunk duplicates were counted once per copy;
         // discount the copies the SPOT merge collapsed. HLL sketches are
         // duplicate-insensitive and need no correction.
-        for (&(p_id, o_type), &n) in &merge_duplicates {
-            target_hook.discount_import_duplicates(config.g_id, p_id, o_type, n);
+        for (&(p_id, o_type, inner), &n) in &merge_duplicates {
+            target_hook.discount_import_duplicates(config.g_id, p_id, o_type, inner, n);
         }
         tracing::info!(
             elapsed_ms = stats_merge_start.elapsed().as_millis(),
@@ -1358,12 +1358,16 @@ pub fn build_indexes_from_commits(
     ))
 }
 
+/// Cross-chunk duplicate copies the SPOT merge collapsed, keyed `(p_id,
+/// o_type, inner predicate)`; the inner predicate is a triple-term row's and
+/// 0 for every other row.
+type DuplicateTally = FxHashMap<(u32, u16, u32), u64>;
+
 struct SpotBuild {
     result: IndexBuildResult,
     class_stats: Option<SpotClassStats>,
-    /// Cross-chunk duplicate copies the SPOT merge collapsed, keyed
-    /// `(p_id, o_type)` so the id-stats hook can discount them.
-    merge_duplicates: FxHashMap<(u32, u16), u64>,
+    /// Cross-chunk duplicate copies the SPOT merge collapsed.
+    merge_duplicates: DuplicateTally,
 }
 
 fn build_spot_index_from_commits(
@@ -1418,7 +1422,7 @@ fn build_spot_index_from_commits(
 
     let mut class_stats_collector =
         rdf_type_p_id.map(|p_id| SpotClassStatsCollector::new(p_id, class_membership));
-    let mut merge_duplicates: FxHashMap<(u32, u16), u64> = FxHashMap::default();
+    let mut merge_duplicates: DuplicateTally = FxHashMap::default();
 
     let total_rows = if commits.len() <= fd_plan.spot_fan_in {
         // Flat merge: one long-lived reader per chunk, all open at once.
@@ -1593,7 +1597,7 @@ fn pump_spot_merge<T, F>(
     g_id: u16,
     mut class_stats_collector: Option<&mut SpotClassStatsCollector>,
     progress: Option<&AtomicU64>,
-    duplicates: &mut FxHashMap<(u32, u16), u64>,
+    duplicates: &mut DuplicateTally,
 ) -> io::Result<u64>
 where
     T: MergeSource,
@@ -1611,7 +1615,16 @@ where
         let pop_dropped = dropped - dropped_seen;
         dropped_seen = dropped;
         if pop_dropped > 0 {
-            *duplicates.entry((record.p_id, record.o_type)).or_insert(0) += pop_dropped;
+            let inner = if fluree_db_core::o_type::OType::from_u16(record.o_type)
+                == fluree_db_core::o_type::OType::TRIPLE_TERM
+            {
+                fluree_db_core::triple_term::term_handle_p_id(record.o_key)
+            } else {
+                0
+            };
+            *duplicates
+                .entry((record.p_id, record.o_type, inner))
+                .or_insert(0) += pop_dropped;
         }
         if op == 0 {
             continue;
