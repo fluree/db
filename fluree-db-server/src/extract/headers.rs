@@ -956,4 +956,142 @@ mod tests {
 
         assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(false)));
     }
+
+    /// Every pragma the parser accepts reaches each translator that carries
+    /// its option: these headers, the API's policy selection and tracking, and
+    /// a multi-query alias's opts. A pragma this table does not list fails the
+    /// test, so a new one cannot be wired into one translator and missed in
+    /// another.
+    #[test]
+    fn every_pragma_reaches_its_translators() {
+        type Check = fn(&FlureeHeaders) -> bool;
+        // (sample value, update form, header check, selects policy, tracks, alias opts key)
+        for name in fluree_db_sparql::pragma_names() {
+            let (value, update, header, policy, tracks, opts_key): (
+                &str,
+                bool,
+                Option<Check>,
+                bool,
+                bool,
+                Option<&str>,
+            ) = match name {
+                // Applied where the request is lowered (query IR, `TxnOpts`)
+                // or by the update route, not by these translators.
+                "reasoning" => ("rdfs", false, None, false, false, None),
+                "reasoning-max-facts" | "reasoning-max-seconds" | "reasoning-max-memory-mb" => {
+                    ("10", false, None, false, false, None)
+                }
+                "include-system-facts" => ("true", false, None, false, false, None),
+                "event-time" => ("2020-01-01T00:00:00Z", true, None, false, false, None),
+                "validation-mode" => ("warn", true, None, false, false, None),
+                "unique-properties" => ("<urn:p>", true, None, false, false, None),
+                "min-t" => (
+                    "1",
+                    false,
+                    Some(|h| h.min_t == Some(1)),
+                    false,
+                    false,
+                    Some("min-t"),
+                ),
+                "meta" => (
+                    "time",
+                    false,
+                    Some(|h| h.track_time),
+                    false,
+                    true,
+                    Some("meta"),
+                ),
+                "max-fuel" => (
+                    "10",
+                    false,
+                    Some(|h| h.max_fuel == Some(10.0)),
+                    false,
+                    true,
+                    Some("max-fuel"),
+                ),
+                "identity" => (
+                    "<urn:id>",
+                    false,
+                    Some(|h| h.identity.is_some()),
+                    true,
+                    false,
+                    Some("identity"),
+                ),
+                "policy-class" => (
+                    "<urn:class>",
+                    false,
+                    Some(|h| !h.policy_class.is_empty()),
+                    true,
+                    false,
+                    Some("policy-class"),
+                ),
+                "policy-values" => (
+                    r#"{"?$x": 1}"#,
+                    false,
+                    Some(|h| h.policy_values.is_some()),
+                    true,
+                    false,
+                    Some("policy-values"),
+                ),
+                "default-allow" => (
+                    "true",
+                    false,
+                    Some(|h| h.default_allow == Some(true)),
+                    true,
+                    false,
+                    Some("default-allow"),
+                ),
+                other => panic!(
+                    "pragma `{other}` is new: apply it in FlureeHeaders::with_sparql_pragmas, \
+                     GovernanceOptions::from_sparql_pragmas, sparql_pragma_tracking and \
+                     sparql_pragma_opts wherever its JSON-LD `opts` twin applies, then list it here"
+                ),
+            };
+            let body = if update {
+                "INSERT DATA { <urn:s> <urn:p> 1 }"
+            } else {
+                "SELECT * WHERE { }"
+            };
+            let sparql = format!("# PRAGMA {name}: {value}\n{body}");
+            let pragmas = fluree_db_sparql::request_pragmas(&sparql)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_ne!(
+                pragmas,
+                Default::default(),
+                "{name}: the sample selects nothing"
+            );
+
+            let headers = FlureeHeaders::default()
+                .with_sparql_pragmas(&pragmas)
+                .unwrap();
+            match header {
+                Some(check) => assert!(check(&headers), "{name}: headers {headers:?}"),
+                None => assert_eq!(
+                    format!("{headers:?}"),
+                    format!("{:?}", FlureeHeaders::default()),
+                    "{name}: no header carries it"
+                ),
+            }
+            assert_eq!(
+                fluree_db_api::GovernanceOptions::from_sparql_pragmas(&pragmas)
+                    .has_any_policy_inputs(),
+                policy,
+                "{name}: policy selection"
+            );
+            let tracking = fluree_db_api::sparql_pragma_tracking(&pragmas);
+            assert_eq!(tracking.any_enabled(), tracks, "{name}: tracking");
+            let opts = fluree_db_api::query::multi::sparql_pragma_opts(&sparql)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let keys: Vec<&String> = opts
+                .as_ref()
+                .and_then(JsonValue::as_object)
+                .map(|o| o.keys().collect())
+                .unwrap_or_default();
+            assert_eq!(
+                keys,
+                opts_key.into_iter().collect::<Vec<_>>(),
+                "{name}: alias opts"
+            );
+        }
+    }
 }

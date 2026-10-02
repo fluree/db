@@ -3066,6 +3066,37 @@ fn test_request_pragmas_helper() {
     );
 }
 
+/// `request_pragmas` skips the parse unless a comment could be a directive. Each
+/// spelling the parser reads as a pragma must get past that check, and the word
+/// alone, outside a comment, must not.
+#[test]
+fn test_request_pragmas_skips_only_text_without_a_directive() {
+    use crate::parse::request_pragmas;
+
+    for comment in [
+        "# PRAGMA max-fuel: 7",
+        "#PRAGMA max-fuel: 7",
+        "## PRAGMA max-fuel: 7",
+        "#\tpragma max-fuel 7",
+        "#\u{3000}Pragma max-fuel: 7",
+    ] {
+        let sparql = format!("SELECT * WHERE {{ }}\n{comment}");
+        assert!(super::may_carry_pragma(&sparql), "{comment:?}");
+        assert_eq!(
+            request_pragmas(&sparql).map(|p| p.max_fuel),
+            Ok(Some(7.0)),
+            "{comment:?}"
+        );
+    }
+    for text in [
+        "SELECT * WHERE { ?s <urn:p> \"pragma\" }",
+        "PREFIX x: <http://ex.org/pragma#>\nSELECT * WHERE { ?s x:p ?o }",
+        "# a comment about the pragma\nSELECT * WHERE { }",
+    ] {
+        assert!(!super::may_carry_pragma(text), "{text:?}");
+    }
+}
+
 /// Query options are refused on an UPDATE; the shared request options apply
 /// to both forms.
 #[test]

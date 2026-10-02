@@ -513,6 +513,7 @@ impl<'a> TransactCore<'a> {
             (Some(opts), _) => Tracker::new(opts.clone()),
             (None, Some(sparql)) => crate::query::helpers::tracker_for_input_limits(
                 &crate::view::QueryInput::Sparql(sparql),
+                None,
             ),
             (None, None) => Tracker::disabled(),
         }
