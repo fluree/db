@@ -1126,6 +1126,26 @@ impl FileStorage {
         Ok(())
     }
 
+    /// Leave `root` with a write its WAL logged but a crash kept off disk.
+    ///
+    /// The write puts `bytes` at `address`. Returns the path of the file the crash lost.
+    #[doc(hidden)]
+    pub async fn crash_with_a_logged_write_for_test(
+        root: impl AsRef<Path>,
+        address: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf> {
+        let storage = Self::new(root.as_ref()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test()?;
+        storage.write_bytes(address, bytes).await?;
+        storage.sync().await?;
+        storage.simulate_crash_for_test();
+        let path = storage.resolve_path(address)?;
+        std::fs::remove_file(&path)
+            .map_err(|e| crate::error::Error::io(format!("remove {}: {e}", path.display())))?;
+        Ok(path)
+    }
+
     /// Run `f` on the writing thread between an oversized write's checkpoint
     /// and its write. Shared across clones.
     #[cfg(test)]

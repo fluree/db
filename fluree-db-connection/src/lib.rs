@@ -458,23 +458,11 @@ mod tests {
         );
     }
 
-    /// Leaves a root whose WAL holds a write the crash kept off disk.
-    /// Returns the path of the missing file.
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     async fn crash_with_a_logged_write(root: &std::path::Path) -> std::path::PathBuf {
-        use fluree_db_core::StorageWrite;
-        let storage = FileStorage::new(root).with_durability(Durability::Wal);
-        storage.recover_wal().unwrap();
-        storage.hold_wal_segments_for_test().unwrap();
-        storage
-            .write_bytes("fluree:file://ledger/a.bin", b"logged")
+        FileStorage::crash_with_a_logged_write_for_test(root, "fluree:file://a.bin", b"logged")
             .await
-            .unwrap();
-        storage.sync().await.unwrap();
-        storage.simulate_crash_for_test();
-        let path = root.join("ledger/a.bin");
-        std::fs::remove_file(&path).unwrap();
-        path
+            .unwrap()
     }
 
     /// Opening a file connection replays the WAL a crash left behind.
