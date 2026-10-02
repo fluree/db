@@ -387,11 +387,12 @@ impl FlureeHeaders {
     /// Lay a SPARQL request's `# PRAGMA` options over the header values.
     ///
     /// A pragma is the request body's own option, so it wins over the header
-    /// that names the same thing — as a JSON-LD body's `opts` do — with two
-    /// exceptions. `max-fuel` takes the tighter of the two caps. And under a
-    /// bound credential a policy pragma may only repeat the selection the
-    /// headers make (or narrow `default-allow`): the headers are the credential
-    /// holder's channel, while the text may be its end user's.
+    /// that names the same thing — as a JSON-LD body's `opts` do — with three
+    /// exceptions, because the headers may be an application's while the text
+    /// is its end user's. `meta` adds to the tracking the headers ask for but
+    /// never removes it. `max-fuel` takes the tighter of the two caps. And
+    /// under a bound credential a policy pragma may only repeat the selection
+    /// the headers make (or narrow `default-allow`).
     ///
     /// Call after [`crate::routes::policy_auth::bind_authorization`]: the policy
     /// selection lands in the same fields a caller's headers do, and
@@ -405,10 +406,9 @@ impl FlureeHeaders {
             )?;
         }
         if let Some(meta) = pragmas.meta {
-            self.track_meta = false;
-            self.track_time = meta.time;
-            self.track_fuel = meta.fuel;
-            self.track_policy = meta.policy;
+            self.track_time |= meta.time;
+            self.track_fuel |= meta.fuel;
+            self.track_policy |= meta.policy;
         }
         if let Some(max_fuel) = pragmas.max_fuel {
             self.max_fuel = Some(self.max_fuel.map_or(max_fuel, |cap| cap.min(max_fuel)));

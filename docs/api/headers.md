@@ -501,8 +501,9 @@ endpoints, used for replication, send an `ETag` and an immutable `Cache-Control`
 A SPARQL request can carry these options in its text instead, as
 [`# PRAGMA` comments](../query/sparql.md#request-options--pragma) (all but `fluree-ledger` and the
 inline `fluree-policy`). A pragma wins over the header that names the same option, except that
-`max-fuel` takes the smaller of the two and, on an authenticated request, a policy pragma may only
-repeat the policy the headers select (see [Request options](../query/sparql.md#request-options--pragma)).
+`meta` adds to the header's tracking, `max-fuel` takes the smaller of the two and, on an
+authenticated request, a policy pragma may only repeat the policy the headers select (see
+[Request options](../query/sparql.md#request-options--pragma)).
 
 Whether a request may choose its own identity or policy depends on the server's
 authorization settings; see [Policy in Queries](../security/policy-in-queries.md). Tracking and

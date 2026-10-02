@@ -150,7 +150,7 @@ Set fuel limits via `opts.max-fuel` (decimal allowed). Setting a fuel limit impl
 }
 ```
 
-You can also use `"maxFuel"` or `"max_fuel"` as alternative key names. The HTTP equivalent is the `fluree-max-fuel` header. A SPARQL request names both in its text as `# PRAGMA max-fuel: 1000` and `# PRAGMA meta: true` (or `meta: fuel, time`); see [Request options](sparql.md#request-options--pragma). A pragma's `max-fuel` can lower the header's limit but never raise it.
+You can also use `"maxFuel"` or `"max_fuel"` as alternative key names. The HTTP equivalent is the `fluree-max-fuel` header. A SPARQL request names both in its text as `# PRAGMA max-fuel: 1000` and `# PRAGMA meta: true` (or `meta: fuel, time`); see [Request options](sparql.md#request-options--pragma). A pragma's `max-fuel` can lower the header's limit but never raise it, and its `meta` adds to the tracking the `fluree-track-*` headers request but cannot switch it off.
 
 Because the `1.000` query floor is charged before execution and counts toward the limit, `max-fuel` must leave room for it:
 

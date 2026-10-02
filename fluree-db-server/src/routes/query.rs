@@ -5116,7 +5116,7 @@ fn apply_envelope_sparql_auth(
         )?;
     }
     let mut merged = merged_opts(outer.as_ref(), pragma_opts.as_ref());
-    fluree_db_api::query::multi::cap_pragma_max_fuel(&mut merged, outer.as_ref());
+    fluree_db_api::query::multi::hold_pragma_tracking(&mut merged, outer.as_ref());
     let mut synthetic = serde_json::json!({"opts": merged});
     crate::routes::policy_auth::apply_authorization_to_opts(&mut synthetic, headers)?;
     sub.opts = synthetic.get("opts").cloned();
