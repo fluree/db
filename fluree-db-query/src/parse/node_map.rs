@@ -41,7 +41,6 @@ struct PropertyParseContext<'a> {
 
 /// rdf:type IRI constant (re-exported from vocab crate for convenience)
 pub(crate) use fluree_vocab::rdf::TYPE as RDF_TYPE;
-use fluree_vocab::xsd;
 
 /// JSON-LD-star annotation keyword. Names the annotation block attached
 /// to an object position. Treated as a literal key (not subject to
@@ -1410,16 +1409,6 @@ fn scan_for_deferred_annotation_keywords(value: &JsonValue) -> Result<()> {
     Ok(())
 }
 
-/// Normalize numeric datatypes to canonical form for matching
-///
-/// Delegates to the shared helper in fluree-vocab which normalizes:
-/// - xsd:int, xsd:short, xsd:byte, xsd:long → xsd:integer
-/// - xsd:float → xsd:double
-#[inline]
-fn normalize_numeric_datatype(expanded_dt_iri: &str) -> &str {
-    xsd::normalize_numeric_datatype(expanded_dt_iri)
-}
-
 /// Parsed value object result
 struct ParsedValueObject {
     /// The parsed term (value or variable)
@@ -1471,12 +1460,9 @@ fn parse_value_object(
             } else if dt.as_ref() == "@id" {
                 (Some(Arc::from("@id")), None)
             } else {
-                // @type is a constant IRI - expand and normalize it
+                // @type is a constant IRI: the literal matches that datatype only
                 let (expanded, _) = ctx.expand_vocab(dt)?;
-                (
-                    Some(Arc::from(normalize_numeric_datatype(expanded.as_str()))),
-                    None,
-                )
+                (Some(Arc::from(expanded.as_str())), None)
             }
         } else {
             (None, None)

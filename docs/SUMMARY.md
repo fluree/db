@@ -270,6 +270,7 @@
 - [Troubleshooting](troubleshooting/README.md)
   - [Common errors](troubleshooting/common-errors.md)
   - [Missing results at a historical `t`](troubleshooting/historical-results-missing.md)
+  - [Typed values wrong after indexing](troubleshooting/typed-values-wrong-after-indexing.md)
   - [Debugging queries](troubleshooting/debugging-queries.md)
   - [Performance investigation with distributed tracing](troubleshooting/performance-tracing.md)
 

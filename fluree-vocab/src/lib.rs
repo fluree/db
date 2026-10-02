@@ -215,64 +215,6 @@ pub mod xsd {
     /// xsd:hexBinary IRI
     pub const HEX_BINARY: &str = "http://www.w3.org/2001/XMLSchema#hexBinary";
 
-    // ========================================================================
-    // Datatype Normalization Helpers
-    // ========================================================================
-    //
-    // These functions normalize XSD datatypes to canonical forms for storage.
-    // This ensures consistency between transact and query paths.
-
-    /// Normalize integer-family datatypes to xsd:integer
-    ///
-    /// XSD defines a type hierarchy where int, short, byte, long are subtypes
-    /// of integer. For storage consistency, we normalize all of these to
-    /// xsd:integer since they all map to the same Rust type (i64 or BigInt).
-    ///
-    /// # Arguments
-    /// * `datatype_iri` - The full IRI of the datatype
-    ///
-    /// # Returns
-    /// * `xsd:integer` IRI if input is an integer-family type
-    /// * The original IRI unchanged otherwise
-    #[inline]
-    pub fn normalize_integer_family(datatype_iri: &str) -> &str {
-        match datatype_iri {
-            LONG | INT | SHORT | BYTE | UNSIGNED_LONG | UNSIGNED_INT | UNSIGNED_SHORT
-            | UNSIGNED_BYTE | NON_NEGATIVE_INTEGER | POSITIVE_INTEGER | NON_POSITIVE_INTEGER
-            | NEGATIVE_INTEGER => INTEGER,
-            _ => datatype_iri,
-        }
-    }
-
-    /// Normalize float to double
-    ///
-    /// XSD float and double both map to f64 in Rust. Normalize to double
-    /// for storage consistency.
-    #[inline]
-    pub fn normalize_float_family(datatype_iri: &str) -> &str {
-        match datatype_iri {
-            FLOAT => DOUBLE,
-            _ => datatype_iri,
-        }
-    }
-
-    /// Normalize all numeric datatypes to their canonical storage form
-    ///
-    /// Combines integer-family and float-family normalization:
-    /// - xsd:int, xsd:short, xsd:byte, xsd:long → xsd:integer
-    /// - xsd:float → xsd:double
-    /// - All other types pass through unchanged
-    #[inline]
-    pub fn normalize_numeric_datatype(datatype_iri: &str) -> &str {
-        match datatype_iri {
-            LONG | INT | SHORT | BYTE | UNSIGNED_LONG | UNSIGNED_INT | UNSIGNED_SHORT
-            | UNSIGNED_BYTE | NON_NEGATIVE_INTEGER | POSITIVE_INTEGER | NON_POSITIVE_INTEGER
-            | NEGATIVE_INTEGER => INTEGER,
-            FLOAT => DOUBLE,
-            _ => datatype_iri,
-        }
-    }
-
     /// Check if a datatype IRI is a numeric type
     #[inline]
     pub fn is_numeric_datatype(datatype_iri: &str) -> bool {

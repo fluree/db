@@ -55,6 +55,7 @@ use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue, MAX_TXN_META_BYTES, MAX_TXN_
 use fluree_graph_turtle::{tokenize, Token, TokenKind};
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// IRI reference for the transaction metadata named graph.
 ///
@@ -91,8 +92,9 @@ pub struct NamedGraphBlock {
     /// base triple is also present in `triples` (Fluree asserts it), so
     /// consumers emit the `f:reifies*` bundle from here and nothing else.
     pub reified: Vec<RawReifiedTriple>,
-    /// Prefix mappings from the TriG document (for IRI expansion).
-    pub prefixes: FxHashMap<String, String>,
+    /// The document's prefix mappings where the block appears (for IRI
+    /// expansion). Blocks with no directive between them share one map.
+    pub prefixes: Arc<FxHashMap<String, String>>,
 }
 
 /// One RDF 1.2 reifier attachment parsed inside a GRAPH block: `reifier`
@@ -138,8 +140,8 @@ pub struct TrigPhase1Result<'a> {
 /// Use `resolve_trig_meta()` to convert to `TxnMetaEntry` with namespace codes.
 #[derive(Debug, Clone)]
 pub struct RawTrigMeta {
-    /// Prefix mappings from the TriG document.
-    pub prefixes: FxHashMap<String, String>,
+    /// The document's prefix mappings where the txn-meta block appears.
+    pub prefixes: Arc<FxHashMap<String, String>>,
     /// Parsed triples from the txn-meta GRAPH block.
     pub triples: Vec<RawTriple>,
 }
@@ -457,8 +459,9 @@ struct TrigMetaParser<'a> {
     input: &'a str,
     tokens: &'a [Token],
     pos: usize,
-    /// Prefix mappings: prefix -> namespace IRI
-    prefixes: FxHashMap<String, String>,
+    /// Prefix mappings: prefix -> namespace IRI. Shared with the blocks parsed
+    /// since the last directive; a directive copies it only if one is.
+    prefixes: Arc<FxHashMap<String, String>>,
     /// Base IRI
     base: Option<String>,
     /// Collected directives (for reconstructing Turtle output)
@@ -509,6 +512,10 @@ struct GraphBlock {
     triples: Vec<ParsedTriple>,
     /// Reifier attachments inside the GRAPH block (TriG-star)
     reified: Vec<ParsedReified>,
+    /// The prefix map where the block appears. Its prefixed names expand with
+    /// this map, not the document's final one: a later `@prefix` must not
+    /// rewrite them. (Directives cannot occur inside a block.)
+    prefixes: Arc<FxHashMap<String, String>>,
 }
 
 /// A reifier attachment before namespace resolution (see [`RawReifiedTriple`]).
@@ -572,7 +579,7 @@ impl<'a> TrigMetaParser<'a> {
             input,
             tokens,
             pos: 0,
-            prefixes: FxHashMap::default(),
+            prefixes: Arc::default(),
             base: None,
             directives: Vec::new(),
             default_triples: Vec::new(),
@@ -727,8 +734,8 @@ impl<'a> TrigMetaParser<'a> {
         // Get namespace IRI
         let namespace = self.parse_iri()?;
 
-        // Register prefix
-        self.prefixes.insert(prefix, namespace);
+        // Register prefix, copying the map only if a block still holds it
+        Arc::make_mut(&mut self.prefixes).insert(prefix, namespace);
 
         // Consume trailing dot if not SPARQL style
         if !is_sparql && self.check(&TokenKind::Dot) {
@@ -904,6 +911,7 @@ impl<'a> TrigMetaParser<'a> {
             iri: graph_iri,
             triples,
             reified,
+            prefixes: Arc::clone(&self.prefixes),
         });
 
         Ok(())
@@ -1487,14 +1495,14 @@ impl<'a> TrigMetaParser<'a> {
 
     /// Extract txn-meta entries, named graphs, and reconstruct Turtle content.
     fn extract(
-        self,
+        mut self,
         ns_registry: &mut NamespaceRegistry,
     ) -> Result<(String, Vec<TxnMetaEntry>, Vec<NamedGraphBlock>)> {
         let mut txn_meta = Vec::new();
         let mut named_graphs = Vec::new();
 
-        // Process GRAPH blocks
-        for block in &self.graph_blocks {
+        // Process GRAPH blocks, moving each one's prefix map out
+        for block in std::mem::take(&mut self.graph_blocks) {
             if block.iri == TXN_META_GRAPH_IRI {
                 // txn-meta graph: extract as TxnMetaEntry
                 for triple in &block.triples {
@@ -1502,7 +1510,7 @@ impl<'a> TrigMetaParser<'a> {
                     let subject_iri = match &triple.subject {
                         TermValue::Iri(iri) => iri.clone(),
                         TermValue::PrefixedName { prefix, local } => {
-                            self.expand_prefixed_name(prefix, local)?
+                            expand_prefixed_name(&block.prefixes, prefix, local)?
                         }
                         TermValue::BlankNode(_) => {
                             return Err(TransactError::Parse(
@@ -1521,7 +1529,7 @@ impl<'a> TrigMetaParser<'a> {
                     let predicate_iri = match &triple.predicate {
                         TermValue::Iri(iri) => iri.clone(),
                         TermValue::PrefixedName { prefix, local } => {
-                            self.expand_prefixed_name(prefix, local)?
+                            expand_prefixed_name(&block.prefixes, prefix, local)?
                         }
                         TermValue::BlankNode(_) => {
                             return Err(TransactError::Parse(
@@ -1535,7 +1543,8 @@ impl<'a> TrigMetaParser<'a> {
 
                     // Convert each object to TxnMetaEntry
                     for obj in &triple.objects {
-                        let value = self.object_to_txn_meta_value(obj, ns_registry)?;
+                        let value =
+                            Self::object_to_txn_meta_value(obj, &block.prefixes, ns_registry)?;
                         txn_meta.push(TxnMetaEntry::new(
                             pred_sid.namespace_code,
                             pred_sid.name.to_string(),
@@ -1548,30 +1557,35 @@ impl<'a> TrigMetaParser<'a> {
                 let raw_triples = self.convert_to_raw_triples(&block.triples)?;
                 let reified = self.convert_reified_to_raw(&block.reified)?;
                 named_graphs.push(NamedGraphBlock {
-                    iri: block.iri.clone(),
+                    iri: block.iri,
                     triples: raw_triples,
                     reified,
-                    prefixes: self.prefixes.clone(),
+                    prefixes: block.prefixes,
                 });
             }
         }
 
-        // Reconstruct Turtle content (directives + default triples)
+        Ok((self.default_graph_turtle(), txn_meta, named_graphs))
+    }
+
+    /// The default graph as Turtle: its triples and the document's directives
+    /// in document order, so each `@prefix`/`@base` applies only to what
+    /// follows it. Emitting every directive first let a later redefinition
+    /// rewrite the triples before it.
+    fn default_graph_turtle(&self) -> String {
+        let mut spans: Vec<(usize, usize)> = self
+            .directives
+            .iter()
+            .chain(&self.default_triples)
+            .copied()
+            .collect();
+        spans.sort_unstable();
         let mut turtle = String::new();
-
-        // Add directives
-        for (start, end) in &self.directives {
-            turtle.push_str(&self.input[*start..*end]);
+        for (start, end) in spans {
+            turtle.push_str(&self.input[start..end]);
             turtle.push('\n');
         }
-
-        // Add default graph triples
-        for (start, end) in &self.default_triples {
-            turtle.push_str(&self.input[*start..*end]);
-            turtle.push('\n');
-        }
-
-        Ok((turtle, txn_meta, named_graphs))
+        turtle
     }
 
     /// Convert ParsedTriples to RawTriples for named graph blocks.
@@ -1690,8 +1704,8 @@ impl<'a> TrigMetaParser<'a> {
     }
 
     fn object_to_txn_meta_value(
-        &self,
         obj: &ObjectValue,
+        prefixes: &FxHashMap<String, String>,
         ns_registry: &mut NamespaceRegistry,
     ) -> Result<TxnMetaValue> {
         match obj {
@@ -1714,7 +1728,7 @@ impl<'a> TrigMetaParser<'a> {
                 })
             }
             ObjectValue::PrefixedName { prefix, local } => {
-                let iri = self.expand_prefixed_name(prefix, local)?;
+                let iri = expand_prefixed_name(prefixes, prefix, local)?;
                 let sid = ns_registry.sid_for_iri(&iri);
                 Ok(TxnMetaValue::Ref {
                     ns: sid.namespace_code,
@@ -1740,27 +1754,14 @@ impl<'a> TrigMetaParser<'a> {
     }
 
     /// Phase 1 extraction: return raw triples without namespace resolution.
-    fn extract_phase1(self) -> Result<TrigPhase1Result<'static>> {
-        // Reconstruct Turtle content (directives + default triples)
-        let mut turtle = String::new();
-
-        // Add directives
-        for (start, end) in &self.directives {
-            turtle.push_str(&self.input[*start..*end]);
-            turtle.push('\n');
-        }
-
-        // Add default graph triples
-        for (start, end) in &self.default_triples {
-            turtle.push_str(&self.input[*start..*end]);
-            turtle.push('\n');
-        }
+    fn extract_phase1(mut self) -> Result<TrigPhase1Result<'static>> {
+        let turtle = self.default_graph_turtle();
 
         let mut raw_meta: Option<RawTrigMeta> = None;
         let mut named_graphs: Vec<NamedGraphBlock> = Vec::new();
 
-        // Process all GRAPH blocks
-        for block in &self.graph_blocks {
+        // Process all GRAPH blocks, moving each one's prefix map out
+        for block in std::mem::take(&mut self.graph_blocks) {
             if block.iri == TXN_META_GRAPH_IRI {
                 // txn-meta graph: convert to RawTrigMeta
                 let mut triples = Vec::new();
@@ -1770,7 +1771,7 @@ impl<'a> TrigMetaParser<'a> {
                     let subject_iri = match &triple.subject {
                         TermValue::Iri(iri) => iri.clone(),
                         TermValue::PrefixedName { prefix, local } => {
-                            self.expand_prefixed_name(prefix, local)?
+                            expand_prefixed_name(&block.prefixes, prefix, local)?
                         }
                         TermValue::BlankNode(_) => {
                             return Err(TransactError::Parse(
@@ -1847,7 +1848,7 @@ impl<'a> TrigMetaParser<'a> {
                 }
 
                 raw_meta = Some(RawTrigMeta {
-                    prefixes: self.prefixes.clone(),
+                    prefixes: block.prefixes,
                     triples,
                 });
             } else {
@@ -1855,10 +1856,10 @@ impl<'a> TrigMetaParser<'a> {
                 let raw_triples = self.convert_to_raw_triples(&block.triples)?;
                 let reified = self.convert_reified_to_raw(&block.reified)?;
                 named_graphs.push(NamedGraphBlock {
-                    iri: block.iri.clone(),
+                    iri: block.iri,
                     triples: raw_triples,
                     reified,
-                    prefixes: self.prefixes.clone(),
+                    prefixes: block.prefixes,
                 });
             }
         }
@@ -1945,6 +1946,91 @@ mod tests {
         let turtle = "@prefix ex: <http://example.org/> . ex:a ex:b \"c\" .";
         let phase1 = parse_trig_phase1(turtle).unwrap();
         assert!(matches!(phase1.turtle, Cow::Borrowed(t) if t == turtle));
+    }
+
+    /// The IRIs the full Turtle parser reads from phase 1's default graph.
+    fn default_graph_json(input: &str) -> String {
+        let phase1 = parse_trig_phase1(input).unwrap();
+        fluree_graph_turtle::parse_to_json(&phase1.turtle)
+            .unwrap()
+            .to_string()
+    }
+
+    /// A redefined prefix applies only after it: the default graph keeps its
+    /// directives in document order, and each block expands with the prefix
+    /// map where it appears. Emitting every directive first let the later
+    /// `ex:` rewrite `ex:x`, and blocks expanded with the final map.
+    #[test]
+    fn phase1_applies_a_redefined_prefix_only_after_it() {
+        let input = "@prefix ex: <http://a.org/> .\n\
+                     ex:x ex:p \"mentions the graph word\" .\n\
+                     GRAPH <http://example.org/g1> { ex:y ex:p \"1\" . }\n\
+                     @prefix ex: <http://b.org/> .\n\
+                     ex:z ex:p \"2\" .\n\
+                     GRAPH <http://example.org/g2> { ex:w ex:p \"2\" . }\n";
+        let json = default_graph_json(input);
+        for iri in ["http://a.org/x", "http://a.org/p", "http://b.org/z"] {
+            assert!(json.contains(iri), "{iri} missing: {json}");
+        }
+        assert!(
+            !json.contains("http://b.org/x"),
+            "ex:x was rewritten: {json}"
+        );
+
+        let phase1 = parse_trig_phase1(input).unwrap();
+        let ex = |i: usize| phase1.named_graphs[i].prefixes.get("ex").cloned();
+        assert_eq!(ex(0).as_deref(), Some("http://a.org/"), "block before it");
+        assert_eq!(ex(1).as_deref(), Some("http://b.org/"), "block after it");
+    }
+
+    /// `@base` twin: a relative IRI resolves against the base in effect where
+    /// it is written.
+    #[test]
+    fn phase1_applies_a_redefined_base_only_after_it() {
+        let json = default_graph_json(
+            "@base <http://a.org/> .\n\
+             <x> <p> \"mentions the graph word\" .\n\
+             @base <http://b.org/> .\n\
+             <y> <p> \"2\" .\n",
+        );
+        for iri in ["http://a.org/x", "http://a.org/p", "http://b.org/y"] {
+            assert!(json.contains(iri), "{iri} missing: {json}");
+        }
+        assert!(!json.contains("http://b.org/x"), "<x> was re-based: {json}");
+    }
+
+    /// The txn-meta block expands with the prefixes where it appears, on
+    /// both extraction paths.
+    #[test]
+    fn txn_meta_expands_with_the_prefixes_where_it_appears() {
+        let input = "@prefix ex: <http://a.org/> .\n\
+                     @prefix fluree: <https://ns.flur.ee/db#> .\n\
+                     GRAPH <#txn-meta> { fluree:commit:this ex:batch ex:b1 . }\n\
+                     @prefix ex: <http://b.org/> .\n";
+        let raw = parse_trig_phase1(input)
+            .unwrap()
+            .raw_meta
+            .expect("txn-meta");
+        assert_eq!(
+            raw.prefixes.get("ex").map(String::as_str),
+            Some("http://a.org/")
+        );
+
+        let mut ns = test_registry();
+        let entry = &extract_trig_txn_meta(input, &mut ns).unwrap().txn_meta[0];
+        let a = ns.sid_for_iri("http://a.org/batch");
+        assert_eq!(
+            (entry.predicate_ns, entry.predicate_name.as_str()),
+            (a.namespace_code, a.name.as_ref()),
+            "predicate expanded with the later prefix"
+        );
+        let b1 = ns.sid_for_iri("http://a.org/b1");
+        assert!(
+            matches!(&entry.value, TxnMetaValue::Ref { ns, name }
+                if *ns == b1.namespace_code && name == b1.name.as_ref()),
+            "object expanded with the later prefix: {:?}",
+            entry.value
+        );
     }
 
     #[test]
