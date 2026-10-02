@@ -428,6 +428,14 @@ impl<'a> AnnotationContext<'a> {
     }
 }
 
+/// An `rdf:reifies` link row. Links are derived from the `f:reifies*` bundles
+/// (which export writes as annotation syntax) and never enter commits, so
+/// export drops them in every mode, `--raw-reifies` included.
+#[inline]
+fn is_link_row(o_type: u16) -> bool {
+    o_type == OType::TRIPLE_TERM.as_u16()
+}
+
 /// Live reifiers for every row of `batch`, row-aligned.
 ///
 /// Returns an empty vec when the export is not emitting annotation syntax;
@@ -456,6 +464,9 @@ async fn batch_reifiers(
             continue; // the bundle itself is never an annotated edge
         }
         let o_type = batch.o_type.get_or(row, 0);
+        if is_link_row(o_type) {
+            continue;
+        }
         let o_key = batch.o_key.get(row);
         let Some(p) = resolver.resolve_predicate_sid(p_id) else {
             continue;
@@ -682,6 +693,9 @@ fn write_turtle_batch<W: Write>(
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
+        if is_link_row(o_type) {
+            continue;
+        }
 
         // The `f:reifies*` bundle is the on-disk encoding of an annotation,
         // not a triple the ledger was asked to hold. It is replaced by the
@@ -877,6 +891,9 @@ pub async fn export_graph_jsonld<W: Write>(
             let p_id = batch.p_id.get_or(row, 0);
             let o_type = batch.o_type.get_or(row, 0);
             let o_key = batch.o_key.get(row);
+            if is_link_row(o_type) {
+                continue;
+            }
 
             if let Some(ann) = ann.as_ref() {
                 if ann.is_reifies_row(p_id) {
@@ -1560,6 +1577,9 @@ fn write_batch<W: Write>(
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
+        if is_link_row(o_type) {
+            continue;
+        }
 
         if let Some(ann) = ann {
             if ann.is_reifies_row(p_id) {
