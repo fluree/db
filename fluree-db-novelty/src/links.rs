@@ -113,6 +113,23 @@ impl Novelty {
         Ok(derived.into_iter().map(|(_, f)| f).collect())
     }
 
+    /// The links a batch of routed flakes would derive if committed next,
+    /// without applying it, each with its graph. Empty while this novelty's
+    /// links wait for an index.
+    pub fn links_for<'a>(
+        &self,
+        batch: impl IntoIterator<Item = (GraphId, &'a Flake)>,
+    ) -> Result<Vec<(GraphId, Flake)>> {
+        let Some(base) = self.current_link_base() else {
+            return Ok(Vec::new());
+        };
+        let touched = touched_reifiers(batch);
+        if touched.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.derive_links(base, &touched, self.t)
+    }
+
     /// The base links are derived from, when every earlier commit has its
     /// links; `None` leaves the next commit's links pending.
     pub(crate) fn current_link_base(&self) -> Option<&LinkBase> {

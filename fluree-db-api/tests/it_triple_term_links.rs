@@ -1914,3 +1914,88 @@ async fn triple_constructs_the_terms_links_hold() {
         strings(&[&["true", "ex:a", "xsd:int", "true", "false", "false", "false"]])
     );
 }
+
+/// A SHACL SPARQL constraint over a quoted pattern validates the post-state
+/// with the transaction's own annotations in it, as a committed read would.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_sparql_constraints_see_the_transactions_links() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:shacl-staged");
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://example.org/> .
+ex:AliceShape a sh:NodeShape ;
+    sh:targetNode ex:alice ;
+    sh:sparql ex:noMallory .
+ex:noMallory sh:message "no claim may say alice knows mallory" ;
+    sh:select "SELECT $this WHERE { << $this <http://example.org/knows> <http://example.org/mallory> >> <http://example.org/source> ?src }" .
+"#,
+        )
+        .await
+        .expect("shape")
+        .ledger;
+    let claim = |o: &str| {
+        format!(
+            "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:knows ex:{o} {{| ex:source ex:web |}} .\n"
+        )
+    };
+    let ledger = fluree
+        .insert_turtle(ledger, &claim("bob"))
+        .await
+        .expect("a conforming claim")
+        .ledger;
+    let rejected = fluree.insert_turtle(ledger, &claim("mallory")).await;
+    assert!(
+        rejected.is_err(),
+        "the staged annotation must violate the shape"
+    );
+}
+
+/// A preview of a staged transaction reads the links of its own
+/// annotations, over an index and over a ledger never indexed.
+#[tokio::test]
+async fn previews_read_the_links_of_their_own_annotations() {
+    std::env::set_var("FLUREE_ANNOTATION_TERMS", "1");
+    let (fluree, indexed) = import(&[("claims.ttl", CLAIMS)], "it/triple-term-links:preview").await;
+    let memory = FlureeBuilder::memory().build_memory();
+    let never_indexed = memory
+        .insert_turtle(
+            support::genesis_ledger(&memory, "it/triple-term-links:preview-memory"),
+            CLAIMS,
+        )
+        .await
+        .expect("claims")
+        .ledger;
+    for (fluree, ledger) in [(&fluree, indexed), (&memory, never_indexed)] {
+        let staged = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(
+                "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
+                 ex:erin ex:knows ex:frank ~ ex:claim9 {| ex:source ex:web |} .\n",
+            )
+            .stage()
+            .await
+            .expect("stage");
+        let preview = fluree_db_api::GraphDb::from_staged(&staged).expect("preview");
+        let result = fluree
+            .query(
+                &preview,
+                "PREFIX ex: <http://example.org/>\n\
+                 SELECT ?s WHERE { << ?s ex:knows ex:frank >> ex:source ex:web }",
+            )
+            .await
+            .expect("preview query");
+        let got = rows(
+            &result
+                .to_jsonld_async(preview.as_graph_db_ref())
+                .await
+                .expect("format"),
+        );
+        assert_eq!(got, strings(&[&["ex:erin"]]));
+    }
+}
