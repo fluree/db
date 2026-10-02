@@ -56,6 +56,8 @@ An omitted or empty application selection denies access, including when locked l
 
 The `fluree-identity`, `fluree-policy-class`, `fluree-policy`, `fluree-policy-values`, and `fluree-default-allow` headers carry policy options for SPARQL, Cypher, GraphQL, push, and commit show. JSON body options override header defaults. Multi-query aliases retain envelope/sub-query precedence. One selection applies across a query's sources; conflicting per-source selections are rejected. A signed request body uses its signing identity and does not inherit an accompanying application's credential authority.
 
+SPARQL text can also select policy, with `# PRAGMA identity`, `policy-class`, `policy-values` and `default-allow` comments (see [Request options](../query/sparql.md#request-options--pragma)). Under a request-selection credential the headers come first. When they select policy, a pragma may only repeat that selection or narrow `default-allow` to `false`, and any other policy pragma is refused with a `403`. When they select nothing, the pragmas select. An application that forwards its users' SPARQL should therefore always send its selection in headers: even `fluree-default-allow: false` alone pins it. Otherwise, reject text that carries policy pragmas. The same holds for a multi-query SPARQL alias against the envelope and alias `opts`. A pragma's `max-fuel` can lower `fluree-max-fuel` but never raise it.
+
 ## Fixed signed delegation
 
 Use an object-valued `fluree.policy` when a browser, partner, or other downstream client should carry a fixed selection:

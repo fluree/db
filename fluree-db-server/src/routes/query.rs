@@ -786,7 +786,7 @@ pub async fn query(
 
         // Log query text according to configuration
         log_query_text(&sparql, &state.telemetry_config, &span);
-        // `# PRAGMA` options win over the headers that name the same thing.
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
         let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Connection-scoped SPARQL requires a FROM/FROM NAMED clause to specify the ledger.
@@ -1158,7 +1158,7 @@ pub async fn query_ledger(
 
         // Log query text according to configuration
         log_query_text(&sparql, &state.telemetry_config, &span);
-        // `# PRAGMA` options win over the headers that name the same thing.
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
         let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Enforce bearer ledger scope for unsigned requests
@@ -1482,7 +1482,7 @@ pub async fn explain_ledger(
         if is_sparql_request(&headers, &credential, &params) {
             let sparql = resolve_sparql_text(&params, &credential)?;
             log_query_text(&sparql, &state.telemetry_config, &span);
-            // `# PRAGMA` options win over the headers that name the same thing.
+            // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
             let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
             // Enforce bearer ledger scope for unsigned requests
@@ -4151,7 +4151,7 @@ pub async fn explain(
         if is_sparql_request(&headers, &credential, &params) {
             let sparql = resolve_sparql_text(&params, &credential)?;
             log_query_text(&sparql, &state.telemetry_config, &span);
-            // `# PRAGMA` options win over the headers that name the same thing.
+            // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
             let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
             // Determine target ledger: header wins, otherwise require a single FROM ledger id.
@@ -5098,13 +5098,25 @@ fn apply_envelope_sparql_auth(
 ) -> Result<()> {
     use fluree_db_api::query::multi::merged_opts;
 
+    let selection = |opts: Option<JsonValue>| {
+        fluree_db_api::GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
+            .map_err(|e| ServerError::bad_request(e.to_string()))
+    };
+
     // The alias's `# PRAGMA` options are its body opts, which the dispatcher
     // lays over `sub.opts`: authorize the selection it will actually run with.
+    // Under a bound credential the envelope's selection is the holder's, and
+    // the pragmas may only repeat it, as they may only repeat its headers.
     let pragma_opts = sparql_alias_pragma_opts(sub)?;
-    let merged = merged_opts(
-        merged_opts(envelope_opts, sub.opts.as_ref()).as_ref(),
-        pragma_opts.as_ref(),
-    );
+    let outer = merged_opts(envelope_opts, sub.opts.as_ref());
+    if let (Some(pragma_opts), Some(_)) = (&pragma_opts, &headers.policy_authorization) {
+        crate::extract::validate_pragma_selection(
+            &selection(Some(pragma_opts.clone()))?,
+            &selection(outer.clone())?,
+        )?;
+    }
+    let mut merged = merged_opts(outer.as_ref(), pragma_opts.as_ref());
+    fluree_db_api::query::multi::cap_pragma_max_fuel(&mut merged, outer.as_ref());
     let mut synthetic = serde_json::json!({"opts": merged});
     crate::routes::policy_auth::apply_authorization_to_opts(&mut synthetic, headers)?;
     sub.opts = synthetic.get("opts").cloned();
@@ -5114,10 +5126,6 @@ fn apply_envelope_sparql_auth(
     // Hold that here rather than lean on it: a difference would be a pragma
     // replacing the authorized selection.
     if let Some(pragma_opts) = &pragma_opts {
-        let selection = |opts: Option<JsonValue>| {
-            fluree_db_api::GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
-                .map_err(|e| ServerError::bad_request(e.to_string()))
-        };
         let authorized = selection(sub.opts.clone())?;
         let dispatched = selection(merged_opts(sub.opts.as_ref(), Some(pragma_opts)))?;
         if !same_policy_selection(&authorized, &dispatched) {

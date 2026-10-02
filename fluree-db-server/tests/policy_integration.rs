@@ -2266,8 +2266,10 @@ async fn policy_values_via_sparql_pragma() {
     assert_eq!(sparql_names(&json), vec!["Executive Salaries"]);
 }
 
-/// A pragma is the request's own option, so it wins over the header that names
-/// the same thing — as a JSON-LD body's `opts` do.
+/// On an unauthenticated request a pragma is the caller's own option, so it
+/// wins over the header that names the same thing — as a JSON-LD body's `opts`
+/// do. Under a credential it may only repeat the headers' selection; see
+/// `request_credential_sparql_pragma_cannot_change_header_selection`.
 #[tokio::test]
 async fn sparql_pragma_policy_class_wins_over_header() {
     let (_tmp, state) = policy_test_state().await;
@@ -2283,6 +2285,78 @@ async fn sparql_pragma_policy_class_wins_over_header() {
     .await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(sparql_names(&json).len(), 3, "{json}");
+}
+
+/// A gateway that holds the request-selection credential for its user.
+fn request_selection_token(ledger: &str) -> String {
+    delegated_token(
+        "http://example.org/app-gateway",
+        ledger,
+        serde_json::json!("request"),
+    )
+}
+
+/// An application holding a request-selected credential forwards its end
+/// user's SPARQL and selects policy in headers. The text's pragmas may repeat
+/// that selection or narrow `default-allow`, never replace it or add to it: a
+/// class beside the header's identity would select the rules, and
+/// `default-allow: true` would widen them.
+#[tokio::test]
+async fn request_credential_sparql_pragma_cannot_change_header_selection() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag10:main").await;
+    let bearer = format!("Bearer {}", request_selection_token("prag10:main"));
+    let run = |pragma: &str, headers: Vec<(&'static str, &'static str)>| {
+        let app = app.clone();
+        let bearer = bearer.clone();
+        let sparql = format!("{pragma}\n{DOCS_SPARQL}");
+        async move {
+            let mut headers: Vec<(&str, &str)> = headers;
+            headers.push(("authorization", &bearer));
+            let (status, json) = sparql_query(app, "prag10:main", &sparql, &headers).await;
+            let mut names: Vec<String> =
+                sparql_names(&json).into_iter().map(String::from).collect();
+            names.sort_unstable();
+            (status, json, names)
+        }
+    };
+    let employee = || vec![("fluree-identity", "http://example.org/employee-user")];
+
+    for pragma in [
+        "",
+        "# PRAGMA identity: <http://example.org/employee-user>",
+        "# PRAGMA default-allow: false",
+    ] {
+        let (status, json, names) = run(pragma, employee()).await;
+        assert_eq!(status, StatusCode::OK, "{pragma:?}: {json}");
+        assert_eq!(names, ["Internal Memo", "Public Post"], "{pragma:?}");
+    }
+
+    for pragma in [
+        "# PRAGMA identity: <http://example.org/manager-user>",
+        "# PRAGMA policy-class: ex:ManagerClass",
+        "# PRAGMA default-allow: true",
+    ] {
+        let (status, json, _) = run(pragma, employee()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{pragma:?}: {json}");
+        assert!(!json.to_string().contains("Executive Salaries"), "{json}");
+    }
+
+    let (status, json, _) = run(
+        "# PRAGMA policy-class: ex:ManagerClass",
+        vec![("fluree-policy-class", "http://example.org/EmployeeClass")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+
+    // Headers that select nothing leave the selection to the pragmas.
+    let (status, json, names) = run(
+        "# PRAGMA identity: <http://example.org/employee-user>",
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(names, ["Internal Memo", "Public Post"]);
 }
 
 fn rewrite_doc1_content_sparql(identity: &str) -> String {
@@ -2357,6 +2431,46 @@ async fn sparql_update_pragma_cannot_escape_bearer_identity() {
         .contains("Credential does not permit policy selection"));
 }
 
+/// The update twin of `request_credential_sparql_pragma_cannot_change_header_selection`.
+/// The pragma's identity would also be recorded as the commit's author.
+#[tokio::test]
+async fn request_credential_sparql_update_pragma_cannot_replace_header_identity() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag11:main").await;
+    add_modify_policies(&app, "prag11:main").await;
+    let bearer = format!("Bearer {}", request_selection_token("prag11:main"));
+    let update = |sparql: String| {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/update/prag11:main")
+            .header("content-type", "application/sparql-update")
+            .header("authorization", &bearer)
+            .header("fluree-identity", "http://example.org/employee-user")
+            .body(Body::from(sparql))
+            .unwrap();
+        let app = app.clone();
+        async move { json_body(app.oneshot(req).await.unwrap()).await }
+    };
+
+    // Repeating the header's identity is accepted, and its policy still governs.
+    let (status, json) = update(rewrite_doc1_content_sparql(
+        "http://example.org/employee-user",
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "control: {json}");
+    assert!(
+        json.to_string()
+            .contains("Employees may not modify document content."),
+        "{json}"
+    );
+
+    let (status, json) = update(rewrite_doc1_content_sparql(
+        "http://example.org/manager-user",
+    ))
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+}
+
 fn docs_alias(ledger: &str, pragma: &str) -> JsonValue {
     serde_json::json!({
         "queries": {
@@ -2389,6 +2503,35 @@ async fn multi_query_sparql_alias_pragma_cannot_escape_bearer() {
         "# PRAGMA identity: <http://example.org/manager-user>",
     );
     let (status, body) = post_envelope(app, &envelope, Some(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.to_string().contains("Executive Salaries"), "{body}");
+}
+
+/// Under a request-selected credential, the envelope's selection is the
+/// application's, and an alias's pragmas may only repeat it.
+#[tokio::test]
+async fn request_credential_multi_query_alias_pragma_cannot_change_envelope_selection() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "prag12:main").await;
+    let token = request_selection_token("prag12:main");
+    let envelope = |pragma: &str| {
+        let mut envelope = docs_alias("prag12:main", pragma);
+        envelope["opts"] = serde_json::json!({"identity": "http://example.org/employee-user"});
+        envelope
+    };
+
+    let (status, body) = post_envelope(app.clone(), &envelope(""), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let alias = serde_json::to_string(&body["results"]["sparql_docs"]).unwrap();
+    assert!(alias.contains("Internal Memo"), "control: {alias}");
+    assert!(!alias.contains("Executive Salaries"), "control: {alias}");
+
+    let (status, body) = post_envelope(
+        app,
+        &envelope("# PRAGMA identity: <http://example.org/manager-user>"),
+        Some(&token),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(!body.to_string().contains("Executive Salaries"), "{body}");
 }

@@ -742,7 +742,10 @@ async fn execute_subquery(
         }
     };
     let envelope_with_sub = merged_opts(envelope_opts, sub.opts.as_ref());
-    let merged_opts_val = merged_opts(envelope_with_sub.as_ref(), body_opts.as_ref());
+    let mut merged_opts_val = merged_opts(envelope_with_sub.as_ref(), body_opts.as_ref());
+    if matches!(sub.language, SubqueryLanguage::Sparql) {
+        super::cap_pragma_max_fuel(&mut merged_opts_val, envelope_with_sub.as_ref());
+    }
     let tracking_opts = TrackingOptions::from_opts_value(merged_opts_val.as_ref());
     let tracking_enabled = tracking_opts.track_time
         || tracking_opts.track_fuel

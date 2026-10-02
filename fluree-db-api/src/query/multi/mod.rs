@@ -790,6 +790,30 @@ pub fn sparql_pragma_opts(sparql: &str) -> std::result::Result<Option<JsonValue>
     Ok((!opts.is_empty()).then_some(JsonValue::Object(opts)))
 }
 
+/// Hold the `max-fuel` a SPARQL alias's pragmas put into `merged` to the cap
+/// its `outer` (envelope ⊕ alias) opts already set. Unlike the alias's other
+/// pragmas, which win as body `opts` do, a pragma can tighten that cap but
+/// never lift it, just as `# PRAGMA max-fuel` cannot lift `fluree-max-fuel`.
+pub fn cap_pragma_max_fuel(merged: &mut Option<JsonValue>, outer: Option<&JsonValue>) {
+    let cap = |opts: &JsonValue| {
+        ["max-fuel", "max_fuel", "maxFuel"]
+            .iter()
+            .find_map(|key| opts.get(*key))
+            .and_then(JsonValue::as_f64)
+    };
+    let (Some(outer_cap), Some(JsonValue::Object(opts))) = (outer.and_then(cap), merged.as_mut())
+    else {
+        return;
+    };
+    if opts
+        .get("max-fuel")
+        .and_then(JsonValue::as_f64)
+        .is_some_and(|max_fuel| max_fuel > outer_cap)
+    {
+        opts.insert("max-fuel".into(), serde_json::json!(outer_cap));
+    }
+}
+
 /// Shallow merge two JSON values, returning a new value. If both are objects,
 /// `inner`'s keys override `outer`'s on conflict. If either is not an object,
 /// `inner` wins entirely (matches "sub-query overrides envelope" semantics).

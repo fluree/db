@@ -387,20 +387,31 @@ impl FlureeHeaders {
     /// Lay a SPARQL request's `# PRAGMA` options over the header values.
     ///
     /// A pragma is the request body's own option, so it wins over the header
-    /// that names the same thing — as a JSON-LD body's `opts` do. Call after
-    /// [`crate::routes::policy_auth::bind_authorization`]: the policy
+    /// that names the same thing — as a JSON-LD body's `opts` do — with two
+    /// exceptions. `max-fuel` takes the tighter of the two caps. And under a
+    /// bound credential a policy pragma may only repeat the selection the
+    /// headers make (or narrow `default-allow`): the headers are the credential
+    /// holder's channel, while the text may be its end user's.
+    ///
+    /// Call after [`crate::routes::policy_auth::bind_authorization`]: the policy
     /// selection lands in the same fields a caller's headers do, and
-    /// `bound_governance` holds it to the bound credential exactly as it holds
-    /// a header (a conflicting selection is refused, never silently replaced).
-    pub fn with_sparql_pragmas(mut self, pragmas: &fluree_db_sparql::Pragmas) -> Self {
+    /// `bound_governance` then holds it to the bound credential exactly as it
+    /// holds a header.
+    pub fn with_sparql_pragmas(mut self, pragmas: &fluree_db_sparql::Pragmas) -> Result<Self> {
+        if self.policy_authorization.is_some() {
+            crate::extract::validate_pragma_selection(
+                &fluree_db_api::GovernanceOptions::from_sparql_pragmas(pragmas),
+                &self.policy_selection()?,
+            )?;
+        }
         if let Some(meta) = pragmas.meta {
             self.track_meta = false;
             self.track_time = meta.time;
             self.track_fuel = meta.fuel;
             self.track_policy = meta.policy;
         }
-        if pragmas.max_fuel.is_some() {
-            self.max_fuel = pragmas.max_fuel;
+        if let Some(max_fuel) = pragmas.max_fuel {
+            self.max_fuel = Some(self.max_fuel.map_or(max_fuel, |cap| cap.min(max_fuel)));
         }
         if pragmas.min_t.is_some() {
             self.min_t = pragmas.min_t;
@@ -417,14 +428,14 @@ impl FlureeHeaders {
         if pragmas.default_allow.is_some() {
             self.default_allow = pragmas.default_allow;
         }
-        self
+        Ok(self)
     }
 
     /// [`Self::with_sparql_pragmas`] for request text; a malformed pragma is a 400.
     pub fn with_sparql_request_pragmas(self, sparql: &str) -> Result<Self> {
         let pragmas =
             fluree_db_sparql::request_pragmas(sparql).map_err(ServerError::bad_request)?;
-        Ok(self.with_sparql_pragmas(&pragmas))
+        self.with_sparql_pragmas(&pragmas)
     }
 
     /// Check if tracking is enabled (any tracking header or max-fuel limit)
@@ -586,6 +597,22 @@ impl FlureeHeaders {
             .as_ref()
             .map(|ct| ct.contains("application/jwt"))
             .unwrap_or(false)
+    }
+
+    /// The policy selection these headers make, before credential
+    /// authorization resolves it.
+    pub(crate) fn policy_selection(&self) -> Result<fluree_db_api::GovernanceOptions> {
+        Ok(fluree_db_api::GovernanceOptions {
+            identity: self.identity.clone(),
+            policy_class: (!self.policy_class.is_empty()).then(|| self.policy_class.clone()),
+            policy: self.policy.clone(),
+            policy_values: self.policy_values_map()?,
+            default_allow: self.default_allow,
+            // Deliberately absent: this is the caller's *selection*, and the
+            // verified identity is not selectable. `bound_governance` stamps it
+            // after authorization resolution.
+            server_identity: None,
+        })
     }
 
     /// Convert policy_values to a HashMap for credential API

@@ -734,6 +734,12 @@ struct LiteralResult {
 /// committed as ONE atomic commit (roadmap decision D-10). An empty vector
 /// (empty or prologue-only request) is a valid no-op.
 ///
+/// The request's `validation-mode` and `unique-properties` pragmas fill the
+/// matching `opts` fields the caller left unset. The other update pragmas
+/// (`event-time`, `max-fuel`, `meta`, policy) govern the commit, tracking and
+/// authorization around the lowered `Txn`s, so they ride `ast.pragmas` for
+/// the caller to apply.
+///
 /// # Errors
 ///
 /// Returns `LowerError` if:
@@ -751,6 +757,7 @@ pub fn lower_sparql_update_request(
             return Err(LowerError::NotAnUpdate { span: ast.span });
         }
     };
+    let opts = with_pragma_txn_opts(ast, opts);
     let mut txns = Vec::with_capacity(request.operations.len());
     for op in &request.operations {
         txns.push(lower_sparql_update(
@@ -769,7 +776,8 @@ pub fn lower_sparql_update_request(
 /// the common one-operation request. It fails loudly on a request with
 /// zero or multiple operations — callers that accept the full request
 /// grammar (the API transaction seam) must use
-/// [`lower_sparql_update_request`] and stage the sequence.
+/// [`lower_sparql_update_request`] and stage the sequence. Pragmas apply as
+/// they do there.
 ///
 /// # Errors
 ///
@@ -790,7 +798,12 @@ pub fn lower_sparql_update_ast(
         }
     };
     match request.operations.as_slice() {
-        [op] => lower_sparql_update(&op.operation, &op.prologue, ns, opts),
+        [op] => lower_sparql_update(
+            &op.operation,
+            &op.prologue,
+            ns,
+            with_pragma_txn_opts(ast, opts),
+        ),
         [] => Err(LowerError::UnsupportedFeature {
             feature: "empty update request (no operation) in single-operation lowering; \
                       use lower_sparql_update_request",
@@ -804,7 +817,27 @@ pub fn lower_sparql_update_ast(
     }
 }
 
+/// `opts` with the transaction options a `# PRAGMA` names, under the same
+/// precedence as their JSON-LD `opts` twins: a value the caller set wins.
+fn with_pragma_txn_opts(ast: &SparqlAst, mut opts: TxnOpts) -> TxnOpts {
+    if opts.validation_mode.is_none() {
+        opts.validation_mode = ast
+            .pragmas
+            .validation_mode
+            .as_deref()
+            .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
+    }
+    if opts.unique_properties.is_none() {
+        opts.unique_properties = ast.pragmas.unique_properties.clone();
+    }
+    opts
+}
+
 /// Lower a SPARQL UPDATE operation to the Transaction IR.
+///
+/// A single operation carries no pragmas; lower the whole request with
+/// [`lower_sparql_update_request`] or [`lower_sparql_update_ast`] to have them
+/// applied.
 ///
 /// # Arguments
 ///
@@ -2778,5 +2811,42 @@ mod tests {
             ),
             "expected a clean quoted-triple-subject UnsupportedFeature, got {result:?}"
         );
+    }
+
+    /// Every request-level entry applies the transaction pragmas, so an
+    /// embedder that lowers the AST itself enforces what the request asked for.
+    #[test]
+    fn request_entries_apply_txn_pragmas_unless_caller_set_them() {
+        use fluree_db_core::ledger_config::ValidationMode;
+
+        let parsed = fluree_db_sparql::parse_sparql(
+            "# PRAGMA unique-properties: ex:email\n\
+             # PRAGMA validation-mode: warn\n\
+             PREFIX ex: <http://example.org/ns/>\n\
+             INSERT DATA { ex:bob ex:email \"bob@example.org\" }",
+        );
+        let ast = parsed.ast.expect("AST");
+        let email = Some(vec!["http://example.org/ns/email".to_string()]);
+
+        let mut ns = NamespaceRegistry::new();
+        let single = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        let request =
+            lower_sparql_update_request(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        for opts in [&single.opts, &request[0].opts] {
+            assert_eq!(opts.unique_properties, email);
+            assert_eq!(opts.validation_mode, Some(ValidationMode::Warn));
+        }
+
+        let caller = TxnOpts {
+            unique_properties: Some(vec!["http://example.org/ns/handle".to_string()]),
+            validation_mode: Some(ValidationMode::Reject),
+            ..TxnOpts::default()
+        };
+        let txn = lower_sparql_update_ast(&ast, &mut ns, caller).expect("lower");
+        assert_eq!(
+            txn.opts.unique_properties,
+            Some(vec!["http://example.org/ns/handle".to_string()])
+        );
+        assert_eq!(txn.opts.validation_mode, Some(ValidationMode::Reject));
     }
 }
