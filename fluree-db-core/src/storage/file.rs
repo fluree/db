@@ -2163,6 +2163,38 @@ mod tests {
         );
     }
 
+    /// A panic in the closure reaches the caller as a panic, not as a storage error.
+    /// The key lock is released, so the next compare-and-swap on the key writes.
+    #[tokio::test]
+    async fn compare_and_swap_resumes_a_panic_in_the_closure_on_the_caller() {
+        let (_dir, storage) = storage();
+        let panicked = tokio::spawn({
+            let storage = storage.clone();
+            async move {
+                storage
+                    .compare_and_swap("h.json", |_| -> StorageExtResult<CasAction<()>> {
+                        panic!("closure panicked")
+                    })
+                    .await
+            }
+        })
+        .await
+        .expect_err("the closure's panic came back as a value");
+        assert_eq!(
+            crate::task::panic_message(panicked.into_panic()),
+            "closure panicked"
+        );
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            storage.compare_and_swap("h.json", |_| Ok(CasAction::<()>::Write(b"v1".to_vec()))),
+        )
+        .await
+        .expect("the panicked compare-and-swap kept the key lock")
+        .unwrap();
+        assert!(matches!(outcome, CasOutcome::Written));
+    }
+
     /// A dropped ledger removes a directory this storage has cached.
     /// Inserting and swapping under it again must recreate the directory.
     #[tokio::test]
