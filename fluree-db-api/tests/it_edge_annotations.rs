@@ -1061,8 +1061,8 @@ async fn subject_expansion_emits_annotation_block_for_annotated_edge() {
     // System facts must still be filtered.
     for k in ann_obj.keys() {
         assert!(
-            !k.starts_with("https://ns.flur.ee/db#reifies"),
-            "f:reifies* must not leak into @annotation body: {k}"
+            !k.contains("reifies"),
+            "the link must not leak into @annotation body: {k}"
         );
     }
 }
@@ -1904,8 +1904,8 @@ async fn variable_predicate_scan_hides_f_reifies_in_named_graph() {
         .collect();
     for p in &predicates {
         assert!(
-            !p.starts_with("https://ns.flur.ee/db#reifies"),
-            "f:reifies* must not leak from named-graph variable-predicate scan: {p} \
+            !p.contains("reifies"),
+            "the link must not leak from named-graph variable-predicate scan: {p} \
              (full bindings: {predicates:?})"
         );
     }
@@ -1975,13 +1975,9 @@ async fn variable_predicate_scan_hides_f_reifies() {
     // No `f:reifies*` predicate may leak.
     for p in &predicates {
         assert!(
-            !p.starts_with("https://ns.flur.ee/db#reifies"),
-            "f:reifies* must not leak through variable-predicate scan: {p} \
+            !p.contains("reifies"),
+            "the link must not leak through variable-predicate scan: {p} \
              (full bindings: {predicates:?})"
-        );
-        assert!(
-            !p.starts_with("f:reifies"),
-            "compact f:reifies* form must not leak: {p}"
         );
     }
     // The user-authored `ex:role` must still be visible.
@@ -2042,8 +2038,8 @@ async fn opts_include_system_facts_does_not_relax_direct_mention_firewall() {
 async fn opts_include_system_facts_surfaces_f_reifies() {
     // The `opts.includeSystemFacts: true` escape disables the
     // variable-predicate filter so debug / inspection callers can see
-    // the underlying `f:reifies*` system facts. Without the flag, the
-    // filter hides them (covered by `variable_predicate_scan_hides_f_reifies`).
+    // the annotation's `rdf:reifies` link. Without the flag, the filter
+    // hides it (covered by `variable_predicate_scan_hides_f_reifies`).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:opts-include-system-facts";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -2086,15 +2082,9 @@ async fn opts_include_system_facts_surfaces_f_reifies() {
         })
         .collect();
 
-    // With the escape, all three required `f:reifies*` predicates are
-    // visible from the annotation subject.
-    let leaked_reifies: Vec<&String> = predicates
-        .iter()
-        .filter(|p| p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies"))
-        .collect();
     assert!(
-        leaked_reifies.len() >= 3,
-        "opts.includeSystemFacts: true must surface the f:reifies* bundle \
+        predicates.iter().any(|p| p == fluree_vocab::rdf::REIFIES),
+        "opts.includeSystemFacts: true must surface the rdf:reifies link \
          (got predicates: {predicates:?})"
     );
 }
@@ -2152,12 +2142,8 @@ async fn opts_include_system_facts_propagates_through_dataset_path() {
                 .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
         })
         .collect();
-    let leaked: Vec<&String> = predicates
-        .iter()
-        .filter(|p| p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies"))
-        .collect();
     assert!(
-        leaked.len() >= 3,
+        predicates.iter().any(|p| p == fluree_vocab::rdf::REIFIES),
         "dataset-path query must propagate opts.includeSystemFacts to the scan operator \
          (got predicates: {predicates:?})"
     );
@@ -2195,15 +2181,14 @@ async fn opts_include_system_facts_works_for_ask_queries() {
 
     // Ask whether the annotation subject has *any* predicate. With
     // the filter on (default) this still answers true via the
-    // ex:role flake. Pin the discriminating shape: ask via a SID-
-    // bound predicate of `f:reifiesSubject`-via-variable that only
-    // matches when the f:reifies* row passes the scan filter.
+    // ex:role flake. Pin the discriminating shape: a variable-predicate
+    // row whose object is a triple term, which only the link is.
     let q_default = json!({
         "@context": ctx(),
-        "ask": [{
-            "@id": "ex:emp/alice-acme",
-            "?p": { "@id": "ex:alice" }
-        }]
+        "ask": [
+            { "@id": "ex:emp/alice-acme", "?p": "?o" },
+            ["filter", "(istriple ?o)"]
+        ]
     });
     let resp_default = fluree
         .query(&support::graphdb_from_ledger(&ledger), &q_default)
@@ -2215,17 +2200,17 @@ async fn opts_include_system_facts_works_for_ask_queries() {
     assert_eq!(
         json_default,
         JsonValue::Bool(false),
-        "without includeSystemFacts, ASK over a hidden f:reifies* row must answer false: {json_default}"
+        "without includeSystemFacts, ASK over the hidden link must answer false: {json_default}"
     );
 
     // With the opt-in, the ASK now returns true because the scan
-    // filter is bypassed and the f:reifiesSubject row binds.
+    // filter is bypassed and the link binds.
     let q_opt = json!({
         "@context": ctx(),
-        "ask": [{
-            "@id": "ex:emp/alice-acme",
-            "?p": { "@id": "ex:alice" }
-        }],
+        "ask": [
+            { "@id": "ex:emp/alice-acme", "?p": "?o" },
+            ["filter", "(istriple ?o)"]
+        ],
         "opts": { "includeSystemFacts": true }
     });
     let resp_opt = fluree
@@ -2236,7 +2221,7 @@ async fn opts_include_system_facts_works_for_ask_queries() {
     assert_eq!(
         json_opt,
         JsonValue::Bool(true),
-        "ASK + opts.includeSystemFacts must surface f:reifies* rows: {json_opt}"
+        "ASK + opts.includeSystemFacts must surface the link: {json_opt}"
     );
 }
 
@@ -2363,19 +2348,12 @@ async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
         "user-authored ex:role must remain visible under wildcard hydration: {node:#?}"
     );
 
-    // No `f:reifies*` predicate may appear under any namespace form
-    // (full IRI or compact alias). The hydration formatter compacts
-    // through the query's `@context`, but we don't declare an `f:`
-    // alias in our test ctx, so any leak would surface as the
-    // expanded IRI.
+    // The link may not appear under any namespace form (full IRI or
+    // compact alias).
     for key in node.keys() {
         assert!(
-            !key.starts_with("https://ns.flur.ee/db#reifies"),
-            "f:reifies* predicate '{key}' must not leak through wildcard hydration"
-        );
-        assert!(
-            !key.starts_with("f:reifies"),
-            "compact f:reifies* form '{key}' must not leak"
+            !key.contains("reifies"),
+            "the link '{key}' must not leak through wildcard hydration"
         );
     }
 }
@@ -2621,7 +2599,7 @@ async fn delete_by_annotation_id_retracts_only_targeted_occurrence() {
     //   ex:emp/A → role=Engineer
     //   ex:emp/B → role=Manager
     // A delete with `@annotation: { @id: ex:emp/A }` must retract
-    // only A's f:reifies* bundle. B and the base edge survive
+    // only A's `rdf:reifies` link. B and the base edge survive
     // unchanged. This is the design's "Delete by Annotation Id"
     // shape — exactly that occurrence, not the base edge.
     let fluree = FlureeBuilder::memory().build_memory();
@@ -2670,13 +2648,10 @@ async fn delete_by_annotation_id_retracts_only_targeted_occurrence() {
         )
         .await
         .expect("delete by annotation id");
-    assert_eq!(
-        r2.receipt.flake_count, 3,
-        "exactly three f:reifies* retracts (subject/predicate/object)"
-    );
+    assert_eq!(r2.receipt.flake_count, 1, "exactly A's link retract");
 
     // Surviving annotations: only B should appear in `@reifies`
-    // queries because A's bundle is gone.
+    // queries because A's link is gone.
     let surviving = json!({
         "@context": ctx(),
         "select": ["?ann", "?role"],
@@ -2926,15 +2901,11 @@ async fn delete_by_annotation_id_named_graph_retracts_in_correct_graph() {
         )
         .await
         .expect("named-graph by-id delete");
-    // Three retract flakes for the bundle (subject/predicate/object).
-    // f:reifiesGraph is also retracted because the synthesized
-    // template carries it explicitly to match the original
-    // assertion's identity. So flake_count = 4: subject + predicate
-    // + object + reifiesGraph.
+    // The link retract, in the link's graph: flake identity includes `g`,
+    // so a default-graph retract would cancel nothing.
     assert_eq!(
-        r2.receipt.flake_count, 4,
-        "named-graph by-id retract must cancel all four reifies* flakes \
-         emitted at insert time (subject/predicate/object + reifiesGraph)"
+        r2.receipt.flake_count, 1,
+        "named-graph by-id retract must cancel the link"
     );
 
     // The annotation should no longer surface via @reifies. If the
@@ -3587,16 +3558,15 @@ async fn graph_wrapped_query_correctly_pairs_annotations_per_graph() {
 // EdgeKey round-trip gate tests — literal-object annotations
 // =====================================================================
 //
-// Contract: every writer of a reifies bundle (insert sibling, in this
-// case) must produce flakes whose decoded `EdgeKey::from_reifies_facts`
-// equals the `EdgeKey::from_flake` of the base edge. If these two
-// disagree, hydration / cascade / by-selector retract all silently fail
-// to find each other.
+// Contract: every annotation writer (insert sibling, in this case) must
+// produce a link whose triple term equals the `EdgeKey::from_flake` of the
+// base edge. If these two disagree, hydration / cascade / by-selector
+// retract all silently fail to find each other.
 //
 // These tests exercise the full JSON-LD expansion → staging → flake
-// pipeline and decode the resulting bundle. They are the load-bearing
+// pipeline and read the resulting link. They are the load-bearing
 // contract that protects against future drift between writer and
-// decoder.
+// reader.
 
 async fn edgekey_roundtrip_for_literal(
     predicate_compact: &str,
@@ -3607,8 +3577,6 @@ async fn edgekey_roundtrip_for_literal(
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
     use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
-    use fluree_db_core::value::FlakeValue;
-    use fluree_vocab::reifies_iris;
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = format!("it-edge-annotations-edgekey-roundtrip-{test_label}");
@@ -3638,11 +3606,6 @@ async fn edgekey_roundtrip_for_literal(
         .snapshot
         .encode_iri(predicate_full)
         .expect("encode predicate IRI");
-    let reifies_subject_pid = ledger
-        .snapshot
-        .encode_iri(reifies_iris::SUBJECT)
-        .expect("encode f:reifiesSubject");
-
     // 1. Base-edge flake.
     let base_flakes = range_with_overlay(
         &ledger.snapshot,
@@ -3663,59 +3626,20 @@ async fn edgekey_roundtrip_for_literal(
     let base_flake = &base_flakes[0];
     let base_edge_key = EdgeKey::from_flake(base_flake);
 
-    // 2. Locate the annotation subject via POST f:reifiesSubject → alice.
-    let ann_pointers = range_with_overlay(
-        &ledger.snapshot,
-        0,
-        ledger.novelty.as_ref(),
-        IndexType::Post,
-        RangeTest::Eq,
-        RangeMatch::predicate_object(
-            reifies_subject_pid.clone(),
-            FlakeValue::Ref(alice_sid.clone()),
-        ),
-        RangeOptions::new().with_to_t(ledger.t()),
-    )
-    .await
-    .expect("scan f:reifiesSubject pointers");
+    // 2. The annotation's link.
+    let links = reifies_bundles_for_subject(ledger, "http://example.org/alice").await;
     assert_eq!(
-        ann_pointers.len(),
+        links.len(),
         1,
-        "[{test_label}] expected exactly one annotation; got {ann_pointers:#?}"
+        "[{test_label}] expected exactly one annotation; got {links:#?}"
     );
-    let ann_sid = ann_pointers[0].s.clone();
+    let bundle = &links[0].1;
+    let decoded_key = edge_of(bundle)
+        .unwrap_or_else(|e| panic!("[{test_label}] {e}; base flake: {base_flake:?}"));
 
-    // 3. Full bundle for that annotation subject.
-    let ann_flakes = range_with_overlay(
-        &ledger.snapshot,
-        0,
-        ledger.novelty.as_ref(),
-        IndexType::Spot,
-        RangeTest::Eq,
-        RangeMatch::subject(ann_sid.clone()),
-        RangeOptions::new().with_to_t(ledger.t()),
-    )
-    .await
-    .expect("scan annotation subject flakes");
-    let bundle: Vec<_> = ann_flakes
-        .iter()
-        .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
-        .cloned()
-        .collect();
-    assert!(
-        !bundle.is_empty(),
-        "[{test_label}] annotation subject must carry an f:reifies* bundle; \
-         got flakes: {ann_flakes:#?}"
-    );
-    let decoded_key = EdgeKey::from_reifies_facts(&bundle).unwrap_or_else(|e| {
-        panic!(
-            "[{test_label}] decode failed: {e:?}; bundle: {bundle:#?}, base flake: {base_flake:?}"
-        )
-    });
-
-    // 4. The contract — decoded EdgeKey from the synthesized sibling
-    //    must equal the base edge's EdgeKey. Mismatch here is the
-    //    silent-failure mode that loses annotations.
+    // 3. The contract — the triple the link names must equal the base
+    //    edge. Mismatch here is the silent-failure mode that loses
+    //    annotations.
     assert_eq!(
         decoded_key, base_edge_key,
         "[{test_label}] decoded EdgeKey diverges from base-edge EdgeKey; \
@@ -3765,72 +3689,79 @@ async fn edgekey_roundtrip_language_tagged_literal_annotation() {
 // =====================================================================
 //
 // Contract (PR-W15): Turtle-star asserting forms (`<< s p o ~ r >>`,
-// `{| … |}`) must produce BIT-IDENTICAL `f:reifies*` flakes to the
-// JSON-LD `@annotation` lowering — same predicates, same object
-// values/datatypes/metadata, same "no f:reifiesDatatype" shape — so
-// cascade retracts, hydration, and the annotation arena treat both
-// surfaces as one. Both surfaces are inserted into the SAME ledger
-// (JSON-LD first, Turtle second) and their bundles compared per
-// transaction time, which keeps Sid identity comparable.
+// `{| … |}`) must produce BIT-IDENTICAL `rdf:reifies` links to the
+// JSON-LD `@annotation` lowering — same triple term, datatype and tag —
+// so cascade retracts and hydration treat both surfaces as one. Both
+// surfaces are inserted into the SAME ledger (JSON-LD first, Turtle
+// second) and their links compared per transaction time, which keeps Sid
+// identity comparable.
 
-/// All `f:reifies*` bundles for annotations reifying edges whose
-/// subject is `base_subject_iri`, grouped by `(ann_sid, t)`.
-async fn reifies_bundles_for_subject(
+/// Live `rdf:reifies` links in graph `g_id` naming a triple whose subject is
+/// `subject`, grouped by `(reifier, t)`.
+async fn links_for_subject_in(
     ledger: &MemoryLedger,
-    base_subject_iri: &str,
+    g_id: fluree_db_core::GraphId,
+    subject: &fluree_db_core::Sid,
+    to_t: i64,
 ) -> Vec<((fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>)> {
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
     use fluree_db_core::value::FlakeValue;
-    use fluree_vocab::reifies_iris;
     use std::collections::BTreeMap;
 
+    let links = range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Psot,
+        RangeTest::Eq,
+        RangeMatch::predicate(fluree_db_core::rdf_reifies_sid().clone()),
+        RangeOptions::new().with_to_t(to_t),
+    )
+    .await
+    .expect("scan rdf:reifies links");
+    let mut out: BTreeMap<(fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>> = BTreeMap::new();
+    for link in links {
+        if matches!(&link.o, FlakeValue::TripleTerm(term) if term.s == *subject) {
+            out.entry((link.s.clone(), link.t)).or_default().push(link);
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Every annotation reifying an edge whose subject is `base_subject_iri`,
+/// in the default graph: its `rdf:reifies` links, grouped by `(ann_sid, t)`.
+async fn reifies_bundles_for_subject(
+    ledger: &MemoryLedger,
+    base_subject_iri: &str,
+) -> Vec<((fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>)> {
     let subject_sid = ledger
         .snapshot
         .encode_iri(base_subject_iri)
         .expect("encode base subject IRI");
-    let reifies_subject_pid = ledger
-        .snapshot
-        .encode_iri(reifies_iris::SUBJECT)
-        .expect("encode f:reifiesSubject");
-
-    let pointers = range_with_overlay(
-        &ledger.snapshot,
-        0,
-        ledger.novelty.as_ref(),
-        IndexType::Post,
-        RangeTest::Eq,
-        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid)),
-        RangeOptions::new().with_to_t(ledger.t()),
-    )
-    .await
-    .expect("scan f:reifiesSubject pointers");
-
-    let mut bundles: BTreeMap<(fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>> =
-        BTreeMap::new();
-    for ptr in &pointers {
-        let ann_sid = ptr.s.clone();
-        let ann_flakes = range_with_overlay(
-            &ledger.snapshot,
-            0,
-            ledger.novelty.as_ref(),
-            IndexType::Spot,
-            RangeTest::Eq,
-            RangeMatch::subject(ann_sid.clone()),
-            RangeOptions::new().with_to_t(ledger.t()),
-        )
-        .await
-        .expect("scan annotation subject flakes");
-        for f in ann_flakes {
-            if fluree_db_core::is_reserved_reifies_predicate(&f.p) {
-                bundles.entry((ann_sid.clone(), f.t)).or_default().push(f);
-            }
-        }
-    }
-    bundles.into_iter().collect()
+    links_for_subject_in(ledger, 0, &subject_sid, ledger.t()).await
 }
 
-/// Normalize a bundle to its time/subject-agnostic body:
+/// The edge a reifier's single link names.
+fn edge_of(links: &[fluree_db_core::Flake]) -> Result<fluree_db_core::edge::EdgeKey, String> {
+    match links {
+        [link] => match &link.o {
+            fluree_db_core::FlakeValue::TripleTerm(term) => Ok(fluree_db_core::edge::EdgeKey {
+                g: None,
+                s: term.s.clone(),
+                p: term.p.clone(),
+                o: term.o.clone(),
+                dt: term.dt.clone(),
+                lang: term.lang.clone(),
+                list_i: None,
+            }),
+            other => Err(format!("link object is not a triple term: {other:?}")),
+        },
+        _ => Err(format!("expected one link, got {links:#?}")),
+    }
+}
+
+/// Normalize a reifier's links to their time/subject-agnostic body:
 /// sorted `(predicate, object, datatype, meta)` rows.
 fn bundle_body(
     bundle: &[fluree_db_core::Flake],
@@ -3849,8 +3780,8 @@ fn bundle_body(
 }
 
 /// Shared driver: insert the JSON-LD form, then the Turtle-star form,
-/// into one ledger; assert the two bundles' bodies are identical and
-/// both decode to the base edge's EdgeKey.
+/// into one ledger; assert the two links are identical and both name the
+/// base edge.
 async fn assert_turtle_star_matches_jsonld(
     ledger_id: &str,
     jsonld_txn: serde_json::Value,
@@ -3932,8 +3863,7 @@ async fn assert_turtle_star_matches_jsonld(
 
     // Every bundle decodes to the base edge's EdgeKey.
     for ((ann, _), bundle) in &bundles {
-        let decoded = EdgeKey::from_reifies_facts(bundle)
-            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
+        let decoded = edge_of(bundle).unwrap_or_else(|e| panic!("link for {ann:?}: {e}"));
         assert_eq!(
             decoded, base_key,
             "bundle for {ann:?} reifies the base edge"
@@ -3972,9 +3902,8 @@ async fn turtle_star_named_reifier_matches_jsonld_named_annotation() {
     // is an idempotent no-op — the engine drops the duplicate flakes —
     // so the same pair can't be exercised twice in one ledger. Bundle
     // bodies are compared with the f:reifiesSubject row normalized.
-    use fluree_db_core::edge::EdgeKey;
+
     use fluree_db_core::FlakeValue;
-    use fluree_vocab::reifies_iris;
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/turtle-star:named-reifier");
@@ -4008,11 +3937,6 @@ async fn turtle_star_named_reifier_matches_jsonld_named_annotation() {
         .snapshot
         .encode_iri("http://example.org/r_tt")
         .expect("encode r_tt");
-    let reifies_subject_pid = ledger
-        .snapshot
-        .encode_iri(reifies_iris::SUBJECT)
-        .expect("encode f:reifiesSubject");
-
     let jl_bundles = reifies_bundles_for_subject(ledger, "http://example.org/alice").await;
     let tt_bundles = reifies_bundles_for_subject(ledger, "http://example.org/bob").await;
     assert_eq!(jl_bundles.len(), 1, "{jl_bundles:#?}");
@@ -4027,8 +3951,8 @@ async fn turtle_star_named_reifier_matches_jsonld_named_annotation() {
     let normalize = |bundle: &[fluree_db_core::Flake]| {
         let mut body = bundle_body(bundle);
         for row in &mut body {
-            if row.0 == reifies_subject_pid {
-                row.1 = FlakeValue::String("<base-subject>".to_string());
+            if let FlakeValue::TripleTerm(term) = &mut row.1 {
+                term.s = fluree_db_core::Sid::new(0, "<base-subject>");
             }
         }
         body.sort_by_key(|row| format!("{row:?}"));
@@ -4037,7 +3961,7 @@ async fn turtle_star_named_reifier_matches_jsonld_named_annotation() {
     assert_eq!(
         normalize(&jl_bundles[0].1),
         normalize(&tt_bundles[0].1),
-        "named-reifier bundle bodies must match modulo the base subject"
+        "named-reifier links must match modulo the base subject"
     );
 
     // Each decodes to its own base edge.
@@ -4045,7 +3969,7 @@ async fn turtle_star_named_reifier_matches_jsonld_named_annotation() {
         (&jl_bundles[0].1, "http://example.org/alice"),
         (&tt_bundles[0].1, "http://example.org/bob"),
     ] {
-        let decoded = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+        let decoded = edge_of(bundle).expect("one link");
         let expected_subject = ledger.snapshot.encode_iri(subject_iri).expect("encode");
         assert_eq!(decoded.s, expected_subject);
     }
@@ -4104,13 +4028,6 @@ async fn turtle_rdf_reifies_triple_term_matches_jsonld_annotation() {
 /// and the annotation is visible to a named-graph-scoped query.
 #[tokio::test]
 async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
-    use fluree_db_core::comparator::IndexType;
-    use fluree_db_core::edge::EdgeKey;
-    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
-    use fluree_db_core::value::FlakeValue;
-    use fluree_vocab::reifies_iris;
-    use std::collections::BTreeMap;
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/trig-star:named-graph";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -4152,46 +4069,11 @@ async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
         .graph_registry
         .graph_id_for_iri(graph_iri)
         .expect("named graph registered");
-    let graph_sid = ledger.snapshot.encode_iri(graph_iri).expect("graph sid");
     let subject_sid = ledger
         .snapshot
         .encode_iri("http://example.org/alice")
         .expect("subject sid");
-    let reifies_subject_pid = ledger
-        .snapshot
-        .encode_iri(reifies_iris::SUBJECT)
-        .expect("f:reifiesSubject sid");
-    let pointers = range_with_overlay(
-        &ledger.snapshot,
-        g_id,
-        ledger.novelty.as_ref(),
-        IndexType::Post,
-        RangeTest::Eq,
-        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid.clone())),
-        RangeOptions::new().with_to_t(t_trig),
-    )
-    .await
-    .expect("scan named-graph f:reifiesSubject pointers");
-    let mut bundles: BTreeMap<(fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>> =
-        BTreeMap::new();
-    for ptr in &pointers {
-        let ann_flakes = range_with_overlay(
-            &ledger.snapshot,
-            g_id,
-            ledger.novelty.as_ref(),
-            IndexType::Spot,
-            RangeTest::Eq,
-            RangeMatch::subject(ptr.s.clone()),
-            RangeOptions::new().with_to_t(t_trig),
-        )
-        .await
-        .expect("scan annotation subject");
-        for f in ann_flakes {
-            if fluree_db_core::is_reserved_reifies_predicate(&f.p) {
-                bundles.entry((ptr.s.clone(), f.t)).or_default().push(f);
-            }
-        }
-    }
+    let bundles = links_for_subject_in(&ledger, g_id, &subject_sid, t_trig).await;
     let mut jl: Vec<_> = bundles
         .iter()
         .filter(|((_, t), _)| *t == t_jsonld)
@@ -4218,14 +4100,9 @@ async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
         jl, tt,
         "TriG-star bundle must be bit-identical to the JSON-LD @graph/@annotation bundle"
     );
+    // Found by the named graph's scan, so both links live in it.
     for ((ann, _), bundle) in &bundles {
-        let key = EdgeKey::from_reifies_facts(bundle)
-            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
-        assert_eq!(
-            key.g.as_ref(),
-            Some(&graph_sid),
-            "bundle for {ann:?} is graph-anchored"
-        );
+        let key = edge_of(bundle).unwrap_or_else(|e| panic!("link for {ann:?}: {e}"));
         assert_eq!(key.s, subject_sid);
     }
 
@@ -4307,7 +4184,6 @@ async fn turtle_star_repeated_anonymous_occurrences_mint_fresh_reifiers() {
     // Turtle must never dedup by EdgeKey), each with a complete bundle
     // decoding to the same base EdgeKey. W3C `pattern-3-nomatch` depends
     // on exactly this behavior.
-    use fluree_db_core::edge::EdgeKey;
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/turtle-star:repeated-anon");
@@ -4362,8 +4238,7 @@ async fn turtle_star_repeated_anonymous_occurrences_mint_fresh_reifiers() {
     // multisets match across surfaces.
     let mut keys = Vec::new();
     for (ann, bundle) in jsonld_anns.iter().chain(turtle_anns.iter()) {
-        let key = EdgeKey::from_reifies_facts(bundle)
-            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
+        let key = edge_of(bundle).unwrap_or_else(|e| panic!("link for {ann:?}: {e}"));
         keys.push(key);
     }
     assert!(
@@ -4475,16 +4350,11 @@ async fn turtle_star_anonymous_mints_never_collide_with_user_bnode_labels() {
 // =====================================================================
 
 /// Insert an annotated literal, then retract by annotation @id, and
-/// verify the f:reifiesSubject pointer no longer resolves. Mirrors the
+/// verify the link no longer resolves. Mirrors the
 /// "live cancels assert" cascade contract enforced in the M1b cascade
 /// tests, but for literal-object annotations.
 #[tokio::test]
 async fn delete_by_id_retracts_literal_annotation_bundle() {
-    use fluree_db_core::comparator::IndexType;
-    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
-    use fluree_db_core::value::FlakeValue;
-    use fluree_vocab::reifies_iris;
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-literal-delete-by-id";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -4499,28 +4369,7 @@ async fn delete_by_id_retracts_literal_annotation_bundle() {
     });
     let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
 
-    let alice_sid = r1
-        .ledger
-        .snapshot
-        .encode_iri("http://example.org/alice")
-        .unwrap();
-    let reifies_subj_pid = r1
-        .ledger
-        .snapshot
-        .encode_iri(reifies_iris::SUBJECT)
-        .unwrap();
-
-    let pre = range_with_overlay(
-        &r1.ledger.snapshot,
-        0,
-        r1.ledger.novelty.as_ref(),
-        IndexType::Post,
-        RangeTest::Eq,
-        RangeMatch::predicate_object(reifies_subj_pid.clone(), FlakeValue::Ref(alice_sid.clone())),
-        RangeOptions::new().with_to_t(r1.ledger.t()),
-    )
-    .await
-    .expect("pre scan");
+    let pre = reifies_bundles_for_subject(&r1.ledger, "http://example.org/alice").await;
     assert_eq!(pre.len(), 1, "annotation must be present pre-delete");
 
     let delete = json!({
@@ -4535,17 +4384,7 @@ async fn delete_by_id_retracts_literal_annotation_bundle() {
     });
     let r2 = fluree.update(r1.ledger, &delete).await.expect("delete");
 
-    let post = range_with_overlay(
-        &r2.ledger.snapshot,
-        0,
-        r2.ledger.novelty.as_ref(),
-        IndexType::Post,
-        RangeTest::Eq,
-        RangeMatch::predicate_object(reifies_subj_pid, FlakeValue::Ref(alice_sid)),
-        RangeOptions::new().with_to_t(r2.ledger.t()),
-    )
-    .await
-    .expect("post scan");
+    let post = reifies_bundles_for_subject(&r2.ledger, "http://example.org/alice").await;
     assert!(
         post.is_empty(),
         "annotation must be retracted post-delete: got {post:#?}"
@@ -4736,11 +4575,6 @@ async fn subject_expansion_promotes_annotated_lang_tagged_literal() {
 /// the matching one.
 #[tokio::test]
 async fn delete_by_selector_retracts_literal_annotation_disambiguating_on_body() {
-    use fluree_db_core::comparator::IndexType;
-    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
-    use fluree_db_core::value::FlakeValue;
-    use fluree_vocab::reifies_iris;
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-literal-delete-selector";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -4764,28 +4598,7 @@ async fn delete_by_selector_retracts_literal_annotation_disambiguating_on_body()
     });
     let r1 = fluree.insert(ledger0, &insert).await.expect("insert two");
 
-    let alice_sid = r1
-        .ledger
-        .snapshot
-        .encode_iri("http://example.org/alice")
-        .unwrap();
-    let reifies_subj_pid = r1
-        .ledger
-        .snapshot
-        .encode_iri(reifies_iris::SUBJECT)
-        .unwrap();
-
-    let pre = range_with_overlay(
-        &r1.ledger.snapshot,
-        0,
-        r1.ledger.novelty.as_ref(),
-        IndexType::Post,
-        RangeTest::Eq,
-        RangeMatch::predicate_object(reifies_subj_pid.clone(), FlakeValue::Ref(alice_sid.clone())),
-        RangeOptions::new().with_to_t(r1.ledger.t()),
-    )
-    .await
-    .expect("pre scan");
+    let pre = reifies_bundles_for_subject(&r1.ledger, "http://example.org/alice").await;
     assert_eq!(pre.len(), 2, "two annotations present pre-delete");
 
     // Selector-form delete: retract the annotation whose body says
@@ -4805,24 +4618,14 @@ async fn delete_by_selector_retracts_literal_annotation_disambiguating_on_body()
     let r2 = fluree.update(r1.ledger, &delete).await.expect("delete");
 
     // One annotation must remain (the payroll one).
-    let post = range_with_overlay(
-        &r2.ledger.snapshot,
-        0,
-        r2.ledger.novelty.as_ref(),
-        IndexType::Post,
-        RangeTest::Eq,
-        RangeMatch::predicate_object(reifies_subj_pid, FlakeValue::Ref(alice_sid)),
-        RangeOptions::new().with_to_t(r2.ledger.t()),
-    )
-    .await
-    .expect("post scan");
+    let post = reifies_bundles_for_subject(&r2.ledger, "http://example.org/alice").await;
     assert_eq!(
         post.len(),
         1,
         "exactly one annotation must survive selector delete (the payroll one); got {post:#?}"
     );
     // The surviving annotation must be ex:ann-payroll.
-    let surviving_sid = &post[0].s;
+    let surviving_sid = &post[0].0 .0;
     let payroll_sid = r2
         .ledger
         .snapshot
@@ -4838,11 +4641,6 @@ async fn delete_by_selector_retracts_literal_annotation_disambiguating_on_body()
 /// EdgeKey has `lang = Some("fr")`.
 #[tokio::test]
 async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
-    use fluree_db_core::comparator::IndexType;
-    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
-    use fluree_db_core::value::FlakeValue;
-    use fluree_vocab::reifies_iris;
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-literal-delete-lang";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -4858,28 +4656,7 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
     });
     let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
 
-    let alice_sid = r1
-        .ledger
-        .snapshot
-        .encode_iri("http://example.org/alice")
-        .unwrap();
-    let reifies_subj_pid = r1
-        .ledger
-        .snapshot
-        .encode_iri(reifies_iris::SUBJECT)
-        .unwrap();
-
-    let pre = range_with_overlay(
-        &r1.ledger.snapshot,
-        0,
-        r1.ledger.novelty.as_ref(),
-        IndexType::Post,
-        RangeTest::Eq,
-        RangeMatch::predicate_object(reifies_subj_pid.clone(), FlakeValue::Ref(alice_sid.clone())),
-        RangeOptions::new().with_to_t(r1.ledger.t()),
-    )
-    .await
-    .expect("pre scan");
+    let pre = reifies_bundles_for_subject(&r1.ledger, "http://example.org/alice").await;
     assert_eq!(pre.len(), 1);
 
     let delete = json!({
@@ -4895,17 +4672,7 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
     });
     let r2 = fluree.update(r1.ledger, &delete).await.expect("delete");
 
-    let post = range_with_overlay(
-        &r2.ledger.snapshot,
-        0,
-        r2.ledger.novelty.as_ref(),
-        IndexType::Post,
-        RangeTest::Eq,
-        RangeMatch::predicate_object(reifies_subj_pid, FlakeValue::Ref(alice_sid)),
-        RangeOptions::new().with_to_t(r2.ledger.t()),
-    )
-    .await
-    .expect("post scan");
+    let post = reifies_bundles_for_subject(&r2.ledger, "http://example.org/alice").await;
     assert!(
         post.is_empty(),
         "lang-tagged annotation must be retracted post-delete: got {post:#?}"
@@ -5000,93 +4767,45 @@ async fn cross_language_annotation_does_not_cross_match() {
         "both annotation bodies must be inserted; got: {bare_rows:#?}"
     );
 
-    // Confirm both `f:reifiesLang` flakes landed (one per annotation).
-    // We scan directly because the user-facing query path filters
-    // system predicates from variable-predicate output.
+    // Confirm both links landed, each naming its own tagged literal. We scan
+    // directly because the user-facing query path hides `rdf:reifies` from
+    // variable-predicate output. The language tag is part of the term: a
+    // writer that dropped it would make the two links one.
     {
         use fluree_db_core::comparator::IndexType;
         use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
-        use fluree_vocab::reifies_iris;
-        let reifies_lang_pid = ledger
-            .snapshot
-            .encode_iri(reifies_iris::LANG)
-            .expect("encode f:reifiesLang");
-        let lang_flakes = range_with_overlay(
+        let links = range_with_overlay(
             &ledger.snapshot,
             0,
             ledger.novelty.as_ref(),
-            IndexType::Spot,
+            IndexType::Psot,
             RangeTest::Eq,
-            RangeMatch::new().with_predicate(reifies_lang_pid),
+            RangeMatch::predicate(fluree_db_core::rdf_reifies_sid().clone()),
             RangeOptions::new().with_to_t(ledger.t()),
         )
         .await
-        .expect("scan f:reifiesLang");
-        assert_eq!(lang_flakes.len(), 2, "expected two f:reifiesLang flakes");
-
-        // ALSO scan the f:reifiesObject flakes to verify whether the
-        // language tag IS stored on the per-flake `m.lang` (in which
-        // case the existing `edge.dtc` clone IS the right
-        // disambiguator and the bug is elsewhere) or NOT stored there
-        // (in which case the new `f:reifiesLang` constraint triple is
-        // necessary). This tells us which IR shape is internally
-        // consistent.
-        let reifies_obj_pid = ledger
-            .snapshot
-            .encode_iri(reifies_iris::OBJECT)
-            .expect("encode f:reifiesObject");
-        let obj_flakes = range_with_overlay(
-            &ledger.snapshot,
-            0,
-            ledger.novelty.as_ref(),
-            IndexType::Spot,
-            RangeTest::Eq,
-            RangeMatch::new().with_predicate(reifies_obj_pid),
-            RangeOptions::new().with_to_t(ledger.t()),
-        )
-        .await
-        .expect("scan f:reifiesObject");
-        assert_eq!(obj_flakes.len(), 2, "expected two f:reifiesObject flakes");
-
-        // The where_plan expansion treats `edge.dtc = LangTag(...)`
-        // on the synthesized f:reifiesObject lookup as the per-
-        // language disambiguator. That depends on the writer
-        // storing the language tag on the flake's `m.lang`. Assert
-        // the exact wire layout the IR relies on so a future writer
-        // refactor can't silently move the language tag off the
-        // f:reifiesObject flake without flipping this test red.
+        .expect("scan rdf:reifies");
+        assert_eq!(links.len(), 2, "expected two links: {links:#?}");
         let rdf_lang_string_sid = ledger
             .snapshot
             .encode_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
             .expect("encode rdf:langString");
-        for f in &obj_flakes {
+        let mut langs = std::collections::HashSet::new();
+        for link in &links {
+            let fluree_db_core::FlakeValue::TripleTerm(term) = &link.o else {
+                panic!("link object must be a triple term: {link:?}");
+            };
             assert_eq!(
-                f.o,
-                fluree_db_core::value::FlakeValue::String("chat".to_string()),
-                "f:reifiesObject object must be the lexical string \"chat\"; got {:?}",
-                f.o
+                term.o,
+                fluree_db_core::value::FlakeValue::String("chat".to_string())
             );
-            assert_eq!(
-                f.dt, rdf_lang_string_sid,
-                "f:reifiesObject dt must be rdf:langString for lang-tagged literal; got {:?}",
-                f.dt
-            );
-            assert!(
-                f.m.as_ref()
-                    .and_then(|m| m.lang.as_ref())
-                    .is_some_and(|l| l == "fr" || l == "en"),
-                "f:reifiesObject must carry m.lang in {{fr,en}}; got {:?}",
-                f.m
-            );
+            assert_eq!(term.dt, rdf_lang_string_sid);
+            langs.insert(term.lang.clone().expect("tagged"));
         }
-        let langs: std::collections::HashSet<String> = obj_flakes
-            .iter()
-            .filter_map(|f| f.m.as_ref().and_then(|m| m.lang.clone()))
-            .collect();
         assert_eq!(
             langs,
             ["fr".to_string(), "en".to_string()].into_iter().collect(),
-            "f:reifiesObject m.lang values must be exactly {{fr, en}}"
+            "the links' tags must be exactly {{fr, en}}"
         );
     }
 
@@ -5520,23 +5239,6 @@ async fn run_graph_mgmt(fluree: &MemoryFluree, ledger: MemoryLedger, sparql: &st
         .ledger
 }
 
-/// Like [`run_graph_mgmt`] but returns the staging `Result` mapped to its
-/// error string — for the negative (rejection) tests.
-async fn try_run_graph_mgmt(
-    fluree: &MemoryFluree,
-    ledger: MemoryLedger,
-    sparql: &str,
-) -> std::result::Result<MemoryLedger, String> {
-    let txn = lower_graph_mgmt(&ledger.snapshot, sparql);
-    fluree
-        .stage_owned(ledger)
-        .txn(txn)
-        .execute()
-        .await
-        .map(|r| r.ledger)
-        .map_err(|e| e.to_string())
-}
-
 /// Pull the annotation body's `ex:role` out of a subject-expansion
 /// hydration row. Tolerates compact-vs-expanded keys and bare-object
 /// vs single-element-array shapes (both formatter-legal).
@@ -5776,11 +5478,10 @@ async fn transfer_named_to_default_drops_reifies_graph_anchor() {
 }
 
 #[tokio::test]
-async fn add_across_graphs_with_reifier_collision_errors() {
-    // Same explicit reifier @id reifying DIFFERENT edges in two graphs.
-    // ADD merges the bundles onto one subject → a second f:reifiesSubject →
-    // from_reifies_facts returns Duplicate → BOTH annotations silently drop.
-    // The fix detects this and fails loud (COPY/MOVE are immune; see below).
+async fn add_across_graphs_merges_a_shared_reifier() {
+    // Same explicit reifier @id reifying DIFFERENT edges in two graphs. ADD
+    // merges the source's link into the destination, where ex:r1 then names
+    // both triples — a reifier may reify several (RDF 1.2).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:add-reifier-collision";
     let g1 = "http://example.org/g1";
@@ -5801,27 +5502,13 @@ async fn add_across_graphs_with_reifier_collision_errors() {
     )
     .await;
 
-    let err = try_run_graph_mgmt(&fluree, ledger.clone(), &format!("ADD <{g1}> TO <{g2}>"))
-        .await
-        .expect_err("ADD with a cross-graph reifier collision must be rejected");
-    assert!(
-        err.contains("reifier") && err.contains("r1"),
-        "expected a reifier-collision rejection naming the reifier, got: {err}"
-    );
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("ADD <{g1}> TO <{g2}>")).await;
 
-    // The rejected ADD is atomic: dest g2's pre-existing ex:r1 annotation
-    // (reifying bob→globex) is untouched and still decodes cleanly.
-    let g2_ann = support::decode_annotations_for_subject(
-        &ledger,
-        graph_id(&ledger, g2),
-        "http://example.org/bob",
-    )
-    .await;
-    assert_eq!(
-        g2_ann.len(),
-        1,
-        "dest's pre-existing annotation must survive the rejected ADD"
-    );
+    let g2_id = graph_id(&ledger, g2);
+    for subject in ["http://example.org/alice", "http://example.org/bob"] {
+        let anns = support::decode_annotations_for_subject(&ledger, g2_id, subject).await;
+        assert_eq!(anns.len(), 1, "g2's ex:r1 must reify {subject}'s edge");
+    }
 }
 
 #[tokio::test]
@@ -6452,76 +6139,6 @@ async fn one_reifier_on_the_same_edge_in_two_graphs_writes_in_one_transaction() 
         .await;
         assert_eq!(anns.len(), 1, "graph {g} must carry its own bundle");
     }
-}
-
-#[tokio::test]
-async fn replaying_a_commit_does_not_refuse_a_reifier_an_older_build_wrote() {
-    // The single-target invariant runs on `stage_flakes`, which put it on the
-    // push path. `insert_turtle` and the permissive bulk-import sink did not
-    // enforce it before this work, so a commit written by an older build can
-    // hold a reifier on two edges. Refusing that on push would strand the
-    // ledger permanently — there is no way forward short of rewriting history
-    // — to prevent data that is already written.
-    //
-    // Authoring still refuses it, which is the case where refusing changes the
-    // outcome. This drives both sides of that distinction through the same
-    // flakes, so the difference is the option and nothing else.
-    use fluree_db_core::{Flake, FlakeValue, Sid};
-
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/edge-annotations:replayed-commit";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
-
-    let sid = |ns: u16, name: &str| Sid::new(ns, name);
-    let reifies = |local: &str| {
-        Sid::new(
-            fluree_vocab::namespaces::FLUREE_DB,
-            Box::leak(local.to_string().into_boxed_str()) as &'static str,
-        )
-    };
-    let ns = 100u16;
-    // One reifier, two different subjects: a bundle that cannot decode.
-    let assert_reifies = |object: Sid| {
-        Flake::new(
-            sid(ns, "claim1"),
-            reifies(fluree_vocab::db::REIFIES_SUBJECT),
-            FlakeValue::Ref(object),
-            Sid::new(0, "@id"),
-            1,
-            true,
-            None,
-        )
-    };
-    let flakes = vec![
-        assert_reifies(sid(ns, "alice")),
-        assert_reifies(sid(ns, "carol")),
-    ];
-
-    let authored = fluree_db_transact::stage_flakes(
-        ledger0.clone(),
-        flakes.clone(),
-        fluree_db_transact::StageOptions::new(),
-    )
-    .await;
-    let err = match authored {
-        Err(e) => e,
-        Ok(_) => panic!("authoring a two-target reifier must be refused"),
-    };
-    assert!(
-        err.to_string().contains("claim1"),
-        "the refusal must name the reifier: {err}"
-    );
-
-    let replayed = fluree_db_transact::stage_flakes(
-        ledger0,
-        flakes,
-        fluree_db_transact::StageOptions::new().replaying_commit(),
-    )
-    .await;
-    assert!(
-        replayed.is_ok(),
-        "replaying an already-authored commit must apply, not strand the ledger"
-    );
 }
 
 // ===========================================================================

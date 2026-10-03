@@ -609,27 +609,11 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
     Ok(())
 }
 
-/// Shared core of the two `emit_reified_triple` impls (`FlakeSink` /
-/// `ImportSink`) and of TriG bulk import: a resolved reifier attachment →
-/// validated → the `EdgeKey::to_reifies_facts_jsonld_compatible` bundle,
-/// so the bit-identical-bundles guarantee (Turtle-star ≡ JSON-LD
-/// `@annotation` at the flake level; cascade retracts cancel either
-/// surface) cannot drift between those callers — each keeps only its own
-/// error channel and emission (Vec-extend vs commit-writer/spool).
-/// Transactional TriG (`convert_named_graphs_to_templates` in
-/// `fluree-db-api`) is a second builder emitting templates; its parity is
-/// pinned by `trig_star_in_graph_block_matches_jsonld_named_graph_annotation`.
-///
-/// `g` is `None` for the Turtle sinks (default graph) and the block's graph
-/// for TriG import; list-occurrence annotations are deferred in v1 →
-/// `list_i = None`.
-///
-/// The validation is the same late hard guard as `build_flake` /
-/// `push_triple`: a bad (value, dt) pair must fail the whole ingest, not
-/// silently drop or corrupt the bundle. The base triple hit the same
-/// guard already, so this only fires on shapes the base emission also
-/// rejected.
-pub(crate) fn reified_triple_bundle(
+/// The RDF 1.2 link `ann rdf:reifies <<( s p o )>>` for a reified triple, in
+/// the triple's graph (`None` for the default graph). Shared by the Turtle
+/// sinks and TriG bulk import. The object pair gets the same late guard as
+/// `build_flake`, so a bad (value, datatype) pair fails the ingest.
+pub(crate) fn reified_triple_link(
     g: Option<Sid>,
     s: Sid,
     p: Sid,
@@ -637,20 +621,23 @@ pub(crate) fn reified_triple_bundle(
     dtc: &fluree_db_core::DatatypeConstraint,
     ann: &Sid,
     t: i64,
-) -> Result<Vec<Flake>> {
+) -> Result<Flake> {
     let dt = dtc.datatype().clone();
-    let lang = dtc.lang_tag().map(std::string::ToString::to_string);
     validate_value_dt_pair(&o, &dt)?;
-    let key = fluree_db_core::edge::EdgeKey {
-        g,
+    let term = fluree_db_core::TripleTermValue {
         s,
         p,
         o,
         dt,
-        lang,
-        list_i: None,
+        lang: dtc.lang_tag().map(str::to_string),
     };
-    Ok(key.to_reifies_facts_jsonld_compatible(ann, t, true))
+    let reifies = fluree_db_core::rdf_reifies_sid().clone();
+    let value = FlakeValue::TripleTerm(Box::new(term));
+    let dt = fluree_db_core::triple_term_datatype_sid().clone();
+    Ok(match g {
+        Some(g) => Flake::new_in_graph(g, ann.clone(), reifies, value, dt, t, true, None),
+        None => Flake::new(ann.clone(), reifies, value, dt, t, true, None),
+    })
 }
 
 /// Infer datatype from a FlakeValue

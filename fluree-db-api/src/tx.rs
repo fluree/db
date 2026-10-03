@@ -2196,8 +2196,7 @@ fn bounded_read_subjects(
         return None;
     }
     let retracts = !txn.delete_templates.is_empty() || txn.txn_type == TxnType::Upsert;
-    if retracts && (ledger.snapshot.has_annotations || ledger.novelty.attachments.has_annotations())
-    {
+    if retracts && (ledger.snapshot.has_annotations || ledger.novelty.has_annotations()) {
         return None;
     }
 
@@ -2532,52 +2531,21 @@ fn convert_named_graphs_to_templates(
             }
         }
 
-        // TriG-star: one `f:reifies*` bundle per reifier attachment, in the
-        // same graph as the edge it reifies — the shape the JSON-LD
-        // `@annotation` sibling produces (f:reifiesGraph present, no
-        // f:reifiesDatatype, f:reifiesLang for language-tagged objects).
-        if !block.reified.is_empty() {
-            use fluree_db_core::namespaces::{
-                reifies_graph_sid, reifies_lang_sid, reifies_object_sid, reifies_predicate_sid,
-                reifies_subject_sid,
-            };
-            let graph_sid = ns_registry.sid_for_iri(&block.iri);
-            for r in &block.reified {
-                let ann = convert_term(&r.reifier, &block.prefixes, ns_registry)?;
-                let s = convert_term(&r.subject, &block.prefixes, ns_registry)?;
-                let p = convert_term(&r.predicate, &block.prefixes, ns_registry)?;
-                let (o, dtc) = convert_object(&r.object, &block.prefixes, ns_registry)?;
-                let lang = match &dtc {
-                    Some(DatatypeConstraint::LangTag(lang)) => Some(lang.to_string()),
-                    _ => None,
-                };
-                let mut push = |pred: &fluree_db_core::Sid,
-                                obj: TemplateTerm,
-                                dtc: Option<DatatypeConstraint>| {
-                    let mut t =
-                        TripleTemplate::new(ann.clone(), TemplateTerm::Sid(pred.clone()), obj)
-                            .in_graph(std::sync::Arc::clone(&graph));
-                    if let Some(d) = dtc {
-                        t = t.with_dtc(d);
-                    }
-                    templates.push(t);
-                };
-                push(
-                    reifies_graph_sid(),
-                    TemplateTerm::Sid(graph_sid.clone()),
-                    None,
-                );
-                push(reifies_subject_sid(), s, None);
-                push(reifies_predicate_sid(), p, None);
-                if let Some(lang) = lang {
-                    push(
-                        reifies_lang_sid(),
-                        TemplateTerm::Value(fluree_db_core::FlakeValue::String(lang)),
-                        None,
-                    );
-                }
-                push(reifies_object_sid(), o, dtc);
-            }
+        // TriG-star: each reified triple's link, in the triple's graph.
+        for r in &block.reified {
+            let ann = convert_term(&r.reifier, &block.prefixes, ns_registry)?;
+            let s = convert_term(&r.subject, &block.prefixes, ns_registry)?;
+            let p = convert_term(&r.predicate, &block.prefixes, ns_registry)?;
+            let (o, dtc) = convert_object(&r.object, &block.prefixes, ns_registry)?;
+            let term = fluree_db_transact::TemplateTripleTerm { s, p, o, dtc };
+            templates.push(
+                TripleTemplate::new(
+                    ann,
+                    TemplateTerm::Sid(fluree_db_core::rdf_reifies_sid().clone()),
+                    TemplateTerm::TripleTerm(Box::new(term)),
+                )
+                .in_graph(std::sync::Arc::clone(&graph)),
+            );
         }
     }
 

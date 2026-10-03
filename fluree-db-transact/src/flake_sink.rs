@@ -7,8 +7,6 @@ use crate::error::TransactError;
 use crate::generate::{infer_datatype, validate_value_dt_pair};
 use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal};
-#[cfg(test)]
-use fluree_db_core::edge::EdgeKey;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
@@ -155,9 +153,9 @@ impl<'a> FlakeSink<'a> {
 
         // Reserved-predicate firewall (mirrors the JSON-LD and SPARQL UPDATE
         // surfaces): a user-authored `f:reifies*` statement must not reach
-        // stage. Annotations are minted only through the RDF 1.2 annotation
-        // syntax (`~` / `{| |}` / `<< >>`), which arrives via
-        // `emit_reified_triple` and builds a complete, validated bundle.
+        // stage. These predicates are the retired attachment encoding; the
+        // RDF 1.2 annotation syntax (`~` / `{| |}` / `<< >>`) arrives via
+        // `emit_reified_triple` and writes the `rdf:reifies` link.
         // Bulk import (`ImportSink`) is the administrative bootstrap path and
         // deliberately stays permissive so an export round-trips.
         if fluree_db_core::is_reserved_reifies_predicate(&p) {
@@ -325,11 +323,8 @@ impl GraphSink for FlakeSink<'_> {
         true
     }
 
-    /// Turtle-star reifier attachment → the durable `f:reifies*` bundle,
-    /// built by the shared [`crate::generate::flakes::reified_triple_bundle`]
-    /// (bit-identical with the JSON-LD `@annotation` lowering and with
-    /// `ImportSink`'s bulk path). The base triple has already been emitted
-    /// by the parser via `emit_triple`.
+    /// The reified triple's link; the parser has already emitted the base
+    /// triple through `emit_triple`.
     fn emit_reified_triple(
         &mut self,
         subject: TermId,
@@ -350,10 +345,10 @@ impl GraphSink for FlakeSink<'_> {
             return Ok(());
         };
 
-        match crate::generate::flakes::reified_triple_bundle(None, s, p, o, &dtc, &ann, self.t) {
-            Ok(bundle) => self.flakes.extend(bundle),
+        match crate::generate::flakes::reified_triple_link(None, s, p, o, &dtc, &ann, self.t) {
+            Ok(link) => self.flakes.push(link),
             Err(e) => {
-                tracing::error!("FlakeSink: invariant violation in reifier bundle, aborting — {e}");
+                tracing::error!("FlakeSink: invariant violation in reified triple, aborting — {e}");
                 if self.invariant_error.is_none() {
                     self.invariant_error = Some(e);
                 }
@@ -613,15 +608,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_reified_triple_emits_jsonld_compatible_bundle() {
-        // Ref-object, default-graph: exactly Subject + Predicate + Object —
-        // NO f:reifiesDatatype (the JSON-LD-compatible shape), and the
-        // bundle decodes back to the base edge's EdgeKey.
-        use fluree_db_core::namespaces::{
-            is_reifies_datatype, is_reifies_object, is_reifies_predicate, is_reifies_subject,
-        };
+    /// The base flake and the term its link names.
+    fn base_and_term(flakes: &[Flake]) -> (&Flake, &fluree_db_core::TripleTermValue) {
+        assert_eq!(flakes.len(), 2, "base + link: {flakes:?}");
+        let (base, link) = (&flakes[0], &flakes[1]);
+        assert!(fluree_db_core::is_rdf_reifies(&link.p));
+        assert_eq!(link.s.name.as_ref(), "reifier");
+        assert_eq!(link.dt, *fluree_db_core::triple_term_datatype_sid());
+        assert!(link.op && link.t == base.t && link.g.is_none());
+        match &link.o {
+            FlakeValue::TripleTerm(term) => (base, term),
+            other => panic!("link object is not a triple term: {other:?}"),
+        }
+    }
 
+    #[test]
+    fn test_reified_triple_emits_link() {
         let (mut ns, t, txn_id) = make_sink();
         let mut sink = FlakeSink::new(&mut ns, t, txn_id);
 
@@ -633,37 +635,15 @@ mod tests {
         sink.emit_reified_triple(s, p, o, r).unwrap();
 
         let flakes = sink.into_flakes().expect("no invariant violation");
-        // 1 base + 3 bundle flakes.
-        assert_eq!(flakes.len(), 4);
-        let base = &flakes[0];
-        let bundle = &flakes[1..];
-        assert!(bundle.iter().any(|f| is_reifies_subject(&f.p)));
-        assert!(bundle.iter().any(|f| is_reifies_predicate(&f.p)));
-        assert!(bundle.iter().any(|f| is_reifies_object(&f.p)));
-        assert!(
-            !bundle.iter().any(|f| is_reifies_datatype(&f.p)),
-            "JSON-LD-compatible bundle must omit f:reifiesDatatype: {bundle:?}"
-        );
-        for f in bundle {
-            assert!(f.op, "assertion bundle");
-            assert_eq!(f.t, t);
-            assert!(f.g.is_none(), "plain Turtle is default-graph");
-        }
-        let decoded = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+        let (base, term) = base_and_term(&flakes);
         assert_eq!(
-            decoded,
-            EdgeKey::from_flake(base),
-            "decoded EdgeKey must equal the base edge's EdgeKey"
+            (&term.s, &term.p, &term.o, &term.dt, &term.lang),
+            (&base.s, &base.p, &base.o, &base.dt, &None)
         );
     }
 
     #[test]
-    fn test_reified_triple_lang_literal_bundle_carries_lang() {
-        // Language-tagged object: bundle adds f:reifiesLang and the
-        // f:reifiesObject flake carries m.lang (cascade symmetry with the
-        // JSON-LD writer — see EdgeKey docs / BUGS-2).
-        use fluree_db_core::namespaces::{is_reifies_lang, is_reifies_object};
-
+    fn test_reified_lang_literal_link_carries_lang() {
         let (mut ns, t, txn_id) = make_sink();
         let mut sink = FlakeSink::new(&mut ns, t, txn_id);
 
@@ -675,26 +655,9 @@ mod tests {
         sink.emit_reified_triple(s, p, o, r).unwrap();
 
         let flakes = sink.into_flakes().expect("no invariant violation");
-        // 1 base + 4 bundle flakes (S, P, O, Lang).
-        assert_eq!(flakes.len(), 5);
-        let base = &flakes[0];
-        let bundle = &flakes[1..];
-        let obj = bundle
-            .iter()
-            .find(|f| is_reifies_object(&f.p))
-            .expect("f:reifiesObject");
-        assert_eq!(
-            obj.m.as_ref().and_then(|m| m.lang.as_deref()),
-            Some("fr"),
-            "f:reifiesObject must carry m.lang"
-        );
-        let lang = bundle
-            .iter()
-            .find(|f| is_reifies_lang(&f.p))
-            .expect("f:reifiesLang");
-        assert!(matches!(&lang.o, FlakeValue::String(l) if l == "fr"));
-        let decoded = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
-        assert_eq!(decoded, EdgeKey::from_flake(base));
+        let (base, term) = base_and_term(&flakes);
+        assert_eq!((&term.o, &term.dt), (&base.o, &base.dt));
+        assert_eq!(term.lang.as_deref(), Some("fr"));
     }
 
     #[test]

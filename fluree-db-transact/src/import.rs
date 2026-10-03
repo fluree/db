@@ -684,9 +684,7 @@ mod inner {
                 }
             }
 
-            // TriG-star: `f:reifies*` bundles in the same graph as the edge
-            // they reify — the bundle the default-graph `ImportSink` emits,
-            // with `f:reifiesGraph` set.
+            // TriG-star: each reified triple's link, in the triple's graph.
             for r in &block.reified {
                 let ann = expand_term(&r.reifier, &block.prefixes, &mut worker_cache, skolem_base)?;
                 let s = expand_term(&r.subject, &block.prefixes, &mut worker_cache, skolem_base)?;
@@ -702,45 +700,22 @@ mod inner {
                     Some(lang) => fluree_db_core::DatatypeConstraint::LangTag(Arc::from(lang)),
                     None => fluree_db_core::DatatypeConstraint::Explicit(dt),
                 };
-                let bundle = crate::generate::flakes::reified_triple_bundle(
+                let link = crate::generate::flakes::reified_triple_link(
                     Some(graph_sid.clone()),
-                    s.clone(),
-                    p.clone(),
+                    s,
+                    p,
                     o,
                     &dtc,
                     &ann,
                     new_t,
                 )?;
-                // The RDF 1.2 link rides alongside the bundle, as on the
-                // default-graph path.
-                if let (Some(sc), Some(object)) = (
-                    spool_ctx.as_mut(),
-                    bundle
-                        .iter()
-                        .find(|f| fluree_db_core::is_reifies_object(&f.p)),
-                ) {
-                    sc.push_named_graph_link(g_id, &s, &p, object, new_t)?;
+                if let (Some(sc), FlakeValue::TripleTerm(term)) = (spool_ctx.as_mut(), &link.o) {
+                    sc.push_named_graph_link(g_id, &ann, term, new_t)?;
                 }
-                for flake in bundle {
-                    if let Some(sc) = spool_ctx.as_mut() {
-                        sc.push_named_graph_record(
-                            g_id,
-                            crate::import_sink::FlakeRecord {
-                                s: &flake.s,
-                                p: &flake.p,
-                                o: &flake.o,
-                                dt: &flake.dt,
-                                lang: flake.m.as_ref().and_then(|m| m.lang.as_deref()),
-                                list_index: None,
-                                t: new_t,
-                            },
-                        )?;
-                    }
-                    writer.push_flake(&flake).map_err(|e| {
-                        TransactError::Parse(format!("failed to encode reifier bundle flake: {e}"))
-                    })?;
-                    op_count += 1;
-                }
+                writer.push_flake(&link).map_err(|e| {
+                    TransactError::Parse(format!("failed to encode link flake: {e}"))
+                })?;
+                op_count += 1;
             }
         }
 

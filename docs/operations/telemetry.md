@@ -305,15 +305,12 @@ query_execute (debug)
 │   ├── sort_blocking (debug, cross-thread via spawn_blocking)
 │   └── ...
 └── format (debug)
-    └── inject_annotations (debug, edge_in_named_graph, path, annotation_count)
-        └── annotation_arena_lookup (debug, live_count)  ← path = "arena" only
+    └── inject_annotations (debug, edge_in_named_graph, annotation_count)
 ```
 
-`inject_annotations` and `annotation_arena_lookup` fire only on
-hydration responses that surface annotation bodies; both are skipped
-on non-annotation ledgers via the formatter's zero-cost gate.
-`path` is `"arena"` when the cached `AnnotationArenaReader` resolved
-the lookup, `"scan"` when the M2a POST-scan fallback ran.
+`inject_annotations` fires only on hydration responses that probe an
+edge for annotations, reading the reifiers' `rdf:reifies` links; it is
+skipped on non-annotation ledgers via the formatter's zero-cost gate.
 
 #### Span Tree (Multi-query envelope)
 

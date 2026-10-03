@@ -355,36 +355,48 @@ async fn annotated_type_edge_is_accepted_by_insert_and_refused_by_upsert() {
 }
 
 #[tokio::test]
-async fn one_named_reifier_on_two_edges_is_rejected_on_every_turtle_path() {
-    // A reifier denotes exactly one edge. Reusing an explicit reifier on
-    // two different triples in one document would store a bundle that
-    // `EdgeKey::from_reifies_facts` rejects, so every reader silently drops
-    // BOTH annotations. Fail loud at write time instead.
+async fn one_named_reifier_on_two_edges_names_both_on_every_turtle_path() {
+    // A reifier may reify several triples (RDF 1.2): reusing an explicit
+    // reifier on two triples links it to both, on the direct Turtle path and
+    // on the JSON-LD-converted one alike.
     let turtle = with_prefixes(
         "ex:alice ex:knows ex:bob ~ ex:claim1 .\n\
          ex:alice ex:knows ex:carol ~ ex:claim1 .\n",
     );
+    let query = "PREFIX ex: <http://example.org/>\n\
+                 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                 SELECT ?o WHERE { ex:claim1 rdf:reifies <<( ex:alice ex:knows ?o )>> } \
+                 ORDER BY ?o";
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let err = fluree
-        .insert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-reuse:insert"),
-            &turtle,
-        )
-        .await
-        .expect_err("insert_turtle must reject a reifier reused on two edges");
-    let msg = err.to_string();
-    assert!(msg.contains("claim1"), "must name the reifier: {msg}");
-
-    let err = fluree
-        .upsert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-reuse:upsert"),
-            &turtle,
-        )
-        .await
-        .expect_err("upsert_turtle must reject a reifier reused on two edges");
-    let msg = err.to_string();
-    assert!(msg.contains("claim1"), "must name the reifier: {msg}");
+    for (path, ledger_id) in [
+        ("insert", "it/turtle-star-reuse:insert"),
+        ("upsert", "it/turtle-star-reuse:upsert"),
+    ] {
+        let ledger = genesis_ledger(&fluree, ledger_id);
+        let committed = match path {
+            "insert" => fluree.insert_turtle(ledger, &turtle).await,
+            _ => fluree.upsert_turtle(ledger, &turtle).await,
+        }
+        .unwrap_or_else(|e| panic!("{path}_turtle: {e}"));
+        let result = support::query_sparql(&fluree, &committed.ledger, query)
+            .await
+            .expect("query");
+        let json = result
+            .to_sparql_json(&committed.ledger.snapshot)
+            .expect("sparql json");
+        let objects: Vec<&str> = json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .filter_map(|b| b["o"]["value"].as_str())
+            .collect();
+        assert_eq!(
+            objects,
+            ["http://example.org/bob", "http://example.org/carol"],
+            "{path}_turtle: claim1 names both edges"
+        );
+    }
 }
 
 #[tokio::test]

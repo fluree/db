@@ -846,15 +846,13 @@ async fn all_spans_properly_closed() {
 }
 
 // =============================================================================
-// Annotation read-path spans — inject_annotations + annotation_arena_lookup
+// Annotation read-path span — inject_annotations
 // =============================================================================
 
 #[tokio::test(flavor = "current_thread")]
 async fn annotation_hydration_emits_inject_annotations_span() {
     // A subject-hydration query against an annotated edge should emit
-    // an `inject_annotations` span tagged with the chosen path
-    // (`scan` here — no arena reader on a memory ledger that hasn't
-    // been reindexed). On non-annotation ledgers the formatter's
+    // an `inject_annotations` span. On non-annotation ledgers the formatter's
     // zero-cost gate skips the span entirely; that contract is
     // covered by `ac5_zero_noise_at_info` above (any span at all
     // would fail it on a non-annotation workload — the API layer is
@@ -902,25 +900,10 @@ async fn annotation_hydration_emits_inject_annotations_span() {
         tracing::Level::DEBUG,
         "inject_annotations must be DEBUG (per CLAUDE.md tracing convention)"
     );
-    let path = inject
-        .fields
-        .get("path")
-        .map(String::as_str)
-        .unwrap_or("<missing>");
-    assert_eq!(
-        path, "scan",
-        "memory ledger without a sealed arena takes the scan path; got {path:?}"
-    );
     assert!(
         inject.fields.contains_key("annotation_count"),
         "inject_annotations must record annotation_count: fields = {:?}",
         inject.fields
-    );
-
-    // Without an arena reader the inner span should not fire.
-    assert!(
-        !store.has_span("annotation_arena_lookup"),
-        "annotation_arena_lookup must not fire when no arena is sealed"
     );
 }
 

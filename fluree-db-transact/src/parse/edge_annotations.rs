@@ -2,11 +2,13 @@
 //! parser.
 //!
 //! Walks the raw transaction document **before** JSON-LD expansion and
-//! rewrites every `@annotation` / `@edge` / `@reifies` block into the
-//! seven-fact `f:reifies*` system encoding. The output is a document
-//! that contains only ordinary IRIs (no `@`-keyword extensions), so
-//! the rest of the parsing pipeline (`expand_with_context_policy`,
-//! `parse_expanded_triples_with_ctx`) processes it unchanged.
+//! rewrites every `@annotation` / `@edge` / `@reifies` block into
+//! `f:reifies*` slot keys naming the annotated edge. JSON-LD has no
+//! triple-term syntax, so the slots are how the edge travels through
+//! `expand_with_context_policy` and `parse_expanded_triples_with_ctx`
+//! unchanged; [`fold_slots_into_links`] then turns each annotation's slots
+//! into its `rdf:reifies <<( s p o )>>` link, and bulk import's sink does
+//! the same. The slots are never stored.
 //!
 //! The accepted insert shape is the **inline form** (`@annotation` /
 //! `@edge` on the *object* node of a predicate):
@@ -1138,39 +1140,17 @@ fn build_annotation_delete(
         // body — same deferral rule as inserts.
         scan_annotation_keywords_in_map(&ann_map, ctx)?;
 
-        // Build the WHERE pattern as a flat triple-pattern node. The
-        // body properties (remaining in `ann_map`) act as selector
-        // predicates; the `f:reifies*` triples pin the annotation to
-        // the (parent_subject, predicate, object_id) edge. We emit
-        // the system predicates directly rather than the higher-level
-        // `@reifies` shape because the standard lowering walker
-        // rejects `@reifies` outside its query-side context, while
-        // `f:reifies*` IRIs are accepted as ordinary IRIs (the
-        // user-authored-reifies firewall has already run against the
-        // original doc, so our synthesized ones aren't re-scanned).
-        // The JSON-LD-Q query parser still resolves `f:reifies*`
-        // triple patterns into the same indexed lookups as
-        // `@reifies` would.
+        // The WHERE node: the body properties (remaining in `ann_map`) act
+        // as selector predicates, and the query-side `@reifies` pins the
+        // annotation to the (parent_subject, predicate, object) edge through
+        // its `rdf:reifies` link.
         let mut where_node = ann_map.clone();
         where_node.insert("@id".to_string(), Value::String(var.clone()));
-        where_node.insert(
-            reifies_iris::SUBJECT.to_string(),
-            json!({"@id": parent_subject}),
-        );
-        where_node.insert(
-            reifies_iris::PREDICATE.to_string(),
-            json!({"@id": predicate}),
-        );
-        where_node.insert(reifies_iris::OBJECT.to_string(), object_payload.clone());
-        if let Some(lang) = &lang_payload {
-            // Emit `f:reifiesLang` as an additional WHERE constraint
-            // so the selector form binds only annotations whose
-            // language tag matches — same lexical string across
-            // different languages must not collide.
-            where_node.insert(reifies_iris::LANG.to_string(), json!(lang));
-        }
+        let mut edge = Map::new();
+        edge.insert("@id".to_string(), json!(parent_subject));
+        edge.insert(predicate.to_string(), object_payload.clone());
+        where_node.insert(REIFIES_KEY.to_string(), Value::Object(edge));
         if let Some(graph) = graph_iri {
-            where_node.insert(reifies_iris::GRAPH.to_string(), json!({"@id": graph}));
             // Named-graph case: wrap the node in the JLDQ s-expression
             // graph form `["graph", "<iri>", { ...patterns... }]` so
             // the WHERE evaluation scopes its triple matches to the
@@ -2079,6 +2059,112 @@ fn intercept_annotations_for_predicate(
         }
         _ => Ok(()),
     }
+}
+
+/// Replace each annotation's lowered `f:reifies*` slot templates with its
+/// `rdf:reifies` link. The slots are this module's intermediate form: they
+/// carry the edge through JSON-LD expansion, which has no triple-term syntax.
+/// Each annotation sets each slot once, in its own node, so a slot set again
+/// for the same reifier starts that reifier's next link.
+pub(crate) fn fold_slots_into_links(templates: &mut Vec<crate::ir::TripleTemplate>) -> Result<()> {
+    use crate::ir::{TemplateGraph, TemplateTerm, TemplateTripleTerm, TripleTemplate};
+    use fluree_db_core::{DatatypeConstraint, FlakeValue};
+    use fluree_vocab::db;
+
+    #[derive(Default)]
+    struct Slots {
+        s: Option<TemplateTerm>,
+        p: Option<TemplateTerm>,
+        o: Option<(TemplateTerm, Option<DatatypeConstraint>)>,
+        lang: Option<String>,
+    }
+    impl Slots {
+        fn has(&self, slot: &str) -> bool {
+            match slot {
+                db::REIFIES_SUBJECT => self.s.is_some(),
+                db::REIFIES_PREDICATE => self.p.is_some(),
+                db::REIFIES_OBJECT => self.o.is_some(),
+                db::REIFIES_LANG => self.lang.is_some(),
+                _ => false,
+            }
+        }
+    }
+    let key = |t: &TripleTemplate| -> Option<(TemplateGraph, String)> {
+        let subject = match &t.subject {
+            TemplateTerm::Var(v) => format!("?{v:?}"),
+            TemplateTerm::Sid(sid) => format!("<{sid}>"),
+            TemplateTerm::BlankNode(label) => label.clone(),
+            _ => return None,
+        };
+        Some((t.graph.clone(), subject))
+    };
+
+    let mut reifiers: Vec<((TemplateGraph, String), TripleTemplate, Slots)> = Vec::new();
+    let mut kept = Vec::with_capacity(templates.len());
+    for t in templates.drain(..) {
+        let slot = match &t.predicate {
+            TemplateTerm::Sid(p) if fluree_db_core::is_reserved_reifies_predicate(p) => {
+                p.name.to_string()
+            }
+            _ => {
+                kept.push(t);
+                continue;
+            }
+        };
+        let k = key(&t).ok_or_else(|| {
+            TransactError::Parse("an annotation's reifier must be a node".to_string())
+        })?;
+        let open = reifiers
+            .iter()
+            .rposition(|(rk, _, slots)| *rk == k && !slots.has(&slot));
+        let at = match open {
+            Some(at) => at,
+            None => {
+                reifiers.push((k, t.clone(), Slots::default()));
+                reifiers.len() - 1
+            }
+        };
+        let slots = &mut reifiers[at].2;
+        match slot.as_str() {
+            db::REIFIES_SUBJECT => slots.s = Some(t.object),
+            db::REIFIES_PREDICATE => slots.p = Some(t.object),
+            db::REIFIES_OBJECT => slots.o = Some((t.object, t.dtc)),
+            db::REIFIES_LANG => {
+                if let TemplateTerm::Value(FlakeValue::String(lang)) = t.object {
+                    slots.lang = Some(lang);
+                }
+            }
+            // The link lives in its template's graph and names the object's
+            // datatype itself.
+            db::REIFIES_GRAPH | db::REIFIES_DATATYPE => {}
+            other => {
+                return Err(TransactError::UnsupportedFeature(format!(
+                    "f:{other} is not supported on an annotation"
+                )))
+            }
+        }
+    }
+
+    for (_, first, slots) in reifiers {
+        let (Some(s), Some(p), Some((o, dtc))) = (slots.s, slots.p, slots.o) else {
+            return Err(TransactError::Parse(
+                "an annotation must name its triple's subject, predicate and object".to_string(),
+            ));
+        };
+        let dtc = match slots.lang {
+            Some(lang) => Some(DatatypeConstraint::LangTag(std::sync::Arc::from(lang))),
+            None => dtc,
+        };
+        kept.push(TripleTemplate {
+            predicate: TemplateTerm::Sid(fluree_db_core::rdf_reifies_sid().clone()),
+            object: TemplateTerm::TripleTerm(Box::new(TemplateTripleTerm { s, p, o, dtc })),
+            dtc: None,
+            list_index: None,
+            ..first
+        });
+    }
+    *templates = kept;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3001,8 +3087,8 @@ mod tests {
         let lowered = lower_delete(doc).unwrap();
         let wn = &wheres(&lowered)[0];
         assert_eq!(
-            wn.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@value": "Alice"})
+            wn.get(REIFIES_KEY).unwrap(),
+            &json!({"@id": "ex:alice", "ex:name": {"@value": "Alice"}})
         );
         let t = &templates(&lowered)[0];
         assert_eq!(
@@ -3014,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_by_selector_on_lang_tagged_literal_emits_lang_in_where_and_template() {
+    fn delete_by_selector_on_lang_tagged_literal_keeps_lang_in_where_and_template() {
         let doc = json!({
             "delete": {
                 "@id": "ex:alice",
@@ -3027,14 +3113,12 @@ mod tests {
         });
         let lowered = lower_delete(doc).unwrap();
         let wn = &wheres(&lowered)[0];
+        // The WHERE selector's `@reifies` keeps the language tag, so the
+        // same lexical string in another language does not bind.
         assert_eq!(
-            wn.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@value": "chat", "@language": "fr"})
+            wn.get(REIFIES_KEY).unwrap(),
+            &json!({"@id": "ex:alice", "ex:label": {"@value": "chat", "@language": "fr"}})
         );
-        // f:reifiesLang on the WHERE selector pins the join to the
-        // right language tag — same lexical string in another
-        // language must not bind.
-        assert_eq!(wn.get(reifies_iris::LANG).unwrap(), &json!("fr"));
         let t = &templates(&lowered)[0];
         assert_eq!(t.get(reifies_iris::LANG).unwrap(), &json!("fr"));
     }

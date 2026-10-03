@@ -1706,7 +1706,7 @@ impl Fluree {
         let changes_dependencies = staged.iter().any(|flake| {
             use fluree_vocab::namespaces::{RDFS, SHACL};
             flake.g.is_some()
-                || fluree_db_core::is_reserved_reifies_predicate(&flake.p)
+                || fluree_db_core::is_annotation_predicate(&flake.p)
                 || flake.p.namespace_code == SHACL
                 || matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o) if o.namespace_code == SHACL)
                 || (flake.p.namespace_code == RDFS

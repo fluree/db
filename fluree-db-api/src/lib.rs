@@ -5015,7 +5015,7 @@ fn cypher_delete_predicate_is_relationship(
         _ => return Ok(false),
     };
 
-    Ok(!fluree_db_core::is_rdf_type(&sid) && !fluree_db_core::is_reserved_reifies_predicate(&sid))
+    Ok(!fluree_db_core::is_rdf_type(&sid) && !fluree_db_core::is_annotation_predicate(&sid))
 }
 
 // ============================================================================

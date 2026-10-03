@@ -159,11 +159,16 @@ pub fn parse_transaction(
         std::borrow::Cow::Borrowed(json)
     };
 
-    match txn_type {
+    let mut txn = match txn_type {
         TxnType::Insert => parse_insert(&lowered, opts, ns_registry),
         TxnType::Upsert => parse_upsert(&lowered, opts, ns_registry),
         TxnType::Update => parse_update(&lowered, opts, ns_registry),
+    }?;
+    if matches!(lowered, std::borrow::Cow::Owned(_)) {
+        super::edge_annotations::fold_slots_into_links(&mut txn.insert_templates)?;
+        super::edge_annotations::fold_slots_into_links(&mut txn.delete_templates)?;
     }
+    Ok(txn)
 }
 
 /// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
@@ -224,33 +229,6 @@ pub fn parse_graph_insert(
     for t in &mut txn.insert_templates {
         t.graph = TemplateGraph::Iri(Arc::clone(&target));
     }
-    // Edge annotations were lowered against a payload with no graph identity,
-    // so their `f:reifies*` bundles carry no `f:reifiesGraph`. Re-homing the
-    // bundle into the target graph without one produces a bundle whose
-    // flake-level graph disagrees with the edge graph it encodes
-    // (`EdgeKey::from_reifies_facts` → `GraphMismatch`, refused at stage).
-    // Anchor every reifier to the target graph, exactly as the named-`@graph`
-    // lowering does for an annotated edge written inside a graph block.
-    let reifies_subject = fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_SUBJECT,
-    );
-    let reifies_graph = fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_GRAPH,
-    );
-    let anchors: Vec<TripleTemplate> = txn
-        .insert_templates
-        .iter()
-        .filter(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == reifies_subject))
-        .map(|t| {
-            let mut anchor = t.clone();
-            anchor.predicate = TemplateTerm::Sid(reifies_graph.clone());
-            anchor.object = TemplateTerm::Sid(ns_registry.sid_for_iri(graph_iri));
-            anchor
-        })
-        .collect();
-    txn.insert_templates.extend(anchors);
     txn.write_graphs.insert(graph_iri.clone());
     Ok(txn)
 }

@@ -86,13 +86,10 @@ impl<'a> ExportBuilder<'a> {
         self
     }
 
-    /// Emit edge annotations as the raw `f:reifies*` system facts, the output
-    /// every release before RDF 1.2 annotation syntax produced.
-    ///
-    /// Kept as an escape hatch for consumers pinned to those bytes. Note that
-    /// Fluree's own JSON-LD and Turtle write surfaces reject hand-written
-    /// `f:reifies*` triples, so this output is re-ingestible only through the
-    /// bulk-import path.
+    /// Write each annotation as its stored `rdf:reifies` link,
+    /// `r rdf:reifies <<( s p o )>>`, rather than as annotation syntax on the
+    /// base edge. JSON-LD has no triple-term syntax, so a JSON-LD export
+    /// keeps `@annotation`.
     pub fn raw_reifies(mut self) -> Self {
         self.raw_reifies = true;
         self
@@ -263,10 +260,10 @@ impl<'a> ExportBuilder<'a> {
         let overlay: &dyn fluree_db_core::OverlayProvider = ledger.novelty.as_ref();
         let dict_novelty = &ledger.dict_novelty;
 
-        // Forward annotation lookup, chosen once for the whole export. `None`
-        // on a ledger that has never carried an annotation — and on
-        // `raw_reifies()`, which keeps the pre-RDF-1.2 output byte for byte.
-        let annotations = if self.raw_reifies {
+        // Edge → reifier lookup, read once for the whole export. `None` on a
+        // ledger that has never carried an annotation — and on
+        // `raw_reifies()`, which writes the links as triples.
+        let annotations = if self.raw_reifies && !matches!(self.format, ExportFormat::JsonLd) {
             None
         } else {
             AnnotationProbe::for_ledger(&ledger, to_t).await?

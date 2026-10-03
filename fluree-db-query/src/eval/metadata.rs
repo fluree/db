@@ -700,7 +700,100 @@ fn node_property_binding(props: Vec<DataProperty>, pred_sid: &Sid) -> Binding {
     }
 }
 
-/// `type(rel)` → relationship type string from `f:reifiesPredicate`.
+/// A reifier's `rdf:reifies` link flakes, raw: the provider's PSOT range, or
+/// the overlay alone on a ledger with none.
+fn read_link_flakes(ctx: &ExecutionContext<'_>, reifier: &Sid) -> Result<Vec<Flake>> {
+    let reifies = fluree_db_core::rdf_reifies_sid();
+    if ctx.active_snapshot.range_provider.is_some() {
+        return read_subject_predicate_flakes(ctx, reifier, reifies);
+    }
+    let mut flakes = Vec::new();
+    if let Some(overlay) = ctx.overlay {
+        overlay.for_each_overlay_flake(
+            ctx.binary_g_id,
+            IndexType::Psot,
+            None,
+            None,
+            true,
+            ctx.to_t,
+            &mut |flake| {
+                if flake.s == *reifier && flake.p == *reifies {
+                    flakes.push(flake.clone());
+                }
+            },
+        );
+    }
+    Ok(flakes)
+}
+
+/// The triple a reifier names: its live link's term, the least when it
+/// names several.
+fn live_term(flakes: Vec<Flake>) -> Option<fluree_db_core::TripleTermValue> {
+    let mut latest: HashMap<fluree_db_core::TripleTermValue, (i64, bool)> = HashMap::new();
+    for flake in flakes {
+        let FlakeValue::TripleTerm(term) = flake.o else {
+            continue;
+        };
+        let entry = latest.entry(*term).or_insert((flake.t, flake.op));
+        if flake.t > entry.0 {
+            *entry = (flake.t, flake.op);
+        }
+    }
+    latest
+        .into_iter()
+        .filter_map(|(term, (_, op))| op.then_some(term))
+        .min()
+}
+
+/// The triple `reifier` names, without view policy (fail-closed under one).
+fn reified_triple(
+    ctx: &ExecutionContext<'_>,
+    reifier: &Sid,
+) -> Result<Option<fluree_db_core::TripleTermValue>> {
+    if !ctx.allow_unfiltered() {
+        tracing::warn!(
+            "Cypher relationship lookup reached the sync path under an active view policy; \
+             returning empty to avoid leaking unfiltered edges"
+        );
+        return Ok(None);
+    }
+    Ok(live_term(read_link_flakes(ctx, reifier)?))
+}
+
+/// The triple `reifier` names, through the view policy.
+async fn reified_triple_filtered(
+    ctx: &ExecutionContext<'_>,
+    reifier: &Sid,
+) -> Result<Option<fluree_db_core::TripleTermValue>> {
+    if ctx.allow_unfiltered() {
+        return reified_triple(ctx, reifier);
+    }
+    let flakes = read_link_flakes(ctx, reifier)?;
+    let overlay = ctx.overlay.unwrap_or(&NoOverlay);
+    let flakes = crate::binary_scan::BinaryScanOperator::filter_flakes_by_policy(
+        ctx,
+        ctx.active_snapshot,
+        overlay,
+        ctx.to_t,
+        ctx.binary_g_id,
+        flakes,
+    )
+    .await?;
+    Ok(live_term(flakes))
+}
+
+/// A relationship endpoint from the triple it reifies.
+fn endpoint(term: fluree_db_core::TripleTermValue, start: bool) -> Option<Sid> {
+    if start {
+        return Some(term.s);
+    }
+    match term.o {
+        FlakeValue::Ref(end) => Some(end),
+        _ => None,
+    }
+}
+
+/// `type(rel)` → relationship type string: the reified triple's predicate.
 pub fn eval_rel_type<R: RowAccess>(
     args: &[Expression],
     row: &R,
@@ -717,25 +810,16 @@ pub fn eval_rel_type<R: RowAccess>(
     ctx.tracker.consume_fuel(1)?;
 
     // A relationship value carries its predicate intrinsically (e.g. from
-    // `relationships(p)`); a reifier-node binding (bound `-[r:T]->`) needs the
-    // `f:reifiesPredicate` lookup.
+    // `relationships(p)`); a reifier-node binding (bound `-[r:T]->`) reads its
+    // link.
     let pred_sid = match &binding {
         Binding::Rel(rel) => rel.predicate.clone(),
         _ => {
             let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
                 return Ok(None);
             };
-            let reifies_pred = ctx
-                .active_snapshot
-                .encode_iri(fluree_vocab::reifies_iris::PREDICATE)
-                .unwrap_or_else(|| {
-                    Sid::new(fluree_vocab::namespaces::FLUREE_DB, "reifiesPredicate")
-                });
-            match lookup_ref_objects(ctx, &reifier, &reifies_pred)?
-                .into_iter()
-                .next()
-            {
-                Some(p) => p,
+            match reified_triple(ctx, &reifier)? {
+                Some(term) => term.p,
                 None => return Ok(None),
             }
         }
@@ -745,47 +829,32 @@ pub fn eval_rel_type<R: RowAccess>(
     Ok(name.map(|s| ComparableValue::String(Arc::from(s))))
 }
 
-/// `startNode(rel)` → the relationship's start node ref (`f:reifiesSubject`).
+/// `startNode(rel)` → the relationship's start node ref.
 pub fn eval_start_node<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
-    eval_rel_endpoint(
-        args,
-        row,
-        ctx,
-        fluree_vocab::reifies_iris::SUBJECT,
-        "reifiesSubject",
-        "startNode",
-    )
+    eval_rel_endpoint(args, row, ctx, true, "startNode")
 }
 
-/// `endNode(rel)` → the relationship's end node ref (`f:reifiesObject`).
+/// `endNode(rel)` → the relationship's end node ref.
 pub fn eval_end_node<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
-    eval_rel_endpoint(
-        args,
-        row,
-        ctx,
-        fluree_vocab::reifies_iris::OBJECT,
-        "reifiesObject",
-        "endNode",
-    )
+    eval_rel_endpoint(args, row, ctx, false, "endNode")
 }
 
-/// Shared body for `startNode` / `endNode`: read the named `f:reifies*` ref off
-/// the reifier and return it as a node ref. Mirrors [`eval_rel_type`] but yields
-/// the node SID (a ref) rather than a type-name string.
+/// Shared body for `startNode` / `endNode`: an endpoint of the triple the
+/// reifier names, as a node ref. Mirrors [`eval_rel_type`] but yields the node
+/// SID (a ref) rather than a type-name string.
 fn eval_rel_endpoint<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
-    reifies_iri: &str,
-    reifies_local: &'static str,
+    start: bool,
     fn_name: &str,
 ) -> Result<Option<ComparableValue>> {
     let arg = arity1(args, fn_name)?;
@@ -797,14 +866,9 @@ fn eval_rel_endpoint<R: RowAccess>(
     };
 
     // A relationship value carries its endpoints intrinsically; a reifier-node
-    // binding needs the `f:reifiesSubject`/`f:reifiesObject` lookup. `is_start`
-    // selects the field for the Rel case.
+    // binding reads its link.
     if let Binding::Rel(rel) = &binding {
-        let node = if reifies_iri == fluree_vocab::reifies_iris::SUBJECT {
-            &rel.start
-        } else {
-            &rel.end
-        };
+        let node = if start { &rel.start } else { &rel.end };
         return Ok(Some(ComparableValue::Sid(node.clone())));
     }
 
@@ -814,12 +878,9 @@ fn eval_rel_endpoint<R: RowAccess>(
 
     ctx.tracker.consume_fuel(1)?;
 
-    let reifies = ctx
-        .active_snapshot
-        .encode_iri(reifies_iri)
-        .unwrap_or_else(|| Sid::new(fluree_vocab::namespaces::FLUREE_DB, reifies_local));
-    let refs = lookup_ref_objects(ctx, &reifier, &reifies)?;
-    Ok(refs.first().map(|s| ComparableValue::Sid(s.clone())))
+    Ok(reified_triple(ctx, &reifier)?
+        .and_then(|term| endpoint(term, start))
+        .map(ComparableValue::Sid))
 }
 
 // ===========================================================================
@@ -903,7 +964,7 @@ pub(crate) async fn eval_node_property_async(
 }
 
 /// `type(rel)` — the `Rel` value carries its predicate intrinsically (no read);
-/// a reifier-node binding reads `f:reifiesPredicate` through the policy filter.
+/// a reifier-node binding reads its link through the policy filter.
 pub(crate) async fn eval_rel_type_async<R: RowAccess>(
     args: &[Expression],
     row: &R,
@@ -920,18 +981,8 @@ pub(crate) async fn eval_rel_type_async<R: RowAccess>(
             let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
                 return Ok(None);
             };
-            let reifies_pred = ctx
-                .active_snapshot
-                .encode_iri(fluree_vocab::reifies_iris::PREDICATE)
-                .unwrap_or_else(|| {
-                    Sid::new(fluree_vocab::namespaces::FLUREE_DB, "reifiesPredicate")
-                });
-            match lookup_ref_objects_filtered(ctx, &reifier, &reifies_pred)
-                .await?
-                .into_iter()
-                .next()
-            {
-                Some(p) => p,
+            match reified_triple_filtered(ctx, &reifier).await? {
+                Some(term) => term.p,
                 None => return Ok(None),
             }
         }
@@ -946,15 +997,7 @@ pub(crate) async fn eval_start_node_async<R: RowAccess>(
     row: &R,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<ComparableValue>> {
-    eval_rel_endpoint_async(
-        args,
-        row,
-        ctx,
-        fluree_vocab::reifies_iris::SUBJECT,
-        "reifiesSubject",
-        "startNode",
-    )
-    .await
+    eval_rel_endpoint_async(args, row, ctx, true, "startNode").await
 }
 
 /// `endNode(rel)` against the policy filter (or the intrinsic `Rel` field).
@@ -963,15 +1006,7 @@ pub(crate) async fn eval_end_node_async<R: RowAccess>(
     row: &R,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<ComparableValue>> {
-    eval_rel_endpoint_async(
-        args,
-        row,
-        ctx,
-        fluree_vocab::reifies_iris::OBJECT,
-        "reifiesObject",
-        "endNode",
-    )
-    .await
+    eval_rel_endpoint_async(args, row, ctx, false, "endNode").await
 }
 
 /// Policy-filtered counterpart of [`eval_rel_endpoint`].
@@ -979,8 +1014,7 @@ async fn eval_rel_endpoint_async<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: &ExecutionContext<'_>,
-    reifies_iri: &str,
-    reifies_local: &'static str,
+    start: bool,
     fn_name: &str,
 ) -> Result<Option<ComparableValue>> {
     let arg = arity1(args, fn_name)?;
@@ -988,23 +1022,17 @@ async fn eval_rel_endpoint_async<R: RowAccess>(
         return Ok(None);
     };
     if let Binding::Rel(rel) = &binding {
-        let node = if reifies_iri == fluree_vocab::reifies_iris::SUBJECT {
-            &rel.start
-        } else {
-            &rel.end
-        };
+        let node = if start { &rel.start } else { &rel.end };
         return Ok(Some(ComparableValue::Sid(node.clone())));
     }
     let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
         return Ok(None);
     };
     ctx.tracker.consume_fuel(1)?;
-    let reifies = ctx
-        .active_snapshot
-        .encode_iri(reifies_iri)
-        .unwrap_or_else(|| Sid::new(fluree_vocab::namespaces::FLUREE_DB, reifies_local));
-    let refs = lookup_ref_objects_filtered(ctx, &reifier, &reifies).await?;
-    Ok(refs.first().map(|s| ComparableValue::Sid(s.clone())))
+    Ok(reified_triple_filtered(ctx, &reifier)
+        .await?
+        .and_then(|term| endpoint(term, start))
+        .map(ComparableValue::Sid))
 }
 
 /// Evaluate a metadata `Call` for one row through the policy-filtered async

@@ -51,44 +51,20 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 /// Given `graph_sids` (ledger GraphId → Sid), returns the
 /// inverse mapping. Used by SHACL/policy to determine which graph a flake
 /// belongs to based on its `Flake.g` field.
-/// Generate cascade `f:reifies*` retraction flakes for any base edges
-/// being retracted in `flakes`.
+/// Retract the annotations a transaction's retracts leave dangling, so a link
+/// never names a triple that is no longer asserted (annotation-syntax reads
+/// rely on it and skip the base edge).
 ///
-/// For each retract flake whose predicate is *not* a system-controlled
-/// `f:reifies*` predicate, build the corresponding `EdgeKey` and look
-/// up its currently-asserted annotations against the merged
-/// snapshot+novelty view. For each annotation, emit the inverse
-/// `f:reifies*` bundle so the durable encoding doesn't keep pointing
-/// at a retracted edge.
+/// 1. A retracted triple retracts every link naming it.
+/// 2. Retracting all of a reifier's body retracts its links.
+/// 3. A reifier left with no link loses its body when it is a blank node, or
+///    in LPG mode (`opts.lpgEdgeLifecycle`), where deleting a relationship
+///    deletes its properties. An IRI reifier's body otherwise stays, as
+///    ordinary RDF about a named resource.
 ///
-/// **Read path:** uses scan-based lookup through
-/// `range_with_overlay`, which reads novelty + indexed base storage,
-/// so annotations that have rolled into base storage post-reindex
-/// are still found and cascaded.
-///
-/// **Graph context:** the inverse bundle is emitted via
-/// `EdgeKey::to_reifies_facts_jsonld_compatible`, which carries the
-/// edge's `g` through to each retract flake. Named-graph assertions
-/// are retracted in the same named graph; default-graph assertions
-/// stay in the default graph. Without this graph-aware emission,
-/// named-graph annotations would be orphaned by mismatched-graph
-/// retracts.
-///
-/// **Performance:** a ledger that has never observed a `f:reifies*`
-/// flake pays zero — the dual-gate fast-path below returns immediately
-/// (see the gate on `snapshot.has_annotations` + `novelty.attachments
-/// .has_annotations()`). Once a ledger does carry annotations, each
-/// retract flake pays one POST point lookup against the binary index;
-/// the lookup returns empty quickly when nothing matches, so the
-/// per-retract cost is bounded by the binary index's empty-range cost.
-///
-/// **Cleanup scope:** retracts the `f:reifies*` bundle only.
-/// Anonymous-annotation metadata cleanup (RDF mode default) and
-/// explicit-IRI metadata cleanup (LPG mode `opts.lpgEdgeLifecycle:
-/// true`) are separate cleanup passes — the bundle-only cascade is
-/// observably safe (anonymous SIDs become unreachable through
-/// `@reifies` once the bundle is gone, and explicit-IRI annotation
-/// metadata stays queryable as ordinary RDF).
+/// Links derived from legacy `f:reifies*` bundles read like any other link;
+/// retracting one leaves the bundle, whose derived assert the retract cancels
+/// in novelty and at the next index build alike.
 async fn cascade_attachment_retracts(
     flakes: &[Flake],
     ledger: &LedgerState,
@@ -97,34 +73,15 @@ async fn cascade_attachment_retracts(
     lpg_edge_lifecycle: bool,
 ) -> Result<Vec<Flake>> {
     use fluree_db_core::comparator::IndexType;
-    use fluree_db_core::edge::EdgeKey;
     use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
-    use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue};
-
+    use fluree_db_core::{is_annotation_predicate, is_rdf_reifies, FlakeValue, TripleTermValue};
     use std::collections::BTreeMap;
-    use tracing::Instrument;
 
     let mut cascade = Vec::new();
-
-    // Fast-path gate: if the ledger has *never* observed a
-    // `f:reifies*` flake (sticky bit on `IndexRoot`, plumbed through
-    // `LedgerSnapshot.has_annotations`) AND the in-memory novelty
-    // hasn't observed one in this run either, skip the cascade
-    // entirely. Non-annotation ledgers pay zero per-retract cost.
-    //
-    // Both gates are required because the indexed bit only updates at
-    // index-build time — a ledger that just received its first
-    // annotation in novelty (no reindex yet) has
-    // `snapshot.has_annotations == false` but
-    // `novelty.attachments.has_annotations() == true`.
-    if !ledger.snapshot.has_annotations && !ledger.novelty.attachments.has_annotations() {
+    if !ledger.snapshot.has_annotations && !ledger.novelty.has_annotations() {
         return Ok(cascade);
     }
 
-    // Wrap the cascade work in a span — skipped for non-annotation
-    // ledgers via the gate above so we don't pay tracing cost on
-    // common-case retracts. `cascade_count` records how many
-    // f:reifies* retract flakes the cascade emitted.
     let span = tracing::debug_span!(
         "cascade_reifies_bundle",
         retract_input_count = flakes.iter().filter(|f| !f.op).count(),
@@ -132,389 +89,166 @@ async fn cascade_attachment_retracts(
         cascade_count = tracing::field::Empty,
     );
     async {
-        let f_reifies_subject = Sid::new(
-            fluree_vocab::namespaces::FLUREE_DB,
-            fluree_vocab::db::REIFIES_SUBJECT,
-        );
         let to_t = ledger.t();
-
-        // Annotation subjects already cascaded in pass 1 (base-edge
-        // retract). Pass 2 (orphan-cleanup) skips these so the
-        // `f:reifies*` bundle isn't double-retracted.
-        let mut cascaded_anns: HashSet<(GraphId, Sid)> = HashSet::new();
-
-        // Reifiers this transaction is *re-pointing*: it asserts at least one
-        // `f:reifies*` fact for them, so they describe some edge after this
-        // transaction and are not orphaned by the base-edge retract below.
-        //
-        // The cascade must leave their bundles alone, because the delta that
-        // reached this point is already complete and already minimal. Sync and
-        // upsert both hand the accumulator the current state as retractions
-        // and the payload as assertions, and matched pairs cancel — so a slot
-        // whose value does not change (typically `f:reifiesPredicate` and
-        // `f:reifiesGraph`) appears in neither list. Cascading the bundle here
-        // would retract exactly those unchanged slots while nothing re-asserts
-        // them, and the surviving bundle would be missing a slot: a re-point
-        // that is entirely well-formed was refused with
-        // `Missing("f:reifiesPredicate")`, and the advice in that error
-        // ("retract the prior attachment in the same transaction") described
-        // what the caller had already done.
-        let repointed: HashSet<Sid> = flakes
-            .iter()
-            .filter(|f| f.op && is_reserved_reifies_predicate(&f.p))
-            .map(|f| f.s.clone())
-            .collect();
-
-        for flake in flakes {
-            if flake.op {
-                continue; // assertion, not a retract — nothing to cascade
-            }
-            if is_reserved_reifies_predicate(&flake.p) {
-                continue; // already a system retract (cascade or upstream); skip
-            }
-            let edge_key = EdgeKey::from_flake(flake);
-            let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
-
-            // POST scan: find every annotation whose `f:reifiesSubject`
-            // points at this edge's subject. The flake's `s` is the
-            // candidate annotation Sid.
-            let candidates = fluree_db_core::range_with_overlay(
+        let scan = |g_id: GraphId, index: IndexType, rm: RangeMatch| {
+            fluree_db_core::range_with_overlay(
                 &ledger.snapshot,
                 g_id,
                 ledger.novelty.as_ref(),
-                IndexType::Post,
+                index,
                 RangeTest::Eq,
-                RangeMatch::new()
-                    .with_predicate(f_reifies_subject.clone())
-                    .with_object(FlakeValue::Ref(edge_key.s.clone())),
+                rm,
                 RangeOptions::new().with_to_t(to_t),
             )
-            .await?;
+        };
+        let reifies = fluree_db_core::rdf_reifies_sid().clone();
+        let retract = |f: &Flake, g: Option<&Sid>| {
+            let mut r = f.clone();
+            r.g = g.cloned();
+            r.t = new_t;
+            r.op = false;
+            r
+        };
 
-            let mut seen: HashSet<Sid> = HashSet::new();
-            for cand in &candidates {
-                let ann_sid = cand.s.clone();
-                if !seen.insert(ann_sid.clone()) {
-                    continue;
-                }
-                if repointed.contains(&ann_sid) {
-                    // This transaction re-points the reifier; its bundle is
-                    // the transaction's to rewrite, not the cascade's to
-                    // retract. `enforce_single_target_reifiers` still checks
-                    // the result, so a genuinely malformed re-point is caught.
-                    continue;
-                }
-
-                // SPOT scan for ALL of the candidate's flakes (system
-                // bundle + body metadata). Splitting after the scan
-                // lets us reuse the same flake set for bundle-validation
-                // and (for anonymous annotations) metadata cleanup.
-                let all_ann_flakes = fluree_db_core::range_with_overlay(
-                    &ledger.snapshot,
-                    g_id,
-                    ledger.novelty.as_ref(),
-                    IndexType::Spot,
-                    RangeTest::Eq,
-                    RangeMatch::new().with_subject(ann_sid.clone()),
-                    RangeOptions::new().with_to_t(to_t),
-                )
-                .await?;
-                // `from_reifies_facts` reconciles the bundle's `f:reifiesGraph`
-                // value against the flake-level `g`, so an indexed named-graph
-                // bundle decoded as `GraphMismatch` and the `Err(_) => continue`
-                // below swallowed it: deleting a base edge left the claim that
-                // reifies it live, pointing at a triple that no longer exists.
-                let mut all_ann_flakes = all_ann_flakes;
-                stamp_graph(&mut all_ann_flakes, flake.g.as_ref());
-                // The index-side `rdf:reifies` link is neither bundle nor body.
-                let (bundle, metadata): (Vec<Flake>, Vec<Flake>) = all_ann_flakes
-                    .into_iter()
-                    .filter(|f| !fluree_db_core::is_rdf_reifies(&f.p))
-                    .partition(|f| is_reserved_reifies_predicate(&f.p));
-                if bundle.is_empty() {
-                    continue;
-                }
-                let cand_edge = match EdgeKey::from_reifies_facts(&bundle) {
-                    Ok(k) => k,
-                    Err(_) => continue,
-                };
-                if cand_edge != edge_key {
-                    continue;
-                }
-
-                // Build the f:reifies* retraction bundle. JSON-LD-
-                // compatible shape (no f:reifiesDatatype) so the
-                // inverse retract is byte-symmetric with the original
-                // assertion.
-                cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(&ann_sid, new_t, false));
-
-                // Annotation-body metadata cleanup. Two modes:
-                //
-                // - **RDF mode** (default, `lpg_edge_lifecycle = false`):
-                //   only anonymous (blank-node) annotation subjects
-                //   are cleaned. Explicit-IRI annotations are
-                //   user-named and remain queryable as ordinary RDF
-                //   on the named subject.
-                // - **LPG mode** (`lpg_edge_lifecycle = true`, set via
-                //   `opts.lpgEdgeLifecycle: true` on the transaction):
-                //   *every* annotation's body is cleaned, matching
-                //   Cypher's relationship lifecycle where deleting an
-                //   edge deletes its property metadata.
-                let cleanup_metadata = lpg_edge_lifecycle
-                    || ann_sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE;
-                if cleanup_metadata {
-                    for asserted in metadata {
-                        // Mirror the asserted shape with `op = false`
-                        // and the new transaction's `t`. Preserves
-                        // graph (`g`), datatype, and metadata so the
-                        // retract matches the assertion's identity.
-                        let mut retract = asserted.clone();
-                        retract.t = new_t;
-                        retract.op = false;
-                        cascade.push(retract);
-                    }
-                }
-                // Track this annotation as already-cascaded so the
-                // orphan-cleanup pass below doesn't double-retract.
-                cascaded_anns.insert((g_id, ann_sid));
-            }
-        }
-
-        // ---------------------------------------------------------------
-        // Pass 2: orphan-cleanup for annotation-metadata-only retracts.
-        //
-        // When a transaction retracts all the user-property metadata of
-        // an annotation subject WITHOUT retracting the base edge, the
-        // base-edge pass above doesn't fire — but the f:reifies* bundle
-        // is now an orphan in the durable encoding, since the
-        // annotation has no body left. An inline `@annotation` query
-        // would still surface the empty annotation subject, which is
-        // not what the user intended.
-        //
-        // Detection: for every retract flake whose subject is an
-        // annotation subject (has currently-asserted f:reifies*
-        // facts), check if the user's retract set covers ALL of that
-        // subject's currently-asserted user-property metadata. If so,
-        // also retract the bundle.
-        //
-        // Both RDF and LPG modes apply this cleanup — the user-intent
-        // signal (retract every metadata flake) is the same either way.
-        // The mode flag only controls whether explicit-IRI metadata
-        // gets retracted from a base-edge cascade.
-        // Group both retract and assert flakes by `(g_id, subject)`,
-        // skipping `f:reifies*` predicates. Pass 2 keys off the retract
-        // groups (only retracts can trigger orphan cleanup) but
-        // consults the assert groups when computing the post-transaction
-        // metadata set — otherwise an in-transaction metadata
-        // replacement (delete old role, insert new role on the same
-        // annotation subject) would cascade the bundle and orphan the
-        // freshly-asserted metadata.
-        let mut grouped_metadata_retracts: BTreeMap<(GraphId, Sid), Vec<&Flake>> = BTreeMap::new();
-        let mut grouped_metadata_asserts: BTreeMap<(GraphId, Sid), Vec<&Flake>> = BTreeMap::new();
-        for flake in flakes {
-            if is_reserved_reifies_predicate(&flake.p) {
-                continue;
-            }
-            let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
-            let key = (g_id, flake.s.clone());
-            if flake.op {
-                grouped_metadata_asserts.entry(key).or_default().push(flake);
+        // This transaction's own link ops, by (graph, reifier).
+        let mut txn_link_retracts: HashSet<(GraphId, Sid, FlakeValue)> = HashSet::new();
+        let mut txn_linked: HashSet<(GraphId, Sid)> = HashSet::new();
+        let mut explicit: BTreeMap<(GraphId, Sid), Option<Sid>> = BTreeMap::new();
+        for f in flakes.iter().filter(|f| is_rdf_reifies(&f.p)) {
+            let g_id = resolve_flake_graph_id(f, reverse_graph)?;
+            if f.op {
+                txn_linked.insert((g_id, f.s.clone()));
             } else {
-                grouped_metadata_retracts
-                    .entry(key)
-                    .or_default()
-                    .push(flake);
+                txn_link_retracts.insert((g_id, f.s.clone(), f.o.clone()));
+                explicit.insert((g_id, f.s.clone()), f.g.clone());
             }
         }
 
-        for ((g_id, ann_sid), retract_set) in grouped_metadata_retracts {
-            if cascaded_anns.contains(&(g_id, ann_sid.clone())) {
-                // Already cascaded via the base-edge pass; skip.
-                continue;
-            }
+        // Links this cascade retracts, by (graph, reifier), with the graph
+        // they are retracted in.
+        let mut unlinked: BTreeMap<(GraphId, Sid), (Option<Sid>, Vec<FlakeValue>)> =
+            BTreeMap::new();
 
-            // Scan all currently-asserted flakes for this subject.
-            let all_flakes = fluree_db_core::range_with_overlay(
-                &ledger.snapshot,
-                g_id,
-                ledger.novelty.as_ref(),
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch::new().with_subject(ann_sid.clone()),
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            // Same seam as the base-edge pass above: stamp before decoding.
-            // The group's own retracts are this transaction's flakes for this
-            // subject, so they carry the graph the scan dropped.
-            let mut all_flakes = all_flakes;
-            stamp_graph(
-                &mut all_flakes,
-                retract_set.first().and_then(|f| f.g.as_ref()),
-            );
-            let (bundle, current_metadata): (Vec<Flake>, Vec<Flake>) = all_flakes
-                .into_iter()
-                .filter(|f| !fluree_db_core::is_rdf_reifies(&f.p))
-                .partition(|f| is_reserved_reifies_predicate(&f.p));
-            if bundle.is_empty() {
-                continue; // not an annotation subject
-            }
-            let edge_key = match EdgeKey::from_reifies_facts(&bundle) {
-                Ok(k) => k,
-                Err(_) => continue, // malformed; skip
-            };
-
-            // Compute the post-transaction metadata set:
-            // (current metadata - retracts in this txn) ∪ asserts in this
-            // txn. Cascade only when post == ∅. This handles the
-            // metadata-replacement case (delete old fact + insert new
-            // fact on the same annotation in one transaction): the new
-            // assertion keeps the post-set non-empty, so the bundle
-            // stays asserted and the new metadata stays attached.
-            //
-            // Identity = `(s, p, o, dt, m)` — the same dimensions
-            // Fluree uses for assertion/retraction matching, so an
-            // assertion with a different object value than the
-            // retracted flake counts as a distinct fact and survives.
-            type FlakeIdentity = (Sid, Sid, FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>);
-            let identity = |f: &Flake| -> FlakeIdentity {
-                (
-                    f.s.clone(),
-                    f.p.clone(),
-                    f.o.clone(),
-                    f.dt.clone(),
-                    f.m.clone(),
-                )
-            };
-            let retracted_ids: HashSet<FlakeIdentity> =
-                retract_set.iter().map(|f| identity(f)).collect();
-            let asserted_ids: HashSet<FlakeIdentity> = grouped_metadata_asserts
-                .get(&(g_id, ann_sid.clone()))
-                .map(|v| v.iter().map(|f| identity(f)).collect::<HashSet<_>>())
-                .unwrap_or_default();
-
-            // Surviving current metadata: present today AND not being
-            // retracted. Plus any new same-txn assertions (which may
-            // overlap with surviving current; HashSet handles the
-            // dedupe for free).
-            let post_metadata: HashSet<FlakeIdentity> = current_metadata
-                .iter()
-                .map(identity)
-                .filter(|id| !retracted_ids.contains(id))
-                .chain(asserted_ids)
-                .collect();
-            if !post_metadata.is_empty() {
-                continue;
-            }
-
-            // Annotation has no surviving metadata after the txn → the
-            // user is disposing of it. Retract the bundle in the
-            // JSON-LD-compatible shape so it cancels the original
-            // assertion.
-            cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(&ann_sid, new_t, false));
-        }
-
-        // ---------------------------------------------------------------
-        // Pass 3: body cleanup for user-explicit bundle retracts.
-        //
-        // The by-id retract pre-pass
-        // (`fluree_db_transact::parse::edge_annotations::lower_delete_annotation_blocks`)
-        // synthesizes only `f:reifies*` retracts — the bundle, no body.
-        // Without this pass, the annotation's body metadata persists
-        // after the bundle is gone. That matches the design contract
-        // for explicit-IRI annotations in default RDF mode
-        // (user-named resources stay queryable as ordinary RDF) but
-        // breaks two cases:
-        //
-        // 1. **Anonymous (BLANK_NODE) annotations:** body becomes
-        //    orphaned bnode-keyed flakes that the wildcard-hide filter
-        //    no longer catches (the `f:reifiesSubject` discriminator
-        //    is gone with the bundle). Always cleanup.
-        // 2. **Explicit-IRI annotations in LPG mode**
-        //    (`opts.lpgEdgeLifecycle: true`): Cypher relationship-delete
-        //    semantics demand that retracting the relationship deletes
-        //    its property metadata too. Cleanup only when the flag is
-        //    set.
-        //
-        // Detection: group the user-input retracts by `(g, ann_sid)`,
-        // keeping only `f:reifies*` flakes. A "complete bundle retract"
-        // has at least the three required slots (subject + predicate +
-        // object) present. Partial retracts are user errors we don't
-        // try to correct.
-        let mut grouped_bundle_retracts: BTreeMap<(GraphId, Sid), Vec<&Flake>> = BTreeMap::new();
+        // 1. Retracted triples.
         for flake in flakes {
-            if flake.op {
-                continue; // assertion, not a retract
+            if flake.op || is_annotation_predicate(&flake.p) {
+                continue;
             }
-            if !is_reserved_reifies_predicate(&flake.p) {
-                continue; // not a bundle flake
+            // A list element is never reified.
+            if flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
+                continue;
             }
             let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
-            grouped_bundle_retracts
-                .entry((g_id, flake.s.clone()))
-                .or_default()
-                .push(flake);
-        }
-
-        for ((g_id, ann_sid), bundle_retracts) in grouped_bundle_retracts {
-            if cascaded_anns.contains(&(g_id, ann_sid.clone())) {
-                // Already handled by Pass 1's base-edge cascade.
-                continue;
-            }
-
-            // Verify all three required slots are retracted at the same
-            // t. The pre-pass emits exactly those three (plus
-            // `f:reifiesGraph` for named-graph annotations); a partial
-            // user-issued retract isn't a "complete bundle retract"
-            // signal.
-            let has_required = [
-                fluree_vocab::db::REIFIES_SUBJECT,
-                fluree_vocab::db::REIFIES_PREDICATE,
-                fluree_vocab::db::REIFIES_OBJECT,
-            ]
-            .iter()
-            .all(|name| {
-                bundle_retracts.iter().any(|f| {
-                    f.p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
-                        && f.p.name.as_ref() == *name
-                })
-            });
-            if !has_required {
-                continue;
-            }
-
-            let is_anonymous = ann_sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE;
-            let cleanup_body = is_anonymous || lpg_edge_lifecycle;
-            if !cleanup_body {
-                continue;
-            }
-
-            // Scan currently-asserted flakes for this annotation
-            // subject. Filter out the bundle (Pass 1's domain) and
-            // emit retracts mirroring each body assertion.
-            let all_flakes = fluree_db_core::range_with_overlay(
-                &ledger.snapshot,
+            let term = FlakeValue::TripleTerm(Box::new(TripleTermValue {
+                s: flake.s.clone(),
+                p: flake.p.clone(),
+                o: flake.o.clone(),
+                dt: flake.dt.clone(),
+                lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
+            }));
+            let links = scan(
                 g_id,
-                ledger.novelty.as_ref(),
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch::new().with_subject(ann_sid.clone()),
-                RangeOptions::new().with_to_t(to_t),
+                IndexType::Post,
+                RangeMatch::new()
+                    .with_predicate(reifies.clone())
+                    .with_object(term.clone()),
             )
             .await?;
-            for asserted in all_flakes {
-                // Bundle flakes are retracted by the caller; the index-side
-                // link is retired by the next index pass, not by a commit.
-                if is_reserved_reifies_predicate(&asserted.p)
-                    || fluree_db_core::is_rdf_reifies(&asserted.p)
-                {
+            for link in links {
+                if txn_link_retracts.contains(&(g_id, link.s.clone(), term.clone())) {
                     continue;
                 }
-                let mut retract = asserted.clone();
-                retract.t = new_t;
-                retract.op = false;
-                cascade.push(retract);
+                cascade.push(retract(&link, flake.g.as_ref()));
+                let entry = unlinked
+                    .entry((g_id, link.s))
+                    .or_insert_with(|| (flake.g.clone(), Vec::new()));
+                entry.1.push(term.clone());
             }
+        }
+
+        // 2. Reifiers whose whole body this transaction retracts. Same-txn
+        //    asserts count toward what survives, so replacing a body value
+        //    keeps the reifier.
+        type FlakeIdentity = (Sid, FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>);
+        let identity =
+            |f: &Flake| -> FlakeIdentity { (f.p.clone(), f.o.clone(), f.dt.clone(), f.m.clone()) };
+        let mut body_retracts: BTreeMap<(GraphId, Sid), (Option<Sid>, HashSet<FlakeIdentity>)> =
+            BTreeMap::new();
+        let mut body_asserts: HashSet<(GraphId, Sid)> = HashSet::new();
+        for f in flakes.iter().filter(|f| !is_annotation_predicate(&f.p)) {
+            let key = (resolve_flake_graph_id(f, reverse_graph)?, f.s.clone());
+            if f.op {
+                body_asserts.insert(key);
+            } else {
+                body_retracts
+                    .entry(key)
+                    .or_insert_with(|| (f.g.clone(), HashSet::new()))
+                    .1
+                    .insert(identity(f));
+            }
+        }
+        for ((g_id, ann), (g_sid, retracted)) in body_retracts {
+            if body_asserts.contains(&(g_id, ann.clone())) {
+                continue;
+            }
+            let current = scan(
+                g_id,
+                IndexType::Spot,
+                RangeMatch::new().with_subject(ann.clone()),
+            )
+            .await?;
+            let (links, body): (Vec<Flake>, Vec<Flake>) = current
+                .into_iter()
+                .filter(|f| !fluree_db_core::is_reserved_reifies_predicate(&f.p))
+                .partition(|f| is_rdf_reifies(&f.p));
+            if links.is_empty() || body.iter().any(|f| !retracted.contains(&identity(f))) {
+                continue;
+            }
+            for link in links {
+                let already = unlinked
+                    .get(&(g_id, ann.clone()))
+                    .is_some_and(|(_, terms)| terms.contains(&link.o));
+                if already || txn_link_retracts.contains(&(g_id, ann.clone(), link.o.clone())) {
+                    continue;
+                }
+                cascade.push(retract(&link, g_sid.as_ref()));
+                unlinked
+                    .entry((g_id, ann.clone()))
+                    .or_insert_with(|| (g_sid.clone(), Vec::new()))
+                    .1
+                    .push(link.o);
+            }
+        }
+
+        // 3. Bodies of reifiers left with no link.
+        for (key, g_sid) in explicit {
+            unlinked.entry(key).or_insert((g_sid, Vec::new()));
+        }
+        for ((g_id, ann), (g_sid, terms)) in unlinked {
+            let anonymous = ann.namespace_code == fluree_vocab::namespaces::BLANK_NODE;
+            if !(anonymous || lpg_edge_lifecycle) || txn_linked.contains(&(g_id, ann.clone())) {
+                continue;
+            }
+            let current = scan(
+                g_id,
+                IndexType::Spot,
+                RangeMatch::new().with_subject(ann.clone()),
+            )
+            .await?;
+            let keeps_link = current.iter().any(|f| {
+                is_rdf_reifies(&f.p)
+                    && !terms.contains(&f.o)
+                    && !txn_link_retracts.contains(&(g_id, ann.clone(), f.o.clone()))
+            });
+            if keeps_link {
+                continue;
+            }
+            let body: Vec<Flake> = current
+                .iter()
+                .filter(|f| !is_annotation_predicate(&f.p))
+                .map(|f| retract(f, g_sid.as_ref()))
+                .collect();
+            cascade.extend(body);
         }
 
         tracing::Span::current().record("cascade_count", cascade.len());
@@ -574,20 +308,6 @@ pub struct StageOptions<'a> {
     ///
     /// The normal `stage()` path builds this internally from `txn.write_graphs`.
     pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
-
-    /// These flakes come from a commit that was already authored and written,
-    /// not from a transaction being authored now.
-    ///
-    /// Authoring invariants become advisory: a violation is logged rather than
-    /// refused. The single-target reifier rule is one. It reached
-    /// `stage_flakes` with this work, which put it on the push path — and
-    /// `insert_turtle` and the permissive bulk-import sink did not enforce it
-    /// before, so a commit written by an older build can hold a reifier on two
-    /// edges. Refusing that on push would strand the ledger permanently, with
-    /// no way forward short of rewriting history, to prevent data that is
-    /// already written. Authoring still refuses it, which is where refusing
-    /// can still change the outcome.
-    pub replaying_commit: bool,
 }
 
 impl<'a> StageOptions<'a> {
@@ -617,13 +337,6 @@ impl<'a> StageOptions<'a> {
     /// Set the graph routing map for named-graph flakes
     pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<GraphId, Sid>) -> Self {
         self.graph_sids = Some(graph_sids);
-        self
-    }
-
-    /// Mark these flakes as the replay of an already-authored commit, making
-    /// authoring invariants advisory. See [`StageOptions::replaying_commit`].
-    pub fn replaying_commit(mut self) -> Self {
-        self.replaying_commit = true;
         self
     }
 }
@@ -1084,9 +797,6 @@ pub async fn stage_with_graph_delta(
             }
         }
 
-        // Stage-time attachment-bundle invariant (shared with `stage_flakes`).
-        enforce_single_target_reifiers(&ledger, &flakes, &reverse_graph).await?;
-
         // Charge 1 micro-fuel per staged flake. Matches query-side scan fuel,
         // which also charges per flake without filtering schema flakes.
         // Fuel exhaustion returns an error so transactions exceeding fuel
@@ -1372,8 +1082,8 @@ async fn scan_graph_flakes(
             return Err(TransactError::WholeGraphScanTooLarge { limit: l });
         }
     }
-    // Links are derived from the bundles this rewrites, never written.
-    flakes.retain(|f| !fluree_db_core::is_rdf_reifies(&f.p));
+    // A legacy attachment bundle is inert: its link reads and moves as a link.
+    flakes.retain(|f| !fluree_db_core::is_reserved_reifies_predicate(&f.p));
     for f in &mut flakes {
         f.g = g_sid.cloned();
     }
@@ -1621,129 +1331,18 @@ async fn stage_graph_mgmt(
                     let dest_contents: HashSet<FlakeContent> =
                         dest_flakes.iter().map(flake_content).collect();
 
-                    // O5: re-homing rewrites the `f:reifiesGraph` anchor per src/
-                    // dest graph (see the assert loop below), so an
-                    // annotation-bearing graph now transfers cleanly instead of
-                    // orphaning the anchor. One case is not repairable by
-                    // rewriting, though: ADD (`clear_dest == false`) merges the
-                    // source bundle into the destination without retracting dest's
-                    // existing bundles. If the SAME explicit reifier `@id` reifies
-                    // a DIFFERENT edge in the source and the destination, the merged
-                    // bundle carries two `f:reifiesSubject` flakes on one subject;
-                    // `EdgeKey::from_reifies_facts` rejects that as `Duplicate`, so
-                    // both readers (JSON-LD hydration + attachment indexer) silently
-                    // drop BOTH annotations — including dest's previously-valid one.
-                    // COPY/MOVE are immune (`clear_dest` retracts the colliding dest
-                    // bundle before the source bundle is asserted). Blank-minted
-                    // reifiers never collide, so this only trips when a user reuses
-                    // an explicit reifier `@id` across the two graphs. Fail loud.
-                    if !*clear_dest {
-                        // The edge a reifier subject denotes, keyed by subject Sid:
-                        // the set of its `f:reifies*` flake contents EXCLUDING
-                        // `f:reifiesGraph` (the only graph-dependent flake). Same
-                        // subject + different signature == a merge that would
-                        // produce a `Duplicate`; same signature (same edge) dedups
-                        // cleanly against `dest_contents` and is fine.
-                        let edge_signatures =
-                            |bundle: &[Flake]| -> HashMap<Sid, HashSet<FlakeContent>> {
-                                let mut sigs: HashMap<Sid, HashSet<FlakeContent>> = HashMap::new();
-                                for f in bundle {
-                                    if fluree_db_core::is_reserved_reifies_predicate(&f.p)
-                                        && !fluree_db_core::is_reifies_graph(&f.p)
-                                    {
-                                        sigs.entry(f.s.clone())
-                                            .or_default()
-                                            .insert(flake_content(f));
-                                    }
-                                }
-                                sigs
-                            };
-                        let dest_sigs = edge_signatures(&dest_flakes);
-                        if !dest_sigs.is_empty() {
-                            let src_sigs = edge_signatures(&src_flakes);
-                            for (subject, src_sig) in &src_sigs {
-                                if let Some(dest_sig) = dest_sigs.get(subject) {
-                                    if src_sig != dest_sig {
-                                        let iri = ns_registry
-                                            .get_prefix(subject.namespace_code)
-                                            .map(|prefix| format!("{}{}", prefix, subject.name))
-                                            .unwrap_or_else(|| subject.to_string());
-                                        return Err(TransactError::UnsupportedFeature(format!(
-                                            "ADD would merge edge annotations that share \
-                                             reifier <{iri}> but reify different edges in the \
-                                             source and destination graphs, which silently \
-                                             drops both annotations. Use COPY/MOVE, or give the \
-                                             annotations distinct reifier @ids."
-                                        )));
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     // Build the source assertions, re-homed into the destination
-                    // graph. Every flake's `g` becomes `dest_sid`; the
-                    // `f:reifiesGraph` anchor additionally encodes the edge's graph
-                    // in its OBJECT, so it needs a reification-aware rewrite rather
-                    // than the generic `g`-only one:
-                    //   - named→named  : rewrite the anchor OBJECT to the dest graph
-                    //     too, so the decoded `g` == flake-level `g` == dest.
-                    //   - named→default: DROP the anchor (the default graph carries
-                    //     none; the decoder wants `g == None`).
-                    //   - default→named: the source carried no anchor, so SYNTHESIZE
-                    //     one per reifier subject (keyed off the exactly-one
-                    //     `f:reifiesSubject` flake per bundle).
-                    let src_is_default = matches!(from, GraphSel::Default);
-                    // default→named synthesizes ONE anchor per reifier subject
-                    // (below), so size for them exactly; other directions add
-                    // nothing beyond the re-homed source flakes.
-                    let synthesized = if src_is_default {
-                        src_flakes
-                            .iter()
-                            .filter(|f| fluree_db_core::is_reifies_subject(&f.p))
-                            .count()
-                    } else {
-                        0
-                    };
-                    let mut rehomed: Vec<Flake> =
-                        Vec::with_capacity(src_flakes.len() + synthesized);
-                    for f in &src_flakes {
-                        if fluree_db_core::is_reifies_graph(&f.p) {
-                            if let Some(dest) = &dest_sid {
-                                let mut a = f.clone();
-                                a.op = true;
-                                a.t = new_t;
-                                a.g = Some(dest.clone());
-                                a.o = FlakeValue::Ref(dest.clone());
-                                rehomed.push(a);
-                            }
-                            // dest default: drop the anchor (emit nothing).
-                            continue;
-                        }
-                        let mut a = f.clone();
-                        a.op = true;
-                        a.t = new_t;
-                        a.g = dest_sid.clone();
-                        rehomed.push(a);
-                    }
-                    if src_is_default {
-                        if let Some(dest) = &dest_sid {
-                            for f in &src_flakes {
-                                if fluree_db_core::is_reifies_subject(&f.p) {
-                                    rehomed.push(Flake::new_in_graph(
-                                        dest.clone(),
-                                        f.s.clone(),
-                                        fluree_db_core::namespaces::reifies_graph_sid().clone(),
-                                        FlakeValue::Ref(dest.clone()),
-                                        fluree_db_core::id_datatype_sid(),
-                                        new_t,
-                                        true,
-                                        None,
-                                    ));
-                                }
-                            }
-                        }
-                    }
+                    // graph.
+                    let rehomed: Vec<Flake> = src_flakes
+                        .iter()
+                        .map(|f| {
+                            let mut a = f.clone();
+                            a.op = true;
+                            a.t = new_t;
+                            a.g = dest_sid.clone();
+                            a
+                        })
+                        .collect();
 
                     // The content set the transfer will land in the destination —
                     // keyed on the RE-HOMED flakes so COPY/MOVE stay symmetric: a
@@ -1842,278 +1441,6 @@ async fn stage_graph_mgmt(
     .await
 }
 
-/// Which of `candidates` could already have rows in `ledger`.
-///
-/// A subject absent from both the persisted subject dictionary and its
-/// graph's novelty provably has no prior facts, so a scan for it can only
-/// come back empty. Skipping that scan matters because it is not cheap when
-/// it misses: a `Sid` neither dictionary can resolve falls through
-/// `binary_range` into `overlay_only_flakes`, which walks the graph's
-/// **entire** novelty. Freshly minted reifiers — every anonymous `{| … |}`
-/// and `<< … >>` — are exactly that shape, so a bulk Turtle-star insert
-/// otherwise pays one whole-novelty walk per annotation in the file.
-///
-/// `None` means absence cannot be decided here (no binary store on an
-/// already-indexed ledger); callers must then treat every candidate as
-/// possibly present and run their scan, so a real load failure surfaces
-/// rather than silently skipping work.
-///
-/// The novelty walk runs at most once per graph and answers for every
-/// candidate in that graph at once. `generate_upsert_deletions` skips absent
-/// subjects the same way and for the same reason, and #1657 fixed the same
-/// shape in `binary_scan`.
-fn subjects_with_prior_rows(
-    ledger: &LedgerState,
-    candidates: &[(GraphId, Sid)],
-) -> Option<HashSet<(GraphId, Sid)>> {
-    use fluree_db_core::comparator::IndexType;
-    use fluree_db_query::BinaryRangeProvider;
-
-    let binary_store = ledger
-        .snapshot
-        .range_provider
-        .as_ref()
-        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
-        .map(|brp| Arc::clone(brp.store()));
-
-    // Genesis with nothing indexed: novelty is the only place a subject can
-    // be, so it decides on its own. An indexed ledger whose store failed to
-    // load must stay undecidable — see `generate_upsert_deletions`.
-    let base_index_absent = ledger.snapshot.range_provider.is_none() && ledger.snapshot.t == 0;
-    if binary_store.is_none() && !base_index_absent {
-        return None;
-    }
-
-    let mut present: HashSet<(GraphId, Sid)> = HashSet::new();
-    let mut want_novelty: HashMap<GraphId, HashSet<&Sid>> = HashMap::new();
-
-    for (g_id, sid) in candidates {
-        let in_base = match binary_store.as_deref() {
-            None => false,
-            Some(store) => {
-                if matches!(
-                    store.find_subject_id_by_parts(sid.namespace_code, &sid.name),
-                    Ok(Some(_))
-                ) {
-                    true
-                } else {
-                    // A namespace code the pre-transaction snapshot cannot
-                    // decode was minted by this transaction, so it names no
-                    // base row. Same reasoning as the upsert skip.
-                    match ledger.snapshot.decode_sid(sid) {
-                        Some(iri) => !matches!(store.find_subject_id(&iri), Ok(None)),
-                        None => false,
-                    }
-                }
-            }
-        };
-        if in_base {
-            present.insert((*g_id, sid.clone()));
-        } else {
-            want_novelty.entry(*g_id).or_default().insert(sid);
-        }
-    }
-
-    for (g_id, subjects) in want_novelty {
-        ledger.novelty.for_each_overlay_flake(
-            g_id,
-            IndexType::Spot,
-            None,
-            None,
-            true,
-            ledger.t(),
-            &mut |flake| {
-                if subjects.contains(&flake.s) {
-                    present.insert((g_id, flake.s.clone()));
-                }
-            },
-        );
-    }
-
-    Some(present)
-}
-
-/// Re-attach the graph to flakes read back through a scan.
-///
-/// Index-decoded flakes carry `g: None` — the graph is the index they came
-/// from, not a field on the flake — while a named-graph transaction's own
-/// flakes carry `g: Some(sid)`. Any comparison or decode that reads `g` has to
-/// put it back first, or an indexed named-graph bundle silently fails to line
-/// up with the transaction that is editing it. `scan_graph_flakes` has always
-/// done this; every other scan of a reifier's own facts needs it too.
-fn stamp_graph(flakes: &mut [Flake], g_sid: Option<&Sid>) {
-    for f in flakes {
-        f.g = g_sid.cloned();
-    }
-}
-
-/// Stage-time attachment-bundle invariant: an annotation SID may
-/// reify exactly one edge. Counting this txn's asserted
-/// `f:reifiesSubject` flakes is insufficient — it misses
-/// (a) re-pointing an `@id` already attached to a *different*
-/// edge in a prior transaction (no retract in this txn), and
-/// (b) same-subject / different-slot multiplicity within one txn
-/// (the subject slot dedupes while the predicate/object slots
-/// diverge). Validate the *net* asserted bundle per touched
-/// annotation SID — current snapshot/novelty state, minus this
-/// txn's retracts, plus its asserts — by decoding it the way the
-/// arena / hydration paths will. A malformed (multi-target) net
-/// bundle is rejected here rather than corrupting downstream
-/// `EdgeKey::from_reifies_facts`.
-///
-/// Runs on every staging entry point — `stage` (JSON-LD / SPARQL) and
-/// `stage_flakes` (the Turtle sink and push/import paths) — so a reifier
-/// reused on two edges is refused no matter which surface wrote it.
-async fn enforce_single_target_reifiers(
-    ledger: &LedgerState,
-    flakes: &[Flake],
-    reverse_graph: &HashMap<Sid, GraphId>,
-) -> Result<()> {
-    use fluree_db_core::comparator::IndexType;
-    use fluree_db_core::edge::EdgeKey;
-    use fluree_db_core::is_reserved_reifies_predicate;
-    use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
-
-    // One pass over `flakes`, grouping every reserved-predicate flake under
-    // its annotation subject. The per-reifier work below then reads only its
-    // own group: re-scanning `flakes` per reifier made the check
-    // O(reifiers x flakes), and since each annotation contributes ~5 flakes
-    // the flake count grows with the reifier count — quadratic on exactly the
-    // shape this check exists for. `stage_flakes` puts it on the bulk Turtle
-    // insert and commit-apply paths, where one transaction can carry every
-    // reifier in a file.
-    //
-    // `touched` keeps the "gate on asserts" property: a reifier is only work
-    // when the txn ASSERTS one of its facts, so pure retracts (which can only
-    // shrink a bundle) and non-annotation transactions stay at zero scan cost.
-    //
-    // The key is `(graph, reifier)`, not the reifier alone. A bundle names its
-    // own graph in `f:reifiesGraph`, and `EdgeKey::from_reifies_facts` checks
-    // that a bundle is graph-uniform before it checks anything else, so
-    // folding one reifier's flakes from two graphs into one bundle reports
-    // `MixedFlakeGraphs` — surfaced here as "multi-target", which it is not.
-    // The same reifier in two graphs is a state graph management produces on
-    // purpose: `COPY <g1> TO <g2>` duplicates annotated edges, reifier IRIs
-    // included, and `add_same_edge_same_reifier_succeeds` pins that it must
-    // work. Keying by subject alone refused within one transaction exactly
-    // what two transactions were free to do.
-    let mut by_reifier: HashMap<(GraphId, &Sid), Vec<&Flake>> = HashMap::new();
-    let mut touched: Vec<(GraphId, &Sid)> = Vec::new();
-    for f in flakes {
-        if !is_reserved_reifies_predicate(&f.p) {
-            continue;
-        }
-        let key = (resolve_flake_graph_id(f, reverse_graph)?, &f.s);
-        let group = by_reifier.entry(key).or_default();
-        if f.op && !group.iter().any(|g| g.op) {
-            touched.push(key);
-        }
-        group.push(f);
-    }
-
-    if !touched.is_empty() {
-        let to_t = ledger.t();
-        // Set key for a `f:reifies*` fact: graph + subject +
-        // predicate + object + datatype. Keying as a set gives
-        // RDF set-semantics, so an idempotent re-assert of an
-        // existing attachment collapses instead of looking like
-        // a duplicate slot, while genuinely divergent slots
-        // (two different edges) remain distinct and trip
-        // `EdgeKey::from_reifies_facts`'s `Duplicate` check.
-        type ReifiesKey = (Option<Sid>, Sid, Sid, FlakeValue, Sid);
-        let reifies_key = |f: &Flake| -> ReifiesKey {
-            (
-                f.g.clone(),
-                f.s.clone(),
-                f.p.clone(),
-                f.o.clone(),
-                f.dt.clone(),
-            )
-        };
-
-        // Resolve each reifier's graph once, then decide in a single pass
-        // which of them can have a prior bundle at all. Without this the scan
-        // below ran per reifier, and a reifier this transaction just minted
-        // resolves in neither dictionary, so each one walked the graph's whole
-        // novelty: O(new reifiers x novelty) on exactly the bulk Turtle-star
-        // insert this check exists to guard.
-        let mut anchors: Vec<((GraphId, &Sid), Option<Sid>)> = Vec::with_capacity(touched.len());
-        for key in &touched {
-            let anchor = by_reifier[key]
-                .iter()
-                .find(|f| f.op)
-                .expect("touched implies an assert");
-            anchors.push((*key, anchor.g.clone()));
-        }
-        let candidates: Vec<(GraphId, Sid)> = anchors
-            .iter()
-            .map(|((g_id, sid), _)| (*g_id, (*sid).clone()))
-            .collect();
-        let may_have_prior = subjects_with_prior_rows(ledger, &candidates);
-
-        for ((g_id, ann_sid), g_sid) in anchors {
-            let mine = &by_reifier[&(g_id, ann_sid)];
-
-            // Current asserted `f:reifies*` bundle for this SID
-            // (pre-txn snapshot + novelty), as a deduped set. A reifier with
-            // no prior rows contributes nothing, so the net bundle is exactly
-            // what this transaction asserts.
-            let mut current = match &may_have_prior {
-                Some(present) if !present.contains(&(g_id, ann_sid.clone())) => Vec::new(),
-                _ => {
-                    fluree_db_core::range_with_overlay(
-                        &ledger.snapshot,
-                        g_id,
-                        ledger.novelty.as_ref(),
-                        IndexType::Spot,
-                        RangeTest::Eq,
-                        RangeMatch::new().with_subject((*ann_sid).clone()),
-                        RangeOptions::new().with_to_t(to_t),
-                    )
-                    .await?
-                }
-            };
-            // Index-decoded flakes carry `g: None` — the graph is the index
-            // they came from, not a field — while this txn's named-graph
-            // flakes carry `g: Some(sid)`. `reifies_key` includes `g`, so
-            // without this stamp an indexed named-graph bundle never matches
-            // the txn's keys: a re-assert would not collapse, and the net
-            // bundle would mix `None` and `Some` and decode as
-            // `MixedFlakeGraphs`. `scan_graph_flakes` stamps for the same
-            // reason.
-            stamp_graph(&mut current, g_sid.as_ref());
-            let mut net: HashMap<ReifiesKey, Flake> = HashMap::new();
-            for f in current {
-                if is_reserved_reifies_predicate(&f.p) {
-                    net.insert(reifies_key(&f), f);
-                }
-            }
-
-            // Fold this txn's effects for the SID: retracts drop
-            // the matching fact; asserts add it.
-            for f in mine {
-                let key = reifies_key(f);
-                if f.op {
-                    net.insert(key, (*f).clone());
-                } else {
-                    net.remove(&key);
-                }
-            }
-
-            let net_bundle: Vec<Flake> = net.into_values().collect();
-            if let Err(e) = EdgeKey::from_reifies_facts(&net_bundle) {
-                return Err(TransactError::InvariantViolation(format!(
-                    "annotation subject `{ann_sid}` would reify a malformed or \
-                     multi-target edge after this transaction ({e:?}); an annotation \
-                     may reify exactly one edge. Retract the prior attachment in the \
-                     same transaction if you intended to re-point it.",
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Stage pre-built flakes against a ledger (bypass WHERE/template pipeline).
 ///
 /// This is the fast path for bulk INSERT from Turtle where flakes are already
@@ -2171,24 +1498,6 @@ pub async fn stage_flakes(
                 HashMap::new()
             }
         };
-
-        // 3. Stage-time attachment-bundle invariant: one reifier, one edge.
-        //    Advisory when replaying a commit that was authored elsewhere —
-        //    see `StageOptions::replaying_commit` for why refusing there would
-        //    strand a ledger rather than prevent anything.
-        match enforce_single_target_reifiers(&ledger, &flakes, &reverse_graph).await {
-            Ok(()) => {}
-            Err(e) if options.replaying_commit => {
-                tracing::warn!(
-                    error = %e,
-                    "replayed commit violates the single-target reifier invariant; \
-                     applying it anyway because the commit is already authored. \
-                     Its attachment bundles will not decode, so the annotations \
-                     involved will not be queryable"
-                );
-            }
-            Err(e) => return Err(e),
-        }
 
         // 4. Charge 1 micro-fuel per staged flake.
         if let Some(tracker) = options.tracker {
@@ -2493,8 +1802,8 @@ async fn classify_subject_lifecycle(
     delta: &SubjectDelta,
     pre_classes: &[Sid],
 ) -> Result<WriteVerb> {
-    // A reifier's link is derived and never retracted by a transaction, so
-    // it would make every full delete of a reifier look partial.
+    // A legacy attachment bundle is never retracted by a transaction, so it
+    // would make every full delete of a reifier look partial.
     let scan_pre_state = || async move {
         let rm = fluree_db_core::RangeMatch::new().with_subject(subject.clone());
         let opts = fluree_db_core::RangeOptions::new().with_to_t(ledger.t());
@@ -2509,7 +1818,7 @@ async fn classify_subject_lifecycle(
         )
         .await
         .map(|mut flakes| {
-            flakes.retain(|f| !fluree_db_core::is_rdf_reifies(&f.p));
+            flakes.retain(|f| !fluree_db_core::is_reserved_reifies_predicate(&f.p));
             flakes
         })
     };

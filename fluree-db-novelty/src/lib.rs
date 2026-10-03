@@ -577,6 +577,9 @@ pub struct Novelty {
     link_base: Option<LinkBase>,
     /// Every commit at or before this `t` has its links in novelty.
     links_through: i64,
+    /// An `rdf:reifies` link has been applied; sticky, like
+    /// [`AttachmentNovelty::has_annotations`].
+    saw_links: bool,
 }
 
 #[inline]
@@ -602,7 +605,14 @@ impl Novelty {
             fact_state: NoveltyFactState::new(),
             link_base: None,
             links_through: t,
+            saw_links: false,
         }
+    }
+
+    /// True once novelty has applied an annotation: an `rdf:reifies` link or
+    /// a legacy `f:reifies*` bundle flake.
+    pub fn has_annotations(&self) -> bool {
+        self.saw_links || self.attachments.has_annotations()
     }
 
     /// Resolve a flake's graph ID from its `Flake.g` field.
@@ -963,6 +973,7 @@ impl Novelty {
             if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
                 accepted_reifies.push(flake.clone());
             }
+            self.saw_links |= fluree_db_core::is_rdf_reifies(&flake.p);
             // Asserting OR retracting a hierarchy edge changes the RDFS
             // schema — invalidate the shared hierarchy cache. Likewise any
             // SHACL-vocabulary flake invalidates the compiled-shapes cache.
@@ -1178,6 +1189,7 @@ impl Novelty {
                 if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
                     accepted_reifies.push(flake.clone());
                 }
+                self.saw_links |= fluree_db_core::is_rdf_reifies(&flake.p);
                 self.fact_state.record(g_id, flake);
             }
 

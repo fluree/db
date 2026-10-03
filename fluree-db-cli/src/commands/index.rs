@@ -73,7 +73,7 @@ pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOu
         })?;
         let view = handle.snapshot().await;
         let ledger_has_annotations =
-            view.snapshot.has_annotations || view.novelty.attachments.has_annotations();
+            view.snapshot.has_annotations || view.novelty.has_annotations();
         if ledger_has_annotations {
             config.attachment_events = provider.attachment_events(handle.id()).await;
         }

@@ -148,16 +148,16 @@ pub use ledger_id::{
     ParsedLedgerId, COMMIT_PREFIX_MIN_LEN, DEFAULT_BRANCH, LEDGER_URN_PREFIX, TIME_TRAVEL_TAGS,
 };
 pub use namespaces::{
-    default_namespace_codes, is_owl_class_class, is_owl_datatype_property_class,
-    is_owl_equivalent_class, is_owl_equivalent_property, is_owl_functional_property,
-    is_owl_imports, is_owl_inverse_functional_property, is_owl_inverse_of,
-    is_owl_object_property_class, is_owl_ontology_class, is_owl_same_as, is_owl_symmetric_property,
-    is_owl_transitive_property, is_rdf_first, is_rdf_nil, is_rdf_property_class, is_rdf_reifies,
-    is_rdf_rest, is_rdf_type, is_rdfs_domain, is_rdfs_range, is_rdfs_subclass_of,
-    is_rdfs_subproperty_of, is_reifies_datatype, is_reifies_graph, is_reifies_lang,
-    is_reifies_list_index, is_reifies_object, is_reifies_predicate, is_reifies_subject,
-    is_reserved_reifies_predicate, is_scan_hidden_predicate, is_schema_class, is_schema_predicate,
-    rdf_reifies_sid, reifies_predicate_sids, triple_term_datatype_sid,
+    default_namespace_codes, is_annotation_predicate, is_owl_class_class,
+    is_owl_datatype_property_class, is_owl_equivalent_class, is_owl_equivalent_property,
+    is_owl_functional_property, is_owl_imports, is_owl_inverse_functional_property,
+    is_owl_inverse_of, is_owl_object_property_class, is_owl_ontology_class, is_owl_same_as,
+    is_owl_symmetric_property, is_owl_transitive_property, is_rdf_first, is_rdf_nil,
+    is_rdf_property_class, is_rdf_reifies, is_rdf_rest, is_rdf_type, is_rdfs_domain, is_rdfs_range,
+    is_rdfs_subclass_of, is_rdfs_subproperty_of, is_reifies_datatype, is_reifies_graph,
+    is_reifies_lang, is_reifies_list_index, is_reifies_object, is_reifies_predicate,
+    is_reifies_subject, is_reserved_reifies_predicate, is_scan_hidden_predicate, is_schema_class,
+    is_schema_predicate, rdf_reifies_sid, reifies_predicate_sids, triple_term_datatype_sid,
 };
 pub use nonempty::NonEmpty;
 pub use ns_encoding::{

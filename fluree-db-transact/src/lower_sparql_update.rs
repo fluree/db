@@ -51,14 +51,14 @@ use fluree_db_sparql::ast::{
     GraphPattern, GraphRefAll, GraphTransfer, Iri, IriValue, Literal,
     LiteralValue as SparqlLiteralValue, Load, Modify, PredicateTerm, Prologue, PropertyPath,
     QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term,
-    TriplePattern, UpdateOperation,
+    TriplePattern, TripleTerm as SparqlTripleTerm, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
 use thiserror::Error;
 
 use crate::ir::{
     GraphMgmtOp, GraphSel, GraphTarget, SparqlWhereClause, TemplateGraph, TemplateTerm,
-    TripleTemplate, Txn, TxnOpts, TxnType,
+    TemplateTripleTerm, TripleTemplate, Txn, TxnOpts, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_vocab::{fluree, xsd};
@@ -273,9 +273,9 @@ fn anon_in_mode_msg(op: &'static str) -> &'static str {
 }
 
 /// Expand any annotated triples in a Vec into the equivalent set of
-/// unannotated triples: the base triple, the `f:reifies*` bundle
-/// (subject/predicate/object only — graph/datatype/lang/listIndex are
-/// derived at flake time), and the body's predicate-object pairs.
+/// unannotated triples, as RDF 1.2 defines the annotation syntax: the base
+/// triple, `reifier rdf:reifies <<( s p o )>>` per annotation, and the body's
+/// predicate-object pairs.
 ///
 /// Default-graph only in v1; an annotation tail inside a `GRAPH` block
 /// is rejected by the caller before this is invoked.
@@ -284,8 +284,6 @@ fn expand_annotated_triples(
     mode: AnnotationExpansionMode,
     bnodes: &mut BlankNodeCounter,
 ) -> Result<(), LowerError> {
-    use fluree_vocab::reifies_iris;
-
     let original = std::mem::take(triples);
     let mut out: Vec<TriplePattern> = Vec::with_capacity(original.len());
 
@@ -295,14 +293,7 @@ fn expand_annotated_triples(
             continue;
         };
 
-        // Reject RDF-star quoted-triple subjects explicitly. The
-        // legacy `<< s p o >>` quoted-triple form has no compatible
-        // representation in the f:reifies* bundle (the base triple
-        // would need to embed inside f:reifiesSubject's object slot
-        // which violates the bundle shape), and `subject_to_object`
-        // below would otherwise hit its `unreachable!()` panic.
-        // Surface this as an explicit `UnsupportedFeature` so the
-        // user sees a real error rather than a transactor panic.
+        // A reified triple as the annotated triple's subject is deferred.
         if let SubjectTerm::QuotedTriple(qt) = &tp.subject {
             return Err(LowerError::UnsupportedFeature {
                 feature: "RDF-star quoted-triple subject combined with an RDF 1.2 \
@@ -311,10 +302,6 @@ fn expand_annotated_triples(
             });
         }
 
-        // Same for an RDF 1.2 triple-term subject (`<<( s p o )>>`,
-        // accept-then-defer, D-1): this expansion pre-pass runs BEFORE the
-        // quad-pattern lowering whose TripleTerm arms defer cleanly, and
-        // `subject_to_object` below would hit its `unreachable!()` panic.
         if let SubjectTerm::TripleTerm(tt) = &tp.subject {
             return Err(LowerError::UnsupportedFeature {
                 feature: "SPARQL 1.2 triple-term subject combined with an RDF 1.2 \
@@ -323,10 +310,9 @@ fn expand_annotated_triples(
             });
         }
 
-        // Reify the base edge and emit base + per-unit bundle + body.
         // The base triple stripped of its annotation goes through
-        // unchanged; each annotation unit (`~ r? {| … |}?`) contributes
-        // its own reifier bundle.
+        // unchanged; each annotation unit (`~ r? {| … |}?`) contributes its
+        // own reifier.
         let span = tp.span;
 
         // Base triple (without annotation)
@@ -340,53 +326,17 @@ fn expand_annotated_triples(
         for unit in &annotation.units {
             let reifier = resolve_reifier(unit, mode, bnodes)?;
 
-            // f:reifies* bundle: SUBJECT, PREDICATE, OBJECT, and (for a
-            // language-tagged object) LANG. f:reifiesGraph is omitted
-            // (default graph only) — WITH-scoped templates are rejected
-            // upstream by `reject_with_scoped_annotations` so this default
-            // identity never gets graph-stamped. f:reifiesDatatype rides on
-            // the f:reifiesObject flake's flake-level dt (the decoder derives
-            // it), and f:reifiesListIndex is deferred (v1).
-            let pred_iri =
-                |s: &'static str| -> PredicateTerm { PredicateTerm::Iri(Iri::full(s, span)) };
             out.push(TriplePattern::new(
                 reifier.clone(),
-                pred_iri(reifies_iris::SUBJECT),
-                subject_to_object(&tp.subject),
+                PredicateTerm::Iri(Iri::full(fluree_vocab::rdf::REIFIES, span)),
+                Term::TripleTerm(Box::new(SparqlTripleTerm {
+                    subject: tp.subject.clone(),
+                    predicate: tp.predicate.clone(),
+                    object: tp.object.clone(),
+                    span,
+                })),
                 span,
             ));
-            out.push(TriplePattern::new(
-                reifier.clone(),
-                pred_iri(reifies_iris::PREDICATE),
-                predicate_to_object(&tp.predicate),
-                span,
-            ));
-            out.push(TriplePattern::new(
-                reifier.clone(),
-                pred_iri(reifies_iris::OBJECT),
-                tp.object.clone(),
-                span,
-            ));
-
-            // f:reifiesLang — required for a language-tagged object.
-            // `EdgeKey::from_reifies_facts` reads `lang` from a dedicated
-            // f:reifiesLang flake, NOT from the f:reifiesObject flake's
-            // `m.lang`. Without this triple the decoded EdgeKey carries
-            // `lang = None` while the base edge's EdgeKey carries
-            // `lang = Some(tag)`, so the forward-map lookup misses: the
-            // annotation silently vanishes from `@annotation` hydration
-            // and the bundle is never cascaded on base-edge retract.
-            // Mirrors the JSON-LD writer (`build_annotation_sibling`).
-            if let Term::Literal(lit) = &tp.object {
-                if let SparqlLiteralValue::LangTagged { lang, .. } = &lit.value {
-                    out.push(TriplePattern::new(
-                        reifier.clone(),
-                        pred_iri(reifies_iris::LANG),
-                        Term::Literal(Literal::string(lang.as_ref(), span)),
-                        span,
-                    ));
-                }
-            }
 
             // Body entries become (reifier, ann_pred, ann_obj) triples.
             // Property-path verbs (legal in query annotation blocks)
@@ -416,33 +366,6 @@ fn expand_annotated_triples(
 
     *triples = out;
     Ok(())
-}
-
-/// Convert a SPARQL subject term into the corresponding object term so
-/// the `f:reifiesSubject` pointer can carry it. Subjects and objects
-/// share the IRI / blank-node / variable cases; literals never appear
-/// as subjects so the case is unreachable in practice.
-fn subject_to_object(s: &SubjectTerm) -> Term {
-    match s {
-        SubjectTerm::Var(v) => Term::Var(v.clone()),
-        SubjectTerm::Iri(i) => Term::Iri(i.clone()),
-        SubjectTerm::BlankNode(b) => Term::BlankNode(b.clone()),
-        SubjectTerm::QuotedTriple(_) => {
-            unreachable!("RDF-star quoted triples are rejected before annotation expansion")
-        }
-        SubjectTerm::TripleTerm(_) => {
-            unreachable!("SPARQL 1.2 triple-term values are rejected before annotation expansion")
-        }
-    }
-}
-
-/// Convert a predicate (IRI or var) into the object slot for
-/// `f:reifiesPredicate`.
-fn predicate_to_object(p: &PredicateTerm) -> Term {
-    match p {
-        PredicateTerm::Var(v) => Term::Var(v.clone()),
-        PredicateTerm::Iri(i) => Term::Iri(i.clone()),
-    }
 }
 
 /// Walk the QuadPatternElement list and expand every annotated triple
@@ -557,9 +480,8 @@ fn reject_user_authored_reifies(
 
     for tp in triples {
         check_predicate(&tp.predicate, prologue)?;
-        // `rdf:reifies` names a triple term; the reified-triple object forms
-        // lower to the bundle, so any other object is a data error the link
-        // lowering would read as a link.
+        // `rdf:reifies` names a triple term; any other object is a data
+        // error the link lowering would read as a link.
         if let PredicateTerm::Iri(iri) = &tp.predicate {
             if expand_iri(iri, prologue)? == fluree_vocab::rdf::REIFIES
                 && !matches!(
@@ -665,16 +587,9 @@ fn reject_user_authored_reifies_in_quad_pattern(
     Ok(())
 }
 
-/// Reject RDF 1.2 annotation tails on `WITH <g>`-scoped template triples.
-///
-/// `WITH <g>` re-homes default-position template triples into `<g>` *after*
-/// annotation expansion, but the v1 expansion omits `f:reifiesGraph` — the
-/// synthetic bundle encodes a default-graph edge identity. Stamping the WITH
-/// graph id over that bundle would mint graph-tagged reifications whose edge
-/// identity is still default-graph, so the forward-map lookup misses: the
-/// annotation never hydrates and never cascades on base-edge retract. Reject
-/// until graph-aware expansion (emitting `f:reifiesGraph`) lands. Annotation
-/// tails inside explicit `GRAPH { ... }` blocks are already rejected by
+/// Reject RDF 1.2 annotation tails on `WITH <g>`-scoped template triples:
+/// SPARQL UPDATE annotations are default-graph only for now. Annotation tails
+/// inside explicit `GRAPH { ... }` blocks are rejected by
 /// [`expand_annotated_triples_in_quad_pattern`]; this covers the top-level
 /// (WITH-scoped) triples it would otherwise expand as default-graph.
 fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerError> {
@@ -1187,15 +1102,35 @@ fn lower_delete_where(
     for tp in triples {
         // WHERE side: lower to UnresolvedPattern::Triple with bnodes rewritten as vars
         let s = subject_to_unresolved_delete_where(&tp.subject, prologue, &mut bnode_vars)?;
-        let p = predicate_to_unresolved(&tp.predicate, prologue)?;
-        let obj = object_to_unresolved_delete_where(&tp.object, prologue, &mut bnode_vars)?;
-
-        where_patterns.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
-            s,
-            p,
-            o: obj.term,
-            dtc: obj.dtc,
-        }));
+        match &tp.object {
+            Term::TripleTerm(tt) if is_rdf_reifies(&tp.predicate, prologue)? => {
+                let edge_s =
+                    subject_to_unresolved_delete_where(&tt.subject, prologue, &mut bnode_vars)?;
+                let edge_p = predicate_to_unresolved(&tt.predicate, prologue)?;
+                let edge_o =
+                    object_to_unresolved_delete_where(&tt.object, prologue, &mut bnode_vars)?;
+                where_patterns.push(UnresolvedPattern::AnnotationTarget {
+                    annotation: s,
+                    edge: UnresolvedTriplePattern {
+                        s: edge_s,
+                        p: edge_p,
+                        o: edge_o.term,
+                        dtc: edge_o.dtc,
+                    },
+                    body: Vec::new(),
+                });
+            }
+            object => {
+                let p = predicate_to_unresolved(&tp.predicate, prologue)?;
+                let obj = object_to_unresolved_delete_where(object, prologue, &mut bnode_vars)?;
+                where_patterns.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                    s,
+                    p,
+                    o: obj.term,
+                    dtc: obj.dtc,
+                }));
+            }
+        }
 
         // DELETE side: lower to TripleTemplate with the same bnode->var mapping
         delete_templates.push(lower_triple_to_delete_template_delete_where(
@@ -1255,7 +1190,7 @@ fn lower_delete_where_with_graphs(
         with_graph_iri: None,
         using_default_graph_iris: Vec::new(),
         using_named_graph_iris: Vec::new(),
-        pattern: quad_pattern_to_graph_pattern(&rewritten),
+        pattern: quad_pattern_to_graph_pattern(&rewritten, prologue)?,
     };
 
     let mut write_graphs = BTreeSet::new();
@@ -1323,15 +1258,21 @@ fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
 
     let mut rewrite_triple = |tp: &TriplePattern| -> TriplePattern {
         let mut out = tp.clone();
-        if let SubjectTerm::BlankNode(bn) = &tp.subject {
-            if let Some(v) = rewrite_bnode(bn) {
-                out.subject = SubjectTerm::Var(v);
+        let mut rewrite = |subject: &mut SubjectTerm, object: &mut Term| {
+            if let SubjectTerm::BlankNode(bn) = subject {
+                if let Some(v) = rewrite_bnode(bn) {
+                    *subject = SubjectTerm::Var(v);
+                }
             }
-        }
-        if let Term::BlankNode(bn) = &tp.object {
-            if let Some(v) = rewrite_bnode(bn) {
-                out.object = Term::Var(v);
+            if let Term::BlankNode(bn) = object {
+                if let Some(v) = rewrite_bnode(bn) {
+                    *object = Term::Var(v);
+                }
             }
+        };
+        rewrite(&mut out.subject, &mut out.object);
+        if let Term::TripleTerm(tt) = &mut out.object {
+            rewrite(&mut tt.subject, &mut tt.object);
         }
         out
     };
@@ -1363,7 +1304,10 @@ fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
 /// Runs of default-graph triples become one BGP; each `GRAPH <iri>|?g { ... }`
 /// block becomes a `GraphPattern::Graph` wrapping its own BGP. Source order is
 /// preserved so bindings join exactly as the user wrote them.
-fn quad_pattern_to_graph_pattern(pattern: &QuadPattern) -> GraphPattern {
+fn quad_pattern_to_graph_pattern(
+    pattern: &QuadPattern,
+    prologue: &Prologue,
+) -> Result<GraphPattern, LowerError> {
     let span = pattern.span;
     let mut parts: Vec<GraphPattern> = Vec::new();
     let mut bgp: Vec<TriplePattern> = Vec::new();
@@ -1376,30 +1320,25 @@ fn quad_pattern_to_graph_pattern(pattern: &QuadPattern) -> GraphPattern {
                 triples,
                 span: g_span,
             } => {
-                if !bgp.is_empty() {
-                    parts.push(GraphPattern::Bgp {
-                        patterns: std::mem::take(&mut bgp),
-                        span,
-                    });
-                }
+                parts.extend(triples_to_graph_patterns(
+                    std::mem::take(&mut bgp),
+                    prologue,
+                    span,
+                )?);
+                let inner = triples_to_graph_patterns(triples.clone(), prologue, *g_span)?;
                 parts.push(GraphPattern::Graph {
                     name: name.clone(),
-                    pattern: Box::new(GraphPattern::Bgp {
-                        patterns: triples.clone(),
-                        span: *g_span,
-                    }),
+                    pattern: Box::new(group(inner, *g_span)),
                     span: *g_span,
                 });
             }
         }
     }
-    if !bgp.is_empty() {
-        parts.push(GraphPattern::Bgp {
-            patterns: bgp,
-            span,
-        });
-    }
+    parts.extend(triples_to_graph_patterns(bgp, prologue, span)?);
+    Ok(group(parts, span))
+}
 
+fn group(mut parts: Vec<GraphPattern>, span: SourceSpan) -> GraphPattern {
     if parts.len() == 1 {
         parts.pop().expect("len checked")
     } else {
@@ -1408,6 +1347,45 @@ fn quad_pattern_to_graph_pattern(pattern: &QuadPattern) -> GraphPattern {
             span,
         }
     }
+}
+
+/// Triples as WHERE patterns: runs of ordinary triples as BGPs, and each
+/// `r rdf:reifies <<( s p o )>>` as the reifier pattern the query parser
+/// builds for it.
+fn triples_to_graph_patterns(
+    triples: Vec<TriplePattern>,
+    prologue: &Prologue,
+    span: SourceSpan,
+) -> Result<Vec<GraphPattern>, LowerError> {
+    let mut parts = Vec::new();
+    let mut bgp = Vec::new();
+    for tp in triples {
+        let reifies = is_rdf_reifies(&tp.predicate, prologue)?;
+        match tp.object {
+            Term::TripleTerm(triple_term) if reifies => {
+                if !bgp.is_empty() {
+                    parts.push(GraphPattern::Bgp {
+                        patterns: std::mem::take(&mut bgp),
+                        span,
+                    });
+                }
+                parts.push(GraphPattern::AnnotationTarget {
+                    reifier: tp.subject,
+                    predicate: tp.predicate,
+                    triple_term,
+                    span: tp.span,
+                });
+            }
+            object => bgp.push(TriplePattern { object, ..tp }),
+        }
+    }
+    if !bgp.is_empty() {
+        parts.push(GraphPattern::Bgp {
+            patterns: bgp,
+            span,
+        });
+    }
+    Ok(parts)
 }
 
 /// Lower Modify operation (DELETE/INSERT with WHERE).
@@ -1605,6 +1583,19 @@ fn lower_triple_to_template(
             let result = literal_to_template(lit, prologue, ns)?;
             (result.term, result.dtc)
         }
+        Term::TripleTerm(tt) if is_rdf_reifies(&triple.predicate, prologue)? => {
+            let s = subject_to_template(&tt.subject, prologue, ns, vars, bnodes)?;
+            let p = predicate_to_template(&tt.predicate, prologue, ns, vars)?;
+            let (o, dtc) = match &tt.object {
+                Term::Literal(lit) => {
+                    let result = literal_to_template(lit, prologue, ns)?;
+                    (result.term, result.dtc)
+                }
+                other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
+            };
+            let term = TemplateTripleTerm { s, p, o, dtc };
+            (TemplateTerm::TripleTerm(Box::new(term)), None)
+        }
         other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
     };
 
@@ -1616,6 +1607,14 @@ fn lower_triple_to_template(
         list_index: None, // Always None for SPARQL UPDATE
         graph: TemplateGraph::Default,
         graph_from_template_default: false,
+    })
+}
+
+/// True when `p` is `rdf:reifies`, whose object is a triple term.
+fn is_rdf_reifies(p: &PredicateTerm, prologue: &Prologue) -> Result<bool, LowerError> {
+    Ok(match p {
+        PredicateTerm::Iri(iri) => expand_iri(iri, prologue)? == fluree_vocab::rdf::REIFIES,
+        PredicateTerm::Var(_) => false,
     })
 }
 
@@ -1712,8 +1711,40 @@ fn lower_triple_to_delete_template_delete_where(
     vars: &mut VarRegistry,
     bnodes: &mut BlankNodeVarNamer,
 ) -> Result<TripleTemplate, LowerError> {
-    // Subject
-    let subject = match &triple.subject {
+    let subject = delete_where_subject_template(&triple.subject, prologue, ns, vars, bnodes)?;
+    let predicate = delete_where_predicate_template(&triple.predicate, prologue, ns, vars)?;
+    let (object, dtc) = match &triple.object {
+        Term::TripleTerm(tt) if is_rdf_reifies(&triple.predicate, prologue)? => {
+            let s = delete_where_subject_template(&tt.subject, prologue, ns, vars, bnodes)?;
+            let p = delete_where_predicate_template(&tt.predicate, prologue, ns, vars)?;
+            let (o, dtc) = delete_where_object_template(&tt.object, prologue, ns, vars, bnodes)?;
+            let term = TemplateTripleTerm { s, p, o, dtc };
+            (TemplateTerm::TripleTerm(Box::new(term)), None)
+        }
+        other => delete_where_object_template(other, prologue, ns, vars, bnodes)?,
+    };
+
+    Ok(TripleTemplate {
+        subject,
+        predicate,
+        object,
+        dtc,
+        list_index: None,
+        graph: TemplateGraph::Default,
+        graph_from_template_default: false,
+    })
+}
+
+/// A DELETE WHERE subject as a template term, a blank node lowered to the
+/// variable its WHERE side binds.
+fn delete_where_subject_template(
+    term: &SubjectTerm,
+    prologue: &Prologue,
+    ns: &mut NamespaceRegistry,
+    vars: &mut VarRegistry,
+    bnodes: &mut BlankNodeVarNamer,
+) -> Result<TemplateTerm, LowerError> {
+    Ok(match term {
         SubjectTerm::Var(v) => TemplateTerm::Var(vars.get_or_insert(&format!("?{}", v.name))),
         SubjectTerm::Iri(iri) => {
             let expanded = expand_iri(iri, prologue)?;
@@ -1746,19 +1777,33 @@ fn lower_triple_to_delete_template_delete_where(
                 span: tt.span,
             });
         }
-    };
+    })
+}
 
-    // Predicate
-    let predicate = match &triple.predicate {
+fn delete_where_predicate_template(
+    term: &PredicateTerm,
+    prologue: &Prologue,
+    ns: &mut NamespaceRegistry,
+    vars: &mut VarRegistry,
+) -> Result<TemplateTerm, LowerError> {
+    Ok(match term {
         PredicateTerm::Var(v) => TemplateTerm::Var(vars.get_or_insert(&format!("?{}", v.name))),
         PredicateTerm::Iri(iri) => {
             let expanded = expand_iri(iri, prologue)?;
             TemplateTerm::Sid(ns.sid_for_iri(&expanded))
         }
-    };
+    })
+}
 
-    // Object + datatype constraint (for literals)
-    let (object, dtc) = match &triple.object {
+/// A DELETE WHERE object as a template term and its datatype constraint.
+fn delete_where_object_template(
+    term: &Term,
+    prologue: &Prologue,
+    ns: &mut NamespaceRegistry,
+    vars: &mut VarRegistry,
+    bnodes: &mut BlankNodeVarNamer,
+) -> Result<(TemplateTerm, Option<DatatypeConstraint>), LowerError> {
+    Ok(match term {
         Term::Var(v) => (
             TemplateTerm::Var(vars.get_or_insert(&format!("?{}", v.name))),
             None,
@@ -1797,16 +1842,6 @@ fn lower_triple_to_delete_template_delete_where(
                 span: tt.span,
             });
         }
-    };
-
-    Ok(TripleTemplate {
-        subject,
-        predicate,
-        object,
-        dtc,
-        list_index: None,
-        graph: TemplateGraph::Default,
-        graph_from_template_default: false,
     })
 }
 

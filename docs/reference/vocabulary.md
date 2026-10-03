@@ -74,7 +74,7 @@ Commit subjects use the scheme `fluree:commit:<content-id>` (e.g. `fluree:commit
 
 ## Edge-annotation predicates (reserved)
 
-These seven predicates encode the edge that an [edge annotation](../concepts/edge-annotations.md) reifies. They are the durable, system-controlled representation behind the `@annotation` / `@reifies` (JSON-LD) and `{| ... |}` / `~` / `rdf:reifies` (SPARQL 1.2) surfaces. Together they form a *reifies bundle* on the annotation subject.
+Earlier releases stored the edge an [edge annotation](../concepts/edge-annotations.md) reifies as these seven predicates, a *reifies bundle* on the annotation subject. An annotation is now stored as its `rdf:reifies` link, `r rdf:reifies <<( s p o )>>`; ledgers written before that still hold bundles, which are read as their links.
 
 | Predicate | Full IRI | Datatype | Description |
 |-----------|----------|----------|-------------|
@@ -86,7 +86,7 @@ These seven predicates encode the edge that an [edge annotation](../concepts/edg
 | `f:reifiesLang` | `https://ns.flur.ee/db#reifiesLang` | `xsd:string` | BCP-47 language tag, present only when the object is a language-tagged string. **Optional.** |
 | `f:reifiesListIndex` | `https://ns.flur.ee/db#reifiesListIndex` | `xsd:int` | List-occurrence index. **Reserved/deferred** — always omitted in this release. |
 
-**These predicates are reserved.** User-authored mention of any `f:reifies*` IRI (compact or full form) is rejected on every transaction write surface (JSON-LD insert/upsert/update, SPARQL UPDATE, Turtle insert/upsert), and they are filtered out of variable-predicate (`?p`) scans and wildcard (`select: "*"`) hydration so they never surface as ordinary RDF. Mint and manage annotations only through `@annotation` / `@edge` (JSON-LD) or the annotation tail (`{| ... |}` / `~` / `rdf:reifies`) in SPARQL 1.2 and Turtle. Bulk `import` is the one administrative exception: it ingests already-lowered bundles without this firewall. See [Edge annotations](../concepts/edge-annotations.md) for the full surface and the [storage-internals design doc](../design/edge-annotations.md) for the bundle encoding and invariants.
+**These predicates are reserved.** User-authored mention of any `f:reifies*` IRI (compact or full form) is rejected on every transaction write surface (JSON-LD insert/upsert/update, SPARQL UPDATE, Turtle insert/upsert), and they are filtered out of variable-predicate (`?p`) scans and wildcard (`select: "*"`) hydration so they never surface as ordinary RDF. Mint and manage annotations only through `@annotation` / `@edge` (JSON-LD) or the annotation tail (`{| ... |}` / `~` / `rdf:reifies`) in SPARQL 1.2 and Turtle. Bulk `import` is the one exception: it reads bundles from an export written before links and stores each annotation's link instead. See [Edge annotations](../concepts/edge-annotations.md) for the full surface and the [storage-internals design doc](../design/edge-annotations.md) for the storage.
 
 ---
 

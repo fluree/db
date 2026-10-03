@@ -254,13 +254,37 @@ async fn sparql_insert_data_with_named_blank_reifier_round_trips() {
     assert_eq!(bindings[0]["since"]["value"].as_str(), Some("2024"));
 }
 
+/// The triples `ex:ann1` reifies, as `subject predicate object` local names.
+async fn ann1_triples(fluree: &MemoryFluree, ledger: &MemoryLedger) -> Vec<String> {
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        SELECT ?s ?p ?o WHERE { ex:ann1 rdf:reifies <<( ?s ?p ?o )>> } ORDER BY ?s ?p ?o
+    ";
+    let json = support::query_sparql(fluree, ledger, query)
+        .await
+        .expect("query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    let local = |v: &serde_json::Value| {
+        v["value"]
+            .as_str()
+            .and_then(|iri| iri.rsplit('/').next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| format!("{} {} {}", local(&b["s"]), local(&b["p"]), local(&b["o"])))
+        .collect()
+}
+
 #[tokio::test]
-async fn sparql_same_id_reifying_two_edges_in_one_txn_is_rejected() {
-    // Single-txn multi-target: one explicit `@id` reifying two edges
-    // that share a subject. The `f:reifiesSubject` slot dedupes (same
-    // subject) so a subject-flake *count* sees one — but the predicate
-    // and object slots diverge, so the net bundle is multi-target. The
-    // net-bundle decode catches it; a plain count would not.
+async fn sparql_same_id_reifying_two_edges_in_one_txn_names_both() {
+    // A reifier may reify several triples (RDF 1.2): one explicit id on two
+    // edges in one transaction links it to both.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/multi-target-one-txn");
     let update = r#"
@@ -271,25 +295,23 @@ async fn sparql_same_id_reifying_two_edges_in_one_txn_is_rejected() {
         }
     "#;
     let txn = lower_update(&ledger0, update);
-    let err = fluree
+    let ledger = fluree
         .stage_owned(ledger0)
         .txn(txn)
         .execute()
         .await
-        .expect_err("one annotation id reifying two edges in one txn must be rejected");
-    let msg = format!("{err:?} {err}");
-    assert!(
-        msg.contains("multi-target") || msg.contains("reify exactly one edge"),
-        "expected multi-target rejection, got: {msg}"
+        .expect("one annotation id on two edges")
+        .ledger;
+    assert_eq!(
+        ann1_triples(&fluree, &ledger).await,
+        ["alice knows bob", "alice worksFor acme"]
     );
 }
 
 #[tokio::test]
-async fn sparql_reattaching_id_to_different_edge_across_txns_is_rejected() {
-    // Cross-txn re-point with no retract: the prior attachment lives in
-    // snapshot/novelty, not in this txn's flake set, so a count over the
-    // current txn alone sees a single subject assert and passes. The
-    // net-bundle check folds the prior state in and rejects.
+async fn sparql_attaching_id_to_a_second_edge_across_txns_names_both() {
+    // Attaching an annotated id to a second edge in a later transaction, with
+    // no retract, adds a link; the first one stays.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/repoint-across-txn");
 
@@ -306,23 +328,21 @@ async fn sparql_reattaching_id_to_different_edge_across_txns_is_rejected() {
         .expect("first attach")
         .ledger;
 
-    let repoint = r#"
+    let second = r#"
         PREFIX ex: <http://example.org/>
         INSERT DATA { ex:carol ex:worksFor ex:dave ~ ex:ann1 {| ex:role "Manager" |} . }
     "#;
-    let t2 = lower_update(&ledger1, repoint);
-    let err = fluree
+    let t2 = lower_update(&ledger1, second);
+    let ledger2 = fluree
         .stage_owned(ledger1)
         .txn(t2)
         .execute()
         .await
-        .expect_err(
-            "re-pointing an annotation id to a different edge across txns must be rejected",
-        );
-    let msg = format!("{err:?} {err}");
-    assert!(
-        msg.contains("multi-target") || msg.contains("reify exactly one edge"),
-        "expected multi-target rejection, got: {msg}"
+        .expect("second attach")
+        .ledger;
+    assert_eq!(
+        ann1_triples(&fluree, &ledger2).await,
+        ["alice worksFor acme", "carol worksFor dave"]
     );
 }
 

@@ -1226,11 +1226,7 @@ async fn stage_commit_flakes(
 ) -> std::result::Result<fluree_db_ledger::StagedLedger, fluree_db_transact::TransactError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
-        .with_graph_sids(graph_sids)
-        // Push applies commits that were authored and written elsewhere, so
-        // authoring invariants are advisory here. See
-        // `StageOptions::replaying_commit`.
-        .replaying_commit();
+        .with_graph_sids(graph_sids);
     if let Some(policy_ctx) = policy_ctx.filter(|p| !p.wrapper().is_root()) {
         options = options.with_policy(policy_ctx);
     }

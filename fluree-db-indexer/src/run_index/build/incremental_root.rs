@@ -142,8 +142,8 @@ impl IncrementalRootBuilder {
 
     /// Update inline predicate SIDs.
     ///
-    /// Also OR-updates `has_annotations` whenever any of the seven
-    /// reserved `f:reifies*` predicate SIDs appears in the new dict.
+    /// Also OR-updates `has_annotations` whenever `rdf:reifies` or a
+    /// legacy `f:reifies*` predicate SID appears in the new dict.
     /// The full-rebuild path computes the same bit at root-assembly
     /// time, but the incremental path clones the old root and would
     /// otherwise carry forward `has_annotations: false` even when the
@@ -152,10 +152,7 @@ impl IncrementalRootBuilder {
     /// reindexes (predicate dicts only accumulate).
     pub fn set_predicate_sids(&mut self, sids: Vec<(u16, String)>) {
         let saw_reifies = sids.iter().any(|(ns, name)| {
-            fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(
-                *ns,
-                name.as_str(),
-            ))
+            fluree_db_core::is_annotation_predicate(&fluree_db_core::Sid::new(*ns, name.as_str()))
         });
         self.root.has_annotations |= saw_reifies;
         self.root.predicate_sids = sids;

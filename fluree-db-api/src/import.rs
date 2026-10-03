@@ -6951,10 +6951,7 @@ where
 
         // Sticky bit (computed before move into the struct literal).
         let import_has_annotations = predicate_sids_v6.iter().any(|(ns, name)| {
-            fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(
-                *ns,
-                name.as_str(),
-            ))
+            fluree_db_core::is_annotation_predicate(&fluree_db_core::Sid::new(*ns, name.as_str()))
         });
 
         let root_v6 = IndexRoot {

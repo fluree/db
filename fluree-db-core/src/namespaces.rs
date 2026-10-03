@@ -392,6 +392,13 @@ pub fn is_rdf_reifies(sid: &Sid) -> bool {
     sid.namespace_code == RDF && sid.name.as_ref() == fluree_vocab::rdf_names::REIFIES
 }
 
+/// True for a predicate whose presence marks a ledger as annotated: the
+/// `rdf:reifies` link, or a legacy `f:reifies*` bundle predicate.
+#[inline]
+pub fn is_annotation_predicate(sid: &Sid) -> bool {
+    is_rdf_reifies(sid) || is_reserved_reifies_predicate(sid)
+}
+
 /// True for the predicates wildcard scans hide from users: the seven
 /// `f:reifies*` bundle predicates and, while the RDF 1.2 link form is
 /// index-internal, `rdf:reifies`. Read-side only; the write firewall is

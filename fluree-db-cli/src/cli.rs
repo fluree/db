@@ -1084,12 +1084,9 @@ pub enum Commands {
         #[arg(long)]
         graph: Option<String>,
 
-        /// Emit edge annotations as raw `f:reifies*` system triples instead of
-        /// RDF 1.2 annotation syntax — the output of every release before 4.2.
-        ///
-        /// For consumers pinned to those bytes. Fluree's own write surfaces
-        /// reject hand-written `f:reifies*` triples, so this output only
-        /// re-imports through `fluree create --from`.
+        /// Write each edge annotation as its stored link,
+        /// `r rdf:reifies <<( s p o )>>`, instead of RDF 1.2 annotation syntax
+        /// on the base edge. JSON-LD keeps `@annotation`.
         #[arg(long)]
         raw_reifies: bool,
 

@@ -1256,7 +1256,7 @@ impl crate::Fluree {
     pub async fn has_annotations(&self, ledger_id: &str) -> Result<bool> {
         let handle = self.ledger_cached(ledger_id).await?;
         let ledger = handle.snapshot().await.to_ledger_state();
-        Ok(ledger.snapshot.has_annotations || ledger.novelty.attachments.has_annotations())
+        Ok(ledger.snapshot.has_annotations || ledger.novelty.has_annotations())
     }
 
     /// Cancel indexing, delete storage artifacts, purge nameservice record,
@@ -2227,7 +2227,7 @@ impl crate::Fluree {
         if indexer_config.attachment_events.is_none() {
             let ledger_has_annotations = ledger_state
                 .as_ref()
-                .map(|st| st.snapshot.has_annotations || st.novelty.attachments.has_annotations())
+                .map(|st| st.snapshot.has_annotations || st.novelty.has_annotations())
                 .unwrap_or(false);
             if ledger_has_annotations {
                 // Caller-supplied provider wins; fall back to the API's
