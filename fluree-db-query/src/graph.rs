@@ -222,6 +222,13 @@ impl GraphOperator {
             // (Subject/string dictionaries are store-global, so decoding
             // against the outer view is sound; when extraction DOES run in
             // the non-seeded UNION/OPTIONAL merge shape it is per inner row.)
+            // A predicate IRI bound in predicate position (`ex:s1 ?g ?o .
+            // GRAPH ?g { … }`).
+            Binding::EncodedPid { p_id } => ctx
+                .binary_store
+                .as_ref()?
+                .resolve_predicate_iri(*p_id)
+                .map(Arc::from),
             Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
                 let gv = ctx.graph_view()?;
                 match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
@@ -344,14 +351,20 @@ impl GraphOperator {
         // away at merge time. Join-equivalent by construction; strictly
         // narrows the inner scan. All other shapes rely on the merge-time
         // `{?g → graph}` join below.
+        //
+        // The seeding row's arena handles (big numbers, vectors) name values
+        // in the outer graph, and the rows leaving carry handles into this
+        // graph's arenas: each is decoded through its own graph on the way.
+        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        let mut row: Vec<Binding> = parent_batch
+            .row_view(row_idx)
+            .expect("row_idx must be valid for batch")
+            .to_vec();
+        crossing.enter(&mut row);
         let seed = match bind_graph_var {
             Some(var) if self.seed_graph_var && !parent_batch.schema().contains(&var) => {
                 let mut schema_vec = parent_batch.schema().to_vec();
                 schema_vec.push(var);
-                let mut row: Vec<Binding> = parent_batch
-                    .row_view(row_idx)
-                    .expect("row_idx must be valid for batch")
-                    .to_vec();
                 row.push(Binding::iri(graph_iri.clone()));
                 if stamp_ledger_id.is_some() {
                     row = crate::dataset_operator::stamp_seed_row(row, ctx);
@@ -360,17 +373,14 @@ impl GraphOperator {
             }
             // Across a ledger boundary the parent's raw `Sid`s are stamped in
             // the requester's ledger before seeding (see `stamp_seed_row`).
-            _ if stamp_ledger_id.is_some() => {
-                let row = parent_batch
-                    .row_view(row_idx)
-                    .expect("row_idx must be valid for batch")
-                    .to_vec();
-                SeedOperator::from_row(
-                    Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
-                    crate::dataset_operator::stamp_seed_row(row, ctx),
-                )
-            }
-            _ => SeedOperator::from_batch_row(parent_batch, row_idx),
+            _ if stamp_ledger_id.is_some() => SeedOperator::from_row(
+                Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
+                crate::dataset_operator::stamp_seed_row(row, ctx),
+            ),
+            _ => SeedOperator::from_row(
+                Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
+                row,
+            ),
         };
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
@@ -398,19 +408,6 @@ impl GraphOperator {
         // a legitimate correlated query with a typed 507.
         let mem_before_inner = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
-
-        // NumBig arena handles are scoped per (graph, predicate). When this
-        // GRAPH scope runs against a different g_id than the surrounding
-        // query, encoded NUM_BIG bindings escaping the scope would later be
-        // decoded against the OUTER graph's arena — silently producing wrong
-        // values. Materialize them here, against this graph's view, before
-        // they leave the scope. (Subject/string/predicate dictionaries are
-        // store-global, so all other encoded kinds escape safely.)
-        let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
-            graph_ctx.graph_view()
-        } else {
-            None
-        };
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
             graph_ctx.check_cancelled()?;
@@ -482,17 +479,7 @@ impl GraphOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
-                        let binding = if numbig_exit_gv.is_some()
-                            && crate::object_binding::is_numbig_encoded(&binding)
-                        {
-                            crate::group_aggregate::materialize_encoded(
-                                &binding,
-                                numbig_exit_gv.as_ref(),
-                            )
-                        } else {
-                            binding
-                        };
-                        merged_row.push(binding);
+                        merged_row.push(crossing.leave(binding));
                     }
                 }
 
@@ -561,6 +548,15 @@ impl GraphOperator {
             ));
         }
 
+        // The whole parent batch seeds the source undecoded: sound only
+        // because nothing crosses graphs here. This path runs without a
+        // dataset, where the source scope inherits the outer graph id, so the
+        // arena crossing is a no-op both ways.
+        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        debug_assert!(
+            crossing.is_noop(),
+            "batched R2RML GRAPH scope crosses graphs: {graph_iri}"
+        );
         let seed = BatchSeedOperator::from_batch(parent_batch.clone());
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
@@ -592,11 +588,10 @@ impl GraphOperator {
         let mem_before_inner = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
 
-        let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
-            graph_ctx.graph_view()
-        } else {
-            None
-        };
+        // As at the per-row exit, only the columns this scope binds leave
+        // through the crossing; the parent columns threaded through keep the
+        // outer graph's handles.
+        let parent_len = self.child.schema().len();
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
             graph_ctx.check_cancelled()?;
@@ -612,22 +607,16 @@ impl GraphOperator {
             // output variable of `self.schema` directly from it.
             for inner_row_idx in 0..batch.len() {
                 let mut merged_row = Vec::with_capacity(self.schema.len());
-                for var in self.schema.iter() {
+                for (i, var) in self.schema.iter().enumerate() {
                     let binding = batch
                         .get(inner_row_idx, *var)
                         .cloned()
                         .unwrap_or(Binding::Unbound);
-                    let binding = if numbig_exit_gv.is_some()
-                        && crate::object_binding::is_numbig_encoded(&binding)
-                    {
-                        crate::group_aggregate::materialize_encoded(
-                            &binding,
-                            numbig_exit_gv.as_ref(),
-                        )
-                    } else {
+                    merged_row.push(if i < parent_len {
                         binding
-                    };
-                    merged_row.push(binding);
+                    } else {
+                        crossing.leave(binding)
+                    });
                 }
                 self.result_buffer.push(merged_row);
             }

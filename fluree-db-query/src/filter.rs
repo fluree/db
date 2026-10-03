@@ -419,14 +419,17 @@ fn try_eval_simple_exists_semijoin(
     let Some(binding) = batch.get(row_idx, *subject_var) else {
         return Ok(Some(false));
     };
-    let Binding::Sid { sid, .. } = binding else {
-        // Only handle the common single-ledger SID binding here.
-        return Ok(None);
+    let s_id = match binding {
+        // The cache holds persisted subject ids, and with the cache built
+        // (no live novelty) an encoded subject carries one — the common
+        // case on an indexed ledger, so it must not drop to the per-row path.
+        Binding::EncodedSid { s_id, .. } => Some(*s_id),
+        Binding::Sid { sid, .. } => store
+            .find_subject_id_by_parts(sid.namespace_code, sid.name.as_ref())
+            .map_err(|e| crate::error::QueryError::Internal(format!("sid->s_id: {e}")))?,
+        // Anything else keeps the per-row correlated evaluation.
+        _ => return Ok(None),
     };
-
-    let s_id = store
-        .find_subject_id_by_parts(sid.namespace_code, sid.name.as_ref())
-        .map_err(|e| crate::error::QueryError::Internal(format!("sid->s_id: {e}")))?;
 
     let has_match = s_id.is_some_and(|id| subjects.contains(&id));
     Ok(Some(if negated { !has_match } else { has_match }))

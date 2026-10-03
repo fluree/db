@@ -1,11 +1,12 @@
 use crate::binding::Binding;
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::dict_novelty::{DictNovelty, StringDictNovelty, SubjectDictNovelty};
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_vocab::xsd_names;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 fn encoded_i_val(o_i: u32) -> i32 {
     if o_i == u32::MAX {
@@ -199,42 +200,30 @@ pub(crate) fn late_materialized_object_binding(
 /// match. Normalizing the decoded minority to encoded form keeps those
 /// surfaces hashing cheap raw IDs.
 ///
-/// Returns `None` when the binding is already encoded or has no encoded
-/// equivalent (value absent from the dictionaries, datatypes the scan keeps
-/// materialized). That is sound: late materialization runs only with an empty
-/// overlay, so a value outside the persisted dictionaries cannot equal any
-/// encoded binding.
+/// One IRI has one canonical form here, whichever form it arrives in: the
+/// scan encodes an IRI as `EncodedPid` in predicate position and as
+/// `EncodedSid` in subject or object position, and a decoded producer carries
+/// it as `Sid`/`Iri`. The canonical form is [`canonical_iri_id`]'s. Blank
+/// nodes follow the same rule: the index stores a blank node as a subject,
+/// so its decoded `Sid` resolves to the id its encoded form carries.
+///
+/// Returns `None` when the binding is already canonical or has no encoded
+/// equivalent: neither of [`TermDicts`]' dictionaries holds the value, or its
+/// datatype stays materialized on every lane. That is sound because every
+/// lane, a batched one with novelty pending included, assigns ids from those
+/// two dictionaries in the same order, so a value neither holds has no
+/// encoded form anywhere.
 ///
 /// The encoded identity fields are `(o_kind, o_key, dt_id, lang_id)` —
 /// `i_val`/`t`/`op` are metadata excluded from `PartialEq`/`Hash`, and `p_id`
 /// only participates for NUM_BIG (which this never produces).
-pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) -> Option<Binding> {
+pub(crate) fn encoded_equivalent(binding: &Binding, dicts: TermDicts<'_>) -> Option<Binding> {
     match binding {
-        Binding::Sid { sid, t, op } => {
-            // Blank nodes stay decoded on the scan path too.
-            if sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
-                return None;
-            }
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .ok()??;
-            Some(Binding::EncodedSid {
-                s_id,
-                t: *t,
-                op: *op,
-            })
+        Binding::Sid { t, op, .. } => Some(canonical_iri_id(binding, dicts)?.into_binding(*t, *op)),
+        Binding::Iri(_) | Binding::IriMatch { .. } => {
+            Some(canonical_iri_id(binding, dicts)?.into_binding(None, None))
         }
-        Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
-            let sid = store.encode_iri(iri.as_ref());
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .ok()??;
-            Some(Binding::EncodedSid {
-                s_id,
-                t: None,
-                op: None,
-            })
-        }
+        Binding::EncodedPid { .. } => encoded_iri_canonical(binding, dicts).flatten(),
         Binding::Lit {
             val,
             dtc,
@@ -244,8 +233,11 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
         } => {
             let (o_kind, o_key, dt_id, lang_id) = match (val, dtc) {
                 (FlakeValue::String(s), DatatypeConstraint::LangTag(tag)) => {
-                    let str_id = store.find_string_id(s).ok()??;
-                    let lang_id = store.find_lang_id(tag)?;
+                    let str_id = dicts.string_id(s)?;
+                    // A language tag first seen in novelty never reaches an
+                    // encoded binding (the overlay keeps it raw), so the
+                    // persisted table is the whole of this lookup.
+                    let lang_id = dicts.store.find_lang_id(tag)?;
                     (
                         ObjKind::LEX_ID.as_u8(),
                         u64::from(str_id),
@@ -263,12 +255,12 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
                     } else {
                         return None;
                     };
-                    let str_id = store.find_string_id(s).ok()??;
+                    let str_id = dicts.string_id(s)?;
                     (ObjKind::LEX_ID.as_u8(), u64::from(str_id), dt_id, 0)
                 }
                 // JSON shares the string dictionary, keyed by its serialized text.
                 (FlakeValue::Json(s), _) => {
-                    let str_id = store.find_string_id(s).ok()??;
+                    let str_id = dicts.string_id(s)?;
                     (
                         ObjKind::JSON_ID.as_u8(),
                         u64::from(str_id),
@@ -350,52 +342,334 @@ pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) ->
     }
 }
 
+/// One store's term dictionaries as a query reads them: the persisted index
+/// and the novelty dictionary layered over it.
+///
+/// Every id a query binds comes from these two, and every lane resolves a
+/// term through them in one order, the persisted dictionary first, so a term
+/// has one id whichever lane met it. That includes the batched lanes, which
+/// bind a term minted since the last index by its novelty id while a plain
+/// scan, with novelty pending, decodes the same term: an equality surface
+/// that resolved decoded terms through the persisted dictionary alone would
+/// key the two apart. The batched lanes' key lookups and every equality
+/// surface resolve a decoded term through this; the scan's overlay
+/// translation keeps the same order on its own path.
+#[derive(Clone, Copy)]
+pub(crate) struct TermDicts<'a> {
+    store: &'a BinaryIndexStore,
+    /// Present only when initialized and non-empty, so a query with nothing
+    /// pending never probes it.
+    novel_subjects: Option<&'a SubjectDictNovelty>,
+    novel_strings: Option<&'a StringDictNovelty>,
+    /// Per persisted predicate, whether its IRI is a subject minted in
+    /// novelty, each found on the predicate's first key for the holder's
+    /// lifetime ([`EqualityNorm`]) instead of a novelty probe per key.
+    /// `None`: probe per key.
+    novel_predicate_subjects: Option<&'a NovelPredicateSubjects>,
+}
+
+/// [`TermDicts`]' per-predicate memo of novelty subject ids: one slot per
+/// persisted predicate, allocated on the first predicate key that needs it
+/// and filled one predicate at a time, so a query probes the novelty
+/// dictionary once per predicate it meets, never once per predicate the
+/// index holds.
+#[derive(Default)]
+pub(crate) struct NovelPredicateSubjects(OnceLock<Box<[std::sync::atomic::AtomicU64]>>);
+
+impl NovelPredicateSubjects {
+    /// A slot not yet resolved.
+    const UNRESOLVED: u64 = u64::MAX;
+    /// A predicate whose IRI is no novelty subject.
+    const NONE: u64 = u64::MAX - 1;
+
+    fn get(
+        &self,
+        store: &BinaryIndexStore,
+        subjects: &SubjectDictNovelty,
+        p_id: u32,
+    ) -> Option<u64> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let slots = self.0.get_or_init(|| {
+            (0..store.p_sid_table().len())
+                .map(|_| AtomicU64::new(Self::UNRESOLVED))
+                .collect()
+        });
+        let slot = slots.get(p_id as usize)?;
+        match slot.load(Ordering::Relaxed) {
+            Self::NONE => None,
+            Self::UNRESOLVED => {
+                let sid = &store.p_sid_table()[p_id as usize];
+                let found = subjects.find_subject(sid.namespace_code, &sid.name);
+                match found {
+                    None => slot.store(Self::NONE, Ordering::Relaxed),
+                    // A subject id sits below both sentinels; one that does
+                    // not is answered unmemoized.
+                    Some(s_id) if s_id < Self::NONE => slot.store(s_id, Ordering::Relaxed),
+                    Some(_) => {}
+                }
+                found
+            }
+            s_id => Some(s_id),
+        }
+    }
+}
+
+impl<'a> TermDicts<'a> {
+    pub(crate) fn new(store: &'a BinaryIndexStore, novelty: Option<&'a DictNovelty>) -> Self {
+        let (subjects, strings) = novelty_layers(novelty);
+        Self::from_layers(store, novelty, subjects, strings)
+    }
+
+    /// With which novelty layers hold entries already known
+    /// ([`novelty_layers`]), so a caller that builds this per row does not
+    /// walk the layer chain each time.
+    #[inline]
+    fn from_layers(
+        store: &'a BinaryIndexStore,
+        novelty: Option<&'a DictNovelty>,
+        subjects: bool,
+        strings: bool,
+    ) -> Self {
+        Self {
+            store,
+            novel_subjects: novelty.filter(|_| subjects).map(|dn| &dn.subjects),
+            novel_strings: novelty.filter(|_| strings).map(|dn| &dn.strings),
+            novel_predicate_subjects: None,
+        }
+    }
+
+    /// The execution context's dictionaries, for the lanes that resolve terms
+    /// to ids. Equality surfaces use [`EqualityNorm`], which also declines
+    /// cross-ledger execution.
+    pub(crate) fn of(ctx: &'a crate::context::ExecutionContext<'_>) -> Option<Self> {
+        Some(Self::new(
+            ctx.binary_store.as_deref()?,
+            ctx.dict_novelty.as_deref(),
+        ))
+    }
+
+    /// The dictionaries a novelty-aware graph view resolves through.
+    pub(crate) fn of_view(view: &'a fluree_db_binary_index::BinaryGraphView) -> Self {
+        Self::new(view.store(), view.dict_novelty().map(|dn| &**dn))
+    }
+
+    /// The subject id of `(ns_code, name)`: the persisted dictionary's, else
+    /// the novelty dictionary's.
+    #[inline]
+    pub(crate) fn subject_id(&self, ns_code: u16, name: &str) -> std::io::Result<Option<u64>> {
+        if let Some(s_id) = self.store.find_subject_id_by_parts(ns_code, name)? {
+            return Ok(Some(s_id));
+        }
+        Ok(self.novel_subject_id(ns_code, name))
+    }
+
+    #[inline]
+    fn novel_subject_id(&self, ns_code: u16, name: &str) -> Option<u64> {
+        self.novel_subjects?.find_subject(ns_code, name)
+    }
+
+    /// The string-dictionary id of `value`, persisted first, then novelty.
+    /// `None` also when the dictionary cannot be read.
+    #[inline]
+    fn string_id(&self, value: &str) -> Option<u32> {
+        match self.store.find_string_id(value) {
+            Ok(Some(str_id)) => Some(str_id),
+            Ok(None) => self.novel_strings?.find_string(value),
+            Err(_) => None,
+        }
+    }
+
+    /// [`IriId`] of persisted predicate `p_id`'s IRI.
+    #[inline]
+    fn predicate_iri_id(&self, p_id: u32) -> IriId {
+        if let Some(s_id) = self.store.predicate_subject_id(p_id) {
+            return IriId::Subject(s_id);
+        }
+        // A predicate IRI first used as a subject or ref object since the
+        // last index has a novelty subject id.
+        if let Some(subjects) = self.novel_subjects {
+            let novel = match self.novel_predicate_subjects {
+                Some(memo) => memo.get(self.store, subjects, p_id),
+                None => self
+                    .store
+                    .p_sid_table()
+                    .get(p_id as usize)
+                    .and_then(|sid| subjects.find_subject(sid.namespace_code, &sid.name)),
+            };
+            if let Some(s_id) = novel {
+                return IriId::Subject(s_id);
+            }
+        }
+        IriId::Predicate(p_id)
+    }
+
+    /// [`IriId`] of a decoded IRI. The predicate table answers first: an IRI
+    /// outside every predicate's namespace, or of a name length no predicate
+    /// there has, is rejected without hashing, and a predicate then costs a
+    /// load instead of a subject-dictionary lookup. A predicate's subject id,
+    /// when it has one, still wins ([`Self::predicate_iri_id`]).
+    #[inline]
+    fn decoded_iri_id(&self, sid: &Sid) -> Option<IriId> {
+        if let Some(p_id) = self.store.predicate_id_for_sid(sid) {
+            return Some(self.predicate_iri_id(p_id));
+        }
+        match self
+            .store
+            .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+        {
+            Ok(Some(s_id)) => Some(IriId::Subject(s_id)),
+            _ => self
+                .novel_subject_id(sid.namespace_code, &sid.name)
+                .map(IriId::Subject),
+        }
+    }
+}
+
+/// Whether an initialized novelty dictionary holds subjects, and strings.
+fn novelty_layers(novelty: Option<&DictNovelty>) -> (bool, bool) {
+    match novelty.filter(|dn| dn.is_initialized()) {
+        Some(dn) => (!dn.subjects.is_empty(), !dn.strings.is_empty()),
+        None => (false, false),
+    }
+}
+
+/// The id an IRI canonically keys by in one store: its subject id when the
+/// IRI has one, persisted or novelty, else its persisted predicate id.
+///
+/// The scan encodes one IRI as `EncodedPid` where a pattern reaches it as a
+/// predicate and as `EncodedSid` where it is a subject or object, and decoded
+/// producers (VALUES, BIND, scans with novelty pending) carry it as
+/// `Sid`/`Iri`. Every equality surface that keys IRIs by id goes through
+/// this, so the forms of one IRI key alike and no surface carries its own
+/// copy of the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IriId {
+    Subject(u64),
+    Predicate(u32),
+}
+
+impl IriId {
+    #[inline]
+    fn into_binding(self, t: Option<i64>, op: Option<bool>) -> Binding {
+        match self {
+            IriId::Subject(s_id) => Binding::EncodedSid { s_id, t, op },
+            IriId::Predicate(p_id) => Binding::EncodedPid { p_id },
+        }
+    }
+}
+
+/// The canonical form of an encoded IRI, without the decoded arms of
+/// [`encoded_equivalent`]: `Some(Some(b))` replaces the binding with `b`,
+/// `Some(None)` keeps it, `None` when the binding is not an encoded IRI. The
+/// keyed surfaces ask this first, so an all-`EncodedSid` key returns at once
+/// and an `EncodedPid` key costs the store's per-predicate load.
+#[inline]
+pub(crate) fn encoded_iri_canonical(
+    binding: &Binding,
+    dicts: TermDicts<'_>,
+) -> Option<Option<Binding>> {
+    match binding {
+        Binding::EncodedSid { .. } => Some(None),
+        // Canonical already unless its IRI is also a subject.
+        Binding::EncodedPid { p_id } => Some(match dicts.predicate_iri_id(*p_id) {
+            id @ IriId::Subject(_) => Some(id.into_binding(None, None)),
+            IriId::Predicate(_) => None,
+        }),
+        _ => None,
+    }
+}
+
+/// [`IriId`] of an IRI-valued binding; `None` for any other binding, for an
+/// IRI no dictionary holds, or when the subject dictionary cannot be read.
+/// A blank node resolves like any other subject.
+#[inline]
+pub(crate) fn canonical_iri_id(binding: &Binding, dicts: TermDicts<'_>) -> Option<IriId> {
+    match binding {
+        Binding::EncodedSid { s_id, .. } => Some(IriId::Subject(*s_id)),
+        Binding::EncodedPid { p_id } => Some(dicts.predicate_iri_id(*p_id)),
+        Binding::Sid { sid, .. } => dicts.decoded_iri_id(sid),
+        Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
+            dicts.decoded_iri_id(&dicts.store.encode_iri(iri.as_ref()))
+        }
+        _ => None,
+    }
+}
+
 fn is_xsd(dt: &Sid, name: &str) -> bool {
     dt.namespace_code == fluree_vocab::namespaces::XSD && dt.name.as_ref() == name
 }
 
-/// Store handle for representation normalization at equality surfaces.
+/// Store, novelty dictionary and graph view for representation
+/// normalization at equality surfaces (DISTINCT, GROUP BY, MINUS, OPTIONAL,
+/// semijoin, subquery keys). The dictionaries ([`TermDicts`]) give a decoded
+/// binding its encoded form; the graph view decodes arena-backed NUM_BIG
+/// values to their canonical numeric form.
 ///
 /// Present only for single-ledger binary execution — the only mode that
 /// emits encoded bindings, and the only mode where one store's dictionaries
-/// are authoritative for every row.
-pub(crate) fn equality_norm_store(
-    ctx: &crate::context::ExecutionContext<'_>,
-) -> Option<Arc<BinaryIndexStore>> {
-    if ctx.is_multi_ledger() {
-        return None;
-    }
-    ctx.binary_store.clone()
-}
-
-/// Store + graph view for representation normalization at equality surfaces
-/// (DISTINCT, GROUP BY, MINUS, semijoin, subquery keys). The store encodes
-/// decoded bindings to their dictionary form; the graph view decodes
-/// arena-backed NUM_BIG values to their canonical numeric form.
+/// are authoritative for every row. Build it once per operator: the graph
+/// view is not free to construct.
 pub(crate) struct EqualityNorm {
     store: Arc<BinaryIndexStore>,
+    novelty: Option<Arc<DictNovelty>>,
+    /// Which novelty layers hold entries ([`novelty_layers`]), read once.
+    novel_subjects: bool,
+    novel_strings: bool,
+    /// See [`TermDicts`]'s field of the same name.
+    novel_predicate_subjects: NovelPredicateSubjects,
     gv: Option<fluree_db_binary_index::BinaryGraphView>,
 }
 
 impl EqualityNorm {
+    #[inline]
+    pub(crate) fn dicts(&self) -> TermDicts<'_> {
+        TermDicts {
+            novel_predicate_subjects: Some(&self.novel_predicate_subjects),
+            ..TermDicts::from_layers(
+                &self.store,
+                self.novelty.as_deref(),
+                self.novel_subjects,
+                self.novel_strings,
+            )
+        }
+    }
+
     pub(crate) fn parts(
         norm: &Option<Self>,
     ) -> (
-        Option<&BinaryIndexStore>,
+        Option<TermDicts<'_>>,
         Option<&fluree_db_binary_index::BinaryGraphView>,
     ) {
         match norm {
-            Some(n) => (Some(&n.store), n.gv.as_ref()),
+            Some(n) => (Some(n.dicts()), n.gv.as_ref()),
             None => (None, None),
         }
     }
 }
 
+/// The dictionaries equality surfaces normalize through, when single-ledger
+/// binary execution applies (see [`EqualityNorm`]).
+pub(crate) fn equality_dicts<'a>(
+    ctx: &'a crate::context::ExecutionContext<'_>,
+) -> Option<TermDicts<'a>> {
+    if ctx.is_multi_ledger() {
+        return None;
+    }
+    TermDicts::of(ctx)
+}
+
 /// Build an [`EqualityNorm`] when single-ledger binary execution applies.
 pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Option<EqualityNorm> {
-    let store = equality_norm_store(ctx)?;
+    if ctx.is_multi_ledger() {
+        return None;
+    }
+    let (novel_subjects, novel_strings) = novelty_layers(ctx.dict_novelty.as_deref());
     Some(EqualityNorm {
-        store,
+        store: ctx.binary_store.clone()?,
+        novelty: ctx.dict_novelty.clone(),
+        novel_subjects,
+        novel_strings,
+        novel_predicate_subjects: NovelPredicateSubjects::default(),
         gv: ctx.graph_view(),
     })
 }
@@ -403,10 +677,10 @@ pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Optio
 /// Normalize one binding for use in an equality/hash key.
 pub(crate) fn normalize_for_key(
     binding: &Binding,
-    store: Option<&BinaryIndexStore>,
+    dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
 ) -> Binding {
-    normalize_for_key_cow(binding, store, gv).into_owned()
+    normalize_for_key_cow(binding, dicts, gv).into_owned()
 }
 
 /// [`normalize_for_key`] without the clone: an already-encoded binding (the
@@ -415,10 +689,27 @@ pub(crate) fn normalize_for_key(
 /// copying it and only materializes the key for rows it actually keeps.
 pub(crate) fn normalize_for_key_cow<'a>(
     binding: &'a Binding,
-    store: Option<&BinaryIndexStore>,
+    dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
 ) -> std::borrow::Cow<'a, Binding> {
     use std::borrow::Cow;
+    // An encoded subject id is its own canonical key: the commonest key pays
+    // nothing else.
+    if let Binding::EncodedSid { .. } = binding {
+        return Cow::Borrowed(binding);
+    }
+    // A key over an arena handle with no view to decode it would key by a
+    // graph-scoped handle; member scans of a union of graphs decode them.
+    debug_assert!(
+        gv.is_some() || !is_arena_encoded(binding),
+        "arena-backed literal keyed with no graph view: {binding:?}"
+    );
+    if let Some(canonical) = dicts.and_then(|d| encoded_iri_canonical(binding, d)) {
+        return match canonical {
+            Some(b) => Cow::Owned(b),
+            None => Cow::Borrowed(binding),
+        };
+    }
     // Arena-keyed NUM_BIG values normalize by DECODING: handles are scoped
     // per (graph, predicate), so the encoded form is not a canonical key for
     // one value across predicates or against decoded rows (VALUES, BIND,
@@ -433,10 +724,143 @@ pub(crate) fn normalize_for_key_cow<'a>(
         }
         return Cow::Borrowed(binding);
     }
-    match store.and_then(|s| encoded_equivalent(binding, s)) {
+    match dicts.and_then(|d| encoded_equivalent(binding, d)) {
         Some(encoded) => Cow::Owned(encoded),
         None => Cow::Borrowed(binding),
     }
+}
+
+/// Whether two bindings are one RDF term, across the forms one term takes:
+/// encoded or decoded, and an IRI as `EncodedPid` (reached as a predicate) or
+/// `EncodedSid` (a subject or object). `Binding`'s `PartialEq` compares forms
+/// structurally and answers `false` across them.
+///
+/// Equal bindings answer at once, and two bindings of one form other than
+/// NUM_BIG literals (whose encoded key is scoped per predicate) are two terms;
+/// only a pair of different forms pays for canonicalization, through the same
+/// [`normalize_for_key_cow`] the keyed equality surfaces use. `norm` is the
+/// caller's, built once ([`equality_norm`]).
+///
+/// The commonest mixed pair, an encoded subject against a decoded one (a
+/// batched lane's row against a scan with novelty pending), compares by
+/// decoding the encoded side instead: the graph view memoizes that per
+/// subject, where encoding the decoded side costs a dictionary lookup each
+/// time.
+///
+/// An arena-backed literal (a big number or a vector) is only comparable
+/// through a graph view: its handle names a value within one graph, so with
+/// none this refuses rather than answer either way. Member scans of a union
+/// of graphs bind those literals decoded, so no query reaches that refusal.
+pub(crate) fn same_term(
+    a: &Binding,
+    b: &Binding,
+    norm: &Option<EqualityNorm>,
+) -> crate::error::Result<bool> {
+    let gv = norm.as_ref().and_then(|n| n.gv.as_ref());
+    if gv.is_none() && (is_arena_encoded(a) || is_arena_encoded(b)) {
+        return Err(undecodable_arena_literal(a, b));
+    }
+    Ok(match one_form_answer(a, b) {
+        Some(same) => same,
+        None => {
+            if let Some(same) = gv.and_then(|gv| encoded_against_decoded_subject(a, b, gv)) {
+                return Ok(same);
+            }
+            let (dicts, gv) = EqualityNorm::parts(norm);
+            normalize_for_key_cow(a, dicts, gv) == normalize_for_key_cow(b, dicts, gv)
+        }
+    })
+}
+
+/// The refusal [`same_term`] answers an arena-backed literal with when no
+/// graph view can decode it.
+#[cold]
+fn undecodable_arena_literal(a: &Binding, b: &Binding) -> crate::error::QueryError {
+    debug_assert!(
+        false,
+        "arena-backed literal compared with no graph view: {a:?} vs {b:?}"
+    );
+    crate::error::QueryError::Internal(format!(
+        "cannot compare an arena-backed literal without a graph view to decode it: \
+         {a:?} vs {b:?}"
+    ))
+}
+
+/// [`same_term`] for an `EncodedSid` against a decoded `Sid`, through the
+/// view's decode (the one a scan binds the decoded form with). `None` for any
+/// other pair, or when the id cannot be decoded.
+#[inline]
+fn encoded_against_decoded_subject(
+    a: &Binding,
+    b: &Binding,
+    gv: &fluree_db_binary_index::BinaryGraphView,
+) -> Option<bool> {
+    let (s_id, sid) = match (a, b) {
+        (Binding::EncodedSid { s_id, .. }, Binding::Sid { sid, .. })
+        | (Binding::Sid { sid, .. }, Binding::EncodedSid { s_id, .. }) => (*s_id, sid),
+        _ => return None,
+    };
+    gv.resolve_subject_sid(s_id)
+        .ok()
+        .map(|decoded| decoded == *sid)
+}
+
+/// [`same_term`] for a caller that holds only the context, such as an inline
+/// BIND: a pair that needs no canonicalization answers at once, an IRI or
+/// dictionary literal canonicalizes through the context's dictionaries, and
+/// an arena-backed literal builds the context's normalization to decode it.
+pub(crate) fn same_term_in(
+    a: &Binding,
+    b: &Binding,
+    ctx: Option<&crate::context::ExecutionContext<'_>>,
+) -> crate::error::Result<bool> {
+    if is_arena_encoded(a) || is_arena_encoded(b) {
+        return same_term(a, b, &ctx.and_then(equality_norm));
+    }
+    Ok(match one_form_answer(a, b) {
+        Some(same) => same,
+        None => {
+            let dicts = ctx.and_then(equality_dicts);
+            normalize_for_key_cow(a, dicts, None) == normalize_for_key_cow(b, dicts, None)
+        }
+    })
+}
+
+/// The answer [`same_term`] gives without canonicalizing: `true` for equal
+/// bindings, `false` for two of one form (other than NUM_BIG), `None` for a
+/// pair of forms that must be canonicalized to compare.
+#[inline]
+fn one_form_answer(a: &Binding, b: &Binding) -> Option<bool> {
+    if a == b {
+        return Some(true);
+    }
+    if std::mem::discriminant(a) == std::mem::discriminant(b) && !is_numbig_encoded(a) {
+        return Some(false);
+    }
+    None
+}
+
+/// True if this is an encoded literal whose key is a handle into a per-graph,
+/// per-predicate arena (a big number or a vector): the handle names a value
+/// only within the graph that bound it.
+#[inline]
+pub(crate) fn is_arena_encoded(binding: &Binding) -> bool {
+    matches!(
+        binding,
+        Binding::EncodedLit { o_kind, .. }
+            if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
+                || *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8()
+    )
+}
+
+/// True if a stored object of `o_type` late-materializes as an arena handle
+/// ([`is_arena_encoded`]), decided before any binding is built.
+#[inline]
+pub(crate) fn is_arena_o_type(o_type: u16) -> bool {
+    matches!(
+        OType::from_u16(o_type).decode_kind(),
+        DecodeKind::NumBigArena | DecodeKind::VectorArena
+    )
 }
 
 /// True if this is an arena-backed (NUM_BIG) encoded literal.
@@ -446,6 +870,70 @@ pub(crate) fn is_numbig_encoded(binding: &Binding) -> bool {
         Binding::EncodedLit { o_kind, .. }
             if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
     )
+}
+
+/// What an arena-backed literal needs to cross between a context and a scope
+/// that reads another graph (a GRAPH scope): a handle names its value only
+/// within the graph that bound it, so one crossing in either direction is
+/// decoded through that graph. Nothing is decoded when both sides read the
+/// same single graph, where a handle means the same value on either side.
+pub(crate) struct ArenaCrossing {
+    /// The outer graph: decodes the handles the seeding row carries in.
+    enter: Option<fluree_db_binary_index::BinaryGraphView>,
+    /// The scope's graph: decodes the handles its rows carry out.
+    leave: Option<fluree_db_binary_index::BinaryGraphView>,
+}
+
+impl ArenaCrossing {
+    /// The crossing between `outer` and a `scope` derived from it. An outer
+    /// context that spans several graphs (a union) has no graph to decode a
+    /// handle through, so everything leaving the scope for it is decoded.
+    pub(crate) fn between(
+        outer: &crate::context::ExecutionContext<'_>,
+        scope: &crate::context::ExecutionContext<'_>,
+    ) -> Self {
+        let same_graph = outer.has_binary_store()
+            && scope.has_binary_store()
+            && outer.binary_g_id == scope.binary_g_id;
+        if same_graph {
+            return Self {
+                enter: None,
+                leave: None,
+            };
+        }
+        Self {
+            enter: outer.graph_view(),
+            leave: scope.graph_view(),
+        }
+    }
+
+    /// Nothing crosses that needs decoding: both sides read one single graph,
+    /// or neither has a graph to decode through.
+    pub(crate) fn is_noop(&self) -> bool {
+        self.enter.is_none() && self.leave.is_none()
+    }
+
+    /// Decode, through the outer graph, the arena handles in a row that seeds
+    /// the scope.
+    pub(crate) fn enter(&self, row: &mut [Binding]) {
+        let Some(gv) = self.enter.as_ref() else {
+            return;
+        };
+        for binding in row.iter_mut().filter(|b| is_arena_encoded(b)) {
+            *binding = crate::group_aggregate::materialize_encoded(binding, Some(gv));
+        }
+    }
+
+    /// `binding`, bound inside the scope, decoded through the scope's graph
+    /// when it is an arena handle.
+    pub(crate) fn leave(&self, binding: Binding) -> Binding {
+        match &self.leave {
+            Some(gv) if is_arena_encoded(&binding) => {
+                crate::group_aggregate::materialize_encoded(&binding, Some(gv))
+            }
+            _ => binding,
+        }
+    }
 }
 
 /// Build a materialized object binding for the binary scan path.

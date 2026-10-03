@@ -53,7 +53,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryIndexStore;
 use rustc_hash::FxHashMap;
 
 use fluree_db_core::{ObjectBounds, StatsView};
@@ -68,6 +67,7 @@ use crate::group_aggregate::{
 };
 use crate::ir::triple::TriplePattern;
 use crate::join::NestedLoopJoinOperator;
+use crate::object_binding::{canonical_iri_id, IriId, TermDicts};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -557,33 +557,35 @@ enum JoinKeyClass {
 
 /// Classify a binding's join key, normalising refs to a `u64` s_id when a store is
 /// available. Unbound → wildcard; Poisoned → dead (drop); everything else → keyed.
+///
+/// IRIs key by [`canonical_iri_id`], the rule every equality surface shares: an
+/// IRI the scan reached as a predicate (`EncodedPid`) keys by its subject id when
+/// it is also a subject, so it joins the same IRI met as a subject or object.
 fn join_key(
     binding: &Binding,
-    store: Option<&BinaryIndexStore>,
+    dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
 ) -> JoinKeyClass {
-    let keyed_ref_or_group = |sid: &fluree_db_core::Sid| {
-        store
-            .and_then(|s| {
-                s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                    .ok()
-                    .flatten()
-            })
-            .map(JoinKey::Ref)
-            .unwrap_or_else(|| JoinKey::Other(binding_to_group_key_owned(binding)))
-    };
     match binding {
         Binding::EncodedSid { s_id, .. } => JoinKeyClass::Keyed(JoinKey::Ref(*s_id)),
-        Binding::Sid { sid, .. } => JoinKeyClass::Keyed(keyed_ref_or_group(sid)),
-        Binding::IriMatch { primary_sid, .. } => {
-            JoinKeyClass::Keyed(keyed_ref_or_group(primary_sid))
-        }
         Binding::Unbound => JoinKeyClass::Wildcard,
         Binding::Poisoned => JoinKeyClass::Dead,
+        Binding::Sid { .. }
+        | Binding::IriMatch { .. }
+        | Binding::Iri(_)
+        | Binding::EncodedPid { .. } => {
+            JoinKeyClass::Keyed(match dicts.and_then(|d| canonical_iri_id(binding, d)) {
+                Some(IriId::Subject(s_id)) => JoinKey::Ref(s_id),
+                Some(IriId::Predicate(p_id)) => {
+                    JoinKey::Other(binding_to_group_key_owned(&Binding::EncodedPid { p_id }))
+                }
+                None => JoinKey::Other(binding_to_group_key_owned(binding)),
+            })
+        }
         // Normalize decoded literals to their encoded form so they key
         // identically to late-materialized scan output.
         other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_normalized(
-            other, store, gv,
+            other, dicts, gv,
         ))),
     }
 }
@@ -711,7 +713,7 @@ impl HashJoinOperator {
         ctx: &ExecutionContext<'_>,
         mut build: BoxedOperator,
     ) -> Result<()> {
-        let store = ctx.binary_store.as_deref();
+        let dicts = TermDicts::of(ctx);
         let gv = ctx.graph_view();
         let ncols = self.build_schema.len();
         build.open(ctx).await?;
@@ -732,7 +734,7 @@ impl HashJoinOperator {
                     .collect();
                 match join_key(
                     batch.get_by_col(row, self.build_key_col),
-                    store,
+                    dicts,
                     gv.as_ref(),
                 ) {
                     JoinKeyClass::Keyed(key) => self.table.entry(key).or_default().push(row_vals),
@@ -820,7 +822,7 @@ impl Operator for HashJoinOperator {
         if let Some(fallback) = self.fallback.as_mut() {
             return fallback.next_batch(ctx).await;
         }
-        let store = ctx.binary_store.as_deref();
+        let dicts = TermDicts::of(ctx);
         let gv = ctx.graph_view();
         let ncols = self.full_schema.len();
         let build_cols = self.build_schema.len();
@@ -858,7 +860,7 @@ impl Operator for HashJoinOperator {
                 // The probe scan always binds the join var, so a non-keyed probe row
                 // (unbound/poisoned) cannot match — skip it.
                 let JoinKeyClass::Keyed(key) =
-                    join_key(pb.get_by_col(row, self.probe_key_col), store, gv.as_ref())
+                    join_key(pb.get_by_col(row, self.probe_key_col), dicts, gv.as_ref())
                 else {
                     continue;
                 };
@@ -933,7 +935,7 @@ impl Operator for HashJoinOperator {
         if let Some(fallback) = self.fallback.as_mut() {
             return fallback.drain_count(ctx).await;
         }
-        let store = ctx.binary_store.as_deref();
+        let dicts = TermDicts::of(ctx);
         let gv = ctx.graph_view();
         let probe = self.probe.as_mut().expect("hash join probe");
         let mut count: u64 = 0;
@@ -943,7 +945,7 @@ impl Operator for HashJoinOperator {
                     for row in 0..batch.len() {
                         let JoinKeyClass::Keyed(key) = join_key(
                             batch.get_by_col(row, self.probe_key_col),
-                            store,
+                            dicts,
                             gv.as_ref(),
                         ) else {
                             continue;

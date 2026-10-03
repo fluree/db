@@ -15,7 +15,10 @@ use crate::fast_path_common::{
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
+use crate::object_binding::{
+    equality_norm, is_arena_encoded, late_materialized_object_binding, materialized_object_binding,
+    same_term, EqualityNorm, TermDicts,
+};
 use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{
@@ -27,7 +30,9 @@ use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::clock::Instant;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
+use fluree_db_core::{
+    DatatypeDictId, GraphId, IndexType, ObjKind, ObjectBounds, Sid, BATCHED_JOIN_SIZE,
+};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -66,11 +71,11 @@ impl GroupedCountDrain {
             &self.output_columns
         };
         self.key.0.clear();
-        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
+        let dicts = self.graph_view.as_ref().map(TermDicts::of_view);
         self.key.0.extend(columns.iter().map(|&col| {
             binding_to_group_key_normalized(
                 batch.get_by_col(row, col),
-                store,
+                dicts,
                 self.graph_view.as_ref(),
             )
         }));
@@ -412,6 +417,261 @@ pub struct UnifyInstruction {
     pub right_col: usize,
 }
 
+/// What [`substitute_binding`] did with one correlated value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Substitution {
+    /// The slot now holds the value.
+    Bound,
+    /// The slot stays a variable: the value constrains nothing (unbound or
+    /// poisoned — callers screen poisoned rows first), or it is an encoded
+    /// value the context cannot decode (see [`CorrelationView`]). A caller
+    /// must then correlate the slot by term equality on the scan's output.
+    Free,
+    /// No triple holds this value in this slot: a literal as a subject or
+    /// predicate, or a value that is not an RDF term (a list, map, path,
+    /// relationship or grouped value). The slot stays a variable.
+    Unmatchable,
+}
+
+/// What a correlated scan decodes a row's encoded values through.
+pub(crate) enum CorrelationView {
+    /// The active graph's view: every encoded value decodes.
+    Graph(BinaryGraphView),
+    /// The ledger's store, for a dataset of several of its graphs, where no
+    /// graph view exists while each graph's scan still binds encoded values.
+    /// What a ledger shares across its graphs decodes — subject, predicate
+    /// and string-dictionary ids, and inline literals; an arena-backed
+    /// literal handle (NUM_BIG, vector) names a value only within its own
+    /// graph and does not.
+    Ledger(BinaryGraphView),
+}
+
+impl CorrelationView {
+    /// `None` only without a store or across ledgers, where no scan binds an
+    /// encoded value.
+    pub(crate) fn of(ctx: &ExecutionContext<'_>) -> Option<Self> {
+        if let Some(gv) = ctx.graph_view() {
+            return Some(Self::Graph(gv));
+        }
+        if ctx.is_multi_ledger() {
+            return None;
+        }
+        let store = ctx.binary_store.as_ref()?;
+        Some(Self::Ledger(
+            store
+                .graph_with_novelty(ctx.binary_g_id, ctx.dict_novelty.clone())
+                .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
+                .with_tracker(ctx.tracker.clone()),
+        ))
+    }
+
+    fn view(&self) -> &BinaryGraphView {
+        match self {
+            Self::Graph(gv) | Self::Ledger(gv) => gv,
+        }
+    }
+
+    /// The view an encoded literal of `o_kind` decodes through, if any.
+    fn literal_view(&self, o_kind: u8) -> Option<&BinaryGraphView> {
+        match self {
+            Self::Graph(gv) => Some(gv),
+            Self::Ledger(_)
+                if o_kind == ObjKind::NUM_BIG.as_u8() || o_kind == ObjKind::VECTOR_ID.as_u8() =>
+            {
+                None
+            }
+            Self::Ledger(gv) => Some(gv),
+        }
+    }
+}
+
+/// Substitute one correlated left-row value into `pattern`'s `position`.
+///
+/// The one place a row's value becomes a scan constant, for every correlated
+/// scan — the nested-loop join's right side and OPTIONAL's per-row lookup —
+/// so a value binds the same way whichever operator carries the correlation
+/// and whichever form the row holds it in. Encoded (late-materialized) ids
+/// decode through `view` (novelty-aware), into any position: an IRI that one
+/// pattern reaches as a predicate (`EncodedPid`) is a subject or object to
+/// another, and the reverse. A value it cannot decode stays free
+/// ([`Substitution::Free`]) for the caller to correlate by term equality;
+/// left free and uncorrelated it would match every row of the slot.
+///
+/// Literals keep the join's term rule: a string binding pushes its datatype or
+/// language tag down with its value; numeric and other values push the value
+/// alone, so they still match across numeric subtypes.
+pub(crate) fn substitute_binding(
+    pattern: &mut TriplePattern,
+    position: PatternPosition,
+    binding: &Binding,
+    view: Option<&CorrelationView>,
+) -> Result<Substitution> {
+    let gv = view.map(CorrelationView::view);
+    let resolve_subject = |gv: &BinaryGraphView, s_id: u64| -> Result<Arc<str>> {
+        let iri = gv.resolve_subject_iri(s_id).map_err(|e| {
+            tracing::debug!(s_id, error = %e, "failed to resolve encoded subject binding");
+            QueryError::dictionary_lookup(format!(
+                "correlated binding: resolve subject IRI for s_id={s_id}: {e}"
+            ))
+        })?;
+        Ok(Arc::from(iri))
+    };
+    let resolve_predicate =
+        |gv: &BinaryGraphView, p_id: u32| gv.store().resolve_predicate_iri(p_id).map(Arc::from);
+
+    match position {
+        PatternPosition::Subject | PatternPosition::Predicate => {
+            let value = match binding {
+                Binding::Sid { sid, .. } => Ref::Sid(sid.clone()),
+                Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
+                    // Ref::Iri so the scan can encode it for each target ledger
+                    Ref::Iri(iri.clone())
+                }
+                Binding::EncodedSid { s_id, .. } => match gv {
+                    Some(gv) => Ref::Iri(resolve_subject(gv, *s_id)?),
+                    None => return Ok(Substitution::Free),
+                },
+                Binding::EncodedPid { p_id } => {
+                    match gv.and_then(|gv| resolve_predicate(gv, *p_id)) {
+                        Some(iri) => Ref::Iri(iri),
+                        None => return Ok(Substitution::Free),
+                    }
+                }
+                Binding::Unbound | Binding::Poisoned => return Ok(Substitution::Free),
+                Binding::Lit { .. }
+                | Binding::EncodedLit { .. }
+                | Binding::Grouped(_)
+                | Binding::Path { .. }
+                | Binding::Rel(_)
+                | Binding::List(_)
+                | Binding::Map(_) => return Ok(Substitution::Unmatchable),
+            };
+            if position == PatternPosition::Subject {
+                pattern.s = value;
+            } else {
+                pattern.p = value;
+            }
+        }
+        PatternPosition::Object => match binding {
+            Binding::Sid { sid, .. } => {
+                pattern.o = Term::Sid(sid.clone());
+            }
+            Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
+                // Term::Iri so the scan can encode it for each target ledger
+                pattern.o = Term::Iri(iri.clone());
+            }
+            Binding::Lit { val, dtc, .. } => {
+                pattern.o = Term::Value(val.clone());
+                // A string binding is one RDF term: `"bob"`, `"bob"@en`,
+                // `"bob"^^xsd:anyURI` and `"bob"^^ex:custom` share a
+                // dictionary key and must not probe each other's rows.
+                // Numeric/other constraints are left off so cross-subtype
+                // matching stays as before.
+                if crate::binding::is_string_dict_term(binding) {
+                    pattern.dtc = Some(dtc.clone());
+                }
+            }
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                ..
+            } => {
+                // Decode the encoded literal (novelty-aware via BinaryGraphView).
+                // Must use decode_value_from_kind with the correct (o_kind, dt_id,
+                // lang_id) — dt_id is a DatatypeDictId, NOT an o_type. p_id is
+                // needed for NUM_BIG per-predicate arena lookup.
+                let Some(gv) = view.and_then(|v| v.literal_view(*o_kind)) else {
+                    return Ok(Substitution::Free);
+                };
+                let val = gv
+                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                    .map_err(|e| {
+                        tracing::debug!(
+                            o_kind,
+                            o_key,
+                            p_id,
+                            dt_id,
+                            lang_id,
+                            error = %e,
+                            "failed to decode encoded object binding"
+                        );
+                        QueryError::dictionary_lookup(format!(
+                            "correlated object binding decode: o_kind={o_kind}, o_key={o_key}, \
+                             p_id={p_id}, dt_id={dt_id}, lang_id={lang_id}: {e}"
+                        ))
+                    })?;
+                pattern.o = Term::Value(val);
+                // Same term-identity rule as the `Lit` arm: a string binding
+                // probes only rows with its exact tag / datatype.
+                //
+                // Read straight off the encoded triple: the datatype id already
+                // names the datatype, so this needs no `OTypeRegistry` (a
+                // 15-element `Vec`, and `decode_value_from_kind` above builds
+                // one already). Only the three reserved string-dictionary ids
+                // can appear here — `late_materialized_object_binding` keeps
+                // every other string datatype materialized, so those reach the
+                // `Lit` arm above instead.
+                let dt = DatatypeDictId::from_u16(*dt_id);
+                let dtc = if !crate::binding::is_string_dict_term(binding) {
+                    None
+                } else if dt == DatatypeDictId::LANG_STRING {
+                    gv.store()
+                        .lang_tag_for_id(*lang_id)
+                        .map(|tag| fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag)))
+                } else {
+                    let sid = crate::eval::rdf::reserved_datatype_sid(dt);
+                    // Unreachable fallback by the argument above: only the three
+                    // reserved ids can appear on an encoded string-dict binding,
+                    // and the two non-langString ones both have well-known Sids.
+                    // Loud when a future widening of the encoded set forgets
+                    // this probe site.
+                    debug_assert!(
+                        sid.is_some(),
+                        "encoded string-dict binding carries non-reserved \
+                         dt_id {dt_id}; late_materialized_object_binding \
+                         keeps those datatypes materialized"
+                    );
+                    sid.or_else(|| gv.store().dt_sids().get(*dt_id as usize).cloned())
+                        .map(fluree_db_core::DatatypeConstraint::Explicit)
+                };
+                if dtc.is_some() {
+                    pattern.dtc = dtc;
+                }
+            }
+            Binding::EncodedSid { s_id, .. } => match gv {
+                Some(gv) => pattern.o = Term::Iri(resolve_subject(gv, *s_id)?),
+                None => return Ok(Substitution::Free),
+            },
+            Binding::EncodedPid { p_id } => match gv.and_then(|gv| resolve_predicate(gv, *p_id)) {
+                // An encoded predicate IRI as an object IRI.
+                Some(iri) => pattern.o = Term::Iri(iri),
+                None => return Ok(Substitution::Free),
+            },
+            Binding::Unbound | Binding::Poisoned => return Ok(Substitution::Free),
+            Binding::Grouped(_) => {
+                // Grouped bindings shouldn't appear in join codepaths
+                debug_assert!(false, "Grouped binding in correlated substitution");
+                return Ok(Substitution::Unmatchable);
+            }
+            Binding::Path { .. } => {
+                // A path value is never a join key.
+                debug_assert!(false, "Path binding in correlated substitution");
+                return Ok(Substitution::Unmatchable);
+            }
+            // A list/map/relationship value can legitimately flow through a
+            // subquery boundary (e.g. `WITH collect(x) AS l`,
+            // `relationships(p)`). None is a valid triple term.
+            Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+                return Ok(Substitution::Unmatchable);
+            }
+        },
+    }
+    Ok(Substitution::Bound)
+}
+
 /// Identifies the source of a left row in `pending_output`.
 #[derive(Debug, Clone)]
 enum BatchRef {
@@ -559,8 +819,8 @@ pub struct NestedLoopJoinOperator {
     combined_schema: Arc<[VarId]>,
     /// Instructions for binding left values into right pattern
     bind_instructions: Vec<BindInstruction>,
-    /// Instructions for unification checks on shared vars
-    unify_instructions: Vec<UnifyInstruction>,
+    /// Term normalization for [`Self::unify_check`], built at open.
+    norm: Option<EqualityNorm>,
     /// Current state
     state: OperatorState,
     /// Current left batch being processed
@@ -792,55 +1052,6 @@ impl NestedLoopJoinOperator {
             &right_scan_inline_ops,
         );
 
-        // Build unify instructions for shared vars
-        //
-        // Variables that are in both left schema and right pattern need unification
-        // UNLESS they are fully substituted into the pattern. However, substitution
-        // depends on runtime binding types:
-        // - Subject/Predicate: Only Sid bindings are substituted
-        // - Object: Sid and Lit bindings are substituted
-        //
-        // We compute right_col based on right_output_vars (which excludes vars
-        // expected to be substituted). At runtime, if substitution doesn't happen
-        // (e.g., Lit at Subject position), the var remains in the right scan output
-        // but at a different position than expected - this is handled by skipping
-        // unification for such edge cases.
-        //
-        // Collect vars that WILL be substituted (based on position)
-        // For Object position, we assume substitution will happen (Sid/Lit)
-        // For Subject/Predicate, substitution requires Sid which we can't verify
-        // at construction time, so we don't create unify instructions for these
-        // positions when the var is in left schema (they have bind_instructions)
-        let bound_vars: std::collections::HashSet<VarId> = bind_instructions
-            .iter()
-            .filter_map(|instr| match instr.position {
-                PatternPosition::Subject => right_pattern.s.as_var(),
-                PatternPosition::Predicate => right_pattern.p.as_var(),
-                PatternPosition::Object => right_pattern.o.as_var(),
-            })
-            .collect();
-
-        let mut unify_instructions = Vec::new();
-        for var in right_pattern.produced_vars() {
-            // Skip vars that have bind_instructions - they will be substituted
-            // (or if not substituted due to binding type, the row is handled
-            // by the scan returning no results or the substitution leaving the var)
-            if bound_vars.contains(&var) {
-                continue;
-            }
-
-            if let Some(&left_col) = left_var_positions.get(&var) {
-                // This var is shared but NOT bound - find its position in right output
-                // Right output schema only includes non-bound vars
-                if let Some(right_idx) = right_output_vars.iter().position(|v| *v == var) {
-                    unify_instructions.push(UnifyInstruction {
-                        left_col,
-                        right_col: right_idx,
-                    });
-                }
-            }
-        }
-
         let has_bounds = object_bounds.is_some();
 
         let batched_eligible = is_batched_eligible(&bind_instructions, &right_pattern);
@@ -883,7 +1094,7 @@ impl NestedLoopJoinOperator {
             right_new_vars: right_output_vars,
             combined_schema,
             bind_instructions,
-            unify_instructions,
+            norm: None,
             state: OperatorState::Created,
             current_left_batch: None,
             current_left_row: 0,
@@ -971,269 +1182,71 @@ impl NestedLoopJoinOperator {
         })
     }
 
-    /// Substitute left row bindings into right pattern.
-    ///
-    /// Uses a novelty-aware `BinaryGraphView` for encoded binding resolution
-    /// so that novelty-only subject/string IDs resolve correctly.
+    /// Substitute left row bindings into right pattern, through
+    /// [`substitute_binding`]. `None` when no triple can match the row: a
+    /// correlated value that can never fill its slot. A value substitution
+    /// leaves free is correlated by [`Self::unify_check`].
     fn substitute_pattern_with_store(
         &self,
         left_batch: &Batch,
         left_row: usize,
-        gv: Option<&BinaryGraphView>,
-    ) -> Result<TriplePattern> {
+        view: Option<&CorrelationView>,
+    ) -> Result<Option<TriplePattern>> {
         let mut pattern = self.right_pattern.clone();
-
         for instr in &self.bind_instructions {
             let binding = left_batch.get_by_col(left_row, instr.left_col);
-
-            match instr.position {
-                PatternPosition::Subject => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.s = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Ref::Iri so scan can encode for each target ledger
-                            pattern.s = Ref::Iri(iri.clone());
-                        }
-                        Binding::EncodedSid { s_id, .. } => {
-                            // Resolve encoded s_id to IRI (novelty-aware via BinaryGraphView)
-                            if let Some(gv) = gv {
-                                let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
-                                    tracing::debug!(
-                                        s_id,
-                                        error = %e,
-                                        "join failed to resolve encoded subject binding"
-                                    );
-                                    QueryError::dictionary_lookup(format!(
-                                        "join subject binding: resolve subject IRI for s_id={s_id}: {e}"
-                                    ))
-                                })?;
-                                pattern.s = Ref::Iri(Arc::from(iri));
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::EncodedPid { p_id } => {
-                            // Predicates are IRIs; allow using an encoded predicate as a subject.
-                            if let Some(gv) = gv {
-                                if let Some(iri) = gv.store().resolve_predicate_iri(*p_id) {
-                                    pattern.s = Ref::Iri(Arc::from(iri));
-                                }
-                            }
-                            // Otherwise leave as variable
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
-                }
-                PatternPosition::Predicate => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.p = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Term::Iri so scan can encode for each target ledger
-                            pattern.p = Ref::Iri(iri.clone());
-                        }
-                        Binding::EncodedSid { s_id, .. } => {
-                            // Allow cross-position reuse: an IRI bound as a subject/object can
-                            // be used to bind a predicate position. Resolve via subject dict.
-                            if let Some(gv) = gv {
-                                let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
-                                    tracing::debug!(
-                                        s_id,
-                                        error = %e,
-                                        "join failed to resolve encoded predicate binding via subject dictionary"
-                                    );
-                                    QueryError::dictionary_lookup(format!(
-                                        "join predicate binding via subject lookup: s_id={s_id}: {e}"
-                                    ))
-                                })?;
-                                pattern.p = Ref::Iri(Arc::from(iri));
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::EncodedPid { p_id } => {
-                            // Resolve encoded p_id to IRI
-                            if let Some(gv) = gv {
-                                if let Some(iri) = gv.store().resolve_predicate_iri(*p_id) {
-                                    pattern.p = Ref::Iri(Arc::from(iri));
-                                }
-                            }
-                            // Otherwise leave as variable
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
-                }
-                PatternPosition::Object => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.o = Term::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Term::Iri so scan can encode for each target ledger
-                            pattern.o = Term::Iri(iri.clone());
-                        }
-                        Binding::Lit { val, dtc, .. } => {
-                            pattern.o = Term::Value(val.clone());
-                            // A string binding is one RDF term: `"bob"`,
-                            // `"bob"@en`, `"bob"^^xsd:anyURI` and
-                            // `"bob"^^ex:custom` share a dictionary key and
-                            // must not probe each other's rows. Numeric/other
-                            // constraints are left off so cross-subtype
-                            // matching stays as before.
-                            if crate::binding::is_string_dict_term(binding) {
-                                pattern.dtc = Some(dtc.clone());
-                            }
-                        }
-                        Binding::EncodedLit {
-                            o_kind,
-                            o_key,
-                            p_id,
-                            dt_id,
-                            lang_id,
-                            ..
-                        } => {
-                            // Decode encoded literal (novelty-aware via BinaryGraphView).
-                            // Must use decode_value_from_kind with the correct (o_kind, dt_id, lang_id)
-                            // — dt_id is a DatatypeDictId, NOT an o_type. p_id is needed for
-                            // NUM_BIG per-predicate arena lookup.
-                            if let Some(gv) = gv {
-                                let val = gv
-                                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
-                                    .map_err(|e| {
-                                        tracing::debug!(
-                                            o_kind,
-                                            o_key,
-                                            p_id,
-                                            dt_id,
-                                            lang_id,
-                                            error = %e,
-                                            "join failed to decode encoded object binding"
-                                        );
-                                        QueryError::dictionary_lookup(format!(
-                                            "join object binding decode: o_kind={o_kind}, o_key={o_key}, p_id={p_id}, dt_id={dt_id}, lang_id={lang_id}: {e}"
-                                        ))
-                                    })?;
-                                pattern.o = Term::Value(val);
-                                // Same term-identity rule as the `Lit` arm:
-                                // a string binding probes only rows with its
-                                // exact tag / datatype.
-                                //
-                                // Read straight off the encoded triple: the
-                                // datatype id already names the datatype, so
-                                // this needs no `OTypeRegistry` (a 15-element
-                                // `Vec`, and `decode_value_from_kind` above
-                                // builds one already). Only the three reserved
-                                // string-dictionary ids can appear here —
-                                // `late_materialized_object_binding` keeps
-                                // every other string datatype materialized, so
-                                // those reach the `Lit` arm above instead.
-                                let dt = DatatypeDictId::from_u16(*dt_id);
-                                let dtc = if !crate::binding::is_string_dict_term(binding) {
-                                    None
-                                } else if dt == DatatypeDictId::LANG_STRING {
-                                    gv.store().lang_tag_for_id(*lang_id).map(|tag| {
-                                        fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag))
-                                    })
-                                } else {
-                                    let sid = crate::eval::rdf::reserved_datatype_sid(dt);
-                                    // Unreachable fallback by the argument
-                                    // above: only the three reserved ids can
-                                    // appear on an encoded string-dict
-                                    // binding, and the two non-langString
-                                    // ones both have well-known Sids. Loud
-                                    // when a future widening of the encoded
-                                    // set forgets this probe site.
-                                    debug_assert!(
-                                        sid.is_some(),
-                                        "encoded string-dict binding carries non-reserved \
-                                         dt_id {dt_id}; late_materialized_object_binding \
-                                         keeps those datatypes materialized"
-                                    );
-                                    sid.or_else(|| {
-                                        gv.store().dt_sids().get(*dt_id as usize).cloned()
-                                    })
-                                    .map(fluree_db_core::DatatypeConstraint::Explicit)
-                                };
-                                if dtc.is_some() {
-                                    pattern.dtc = dtc;
-                                }
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::EncodedSid { s_id, .. } => {
-                            // Resolve encoded s_id to IRI (novelty-aware)
-                            if let Some(gv) = gv {
-                                let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
-                                    tracing::debug!(
-                                        s_id,
-                                        error = %e,
-                                        "join failed to resolve encoded object subject binding"
-                                    );
-                                    QueryError::dictionary_lookup(format!(
-                                        "join object subject lookup: s_id={s_id}: {e}"
-                                    ))
-                                })?;
-                                pattern.o = Term::Iri(Arc::from(iri));
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::EncodedPid { p_id } => {
-                            // Allow using an encoded predicate IRI as an object IRI.
-                            if let Some(gv) = gv {
-                                if let Some(iri) = gv.store().resolve_predicate_iri(*p_id) {
-                                    pattern.o = Term::Iri(Arc::from(iri));
-                                }
-                            }
-                            // Otherwise leave as variable
-                        }
-                        Binding::Unbound | Binding::Poisoned => {
-                            // Leave as variable (Poisoned vars from OPTIONAL also remain unbound)
-                        }
-                        Binding::Grouped(_) => {
-                            // Grouped bindings shouldn't appear in join codepaths
-                            debug_assert!(false, "Grouped binding in join bind");
-                            // Leave as variable
-                        }
-                        Binding::Path { .. } => {
-                            // A path value is never a join key — leave as variable.
-                            debug_assert!(false, "Path binding in join bind");
-                        }
-                        // A list/map/relationship value can legitimately flow
-                        // through a subquery boundary (e.g. `WITH collect(x) AS l`,
-                        // `relationships(p)`). None is a valid triple term, so leave
-                        // the slot as a variable (no match) rather than asserting.
-                        Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {}
-                    }
-                }
+            if substitute_binding(&mut pattern, instr.position, binding, view)?
+                == Substitution::Unmatchable
+            {
+                return Ok(None);
             }
         }
-
-        Ok(pattern)
+        Ok(Some(pattern))
     }
 
-    /// Check if left row bindings match right row bindings for shared vars
-    ///
-    /// Returns true if all shared vars have equal values on both sides.
-    ///
-    /// Uses `eq_for_join()` for same-ledger SID optimization when comparing
-    /// `IriMatch` bindings from the same ledger.
+    /// `(left column, right column)` of each variable a right batch binds
+    /// that the left row also carries. Substitution makes a correlated slot a
+    /// constant, so its variable is absent from the right batch; one present
+    /// is a slot substitution left free — an unbound left value, or one it
+    /// could not decode. Usually empty.
+    fn shared_columns(&self, right_schema: &[VarId]) -> Vec<(usize, usize)> {
+        right_schema
+            .iter()
+            .enumerate()
+            .filter_map(|(right_col, var)| {
+                let left_col = self.left_schema.iter().position(|v| v == var)?;
+                Some((left_col, right_col))
+            })
+            .collect()
+    }
+
+    /// Whether a right row agrees with its left row on every variable both
+    /// bind ([`Self::shared_columns`]): one RDF term, whichever form each side
+    /// carries it in. An unbound left value constrains nothing —
+    /// `combine_rows` takes the right side's.
     fn unify_check(
         &self,
         left_batch: &Batch,
         left_row: usize,
         right_batch: &Batch,
         right_row: usize,
-    ) -> bool {
-        self.unify_instructions.iter().all(|instr| {
-            let left_val = left_batch.get_by_col(left_row, instr.left_col);
-            let right_val = right_batch.get_by_col(right_row, instr.right_col);
-            left_val.eq_for_join(right_val)
-        })
+        shared: &[(usize, usize)],
+    ) -> Result<bool> {
+        for &(left_col, right_col) in shared {
+            let left_val = left_batch.get_by_col(left_row, left_col);
+            if left_val.is_unbound_or_poisoned() {
+                continue;
+            }
+            let right_val = right_batch.get_by_col(right_row, right_col);
+            // An arena handle is never compared structurally here: across
+            // graphs equal handles can name different values.
+            let same = (!is_arena_encoded(left_val) && left_val.eq_for_join(right_val))
+                || same_term(left_val, right_val, &self.norm)?;
+            if !same {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Combine left row with right row into output row
@@ -1338,6 +1351,7 @@ impl Operator for NestedLoopJoinOperator {
 
         // Open left operator
         self.left.open(ctx).await?;
+        self.norm = equality_norm(ctx);
 
         // Reset state for fresh execution
         self.pending_output.clear();
@@ -1365,7 +1379,6 @@ impl Operator for NestedLoopJoinOperator {
                 .bind_instructions
                 .iter()
                 .any(|b| b.position == PatternPosition::Object),
-            unify_instructions = self.unify_instructions.len(),
             has_object_bounds = self.object_bounds.is_some(),
             right_subject_is_var = matches!(&self.right_pattern.s, Ref::Var(_)),
             right_predicate_is_fixed = self.right_pattern.p.is_sid(),
@@ -1444,9 +1457,9 @@ impl Operator for NestedLoopJoinOperator {
             self.logged_runtime_mode = true;
         }
 
-        // Cache novelty-aware graph view once for the entire next_batch call
-        // (avoids repeated Arc::clone + construction per-row).
-        let cached_gv = ctx.graph_view();
+        // Built once for the whole next_batch call (avoids repeated Arc::clone
+        // + construction per row).
+        let cached_view = CorrelationView::of(ctx);
 
         // Process until we have output or exhaust input
         loop {
@@ -1554,28 +1567,17 @@ impl Operator for NestedLoopJoinOperator {
 
                 let resolved: Option<u64> = {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
-                    let store = ctx.binary_store.as_deref();
-                    // Persisted reverse dict first, then DictNovelty: a subject
-                    // minted after the last index resolves to a novelty s_id —
-                    // the same id space the overlay ops are translated into —
-                    // so novelty-only left subjects stay on the batched lane
-                    // (the merge injects their facts) instead of each paying a
-                    // per-row fallback scan.
+                    // A subject minted after the last index resolves to a
+                    // novelty s_id — the same id space the overlay ops are
+                    // translated into — so novelty-only left subjects stay on
+                    // the batched lane (the merge injects their facts) instead
+                    // of each paying a per-row fallback scan. The dictionaries
+                    // are read only for a decoded subject.
                     let resolve_subject = |sid: &Sid| -> Option<u64> {
-                        store
-                            .and_then(|s| {
-                                s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                                    .ok()
-                                    .flatten()
-                            })
-                            .or_else(|| {
-                                ctx.dict_novelty
-                                    .as_ref()
-                                    .filter(|dn| dn.is_initialized())
-                                    .and_then(|dn| {
-                                        dn.subjects.find_subject(sid.namespace_code, &sid.name)
-                                    })
-                            })
+                        TermDicts::of(ctx)?
+                            .subject_id(sid.namespace_code, &sid.name)
+                            .ok()
+                            .flatten()
                     };
                     match left_batch.get_by_col(left_row, left_col) {
                         Binding::EncodedSid { s_id, .. } => Some(*s_id),
@@ -1604,11 +1606,14 @@ impl Operator for NestedLoopJoinOperator {
                     let batch_idx = self.ensure_current_batch_stored();
                     let batch_ref = BatchRef::Stored(batch_idx);
                     let left_batch = self.stored_left_batches.last().unwrap();
-                    let bound_pattern = self.substitute_pattern_with_store(
+                    let Some(bound_pattern) = self.substitute_pattern_with_store(
                         left_batch,
                         left_row,
-                        cached_gv.as_ref(),
-                    )?;
+                        cached_view.as_ref(),
+                    )?
+                    else {
+                        continue;
+                    };
                     let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
                     let mut right_scan = make_right_scan(
                         bound_pattern,
@@ -1629,8 +1634,11 @@ impl Operator for NestedLoopJoinOperator {
                 let batch_idx = self.ensure_current_batch_stored();
                 let batch_ref = BatchRef::Stored(batch_idx);
                 let left_batch = self.stored_left_batches.last().unwrap();
-                let bound_pattern =
-                    self.substitute_pattern_with_store(left_batch, left_row, cached_gv.as_ref())?;
+                let Some(bound_pattern) =
+                    self.substitute_pattern_with_store(left_batch, left_row, cached_view.as_ref())?
+                else {
+                    continue;
+                };
                 let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
                 let mut right_scan = make_right_scan(
                     bound_pattern,
@@ -1817,6 +1825,7 @@ impl NestedLoopJoinOperator {
             let (batch_ref, left_row, right_batch) = self.pending_output.front().unwrap();
             let left_row = *left_row;
             let right_batch_len = right_batch.len();
+            let shared = self.shared_columns(right_batch.schema());
 
             let left_batch = match self.resolve_left_batch(batch_ref) {
                 Some(b) => b,
@@ -1831,7 +1840,7 @@ impl NestedLoopJoinOperator {
             let mut right_row = self.pending_right_row;
             while right_row < right_batch_len && rows_added < batch_size {
                 // Unification check: shared vars must match
-                if self.unify_check(left_batch, left_row, right_batch, right_row) {
+                if self.unify_check(left_batch, left_row, right_batch, right_row, &shared)? {
                     // Combine and add to output
                     let mut combined =
                         self.combine_rows(left_batch, left_row, right_batch, right_row);
@@ -2690,11 +2699,7 @@ impl NestedLoopJoinOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
     ) -> Result<()> {
-        use fluree_db_binary_index::format::run_record_v2::{
-            cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
-        };
         use fluree_db_binary_index::RunSortOrder;
-        use fluree_db_core::o_type::OType;
 
         if self.batched_accumulator.is_empty() {
             return Ok(());
@@ -2738,14 +2743,6 @@ impl NestedLoopJoinOperator {
         let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); self.batched_accumulator.len()];
         let mut matched_rows: u64 = 0;
 
-        // Batched object join (leaf-level): scan each relevant OPST leaf at most once.
-        //
-        // We build a set of leaf indices that contain any of our object IDs, then scan
-        // those leaves. This avoids re-opening and re-decoding leaflets once per object
-        // (which is the dominant cost in `BinaryCursor`-per-object approaches).
-        let iri_ref = OType::IRI_REF.as_u16();
-        let cmp = cmp_v2_for_order(RunSortOrder::Opst);
-
         let mut objs: Vec<u64> = o_to_accum.keys().copied().collect();
         objs.sort_unstable();
         objs.dedup();
@@ -2753,245 +2750,26 @@ impl NestedLoopJoinOperator {
             self.clear_batched_state();
             return Ok(());
         }
+        let accums: Vec<&[usize]> = objs.iter().map(|o| o_to_accum[o].as_slice()).collect();
 
-        // Collect leaf indices for all object keys.
-        let mut leaf_indices: Vec<usize> = Vec::new();
-        for &o_s_id in &objs {
-            let min_key = RunRecordV2 {
-                s_id: SubjectId(0),
-                o_key: o_s_id,
-                p_id,
-                t: 0,
-                o_i: 0,
-                o_type: iri_ref,
-                g_id: ctx.binary_g_id,
-            };
-            let max_key = RunRecordV2 {
-                s_id: SubjectId(u64::MAX),
-                o_key: o_s_id,
-                p_id,
-                t: u32::MAX,
-                o_i: u32::MAX,
-                o_type: iri_ref,
-                g_id: ctx.binary_g_id,
-            };
-            let r = branch.find_leaves_in_range(&min_key, &max_key, cmp);
-            leaf_indices.extend(r);
-        }
-        leaf_indices.sort_unstable();
-        leaf_indices.dedup();
-
-        let need_replay = ctx.to_t < store.max_t();
-        let replay_to = need_replay.then_some(ctx.to_t);
-        let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
-        for leaf_idx in leaf_indices {
-            ctx.check_cancelled()?;
-            let leaf_entry = &branch.leaves[leaf_idx];
-            let leaf = prepare_leaf_for_scan(&store, leaf_entry, need_replay)?;
-
-            for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
-                ctx.check_cancelled()?;
-                let needs_history_replay =
-                    need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
-                if entry.row_count == 0 && !needs_history_replay {
-                    continue;
-                }
-                if entry.p_const.is_some() && entry.p_const != Some(p_id) {
-                    continue;
-                }
-                if entry.o_type_const.is_some() && entry.o_type_const != Some(iri_ref) {
-                    continue;
-                }
-
-                // Quick reject based on leaflet key range.
-                let first = read_ordered_key_v2(RunSortOrder::Opst, &entry.first_key);
-                let last = read_ordered_key_v2(RunSortOrder::Opst, &entry.last_key);
-                let first_o = first.o_key;
-                let last_o = last.o_key;
-                if last_o < objs[0] || first_o > *objs.last().unwrap() {
-                    continue;
-                }
-                // If no object keys fall within [first_o, last_o], skip.
-                let start = objs.partition_point(|&x| x < first_o);
-                let end = objs.partition_point(|&x| x <= last_o);
-                if start >= end {
-                    continue;
-                }
-
-                // We only need core identity columns for this join, but for
-                // historical snapshots we also need `T` so `replay_leaflet_at_t`
-                // can detect base rows that postdate `to_t`. The overlay merge
-                // additionally needs `OI`: CORE lacks it, and a fate check
-                // reading `o_i` as a default would mis-reconcile retracts on
-                // multi-entry (`@list`) refs in BOTH cache configurations.
-                use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
-                let proj = if need_replay {
-                    ColumnProjection::all()
-                } else if probe_ops.is_some() {
-                    ColumnProjection {
-                        output: ColumnSet::CORE.union(ColumnSet::single(
-                            fluree_db_binary_index::format::column_block::ColumnId::OI,
-                        )),
-                        internal: ColumnSet::EMPTY,
-                    }
-                } else {
-                    ColumnProjection {
-                        output: ColumnSet::CORE,
-                        internal: ColumnSet::EMPTY,
-                    }
-                };
-                // The cache keys on the decoded column set, so this narrow
-                // entry never collides with a wider one.
-                let batch = leaf.load_leaflet(&store, leaflet_idx, &proj, replay_to)?;
-                ctx.check_cancelled()?;
-
-                // OPST leaflets are ordered by (o_type, o_key, p_id, s_id, t...).
-                // Instead of scanning every row in the leaflet, binary-search the
-                // `o_key` column for just the object IDs we care about and only
-                // visit those row ranges. This keeps work proportional to matches
-                // rather than leaflet size.
-                let fluree_db_binary_index::read::column_types::ColumnData::Block(o_keys) =
-                    &batch.o_key
-                else {
-                    // o_key is required; AbsentDefault cannot occur here.
-                    // Const(o_key) would mean the entire leaflet shares one object key,
-                    // which is extremely rare for OPST; fall back to row-scan in that case.
-                    for row in 0..batch.row_count {
-                        let ot = batch.o_type.get_or(row, 0);
-                        if ot != iri_ref {
-                            continue;
-                        }
-                        let pid = batch.p_id.get_or(row, 0);
-                        if pid != p_id {
-                            continue;
-                        }
-                        let o_key = batch.o_key.get_or(row, 0);
-                        let Some(accum_idxs) = o_to_accum.get(&o_key) else {
-                            continue;
-                        };
-                        let s_id = batch.s_id.get_or(row, 0);
-                        if let Some(probe) = probe_ops.as_mut() {
-                            let win = probe.object_window(o_key);
-                            let o_i_val = batch.o_i.get_or(row, u32::MAX);
-                            if probe.base_row_fate(&win, s_id, o_i_val) == RowFate::Drop {
-                                continue;
-                            }
-                        }
-                        self.emit_object_probe_match(
-                            ctx,
-                            s_id,
-                            accum_idxs,
-                            &mut scatter,
-                            &mut matched_rows,
-                        )?;
-                    }
-                    continue;
-                };
-
-                // Only consider the subset of objects that intersect this leaflet's object range.
-                let mut obj_idx = start;
-                let objs_slice = &objs[..];
-                let o_keys_slice: &[u64] = o_keys.as_ref();
-
-                // Fast path: if o_type/p_id are const and already filtered by leaflet
-                // metadata, we can skip per-row checks.
-                let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == iri_ref;
-                let pid_const_ok = batch.p_id.is_const() && batch.p_id.get_or(0, 0) == p_id;
-
-                // Start scanning at the first possible match within this leaflet.
-                let mut row = 0usize;
-                while row < batch.row_count && obj_idx < end {
-                    let target = objs_slice[obj_idx];
-
-                    // Seek row to the first o_key >= target.
-                    if o_keys_slice[row] < target {
-                        let next = o_keys_slice[row..].partition_point(|&x| x < target);
-                        row = row.saturating_add(next);
-                        if row >= batch.row_count {
-                            break;
-                        }
-                    }
-
-                    let cur = o_keys_slice[row];
-                    if cur > target {
-                        obj_idx += 1;
-                        continue;
-                    }
-                    // cur == target: process run [row, run_end).
-                    let run_end = row + o_keys_slice[row..].partition_point(|&x| x == target);
-
-                    // accum indices for this object key (bound from left).
-                    let Some(accum_idxs) = o_to_accum.get(&target) else {
-                        row = run_end;
-                        obj_idx += 1;
-                        continue;
-                    };
-                    let probe_window = probe_ops
-                        .as_ref()
-                        .map(|p| p.object_window(target))
-                        .filter(|w| !w.is_empty());
-
-                    for r in row..run_end {
-                        if !ot_const_ok {
-                            let ot = batch.o_type.get_or(r, 0);
-                            if ot != iri_ref {
-                                continue;
-                            }
-                        }
-                        if !pid_const_ok {
-                            let pid = batch.p_id.get_or(r, 0);
-                            if pid != p_id {
-                                continue;
-                            }
-                        }
-
-                        let s_id = batch.s_id.get_or(r, 0);
-                        if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                            let o_i_val = batch.o_i.get_or(r, u32::MAX);
-                            if probe.base_row_fate(win, s_id, o_i_val) == RowFate::Drop {
-                                continue;
-                            }
-                        }
-                        self.emit_object_probe_match(
-                            ctx,
-                            s_id,
-                            accum_idxs,
-                            &mut scatter,
-                            &mut matched_rows,
-                        )?;
-                    }
-
-                    row = run_end;
-                    obj_idx += 1;
-                }
-            }
-        }
-
-        // Inject novelty-only matches: unconsumed asserts per probed object,
-        // through the same emit path (and so the same inline filters) as base
-        // rows. Novelty-asserting subjects emit as EncodedSid, the same
-        // representation overlay-merged cursor rows use.
-        if let Some(probe) = probe_ops.as_mut() {
-            for &o_key in &objs {
-                let Some(accum_idxs) = o_to_accum.get(&o_key) else {
-                    continue;
-                };
-                let mut injected: Vec<u64> = Vec::new();
-                probe.drain_asserts_for_object(o_key, |s_id| {
-                    injected.push(s_id);
-                    Ok(())
-                })?;
-                for s_id in injected {
-                    self.emit_object_probe_match(
-                        ctx,
-                        s_id,
-                        accum_idxs,
-                        &mut scatter,
-                        &mut matched_rows,
-                    )?;
-                }
-            }
-        }
+        let this = &*self;
+        for_each_object_probe_match(
+            ctx,
+            &store,
+            &branch,
+            p_id,
+            &objs,
+            probe_ops.as_mut(),
+            |obj_idx, s_id| {
+                this.emit_object_probe_match(
+                    ctx,
+                    s_id,
+                    accums[obj_idx],
+                    &mut scatter,
+                    &mut matched_rows,
+                )
+            },
+        )?;
         if let Some(probe) = &probe_ops {
             tracing::debug!(
                 dropped_rows = probe.dropped_rows,
@@ -3250,6 +3028,248 @@ fn decode_overlay_object(
     )
 }
 
+/// Walk OPST for the `IRI_REF` rows of predicate `p_id` whose object is one of
+/// `objs` (sorted, deduplicated), calling `visit(obj_idx, s_id)` — `obj_idx`
+/// indexes `objs` — for each live row: base rows the overlay does not retract,
+/// then each novelty-only assert when `probe_ops` merges one.
+///
+/// Each OPST leaf holding any of the objects is read at most once, and inside a
+/// leaflet the `o_key` column is binary-searched per object, so the work tracks
+/// the matches rather than the leaflet or predicate size. Shared by the
+/// nested-loop join's bound-object lane and OPTIONAL's.
+pub(crate) fn for_each_object_probe_match(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    branch: &fluree_db_binary_index::BranchManifest,
+    p_id: u32,
+    objs: &[u64],
+    mut probe_ops: Option<&mut ObjectProbeOps>,
+    mut visit: impl FnMut(usize, u64) -> Result<()>,
+) -> Result<()> {
+    use fluree_db_binary_index::format::run_record_v2::{
+        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
+    };
+    use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
+    use fluree_db_binary_index::RunSortOrder;
+    use fluree_db_core::o_type::OType;
+
+    if objs.is_empty() {
+        return Ok(());
+    }
+    let iri_ref = OType::IRI_REF.as_u16();
+    let cmp = cmp_v2_for_order(RunSortOrder::Opst);
+
+    // Collect leaf indices for all object keys.
+    let mut leaf_indices: Vec<usize> = Vec::new();
+    for &o_s_id in objs {
+        let min_key = RunRecordV2 {
+            s_id: SubjectId(0),
+            o_key: o_s_id,
+            p_id,
+            t: 0,
+            o_i: 0,
+            o_type: iri_ref,
+            g_id: ctx.binary_g_id,
+        };
+        let max_key = RunRecordV2 {
+            s_id: SubjectId(u64::MAX),
+            o_key: o_s_id,
+            p_id,
+            t: u32::MAX,
+            o_i: u32::MAX,
+            o_type: iri_ref,
+            g_id: ctx.binary_g_id,
+        };
+        let r = branch.find_leaves_in_range(&min_key, &max_key, cmp);
+        leaf_indices.extend(r);
+    }
+    leaf_indices.sort_unstable();
+    leaf_indices.dedup();
+
+    let need_replay = ctx.to_t < store.max_t();
+    let replay_to = need_replay.then_some(ctx.to_t);
+    let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
+    for leaf_idx in leaf_indices {
+        ctx.check_cancelled()?;
+        let leaf_entry = &branch.leaves[leaf_idx];
+        let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
+
+        for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
+            ctx.check_cancelled()?;
+            let needs_history_replay =
+                need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+            if entry.row_count == 0 && !needs_history_replay {
+                continue;
+            }
+            if entry.p_const.is_some() && entry.p_const != Some(p_id) {
+                continue;
+            }
+            if entry.o_type_const.is_some() && entry.o_type_const != Some(iri_ref) {
+                continue;
+            }
+
+            // Quick reject based on leaflet key range.
+            let first = read_ordered_key_v2(RunSortOrder::Opst, &entry.first_key);
+            let last = read_ordered_key_v2(RunSortOrder::Opst, &entry.last_key);
+            let first_o = first.o_key;
+            let last_o = last.o_key;
+            if last_o < objs[0] || first_o > *objs.last().unwrap() {
+                continue;
+            }
+            // If no object keys fall within [first_o, last_o], skip.
+            let start = objs.partition_point(|&x| x < first_o);
+            let end = objs.partition_point(|&x| x <= last_o);
+            if start >= end {
+                continue;
+            }
+
+            // We only need core identity columns for this join, but for
+            // historical snapshots we also need `T` so `replay_leaflet_at_t`
+            // can detect base rows that postdate `to_t`. The overlay merge
+            // additionally needs `OI`: CORE lacks it, and a fate check
+            // reading `o_i` as a default would mis-reconcile retracts on
+            // multi-entry (`@list`) refs in BOTH cache configurations.
+            let proj = if need_replay {
+                ColumnProjection::all()
+            } else if probe_ops.is_some() {
+                ColumnProjection {
+                    output: ColumnSet::CORE.union(ColumnSet::single(
+                        fluree_db_binary_index::format::column_block::ColumnId::OI,
+                    )),
+                    internal: ColumnSet::EMPTY,
+                }
+            } else {
+                ColumnProjection {
+                    output: ColumnSet::CORE,
+                    internal: ColumnSet::EMPTY,
+                }
+            };
+            // The cache keys on the decoded column set, so this narrow
+            // entry never collides with a wider one.
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            ctx.check_cancelled()?;
+
+            // OPST leaflets are ordered by (o_type, o_key, p_id, s_id, t...).
+            // Instead of scanning every row in the leaflet, binary-search the
+            // `o_key` column for just the object IDs we care about and only
+            // visit those row ranges. This keeps work proportional to matches
+            // rather than leaflet size.
+            let fluree_db_binary_index::read::column_types::ColumnData::Block(o_keys) =
+                &batch.o_key
+            else {
+                // o_key is required; AbsentDefault cannot occur here.
+                // Const(o_key) would mean the entire leaflet shares one object key,
+                // which is extremely rare for OPST; fall back to row-scan in that case.
+                for row in 0..batch.row_count {
+                    let ot = batch.o_type.get_or(row, 0);
+                    if ot != iri_ref {
+                        continue;
+                    }
+                    let pid = batch.p_id.get_or(row, 0);
+                    if pid != p_id {
+                        continue;
+                    }
+                    let o_key = batch.o_key.get_or(row, 0);
+                    let Ok(obj_idx) = objs.binary_search(&o_key) else {
+                        continue;
+                    };
+                    let s_id = batch.s_id.get_or(row, 0);
+                    if let Some(probe) = probe_ops.as_mut() {
+                        let win = probe.object_window(o_key);
+                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                        if probe.base_row_fate(&win, s_id, o_i_val) == RowFate::Drop {
+                            continue;
+                        }
+                    }
+                    visit(obj_idx, s_id)?;
+                }
+                continue;
+            };
+
+            // Only consider the subset of objects that intersect this leaflet's object range.
+            let mut obj_idx = start;
+            let o_keys_slice: &[u64] = o_keys.as_ref();
+
+            // Fast path: if o_type/p_id are const and already filtered by leaflet
+            // metadata, we can skip per-row checks.
+            let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == iri_ref;
+            let pid_const_ok = batch.p_id.is_const() && batch.p_id.get_or(0, 0) == p_id;
+
+            // Start scanning at the first possible match within this leaflet.
+            let mut row = 0usize;
+            while row < batch.row_count && obj_idx < end {
+                let target = objs[obj_idx];
+
+                // Seek row to the first o_key >= target.
+                if o_keys_slice[row] < target {
+                    let next = o_keys_slice[row..].partition_point(|&x| x < target);
+                    row = row.saturating_add(next);
+                    if row >= batch.row_count {
+                        break;
+                    }
+                }
+
+                let cur = o_keys_slice[row];
+                if cur > target {
+                    obj_idx += 1;
+                    continue;
+                }
+                // cur == target: process run [row, run_end).
+                let run_end = row + o_keys_slice[row..].partition_point(|&x| x == target);
+
+                let probe_window = probe_ops
+                    .as_ref()
+                    .map(|p| p.object_window(target))
+                    .filter(|w| !w.is_empty());
+
+                for r in row..run_end {
+                    if !ot_const_ok {
+                        let ot = batch.o_type.get_or(r, 0);
+                        if ot != iri_ref {
+                            continue;
+                        }
+                    }
+                    if !pid_const_ok {
+                        let pid = batch.p_id.get_or(r, 0);
+                        if pid != p_id {
+                            continue;
+                        }
+                    }
+
+                    let s_id = batch.s_id.get_or(r, 0);
+                    if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                        let o_i_val = batch.o_i.get_or(r, u32::MAX);
+                        if probe.base_row_fate(win, s_id, o_i_val) == RowFate::Drop {
+                            continue;
+                        }
+                    }
+                    visit(obj_idx, s_id)?;
+                }
+
+                row = run_end;
+                obj_idx += 1;
+            }
+        }
+    }
+
+    // Inject novelty-only matches: unconsumed asserts per probed object.
+    // Novelty-asserting subjects are visited by id, the same representation
+    // overlay-merged cursor rows use.
+    if let Some(probe) = probe_ops {
+        for (obj_idx, &o_key) in objs.iter().enumerate() {
+            let mut injected: Vec<u64> = Vec::new();
+            probe.drain_asserts_for_object(o_key, |s_id| {
+                injected.push(s_id);
+                Ok(())
+            })?;
+            for s_id in injected {
+                visit(obj_idx, s_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Bundled parameters for [`batched_subject_probe_binary`].
 pub(crate) struct SubjectProbeParams<'a> {
     pub pred_sid: &'a Sid,
@@ -3290,7 +3310,7 @@ pub(crate) fn batched_subject_probe_binary(
 /// on an untracked query before touching the atomic at all.
 ///
 /// [`PER_ROW_MICRO_FUEL`]: fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL
-fn charge_probe_rows(ctx: &ExecutionContext<'_>, rows: usize) -> Result<()> {
+pub(crate) fn charge_probe_rows(ctx: &ExecutionContext<'_>, rows: usize) -> Result<()> {
     ctx.tracker
         .consume_fuel(rows as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL)?;
     Ok(())
@@ -4311,12 +4331,6 @@ mod tests {
             crate::temporal_mode::TemporalMode::Current,
         );
 
-        // Verify that ?v is NOT in unify_instructions (it's substituted, not unified)
-        assert!(
-            join.unify_instructions.is_empty(),
-            "No unify instructions expected when shared var at Object position has Lit binding"
-        );
-
         // Left batch: ?v = 1
         let left_batch = Batch::new(
             left_schema,
@@ -4704,9 +4718,6 @@ mod tests {
             EmitMask::ALL,
             crate::temporal_mode::TemporalMode::Current,
         );
-
-        // No unify_instructions since no shared vars between left [?s] and right [?x, ?y]
-        assert!(join.unify_instructions.is_empty());
 
         // Left batch: ?s = some:subject (a Sid)
         let left_batch = Batch::new(

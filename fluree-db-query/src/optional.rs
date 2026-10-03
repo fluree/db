@@ -27,15 +27,18 @@ use crate::binding::{Batch, Binding, UnmatchedOptional};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
-use crate::fast_path_common::{subject_probe_lane_plan, ProbeLanePlan, ProbeOps};
+use crate::fast_path_common::{
+    object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
+};
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::join::{
-    batched_subject_probe_binary, BindInstruction, PatternPosition, SubjectProbeParams,
-    UnifyInstruction,
+    batched_subject_probe_binary, charge_probe_rows, for_each_object_probe_match,
+    substitute_binding, BindInstruction, CorrelationView, PatternPosition, SubjectProbeParams,
+    Substitution, UnifyInstruction,
 };
-use crate::object_binding::{equality_norm, EqualityNorm};
+use crate::object_binding::{equality_norm, same_term, EqualityNorm, TermDicts};
 use crate::operator::flush::FlushSchedule;
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -45,8 +48,9 @@ use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::clock::Instant;
-use fluree_db_core::StatsView;
+use fluree_db_core::{ObjKind, Sid, StatsView};
 use lru::LruCache;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -54,6 +58,10 @@ use std::sync::Arc;
 /// Keep OPTIONAL diagnostics concise during perf captures by surfacing only
 /// expensive batches or obvious cache/planning churn at debug level.
 const OPTIONAL_DEBUG_MIN_WORK: usize = 8;
+/// Routing stamp of the bound-object lane (`?x <p> ?o`, `?o` from the
+/// required side), so a test can pin that the lane answered rather than the
+/// per-row lookups it replaces.
+pub(crate) const OBJECT_PROBE_SITE: &str = "optional_object_probe";
 const OPTIONAL_DEBUG_MIN_MS: u64 = 25;
 
 /// Per-row result of a batched optional build: `(row_index, batches)`.
@@ -132,6 +140,11 @@ pub trait OptionalBuilder: Send + Sync {
         false
     }
 
+    /// Most driving rows one coalesced seed holds.
+    fn seed_coalesce_cap(&self) -> usize {
+        optional_seed_coalesce_cap()
+    }
+
     /// Optional cache key for correlated OPTIONAL evaluation.
     ///
     /// If this returns `Some(key)`, the OptionalOperator may memoize the optional-side
@@ -165,25 +178,17 @@ pub trait OptionalBuilder: Send + Sync {
 /// Encoded id of a subject binding, for the batched probes; `None` when the
 /// binding has none.
 fn resolve_subject_id(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
-    let Some(store) = ctx.binary_store.as_deref() else {
-        return Ok(None);
-    };
     match binding {
-        Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-        Binding::Sid { sid, .. } => {
-            // Persisted reverse dict first, then DictNovelty — subjects
-            // minted after the last index resolve to novelty s_ids, the
-            // same id space the overlay ops are translated into.
-            let persisted = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
-            Ok(persisted.or_else(|| {
-                ctx.dict_novelty
-                    .as_ref()
-                    .filter(|dn| dn.is_initialized())
-                    .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-            }))
-        }
+        Binding::EncodedSid { s_id, .. } => Ok(ctx.binary_store.is_some().then_some(*s_id)),
+        // Subjects minted after the last index resolve to novelty s_ids, the
+        // same id space the overlay ops are translated into. The dictionaries
+        // are read only for a decoded subject.
+        Binding::Sid { sid, .. } => match TermDicts::of(ctx) {
+            Some(dicts) => dicts
+                .subject_id(sid.namespace_code, &sid.name)
+                .map_err(|e| QueryError::execution(format!("subject id lookup: {e}"))),
+            None => Ok(None),
+        },
         _ => Ok(None),
     }
 }
@@ -328,152 +333,286 @@ impl PatternOptionalBuilder {
     /// True when the pattern's object variable is also a REQUIRED variable, so
     /// the per-row object substitution is load-bearing.
     ///
-    /// The batched probe keys on `(subject, predicate)` and reads the object
-    /// slot off the plan-time template, never off the row — sound while the
-    /// object variable is optional-only, wrong the moment the required side
-    /// carries values for it. Left in, it answered one bare existence row per
-    /// matching triple: a required row binding the variable was duplicated
-    /// instead of filtered, and a required row leaving it unbound was passed
-    /// through instead of extended. The per-row `build` path substitutes the
-    /// row's own object (and leaves an unbound one free), so it is exactly
-    /// right here; this shape declines the probe and takes it.
+    /// The subject-keyed batched probe keys on `(subject, predicate)` and reads
+    /// the object slot off the plan-time template, never off the row — sound
+    /// while the object variable is optional-only, wrong the moment the
+    /// required side carries values for it. Left in, it answered one bare
+    /// existence row per matching triple: a required row binding the variable
+    /// was duplicated instead of filtered, and a required row leaving it
+    /// unbound was passed through instead of extended. That shape takes the
+    /// bound-object probe instead when the object is a ref the subject of the
+    /// pattern is free for, and the per-row `build` path otherwise, which
+    /// substitutes the row's own object in whatever form it arrives (and
+    /// leaves an unbound one free).
     ///
     /// The alternative — widen the probe to materialise the object and let
     /// `unify_check` filter — was declined because `Binding`'s `PartialEq`
     /// answers `false`, not an error, across representations (`EncodedSid` vs
-    /// `Sid`, `Sid` vs `Iri`, `EncodedLit` vs `Lit`), so a cross-representation
-    /// object correlation would silently DROP rows; #1729 is a live instance on
-    /// the literal/datatype arm. Note this narrows the exposure rather than
-    /// removing it: `substitute_pattern` leaves a late-materialised
-    /// `EncodedSid`/`EncodedPid`/`EncodedLit` object free, and `unify_check`'s
-    /// `left_val == right_val` is then what enforces the correlation on the
-    /// per-row path too.
+    /// `Sid`, `EncodedPid` vs `EncodedSid`, `EncodedLit` vs `Lit`), so a
+    /// cross-representation object correlation would silently DROP rows; #1729
+    /// is a live instance on the literal/datatype arm.
     fn object_var_shared_with_required(&self) -> bool {
         matches!(&self.pattern.o, Term::Var(v) if !self.optional_only_vars.contains(v))
     }
 
-    /// Substitute required bindings into pattern
+    /// The required column of a pattern the bound-object lane can answer:
+    /// `?x <p> ?o` correlated on its object alone — `?o` comes from the
+    /// required side, `?x` is optional-only, `<p>` is not correlated, and no
+    /// datatype constraint narrows the object.
+    fn object_probe_column(&self) -> Option<usize> {
+        if self.pattern.dtc.is_some() {
+            return None;
+        }
+        let Ref::Var(subject) = &self.pattern.s else {
+            return None;
+        };
+        if !self.optional_only_vars.contains(subject) {
+            return None;
+        }
+        let mut object_col = None;
+        for instr in &self.bind_instructions {
+            match instr.position {
+                PatternPosition::Object => object_col = Some(instr.left_col),
+                PatternPosition::Subject | PatternPosition::Predicate => return None,
+            }
+        }
+        object_col
+    }
+
+    /// Runtime admission of the bound-object lane: single-ledger binary
+    /// execution that may emit encoded subjects (the lane answers with
+    /// `EncodedSid`, as the join's bound-object lane does), a constant
+    /// predicate, and an overlay the probe can merge.
+    fn object_probe_plan(
+        &self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<
+        Option<(
+            Arc<fluree_db_binary_index::BinaryIndexStore>,
+            Sid,
+            ProbeLanePlan,
+        )>,
+    > {
+        if ctx.is_multi_ledger() || ctx.eager_materialization {
+            return Ok(None);
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return Ok(None);
+        };
+        let Some(pred_sid) = try_normalize_pred_sid(store, &self.pattern.p) else {
+            return Ok(None);
+        };
+        Ok(match object_probe_lane_plan(ctx, store, &pred_sid)? {
+            ProbeLanePlan::Decline => None,
+            plan => Some((Arc::clone(store), pred_sid, plan)),
+        })
+    }
+
+    /// The bound-object lane: one sorted OPST pass over every required row's
+    /// object answers the whole batch, binding the optional-only subject.
+    /// Without it each row ran its own lookup, and before the substitution
+    /// covered encoded objects, its own scan of the whole predicate (#1973).
     ///
-    /// For IriMatch bindings in subject/predicate positions, uses `Ref::Iri` to carry
-    /// the canonical IRI. For IriMatch bindings in object position, uses `Term::Iri`.
-    /// The scan operator will encode this IRI for each target ledger's namespace
-    /// table, enabling correct cross-ledger OPTIONAL matching.
+    /// Declines — to the per-row path, which handles every form — when the
+    /// lane is not admitted, or when a row's object is not a ref with an id:
+    /// an unbound object (the triple's object is then free), a literal (the
+    /// OPST ref probe cannot see literal objects), or an IRI the dictionaries
+    /// do not hold.
+    fn build_object_probe_batch(
+        &self,
+        required_batch: &Batch,
+        start_row: usize,
+        object_left_col: usize,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Vec<OptionalBatchRow>>> {
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        let declined = || {
+            stamp_fast_path(
+                OBJECT_PROBE_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
+            Ok(None)
+        };
+        let Some((store, pred_sid, lane_plan)) = self.object_probe_plan(ctx)? else {
+            return declined();
+        };
+        let Ref::Var(subject_var) = self.pattern.s else {
+            return declined();
+        };
+
+        let slots = required_batch.len() - start_row;
+        let mut object_slots: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        for row in start_row..required_batch.len() {
+            if self.has_poisoned_binding(required_batch, row) {
+                // A poisoned correlation value matches nothing.
+                continue;
+            }
+            let Some(o_id) =
+                resolve_subject_id(required_batch.get_by_col(row, object_left_col), ctx)?
+            else {
+                return declined();
+            };
+            object_slots.entry(o_id).or_default().push(row - start_row);
+        }
+
+        let mut objects: Vec<u64> = object_slots.keys().copied().collect();
+        objects.sort_unstable();
+        let mut values: Vec<Vec<Binding>> = vec![Vec::new(); slots];
+        let mut matched = 0usize;
+        let branch =
+            store.branch_for_order(ctx.binary_g_id, fluree_db_binary_index::RunSortOrder::Opst);
+        if let (Some(p_id), Some(branch)) = (store.sid_to_p_id(&pred_sid), branch) {
+            let slots_by_object: Vec<&[usize]> =
+                objects.iter().map(|o| object_slots[o].as_slice()).collect();
+            let mut probe_ops = match &lane_plan {
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+                _ => None,
+            };
+            for_each_object_probe_match(
+                ctx,
+                &store,
+                branch,
+                p_id,
+                &objects,
+                probe_ops.as_mut(),
+                |obj_idx, s_id| {
+                    for &slot in slots_by_object[obj_idx] {
+                        values[slot].push(Binding::encoded_sid(s_id));
+                        matched += 1;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        // Lanes that read leaflets directly pay their rows' fuel here.
+        charge_probe_rows(ctx, matched)?;
+        stamp_fast_path(OBJECT_PROBE_SITE, FastPathOutcome::Proceed);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![subject_var].into_boxed_slice());
+        let mut pending = Vec::with_capacity(slots);
+        for (slot, subjects) in values.into_iter().enumerate() {
+            let optional_batches = if subjects.is_empty() {
+                Vec::new()
+            } else {
+                vec![Batch::new(schema.clone(), vec![subjects])?]
+            };
+            pending.push((start_row + slot, optional_batches));
+        }
+        tracing::debug!(
+            rows = pending.len(),
+            objects = objects.len(),
+            matched,
+            "optional bound-object probe complete"
+        );
+        Ok(Some(pending))
+    }
+
+    /// Whether this row's object value is left to `unify_check` instead of
+    /// decoded into the scan: an encoded object when the row also binds the
+    /// subject. The scan is then already a seek on that subject, and decoding
+    /// the object (a dictionary lookup per row) would only narrow a lookup
+    /// that is already narrow; `unify_check` compares it with `same_term`,
+    /// which treats the encoded and decoded forms of one term as one. That is
+    /// the substitution's own match for every encoded value but a numeric
+    /// one: a substituted numeric matches by value across numeric datatypes,
+    /// and `same_term` would not, so numerics are still substituted.
+    /// [`Self::substitute_pattern`] and the cache key both follow this, so a
+    /// row keys its object as free exactly when its scan leaves it free.
+    fn object_left_to_unify(&self, required_batch: &Batch, row: usize) -> bool {
+        let Some(subject_col) = self.subject_left_col() else {
+            return false;
+        };
+        let Some(object_col) = self
+            .bind_instructions
+            .iter()
+            .find(|instr| instr.position == PatternPosition::Object)
+            .map(|instr| instr.left_col)
+        else {
+            return false;
+        };
+        matches!(
+            required_batch.get_by_col(row, subject_col),
+            Binding::Sid { .. }
+                | Binding::IriMatch { .. }
+                | Binding::Iri(_)
+                | Binding::EncodedSid { .. }
+                | Binding::EncodedPid { .. }
+        ) && match required_batch.get_by_col(row, object_col) {
+            Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => true,
+            Binding::EncodedLit { o_kind, .. } => ![
+                ObjKind::NUM_INT.as_u8(),
+                ObjKind::NUM_F64.as_u8(),
+                ObjKind::NUM_BIG.as_u8(),
+            ]
+            .contains(o_kind),
+            _ => false,
+        }
+    }
+
+    /// This row's correlated values bound into the pattern, through the
+    /// substitution every correlated scan shares ([`substitute_binding`]):
+    /// encoded values decode into their slot in any position, so the scan is
+    /// a bound lookup whichever form the row carries a term in. `None` when no
+    /// triple can match the row — a correlated value that can never fill its
+    /// slot (a literal as a subject or predicate, a list or map value).
+    ///
+    /// A value the context cannot decode (an arena-backed literal while
+    /// several graphs are active) stays a variable, and `unify_check`
+    /// correlates it by term equality.
     fn substitute_pattern(
         &self,
         required_batch: &Batch,
         row: usize,
         ctx: &ExecutionContext<'_>,
-    ) -> Result<TriplePattern> {
+    ) -> Result<Option<TriplePattern>> {
         let mut pattern = self.pattern.clone();
-
+        // Built only when a row carries an encoded value: decoded rows (the
+        // novelty lane) never need it.
+        let mut view: Option<Option<CorrelationView>> = None;
+        let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
+            if object_to_unify && instr.position == PatternPosition::Object {
+                continue;
+            }
             let binding = required_batch.get_by_col(row, instr.left_col);
-
-            match instr.position {
-                PatternPosition::Subject => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.s = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Ref::Iri so scan can encode for each target ledger
-                            pattern.s = Ref::Iri(iri.clone());
-                        }
-                        Binding::EncodedSid { s_id, .. } => {
-                            // Late materialized subject ID: resolve to IRI for correlation.
-                            // Uses novelty-aware BinaryGraphView via ctx.graph_view().
-                            let gv = ctx.graph_view().ok_or_else(|| {
-                                QueryError::Internal(
-                                    "OPTIONAL correlation requires binary store for EncodedSid"
-                                        .into(),
-                                )
-                            })?;
-                            let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
-                                QueryError::Internal(format!("resolve subject iri: {e}"))
-                            })?;
-                            pattern.s = Ref::Iri(Arc::<str>::from(iri));
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
-                }
-                PatternPosition::Predicate => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.p = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Ref::Iri so scan can encode for each target ledger
-                            pattern.p = Ref::Iri(iri.clone());
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
-                }
-                PatternPosition::Object => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.o = Term::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Term::Iri so scan can encode for each target ledger
-                            pattern.o = Term::Iri(iri.clone());
-                        }
-                        Binding::Lit { val, dtc, .. } => {
-                            pattern.o = Term::Value(val.clone());
-                            // A string binding is one RDF term: `"bob"`,
-                            // `"bob"@en`, `"bob"^^xsd:anyURI` and
-                            // `"bob"^^ex:custom` share a dictionary key and
-                            // must not probe each other's rows. Numeric/other
-                            // constraints are left off so cross-subtype
-                            // matching stays as before.
-                            if crate::binding::is_string_dict_term(binding) {
-                                pattern.dtc = Some(dtc.clone());
-                            }
-                        }
-                        Binding::EncodedLit { .. } => {
-                            // Late materialized literal: no decode context here; leave unbound.
-                        }
-                        Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
-                            // Late materialized IRI: no decode context here; leave unbound.
-                        }
-                        Binding::Unbound | Binding::Poisoned => {
-                            // Leave as variable
-                        }
-                        Binding::Grouped(_) => {
-                            debug_assert!(
-                                false,
-                                "Grouped binding in optional pattern substitution"
-                            );
-                            // Leave as variable
-                        }
-                        Binding::Path { .. }
-                        | Binding::Rel(_)
-                        | Binding::List(_)
-                        | Binding::Map(_) => {
-                            // A path/list value is never substituted into a triple slot.
-                        }
-                    }
-                }
+            let encoded = matches!(
+                binding,
+                Binding::EncodedSid { .. }
+                    | Binding::EncodedPid { .. }
+                    | Binding::EncodedLit { .. }
+            );
+            let view = if encoded {
+                view.get_or_insert_with(|| CorrelationView::of(ctx))
+                    .as_ref()
+            } else {
+                None
+            };
+            if substitute_binding(&mut pattern, instr.position, binding, view)?
+                == Substitution::Unmatchable
+            {
+                return Ok(None);
             }
         }
-
-        Ok(pattern)
+        Ok(Some(pattern))
     }
 }
 
-/// Append one correlation binding to a cache key, or return `false` when it
-/// has no stable encoding (the caller then declines to cache).
+/// Append one correlation value to a cache key, or return `false` to leave the
+/// row uncached.
 ///
-/// The key is the SUBSTITUTED PATTERN, not the row: this mirrors
-/// [`PatternOptionalBuilder::substitute_pattern`] position by position, so a
-/// slot that substitution pushes a value into is keyed by that value, and a
-/// slot it leaves free gets the same `u` token whatever the row held. Two rows whose
-/// substituted patterns are identical then share one scan — which is what the
-/// cache is for, since `unify_check` re-applies the row's own correlation when
-/// the pending match is drained.
+/// Rows that key alike share one scan, so the key must determine the
+/// SUBSTITUTED PATTERN: every value [`substitute_binding`] binds into a slot is
+/// keyed by an identity that fixes what it binds, in every position. Encoded
+/// values key by their encoded identity, which is cheaper than decoding and
+/// determines the decode. A slot substitution leaves free (an unbound value)
+/// gets its own `u` token rather than colliding with any bound value;
+/// `unify_check` re-applies the row's own correlation when the pending match
+/// drains. Keying a bound value as free would hand one row's lookup to every
+/// row.
+///
+/// Rows with no scan to share are not keyed: a poisoned value, and a value
+/// substitution reports unmatchable (a literal as a subject or predicate, a
+/// list or map value), for which `build` answers no match.
 ///
 /// Every variable-length component is length-prefixed so two different
 /// correlation tuples can never concatenate to the same bytes.
@@ -488,16 +627,11 @@ fn push_cache_key_component(
         key.extend_from_slice(bytes);
     }
 
-    // `substitute_pattern` leaves the slot a variable, so "free here" is a
-    // correlation state in its own right and gets its own token rather than
-    // colliding with any bound value.
-    fn push_free(key: &mut Vec<u8>) -> bool {
-        key.push(b'u');
-        true
-    }
-
     match binding {
-        Binding::Poisoned => false,
+        Binding::Unbound => {
+            key.push(b'u');
+            true
+        }
         Binding::Sid { sid, .. } => {
             // Fallback stable key: namespace code + suffix bytes.
             key.push(b's');
@@ -509,22 +643,40 @@ fn push_cache_key_component(
             push_bytes(key, b'i', iri.as_bytes());
             true
         }
-        // Only the SUBJECT slot resolves an encoded id to an IRI and pushes it
-        // down; elsewhere substitution leaves the slot free.
-        Binding::EncodedSid { s_id, .. } if position == PatternPosition::Subject => {
+        Binding::EncodedSid { s_id, .. } => {
             key.push(b'S');
             key.extend_from_slice(&s_id.to_le_bytes());
+            true
+        }
+        Binding::EncodedPid { p_id } => {
+            key.push(b'P');
+            key.extend_from_slice(&p_id.to_le_bytes());
+            true
+        }
+        // The fields the decode reads; `i_val` and `t` are metadata.
+        Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        } if position == PatternPosition::Object => {
+            key.push(b'L');
+            key.push(*o_kind);
+            key.extend_from_slice(&o_key.to_le_bytes());
+            key.extend_from_slice(&p_id.to_le_bytes());
+            key.extend_from_slice(&dt_id.to_le_bytes());
+            key.extend_from_slice(&lang_id.to_le_bytes());
             true
         }
         // A literal OBJECT is pushed down by value (plus a string term
         // constraint), so rows carrying different literals must not share an
         // entry. Keying it would need a stable byte encoding of every
-        // `FlakeValue`/datatype pair — more than this fix is buying — so the
-        // row goes uncached instead. In every other slot a literal is left
-        // free, like any other unsubstitutable binding.
-        Binding::Lit { .. } if position == PatternPosition::Object => false,
-        // Everything else: substitution's own `_ => leave as variable` arms.
-        _ => push_free(key),
+        // `FlakeValue`/datatype pair, so the row goes uncached instead.
+        Binding::Lit { .. } => false,
+        // Poisoned, and values substitution reports unmatchable.
+        _ => false,
     }
 }
 
@@ -541,7 +693,11 @@ impl OptionalBuilder for PatternOptionalBuilder {
     /// True only when `build_batch`'s own admission gates hold, so the
     /// operator never buffers the driving side just to fall back per-row.
     fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if self.object_probe_column().is_some() {
+            return matches!(self.object_probe_plan(ctx), Ok(Some(_)));
+        }
         if ctx.is_multi_ledger()
+            || ctx.eager_materialization
             || self.pattern.dtc.is_some()
             || self.subject_left_col().is_none()
             || self.object_var_shared_with_required()
@@ -560,6 +716,18 @@ impl OptionalBuilder for PatternOptionalBuilder {
         )
     }
 
+    /// The bound-object lane coalesces at most the window the join's own
+    /// bound-object lane flushes at: the OPST pass costs a seek per distinct
+    /// object, so a larger window saves little, while main answered these
+    /// OPTIONALs row by row and buffered nothing.
+    fn seed_coalesce_cap(&self) -> usize {
+        if self.object_probe_column().is_some() {
+            fluree_db_core::BATCHED_JOIN_SIZE.min(optional_seed_coalesce_cap())
+        } else {
+            optional_seed_coalesce_cap()
+        }
+    }
+
     fn build(
         &self,
         required_batch: &Batch,
@@ -573,7 +741,9 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
 
         // Substitute bindings into pattern and create scan operator
-        let bound_pattern = self.substitute_pattern(required_batch, row, ctx)?;
+        let Some(bound_pattern) = self.substitute_pattern(required_batch, row, ctx)? else {
+            return Ok(None);
+        };
         Ok(Some(Box::new(
             crate::dataset_operator::DatasetOperator::scan(
                 bound_pattern,
@@ -592,8 +762,14 @@ impl OptionalBuilder for PatternOptionalBuilder {
         start_row: usize,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<Vec<OptionalBatchRow>>> {
-        if start_row >= required_batch.len()
-            || ctx.is_multi_ledger()
+        if start_row >= required_batch.len() {
+            return Ok(None);
+        }
+        if let Some(object_left_col) = self.object_probe_column() {
+            return self.build_object_probe_batch(required_batch, start_row, object_left_col, ctx);
+        }
+        if ctx.is_multi_ledger()
+            || ctx.eager_materialization
             || self.object_var_shared_with_required()
         {
             return Ok(None);
@@ -724,12 +900,18 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
 
         let mut key = Vec::with_capacity(16 * self.bind_instructions.len());
+        let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
             key.push(match instr.position {
                 PatternPosition::Subject => b'0',
                 PatternPosition::Predicate => b'1',
                 PatternPosition::Object => b'2',
             });
+            if object_to_unify && instr.position == PatternPosition::Object {
+                // Left free by the scan: rows sharing the subject share it.
+                key.push(b'u');
+                continue;
+            }
             let binding = required_batch.get_by_col(row, instr.left_col);
             if !push_cache_key_component(&mut key, instr.position, binding) {
                 return Ok(None);
@@ -1475,7 +1657,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         let seed_vars: Vec<VarId> = seed_cols.iter().map(|&c| req_schema[c]).collect();
 
         let norm = equality_norm(ctx);
-        let (store, gv) = EqualityNorm::parts(&norm);
+        let (dicts, gv) = EqualityNorm::parts(&norm);
 
         // Per row: full correlation key (for matching) + distinct seed tuple
         // over the seeded subset. A poisoned/unbound correlation var can never
@@ -1531,13 +1713,13 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             let key: Vec<GroupKeyOwned> = corr_cols
                 .iter()
                 .map(|&c| {
-                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
+                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
                 .collect();
             let seed_key: Vec<GroupKeyOwned> = seed_cols
                 .iter()
                 .map(|&c| {
-                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
+                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
                 .collect();
             if seen_seed.insert(seed_key) {
@@ -1613,7 +1795,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             for r in 0..batch.len() {
                 let key: Vec<GroupKeyOwned> = out_corr_cols
                     .iter()
-                    .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), store, gv))
+                    .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), dicts, gv))
                     .collect();
                 let projected: Vec<Binding> = out_opt_cols
                     .iter()
@@ -2299,6 +2481,8 @@ pub struct OptionalOperator {
     /// A required batch a budget-sized seed stopped partway through, and the
     /// first row it left unread.
     required_pending: Option<(Batch, usize)>,
+    /// Term normalization for `unify_check`, built once at open.
+    norm: Option<EqualityNorm>,
 }
 
 /// Tracks a required row's optional matches with progress cursor
@@ -2329,7 +2513,7 @@ impl OptionalOperator {
         // A scan batch can be a whole leaflet, so a budget-sized window takes
         // only the rows it needs; a cap-sized one keeps its last batch whole,
         // as before.
-        let exact = window < optional_seed_coalesce_cap();
+        let exact = window < self.optional_builder.seed_coalesce_cap();
         self.coalesce_schedule.advance();
         let mut schema: Option<Arc<[VarId]>> = None;
         let mut columns: Vec<Vec<Binding>> = Vec::new();
@@ -2410,6 +2594,7 @@ impl OptionalOperator {
             .collect();
 
         let unmatched = optional_builder.unmatched_optional().binding();
+        let coalesce_cap = optional_builder.seed_coalesce_cap();
 
         Self {
             required,
@@ -2424,8 +2609,9 @@ impl OptionalOperator {
             pending_output: VecDeque::new(),
             out_schema: None,
             result_cache: LruCache::new(NonZeroUsize::new(8192).expect("8192 is non-zero")),
-            coalesce_schedule: FlushSchedule::fixed(optional_seed_coalesce_cap()),
+            coalesce_schedule: FlushSchedule::fixed(coalesce_cap),
             required_pending: None,
+            norm: None,
         }
     }
 
@@ -2474,41 +2660,42 @@ impl OptionalOperator {
     }
 
     /// Check if required row bindings match optional row bindings for shared vars
+    ///
+    /// A shared value is one RDF term whichever form each side carries it in
+    /// ([`same_term`]): the required side may hold an IRI encoded as a
+    /// predicate while the optional side decoded it, or found it as a subject.
     fn unify_check(
         &self,
         required_batch: &Batch,
         required_row: usize,
         optional_batch: &Batch,
         optional_row: usize,
-    ) -> bool {
+    ) -> Result<bool> {
         // Unification must be resilient to optional operator schemas that do not
         // include substituted correlation vars.
         //
         // If the optional-side batch doesn't have the shared var column, we treat
         // it as already enforced by correlation/substitution and skip the check.
-        self.optional_builder
-            .unify_instructions()
-            .iter()
-            .all(|instr| {
-                let var = self.required_schema[instr.left_col];
-                let opt_col = optional_batch.schema().iter().position(|v| *v == var);
-                if let Some(opt_col) = opt_col {
-                    let left_val = required_batch.get_by_col(required_row, instr.left_col);
-                    let right_val = optional_batch.get_by_col(optional_row, opt_col);
+        for instr in self.optional_builder.unify_instructions() {
+            let var = self.required_schema[instr.left_col];
+            let Some(opt_col) = optional_batch.schema().iter().position(|v| *v == var) else {
+                continue;
+            };
+            let left_val = required_batch.get_by_col(required_row, instr.left_col);
+            let right_val = optional_batch.get_by_col(optional_row, opt_col);
 
-                    // Poisoned blocks matching; Unbound is compatible with anything.
-                    if left_val.is_poisoned() || right_val.is_poisoned() {
-                        return false;
-                    }
-                    if matches!(left_val, Binding::Unbound) || matches!(right_val, Binding::Unbound)
-                    {
-                        return true;
-                    }
-                    left_val == right_val
-                } else {
-                    true
-                }
-            })
+            // Poisoned blocks matching; Unbound is compatible with anything.
+            if left_val.is_poisoned() || right_val.is_poisoned() {
+                return Ok(false);
+            }
+            if matches!(left_val, Binding::Unbound) || matches!(right_val, Binding::Unbound) {
+                continue;
+            }
+            if !same_term(left_val, right_val, &self.norm)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Combine required row with optional row into output row
@@ -2586,7 +2773,8 @@ impl Operator for OptionalOperator {
     /// pre-item-11 full outer scan — byte-identical results).
     fn set_row_budget(&mut self, budget: usize) {
         if crate::r2rml::optional_budget_enabled() {
-            self.coalesce_schedule = FlushSchedule::budgeted(budget, optional_seed_coalesce_cap());
+            self.coalesce_schedule =
+                FlushSchedule::budgeted(budget, self.optional_builder.seed_coalesce_cap());
             self.required.set_row_budget(budget);
         } else {
             tracing::debug!(budget, "OPTIONAL row-budget forwarding disabled by switch");
@@ -2603,6 +2791,7 @@ impl Operator for OptionalOperator {
 
         // Open required operator
         self.required.open(ctx).await?;
+        self.norm = equality_norm(ctx);
 
         self.state = OperatorState::Open;
         Ok(())
@@ -2711,7 +2900,7 @@ impl Operator for OptionalOperator {
                                 required_row,
                                 &self.pending_output.front().unwrap().optional_batches[batch_idx],
                                 opt_row,
-                            ) {
+                            )? {
                                 continue;
                             }
 
@@ -2935,6 +3124,18 @@ impl Operator for OptionalOperator {
             return Ok(None);
         }
 
+        // The per-row path returns as soon as one required row's matches are
+        // drained, so its batches hold a row or a few. Columns sized for
+        // `batch_size` would keep ~1,000 slots per column per required row
+        // alive in every consumer that buffers the output (#1973: 160+ KB
+        // per required row). Size those to their rows; a batch at least half
+        // full keeps its columns. (Keeping the columns of batches down to an
+        // eighth full cost more, not less: measured on the hash-join lane.)
+        if rows_added < batch_size / 2 {
+            for column in &mut output_columns {
+                column.shrink_to_fit();
+            }
+        }
         let batch = Batch::new(self.combined_schema.clone(), output_columns)?;
         if should_debug {
             tracing::debug!(
@@ -3926,6 +4127,76 @@ mod tests {
         }
     }
 
+    /// A builder that answers every row on the per-row path, as a miss.
+    struct PerRowMissBuilder {
+        schema: Arc<[VarId]>,
+        opt_only: Vec<VarId>,
+    }
+    #[async_trait]
+    impl OptionalBuilder for PerRowMissBuilder {
+        fn build(
+            &self,
+            _r: &Batch,
+            _row: usize,
+            _ctx: &ExecutionContext<'_>,
+        ) -> Result<Option<BoxedOperator>> {
+            Ok(None)
+        }
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        fn optional_only_vars(&self) -> &[VarId] {
+            &self.opt_only
+        }
+        fn unify_instructions(&self) -> &[UnifyInstruction] {
+            &[]
+        }
+        fn unmatched_optional(&self) -> UnmatchedOptional {
+            UnmatchedOptional::default()
+        }
+    }
+
+    /// #1973: the per-row path hands back a batch per required row; those
+    /// batches must not carry columns sized for a full `batch_size`.
+    #[test]
+    fn per_row_output_batches_are_sized_to_their_rows() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let rs: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let required = MultiBatchOp {
+            batches: [iri_batch(&rs, &["a", "b", "c"])].into_iter().collect(),
+        };
+        let opt = VarId(1);
+        let builder = PerRowMissBuilder {
+            schema: Arc::from(vec![VarId(0), opt].into_boxed_slice()),
+            opt_only: vec![opt],
+        };
+        let mut op =
+            OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        assert!(ctx.batch_size >= 100, "batch size {}", ctx.batch_size);
+
+        let rows = futures::executor::block_on(async {
+            op.open(&ctx).await.unwrap();
+            let mut rows = 0;
+            while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+                let (_, columns, len) = batch.into_parts();
+                for column in &columns {
+                    assert!(
+                        column.capacity() <= len.max(4) * 2,
+                        "{len}-row batch keeps a column of capacity {}",
+                        column.capacity()
+                    );
+                }
+                rows += len;
+            }
+            rows
+        });
+        assert_eq!(rows, 3);
+    }
+
     fn iri_batch(schema: &Arc<[VarId]>, vals: &[&str]) -> Batch {
         Batch::new(
             schema.clone(),
@@ -4151,45 +4422,84 @@ mod tests {
         )));
     }
 
-    /// The cache key is the SUBSTITUTED PATTERN, so a slot substitution leaves
-    /// free keys as free whatever the row held, and two rows that would drive
-    /// the identical scan share one entry.
+    /// The cache key determines the SUBSTITUTED PATTERN. Substitution binds
+    /// every term value into its slot in every position, encoded or decoded,
+    /// so each keys by its own identity: keying a bound value as free would
+    /// hand one row's lookup to every row (the trap an encoded object used to
+    /// sit in, when substitution left it free). Only an unbound value keys as
+    /// free; rows with no scan to share are not keyed at all.
     #[test]
-    fn cache_key_keys_a_free_slot_as_free() {
+    fn cache_key_keys_every_bound_value_by_identity() {
         fn key(position: PatternPosition, binding: &Binding) -> Option<Vec<u8>> {
             let mut k = Vec::new();
             push_cache_key_component(&mut k, position, binding).then_some(k)
         }
-
-        let encoded = Binding::EncodedSid {
-            s_id: 42,
+        let sid = |s_id| Binding::EncodedSid {
+            s_id,
             t: None,
             op: None,
         };
-        // Object: substitution leaves a late-materialised IRI free, so this must
-        // key identically to an unbound object — N objects, ONE scan.
-        assert_eq!(
-            key(PatternPosition::Object, &encoded),
-            key(PatternPosition::Object, &Binding::Unbound),
+        let pid = |p_id| Binding::EncodedPid { p_id };
+        let lit = |o_key| Binding::EncodedLit {
+            o_kind: fluree_db_core::ObjKind::LEX_ID.as_u8(),
+            o_key,
+            p_id: 3,
+            dt_id: fluree_db_core::DatatypeDictId::STRING.as_u16(),
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+        };
+        let free = Some(vec![b'u']);
+        let positions = [
+            PatternPosition::Subject,
+            PatternPosition::Predicate,
+            PatternPosition::Object,
+        ];
+
+        for position in positions {
+            assert_eq!(key(position, &Binding::Unbound), free, "{position:?}");
+            assert_eq!(key(position, &Binding::Poisoned), None, "{position:?}");
+            for (a, b) in [
+                (sid(42), sid(43)),
+                (pid(7), pid(8)),
+                (
+                    Binding::sid(Sid::new(9, "a")),
+                    Binding::sid(Sid::new(9, "b")),
+                ),
+            ] {
+                let (ka, kb) = (key(position, &a), key(position, &b));
+                assert!(
+                    ka.is_some() && ka != free,
+                    "{position:?}: {a:?} keys by value"
+                );
+                assert_ne!(ka, kb, "{position:?}: {a:?} vs {b:?}");
+            }
+            // One IRI in two encoded forms decodes to the same constant, but
+            // the forms key apart: a cache miss, never a shared wrong entry.
+            assert_ne!(
+                key(position, &sid(7)),
+                key(position, &pid(7)),
+                "{position:?}"
+            );
+        }
+
+        // An encoded literal object keys by the fields its decode reads...
+        let (a, b) = (
+            key(PatternPosition::Object, &lit(1)),
+            key(PatternPosition::Object, &lit(2)),
         );
-        // Subject: substitution resolves it and pushes it down, so it keys by value.
-        assert_ne!(
-            key(PatternPosition::Subject, &encoded),
-            key(PatternPosition::Subject, &Binding::Unbound),
-        );
-        assert_ne!(
-            key(PatternPosition::Subject, &encoded),
-            key(
-                PatternPosition::Subject,
-                &Binding::EncodedSid {
-                    s_id: 43,
-                    t: None,
-                    op: None
-                }
-            ),
-        );
-        // A literal OBJECT is pushed down by value; declining to cache is how
-        // rows carrying different literals are kept apart.
+        assert!(a.is_some() && a != free);
+        assert_ne!(a, b);
+        // ...and not by list index or assertion time.
+        let mut c = lit(1);
+        if let Binding::EncodedLit { i_val, t, .. } = &mut c {
+            *i_val = 4;
+            *t = 9;
+        }
+        assert_eq!(key(PatternPosition::Object, &c), a);
+
+        // A decoded literal object is pushed down by value; declining to cache
+        // is how rows carrying different literals are kept apart.
         assert_eq!(
             key(
                 PatternPosition::Object,
@@ -4197,5 +4507,17 @@ mod tests {
             ),
             None
         );
+        // A literal as a subject or predicate cannot match: no scan to share.
+        for position in [PatternPosition::Subject, PatternPosition::Predicate] {
+            assert_eq!(key(position, &lit(1)), None, "{position:?}");
+            assert_eq!(
+                key(
+                    position,
+                    &Binding::lit(fluree_db_core::FlakeValue::Long(7), Sid::new(0, "integer"))
+                ),
+                None,
+                "{position:?}"
+            );
+        }
     }
 }

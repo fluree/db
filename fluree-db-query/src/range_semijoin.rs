@@ -1236,7 +1236,7 @@ impl Operator for RangeSemiJoinOperator {
                     crate::fast_path_outcome::FastPathOutcome::Proceed,
                 );
 
-                let (store, gv) = EqualityNorm::parts(&self.norm);
+                let (dicts, gv) = EqualityNorm::parts(&self.norm);
                 let mut fallback_rows: Vec<usize> = Vec::new();
                 for (row, keep_row) in keep.iter_mut().enumerate() {
                     if !*keep_row {
@@ -1253,7 +1253,7 @@ impl Operator for RangeSemiJoinOperator {
                         }
                         Some(Binding::Poisoned) => false,
                         Some(subject) => {
-                            let key = binding_to_group_key_normalized(subject, store, gv);
+                            let key = binding_to_group_key_normalized(subject, dicts, gv);
                             let mut any = false;
                             for value in index.values.values_of(&key) {
                                 if self.value_passes(c, interval, &batch, row, value, ctx)? {

@@ -268,6 +268,57 @@ impl std::ops::Deref for SharedLeafBytes {
     }
 }
 
+/// Memo behind [`BinaryIndexStore::predicate_id_for_sid`]: the map, and per
+/// namespace code the name lengths (mod 64) its predicates have, so most IRIs
+/// that are not predicates — every one outside a predicate's namespace — are
+/// answered without hashing their name.
+struct PredicateIdsBySid {
+    by_sid: rustc_hash::FxHashMap<Sid, u32>,
+    /// Indexed by namespace code, up to the highest one a predicate uses.
+    name_lengths: Box<[u64]>,
+}
+
+impl PredicateIdsBySid {
+    fn new(sids: &[Sid]) -> Self {
+        let top = sids
+            .iter()
+            .map(|sid| usize::from(sid.namespace_code) + 1)
+            .max()
+            .unwrap_or(0);
+        let mut name_lengths = vec![0u64; top];
+        let mut by_sid = rustc_hash::FxHashMap::default();
+        by_sid.reserve(sids.len());
+        for (p_id, sid) in sids.iter().enumerate() {
+            name_lengths[usize::from(sid.namespace_code)] |= Self::length_bit(sid);
+            by_sid.insert(sid.clone(), p_id as u32);
+        }
+        Self {
+            by_sid,
+            name_lengths: name_lengths.into(),
+        }
+    }
+
+    #[inline]
+    fn length_bit(sid: &Sid) -> u64 {
+        1 << (sid.name.len() % 64)
+    }
+
+    #[inline]
+    fn get(&self, sid: &Sid) -> Option<u32> {
+        let lengths = *self.name_lengths.get(usize::from(sid.namespace_code))?;
+        if lengths & Self::length_bit(sid) == 0 {
+            return None;
+        }
+        self.by_sid.get(sid).copied()
+    }
+}
+
+/// Slot of [`BinaryIndexStore::predicate_subject_id`]'s memo before its
+/// predicate is resolved.
+const PREDICATE_SUBJECT_UNRESOLVED: u64 = u64::MAX;
+/// Slot of a predicate whose IRI is no subject.
+const PREDICATE_NOT_A_SUBJECT: u64 = u64::MAX - 1;
+
 /// Index store — reads FLI3/FBR3/FHS1 artifacts via FIR6 root.
 ///
 /// - Routing via `BranchManifest` (sidecar CIDs for history)
@@ -324,6 +375,12 @@ pub struct BinaryIndexStore {
     /// configuration (`set_ns_split_mode`, namespace augmentation), which
     /// cannot occur once the store is behind `Arc`.
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
+    /// Per persisted predicate, the subject id of its IRI, each resolved on
+    /// its first use. See [`Self::predicate_subject_id`].
+    pred_subject_ids: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+    /// Persisted `Sid → p_id`, built on first use from `p_sid_table`. See
+    /// [`Self::predicate_id_for_sid`].
+    p_id_by_sid: std::sync::OnceLock<PredicateIdsBySid>,
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
@@ -393,6 +450,8 @@ impl BinaryIndexStore {
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            pred_subject_ids: std::sync::OnceLock::new(),
+            p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         }
     }
@@ -575,6 +634,8 @@ impl BinaryIndexStore {
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            pred_subject_ids: std::sync::OnceLock::new(),
+            p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         })
     }
@@ -1891,6 +1952,79 @@ impl BinaryIndexStore {
         })
     }
 
+    /// The persisted subject id of predicate `p_id`'s IRI: `Some` when that
+    /// IRI is also a subject or a ref object in this index, `None` when it is
+    /// only ever a predicate (or `p_id` is not a persisted predicate).
+    ///
+    /// One IRI is encoded twice: as an `EncodedPid` where a pattern reaches it
+    /// in predicate position, as an `EncodedSid` where it is a subject or
+    /// object. Equality surfaces map the first onto the second through this on
+    /// every predicate-valued key, so it must cost a load, not a dictionary
+    /// lookup. Each predicate resolves on its own first use, so a query pays
+    /// one dictionary lookup per predicate it meets, never one per predicate
+    /// the index holds. A dictionary I/O error is reported as `None` and not
+    /// memoized.
+    #[inline]
+    pub fn predicate_subject_id(&self, p_id: u32) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let slot = self
+            .pred_subject_ids
+            .get()
+            .and_then(|slots| slots.get(p_id as usize));
+        if let Some(slot) = slot {
+            match slot.load(Ordering::Relaxed) {
+                PREDICATE_NOT_A_SUBJECT => return None,
+                PREDICATE_SUBJECT_UNRESOLVED => {}
+                s_id => return Some(s_id),
+            }
+        }
+        self.predicate_subject_id_slow(p_id)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn predicate_subject_id_slow(&self, p_id: u32) -> Option<u64> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let slot = self
+            .pred_subject_ids
+            .get_or_init(|| {
+                (0..self.p_sid_table().len())
+                    .map(|_| AtomicU64::new(PREDICATE_SUBJECT_UNRESOLVED))
+                    .collect()
+            })
+            .get(p_id as usize)?;
+        let sid = &self.p_sid_table()[p_id as usize];
+        match self.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+            Ok(found) => {
+                // A subject id is a namespace code and a local id below the
+                // two sentinels; one that is not is answered unmemoized.
+                match found {
+                    None => slot.store(PREDICATE_NOT_A_SUBJECT, Ordering::Relaxed),
+                    Some(s_id) if s_id < PREDICATE_NOT_A_SUBJECT => {
+                        slot.store(s_id, Ordering::Relaxed);
+                    }
+                    Some(_) => {}
+                }
+                found
+            }
+            Err(e) => {
+                tracing::debug!(p_id, error = %e, "predicate subject id lookup failed");
+                None
+            }
+        }
+    }
+
+    /// The persisted `p_id` of a predicate IRI given as a canonical `Sid`,
+    /// without building its IRI string — the per-row form of
+    /// [`Self::sid_to_p_id`]. An IRI in no predicate's namespace answers on a
+    /// bit test.
+    #[inline]
+    pub fn predicate_id_for_sid(&self, sid: &Sid) -> Option<u32> {
+        self.p_id_by_sid
+            .get_or_init(|| PredicateIdsBySid::new(self.p_sid_table()))
+            .get(sid)
+    }
+
     /// Lookup a predicate IRI → p_id.
     pub fn find_predicate_id(&self, iri: &str) -> Option<u32> {
         self.dicts.predicate_reverse.get(iri).copied()
@@ -3038,6 +3172,11 @@ impl BinaryGraphView {
     /// Check whether this view has DictNovelty attached.
     pub fn has_dict_novelty(&self) -> bool {
         self.dict_novelty.is_some()
+    }
+
+    /// The novelty dictionary this view resolves novel ids through.
+    pub fn dict_novelty(&self) -> Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>> {
+        self.dict_novelty.as_ref()
     }
 
     // ── Internal watermark helpers ──────────────────────────────────────

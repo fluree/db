@@ -47,6 +47,8 @@ mod it_query_jsonld_compound;
 mod it_query_list_functions;
 #[path = "it_query_misc.rs"]
 mod it_query_misc;
+#[path = "it_query_optional_encoded_bindings.rs"]
+mod it_query_optional_encoded_bindings;
 #[path = "it_query_optional_hashjoin.rs"]
 mod it_query_optional_hashjoin;
 #[path = "it_query_post_order_limit.rs"]

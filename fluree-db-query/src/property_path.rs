@@ -1496,15 +1496,23 @@ impl PropertyPathOperator {
                     Binding::Iri(iri) => db_for_encode.encode_iri(iri),
                     // Indexed BinaryScan emits late-materialized EncodedSid for a
                     // correlated path endpoint (e.g. the ?mid of `?s p1 ?mid . ?mid p2+ ?o`
-                    // with a bound subject). Resolve its raw s_id (only meaningful within
-                    // this single ledger, which property paths already require) to its IRI
-                    // via the active graph's store, then re-encode against the same graph —
-                    // matching the `IriMatch`/`Iri` arms above. Without this arm the binding
-                    // resolved to None and fell into the full-closure branch, pairing the
-                    // row with the entire p2 closure.
-                    Binding::EncodedSid { s_id, .. } => binary_store
-                        .and_then(|st| st.resolve_subject_iri(*s_id).ok())
+                    // with a bound subject), and a batched join lane binds a subject
+                    // minted since the last index by its novelty id. Resolve the id
+                    // (only meaningful within this single ledger, which property paths
+                    // already require) to its IRI through the novelty-aware graph view,
+                    // then re-encode against the same graph — matching the
+                    // `IriMatch`/`Iri` arms above. Without this arm the binding resolved
+                    // to None and fell into the full-closure branch, pairing the row
+                    // with the entire p2 closure.
+                    Binding::EncodedSid { s_id, .. } => ctx
+                        .graph_view()
+                        .and_then(|gv| gv.resolve_subject_iri(*s_id).ok())
                         .and_then(|iri| db_for_encode.encode_iri(&iri)),
+                    // A predicate the scan reached in predicate position (`ex:s1 ?p ?o .
+                    // ?p ex:parentProp+ ?super`), the same full-closure trap.
+                    Binding::EncodedPid { p_id } => binary_store
+                        .and_then(|st| st.resolve_predicate_iri(*p_id))
+                        .and_then(|iri| db_for_encode.encode_iri(iri)),
                     _ => None,
                 }),
             }

@@ -114,8 +114,8 @@ impl GroupByOperator {
         self.group_key_indices
             .iter()
             .map(|&idx| {
-                let (store, gv) = EqualityNorm::parts(&self.norm);
-                normalize_for_key(&row[idx], store, gv)
+                let (dicts, gv) = EqualityNorm::parts(&self.norm);
+                normalize_for_key(&row[idx], dicts, gv)
             })
             .collect()
     }

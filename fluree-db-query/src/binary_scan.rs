@@ -34,7 +34,9 @@ use crate::error::{QueryError, Result};
 use crate::fast_path_common::{contiguous_id_range, subject_ref_to_s_id};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function};
-use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
+use crate::object_binding::{
+    is_arena_o_type, late_materialized_object_binding, materialized_object_binding,
+};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{Operator, OperatorState};
 use crate::sid_iri;
@@ -1385,6 +1387,9 @@ impl BinaryScanOperator {
             // In particular, `?x ?x ?o` would otherwise compare EncodedSid vs EncodedPid.
             && !self.check_s_eq_p
             && !self.check_p_eq_o;
+        // A member of a union of graphs binds its arena-backed literals
+        // decoded: their handles name a value only within this graph.
+        let decode_arena_literals = ctx.is_some_and(|c| c.graph_union_member);
 
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
@@ -1527,9 +1532,11 @@ impl BinaryScanOperator {
                 let binding = if needs_o_decode || !late_materialize {
                     let val = decoded_o.expect("decoded object required");
                     materialized_object_binding(self.store(), o_type, p_id, val, t_opt, None)
-                } else if let Some(encoded) =
+                } else if let Some(encoded) = if decode_arena_literals && is_arena_o_type(o_type) {
+                    None
+                } else {
                     late_materialized_object_binding(o_type, o_key, p_id, t_enc, o_i, None)
-                {
+                } {
                     encoded
                 } else {
                     // Fallback: decode if we don't have a safe encoded representation.
@@ -2124,6 +2131,7 @@ impl Operator for BinaryScanOperator {
             p_bound = p_sid.is_some(),
             ?filter.s_id,
             ?filter.p_id,
+            arena_literals_decoded = ctx.graph_union_member,
             "BinaryScanOperator::open"
         );
 
@@ -2937,6 +2945,7 @@ impl Operator for BinaryScanOperator {
             order = ?order,
             g_id = self.g_id,
             pattern = ?self.pattern,
+            arena_literals_decoded = ctx.graph_union_member,
             "BinaryScanOperator::open"
         );
 
