@@ -841,9 +841,9 @@ async fn non_annotation_ledger_skips_inject_annotations() {
 #[tokio::test]
 async fn explain_expands_annotations_as_the_executor_does() {
     // `/explain` must expand an `@annotation` pattern the way the executor
-    // does (the base edge and the reifier's `rdf:reifies` link), or an
-    // annotated query explains as nearly empty, and must report the stats the
-    // index build wrote.
+    // does (the body and the reifier's `rdf:reifies` link), or an annotated
+    // query explains as nearly empty, and must report the stats the index
+    // build wrote.
     use crate::support::graphdb_from_ledger;
 
     let fluree = FlureeBuilder::memory()
@@ -899,7 +899,6 @@ async fn explain_expands_annotations_as_the_executor_does() {
                 .collect();
             for expected in [
                 "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies",
-                "ex:worksFor",
                 "ex:role",
             ] {
                 assert!(

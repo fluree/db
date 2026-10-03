@@ -132,17 +132,25 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, one_graph: bool) {
             body,
             term,
         } => {
-            // Build the chain (the body, the annotation's link to the edge,
-            // and the base edge) into a local vector. It is wrapped in
+            // Build the chain (the body and the annotation's link to the
+            // edge) into a local vector. It is wrapped in
             // `Pattern::DefaultGraphSource` when the default graph is a union,
             // so the per-source iteration correlates them; otherwise one graph
             // is in scope and the chain joins its enclosing block.
             //
             // The order is the planner's tie-break: the body and the link are
-            // probes by reifier, the term's components then decode from the
-            // bound term, and the base edge last is an existence check on
-            // three bound positions. Estimates still decide where they differ
-            // (a constant subject makes the base edge the cheaper entry).
+            // probes by reifier, and the term's components then decode from
+            // the bound term. Estimates still decide where they differ (a
+            // constant subject anchors the components through the term
+            // dictionary).
+            //
+            // The base edge is not joined: every write that attaches a
+            // reifier asserts its edge in the same graph and commit, and
+            // retracting the edge retracts the attachment, so a live link
+            // names a live edge; a policy that hides the edge hides the link.
+            // Joining it anyway probed the edge once per annotation. A
+            // reifier that does not assert its triple would end that
+            // invariant, and with it this elision.
             let mut chain: Vec<Pattern> = Vec::new();
 
             // 1. Body patterns (recursively expanded so nested annotations —
@@ -160,22 +168,16 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, one_graph: bool) {
             ));
             crate::ir::term_components::link_patterns(
                 annotation,
-                edge.clone(),
+                edge,
                 reifies,
                 || term,
                 &|_| None,
                 &mut chain,
             );
 
-            // 3. Base edge triple: provides visibility. The standard scan
-            //    applies snapshot rules + policy filters here, so an
-            //    operator-style visibility check is redundant.
-            chain.push(Pattern::Triple(edge));
-
             // Under a default-graph union the `DefaultGraphSource` wrapper
             // switches the execution context to one member at a time, so the
-            // base edge and the link come from the same graph; without it a
-            // base edge from `g1` would pair with a link from `g2`.
+            // body and the link come from the same graph.
 
             if one_graph {
                 // One graph is in scope (an enclosing `Pattern::Graph`, or a
@@ -6647,11 +6649,11 @@ mod tests {
         let expanded = expand_edge_annotation_patterns(&patterns);
         let chain = unwrap_default_graph_source(&expanded[0]);
         // body triple + link + its predicate filter + term components +
-        // base + the sunk FILTER
-        assert_eq!(chain.len(), 6);
+        // the sunk FILTER
+        assert_eq!(chain.len(), 5);
         assert_eq!(filter_count(chain), 1);
         assert!(
-            matches!(chain[5], Pattern::Filter(_)),
+            matches!(chain[4], Pattern::Filter(_)),
             "the FILTER sinks to the end of the chain, where the body is: {chain:?}"
         );
         // Copied, not relocated: the original keeps feeding
