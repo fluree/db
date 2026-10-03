@@ -132,20 +132,6 @@ pub(crate) fn parse_and_lower_sparql_update(
         return Err(ApiError::sparql(message, errors));
     }
 
-    // Transaction options a `# PRAGMA` names, under the same precedence as
-    // their JSON-LD `opts` twins: a value the caller set programmatically wins.
-    let mut txn_opts = txn_opts;
-    if txn_opts.validation_mode.is_none() {
-        txn_opts.validation_mode = ast
-            .pragmas
-            .validation_mode
-            .as_deref()
-            .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
-    }
-    if txn_opts.unique_properties.is_none() {
-        txn_opts.unique_properties = ast.pragmas.unique_properties.clone();
-    }
-
     let mut ns = NamespaceRegistry::from_db(snapshot);
     lower_sparql_update_request(&ast, &mut ns, txn_opts)
         .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))
@@ -527,6 +513,7 @@ impl<'a> TransactCore<'a> {
             (Some(opts), _) => Tracker::new(opts.clone()),
             (None, Some(sparql)) => crate::query::helpers::tracker_for_input_limits(
                 &crate::view::QueryInput::Sparql(sparql),
+                None,
             ),
             (None, None) => Tracker::disabled(),
         }

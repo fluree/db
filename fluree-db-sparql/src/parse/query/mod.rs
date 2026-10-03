@@ -7,6 +7,7 @@ mod describe;
 mod modifier;
 mod pattern;
 mod pragma;
+pub use pragma::pragma_names;
 mod select;
 mod term;
 mod update;
@@ -125,15 +126,12 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
 /// before it parses the request to run it — a fuel cap, a policy selection, a
 /// `min-t` wait.
 ///
-/// Text that never mentions `pragma` returns the defaults without parsing. A
-/// request that fails to parse for any other reason also returns the defaults:
-/// it will not run, and the parse that would run it reports the error.
+/// Text with no comment that could be a `# PRAGMA` returns the defaults
+/// without parsing. A request that fails to parse for any other reason also
+/// returns the defaults: it will not run, and the parse that would run it
+/// reports the error.
 pub fn request_pragmas(input: &str) -> Result<Pragmas, String> {
-    let mentions_pragma = input
-        .as_bytes()
-        .windows(6)
-        .any(|w| w.eq_ignore_ascii_case(b"pragma"));
-    if !mentions_pragma {
+    if !may_carry_pragma(input) {
         return Ok(Pragmas::default());
     }
     let output = parse_sparql(input);
@@ -151,6 +149,19 @@ pub fn request_pragmas(input: &str) -> Result<Pragmas, String> {
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// Whether some `#` in `input` is followed, past further `#`s and same-line
+/// whitespace, by `pragma` in any case. That covers every comment the parser
+/// reads as a directive, without lexing; a `#` inside a string or IRI can only
+/// cost a parse, never hide a pragma.
+fn may_carry_pragma(input: &str) -> bool {
+    input.match_indices('#').any(|(at, _)| {
+        input[at..]
+            .trim_start_matches(|c: char| c == '#' || (c.is_whitespace() && c != '\n' && c != '\r'))
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("pragma"))
+    })
 }
 
 /// Parse a group graph pattern from a token stream.

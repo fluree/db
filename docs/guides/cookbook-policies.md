@@ -311,8 +311,9 @@ curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \
 ### SPARQL (pragmas or headers)
 
 SPARQL carries the same options as `# PRAGMA` comments in the query text (see
-[Request options](../query/sparql.md#request-options--pragma)), which win over
-the headers below:
+[Request options](../query/sparql.md#request-options--pragma)). On an
+unauthenticated request they win over the headers below; on an authenticated one,
+a policy pragma may only repeat the selection the headers make:
 
 ```sparql
 # PRAGMA identity: ex:aliceIdentity

@@ -2464,14 +2464,15 @@ pub(crate) async fn submit_sparql_update(
 ) -> Result<Response> {
     let tx_id = compute_tx_id_sparql(&sparql);
 
-    // `# PRAGMA` options win over the headers that name the same thing. The
-    // transaction-level ones (`validation-mode`, `unique-properties`) ride the
-    // text itself and are applied where it is lowered.
+    // `# PRAGMA` options merge with the headers as `with_sparql_pragmas`
+    // describes. The transaction-level ones (`validation-mode`,
+    // `unique-properties`) ride the text itself and are applied where it is
+    // lowered.
     let pragmas = fluree_db_sparql::request_pragmas(&sparql).map_err(|e| {
         set_span_error_code(parent_span, "error:BadRequest");
         ServerError::bad_request(e)
     })?;
-    let headers = &headers.clone().with_sparql_pragmas(&pragmas);
+    let headers = &headers.clone().with_sparql_pragmas(&pragmas)?;
 
     // Resolve the ledger handle up front: a missing ledger surfaces as a 404
     // here, and the handle provides the canonical ledger ID for commit_opts.

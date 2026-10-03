@@ -189,7 +189,7 @@ curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \
   -d 'SELECT ?name WHERE { ?p <http://schema.org/name> ?name }'
 ```
 
-A pragma wins over the header that names the same option, and both are held to the caller's credential the same way. A pragma's prefixed name expands against the query's own `PREFIX` declarations; a header takes the IRI as written. The inline policy document has no pragma: send it with the `fluree-policy` header. The full header set is documented in the [policy model](policy-model.md#request-time-options).
+On an unauthenticated request, a pragma wins over the header that names the same option. On an authenticated one, the headers' policy selection stands: a policy pragma may repeat it or narrow `default-allow` to `false`, and anything else is refused with a `403`. If the headers select no policy, the pragmas do. Either way, the selection is held to the caller's credential. A pragma's prefixed name expands against the query's own `PREFIX` declarations; a header takes the IRI as written. The inline policy document has no pragma: send it with the `fluree-policy` header. The full header set is documented in the [policy model](policy-model.md#request-time-options).
 
 ## JSON-LD queries
 
