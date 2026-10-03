@@ -371,3 +371,49 @@ async fn agent_json_pinned_paging_is_disjoint_and_complete() {
         "pages are disjoint and together cover all 4 rows: {s1:?} {s2:?}"
     );
 }
+
+/// The connection's identity selects policy and `t` pins the snapshot, so a
+/// pragma naming either is refused rather than silently ignored; `max-fuel`
+/// still caps the query.
+#[tokio::test]
+async fn sparql_query_pragmas() {
+    let (_tmp, state) = test_state().await;
+    create_ledger(&state, "test:pragmas").await;
+    insert(&state, "test:pragmas", rows_graph(3)).await;
+    let svc = FlureeToolService::new(state.clone());
+
+    for pragma in [
+        "# PRAGMA identity: <did:key:someone-else>",
+        "# PRAGMA policy-class: <http://example.org/Open>",
+        "# PRAGMA default-allow: true",
+        "# PRAGMA min-t: 1",
+    ] {
+        let err = svc
+            .execute_sparql_agent_json(
+                "test:pragmas",
+                &format!("{pragma}\n{QUERY}"),
+                None,
+                None,
+                32_768,
+            )
+            .await
+            .expect_err(pragma);
+        assert!(
+            err.to_string()
+                .contains("does not take policy or min-t pragmas"),
+            "{pragma}: {err}"
+        );
+    }
+
+    let err = svc
+        .execute_sparql_agent_json(
+            "test:pragmas",
+            &format!("# PRAGMA max-fuel: 0.5\n{QUERY}"),
+            None,
+            None,
+            32_768,
+        )
+        .await
+        .expect_err("a sub-floor max-fuel");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+}

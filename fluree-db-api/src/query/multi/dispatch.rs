@@ -730,12 +730,22 @@ async fn execute_subquery(
     // user-supplied envelope `meta: true` clobber a server-forced
     // bearer identity. Precedence (most specific wins):
     //
-    //   sub.query["opts"]   ← body (server may pre-inject here)
+    //   sub.query["opts"]   ← body (server may pre-inject here); for a
+    //                         SPARQL alias, its `# PRAGMA` options
     //   sub.opts            ← per-sub-query override
     //   envelope.opts       ← envelope defaults
-    let body_opts = sub.query.as_object().and_then(|o| o.get("opts").cloned());
+    let body_opts = match sub.language {
+        SubqueryLanguage::JsonLd => sub.query.as_object().and_then(|o| o.get("opts").cloned()),
+        SubqueryLanguage::Sparql => {
+            super::sparql_pragma_opts(sub.query.as_str().unwrap_or_default())
+                .map_err(ApiError::invalid_query)?
+        }
+    };
     let envelope_with_sub = merged_opts(envelope_opts, sub.opts.as_ref());
-    let merged_opts_val = merged_opts(envelope_with_sub.as_ref(), body_opts.as_ref());
+    let mut merged_opts_val = merged_opts(envelope_with_sub.as_ref(), body_opts.as_ref());
+    if matches!(sub.language, SubqueryLanguage::Sparql) {
+        super::hold_pragma_tracking(&mut merged_opts_val, envelope_with_sub.as_ref());
+    }
     let tracking_opts = TrackingOptions::from_opts_value(merged_opts_val.as_ref());
     let tracking_enabled = tracking_opts.track_time
         || tracking_opts.track_fuel
@@ -809,10 +819,9 @@ async fn execute_subquery(
                 .filter(|cfg| !matches!(cfg.format, OutputFormat::JsonLd))
                 .cloned();
 
-            // Policy enforcement for SPARQL aliases. SPARQL bodies carry no
-            // `opts` block, so identity / policy-class / inline policy can only
-            // reach execution through the merged envelope/sub opts assembled
-            // above. Parse them into `GovernanceOptions` and thread them
+            // Policy enforcement for SPARQL aliases. Identity / policy-class /
+            // inline policy reach execution through the merged envelope/sub/
+            // pragma opts assembled above. Parse them into `GovernanceOptions` and thread them
             // down; `run_sparql_subquery` only diverts to the policy path when
             // an actual policy input is present. The identity here is whatever
             // the caller (HTTP handler) resolved through its impersonation gate

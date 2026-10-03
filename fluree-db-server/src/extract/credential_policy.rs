@@ -97,6 +97,22 @@ fn conflict(field: &str) -> ServerError {
     .into()
 }
 
+/// Hold a SPARQL request's policy pragmas to the selection its headers (or a
+/// multi-query alias's envelope options) make under a bound credential. That
+/// selection is the credential holder's — often an application forwarding its
+/// end user's text — so a pragma may repeat it or narrow `default-allow` to
+/// false, but never change it or add to it. When the selection is empty, the
+/// pragmas make it, and the credential then holds them like any request.
+pub(crate) fn validate_pragma_selection(
+    pragmas: &GovernanceOptions,
+    selection: &GovernanceOptions,
+) -> Result<()> {
+    if selection.has_any_policy_inputs() {
+        validate_selection(pragmas, selection, true)?;
+    }
+    Ok(())
+}
+
 fn validate_selection(
     requested: &GovernanceOptions,
     bound: &GovernanceOptions,

@@ -5,7 +5,7 @@
 use crate::query::helpers::{
     build_query_result, charge_query_floor, lower_sparql_ast, parse_and_validate_sparql,
     parse_jsonld_query, parse_sparql_to_ir, prepare_for_execution, sparql_ast_has_dataset,
-    status_for_query_error, tracked_query_tracker, tracker_for_limits,
+    status_for_query_error, tracked_query_tracker, tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, QueryInput};
 use crate::{
@@ -131,10 +131,7 @@ impl Fluree {
         // tracked. (The single-ledger fast path above delegates to `query`,
         // which charges the floor itself — so we only reach here, and charge
         // once, on the genuine multi-ledger/dataset path.)
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
+        let tracker = tracker_for_input_limits(&input, parsed_ast.as_ref());
         charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Parse to common IR (using primary db for namespace resolution).
@@ -253,10 +250,7 @@ impl Fluree {
         // `max-fuel` is rejected before parse/plan; no-op when fuel isn't
         // tracked. (The single-ledger fast path above delegates to
         // `query_view_with_r2rml`, which charges the floor — so we charge once.)
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
+        let tracker = tracker_for_input_limits(&input, None);
         charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Parse to common IR (using primary db for namespace resolution).
@@ -352,7 +346,7 @@ impl Fluree {
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         // Tracker: caller-provided options if given, else per-input defaults.
-        let tracker = tracked_query_tracker(&input, &tracking_override);
+        let tracker = tracked_query_tracker(&input, &tracking_override, parsed_ast.as_ref());
 
         // Charge the one-time query floor before parsing (see `query_tracked`).
         charge_query_floor(&tracker)
@@ -479,7 +473,7 @@ impl Fluree {
     {
         let input = q.into();
 
-        let tracker = tracked_query_tracker(&input, &tracking_override);
+        let tracker = tracked_query_tracker(&input, &tracking_override, None);
 
         // Charge the one-time query floor before parsing (see `query_tracked`).
         charge_query_floor(&tracker)

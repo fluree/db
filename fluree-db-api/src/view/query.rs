@@ -4,9 +4,10 @@
 //! a GraphDb, respecting policy and reasoning wrappers.
 
 use crate::query::helpers::{
-    build_query_result, charge_query_floor, lower_sparql_ast, parse_and_validate_sparql,
-    parse_cypher_to_ir, parse_jsonld_query, prepare_for_execution, sparql_ast_has_dataset,
-    status_for_query_error, tracked_query_tracker, tracker_for_limits,
+    build_query_result, charge_query_floor, input_fuel_limit, limits_tracker, lower_sparql_ast,
+    parse_and_validate_sparql, parse_cypher_to_ir, parse_jsonld_query, prepare_for_execution,
+    sparql_ast_has_dataset, status_for_query_error, tracked_query_tracker,
+    tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -370,10 +371,8 @@ impl Fluree {
         // 0. Tracker for fuel limits only (no tracking overhead for non-tracked
         // calls). Charge the floor up front so a sub-floor `max-fuel` is
         // rejected before we spend parse/plan work; no-op when fuel isn't tracked.
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
+        let fuel_limit = input_fuel_limit(&input, sparql_ast.as_ref());
+        let tracker = limits_tracker(fuel_limit);
         charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
@@ -417,10 +416,7 @@ impl Fluree {
             let _guard = residency_cs.as_ref().and_then(|cs| cs.query_guard());
             let mut budget = fluree_db_binary_index::read::need_fetch::RetryBudget::default();
             loop {
-                let round_tracker = match &input {
-                    QueryInput::JsonLd(json) => tracker_for_limits(json),
-                    QueryInput::Sparql(_) => Tracker::disabled(),
-                };
+                let round_tracker = limits_tracker(fuel_limit);
                 charge_query_floor(&round_tracker).map_err(fluree_db_query::QueryError::from)?;
                 let round = self
                     .plan_and_execute_round(db, &vars, &parsed, &round_tracker, &options)
@@ -694,10 +690,7 @@ impl Fluree {
 
         // 0. Tracker (fuel limits only). Charge the floor up front so a
         // sub-floor `max-fuel` is rejected before parse/plan; no-op untracked.
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
+        let tracker = tracker_for_input_limits(&input, sparql_ast.as_ref());
         charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
@@ -838,7 +831,7 @@ impl Fluree {
             let ast = match parse_and_validate_sparql(sparql) {
                 Ok(ast) => ast,
                 Err(e) => {
-                    let tracker = tracked_query_tracker(&input, &tracking_override);
+                    let tracker = tracked_query_tracker(&input, &tracking_override, None);
                     let _ = charge_query_floor(&tracker);
                     return Err(crate::query::TrackedErrorResponse::new(
                         400,
@@ -866,7 +859,7 @@ impl Fluree {
                 }
                 Ok(None) => sparql_ast = Some(ast),
                 Err(e) => {
-                    let tracker = tracked_query_tracker(&input, &tracking_override);
+                    let tracker = tracked_query_tracker(&input, &tracking_override, Some(&ast));
                     let _ = charge_query_floor(&tracker);
                     return Err(crate::query::TrackedErrorResponse::new(
                         400,
@@ -878,7 +871,7 @@ impl Fluree {
         }
 
         // Tracker: caller-provided options if given, else per-input defaults.
-        let tracker = tracked_query_tracker(&input, &tracking_override);
+        let tracker = tracked_query_tracker(&input, &tracking_override, sparql_ast.as_ref());
 
         // Charge the one-time query floor before parsing so a parse/plan error
         // still reports it and a sub-floor max-fuel is rejected up front.
@@ -1001,8 +994,9 @@ impl Fluree {
         // rather than silently ignored. Otherwise the AST is reused for lowering.
         let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            let tracker = tracked_query_tracker(&input, &tracking_override);
-            let ast = match parse_and_validate_sparql(sparql) {
+            let parsed = parse_and_validate_sparql(sparql);
+            let tracker = tracked_query_tracker(&input, &tracking_override, parsed.as_ref().ok());
+            let ast = match parsed {
                 Ok(ast) => ast,
                 Err(e) => {
                     let _ = charge_query_floor(&tracker);
@@ -1034,7 +1028,7 @@ impl Fluree {
             }
         }
 
-        let tracker = tracked_query_tracker(&input, &tracking_override);
+        let tracker = tracked_query_tracker(&input, &tracking_override, sparql_ast.as_ref());
 
         // Charge the one-time query floor before parsing (see `query_tracked`).
         charge_query_floor(&tracker)

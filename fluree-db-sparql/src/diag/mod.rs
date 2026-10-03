@@ -179,6 +179,11 @@ pub enum DiagCode {
     #[serde(rename = "F011")]
     AnonymousAnnotationInDelete,
 
+    /// `# PRAGMA` directive with an unknown name, a malformed value, or one
+    /// that does not apply to the request form
+    #[serde(rename = "F012")]
+    InvalidPragma,
+
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
@@ -238,6 +243,7 @@ impl DiagCode {
             Self::AnonymousAnnotationInGroundData => "V008",
             Self::BlankNodeInDelete => "F010",
             Self::AnonymousAnnotationInDelete => "F011",
+            Self::InvalidPragma => "F012",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

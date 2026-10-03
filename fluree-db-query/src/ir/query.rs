@@ -371,7 +371,7 @@ pub struct Query {
     /// filter that hides Fluree-system predicates (`f:reifies*` in
     /// every graph; the broader `f:` namespace in the default graph).
     /// Surfaced via `opts.includeSystemFacts: true` on JSON-LD
-    /// queries; SPARQL has no equivalent option today.
+    /// queries and `# PRAGMA include-system-facts: true` on SPARQL.
     ///
     /// Direct user mention of `f:reifies*` IRIs is rejected at parse
     /// time (`fluree-db-query` JSON-LD firewall and `fluree-db-sparql`
