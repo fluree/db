@@ -1198,9 +1198,11 @@ WHERE {
 
 SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
 
-- **`WITH <iri>`**: sets the default graph for INSERT/DELETE templates that don’t use an explicit `GRAPH <iri> { ... }` block.
-- **`USING <iri>`**: scopes the default graph(s) for `WHERE` evaluation. Repeated `USING` clauses are evaluated as a **merged default graph**.
-- **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs.
+- **`WITH <iri>`**: sets the default graph for INSERT/DELETE templates that don’t use an explicit `GRAPH <iri> { ... }` block. With no `USING` or `USING NAMED` clause, it also sets the default graph for `WHERE` evaluation. A graph that doesn’t exist reads as empty, so the `WHERE` matches nothing; it never falls back to the ledger’s default graph.
+- **`USING <iri>`**: scopes the default graph(s) for `WHERE` evaluation. Repeated `USING` clauses are evaluated as a **merged default graph**. A graph that doesn’t exist contributes nothing, so a lone `USING` of an unknown graph gives the `WHERE` an empty default graph.
+- **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs. With `USING NAMED` and no `USING`, the `WHERE`’s default graph is empty.
+
+The ledger’s own address (`mydb`, `mydb:main` or `urn:fluree:mydb:main`, with no `#fragment` and no time pin) names the ledger’s default graph in `USING` and `WITH`. `WITH <mydb:main>` therefore reads and writes the default graph and never creates a named graph called `mydb:main`. Only these two clauses treat the address this way: a `GRAPH <iri>` block in a template or in the `WHERE`, `USING NAMED`, and an `INSERT DATA`/`DELETE DATA` quad resolve it like any other graph IRI. The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
 
 ### Graph variables in templates
 

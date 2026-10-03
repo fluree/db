@@ -4513,7 +4513,7 @@ mod tests {
                 objects: vec![RawObject::Iri("http://example.org/evil".to_string())],
             }],
             reified: Vec::new(),
-            prefixes: rustc_hash::FxHashMap::default(),
+            prefixes: Default::default(),
         };
         let mut ns = NamespaceRegistry::new();
         let err = convert_named_graphs_to_templates(&[block], &mut ns)
@@ -4564,7 +4564,7 @@ mod tests {
                 objects: vec![RawObject::Iri("http://example.org/b".to_string())],
             }],
             reified: Vec::new(),
-            prefixes: rustc_hash::FxHashMap::default(),
+            prefixes: Default::default(),
         };
         let mut ns = NamespaceRegistry::new();
         let err = convert_named_graphs_to_templates(&[block], &mut ns)
@@ -4586,7 +4586,7 @@ mod tests {
                 objects: vec![RawObject::Iri("http://example.org/b".to_string())],
             }],
             reified: Vec::new(),
-            prefixes: rustc_hash::FxHashMap::default(),
+            prefixes: Default::default(),
         };
         let mut ns = NamespaceRegistry::new();
         let err = convert_named_graphs_to_templates(&[block], &mut ns)
@@ -4608,7 +4608,7 @@ mod tests {
                 objects: vec![RawObject::Iri("_:other".to_string())],
             }],
             reified: Vec::new(),
-            prefixes: rustc_hash::FxHashMap::default(),
+            prefixes: Default::default(),
         };
         let mut ns = NamespaceRegistry::new();
         let (templates, _delta) =

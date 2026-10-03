@@ -1516,6 +1516,89 @@ GRAPH <http://example.org/graphs/audit> {
     );
 }
 
+/// Bulk import reads a `.trig` file with graph blocks through TriG phase 1,
+/// which rebuilt the default graph with every directive first and expanded
+/// every block with the file's final prefix map. A redefined `@prefix` must
+/// apply only to what follows it, in the default graph and in the blocks.
+#[tokio::test]
+async fn import_trig_applies_a_redefined_prefix_only_after_it() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig = "@prefix ex: <http://a.org/> .\n\
+                ex:x ex:p \"d1\" .\n\
+                GRAPH <http://example.org/g1> { ex:y ex:p \"g1\" . }\n\
+                @prefix ex: <http://b.org/> .\n\
+                ex:z ex:p \"d2\" .\n\
+                GRAPH <http://example.org/g2> { ex:w ex:p \"g2\" . }\n";
+    let path = data_dir.path().join("data.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create("test/trig-directives:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig import should succeed");
+    let ledger = fluree
+        .ledger("test/trig-directives:main")
+        .await
+        .expect("load ledger");
+
+    let rows = |sparql: &'static str| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            let result = support::query_sparql(fluree, ledger, sparql)
+                .await
+                .expect("query");
+            let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let cell = |c: &serde_json::Value| {
+                c.as_str()
+                    .or_else(|| c.get("@id").and_then(|v| v.as_str()))
+                    .or_else(|| c.get("@value").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| c.to_string())
+            };
+            let mut rows: Vec<String> = json
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|r| {
+                    r.as_array()
+                        .expect("row")
+                        .iter()
+                        .map(cell)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            rows.sort();
+            rows
+        }
+    };
+    assert_eq!(
+        rows("SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await,
+        [
+            "http://a.org/x http://a.org/p d1",
+            "http://b.org/z http://b.org/p d2",
+        ],
+        "default graph"
+    );
+    assert_eq!(
+        rows("SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }").await,
+        [
+            "http://example.org/g1 http://a.org/y http://a.org/p g1",
+            "http://example.org/g2 http://b.org/w http://b.org/p g2",
+        ],
+        "graph blocks"
+    );
+}
+
 /// TriG-star inside a `GRAPH` block on the bulk-import path: the reifier
 /// bundle is spooled into the named graph's index and the annotation is
 /// visible to a named-graph-scoped query.
