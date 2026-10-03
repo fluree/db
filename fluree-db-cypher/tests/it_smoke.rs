@@ -1,3 +1,5 @@
+#![allow(clippy::needless_raw_string_hashes)]
+
 //! Smoke tests: scaffolding compiles and the parse entry point returns.
 
 use fluree_db_cypher::parse_cypher;
@@ -166,5 +168,85 @@ fn keyword_primaries_still_parse_as_constructs() {
             out.diagnostics
         );
         assert!(out.ast.is_some(), "{query} produced no AST");
+    }
+}
+
+// ===========================================================================
+// fluree/db#1873 — a read clause written after a write clause was silently
+// hoisted in front of every write, because `Update` is a fixed
+// reads-then-writes shape with nowhere to record the position.
+// ===========================================================================
+
+/// Parse and return the error message, asserting the statement was rejected.
+fn parse_error(src: &str) -> String {
+    let out = parse_cypher(src);
+    assert!(out.has_errors(), "expected a parse error: {src}");
+    out.diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+#[test]
+fn issue1873_read_after_write_is_rejected() {
+    for (src, kw) in [
+        (r#"MERGE (n:P {id: "w"}) WITH n SET n.nm = "b""#, "WITH"),
+        // The corrupting shape: this one COMMITTED, writing one marker per
+        // pre-MERGE name onto the newly merged node.
+        (
+            r#"MERGE (n:P {name: "Zed"}) WITH n.name AS nm SET n.marker = nm"#,
+            "WITH",
+        ),
+        // Silent zero-flake commit: the filter ran before the SET it reads.
+        (
+            r#"MATCH (n:P) SET n.a = 1 WITH n WHERE n.a = 1 SET n.b = 2"#,
+            "WITH",
+        ),
+        (r#"CREATE (n:P {id: "c"}) WITH n SET n.nm = "a""#, "WITH"),
+        (
+            r#"MATCH (n:P) SET n.a = 1 MATCH (m:Q) SET m.b = 2"#,
+            "MATCH",
+        ),
+        (r#"CREATE (n:P) UNWIND [1, 2] AS x SET n.v = x"#, "UNWIND"),
+        (
+            r#"MERGE (n:P {id: "o"}) OPTIONAL MATCH (m:Q) SET n.v = 1"#,
+            "OPTIONAL MATCH",
+        ),
+    ] {
+        let msg = parse_error(src);
+        assert!(
+            msg.contains(&format!("`{kw}` after a write clause")),
+            "must name the offending clause: {msg} (for {src})"
+        );
+        assert!(
+            msg.contains("silently rearranged"),
+            "must say why, not just that it is unsupported: {msg}"
+        );
+    }
+}
+
+#[test]
+fn issue1873_reads_before_writes_still_parse() {
+    // The guard keys off source position, not clause kind. These have every
+    // read ahead of every write, so nothing is hoisted and all must parse —
+    // including the shape that is structurally identical to a hoisted one in
+    // the AST (`[Match, With] / [Merge, Set]`) and distinguishable only by
+    // position.
+    for src in [
+        r#"MATCH (a:P {id: "a"}) WITH a MERGE (b:Q {id: "z"}) SET b.x = 1"#,
+        r#"MATCH (n:P) WITH n, n.name AS nm SET n.marker = nm"#,
+        r#"MERGE (n:P {id: "y"}) SET n.nm = "a""#,
+        r#"CREATE (n:P {id: "c9"})"#,
+        r#"MATCH (n:P) SET n.a = 1 SET n.b = 2"#,
+        r#"UNWIND [1, 2] AS x CREATE (n:P {v: x})"#,
+        r#"MATCH (n:P) RETURN n"#,
+    ] {
+        let out = parse_cypher(src);
+        assert!(
+            !out.has_errors(),
+            "must still parse: {src} -> {:?}",
+            out.diagnostics
+        );
     }
 }
