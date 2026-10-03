@@ -26,9 +26,9 @@ use std::sync::Arc;
 
 use fluree_db_core::ledger_config::{
     DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphSourceRef, LedgerConfig,
-    OntologyImportBinding, OverrideControl, PolicyDefaults, ReasoningDefaults, ResolvedConfig,
-    RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy,
-    ValidationMode,
+    OntologyImportBinding, OverrideControl, PolicyDefaults, QueryDefaults, ReasoningDefaults,
+    ResolvedConfig, RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode,
+    TrustPolicy, ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
 use fluree_db_novelty::Novelty;
@@ -71,6 +71,7 @@ pub async fn resolve_ledger_config(
     let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let query = read_query_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
 
     Ok(Some(LedgerConfig {
@@ -82,6 +83,7 @@ pub async fn resolve_ledger_config(
         transact,
         full_text,
         serving,
+        query,
         graph_overrides,
     }))
 }
@@ -172,7 +174,7 @@ async fn resolve_config_sid(
 }
 
 /// Resolve only the serving posture (`f:servingDefaults`), skipping the other
-/// seven setting groups. The serving gates read only `config.serving`, so this
+/// setting groups. The serving gates read only `config.serving`, so this
 /// avoids the wasted group reads a full [`resolve_ledger_config`] would do.
 pub async fn resolve_serving_only(
     snapshot: &LedgerSnapshot,
@@ -1467,6 +1469,40 @@ async fn read_serving_defaults(
         serve_query,
         serve_blocks,
         public_visibility,
+    }))
+}
+
+/// Read query defaults from the LedgerConfig subject.
+///
+/// Ledger-scoped group: read only off `f:LedgerConfig` (never GraphConfig)
+/// and carries no override control.
+async fn read_query_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<QueryDefaults>> {
+    let Some(group_sid) = read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::QUERY_DEFAULTS,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let union_default_graph = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::UNION_DEFAULT_GRAPH,
+    )
+    .await?;
+    Ok(Some(QueryDefaults {
+        union_default_graph,
     }))
 }
 

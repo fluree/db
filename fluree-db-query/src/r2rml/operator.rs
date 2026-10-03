@@ -1047,7 +1047,7 @@ impl R2rmlScanOperator {
             // Scan the table, pushing resolved FILTER predicates for file pruning
             // (column resolution needs the mapping, so it happens here).
             let scan_filters = self.build_scan_filters(triples_map);
-            let as_of_t = if ctx.dataset.is_some() {
+            let as_of_t = if ctx.explicit_dataset().is_some() {
                 None
             } else {
                 Some(ctx.to_t)
@@ -1235,7 +1235,7 @@ impl R2rmlScanOperator {
                     // per-operator cache too so later batches of THIS instance take
                     // the fast local path.
                     if parent_memo {
-                        let as_of_t = if ctx.dataset.is_some() {
+                        let as_of_t = if ctx.explicit_dataset().is_some() {
                             None
                         } else {
                             Some(ctx.to_t)
@@ -1302,7 +1302,7 @@ impl R2rmlScanOperator {
                     parent_projection.sort();
                     parent_projection.dedup();
 
-                    let as_of_t = if ctx.dataset.is_some() {
+                    let as_of_t = if ctx.explicit_dataset().is_some() {
                         None
                     } else {
                         Some(ctx.to_t)
@@ -1343,7 +1343,7 @@ impl R2rmlScanOperator {
                         // through to a per-batch rebuild) if it would push the memo
                         // past its total-rows cap — bounding cross-parent
                         // accumulation the per-operator cache never had.
-                        let as_of_t = if ctx.dataset.is_some() {
+                        let as_of_t = if ctx.explicit_dataset().is_some() {
                             None
                         } else {
                             Some(ctx.to_t)
@@ -2919,7 +2919,7 @@ impl Operator for R2rmlScanOperator {
         // IMPORTANT: In dataset mode, there is no meaningful dataset-level `to_t`.
         // Passing `None` avoids inventing a cross-ledger time and lets the provider
         // select the latest snapshot (or apply its own semantics).
-        let as_of_t = if ctx.dataset.is_some() {
+        let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)

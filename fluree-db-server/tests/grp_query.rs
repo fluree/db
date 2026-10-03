@@ -27,3 +27,5 @@ mod sparql_protocol_dataset_params;
 mod sparql_service_description;
 #[path = "stream_query_integration.rs"]
 mod stream_query_integration;
+#[path = "union_default_graph.rs"]
+mod union_default_graph;

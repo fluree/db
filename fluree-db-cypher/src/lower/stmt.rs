@@ -52,6 +52,7 @@ pub fn lower_query<E: IriEncoder>(
         post_values: None,
         // System-fact filter ON — hides f:reifies* from untyped relationship matches.
         include_system_facts: false,
+        union_default_graph: None,
         cypher_vocab: None,
         // Cypher null: a later pattern using a var an OPTIONAL MATCH left
         // null matches nothing (SPARQL's unbound would match anything).
@@ -148,6 +149,7 @@ fn lower_union_query<E: IriEncoder>(
         reasoning: Default::default(),
         post_values: None,
         include_system_facts: false,
+        union_default_graph: None,
         cypher_vocab: None,
         // Cypher null: a later pattern using a var an OPTIONAL MATCH left
         // null matches nothing (SPARQL's unbound would match anything).

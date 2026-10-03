@@ -1340,6 +1340,7 @@ SELECT ?name WHERE { ?person ex:name ?name }
 | `reasoning` | `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`, `none`, or a list | queries | `reasoning` | — |
 | `reasoning-max-facts`, `reasoning-max-seconds`, `reasoning-max-memory-mb` | integer | queries | `reasoningBudget` | — |
 | `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
+| `union-default-graph` | `true` / `false` | queries | `unionDefaultGraph` | — |
 | `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |
 | `meta` | `true`, `false`, or a list of `time`, `fuel`, `policy` | queries and updates | `meta` | `fluree-track-*` |
 | `max-fuel` | number | queries and updates | `max-fuel` | `fluree-max-fuel` |

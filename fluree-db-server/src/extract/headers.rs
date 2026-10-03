@@ -981,7 +981,9 @@ mod tests {
                 "reasoning-max-facts" | "reasoning-max-seconds" | "reasoning-max-memory-mb" => {
                     ("10", false, None, false, false, None)
                 }
-                "include-system-facts" => ("true", false, None, false, false, None),
+                "include-system-facts" | "union-default-graph" => {
+                    ("true", false, None, false, false, None)
+                }
                 "event-time" => ("2020-01-01T00:00:00Z", true, None, false, false, None),
                 "validation-mode" => ("warn", true, None, false, false, None),
                 "unique-properties" => ("<urn:p>", true, None, false, false, None),

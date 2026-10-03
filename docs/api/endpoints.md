@@ -1502,7 +1502,7 @@ _:service a sd:Service ;
 - **Format:** chosen by `Accept`: JSON-LD (the default), Turtle, N-Triples or RDF/XML. Any other `Accept` is a `406`.
 - **Endpoint IRI:** `sd:endpoint` is the URL the request addressed, taken from `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sets them, otherwise from `Host`.
 - **Auth:** the description sits behind the same authentication as the endpoint. With data auth required, a request without a credential is a `401`.
-- **Features:** no `sd:feature` is claimed. The default graph is not the union of the named graphs, and Fluree has no empty named graph.
+- **Features:** a ledger's endpoint claims `sd:feature sd:UnionDefaultGraph` while the ledger's [`f:unionDefaultGraph`](../ledger-config/setting-groups.md#fquerydefaults--query-defaults) setting is on (and the caller's token may read the ledger); see [Union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph). No other `sd:feature` is claimed: `/query` reads whatever default graph `FROM` names, and Fluree has no empty named graph.
 
 ### History Queries via POST /query
 

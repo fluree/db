@@ -202,6 +202,10 @@ pub struct GraphDb {
     pub(crate) resolved_config: Option<ResolvedConfig>,
     /// Successful resolution found no config; distinct from not yet resolved.
     pub(crate) config_absent: bool,
+    /// This view's own union default graph switch, ahead of the ledger's
+    /// `f:unionDefaultGraph` and behind the query's; see
+    /// [`Self::with_union_default_graph`].
+    pub(crate) union_default_graph: Option<bool>,
 
     // ========================================================================
     // Datalog config (from config graph, applied at query boundary)
@@ -307,6 +311,7 @@ impl GraphDb {
             ledger_config: None,
             resolved_config: None,
             config_absent: false,
+            union_default_graph: None,
             datalog_enabled: true,
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
@@ -640,6 +645,17 @@ impl GraphDb {
 
     pub(crate) fn config_is_resolved(&self) -> bool {
         self.config_absent || self.resolved_config.is_some()
+    }
+
+    /// Set whether a query on this view reads its default graph as the union
+    /// of the ledger's default graph and its named graphs, whatever the
+    /// ledger's `f:unionDefaultGraph` says. A query's own switch still wins.
+    ///
+    /// A write-branch probe sets it off: it must see what the write will
+    /// stage against, and writes go to the default graph alone.
+    pub(crate) fn with_union_default_graph(mut self, on: bool) -> Self {
+        self.union_default_graph = Some(on);
+        self
     }
 
     /// Get the full ledger config (if any).
