@@ -139,15 +139,17 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, one_graph: bool) {
             // is in scope and the chain joins its enclosing block.
             //
             // The order is the planner's tie-break: the body and the link are
-            // probes by reifier, the term's components then decode from the
-            // bound term, and the edge is a bound existence probe last. Estimates still decide where they differ (a
+            // probes by reifier, and the term's components then decode from
+            // the bound term. Estimates still decide where they differ (a
             // constant subject anchors the components through the term
             // dictionary).
             //
-            // Annotation syntax asserts its triple (RDF 1.2), so the edge is
-            // joined: a reifier may reify a triple that is not asserted, and
-            // such a link must not match `s p o {| … |}`.
-            let base_edge = Pattern::Triple(edge.clone());
+            // Annotation syntax asserts its triple (RDF 1.2): a reifier may
+            // reify a triple that is not asserted, and such a link must not
+            // match `s p o {| … |}`. The components bind every position of the
+            // edge, so the edge only checks existence; as a joined triple the
+            // planner drove from it, scanning the whole predicate (LDBC IC7).
+            let base_edge = Pattern::Exists(vec![Pattern::Triple(edge.clone())]);
             let mut chain: Vec<Pattern> = Vec::new();
 
             // 1. Body patterns (recursively expanded so nested annotations —
@@ -6605,6 +6607,23 @@ mod tests {
             .iter()
             .filter(|p| matches!(p, Pattern::Filter(e) if !link_filter(e)))
             .count()
+    }
+
+    /// The annotated edge only checks that its triple is asserted: the term's
+    /// components bind every position, and as a joined triple the planner
+    /// drove from it.
+    #[test]
+    fn annotated_edge_is_an_existence_check() {
+        let expanded = expand_edge_annotation_patterns(&[annotated_hop(0, 1, 2, 3)]);
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let knows = |p: &Pattern| matches!(p, Pattern::Triple(tp) if matches!(&tp.p, Ref::Sid(sid) if &*sid.name == "knows"));
+        assert!(!chain.iter().any(knows), "no joined edge: {chain:?}");
+        assert!(
+            chain
+                .iter()
+                .any(|p| matches!(p, Pattern::Exists(inner) if matches!(inner.as_slice(), [e] if knows(e)))),
+            "the edge is an EXISTS: {chain:?}"
+        );
     }
 
     #[test]
