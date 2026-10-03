@@ -154,8 +154,7 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
         .build_memory();
     let ledger_id = "it/annotation-filter-pushdown:threshold";
 
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
 
     local
         .run_until(async move {

@@ -1228,10 +1228,8 @@ pub fn estimate_pattern(
             row_count: DEFAULT_SERVICE_ROW_COUNT,
         },
 
-        // Edge-annotation patterns (M0): treated as a `Source` with the
-        // wrapped edge's cardinality as a first approximation. Real
-        // cost-based selection between edge-first and annotation-first
-        // scans arrives in M3 alongside `AnnotationStats`.
+        // Edge-annotation patterns expand before planning; estimated by the
+        // wrapped edge's cardinality as a first approximation.
         Pattern::EdgeAnnotation { edge, .. } => PatternEstimate::Source {
             row_count: estimate_triple_row_count(edge, bound_vars, stats),
         },
@@ -4381,89 +4379,6 @@ mod tests {
             Some("http://example.org/z"),
             "expected stats-driven ordering to pick the most selective predicate first; got ordered[0]={:?}",
             ordered[0]
-        );
-    }
-
-    #[test]
-    fn estimate_uses_merged_annotation_stats_for_reifies_predicates() {
-        // After `StatsView::merge_annotation_stats` runs with per-slot
-        // NDVs, the planner's classifier should produce arena-aligned
-        // BoundObject estimates: `count / ndv_values` for the matching
-        // slot's NDV, not the conservative fallback.
-
-        use fluree_db_core::AnnotationStats;
-        use fluree_vocab::db as p;
-        use fluree_vocab::namespaces::FLUREE_DB;
-
-        let mut stats = StatsView::default();
-        let ann = AnnotationStats {
-            forward_rows: 1_000,
-            reverse_rows: 1_000,
-            distinct_edges: 200,
-            distinct_annotations: 800,
-            live_attachment_pairs: 800,
-            distinct_reified_subjects: 50,
-            distinct_reified_predicates: 4,
-            distinct_reified_objects: 200,
-            ..Default::default()
-        };
-        let mut ns = std::collections::HashMap::new();
-        ns.insert(FLUREE_DB, "https://ns.flur.ee/db#".to_string());
-        stats.merge_annotation_stats(&ann, &ns);
-
-        // PropertyScan: `?ann f:reifiesObject ?o` — total annotations.
-        let scan = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
-            Term::Var(VarId(1)),
-        );
-        let scan_est = estimate_triple_row_count(&scan, &HashSet::new(), Some(&stats));
-        assert_eq!(
-            scan_est, 800.0,
-            "PropertyScan should equal annotation count"
-        );
-
-        // BoundObject: `?ann f:reifiesObject <some_object>`. With per-
-        // slot NDV the estimate is `800 / 200 = 4` — annotations per
-        // pinned object.
-        let bound_o = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
-            Term::Sid(Sid::new(7, "obj1")),
-        );
-        let bound_o_est = estimate_triple_row_count(&bound_o, &HashSet::new(), Some(&stats));
-        assert_eq!(
-            bound_o_est, 4.0,
-            "BoundObject on reifiesObject should be distinct_annotations / distinct_reified_objects"
-        );
-
-        // BoundSubject: a known annotation subject probing its slot.
-        let mut bound_subj_ctx = HashSet::new();
-        bound_subj_ctx.insert(VarId(0));
-        let bound_s = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_SUBJECT)),
-            Term::Var(VarId(2)),
-        );
-        let bound_s_est = estimate_triple_row_count(&bound_s, &bound_subj_ctx, Some(&stats));
-        assert_eq!(
-            bound_s_est, 1.0,
-            "BoundSubject on reifiesSubject should be ~1 row per known annotation"
-        );
-
-        // BoundObject on reifiesPredicate: 800 / 4 = 200 annotations
-        // per pinned predicate. Larger than reifiesObject's
-        // selectivity here, which is realistic — predicates are
-        // typically a small set even at scale.
-        let bound_p = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_PREDICATE)),
-            Term::Sid(Sid::new(7, "worksFor")),
-        );
-        let bound_p_est = estimate_triple_row_count(&bound_p, &HashSet::new(), Some(&stats));
-        assert_eq!(
-            bound_p_est, 200.0,
-            "BoundObject on reifiesPredicate should be distinct_annotations / distinct_reified_predicates"
         );
     }
 

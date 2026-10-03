@@ -678,14 +678,6 @@ harness = false
 required-features = ["credential"]
 
 [[bench]]
-name = "annotation_hydration"
-harness = false
-
-[[bench]]
-name = "annotation_planner"
-harness = false
-
-[[bench]]
 name = "annotation_varlength_probe"
 harness = false
 

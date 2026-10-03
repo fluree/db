@@ -175,8 +175,7 @@ async fn incremental_index_appends_new_terms_and_reuses_existing_handles() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/triple-term-links:incremental";
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
     let ctx = json!({ "ex": "http://example.org/" });
 
     local
@@ -554,8 +553,7 @@ async fn incremental_index_follows_a_partial_repoint() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/triple-term-links:incremental-repoint";
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
     let turtle =
         |body: &str| format!("VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n{body}\n");
 
@@ -791,8 +789,7 @@ async fn incremental_term_packs_are_compacted() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/triple-term-links:term-pack-compaction";
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
 
     local
         .run_until(async {
@@ -1182,8 +1179,7 @@ async fn novelty_links_follow_the_index_they_were_published_over() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/triple-term-links:novelty-over-publish";
-    let (local, indexer) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, indexer) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
     let claim = |age: u32| {
         format!(
             "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
@@ -1418,8 +1414,7 @@ async fn arena_kind_links_follow_incremental_repoints_in_every_graph() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/triple-term-links:arena-incremental";
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
     let trig = |body: &str| {
         format!(
             "VERSION \"1.2\"\n@prefix ex: <http://example.org/> .\n\
@@ -1581,8 +1576,7 @@ async fn link_counts_follow_every_build() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/triple-term-links:link-counts-incremental";
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
     local
         .run_until(async {
             let ledger = fluree
@@ -1619,8 +1613,7 @@ async fn first_annotation_after_an_index_without_terms() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/triple-term-links:first-annotation-incremental";
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
     let (store, _guard) = support::span_capture::init_test_tracing();
     local
         .run_until(async {
@@ -1785,8 +1778,7 @@ async fn object_bound_terms_read_the_object_tree() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/triple-term-links:object-tree-incremental";
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
     local
         .run_until(async {
             // The first build sees no annotation, so the next one writes the

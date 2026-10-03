@@ -656,16 +656,8 @@ pub struct ImportResult {
     pub index_t: i64,
     /// Optional summary of top classes, properties, and connections.
     pub summary: Option<ImportSummary>,
-    /// Whether the imported dataset contains at least one
-    /// `f:reifies*` flake (an edge-annotation bundle). The bulk-import
-    /// root itself writes `annotation_index: None`, so callers that
-    /// want a sealed annotation arena available immediately should
-    /// follow up with `Fluree::reindex(...)` — the api's
-    /// `ApiAttachmentEventsProvider` scans the base index for
-    /// `f:reifies*` flakes when the running overlay is empty, so
-    /// reindex produces an authoritative arena from the just-imported
-    /// data. The CLI's `fluree create --import` performs this
-    /// follow-up automatically. `false` when `build_index == false`.
+    /// Whether the imported dataset contains at least one edge annotation.
+    /// `false` when `build_index == false`.
     pub has_annotations: bool,
     /// Tracking tally (fuel, time) when a tracker was supplied via
     /// `ImportBuilder::tracker(...)`. `None` when tracking was disabled.
@@ -6172,11 +6164,8 @@ struct IndexUploadResult {
     root_id: fluree_db_core::ContentId,
     index_t: i64,
     summary: Option<ImportSummary>,
-    /// Sticky bit: at least one `f:reifies*` predicate landed in the
-    /// imported dataset. Surfaced to `ImportResult.has_annotations`
-    /// so the CLI can auto-seal the annotation arena via a follow-up
-    /// `reindex` pass (the bulk-import root currently writes
-    /// `annotation_index: None` even when annotations are present).
+    /// Sticky bit: at least one annotation predicate landed in the
+    /// imported dataset. Surfaced as `ImportResult.has_annotations`.
     has_annotations: bool,
     /// Duplicate input statements collapsed out of the index (chunk-level
     /// dedup + cross-chunk merge dedup). The commit blobs keep the raw ops.
@@ -6985,27 +6974,12 @@ where
             prev_index: None,
             garbage: None,
             sketch_ref: None,
-            // Bulk import path: detect annotations the same way the
-            // incremental indexer does — any of the seven reserved
-            // `f:reifies*` SIDs in the predicate dict means the
-            // ledger has annotations. Computed above before the
+            // Detected the same way the indexer does: an annotation
+            // predicate in the predicate dict. Computed above before the
             // dict moves into this struct literal.
             has_annotations: import_has_annotations,
-            annotation_index: None,
+            legacy_annotation_arena: None,
             term_dict: term_dict_refs,
-            // Sticky-bit canonical contract lives on
-            // `IndexRoot.had_annotation_arena` in
-            // `fluree-db-binary-index/src/format/index_root.rs`.
-            // Bulk import is the *only* path that leaves the bit
-            // false (it bypasses both incremental and full-rebuild
-            // root-assembly paths, which both coerce the bit on).
-            // That makes the
-            // `has_annotations=true && had_annotation_arena=false`
-            // shape the unique bootstrap-eligible state the
-            // provider's base-index scan-fallback gates on — a
-            // later defensive drop carries the sticky bit forward
-            // and stays out of the bootstrap path.
-            had_annotation_arena: false,
             // Every record written through the spool pipeline reports
             // whether it carried an RDF-list position, OR'd into one sticky
             // bit on the shared `SpoolConfig` and read after the parse

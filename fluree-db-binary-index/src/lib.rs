@@ -10,7 +10,6 @@ pub mod error;
 pub mod types;
 pub mod wasm_compat;
 
-pub mod annotation_arena;
 pub mod arena;
 pub mod dict;
 pub mod dict_novelty_safe;
@@ -33,9 +32,10 @@ pub use read::replay::{batch_has_rows_above_t, replay_leaflet, replay_leaflet_at
 // ── Format types ────────────────────────────────────────────────────────────
 pub use format::branch::{BranchManifest, LeafEntry};
 pub use format::expanded_cas::{
-    collect_root_cas_ids_expanded, collect_root_cas_ids_expanded_tolerant, ChainCasIds,
+    collect_root_cas_ids_expanded, collect_root_cas_ids_expanded_tolerant,
+    legacy_annotation_arena_cids, ChainCasIds,
 };
-pub use format::index_root::IndexRoot;
+pub use format::index_root::{IndexRoot, LegacyAnnotationArena};
 pub use format::run_record::{cmp_for_order, cmp_psot, cmp_spot, RunRecord, RunSortOrder};
 pub use format::wire_helpers::{
     BinaryGarbageRef, BinaryPrevIndexRef, DictPackRefs, DictRefs, DictTreeRefs, FulltextArenaRef,

@@ -125,23 +125,12 @@ async fn hydration_reads_indexed_annotations() {
 
 #[tokio::test]
 async fn non_annotation_ledger_skips_inject_annotations() {
-    // Hydration on a ledger that has never seen an `f:reifies*`
-    // flake must NOT pay the per-ref-value POST scan that
-    // `inject_annotations` does on the M2a fallback path. The gate
-    // (mirror of the cascade fast-path) checks both
-    // `snapshot.has_annotations` and the overlay's
-    // `attachments.has_annotations()`. We can't directly observe
-    // "the scan didn't run," but we can verify three positive
-    // signals:
-    //
-    // 1. `snapshot.has_annotations == false` — sticky bit never
-    //    flipped on an annotation-free ledger.
-    // 2. The overlay's `attachments.has_annotations()` is also
-    //    false — no novelty-side `f:reifies*` events.
-    // 3. The hydration query returns the right shape with no
-    //    `@annotation` keys anywhere — the only output the gate
-    //    short-circuits on (the keys would still be absent on the
-    //    scan path, but we'd pay the POST scan to find that out).
+    // Hydration on a ledger that has never held an annotation must not
+    // pay `inject_annotations`' per-ref-value link probe. The gate (mirror
+    // of the cascade fast-path) checks `snapshot.has_annotations` and
+    // `novelty.has_annotations()`. "The probe didn't run" isn't directly
+    // observable, so this checks that both bits stay clear, through an
+    // index build too, and that hydration renders no `@annotation` keys.
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
@@ -165,17 +154,8 @@ async fn non_annotation_ledger_skips_inject_annotations() {
         "non-annotation ledger must not have sticky bit set"
     );
     assert!(
-        !after.ledger.novelty.attachments.has_annotations(),
+        !after.ledger.novelty.has_annotations(),
         "novelty overlay must report zero annotations"
-    );
-    assert!(
-        after.ledger.snapshot.annotation_index.is_none(),
-        "non-annotation ledger must not have an annotation_index"
-    );
-    assert!(
-        !after.ledger.snapshot.has_arena_reader(),
-        "non-annotation ledger must not advertise an arena reader \
-         (gate guarantees no CAS reads on hydration either)"
     );
 
     // Subject hydration that would otherwise call `inject_annotations`
@@ -197,14 +177,7 @@ async fn non_annotation_ledger_skips_inject_annotations() {
         "non-annotation ledger must not produce any @annotation keys: {json_str}"
     );
 
-    // Reindex with provider attached. Even with the provider asking
-    // for events, an annotation-free ledger must produce a fresh
-    // root with `annotation_index = None` (no arena artifacts in
-    // CAS at all). Verifies the indexer's "non-annotation fast
-    // path" — no CAS writes for branch/leaf blobs that would just
-    // be empty placeholders.
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
     local
         .run_until(async {
             let _ = fluree.ledger_cached(ledger_id).await.unwrap();
@@ -221,14 +194,6 @@ async fn non_annotation_ledger_skips_inject_annotations() {
             assert!(
                 !post.snapshot.has_annotations,
                 "indexed root must not flip sticky bit on non-annotation ledger"
-            );
-            assert!(
-                post.snapshot.annotation_index.is_none(),
-                "indexed root must not carry an annotation_index"
-            );
-            assert!(
-                !post.snapshot.has_arena_reader(),
-                "post-reindex snapshot must still skip arena reader"
             );
         })
         .await;
@@ -247,8 +212,7 @@ async fn explain_expands_annotations_as_the_executor_does() {
         .build_memory();
     let ledger_id = "it/edge-annotations-indexed:explain-expansion";
 
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
 
     local
         .run_until(async move {
@@ -324,8 +288,7 @@ async fn transfer_named_to_named_survives_reindex() {
     let g1 = "http://example.org/g1";
     let g2 = "http://example.org/g2";
 
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
 
     local
         .run_until(async move {
@@ -369,14 +332,6 @@ async fn transfer_named_to_named_survives_reindex() {
                 .await
                 .expect("stage COPY");
 
-            // Force the manager to cache the running ledger so the indexer's
-            // attachment-events provider finds it (mirrors the pattern in
-            // `incremental_arena_seal_then_arena_backed_query`).
-            let _ = fluree
-                .ledger_cached(ledger_id)
-                .await
-                .expect("cached load before reindex");
-
             support::trigger_index_and_wait(&handle, ledger_id, after_copy.receipt.t).await;
             support::wait_for_index_application(&fluree, ledger_id, after_copy.receipt.t).await;
 
@@ -414,8 +369,7 @@ async fn transfer_default_to_named_synthesized_anchor_survives_reindex() {
     let ledger_id = "it/edge-annotations-indexed:xfer-default-to-named";
     let g2 = "http://example.org/g2";
 
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
 
     local
         .run_until(async move {
@@ -499,8 +453,7 @@ async fn indexed_literal_object_annotation_matches() {
         .build_memory();
     let ledger_id = "it/edge-annotations-indexed:literal-object";
 
-    let (local, handle) =
-        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
 
     local
         .run_until(async move {

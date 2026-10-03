@@ -365,58 +365,13 @@ pub fn start_background_indexer_local(
     (local, handle)
 }
 
-/// Variant that wires an `AttachmentEventsProvider` against a
-/// running `Fluree`'s `LedgerManager`. Tests that exercise the M2b
-/// arena-seal path use this so the worker resolves per-job
-/// attachment events from the live overlay.
-///
-/// The provider returns `Augment(events)` — the safe default
-/// matching the api's production behavior.
+/// [`start_background_indexer_local`] over a running `Fluree`'s backend and
+/// nameservice.
 #[cfg(feature = "native")]
-pub fn start_background_indexer_with_attachments(
+pub fn start_background_indexer_for(
     fluree: &fluree_db_api::Fluree,
     config: fluree_db_indexer::IndexerConfig,
 ) -> (LocalSet, fluree_db_indexer::IndexerHandle) {
-    use async_trait::async_trait;
-    use fluree_db_indexer::{AttachmentEventCoverage, AttachmentEventsProvider};
-
-    struct TestProvider {
-        manager: Arc<fluree_db_api::LedgerManager>,
-    }
-
-    impl std::fmt::Debug for TestProvider {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("TestProvider").finish()
-        }
-    }
-
-    #[async_trait]
-    impl AttachmentEventsProvider for TestProvider {
-        async fn attachment_events(
-            &self,
-            ledger_id: &fluree_db_api::LedgerId,
-        ) -> Option<AttachmentEventCoverage> {
-            use fluree_db_api::ledger_manager::RunningCoverage;
-            let result = self
-                .manager
-                .try_running_attachment_events(ledger_id)
-                .await?;
-            Some(match result.coverage {
-                RunningCoverage::Authoritative => {
-                    AttachmentEventCoverage::Authoritative(result.events)
-                }
-                RunningCoverage::Augment => AttachmentEventCoverage::Augment(result.events),
-            })
-        }
-    }
-
-    let manager = fluree
-        .ledger_manager()
-        .expect("test must be built with with_ledger_cache_config")
-        .clone();
-    let provider: Arc<dyn AttachmentEventsProvider> = Arc::new(TestProvider { manager });
-    let config = config.with_attachment_events_provider(provider);
-
     start_background_indexer_local(
         fluree.backend().clone(),
         fluree

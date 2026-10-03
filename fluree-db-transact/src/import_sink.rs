@@ -1457,13 +1457,10 @@ mod inner {
         }
 
         #[test]
-        fn test_reified_triple_streams_jsonld_compatible_bundle() {
-            // The import path must write the SAME bundle shape as the
-            // transactional FlakeSink / JSON-LD lowering: base triple +
-            // S/P/O bundle, no f:reifiesDatatype, decodable to the base
-            // edge's EdgeKey.
-            use fluree_db_core::edge::EdgeKey;
-            use fluree_db_core::namespaces::is_reifies_datatype;
+        fn test_reified_triple_streams_its_link() {
+            // Import writes the same record as the transactional FlakeSink:
+            // the base triple plus `r rdf:reifies <<( s p o )>>`.
+            use fluree_db_core::FlakeValue;
 
             let mut ns = NamespaceRegistry::new();
             let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
@@ -1476,19 +1473,22 @@ mod inner {
             sink.emit_reified_triple(s, p, o, r).unwrap();
 
             let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
-            assert_eq!(writer.op_count(), 4, "base + 3 bundle flakes");
+            assert_eq!(writer.op_count(), 2, "base + link");
 
             let result = writer.finish(&make_envelope(1)).unwrap();
             let decoded = read_commit(&result.bytes).unwrap();
-            assert_eq!(decoded.flakes.len(), 4);
-            let base = &decoded.flakes[0];
-            let bundle = &decoded.flakes[1..];
-            assert!(
-                !bundle.iter().any(|f| is_reifies_datatype(&f.p)),
-                "import bundle must omit f:reifiesDatatype: {bundle:?}"
+            let [base, link] = decoded.flakes.as_slice() else {
+                panic!("expected base + link: {:?}", decoded.flakes);
+            };
+            assert!(fluree_db_core::is_rdf_reifies(&link.p));
+            let FlakeValue::TripleTerm(term) = &link.o else {
+                panic!("link object is not a triple term: {link:?}");
+            };
+            assert_eq!(
+                (&term.s, &term.p, &term.o),
+                (&base.s, &base.p, &base.o),
+                "the link names the base edge"
             );
-            let key = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
-            assert_eq!(key, EdgeKey::from_flake(base));
         }
 
         #[test]

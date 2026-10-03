@@ -26,7 +26,6 @@
 
 pub mod address;
 pub mod address_path;
-pub mod annotation_index;
 pub mod cancellation;
 pub mod clock;
 pub mod coerce;
@@ -97,7 +96,6 @@ pub mod wasm_cache;
 
 // Re-export main types
 pub use address::{extract_identifier, extract_path, parse_fluree_address, ParsedFlureeAddress};
-pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
 pub use cancellation::{QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
 pub use commit::{
@@ -124,7 +122,7 @@ pub use content_kind::{
 pub use datatype_constraint::DatatypeConstraint;
 pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
 pub use dict_novelty::DictNovelty;
-pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError};
+pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey};
 pub use error::{Error, Result};
 pub use flake::{normalize_lang_tag, Flake, FlakeMeta};
 pub use graph_db_ref::GraphDbRef;

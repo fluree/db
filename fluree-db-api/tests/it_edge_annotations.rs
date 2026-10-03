@@ -2458,20 +2458,10 @@ async fn wildcard_subject_hydration_keeps_explicit_iri_annotations_visible() {
 
 #[tokio::test]
 async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
-    // Regression: cascade retract bundles must carry the same
-    // `g = Some(graph_sid)` as the original named-graph assertion.
-    // A default-graph retract would not match named-graph
-    // assertions in Fluree's flake identity model, leaving the
-    // annotation orphaned in the named graph.
-    //
-    // We can't directly inspect the flake graph from the public
-    // API, but we *can* observe the retract via the
-    // `AttachmentNovelty` overlay: if the cascade emitted retracts
-    // in the named graph, the overlay's observer would record
-    // them, and `current_annotations_for_at` would return zero
-    // for the edge after the retract. If the retracts went to the
-    // default graph, the named-graph assertion would still be
-    // active in the overlay.
+    // Regression: the cascade's link retract must carry the named graph of
+    // the original assertion. A default-graph retract would not match it in
+    // Fluree's flake identity model, leaving the link live in the named
+    // graph after its edge is gone.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:cascade-named-graph";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -2497,6 +2487,7 @@ async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
     // explicit. The named-graph selector tells the transactor to
     // emit the retract flake in the named graph.
     let insert_t = after_insert.ledger.t();
+    let after_insert_ledger = after_insert.ledger.clone();
     let delete = json!({
         "@context": ctx(),
         "delete": {
@@ -2526,39 +2517,38 @@ async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
         .await
         .expect("named-graph base re-insert");
 
-    // After the cascade, the AttachmentNovelty observer should
-    // have recorded both the named-graph assertion AND a matching
-    // named-graph retract. With the named-graph fix, both events
-    // share the same `EdgeKey { g: Some(graph_a), ... }` so the
-    // forward map's latest event for that key is a retract (op=false).
-    //
-    // Without the fix, the assertion is keyed by `g=Some(graph_a)`
-    // but the retract would be keyed by `g=None` (different
-    // EdgeKey), so the named-graph forward rows would still show
-    // the annotation as currently asserted.
-    //
-    // We don't reconstruct the EdgeKey directly — we walk the
-    // forward map and assert that *no* named-graph edge has any
-    // currently-attached annotation.
-    let attachments = &after_reinsert.ledger.novelty.attachments;
-    let as_of = after_reinsert.ledger.t();
-    let mut leaked_named_graph_attachments: Vec<String> = Vec::new();
-    for (edge_key, _rows) in attachments.iter_forward() {
-        if edge_key.g.is_none() {
-            continue; // default-graph edge — not what this test guards
-        }
-        let live: Vec<fluree_db_core::Sid> = attachments
-            .current_annotations_for_at(edge_key, as_of)
-            .collect();
-        if !live.is_empty() {
-            leaked_named_graph_attachments.push(format!("{edge_key:?} -> {live:?}"));
-        }
-    }
-    assert!(
-        leaked_named_graph_attachments.is_empty(),
-        "after named-graph cascade, no named-graph edge should have currently-attached \
-         annotations; got: {leaked_named_graph_attachments:#?}"
+    let hr_graph = |ledger: &MemoryLedger| {
+        ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri("http://example.org/hr-graph")
+            .expect("named graph registered")
+    };
+    let alice = after_reinsert
+        .ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .expect("subject sid");
+    assert_eq!(
+        links_for_subject_in(
+            &after_insert_ledger,
+            hr_graph(&after_insert_ledger),
+            &alice,
+            insert_t
+        )
+        .await
+        .len(),
+        1,
+        "precondition: the insert linked the named-graph edge in its graph"
     );
+    let ledger = &after_reinsert.ledger;
+    for g_id in [hr_graph(ledger), 0] {
+        let live = links_for_subject_in(ledger, g_id, &alice, ledger.t()).await;
+        assert!(
+            live.is_empty(),
+            "the cascade must retract the named-graph link (graph {g_id}): {live:#?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5782,10 +5772,9 @@ async fn copy_with_explicit_reifier_reads_scoped_per_graph() {
 
 #[tokio::test]
 async fn count_shapes_read_only_the_reifies_lookups_they_need() {
-    // Without a sealed arena the wrapper runs the generic `f:reifies*`
-    // chain, which drops the base-edge check and every lookup whose
-    // position nothing reads (`elide_redundant_chain`). The answers must
-    // not move: a plain subject that merely carries the body predicate
+    // An annotation pattern expands to the link and its term components,
+    // and lowering drops every component lookup whose position nothing
+    // reads (`elide_unread_term_binds`). The answers must not move: a plain subject that merely carries the body predicate
     // (`ex:carol ex:source`) is not a reifier, endpoints that are read
     // still bind, and a constant endpoint still constrains.
     let fluree = FlureeBuilder::memory().build_memory();

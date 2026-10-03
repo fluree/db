@@ -63,6 +63,8 @@ Hydration (`@annotation` in subject expansion) and export read links the same wa
 
 Earlier releases stored an annotation as an `f:reifies*` bundle (`f:reifiesSubject`, `f:reifiesPredicate`, `f:reifiesObject`, …) on the reifier. Those bundles stay in commits, and the link is derived from them wherever it is needed: an index build derives it from each commit's bundle ops (`link_synth`), and novelty derives it for commits the index has not covered (`fluree-db-novelty/src/links.rs`). Readers see only links. A write that retracts a derived link leaves the bundle in place; the retract cancels the derived assert in novelty and at the next build alike.
 
+Index roots from those releases may also carry an annotation-arena section. Readers skip it, keeping only the arena's two branch CIDs, and the next index build releases the arena's blobs as garbage.
+
 An annotated index built before links has no term dictionary. Link reads on it fail asking for a rebuild (`fluree reindex`) rather than answering without its annotations. An incremental build over it declines once its window holds a triple term — a term dictionary covering the window alone would lift that refusal — and the index build falls back to a full rebuild, which links every annotation in history.
 
 ## See also

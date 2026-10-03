@@ -1208,11 +1208,11 @@ mod tests {
     /// Used by `test_apply_index_equal_t_noop` to produce two FIR6
     /// blobs with the same `index_t` but different CIDs without
     /// resorting to trailing-byte padding (which the strict
-    /// `FIR6: trailing bytes after annotation_index` check rejects).
+    /// `FIR6: trailing bytes` check rejects).
     fn build_test_fir6_with_base(ledger_id: &str, index_t: i64, base_t: i64) -> Vec<u8> {
         // Mirror `fluree-db-core::db::decode_fir6_metadata` exactly.
         // The decoder now enforces a strict trailing-byte check
-        // (`FIR6: trailing bytes after annotation_index`), so any
+        // (`FIR6: trailing bytes`), so any
         // section that doesn't exactly match what the decoder reads
         // will surface either as truncation or trailing-byte error.
         // Keep this skeleton in lockstep with the decoder.
@@ -1274,7 +1274,7 @@ mod tests {
         // named graph routing
         buf.extend_from_slice(&0u16.to_le_bytes()); // named_count = 0
 
-        // No optional sections (flags=0); no annotation_index section.
+        // No optional sections (flags=0).
         // The strict trailing-byte check requires exactly zero bytes
         // beyond this point.
 

@@ -1344,7 +1344,6 @@ where
                 db_stats: Some(db_stats),
                 db_schema,
                 sketch_ref,
-                attachment_events: config.attachment_events.clone(),
                 prev_index: prev_index.clone(),
                 term_dict,
             };
