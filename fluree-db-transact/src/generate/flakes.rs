@@ -4,7 +4,7 @@
 //! with variable bindings into concrete flakes.
 
 use crate::error::{Result, TransactError};
-use crate::ir::{TemplateGraph, TemplateTerm, TripleTemplate};
+use crate::ir::{TemplateGraph, TemplateTerm, TemplateTripleTerm, TripleTemplate};
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_query::{Batch, Binding, VarId};
@@ -382,6 +382,9 @@ impl<'a> FlakeGenerator<'a> {
             TemplateTerm::Value(_) => Err(TransactError::InvalidTerm(
                 "Subject cannot be a literal value".to_string(),
             )),
+            TemplateTerm::TripleTerm(_) => Err(TransactError::InvalidTerm(
+                "Subject cannot be a triple term".to_string(),
+            )),
         }
     }
 
@@ -434,6 +437,9 @@ impl<'a> FlakeGenerator<'a> {
             )),
             TemplateTerm::Value(_) => Err(TransactError::InvalidTerm(
                 "Predicate cannot be a literal value".to_string(),
+            )),
+            TemplateTerm::TripleTerm(_) => Err(TransactError::InvalidTerm(
+                "Predicate cannot be a triple term".to_string(),
             )),
         }
     }
@@ -499,7 +505,55 @@ impl<'a> FlakeGenerator<'a> {
                 let sid = self.skolemize_blank_node(label, solution);
                 Ok((Some(FlakeValue::Ref(sid)), Some(DT_ID.clone())))
             }
+            TemplateTerm::TripleTerm(term) => {
+                Ok(match self.resolve_triple_term(term, bindings, row)? {
+                    Some(t) => (
+                        Some(FlakeValue::TripleTerm(Box::new(t))),
+                        Some(fluree_db_core::triple_term_datatype_sid().clone()),
+                    ),
+                    None => (None, None),
+                })
+            }
         }
+    }
+
+    /// A triple term's positions, resolved as a flake's own are; `None` when
+    /// one is unbound.
+    fn resolve_triple_term(
+        &mut self,
+        term: &TemplateTripleTerm,
+        bindings: &Batch,
+        row: usize,
+    ) -> Result<Option<fluree_db_core::TripleTermValue>> {
+        if matches!(term.o, TemplateTerm::TripleTerm(_)) {
+            return Err(TransactError::InvalidTerm(
+                "a triple term cannot nest another".to_string(),
+            ));
+        }
+        let s = self.resolve_subject(&term.s, bindings, row)?;
+        let p = self.resolve_predicate(&term.p, bindings, row)?;
+        let explicit_dt = term
+            .dtc
+            .as_ref()
+            .map(fluree_db_core::DatatypeConstraint::datatype);
+        let (o, dt) = self.resolve_object(&term.o, explicit_dt, bindings, row)?;
+        let lang = match (&term.dtc, &term.o) {
+            (Some(dtc), _) => dtc.lang_tag().map(str::to_string),
+            (None, TemplateTerm::Var(v)) => match bindings.get(row, *v) {
+                Some(Binding::Lit { dtc, .. }) => dtc.lang_tag().map(str::to_string),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (Some(s), Some(p), Some(o), Some(dt)) = (s, p, o, dt) else {
+            return Ok(None);
+        };
+        let dt = if lang.is_some() {
+            DT_LANG_STRING.clone()
+        } else {
+            dt
+        };
+        Ok(Some(fluree_db_core::TripleTermValue { s, p, o, dt, lang }))
     }
 
     /// Skolemize a blank node to a Sid.
@@ -701,6 +755,58 @@ mod tests {
         assert_eq!(flakes.len(), 1);
         // Check that the blank node was skolemized
         assert!(flakes[0].s.name.contains("b1"));
+    }
+
+    #[test]
+    fn triple_term_template_resolves_per_solution() {
+        let mut registry = NamespaceRegistry::new();
+        let mut generator = FlakeGenerator::new(1, &mut registry, "txn1".to_string());
+        let (r, s, o) = (VarId(0), VarId(1), VarId(2));
+        let schema: Arc<[VarId]> = Arc::new([r, s, o]);
+        let sid = |name: &str| Binding::sid(Sid::new(1, name));
+        let batch = Batch::new(
+            schema,
+            vec![
+                vec![sid("ex:r1"), sid("ex:r2")],
+                vec![sid("ex:alice"), sid("ex:bob")],
+                vec![
+                    sid("ex:bob"),
+                    Binding::Lit {
+                        val: FlakeValue::String("salut".into()),
+                        dtc: DatatypeConstraint::LangTag("fr".into()),
+                        t: None,
+                        op: None,
+                        p_id: None,
+                    },
+                ],
+            ],
+        )
+        .unwrap();
+        let templates = vec![TripleTemplate::new(
+            TemplateTerm::Var(r),
+            TemplateTerm::Sid(Sid::new(2, "reifies")),
+            TemplateTerm::TripleTerm(Box::new(TemplateTripleTerm {
+                s: TemplateTerm::Var(s),
+                p: TemplateTerm::Sid(Sid::new(1, "ex:says")),
+                o: TemplateTerm::Var(o),
+                dtc: None,
+            })),
+        )];
+
+        let flakes = generator.generate_assertions(&templates, &batch).unwrap();
+
+        assert_eq!(flakes.len(), 2);
+        let term = |i: usize| match &flakes[i].o {
+            FlakeValue::TripleTerm(t) => t.as_ref().clone(),
+            other => panic!("not a triple term: {other:?}"),
+        };
+        assert_eq!(flakes[0].dt, *fluree_db_core::triple_term_datatype_sid());
+        assert_eq!(term(0).s, Sid::new(1, "ex:alice"));
+        assert_eq!(term(0).o, FlakeValue::Ref(Sid::new(1, "ex:bob")));
+        assert_eq!(term(0).dt, *DT_ID);
+        assert_eq!(term(1).o, FlakeValue::String("salut".into()));
+        assert_eq!(term(1).dt, *DT_LANG_STRING);
+        assert_eq!(term(1).lang.as_deref(), Some("fr"));
     }
 
     #[test]

@@ -939,14 +939,17 @@ impl<'a> TemplateParseCtx<'a> {
 /// stored data). Stable `_:fdb-` ids never appear here — the term parsers
 /// resolve them to constant `TemplateTerm::Sid`s.
 fn first_blank_node_in_templates(templates: &[TripleTemplate]) -> Option<&str> {
-    templates.iter().find_map(|t| {
-        [&t.subject, &t.predicate, &t.object]
-            .into_iter()
-            .find_map(|term| match term {
-                TemplateTerm::BlankNode(label) => Some(label.as_str()),
-                _ => None,
-            })
-    })
+    let mut found = None;
+    for t in templates {
+        for term in [&t.subject, &t.predicate, &t.object] {
+            term.for_each_leaf(&mut |leaf| {
+                if let (None, TemplateTerm::BlankNode(label)) = (found, leaf) {
+                    found = Some(label.as_str());
+                }
+            });
+        }
+    }
+    found
 }
 
 fn parse_update_templates_with_ctx(

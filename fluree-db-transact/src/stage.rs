@@ -2653,11 +2653,13 @@ fn collect_template_vars(template_groups: &[&[TripleTemplate]]) -> Vec<VarId> {
     for group in template_groups {
         for tmpl in *group {
             for term in [&tmpl.subject, &tmpl.predicate, &tmpl.object] {
-                if let TemplateTerm::Var(v) = term {
-                    if seen.insert(*v) {
-                        out.push(*v);
+                term.for_each_leaf(&mut |leaf| {
+                    if let TemplateTerm::Var(v) = leaf {
+                        if seen.insert(*v) {
+                            out.push(*v);
+                        }
                     }
-                }
+                });
             }
             if let TemplateGraph::Var(v) = tmpl.graph {
                 if seen.insert(v) {
@@ -3335,6 +3337,9 @@ fn template_term_to_binding(term: &TemplateTerm) -> Result<Binding> {
         )),
         TemplateTerm::BlankNode(_) => Err(TransactError::InvalidTerm(
             "Blank nodes not allowed in VALUES data rows".to_string(),
+        )),
+        TemplateTerm::TripleTerm(_) => Err(TransactError::InvalidTerm(
+            "Triple terms not allowed in VALUES data rows".to_string(),
         )),
     }
 }
