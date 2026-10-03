@@ -1264,3 +1264,247 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
         })
         .await;
 }
+
+const OVERFLOW_INT: &str = "123456789012345678901234567890";
+const OVERFLOW_DEC: &str = "1234567890123456789012345678.5";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
+
+/// An indexed ledger whose `ex:serial` (an overflow `xsd:integer`) and
+/// `ex:price` (a big `xsd:decimal`) are both served from the NUM_BIG arena as
+/// encoded bindings, with the integer repeated in a named graph. Those
+/// bindings carry `dt_id = DECIMAL` whatever the value, so every surface that
+/// reads a datatype or keys a value must decode first.
+async fn indexed_overflow_numerics(
+    ledger_id: &'static str,
+) -> (MemoryFluree, fluree_db_api::LedgerState) {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+            let trig = format!(
+                r"
+                @prefix ex: <http://example.org/> .
+                ex:acct ex:serial {OVERFLOW_INT} ;
+                        ex:price {OVERFLOW_DEC} .
+                GRAPH <http://example.org/g> {{
+                    ex:named ex:serial {OVERFLOW_INT} .
+                }}
+                "
+            );
+            let result = fluree
+                .stage_owned(ledger)
+                .upsert_turtle(&trig)
+                .execute()
+                .await
+                .expect("upsert trig");
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            (fluree, ledger)
+        })
+        .await
+}
+
+async fn sparql_results(
+    fluree: &MemoryFluree,
+    ledger: &fluree_db_api::LedgerState,
+    query: &str,
+) -> JsonValue {
+    support::query_sparql(fluree, ledger, query)
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e}\n{query}"))
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json")
+}
+
+#[tokio::test]
+async fn indexed_overflow_integer_datatype_is_xsd_integer() {
+    let (fluree, ledger) = indexed_overflow_numerics("decimal/bigint-datatype:main").await;
+
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT (DATATYPE(?o) AS ?dt) WHERE { ex:acct ex:serial ?o }",
+    )
+    .await;
+    assert_eq!(
+        binding_values(&json, "dt"),
+        vec![XSD_INTEGER],
+        "DATATYPE of an indexed overflow integer"
+    );
+
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+         SELECT ?o WHERE { ex:acct ex:serial ?o FILTER(DATATYPE(?o) = xsd:integer) }",
+    )
+    .await;
+    assert_eq!(
+        binding_values(&json, "o"),
+        vec![OVERFLOW_INT],
+        "FILTER on DATATYPE = xsd:integer must keep the overflow integer"
+    );
+
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT (DATATYPE(?o) AS ?dt) WHERE { ex:acct ex:price ?o }",
+    )
+    .await;
+    assert_eq!(
+        binding_values(&json, "dt"),
+        vec![XSD_DECIMAL],
+        "DATATYPE of an indexed big decimal stays xsd:decimal"
+    );
+}
+
+#[tokio::test]
+async fn indexed_overflow_integer_unifies_with_decoded_copies() {
+    // The scan's encoded copy and a BIND constant are the same term, so they
+    // must share one DISTINCT row, one group, and cancel under MINUS.
+    let (fluree, ledger) = indexed_overflow_numerics("decimal/bigint-unify:main").await;
+
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT DISTINCT ?o WHERE {{
+                 {{ ex:acct ex:serial ?o }} UNION {{ BIND({OVERFLOW_INT} AS ?o) }}
+             }}"
+        ),
+    )
+    .await;
+    assert_eq!(binding_values(&json, "o"), vec![OVERFLOW_INT], "DISTINCT");
+
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?o (COUNT(*) AS ?n) WHERE {{
+                 {{ ex:acct ex:serial ?o }} UNION {{ BIND({OVERFLOW_INT} AS ?o) }}
+             }} GROUP BY ?o"
+        ),
+    )
+    .await;
+    assert_eq!(binding_values(&json, "n"), vec!["2"], "GROUP BY");
+
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?o WHERE {{
+                 {{ BIND({OVERFLOW_INT} AS ?o) }} MINUS {{ ex:acct ex:serial ?o }}
+             }}"
+        ),
+    )
+    .await;
+    assert!(binding_values(&json, "o").is_empty(), "MINUS: {json}");
+
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT DISTINCT ?o WHERE {{
+                 {{ ex:acct ex:price ?o }} UNION {{ BIND({OVERFLOW_DEC} AS ?o) }}
+             }}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        binding_values(&json, "o"),
+        vec![OVERFLOW_DEC],
+        "DISTINCT over a big decimal"
+    );
+}
+
+#[tokio::test]
+async fn indexed_overflow_integer_renders_xsd_integer_through_graph_and_order_by() {
+    // Leaving a GRAPH scope and sorting both materialize the encoded value
+    // before the formatter sees it, so the datatype they stamp is what renders.
+    let (fluree, ledger) = indexed_overflow_numerics("decimal/bigint-render:main").await;
+
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?o WHERE { GRAPH <http://example.org/g> { ?s ex:serial ?o } }",
+    )
+    .await;
+    assert_eq!(binding_values(&json, "o"), vec![OVERFLOW_INT]);
+    assert_eq!(binding_datatypes(&json, "o"), vec![XSD_INTEGER], "GRAPH");
+
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?o WHERE { { ex:acct ex:serial ?o } UNION { BIND(5 AS ?o) } } ORDER BY ?o",
+    )
+    .await;
+    assert_eq!(binding_values(&json, "o"), vec!["5", OVERFLOW_INT]);
+    assert_eq!(
+        binding_datatypes(&json, "o"),
+        vec![XSD_INTEGER, XSD_INTEGER],
+        "ORDER BY"
+    );
+}
+
+#[tokio::test]
+async fn jsonld_indexed_overflow_integer_datatype_and_distinct() {
+    let (fluree, ledger) = indexed_overflow_numerics("decimal/bigint-jsonld:main").await;
+    let ctx = serde_json::json!({
+        "ex": "http://example.org/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let query = serde_json::json!({
+        "@context": ctx,
+        "select": ["?dt"],
+        "where": [
+            {"@id": "ex:acct", "ex:serial": "?o"},
+            ["bind", "?dt", ["expr", ["datatype", "?o"]]]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("datatype query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(rows, serde_json::json!([["xsd:integer"]]), "datatype");
+
+    let query = serde_json::json!({
+        "@context": ctx,
+        "selectDistinct": ["?o"],
+        "where": [["union",
+            {"@id": "ex:acct", "ex:serial": "?o"},
+            [["values", ["?o", [{"@value": OVERFLOW_INT, "@type": "xsd:integer"}]]]]
+        ]]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("distinct query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "selectDistinct must merge the scanned and VALUES copies: {rows}"
+    );
+}

@@ -3224,9 +3224,7 @@ fn materialize_one_binding(
                 }
                 other => {
                     let dt_sid = store_ref
-                        .dt_sids()
-                        .get(dt_id as usize)
-                        .cloned()
+                        .resolve_dt_id_sid_for_value(dt_id, &other)
                         .unwrap_or_else(|| Sid::new(0, ""));
                     let dt_iri = store_ref.sid_to_iri(&dt_sid).ok_or_else(|| {
                         TransactError::Query(fluree_db_query::QueryError::Internal(format!(
