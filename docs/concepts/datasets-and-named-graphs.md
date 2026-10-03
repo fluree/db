@@ -241,7 +241,7 @@ SELECT ?name WHERE { ?person ex:name ?name }
 The union is a set: a triple stored in several graphs matches once, and a property path follows edges across graphs, so `ex:alice ex:knows+ ?x` reaches a node through an edge in the default graph and the next edge in a named graph. It applies whenever the query does not choose a default graph of its own, which includes naming just the ledger itself in `FROM`. Everything else stays as it was:
 
 - `GRAPH <iri>` and `GRAPH ?g` address the named graphs exactly as without the union, and `GRAPH <ledger:main>` still names the default graph alone.
-- `FROM <graph>` reads just that graph; `FROM NAMED` names exactly the graphs it lists.
+- `FROM <graph>` reads just that graph; `FROM NAMED` names exactly the graphs it lists. A `FROM` list that names the ledger and any of its graphs reads just the graphs it names, not the union.
 - The reserved `#txn-meta` and `#config` graphs are never part of the union.
 - Policy applies to each graph as it would to a `GRAPH` pattern reading it.
 - Transactions are unaffected: they write to the graphs they name, and an update's `WHERE` matches the default graph alone. History queries (`FROM … TO …`) read the default graph alone too.
