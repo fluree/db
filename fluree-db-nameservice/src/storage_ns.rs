@@ -469,12 +469,12 @@ where
     /// no write is performed.
     async fn cas_update<T, F>(&self, key: &str, update_fn: F) -> Result<()>
     where
-        T: Serialize + for<'de> Deserialize<'de>,
-        F: Fn(Option<T>) -> Option<T> + Send + Sync,
+        T: Serialize + for<'de> Deserialize<'de> + 'static,
+        F: Fn(Option<T>) -> Option<T> + Send + Sync + 'static,
     {
         let outcome = self
             .storage
-            .compare_and_swap(key, |current_bytes| {
+            .compare_and_swap(key, move |current_bytes| {
                 let current: Option<T> = current_bytes.map(deserialize_json).transpose()?;
 
                 match update_fn(current) {
@@ -503,12 +503,12 @@ where
         update_fn: F,
     ) -> Result<CasUpdateOutcome>
     where
-        T: Serialize + for<'de> Deserialize<'de>,
-        F: Fn(Option<T>) -> CasUpdateDecision<T> + Send + Sync,
+        T: Serialize + for<'de> Deserialize<'de> + 'static,
+        F: Fn(Option<T>) -> CasUpdateDecision<T> + Send + Sync + 'static,
     {
         let outcome = self
             .storage
-            .compare_and_swap(key, |current_bytes| {
+            .compare_and_swap(key, move |current_bytes| {
                 let current: Option<T> = current_bytes.map(deserialize_json).transpose()?;
 
                 match update_fn(current) {
@@ -757,7 +757,7 @@ where
 
         let outcome = self
             .storage
-            .compare_and_swap(&key, |bytes| {
+            .compare_and_swap(&key, move |bytes| {
                 let Some(data) = bytes else {
                     return Ok(CasAction::Abort(()));
                 };
@@ -964,7 +964,7 @@ where
         let index_key = self.index_key(&ledger_name, &branch);
         let cid_str = index_id.to_string();
 
-        self.cas_update::<NsIndexFileV2, _>(&index_key, |existing| {
+        self.cas_update::<NsIndexFileV2, _>(&index_key, move |existing| {
             let should_update = match &existing {
                 Some(file) => index_t >= file.index.t, // Allow equal
                 None => true,
@@ -1535,7 +1535,7 @@ where
 
         let outcome = self
             .storage
-            .compare_and_swap(&key, |current_bytes| {
+            .compare_and_swap(&key, move |current_bytes| {
                 let Some(bytes) = current_bytes else {
                     return Ok(CasAction::Abort(StatusCasResult::Conflict { actual: None }));
                 };
@@ -1633,7 +1633,7 @@ where
 
         let outcome = self
             .storage
-            .compare_and_swap(&key, |current_bytes| {
+            .compare_and_swap(&key, move |current_bytes| {
                 let Some(bytes) = current_bytes else {
                     return Ok(CasAction::Abort(ConfigCasResult::Conflict { actual: None }));
                 };
@@ -1897,8 +1897,9 @@ mod tests {
         where
             F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
                 + Send
-                + Sync,
-            T: Send,
+                + Sync
+                + 'static,
+            T: Send + 'static,
         {
             let mut data = self.data.write().unwrap();
             let current = data.get(address).map(std::vec::Vec::as_slice);
@@ -2021,8 +2022,9 @@ mod tests {
         where
             F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
                 + Send
-                + Sync,
-            T: Send,
+                + Sync
+                + 'static,
+            T: Send + 'static,
         {
             // On the first call, run the closure but then call it again to
             // simulate a concurrent modification that invalidated the first read.

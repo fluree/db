@@ -118,7 +118,13 @@ where
 
     /// Encrypt plaintext and build the complete envelope.
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let key = self.keys.current_key();
+        Self::encrypt_with(&self.keys, plaintext)
+    }
+
+    /// [`Self::encrypt`] with only the key provider, for callers that cannot
+    /// borrow the storage.
+    fn encrypt_with(keys: &K, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let key = keys.current_key();
 
         // Create cipher from key
         let cipher =
@@ -153,12 +159,17 @@ where
 
     /// Decrypt an envelope and return the plaintext.
     fn decrypt(&self, envelope: &[u8]) -> Result<Vec<u8>> {
+        Self::decrypt_with(&self.keys, envelope)
+    }
+
+    /// [`Self::decrypt`] with only the key provider, for callers that cannot
+    /// borrow the storage.
+    fn decrypt_with(keys: &K, envelope: &[u8]) -> Result<Vec<u8>> {
         // Parse and validate header
         let header = parse_header(envelope)?;
 
         // Look up the key
-        let key = self
-            .keys
+        let key = keys
             .key_by_id(header.key_id)
             .ok_or_else(|| EncryptionError::unknown_key_id(header.key_id))?;
 
@@ -452,8 +463,8 @@ mod nameservice_impls {
     #[async_trait]
     impl<S, K> StorageCas for EncryptedStorage<S, K>
     where
-        S: StorageCas,
-        K: KeyProvider,
+        S: StorageCas + 'static,
+        K: KeyProvider + 'static,
     {
         async fn insert(&self, address: &str, bytes: &[u8]) -> StorageExtResult<bool> {
             let encrypted = self
@@ -470,15 +481,18 @@ mod nameservice_impls {
         where
             F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
                 + Send
-                + Sync,
-            T: Send,
+                + Sync
+                + 'static,
+            T: Send + 'static,
         {
+            // The closure may run off this task, so it owns its keys.
+            let keys = Arc::clone(&self.keys);
             self.inner
-                .compare_and_swap(address, |current_encrypted| {
+                .compare_and_swap(address, move |current_encrypted| {
                     // Decrypt current value if present
                     let current_plaintext = current_encrypted
                         .map(|enc| {
-                            self.decrypt(enc)
+                            Self::decrypt_with(&keys, enc)
                                 .map_err(|e| StorageExtError::other(e.to_string()))
                         })
                         .transpose()?;
@@ -486,8 +500,7 @@ mod nameservice_impls {
                     let current_ref = current_plaintext.as_deref();
                     match f(current_ref)? {
                         CasAction::Write(plaintext) => {
-                            let encrypted = self
-                                .encrypt(&plaintext)
+                            let encrypted = Self::encrypt_with(&keys, &plaintext)
                                 .map_err(|e| StorageExtError::other(e.to_string()))?;
                             Ok(CasAction::Write(encrypted))
                         }
