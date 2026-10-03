@@ -93,7 +93,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// must range over the same variables. Three categories are hidden:
     /// - `?__*` — planner / aggregate / property-path synthetics.
     /// - `?#*`  — annotation-reifier synthetics
-    ///   (see `annotation::INTERNAL_VAR_PREFIX`).
+    ///   (see `annotation::ANONYMOUS_REIFIER_PREFIX`).
     /// - `_:*`  — SPARQL blank-node variables. Per SPARQL §4.1.4 these are
     ///   non-distinguished and not in SELECT scope, so they don't appear in
     ///   `SELECT *` results. Hiding them here also covers blank-node-labelled

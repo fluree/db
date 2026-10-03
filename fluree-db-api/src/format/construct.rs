@@ -168,8 +168,10 @@ pub(super) fn instantiate_construct_graph(
                 // `?r rdf:reifies ?t` with a triple term bound to ?t (or a
                 // constant one) writes what `?r rdf:reifies <<( s p o )>>`
                 // does: ?r's reification of the term's triple, which it does
-                // not assert.
+                // not assert. A reified-only pattern is the triple a reifier
+                // reifies, whatever its predicate.
                 let components = match &slots[2] {
+                    _ if !*asserted => None,
                     Slot::Var(v) => batch
                         .get(row, *v)
                         .map(|b| terms.triple_term(b))

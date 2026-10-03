@@ -2094,6 +2094,59 @@ async fn triple_terms_render_in_every_result_format() {
     assert_eq!(parsed(FormatterConfig::typed_json()), typed);
 }
 
+/// A reified triple in a CONSTRUCT template writes a reification by a fresh
+/// blank node per solution, without the triple; the shorthand's anonymous
+/// `{| |}` is such a blank node too, not the reifier it matched.
+#[tokio::test]
+async fn construct_templates_reify_through_fresh_blank_nodes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .insert_turtle(
+            support::genesis_ledger(&fluree, "it/triple-term-links:construct-reified"),
+            CLAIMS,
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    let construct = |sparql: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            let sparql = format!("PREFIX ex: <http://example.org/>\n{sparql}");
+            support::query_sparql(fluree, ledger, &sparql)
+                .await
+                .unwrap_or_else(|e| panic!("{sparql}: {e}"))
+                .to_construct(&ledger.snapshot)
+                .expect("JSON-LD")["@graph"]
+                .clone()
+        }
+    };
+    let blank = |node: &JsonValue| node["@id"].as_str().is_some_and(|id| id.starts_with("_:"));
+
+    let graph = construct("CONSTRUCT { << ex:x ex:y ex:z >> ex:seen ex:me } WHERE {}").await;
+    let nodes = graph.as_array().expect("graph");
+    assert_eq!(
+        nodes.len(),
+        1,
+        "the reifier alone, the triple unasserted: {graph}"
+    );
+    assert!(blank(&nodes[0]), "{graph}");
+    assert_eq!(
+        nodes[0]["@reifies"],
+        json!([{"@id": "ex:x", "ex:y": {"@id": "ex:z"}}]),
+        "{graph}"
+    );
+    assert_eq!(nodes[0]["ex:seen"], json!([{"@id": "ex:me"}]), "{graph}");
+
+    let graph = construct("CONSTRUCT WHERE { ex:alice ex:knows ?o {| ex:confidence ?c |} }").await;
+    let text = graph.to_string();
+    assert!(text.contains("0.9"), "the annotation is written: {text}");
+    assert!(
+        !text.contains("ex:claim1"),
+        "a fresh reifier, not the one the anonymous block matched: {text}"
+    );
+}
+
 /// `?r rdf:reifies ?t` in a CONSTRUCT template, with a triple term bound to
 /// ?t, writes what the explicit `<<( s p o )>>` template writes: the
 /// reification, without asserting its triple. Under any other predicate it

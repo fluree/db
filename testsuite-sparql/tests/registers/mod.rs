@@ -406,14 +406,9 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
     // SRX results: the harness reads no `<triple>` result term (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
-    // SPARQL lowering: "RDF-star quoted triples in this position lowering is
-    // not yet implemented" (CONSTRUCT templates) (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-1",
+    // results not isomorphic: the template reifies `_:r rdf:reifies <<( … )>>`,
+    // a nested triple term the result drops (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
-    // results not isomorphic: CONSTRUCT WHERE reuses the matched reifier for
-    // an anonymous `{| |}`, where the template mints a fresh blank node per
-    // solution (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
     // SPARQL lowering: triple-term values in VALUES data not implemented (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
     // update-3: the `{| |}` INSERT DATA executes, but the expected post-update

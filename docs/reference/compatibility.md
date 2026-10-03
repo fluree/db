@@ -187,7 +187,8 @@ Supported query and update annotation syntax:
 - Named reifiers: `?s ?p ?o ~ ?r {| ... |}` (IRI, blank-node, or variable reifier)
 - `rdf:reifies` form with `<<( s p o )>>` triple terms
 - Annotations in `INSERT DATA` / `DELETE DATA`
-- Annotations in `CONSTRUCT` templates (`~ ?r`, `{| ... |}`, and `?r rdf:reifies <<( s p o )>>`),
+- Annotations in `CONSTRUCT` templates (`~ ?r`, `{| ... |}`, `<< s p o >>` reified triples and
+  `?r rdf:reifies <<( s p o )>>`),
   written by every result format
 
 Also supported: triple terms as values in patterns, `INSERT DATA` / `DELETE DATA` /

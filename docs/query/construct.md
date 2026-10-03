@@ -204,6 +204,22 @@ A `{| ... |}` block without a reifier, or a blank-node reifier (`~ _:r`), mints 
 node for each solution, like `[ ]`. The block's properties become ordinary triples about the
 reifier.
 
+A reified triple, `<< s p o ~ r >>`, in a template subject or object stands for its reifier
+and writes `r`'s reification of `s p o` without asserting it; without `~ r` the reifier is a
+fresh blank node per solution:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+# Record each claim without asserting it
+CONSTRUCT { << ?s ex:worksFor ?o >> ex:source ex:hrExport }
+WHERE { ?s ex:claimsEmployer ?o }
+```
+
+In the `CONSTRUCT WHERE` shorthand the template is the pattern, and an anonymous `{| ... |}`
+(or a bare `~`) in it is a blank node there too: the result names a fresh reifier, not the
+one the pattern matched.
+
 In a JSON-LD query, put `@annotation` on the object, as when writing an annotation. An
 `@annotation` without an `@id` mints a fresh reifier per solution:
 
@@ -367,8 +383,6 @@ details of each.
   1.2 defines it; the annotation tail `s p o ~ ?r` writes both. `?r rdf:reifies ?t`, with `?t`
   bound to a triple term, writes the same as the first. A JSON-LD result writes a reification
   whose triple it does not carry as the reifier's `@reifies`.
-  Under any other predicate, a bound triple term is written as a literal holding its N-Triples
-  text: a result graph holds triple terms only as reifications.
 - A SPARQL datalog rule whose head (the template) annotates an edge or writes into a named
   graph is rejected: rules infer default-graph triples only.
 

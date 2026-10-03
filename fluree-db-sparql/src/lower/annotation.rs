@@ -32,11 +32,15 @@ use std::collections::HashMap;
 use super::path::PathObject;
 use super::{LoweringContext, Result};
 
-/// Prefix used for registry names of synthetic variables that must
-/// stay invisible to `SELECT *` and unmatchable by user input. `#`
-/// is comment-start in SPARQL, so no user variable can lex with this
-/// prefix.
-pub(super) const INTERNAL_VAR_PREFIX: &str = "#";
+/// Registry-name prefix of the variable an anonymous reifier (`{| |}`, a
+/// bare `~`) lowers to. `#` is comment-start in SPARQL, so no user variable
+/// can lex with it, and `SELECT *` hides it.
+pub(super) const ANONYMOUS_REIFIER_PREFIX: &str = "?#__ann_";
+
+/// The variable an anonymous reifier lowers to.
+pub(super) fn is_anonymous_reifier(name: &str) -> bool {
+    name.starts_with(ANONYMOUS_REIFIER_PREFIX)
+}
 
 /// Per-BGP memo of already-desugared reified-triple occurrences, keyed
 /// by source span. A quoted triple shared across several triple
@@ -170,11 +174,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // as a comment-start outside string literals, so no user
                 // variable can ever lex with this name. `lower_select_clause`
                 // filters these out of `SELECT *` expansion.
-                let var_id = self.vars.get_or_insert(&format!(
-                    "?{}__ann_{}",
-                    INTERNAL_VAR_PREFIX,
-                    self.vars.len()
-                ));
+                let var_id = self
+                    .vars
+                    .get_or_insert(&format!("{ANONYMOUS_REIFIER_PREFIX}{}", self.vars.len()));
                 Ok(Ref::Var(var_id))
             }
         }
