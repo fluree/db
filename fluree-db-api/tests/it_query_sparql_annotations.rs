@@ -546,40 +546,66 @@ async fn sparql_reifies_hidden_in_annotation_block_body_is_rejected() {
     );
 }
 
+/// The rows `select` returns over `ledger_id`'s current state.
+async fn select_rows(fluree: &MemoryFluree, ledger_id: &str, select: &str) -> Vec<JsonValue> {
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    support::query_sparql(fluree, &ledger, select)
+        .await
+        .expect("query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .clone()
+}
+
+/// Annotation tails write into the graph their triple is written to, inside
+/// a `GRAPH` block and under `WITH` alike.
 #[tokio::test]
-async fn sparql_with_scoped_annotation_template_is_rejected() {
-    // `WITH <g>` re-homes default-position template triples into <g> after
-    // annotation expansion, but v1 expansion omits f:reifiesGraph (the edge
-    // identity is default-graph). Allowing it would mint graph-tagged
-    // reifications carrying a default-graph edge identity — a broken edge
-    // that never hydrates or cascades. Reject until graph-aware expansion
-    // lands. Annotation tails inside explicit GRAPH blocks are rejected
-    // separately by the quad-pattern expansion.
-    let ledger0 = {
-        let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/with-scoped-rej")
-    };
-    let update = r#"
-        PREFIX ex: <http://example.org/>
-        WITH <http://example.org/g>
-        INSERT { ?person ex:worksFor ex:acme {| ex:role "Engineer" |} }
-        WHERE  { ?person a ex:Person }
-    "#;
-    let parsed = fluree_db_sparql::parse_sparql(update);
-    assert!(
-        !parsed.has_errors(),
-        "parse should succeed: {:?}",
-        parsed.diagnostics
-    );
-    let ast = parsed.ast.unwrap();
-    let mut ns = NamespaceRegistry::from_db(&ledger0.snapshot);
-    let err = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
-        .expect_err("annotation tail on a WITH-scoped template must be rejected");
-    let msg = format!("{err:?} {err}");
-    assert!(
-        msg.contains("WITH-scoped"),
-        "expected WITH-scoped annotation rejection, got: {msg}"
-    );
+async fn sparql_update_annotations_land_in_named_graphs() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-ann-update/named-graphs";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    for update in [
+        r"PREFIX ex: <http://example.org/>
+          INSERT DATA {
+            GRAPH <http://example.org/g> { ex:a ex:knows ex:b {| ex:src ex:x |} }
+            GRAPH <http://example.org/g2> { ex:alice a ex:Person }
+          }",
+        r#"PREFIX ex: <http://example.org/>
+           WITH <http://example.org/g2>
+           INSERT { ?person ex:worksFor ex:acme {| ex:role "Engineer" |} }
+           WHERE  { ?person a ex:Person }"#,
+    ] {
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(update)
+            .commit()
+            .await
+            .expect("update");
+    }
+    let src = select_rows(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?src WHERE { GRAPH <http://example.org/g> { ex:a ex:knows ex:b {| ex:src ?src |} } }",
+    )
+    .await;
+    assert_eq!(src.len(), 1, "{src:?}");
+    let role = select_rows(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?role WHERE { GRAPH <http://example.org/g2> \
+         { ex:alice ex:worksFor ex:acme {| ex:role ?role |} } }",
+    )
+    .await;
+    assert_eq!(role.len(), 1, "{role:?}");
+    assert_eq!(role[0]["role"]["value"], "Engineer");
 }
 
 #[tokio::test]
@@ -976,38 +1002,62 @@ async fn sparql_quoted_triple_with_annotation_tail_is_rejected() {
     );
 }
 
+/// A reified triple in SPARQL UPDATE stands for its reifier and does not
+/// assert its triple (RDF 1.2), in subject and object position alike, and an
+/// annotation tail on the triple it is part of still applies.
 #[tokio::test]
-async fn sparql_update_quoted_triple_with_annotation_tail_does_not_panic() {
-    // Mirrors the read-side test but exercises the UPDATE path.
-    // `<<:s :p :o>> ~ {| :ann :v |}` used to hit
-    // `unreachable!()` inside `expand_annotated_triples` because
-    // a QuotedTriple subject reached `subject_to_object`. The
-    // expansion path must reject this explicitly with an
-    // `UnsupportedFeature` error before that helper is called.
-    let ledger0 = {
-        let fluree = FlureeBuilder::memory().build_memory();
-        genesis_ledger(&fluree, "it/sparql-ann-update/quoted-triple-tail")
-    };
-    let update = r"
-        PREFIX ex: <http://example.org/>
-        INSERT DATA {
-          << ex:alice ex:worksFor ex:acme >> ex:ann ex:v {| ex:role ex:eng |} .
-        }
-    ";
-    let parsed = fluree_db_sparql::parse_sparql(update);
-    if parsed.has_errors() {
-        // Parser may already reject this shape; that's also acceptable
-        // — the point of the test is "no panic in the lowering path".
-        return;
-    }
-    let ast = parsed.ast.unwrap();
-    let mut ns = NamespaceRegistry::from_db(&ledger0.snapshot);
-    let err = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
-        .expect_err("quoted-triple subject + annotation tail must be rejected");
-    let msg = format!("{err:?} {err}");
+async fn sparql_update_reified_triples_do_not_assert_their_triple() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-ann-update/reified-triples";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            r"PREFIX ex: <http://example.org/>
+              INSERT DATA {
+                << ex:alice ex:worksFor ex:acme ~ ex:claim >> ex:source ex:hr {| ex:seenBy ex:bob |} .
+                ex:doc ex:cites << ex:x ex:y ex:z >> .
+              }",
+        )
+        .commit()
+        .await
+        .expect("INSERT DATA with reified triples");
+
+    let rows = |select: &'static str| select_rows(&fluree, ledger_id, select);
     assert!(
-        msg.contains("quoted-triple") || msg.contains("annotation tail"),
-        "expected UnsupportedFeature on quoted-triple + tail, got: {msg}"
+        rows("PREFIX ex: <http://example.org/> SELECT ?o WHERE { ex:alice ex:worksFor ?o }")
+            .await
+            .is_empty(),
+        "the reified triple is not asserted"
+    );
+    let claim = rows(
+        "PREFIX ex: <http://example.org/>
+         SELECT ?r ?s WHERE { << ex:alice ex:worksFor ex:acme ~ ?r >> ex:source ?s }",
+    )
+    .await;
+    assert_eq!(claim.len(), 1, "{claim:?}");
+    assert_eq!(claim[0]["r"]["value"], "http://example.org/claim");
+    let seen = rows(
+        "PREFIX ex: <http://example.org/>
+         SELECT ?w WHERE { ex:claim ex:source ex:hr {| ex:seenBy ?w |} }",
+    )
+    .await;
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let cited = rows(
+        "PREFIX ex: <http://example.org/>
+         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+         SELECT ?r WHERE { ex:doc ex:cites ?r . ?r rdf:reifies <<( ex:x ex:y ex:z )>> }",
+    )
+    .await;
+    assert_eq!(cited.len(), 1, "{cited:?}");
+    assert!(
+        rows("PREFIX ex: <http://example.org/> SELECT ?z WHERE { ex:x ex:y ?z }")
+            .await
+            .is_empty()
     );
 }
 

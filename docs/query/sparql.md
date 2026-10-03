@@ -1090,11 +1090,10 @@ INSERT DATA {
 }
 ```
 
-Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates, and in `CONSTRUCT` templates, where they carry reifiers into every result format (see [CONSTRUCT](construct.md#edge-annotations-in-the-template)). Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
+Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates, inside `GRAPH { }` blocks and under `WITH <g>` (the link and body land in the triple's graph), and in `CONSTRUCT` templates, where they carry reifiers into every result format (see [CONSTRUCT](construct.md#edge-annotations-in-the-template)). Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
 
 ### Boundaries (rejected at parse / lowering time)
 
-- **Default graph only.** An annotation tail inside an explicit `GRAPH { }` block, or under a `WITH <g>` template, is rejected — SPARQL UPDATE annotations target the default graph. Use the JSON-LD `@annotation` surface to annotate an edge inside a named graph.
 - **Simple-predicate triples only.** `?s ex:p1/ex:p2 ?o {| ... |}` (property-path) is rejected.
 - **Triple terms only as `rdf:reifies` objects**; any other use errors at parse time.
 - **No reserved predicates by hand.** The [system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
@@ -1294,7 +1293,7 @@ Current restrictions / boundaries:
 - **Graph management operations**: `CREATE`, `CLEAR`, `DROP`, `ADD`, `MOVE` and `COPY` are supported, and `CLEAR`/`DROP` accept `GRAPH <iri>`, `DEFAULT`, `NAMED` and `ALL`. `DROP` behaves like `CLEAR`: the graph registry is additive, so a dropped graph stays registered but empty. These operations refuse the reserved `#config` and `#txn-meta` graphs. Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op.
 - **SERVICE**: Only local-ledger endpoints of the form `fluree:ledger:<name>[:<branch>]` are supported; arbitrary remote HTTP `SERVICE` endpoints are not supported.
 - **Property paths**: Supported in `WHERE` (subject to Fluree capability settings).
-- **Edge annotations are default-graph only**: an annotation tail (`{| ... |}`) inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected; a blank or anonymous reifier is rejected in `DELETE DATA`. See [Edge annotations](#edge-annotations-sparql-12--rdf-12) for the full boundary list.
+- **Edge annotations**: a blank or anonymous reifier is rejected in `DELETE DATA`. See [Edge annotations](#edge-annotations-sparql-12--rdf-12) for the full boundary list.
 
 ### Endpoint Usage
 

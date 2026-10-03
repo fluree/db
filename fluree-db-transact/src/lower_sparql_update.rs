@@ -50,8 +50,8 @@ use fluree_db_sparql::ast::{
     AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphMgmtRef, GraphOrDefault,
     GraphPattern, GraphRefAll, GraphTransfer, Iri, IriValue, Literal,
     LiteralValue as SparqlLiteralValue, Load, Modify, PredicateTerm, Prologue, PropertyPath,
-    QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term,
-    TriplePattern, TripleTerm as SparqlTripleTerm, UpdateOperation,
+    QuadData, QuadPattern, QuadPatternElement, QueryBody, QuotedTriple, ReifierId, SparqlAst,
+    SubjectTerm, Term, TriplePattern, TripleTerm as SparqlTripleTerm, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
 use thiserror::Error;
@@ -272,13 +272,11 @@ fn anon_in_mode_msg(op: &'static str) -> &'static str {
     }
 }
 
-/// Expand any annotated triples in a Vec into the equivalent set of
-/// unannotated triples, as RDF 1.2 defines the annotation syntax: the base
-/// triple, `reifier rdf:reifies <<( s p o )>>` per annotation, and the body's
-/// predicate-object pairs.
-///
-/// Default-graph only in v1; an annotation tail inside a `GRAPH` block
-/// is rejected by the caller before this is invoked.
+/// Expand any reified or annotated triples in a Vec into the equivalent set
+/// of plain triples, as RDF 1.2 defines them. A reified triple (`<< s p o ~
+/// r >>`) becomes its reifier plus `r rdf:reifies <<( s p o )>>`, without
+/// `s p o`; an annotated triple becomes the base triple, `reifier rdf:reifies
+/// <<( s p o )>>` per annotation, and the body's predicate-object pairs.
 fn expand_annotated_triples(
     triples: &mut Vec<TriplePattern>,
     mode: AnnotationExpansionMode,
@@ -287,20 +285,17 @@ fn expand_annotated_triples(
     let original = std::mem::take(triples);
     let mut out: Vec<TriplePattern> = Vec::with_capacity(original.len());
 
-    for tp in original {
+    for mut tp in original {
+        if let SubjectTerm::QuotedTriple(qt) = &tp.subject {
+            tp.subject = reify(qt, mode, bnodes, &mut out)?;
+        }
+        if let Term::QuotedTriple(qt) = &tp.object {
+            tp.object = reify(qt, mode, bnodes, &mut out)?.into();
+        }
         let Some(annotation) = tp.annotation.clone() else {
             out.push(tp);
             continue;
         };
-
-        // A reified triple as the annotated triple's subject is deferred.
-        if let SubjectTerm::QuotedTriple(qt) = &tp.subject {
-            return Err(LowerError::UnsupportedFeature {
-                feature: "RDF-star quoted-triple subject combined with an RDF 1.2 \
-                          annotation tail (`{| ... |}`) in SPARQL UPDATE",
-                span: qt.span,
-            });
-        }
 
         if let SubjectTerm::TripleTerm(tt) = &tp.subject {
             return Err(LowerError::UnsupportedFeature {
@@ -368,10 +363,45 @@ fn expand_annotated_triples(
     Ok(())
 }
 
-/// Walk the QuadPatternElement list and expand every annotated triple
-/// in-place. Annotation tails inside a GRAPH block are rejected with a
-/// "deferred to a follow-up" message so the v1 default-graph contract
-/// stays unambiguous.
+/// The reifier `qt` denotes, after pushing its `rdf:reifies` link (and any
+/// nested reified triple's) onto `out`.
+fn reify(
+    qt: &QuotedTriple,
+    mode: AnnotationExpansionMode,
+    bnodes: &mut BlankNodeCounter,
+    out: &mut Vec<TriplePattern>,
+) -> Result<SubjectTerm, LowerError> {
+    let subject = match qt.subject.as_ref() {
+        SubjectTerm::QuotedTriple(inner) => reify(inner, mode, bnodes, out)?,
+        subject => subject.clone(),
+    };
+    let object = match qt.object.as_ref() {
+        Term::QuotedTriple(inner) => reify(inner, mode, bnodes, out)?.into(),
+        object => object.clone(),
+    };
+    let unit = AnnotationUnit {
+        reifier: qt.reifier.as_ref().and_then(|r| r.id.clone()),
+        block: None,
+        span: qt.span,
+    };
+    let reifier = resolve_reifier(&unit, mode, bnodes)?;
+    out.push(TriplePattern::new(
+        reifier.clone(),
+        PredicateTerm::Iri(Iri::full(fluree_vocab::rdf::REIFIES, qt.span)),
+        Term::TripleTerm(Box::new(SparqlTripleTerm {
+            subject,
+            predicate: qt.predicate.clone(),
+            object,
+            span: qt.span,
+        })),
+        qt.span,
+    ));
+    Ok(reifier)
+}
+
+/// Walk the QuadPatternElement list and expand every reified or annotated
+/// triple in-place, inside `GRAPH` blocks too: the link and body land in the
+/// block's graph, beside the triple.
 fn expand_annotated_triples_in_quad_pattern(
     pattern: &mut QuadPattern,
     mode: AnnotationExpansionMode,
@@ -386,16 +416,10 @@ fn expand_annotated_triples_in_quad_pattern(
             QuadPatternElement::Triple(t) => default_triples.push(*t),
             QuadPatternElement::Graph {
                 name,
-                triples,
+                mut triples,
                 span,
             } => {
-                if triples.iter().any(|t| t.annotation.is_some()) {
-                    return Err(LowerError::UnsupportedFeature {
-                        feature: "annotation tail inside a GRAPH block in SPARQL UPDATE \
-                                  (default-graph only in v1)",
-                        span,
-                    });
-                }
+                expand_annotated_triples(&mut triples, mode, bnodes)?;
                 graph_blocks.push(QuadPatternElement::Graph {
                     name,
                     triples,
@@ -581,28 +605,6 @@ fn reject_user_authored_reifies_in_quad_pattern(
             }
             QuadPatternElement::Graph { triples, .. } => {
                 reject_user_authored_reifies(triples, prologue)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Reject RDF 1.2 annotation tails on `WITH <g>`-scoped template triples:
-/// SPARQL UPDATE annotations are default-graph only for now. Annotation tails
-/// inside explicit `GRAPH { ... }` blocks are rejected by
-/// [`expand_annotated_triples_in_quad_pattern`]; this covers the top-level
-/// (WITH-scoped) triples it would otherwise expand as default-graph.
-fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerError> {
-    for el in &pattern.patterns {
-        if let QuadPatternElement::Triple(tp) = el {
-            if tp.annotation.is_some() {
-                return Err(LowerError::UnsupportedFeature {
-                    feature: "RDF 1.2 annotation tail (`{| ... |}`) on a WITH-scoped \
-                              SPARQL UPDATE template (SPARQL UPDATE annotations are \
-                              default-graph only; use the JSON-LD @annotation surface to \
-                              annotate an edge in a named graph)",
-                    span: tp.span,
-                });
             }
         }
     }
@@ -1451,9 +1453,6 @@ fn lower_modify(
     let delete_templates = if let Some(delete_clause) = &modify.delete_clause {
         reject_blank_nodes_in_delete_quad_pattern(delete_clause, "DELETE templates")?;
         reject_user_authored_reifies_in_quad_pattern(delete_clause, prologue)?;
-        if default_template_graph.is_some() {
-            reject_with_scoped_annotations(delete_clause)?;
-        }
         let mut expanded = delete_clause.clone();
         expand_annotated_triples_in_quad_pattern(
             &mut expanded,
@@ -1475,9 +1474,6 @@ fn lower_modify(
 
     let insert_templates = if let Some(insert_clause) = &modify.insert_clause {
         reject_user_authored_reifies_in_quad_pattern(insert_clause, prologue)?;
-        if default_template_graph.is_some() {
-            reject_with_scoped_annotations(insert_clause)?;
-        }
         let mut expanded = insert_clause.clone();
         expand_annotated_triples_in_quad_pattern(
             &mut expanded,
@@ -2823,21 +2819,28 @@ mod tests {
         );
     }
 
-    /// The pre-existing QuotedTriple twin of the guard: `<< s p o >>` subject
-    /// + annotation tail is likewise a clean error, not a panic.
+    /// A reified triple stands for its reifier and is not asserted: `<< s p
+    /// o >> q o2 {| a b |}` writes the reifier's link, `r q o2` and that
+    /// triple's annotation, and no `s p o`.
     #[test]
-    fn test_quoted_triple_subject_with_annotation_tail_is_rejected() {
-        let result = parse_and_lower(
+    fn test_reified_triple_subject_with_annotation_tail_does_not_assert_it() {
+        let txn = parse_and_lower(
             r"PREFIX ex: <http://example.org/>
                INSERT DATA { << ex:s ex:p ex:o >> ex:q ex:o2 {| ex:a ex:b |} }",
-        );
+        )
+        .expect("lower");
+        let links = txn
+            .insert_templates
+            .iter()
+            .filter(|t| matches!(&t.object, TemplateTerm::TripleTerm(_)))
+            .count();
+        assert_eq!(links, 2, "the reified triple's link and the annotation's");
         assert!(
-            matches!(
-                &result,
-                Err(LowerError::UnsupportedFeature { feature, .. })
-                    if feature.contains("quoted-triple subject")
-            ),
-            "expected a clean quoted-triple-subject UnsupportedFeature, got {result:?}"
+            !txn.insert_templates
+                .iter()
+                .any(|t| matches!(&t.subject, TemplateTerm::Sid(sid) if &*sid.name == "s")),
+            "the reified triple is not asserted: {:?}",
+            txn.insert_templates
         );
     }
 }

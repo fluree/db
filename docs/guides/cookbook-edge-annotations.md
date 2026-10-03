@@ -11,7 +11,7 @@ Throughout, the running example is employment: a `worksFor` edge that needs a `r
 | You have… | Use | Why |
 |---|---|---|
 | JSON-LD writes, or you need named-graph edges, or literal-valued edges | **JSON-LD `@annotation`** | Most complete surface — covers everything below. |
-| A SPARQL 1.1/1.2 pipeline, or you're porting RDF-star data | **SPARQL 1.2 annotation tail** (`{\| \|}`, `~`, `rdf:reifies`) | Standards syntax. Default-graph only today. |
+| A SPARQL 1.1/1.2 pipeline, or you're porting RDF-star data | **SPARQL 1.2 annotation tail** (`{\| \|}`, `~`, `rdf:reifies`) | Standards syntax, in the default graph and named graphs. |
 | A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept `{\| \|}`, `~`, `<< >>` and `rdf:reifies <<( )>>`, and TriG `GRAPH { }` blocks accept them too (TriG via `insert` / `upsert` / `import` / `/sync`) | Same on-disk shape as `@annotation`; the annotation syntax asserts its triple, `<< >>` and `rdf:reifies` do not; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
 
 ## Attach metadata to a relationship
@@ -234,7 +234,7 @@ SELECT ?person ?org WHERE {
 }
 ```
 
-The triple term `<<( s p o )>>` is accepted **only** as the object of `rdf:reifies`. The bare, parenthesis-free `<< s p o >>` form is the separate Fluree `f:t`/`f:op` flake-metadata construct — the two don't compose. Per-operation reifier rules (variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
+The triple term `<<( s p o )>>` is accepted **only** as the object of `rdf:reifies`. The parenthesis-free `<< s p o ~ :r >>` is a reified triple: it stands for its reifier and does not assert `s p o` (a reifier-less `<< s p o >>` under `f:t` / `f:op` is the separate flake-metadata construct). Per-operation reifier rules (variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
 
 ## Annotate an edge inside a named graph
 
@@ -254,7 +254,7 @@ Edge annotations live in the same graph as the edge they reify. On the JSON-LD s
 }
 ```
 
-> **SPARQL UPDATE is default-graph only today.** An annotation tail inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected — use the JSON-LD surface above for named-graph edge annotations.
+> **Named graphs.** An annotation tail inside a `GRAPH { }` block or under a `WITH <g>` template writes the link and body into that graph, beside the triple.
 
 ## Keep a Turtle claims file in sync
 
