@@ -230,10 +230,13 @@ fluree query --ledger mydb:main#config 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 
 No special CLI commands are needed — config is data, written and queried like any other named graph.
 
-A reserved graph has to be named in full. `FROM <config>` and `FROM <#config>`
-are not the config graph's IRI and are rejected, and `GRAPH ?g` never
-enumerates the reserved graphs — naming one is always something the query
-author did on purpose.
+Where a query targets one ledger (the ledger route `/query/<ledger>`, the CLI
+with a ledger, an embedded view), `FROM <config>` and `FROM <txn-meta>` name
+that ledger's reserved graphs by keyword. The connection route `/query` has no
+target ledger, so there a reserved graph is named in full (`<ledger>#config`
+or its `urn:fluree:` IRI). `FROM <#config>` is a relative IRI, not a graph
+name, and is refused. `GRAPH ?g` never enumerates the reserved graphs, so
+naming one is always something the query author did on purpose.
 
 Reachability is not access. Adding `f:policyDefaults [ f:defaultAllow false ]`
 to the config above makes the `FROM` query return zero rows instead of three,

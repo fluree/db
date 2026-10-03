@@ -3,7 +3,7 @@
 //! This module provides the API-layer types for declaring and resolving datasets:
 //!
 //! - [`DatasetSpec`]: Declarative specification from query parsing (unresolved)
-//! - [`GraphSource`]: Individual graph source with optional time specification
+//! - [`GraphSource`]: One dataset member, parsed once into a typed reference
 //! - [`TimeSpec`]: Time-travel specification (at t, commit, or time)
 //! - [`DataSetDb`](crate::view::DataSetDb): Resolved dataset composed of views
 //!
@@ -31,46 +31,19 @@
 //! let result = fluree.query_dataset(&dataset, &query).await?;
 //! ```
 
-use fluree_db_core::ledger_id::{
-    parse_time_travel_spec, LedgerIdParseError, LedgerIdTimeSpec, COMMIT_PREFIX_MIN_LEN,
-    TIME_TRAVEL_TAGS,
-};
-use fluree_db_core::VerifiedIdentity;
-use fluree_db_sparql::ast::{DatasetClause as SparqlDatasetClause, IriValue};
+use fluree_db_core::{LedgerId, VerifiedIdentity};
+use fluree_db_sparql::ResolvedDatasetClause;
+use std::sync::Arc;
 
-/// Convert a SPARQL IriValue to a string for use as a ledger identifier.
-///
-/// - Full IRIs (from `<...>` syntax) return the IRI string directly
-/// - Prefixed IRIs return `prefix:local` (unexpanded)
-///
-/// # Note on Prefixed IRIs
-///
-/// SPARQL `FROM` clauses typically use full IRI syntax: `FROM <ledger:main>`.
-/// The angle brackets make this a full IRI, even if it looks like a CURIE.
-/// Actual prefixed names (`ex:graph` without brackets) would need the prologue
-/// prefix map to expand properly.
-///
-/// For dataset identifiers (ledger aliases), we expect full IRIs in `<...>` form.
-/// If prefixed names appear, they're passed through as-is and will likely fail
-/// nameservice resolution unless the identifier happens to match.
-fn iri_value_to_string(iri: &IriValue) -> String {
-    match iri {
-        IriValue::Full(s) => s.to_string(),
-        IriValue::Prefixed { prefix, local } => {
-            if prefix.is_empty() {
-                format!(":{local}")
-            } else {
-                format!("{prefix}:{local}")
-            }
-        }
-    }
-}
+pub use fluree_db_core::{DatasetRef, GraphIri, GraphSel, LedgerRef, MemberRef};
 
 /// Declarative dataset specification from query parsing
 ///
-/// This is the API-layer type containing unresolved ledger aliases
-/// and time-travel specs. It represents what the user requested,
-/// before resolution via nameservice.
+/// What the user asked for, parsed once: every member is a typed
+/// [`GraphSource`], and nothing downstream re-reads its text to decide what it
+/// names. Resolution against the nameservice (a connection surface) or a
+/// target ledger's graph registry (a ledger-scoped surface) happens when the
+/// dataset is built.
 ///
 /// # Examples
 ///
@@ -88,8 +61,8 @@ fn iri_value_to_string(iri: &IriValue) -> String {
 /// SPARQL:
 /// ```sparql
 /// FROM <ledger:main>
-/// FROM NAMED <graph1>
-/// FROM NAMED <graph2>
+/// FROM NAMED <graph1:main>
+/// FROM NAMED <graph2:main>
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct DatasetSpec {
@@ -151,24 +124,31 @@ impl DatasetSpec {
         self.history_range.as_ref()
     }
 
-    /// Create a DatasetSpec from a SPARQL DatasetClause
-    ///
-    /// Converts SPARQL FROM and FROM NAMED clauses to the API-layer
-    /// DatasetSpec format.
-    ///
-    /// # Example
-    ///
-    /// ```sparql
-    /// SELECT ?s
-    /// FROM <http://example.org/graph1>
-    /// FROM <http://example.org/graph2>
-    /// FROM NAMED <http://example.org/named1>
-    /// WHERE { ?s ?p ?o }
-    /// ```
-    ///
-    /// Would produce a DatasetSpec with:
-    /// - 2 default graphs (graph1, graph2)
-    /// - 1 named graph (named1)
+    /// Every member, default graphs first.
+    pub fn sources(&self) -> impl Iterator<Item = &GraphSource> {
+        self.default_graphs.iter().chain(&self.named_graphs)
+    }
+
+    /// The ledgers (or graph sources) this dataset names by address, each
+    /// once, in first-mention order: what a connection surface authorizes and
+    /// refreshes. A bare graph IRI or a graph keyword names no ledger.
+    pub fn ledgers(&self) -> Vec<LedgerId> {
+        let mut out: Vec<LedgerId> = Vec::new();
+        let ids = self
+            .sources()
+            .filter_map(|s| s.address().map(LedgerRef::id))
+            .chain(self.history_range.iter().map(|r| &r.ledger));
+        for id in ids {
+            if !out.contains(id) {
+                out.push(id.clone());
+            }
+        }
+        out
+    }
+
+    /// Create a DatasetSpec from a SPARQL dataset clause whose IRIs the
+    /// prologue has already expanded (prefixes applied, BASE resolved), as
+    /// [`fluree_db_sparql::resolve_dataset_clause`] returns it.
     ///
     /// ## Fluree Extension: History Range
     ///
@@ -179,111 +159,261 @@ impl DatasetSpec {
     /// ```
     ///
     /// When `TO` clause is present, creates a history range query.
-    pub fn from_sparql_clause(clause: &SparqlDatasetClause) -> Result<Self, DatasetParseError> {
+    pub fn from_sparql(clause: &ResolvedDatasetClause) -> Result<Self, DatasetParseError> {
+        let parse = |iri: &Arc<str>| GraphSource::parse(iri);
         let default_graphs = clause
             .default_graphs
             .iter()
-            .map(|iri| {
-                let iri_str = iri_value_to_string(&iri.value);
-                let (identifier, time_spec) = parse_ledger_id_time_travel(&iri_str)?;
-                let mut source = GraphSource::new(identifier);
-                source.time_spec = time_spec;
-                Ok(source)
-            })
-            .collect::<Result<Vec<_>, DatasetParseError>>()?;
-
+            .map(parse)
+            .collect::<Result<Vec<_>, _>>()?;
         let named_graphs = clause
             .named_graphs
             .iter()
-            .map(|iri| {
-                let iri_str = iri_value_to_string(&iri.value);
-                let (identifier, time_spec) = parse_ledger_id_time_travel(&iri_str)?;
-                let mut source = GraphSource::new(identifier);
-                source.time_spec = time_spec;
-                Ok(source)
-            })
-            .collect::<Result<Vec<_>, DatasetParseError>>()?;
-
-        // Check for explicit TO clause (Fluree extension for history range)
-        let history_range = if let Some(to_iri) = &clause.to_graph {
-            // Explicit FROM...TO syntax
-            if default_graphs.is_empty() {
-                return Err(DatasetParseError::InvalidFrom(
-                    "FROM...TO requires a FROM graph".to_string(),
-                ));
+            .map(parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        let history_range = match &clause.to_graph {
+            Some(to) => {
+                let [from] = default_graphs.as_slice() else {
+                    return Err(DatasetParseError::InvalidFrom(
+                        "FROM...TO requires exactly one FROM graph".to_string(),
+                    ));
+                };
+                Some(HistoryTimeRange::between(
+                    from,
+                    &GraphSource::parse(to)?,
+                    ("FROM", "TO"),
+                )?)
             }
-            let from_source = &default_graphs[0];
-            let from_time = from_source.time_spec.as_ref().ok_or_else(|| {
-                DatasetParseError::InvalidFrom(
-                    "FROM graph in history range must have time specification".to_string(),
-                )
-            })?;
-
-            let to_iri_str = iri_value_to_string(&to_iri.value);
-            let (to_identifier, to_time_spec) = parse_ledger_id_time_travel(&to_iri_str)?;
-            let to_time = to_time_spec.ok_or_else(|| {
-                DatasetParseError::InvalidFrom("TO graph must have time specification".to_string())
-            })?;
-
-            // Verify same ledger
-            if !same_ledger(&from_source.identifier, &to_identifier) {
-                return Err(DatasetParseError::InvalidFrom(format!(
-                    "FROM and TO must reference the same ledger: {} vs {}",
-                    from_source.identifier, to_identifier
-                )));
-            }
-
-            Some(HistoryTimeRange::new(
-                &from_source.identifier,
-                from_time.clone(),
-                to_time,
-            ))
-        } else {
-            // No TO clause = not a history query
-            // Multiple FROM clauses are treated as a union query, not history
-            None
+            // No TO clause = not a history query. Multiple FROM clauses are a
+            // union, not a range.
+            None => None,
         };
-
         Ok(Self {
             default_graphs,
             named_graphs,
             history_range,
         })
     }
+
+    /// [`DatasetSpec::from_sparql`] for a parsed query: resolves the dataset
+    /// clause against the query's prologue first. A query with no dataset
+    /// clause has an empty spec.
+    pub fn from_sparql_ast(ast: &fluree_db_sparql::SparqlAst) -> Result<Self, DatasetParseError> {
+        match fluree_db_sparql::resolve_dataset_clause(ast)
+            .map_err(|e| DatasetParseError::InvalidFrom(e.to_string()))?
+        {
+            Some(clause) => Self::from_sparql(&clause),
+            None => Ok(Self::new()),
+        }
+    }
 }
 
-/// Individual graph source with optional time specification
+/// One member of a dataset, parsed once.
 ///
-/// Represents a single graph in a dataset, identified by a ledger alias
-/// (IRI) and optionally pinned to a specific time.
+/// A member records the text as written (a SPARQL `FROM` / `FROM NAMED` IRI
+/// after prefix and BASE expansion, a JSON-LD string, or a JSON-LD object's
+/// `@id`), what that text names ([`MemberRef`]), the time it is read at, and
+/// its per-source options. The fields are private: a `GraphSource` is built by
+/// parsing ([`GraphSource::parse`]) or from an already-typed address
+/// ([`GraphSource::ledger`]), never from an unclassified string.
 ///
-/// ## New fields (query-connection named graph support)
+/// A named member is known by its [`GraphSource::name`]: its alias when it has
+/// one, else the text as written, pin included, so `FROM NAMED <L@t:2>` is
+/// `GRAPH <L@t:2>` and two pins of one ledger are two members.
 ///
-/// - `source_alias`: Dataset-local alias for referencing this source in the query.
-///   Must be unique across all sources in a request.
-/// - `graph_selector`: Which graph within the ledger to query (default, txn-meta, or IRI).
-/// - `policy_override`: Per-source policy options (overrides global query options).
+/// Two fields stay public for callers that read which ledgers a query names
+/// before running it (an authorizer, for one): [`GraphSource::identifier`] and
+/// [`GraphSource::policy_override`]. Both are derived from the parse, and
+/// resolution reads the typed reference, never them. Read them; do not set
+/// them.
 #[derive(Debug, Clone)]
 pub struct GraphSource {
-    /// Ledger alias or IRI (e.g., "mydb:main", "http://example.org/ledger1")
+    /// The reference as the query named it, with an address's `@` time pin
+    /// removed (the member's time holds it) and any `#graph` kept:
+    /// `hist:main@t:42#txn-meta` → `hist:main#txn-meta`, and an object's `@id`
+    /// as written. A graph keyword or a graph IRI is kept as written.
     pub identifier: String,
-    /// Optional time-travel specification
-    pub time_spec: Option<TimeSpec>,
-    /// Dataset-local alias for this source (unique within the request)
-    ///
-    /// Used to reference this specific graph source in query patterns,
-    /// especially when the same graph IRI exists in multiple ledgers.
-    pub source_alias: Option<String>,
-    /// Graph selector within the ledger
-    ///
-    /// If None, the default graph is selected (same as `GraphSelector::Default`).
-    /// This is separate from the `#txn-meta` fragment in the identifier for cleaner semantics.
-    pub graph_selector: Option<GraphSelector>,
-    /// Per-source policy override
-    ///
-    /// If present, applies policy options only to this source, overriding
-    /// any global policy settings for this specific graph.
+    /// The per-source policy the object form's `policy` names, applied to this
+    /// source in place of the request's policy.
     pub policy_override: Option<SourcePolicyOverride>,
+    /// The text as written, kept only when it differs from `identifier` (a
+    /// `urn:fluree:` or pinned spelling, an object's `@id`): usually the two
+    /// agree, and the text is stored once.
+    written: Option<Arc<str>>,
+    /// What `written` names. An address here carries no pin: the pin lives in
+    /// `at`, where a JSON-LD `t` / `at` key or a path pin also lands.
+    reference: MemberRef,
+    at: Option<TimeSpec>,
+    alias: Option<String>,
+}
+
+/// [`GraphSource::identifier`] for a member written `written`: an address is
+/// reported as `name[:branch][#graph]`, whatever its spelling (the
+/// `urn:fluree:` wrapper and the `@` pin removed, a bare name kept bare), and
+/// anything else is kept as written.
+fn identifier_of(written: &str, reference: &MemberRef) -> String {
+    if reference.address().is_none() {
+        return written.to_string();
+    }
+    let body = written
+        .strip_prefix(fluree_db_core::LEDGER_URN_PREFIX)
+        .unwrap_or(written);
+    let (before_graph, graph) = match body.split_once('#') {
+        Some((before, graph)) => (before, Some(graph)),
+        None => (body, None),
+    };
+    match (before_graph.split_once('@'), graph) {
+        (Some((base, _pin)), Some(graph)) => format!("{base}#{graph}"),
+        (Some((base, _pin)), None) => base.to_string(),
+        (None, _) => body.to_string(),
+    }
+}
+
+impl GraphSource {
+    /// Parse a dataset-position string: a SPARQL `FROM` / `FROM NAMED` / `TO`
+    /// IRI (after prologue expansion) or a JSON-LD `from` / `fromNamed`
+    /// string. A graph keyword (`default`, `txn-meta`, `config`) names a graph
+    /// of the target ledger; anything else is classified by
+    /// [`DatasetRef::parse`].
+    pub fn parse(s: &str) -> Result<Self, DatasetParseError> {
+        let reference = MemberRef::parse(s)
+            .map_err(|e| DatasetParseError::InvalidGraphSource(format!("'{s}': {e}")))?;
+        Ok(Self::from_member(s, reference))
+    }
+
+    /// A member for an already-parsed ledger address: its graph, and its pin
+    /// as the member's time. Its text, `name:branch[#graph]`, is built once,
+    /// at its final length, and is its identifier too.
+    pub fn ledger(address: LedgerRef) -> Self {
+        let id = address.id().as_str();
+        let graph = (!address.graph().is_default()).then(|| address.graph().as_str());
+        let mut text = String::with_capacity(id.len() + graph.map_or(0, |g| 1 + g.len()));
+        text.push_str(id);
+        if let Some(graph) = graph {
+            text.push('#');
+            text.push_str(graph);
+        }
+        let reference = MemberRef::Dataset(DatasetRef::Address(address));
+        debug_assert_eq!(identifier_of(&text, &reference), text);
+        Self::from_parts(text, None, reference)
+    }
+
+    /// A member written `written`: its identifier, and the text itself only
+    /// where the two differ.
+    fn from_member(written: &str, reference: MemberRef) -> Self {
+        let identifier = identifier_of(written, &reference);
+        let written = (identifier != written).then(|| written.into());
+        Self::from_parts(identifier, written, reference)
+    }
+
+    fn from_parts(identifier: String, written: Option<Arc<str>>, reference: MemberRef) -> Self {
+        let (reference, at) = match reference {
+            MemberRef::Dataset(DatasetRef::Address(address)) => {
+                let at = address.at().cloned();
+                (
+                    MemberRef::Dataset(DatasetRef::Address(address.without_at())),
+                    at,
+                )
+            }
+            other => (other, None),
+        };
+        Self {
+            identifier,
+            policy_override: None,
+            written,
+            reference,
+            at,
+            alias: None,
+        }
+    }
+
+    /// The text as written.
+    pub fn written(&self) -> &str {
+        self.written.as_deref().unwrap_or(&self.identifier)
+    }
+
+    /// What the text names (an address here carries no pin; see
+    /// [`GraphSource::time_spec`]).
+    pub fn reference(&self) -> &MemberRef {
+        &self.reference
+    }
+
+    /// The address reading, when there is one: a ledger or graph source and
+    /// a graph of it.
+    pub fn address(&self) -> Option<&LedgerRef> {
+        self.reference.address()
+    }
+
+    /// When the member is read.
+    pub fn time_spec(&self) -> Option<&TimeSpec> {
+        self.at.as_ref()
+    }
+
+    /// Dataset-local alias (unique within the request).
+    pub fn alias(&self) -> Option<&str> {
+        self.alias.as_deref()
+    }
+
+    /// The name `GRAPH <name>` matches and `GRAPH ?g` binds for a named member:
+    /// the alias, else the text as written.
+    pub fn name(&self) -> &str {
+        self.alias.as_deref().unwrap_or_else(|| self.written())
+    }
+
+    /// Per-source policy override.
+    pub fn policy_override(&self) -> Option<&SourcePolicyOverride> {
+        self.policy_override.as_ref()
+    }
+
+    /// Read the member at `time_spec`, replacing any time it named itself.
+    pub fn with_time(mut self, time_spec: TimeSpec) -> Self {
+        self.at = Some(time_spec);
+        self
+    }
+
+    /// Set dataset-local alias
+    pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
+        self.alias = Some(alias.into());
+        self
+    }
+
+    /// Set per-source policy override
+    pub fn with_policy(mut self, policy: SourcePolicyOverride) -> Self {
+        self.policy_override = Some(policy);
+        self
+    }
+
+    /// The written text minus its `@` pin (`L@t:2#g` → `L#g`): the name a
+    /// pinned member was known by before members were named as written, kept
+    /// as a non-enumerated alias so a `GRAPH <L>` over `FROM NAMED <L@t:2>`
+    /// still matches. `None` for a member with no pin in its text.
+    pub(crate) fn unpinned_name(&self) -> Option<String> {
+        self.address()?;
+        let written = self.written();
+        let (before_graph, graph) = match written.split_once('#') {
+            Some((before, graph)) => (before, Some(graph)),
+            None => (written, None),
+        };
+        let (base, _pin) = before_graph.split_once('@')?;
+        Some(match graph {
+            Some(graph) => format!("{base}#{graph}"),
+            None => base.to_string(),
+        })
+    }
+}
+
+impl TryFrom<&str> for GraphSource {
+    type Error = DatasetParseError;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Self::parse(s)
+    }
+}
+
+impl std::str::FromStr for GraphSource {
+    type Err = DatasetParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
 }
 
 /// Per-source policy override options
@@ -339,312 +469,38 @@ impl SourcePolicyOverride {
     }
 }
 
-impl GraphSource {
-    /// Create a graph source from an identifier
-    pub fn new(identifier: impl Into<String>) -> Self {
-        Self {
-            identifier: identifier.into(),
-            time_spec: None,
-            source_alias: None,
-            graph_selector: None,
-            policy_override: None,
-        }
-    }
-
-    /// Set time specification
-    pub fn with_time(mut self, time_spec: TimeSpec) -> Self {
-        self.time_spec = Some(time_spec);
-        self
-    }
-
-    /// Set dataset-local alias
-    pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
-        self.source_alias = Some(alias.into());
-        self
-    }
-
-    /// Set graph selector
-    pub fn with_graph(mut self, selector: GraphSelector) -> Self {
-        self.graph_selector = Some(selector);
-        self
-    }
-
-    /// Set per-source policy override
-    pub fn with_policy(mut self, policy: SourcePolicyOverride) -> Self {
-        self.policy_override = Some(policy);
-        self
-    }
-
-    /// Create from identifier string
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
-        Self::new(s)
-    }
-}
-
-impl From<&str> for GraphSource {
-    fn from(s: &str) -> Self {
-        Self::new(s)
-    }
-}
-
-impl From<String> for GraphSource {
-    fn from(s: String) -> Self {
-        Self::new(s)
-    }
-}
-
 /// Graph selector for specifying which graph within a ledger to query.
 ///
-/// A ledger can contain multiple named graphs:
+/// The one graph-name keyword table lives in `fluree-db-core`
+/// ([`GraphSel`]); this name is kept so existing paths compile. A ledger can
+/// contain multiple named graphs:
 /// - Default graph (g_id=0): the main data graph
 /// - txn-meta graph (g_id=1): transaction metadata
 /// - config graph (g_id=2): ledger governance/config
-/// - User-defined named graphs: arbitrary IRIs mapped to g_id via registry
+/// - User-defined named graphs: absolute IRIs mapped to g_id via the registry
 ///
 /// `TxnMeta` and `Config` name RESERVED graphs. Selecting one is an explicit,
 /// ledger-qualified act — the selector only exists because a caller wrote it —
 /// so it is permitted here; what stays closed is implicit reachability
 /// (`GRAPH ?g` enumeration, an unnamed `GRAPH <iri>`). See the reserved-graph
 /// contract table on `Fluree::resolve_within_ledger_graph` in `view/query.rs`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum GraphSelector {
-    /// The ledger's default graph (g_id=0)
-    Default,
-    /// The built-in transaction metadata graph (g_id=1)
-    TxnMeta,
-    /// The ledger's config graph (g_id=2)
-    Config,
-    /// A user-defined named graph by IRI
-    /// The IRI is resolved to a g_id via the ledger's graph registry
-    Iri(String),
-}
+pub type GraphSelector = GraphSel;
 
-impl GraphSelector {
-    /// Create a selector for the default graph
-    pub fn default_graph() -> Self {
-        Self::Default
-    }
-
-    /// Create a selector for the txn-meta graph
-    pub fn txn_meta() -> Self {
-        Self::TxnMeta
-    }
-
-    /// Create a selector for the config graph
-    pub fn config() -> Self {
-        Self::Config
-    }
-
-    /// Create a selector for a named graph by IRI
-    pub fn iri(iri: impl Into<String>) -> Self {
-        Self::Iri(iri.into())
-    }
-
-    /// Parse from string value (as used in JSON "graph" field)
-    ///
-    /// - `"default"` → Default
-    /// - `"txn-meta"` → TxnMeta
-    /// - `"config"` → Config
-    /// - anything else → Iri(value)
-    ///
-    /// `"config"` is a well-known name like `"txn-meta"`, not a graph IRI:
-    /// without this arm it fell through to `Iri("config")`, an exact-IRI
-    /// lookup for the bare word that can never match the registered
-    /// `urn:fluree:<ledger>#config`.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "default" => Self::Default,
-            "txn-meta" => Self::TxnMeta,
-            "config" => Self::Config,
-            _ => Self::Iri(s.to_string()),
-        }
-    }
-}
-
-/// Time specification for graph sources
+/// Time specification for graph sources: one point in a ledger's history.
 ///
-/// Allows pinning a graph to a specific point in time.
-#[derive(Debug, Clone, PartialEq)]
-pub enum TimeSpec {
-    /// At a specific transaction number
-    AtT(i64),
-    /// At a specific commit hash
-    AtCommit(String),
-    /// At a specific ISO 8601 timestamp, resolved against commit *event
-    /// time* (`db:time` — user-suppliable for backdated historical loads)
-    AtTime(String),
-    /// At a specific ISO 8601 timestamp, resolved against the wall-clock
-    /// time commits were *recorded* (`db:receivedAt`, audit axis).
-    /// Identical to `AtTime` on ledgers that never used caller-supplied
-    /// event times.
-    AtRecorded(String),
-    /// At a table format's own snapshot id (`@snapshot:<id>`). Resolvable only
-    /// by a graph source backed by a snapshotted table; native ledgers reject it.
-    AtSnapshot(i64),
-    /// "latest" keyword - resolves to current ledger t
-    Latest,
-}
-
-impl TimeSpec {
-    /// Create at-t specification
-    pub fn at_t(t: i64) -> Self {
-        Self::AtT(t)
-    }
-
-    /// Create at-commit specification
-    pub fn at_commit(commit: impl Into<String>) -> Self {
-        Self::AtCommit(commit.into())
-    }
-
-    /// Create at-time specification
-    pub fn at_time(time: impl Into<String>) -> Self {
-        Self::AtTime(time.into())
-    }
-
-    /// Create at-recorded specification (audit axis)
-    pub fn at_recorded(time: impl Into<String>) -> Self {
-        Self::AtRecorded(time.into())
-    }
-
-    /// Create latest specification
-    pub fn latest() -> Self {
-        Self::Latest
-    }
-
-    /// Parse the canonical time-travel grammar: a ledger address's `@` suffix
-    /// (`mydb:main@t:5`) with the `@` removed.
-    ///
-    /// | spelling | meaning |
-    /// |---|---|
-    /// | `t:<N>` | transaction number `N` |
-    /// | `t:latest` | the ledger's current head |
-    /// | `time:<timestamp>` (alias `iso:`) | commit *event* time (`db:time`) |
-    /// | `recorded:<timestamp>` | wall-clock time the commit was recorded (`db:receivedAt`) |
-    /// | `commit:<prefix>` | commit hex-digest prefix, at least 6 characters |
-    ///
-    /// This is an address grammar, so it is deliberately strict — widening it
-    /// here widens what `ledger@<spec>` accepts on every query surface. User
-    /// typed `--at` / `at=` arguments go through [`TimeSpec::parse_at`], which
-    /// layers the CLI's older bare spellings on top without touching this one.
-    pub fn parse(spec: &str) -> Result<Self, LedgerIdParseError> {
-        Self::parse_with_sigil(spec, "")
-    }
-
-    /// [`TimeSpec::parse`] for the suffix of a ledger address — identical
-    /// grammar, but errors quote the tag with the `@` the user actually typed
-    /// (`Missing value after '@t:'`, not `'t:'`).
-    pub fn parse_address_suffix(spec: &str) -> Result<Self, LedgerIdParseError> {
-        Self::parse_with_sigil(spec, "@")
-    }
-
-    fn parse_with_sigil(spec: &str, sigil: &str) -> Result<Self, LedgerIdParseError> {
-        // `LedgerIdTimeSpec` has no `Latest`: resolving it needs the ledger's
-        // current `t`, which the core parser has no access to. Taking it here
-        // is what makes `@t:latest` work, and is the case `dataset.rs` used to
-        // special-case in its own copy of this logic.
-        if spec == "t:latest" {
-            return Ok(TimeSpec::Latest);
-        }
-        parse_time_travel_spec(spec, sigil).map(TimeSpec::from)
-    }
-
-    /// Parse an `--at` / `at=` argument: [`TimeSpec::parse`]'s grammar plus the
-    /// three bare spellings the CLI and `POST /export` accepted before the
-    /// canonical tags were wired up.
-    ///
-    /// Beyond the tagged forms it accepts, in this order:
-    ///
-    /// - `latest` — the untagged spelling of `t:latest`, which `fluree history
-    ///   --to` has always taken.
-    /// - a bare integer → `AtT`
-    /// - a string containing `-` → `AtTime` (an ISO-8601 timestamp or date; a
-    ///   hex digest never contains one, so a date-only value fails as a bad
-    ///   timestamp rather than as an unknown commit)
-    /// - anything else → `AtCommit` (a bare hex-digest prefix)
-    ///
-    /// **A bare integer is a `t`, not a commit prefix.** `123456` is both a
-    /// valid `t` and a valid 6-character hex prefix; this grammar resolves the
-    /// ambiguity in favour of `t` because that is what `--at` has always done.
-    /// `commit:123456` forces the prefix reading and `t:123456` forces the
-    /// other — which is the point of having the tags.
-    ///
-    /// A spec that *starts with* a canonical tag is never reinterpreted as one
-    /// of the bare forms: `--at t:abc` is a malformed `t:`, not a commit prefix
-    /// named `t:abc`. Silently falling through was the whole of #1805.
-    pub fn parse_at(spec: &str) -> Result<Self, LedgerIdParseError> {
-        if spec == "latest" {
-            return Ok(TimeSpec::Latest);
-        }
-        if TIME_TRAVEL_TAGS.iter().any(|tag| spec.starts_with(tag)) {
-            return Self::parse(spec).map_err(|e| {
-                LedgerIdParseError::new(format!("{e}. {ACCEPTED_TIME_SPEC_SPELLINGS}"))
-            });
-        }
-        if spec.is_empty() {
-            return Err(LedgerIdParseError::new(format!(
-                "Empty time spec. {ACCEPTED_TIME_SPEC_SPELLINGS}"
-            )));
-        }
-        if let Ok(t) = spec.parse::<i64>() {
-            return Ok(TimeSpec::AtT(t));
-        }
-        if spec.contains('-') {
-            // Looks like ISO-8601 (e.g. "2024-01-15T10:30:00Z", or a bare date).
-            return Ok(TimeSpec::AtTime(spec.to_string()));
-        }
-        // The same floor the `commit:` arm applies, so the two spellings of a
-        // too-short prefix agree: `commit:abc` was rejected by the tag arm
-        // while a bare `abc` was accepted and died at the resolver with the
-        // same complaint several layers down.
-        //
-        // This is a fast-path rejection, not the authority. `normalize_commit_ref`
-        // strips `fluree:commit:` / `sha256:` and decodes canonical CIDs before
-        // measuring, so `sha256:abc` is ten characters here and three there —
-        // it passes this check and is correctly rejected downstream. Measuring
-        // the raw string is only sound in the direction it is used: everything
-        // this rejects, the resolver would also reject.
-        if spec.len() < COMMIT_PREFIX_MIN_LEN {
-            return Err(LedgerIdParseError::new(format!(
-                "Commit prefix must be at least {COMMIT_PREFIX_MIN_LEN} characters, got {}. \
-                 {ACCEPTED_TIME_SPEC_SPELLINGS}",
-                spec.len()
-            )));
-        }
-        Ok(TimeSpec::AtCommit(spec.to_string()))
-    }
-}
-
-/// The spellings [`TimeSpec::parse_at`] accepts, quoted back when a user reaches
-/// for a canonical tag and mis-spells it.
-pub const ACCEPTED_TIME_SPEC_SPELLINGS: &str =
-    "Accepted: t:<N>, t:latest, latest, time:<ISO-8601> (or its alias iso:), \
-     recorded:<ISO-8601>, commit:<hex-prefix>, snapshot:<id> (graph sources only), \
-     a bare transaction number, a bare ISO-8601 timestamp, or a bare commit \
-     hex-digest prefix";
-
-impl From<LedgerIdTimeSpec> for TimeSpec {
-    fn from(spec: LedgerIdTimeSpec) -> Self {
-        match spec {
-            LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
-            LedgerIdTimeSpec::AtIso(value) => TimeSpec::AtTime(value),
-            LedgerIdTimeSpec::AtCommit(value) => TimeSpec::AtCommit(value),
-            LedgerIdTimeSpec::AtRecorded(value) => TimeSpec::AtRecorded(value),
-            LedgerIdTimeSpec::AtSnapshot(id) => TimeSpec::AtSnapshot(id),
-        }
-    }
-}
+/// Defined in `fluree-db-core` (the address grammar lives there) and
+/// re-exported here unchanged.
+pub use fluree_db_core::{TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS};
 
 /// Time range for history queries
 ///
-/// Represents a range of time for querying changes/history.
-/// Detected when `from` is an array with two time-specced endpoints
-/// for the same ledger (e.g., `["ledger@t:1", "ledger@t:latest"]`).
+/// Represents a range of time for querying changes/history on one ledger,
+/// from `"from": "ledger@t:1", "to": "ledger@t:latest"` (JSON-LD) or
+/// `FROM <ledger@t:1> TO <ledger@t:latest>` (SPARQL).
 #[derive(Debug, Clone)]
 pub struct HistoryTimeRange {
-    /// The ledger identifier (without time suffix)
-    pub identifier: String,
+    /// The ledger whose history is read.
+    pub ledger: LedgerId,
     /// Start of the time range
     pub from: TimeSpec,
     /// End of the time range
@@ -653,12 +509,51 @@ pub struct HistoryTimeRange {
 
 impl HistoryTimeRange {
     /// Create a new history time range
-    pub fn new(identifier: impl Into<String>, from: TimeSpec, to: TimeSpec) -> Self {
-        Self {
-            identifier: identifier.into(),
-            from,
-            to,
+    pub fn new(ledger: LedgerId, from: TimeSpec, to: TimeSpec) -> Self {
+        Self { ledger, from, to }
+    }
+
+    /// The range between two parsed endpoints: both must name the same whole
+    /// ledger, each with a time. `keys` names the two endpoints the way the
+    /// query spelled them, for error text.
+    fn between(
+        from: &GraphSource,
+        to: &GraphSource,
+        (from_key, to_key): (&str, &str),
+    ) -> Result<Self, DatasetParseError> {
+        let endpoint = |source: &GraphSource, key: &str| -> Result<LedgerId, DatasetParseError> {
+            match source.address() {
+                Some(address) if address.graph().is_default() => Ok(address.id().clone()),
+                Some(_) => Err(DatasetParseError::InvalidFrom(format!(
+                    "a history range reads a whole ledger; drop the graph from '{}'",
+                    source.written()
+                ))),
+                None => Err(DatasetParseError::InvalidFrom(format!(
+                    "{key} in a history range must name a ledger, got '{}'",
+                    source.written()
+                ))),
+            }
+        };
+        let ledger = endpoint(from, from_key)?;
+        if endpoint(to, to_key)? != ledger {
+            return Err(DatasetParseError::InvalidFrom(format!(
+                "{from_key} and {to_key} must reference the same ledger: '{}' vs '{}'",
+                from.written(),
+                to.written()
+            )));
         }
+        let from_time = from.time_spec().cloned().ok_or_else(|| {
+            DatasetParseError::InvalidFrom(format!(
+                "{from_key} graph in a history range must have a time specification \
+                 (e.g., ledger@t:1)"
+            ))
+        })?;
+        let to_time = to.time_spec().cloned().ok_or_else(|| {
+            DatasetParseError::InvalidFrom(format!(
+                "{to_key} graph must have a time specification (e.g., ledger@t:latest)"
+            ))
+        })?;
+        Ok(Self::new(ledger, from_time, to_time))
     }
 }
 
@@ -710,9 +605,15 @@ impl std::fmt::Display for DatasetParseError {
 impl std::error::Error for DatasetParseError {}
 
 impl DatasetSpec {
-    /// Parse a DatasetSpec from JSON-LD query options
+    /// Parse a DatasetSpec from a JSON-LD query body.
     ///
-    /// Extracts "from" and "fromNamed" keys from the query object.
+    /// One parser for every JSON-LD surface. The dataset may be given at the
+    /// top level or inside `opts`, which takes precedence:
+    ///
+    /// - default graphs: `opts.from` || `opts.ledger` || `from` || `ledger`
+    /// - named graphs: `opts.fromNamed` || `opts.from-named` || `fromNamed` ||
+    ///   `from-named`
+    /// - history end: `opts.to` || `to`
     ///
     /// # Supported formats
     ///
@@ -722,6 +623,11 @@ impl DatasetSpec {
     /// - Object with time: `"from": {"@id": "ledger:main", "t": 42}`
     /// - Array of objects: `"from": [{"@id": "ledger1", "t": 10}, "ledger2"]`
     /// - Object with alias/graph: `"from": {"@id": "ledger:main", "alias": "a", "graph": "txn-meta"}`
+    ///
+    /// A string is a dataset-position reference ([`GraphSource::parse`]): a
+    /// ledger address, a graph IRI, or a graph keyword. An object's `@id` is a
+    /// ledger address ([`LedgerRef::parse`]) and its `graph` / `@graph` a graph
+    /// of that ledger ([`GraphSel::parse`]).
     ///
     /// **"fromNamed" (named graphs)** — object format (preferred):
     /// - Keys are dataset-local aliases, values have `@id` and optional `@graph`:
@@ -748,168 +654,56 @@ impl DatasetSpec {
     /// assert_eq!(spec.num_graphs(), 2);
     /// ```
     pub fn from_json(json: &JsonValue) -> Result<Self, DatasetParseError> {
-        let obj = match json.as_object() {
-            Some(o) => o,
-            None => return Ok(Self::new()), // Not an object, return empty spec
+        let Some(obj) = json.as_object() else {
+            return Ok(Self::new()); // Not an object, return empty spec
         };
-
-        let mut spec = Self::new();
-
-        // Parse "from" (default graphs)
-        if let Some(from_val) = obj.get("from") {
-            spec.default_graphs = parse_graph_sources(from_val, "from")?;
-        }
-
-        // Check for explicit "to" key (history query)
-        // Syntax: { "from": "ledger@t:1", "to": "ledger@t:latest" }
-        // This mirrors SPARQL's FROM ... TO ... syntax
-        if let Some(to_val) = obj.get("to") {
-            // Must have exactly one "from" graph
-            if spec.default_graphs.len() != 1 {
-                return Err(DatasetParseError::InvalidFrom(
-                    "'to' requires exactly one 'from' graph".to_string(),
-                ));
-            }
-            let from_source = &spec.default_graphs[0];
-            let to_source = parse_single_graph_source(to_val, "to")?;
-
-            // Validate same ledger
-            if !same_ledger(&from_source.identifier, &to_source.identifier) {
-                return Err(DatasetParseError::InvalidFrom(format!(
-                    "'from' and 'to' must reference the same ledger: '{}' vs '{}'",
-                    from_source.identifier, to_source.identifier
-                )));
-            }
-
-            // Require time specs on both
-            let from_time = from_source.time_spec.as_ref().ok_or_else(|| {
-                DatasetParseError::InvalidFrom(
-                    "'from' graph in history query must have time specification (e.g., ledger@t:1)"
-                        .to_string(),
-                )
-            })?;
-            let to_time = to_source.time_spec.as_ref().ok_or_else(|| {
-                DatasetParseError::InvalidFrom(
-                    "'to' graph must have time specification (e.g., ledger@t:latest)".to_string(),
-                )
-            })?;
-
-            spec.history_range = Some(HistoryTimeRange::new(
-                &from_source.identifier,
-                from_time.clone(),
-                to_time.clone(),
-            ));
-        }
-
-        // Parse "fromNamed" (preferred) or "from-named" (legacy key).
-        // "fromNamed" takes precedence if both are present.
-        // Both keys accept: object (keys = aliases), string, array, or null.
-        if let Some(from_named_val) = obj.get("fromNamed") {
-            if let Some(named_obj) = from_named_val.as_object() {
-                spec.named_graphs = parse_named_graph_object(named_obj)?;
-            } else {
-                spec.named_graphs = parse_graph_sources(from_named_val, "fromNamed")?;
-            }
-        } else if let Some(from_named_val) = obj.get("from-named") {
-            spec.named_graphs = parse_graph_sources(from_named_val, "from-named")?;
-        }
-
-        // Validate alias uniqueness across all sources
-        validate_alias_uniqueness(&spec)?;
-
-        Ok(spec)
-    }
-
-    /// Parse dataset + connection options from a query JSON object.
-    ///
-    /// Mirrors `query-connection` semantics:
-    /// - Dataset spec may live at top-level (`from`, `fromNamed`, `ledger`) OR inside `opts`.
-    /// - Connection/policy-related options are read from `opts`.
-    /// - History queries use explicit `to` key: `{ "from": "ledger@t:1", "to": "ledger@t:latest" }`
-    /// - Both `fromNamed` (object) and `from-named` (array, legacy) are accepted.
-    pub fn from_query_json(
-        json: &JsonValue,
-    ) -> Result<(Self, GovernanceOptions), DatasetParseError> {
-        let obj = match json.as_object() {
-            Some(o) => o,
-            None => return Ok((Self::new(), GovernanceOptions::default())),
-        };
-
         let opts_obj = obj.get("opts").and_then(|v| v.as_object());
+        let in_opts = |key: &str| opts_obj.and_then(|o| o.get(key));
 
-        // Dataset location precedence:
-        // default aliases: opts.from || opts.ledger || query.from || query.ledger
-        // named aliases:   opts.fromNamed || opts.from-named || query.fromNamed || query.from-named
-        // to (history):    opts.to || query.to
-        let from_val = opts_obj
-            .and_then(|o| o.get("from"))
-            .or_else(|| opts_obj.and_then(|o| o.get("ledger")))
+        let from_val = in_opts("from")
+            .or_else(|| in_opts("ledger"))
             .or_else(|| obj.get("from"))
             .or_else(|| obj.get("ledger"));
-
         // "fromNamed" (new) takes precedence over "from-named" (legacy).
-        let from_named_val = opts_obj
-            .and_then(|o| o.get("fromNamed").or_else(|| o.get("from-named")))
+        let from_named_val = in_opts("fromNamed")
+            .or_else(|| in_opts("from-named"))
             .or_else(|| obj.get("fromNamed"))
             .or_else(|| obj.get("from-named"));
-
-        let to_val = opts_obj.and_then(|o| o.get("to")).or_else(|| obj.get("to"));
+        let to_val = in_opts("to").or_else(|| obj.get("to"));
 
         let mut spec = Self::new();
         if let Some(v) = from_val {
             spec.default_graphs = parse_graph_sources(v, "from")?;
         }
 
-        // Check for explicit "to" key (history query)
+        // Explicit "to" key: a history query, mirroring SPARQL's FROM ... TO.
         if let Some(to_v) = to_val {
-            // Must have exactly one "from" graph
-            if spec.default_graphs.len() != 1 {
+            let [from] = spec.default_graphs.as_slice() else {
                 return Err(DatasetParseError::InvalidFrom(
                     "'to' requires exactly one 'from' graph".to_string(),
                 ));
-            }
-            let from_source = &spec.default_graphs[0];
-            let to_source = parse_single_graph_source(to_v, "to")?;
-
-            // Validate same ledger
-            if !same_ledger(&from_source.identifier, &to_source.identifier) {
-                return Err(DatasetParseError::InvalidFrom(format!(
-                    "'from' and 'to' must reference the same ledger: '{}' vs '{}'",
-                    from_source.identifier, to_source.identifier
-                )));
-            }
-
-            // Require time specs on both
-            let from_time = from_source.time_spec.as_ref().ok_or_else(|| {
-                DatasetParseError::InvalidFrom(
-                    "'from' graph in history query must have time specification (e.g., ledger@t:1)"
-                        .to_string(),
-                )
-            })?;
-            let to_time = to_source.time_spec.as_ref().ok_or_else(|| {
-                DatasetParseError::InvalidFrom(
-                    "'to' graph must have time specification (e.g., ledger@t:latest)".to_string(),
-                )
-            })?;
-
-            spec.history_range = Some(HistoryTimeRange::new(
-                &from_source.identifier,
-                from_time.clone(),
-                to_time.clone(),
-            ));
+            };
+            let to = parse_single_graph_source(to_v, "to")?;
+            spec.history_range = Some(HistoryTimeRange::between(from, &to, ("'from'", "'to'"))?);
         }
 
         if let Some(v) = from_named_val {
-            if let Some(named_obj) = v.as_object() {
-                spec.named_graphs = parse_named_graph_object(named_obj)?;
-            } else {
-                spec.named_graphs = parse_graph_sources(v, "from-named")?;
-            }
+            spec.named_graphs = match v.as_object() {
+                Some(named_obj) => parse_named_graph_object(named_obj)?,
+                None => parse_graph_sources(v, "fromNamed")?,
+            };
         }
 
-        // Validate alias uniqueness across all sources
         validate_alias_uniqueness(&spec)?;
+        Ok(spec)
+    }
 
+    /// [`DatasetSpec::from_json`] plus the query's connection options
+    /// (identity and policy inputs from `opts`).
+    pub fn from_query_json(
+        json: &JsonValue,
+    ) -> Result<(Self, GovernanceOptions), DatasetParseError> {
+        let spec = Self::from_json(json)?;
         let qc_opts = GovernanceOptions::from_json(json)?;
         Ok((spec, qc_opts))
     }
@@ -1143,85 +937,18 @@ impl GovernanceOptions {
     }
 }
 
-/// Parse time-travel specification from ledger ID string.
-///
-/// Supports compatible formats:
-/// - `ledger:main@t:42` → identifier="ledger:main", TimeSpec::AtT(42)
-/// - `ledger:main@t:latest` → identifier="ledger:main", TimeSpec::Latest
-/// - `ledger:main@time:2025-01-01T00:00:00Z` → identifier="ledger:main", TimeSpec::AtTime(...)
-/// - `ledger:main@commit:abc123` → identifier="ledger:main", TimeSpec::AtCommit(...)
-///
-/// Returns (identifier, Option<TimeSpec>).
-fn parse_ledger_id_time_travel(
-    ledger_id: &str,
-) -> Result<(String, Option<TimeSpec>), DatasetParseError> {
-    // Support optional named-graph fragment selector after time spec:
-    //   ledger:main@t:42#txn-meta
-    // We parse time-travel on the portion before '#', then re-attach the fragment
-    // to the identifier (so the identifier remains stable and time is separate).
-    let (before_fragment, fragment) = match ledger_id.split_once('#') {
-        Some((left, right)) => {
-            if right.is_empty() {
-                return Err(DatasetParseError::InvalidGraphSource(
-                    "Missing named graph after '#'".to_string(),
-                ));
-            }
-            (left, Some(right))
-        }
-        None => (ledger_id, None),
-    };
-    let fragment_suffix = fragment.map(|f| format!("#{f}")).unwrap_or_default();
-
-    // The suffix grammar itself lives in `TimeSpec::parse`, shared with the
-    // CLI's `--at` and the server's `at=` (#1805). All this layer does is find
-    // the `@` and re-attach the fragment.
-    let (identifier, time_spec) = match before_fragment.split_once('@') {
-        Some((base, spec)) => {
-            if base.is_empty() {
-                return Err(DatasetParseError::InvalidGraphSource(
-                    "Ledger ID cannot be empty before '@'".to_string(),
-                ));
-            }
-            let spec = TimeSpec::parse_address_suffix(spec)
-                .map_err(|e| DatasetParseError::InvalidGraphSource(e.to_string()))?;
-            (base, Some(spec))
-        }
-        None => (before_fragment, None),
-    };
-
-    Ok((format!("{identifier}{fragment_suffix}"), time_spec))
-}
-
-/// Whether two time-stripped identifiers name the same ledger and graph, so
-/// `mydb@t:1` → `mydb:main@t:5` is one ledger. Identifiers that do not parse
-/// compare as written and fail at load.
-fn same_ledger(a: &str, b: &str) -> bool {
-    match (
-        fluree_db_core::LedgerRef::parse(a),
-        fluree_db_core::LedgerRef::parse(b),
-    ) {
-        (Ok(a), Ok(b)) => a.id == b.id && a.fragment == b.fragment,
-        _ => a == b,
-    }
-}
-
 /// Parse graph sources from a JSON value
 ///
 /// Accepts:
-/// - String: single graph source (may include @t:/@time:/@commit: time-travel syntax)
+/// - String: single graph source ([`GraphSource::parse`])
 /// - Array: multiple graph sources
-/// - Object: single graph source with time spec
+/// - Object: single graph source (see [`parse_single_graph_source`])
 fn parse_graph_sources(
     val: &JsonValue,
     field_name: &str,
 ) -> Result<Vec<GraphSource>, DatasetParseError> {
     match val {
-        JsonValue::String(s) => {
-            let (identifier, time_spec) = parse_ledger_id_time_travel(s)?;
-            let mut source = GraphSource::new(identifier);
-            source.time_spec = time_spec;
-            Ok(vec![source])
-        }
+        JsonValue::String(s) => Ok(vec![GraphSource::parse(s)?]),
         JsonValue::Array(arr) => arr
             .iter()
             .map(|item| parse_single_graph_source(item, field_name))
@@ -1237,7 +964,7 @@ fn parse_graph_sources(
 /// Parse named graph sources from the new object format.
 ///
 /// Accepts a JSON object where keys are dataset-local aliases and values are
-/// objects with `@id` (optional ledger ref) and `@graph` (graph selector):
+/// objects with `@id` (ledger ref) and `@graph` (graph selector):
 ///
 /// ```json
 /// {
@@ -1252,10 +979,11 @@ fn parse_graph_sources(
 /// }
 /// ```
 ///
-/// Keys become the `source_alias`. The `@id` field is required (ledger reference).
-/// The graph selector is optional ("default", "txn-meta", or a graph IRI) and may
-/// be spelled `@graph` or `graph` — the `from` single-source form reads the same
-/// two spellings, so neither form silently ignores the other's.
+/// Keys become the source alias. The `@id` field is required (ledger reference).
+/// The graph selector is optional ("default", "txn-meta", "config", or an
+/// absolute graph IRI) and may be spelled `@graph` or `graph` — the `from`
+/// single-source form reads the same two spellings, so neither form silently
+/// ignores the other's.
 fn parse_named_graph_object(
     obj: &serde_json::Map<String, JsonValue>,
 ) -> Result<Vec<GraphSource>, DatasetParseError> {
@@ -1266,7 +994,6 @@ fn parse_named_graph_object(
                 "fromNamed entry '{alias}' must be an object"
             ))
         })?;
-
         let raw_identifier = entry
             .get("@id")
             .or_else(|| entry.get("id"))
@@ -1276,31 +1003,7 @@ fn parse_named_graph_object(
                     "fromNamed entry '{alias}' must have an '@id' string field"
                 ))
             })?;
-
-        let (identifier, time_spec) = parse_ledger_id_time_travel(raw_identifier)?;
-        let mut source = GraphSource::new(&identifier);
-        source.time_spec = time_spec;
-        source.source_alias = Some(alias.clone());
-
-        // Parse time specification from explicit keys (overrides string suffix)
-        if let Some(t_val) = entry.get("t") {
-            if let Some(t) = t_val.as_i64() {
-                source.time_spec = Some(TimeSpec::AtT(t));
-            }
-        } else if let Some(at_val) = entry.get("at") {
-            if let Some(at_str) = at_val.as_str() {
-                source.time_spec = Some(parse_object_at(at_str)?);
-            }
-        }
-
-        // Parse graph selector (`@graph` or `graph`)
-        source.graph_selector = parse_graph_selector_field(entry, &identifier, raw_identifier)?;
-
-        // Parse policy override
-        if let Some(policy_val) = entry.get("policy") {
-            source.policy_override = Some(parse_source_policy_override(policy_val)?);
-        }
-
+        let source = parse_object_source(entry, raw_identifier)?.with_alias(alias.clone());
         sources.push(source);
     }
     Ok(sources)
@@ -1315,67 +1018,80 @@ fn parse_object_at(at_str: &str) -> Result<TimeSpec, DatasetParseError> {
     TimeSpec::parse_at(at_str).map_err(|e| DatasetParseError::InvalidGraphSource(e.to_string()))
 }
 
-/// Read a source object's graph selector, accepting either spelling.
+/// A source object's `@id`, time keys, graph selector and policy (`alias` is
+/// read by the caller, since `fromNamed` object keys supply it too).
 ///
-/// The `fromNamed` object form historically read only `@graph` while the
-/// `from` single-source form read only `graph`. Writing the other form's
-/// spelling was not an error — the key was silently ignored and the source
-/// resolved to the whole ledger, so the query returned a plausible wrong
-/// answer with a 200. Both forms now accept both spellings.
-fn parse_graph_selector_field(
+/// `@id` is a ledger address. The graph selector may be spelled `@graph` or
+/// `graph`: the `fromNamed` object form historically read only `@graph` while
+/// the `from` single-source form read only `graph`, and writing the other
+/// form's spelling was silently ignored — the source resolved to the whole
+/// ledger and the query returned a plausible wrong answer with a 200. Naming
+/// a graph both in the `@id` fragment and in the selector is refused as
+/// ambiguous. An explicit `t` / `at` key overrides a pin in the `@id`.
+fn parse_object_source(
     obj: &serde_json::Map<String, JsonValue>,
-    identifier: &str,
     raw_identifier: &str,
-) -> Result<Option<GraphSelector>, DatasetParseError> {
-    let (key, graph_val) = match obj.get("@graph") {
-        Some(v) => ("@graph", v),
-        None => match obj.get("graph") {
-            Some(v) => ("graph", v),
-            None => return Ok(None),
-        },
-    };
+) -> Result<GraphSource, DatasetParseError> {
+    let mut address = LedgerRef::parse(raw_identifier)
+        .map_err(|e| DatasetParseError::InvalidGraphSource(format!("'@id' {e}")))?;
 
-    // Ambiguity: the identifier already selected a reserved graph by fragment.
-    // Both reserved fragments are checked, not just `#txn-meta`: `#config` is
-    // addressable the same way, so `{"@id": "L#config", "graph": …}` is the
-    // same contradiction and must be refused the same way.
-    if identifier.contains("#txn-meta") || identifier.contains("#config") {
-        return Err(DatasetParseError::AmbiguousGraphSelector(
-            raw_identifier.to_string(),
-        ));
+    let graph = match obj.get("@graph") {
+        Some(v) => Some(("@graph", v)),
+        None => obj.get("graph").map(|v| ("graph", v)),
+    };
+    if let Some((key, graph_val)) = graph {
+        if !address.graph().is_default() {
+            return Err(DatasetParseError::AmbiguousGraphSelector(
+                raw_identifier.to_string(),
+            ));
+        }
+        let graph_str = graph_val.as_str().ok_or_else(|| {
+            DatasetParseError::InvalidGraphSource(format!(
+                "'{key}' must be a string ('default', 'txn-meta', 'config', or a graph IRI)"
+            ))
+        })?;
+        let sel = GraphSel::parse(graph_str)
+            .map_err(|e| DatasetParseError::InvalidGraphSource(format!("'{key}': {e}")))?;
+        address = address.with_graph(sel);
     }
 
-    let graph_str = graph_val.as_str().ok_or_else(|| {
-        DatasetParseError::InvalidGraphSource(format!(
-            "'{key}' must be a string ('default', 'txn-meta', 'config', or a graph IRI)"
-        ))
-    })?;
-    Ok(Some(GraphSelector::from_str(graph_str)))
+    if let Some(t_val) = obj.get("t") {
+        if let Some(t) = t_val.as_i64() {
+            address = address.with_at(TimeSpec::AtT(t));
+        }
+    } else if let Some(at_val) = obj.get("at") {
+        if let Some(at_str) = at_val.as_str() {
+            address = address.with_at(parse_object_at(at_str)?);
+        }
+    }
+
+    let reference = MemberRef::Dataset(DatasetRef::Address(address));
+    let identifier = identifier_of(raw_identifier, &reference);
+    let written = (identifier != raw_identifier).then(|| raw_identifier.into());
+    let mut source = GraphSource::from_parts(identifier, written, reference);
+    if let Some(policy_val) = obj.get("policy") {
+        source = source.with_policy(parse_source_policy_override(policy_val)?);
+    }
+    Ok(source)
 }
 
 /// Parse a single graph source from a JSON value
 ///
 /// Accepts:
-/// - String: identifier (may include @t:/@time:/@commit: time-travel syntax and #txn-meta fragment)
+/// - String: a dataset-position reference ([`GraphSource::parse`])
 /// - Object: Extended graph source object with optional fields:
 ///   - `@id` / `id`: ledger reference (required)
 ///   - `t` / `at`: time specification
 ///   - `alias`: dataset-local alias (optional)
-///   - `graph` / `@graph`: graph selector - "default", "txn-meta", or IRI string (optional)
+///   - `graph` / `@graph`: graph selector - "default", "txn-meta", "config", or an IRI (optional)
 ///   - `policy`: per-source policy override (optional)
 fn parse_single_graph_source(
     val: &JsonValue,
     field_name: &str,
 ) -> Result<GraphSource, DatasetParseError> {
     match val {
-        JsonValue::String(s) => {
-            let (identifier, time_spec) = parse_ledger_id_time_travel(s)?;
-            let mut source = GraphSource::new(identifier);
-            source.time_spec = time_spec;
-            Ok(source)
-        }
+        JsonValue::String(s) => GraphSource::parse(s),
         JsonValue::Object(obj) => {
-            // Get identifier from @id or id
             let raw_identifier = obj
                 .get("@id")
                 .or_else(|| obj.get("id"))
@@ -1385,43 +1101,13 @@ fn parse_single_graph_source(
                         "'{field_name}' object must have '@id' or 'id' string field"
                     ))
                 })?;
-
-            // Parse time-travel and fragment from the identifier
-            let (identifier, time_spec) = parse_ledger_id_time_travel(raw_identifier)?;
-
-            let mut source = GraphSource::new(&identifier);
-            source.time_spec = time_spec;
-
-            // Parse time specification from explicit keys (overrides string suffix)
-            if let Some(t_val) = obj.get("t") {
-                if let Some(t) = t_val.as_i64() {
-                    source.time_spec = Some(TimeSpec::AtT(t));
-                }
-            } else if let Some(at_val) = obj.get("at") {
-                if let Some(at_str) = at_val.as_str() {
-                    source.time_spec = Some(parse_object_at(at_str)?);
-                }
-            }
-
-            // Parse alias (dataset-local identifier for this source)
+            let mut source = parse_object_source(obj, raw_identifier)?;
             if let Some(alias_val) = obj.get("alias") {
-                if let Some(alias) = alias_val.as_str() {
-                    source.source_alias = Some(alias.to_string());
-                } else {
-                    return Err(DatasetParseError::InvalidGraphSource(
-                        "'alias' must be a string".to_string(),
-                    ));
-                }
+                let alias = alias_val.as_str().ok_or_else(|| {
+                    DatasetParseError::InvalidGraphSource("'alias' must be a string".to_string())
+                })?;
+                source = source.with_alias(alias);
             }
-
-            // Parse graph selector (`graph` or `@graph`)
-            source.graph_selector = parse_graph_selector_field(obj, &identifier, raw_identifier)?;
-
-            // Parse policy override
-            if let Some(policy_val) = obj.get("policy") {
-                source.policy_override = Some(parse_source_policy_override(policy_val)?);
-            }
-
             Ok(source)
         }
         _ => Err(DatasetParseError::InvalidGraphSource(format!(
@@ -1510,404 +1196,100 @@ fn parse_source_policy_override(
 /// Per the handoff spec: "if an alias appears more than once in the request
 /// (across both 'from' and 'fromNamed'), return an error."
 ///
-/// Also validates that aliases don't collide with identifiers, since the dataset
-/// builder adds both identifier and alias as lookup keys in the runtime dataset.
+/// Also validates that an alias does not collide with another member's text as
+/// written, since a member without an alias is known by that text.
 fn validate_alias_uniqueness(spec: &DatasetSpec) -> Result<(), DatasetParseError> {
     use std::collections::HashSet;
 
-    // Collect all identifiers first (these are always present)
-    let mut all_keys: HashSet<String> = spec
-        .default_graphs
-        .iter()
-        .chain(spec.named_graphs.iter())
-        .map(|s| s.identifier.clone())
-        .collect();
-
-    // Check each alias for collisions
-    for source in spec.default_graphs.iter().chain(spec.named_graphs.iter()) {
-        if let Some(alias) = &source.source_alias {
-            // Check against identifiers and other aliases
-            if !all_keys.insert(alias.clone()) {
-                return Err(DatasetParseError::DuplicateAlias(alias.clone()));
+    let mut all_keys: HashSet<&str> = spec.sources().map(GraphSource::written).collect();
+    for source in spec.sources() {
+        if let Some(alias) = source.alias() {
+            if !all_keys.insert(alias) {
+                return Err(DatasetParseError::DuplicateAlias(alias.to_string()));
             }
         }
     }
-
     Ok(())
 }
 
-/// Extract unique ledger identifiers from a SPARQL query's FROM / FROM NAMED clauses.
-///
-/// Parses the SPARQL, extracts the dataset clause, strips time-travel suffixes,
-/// and returns the de-duplicated base ledger IDs.
-///
-/// Returns `Ok(vec![])` if the query has no FROM/FROM NAMED clauses.
-/// Returns `Err` only for SPARQL parse failures that prevent dataset extraction.
+/// The ledgers a SPARQL query's dataset clause names, for a caller that
+/// authorizes them before execution: each member's
+/// [`GraphSource::identifier`] with any `#graph` removed, and the history
+/// range's ledger, in order and deduplicated. Members are parsed once, by the
+/// grammar execution uses. A reference whose reading depends on a ledger's
+/// graph registry (a graph IRI that may be a graph or a ledger) is reported
+/// too: reporting too much can only deny a read, reporting too little would
+/// allow one unchecked. [`sparql_dataset_ledgers`] gives the typed ids of the
+/// ledgers the connection path loads.
 pub fn sparql_dataset_ledger_ids(sparql: &str) -> Result<Vec<String>, DatasetParseError> {
+    let spec = DatasetSpec::from_sparql_ast(&parse_sparql_for_dataset(sparql)?)?;
+    let mut out: Vec<String> = Vec::new();
+    let reported = spec
+        .sources()
+        .map(|source| {
+            source
+                .identifier
+                .split('#')
+                .next()
+                .unwrap_or(&source.identifier)
+                .to_string()
+        })
+        .chain(spec.history_range.iter().map(|r| r.ledger.to_string()));
+    for id in reported {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// The typed ids of the ledgers the connection path loads for a SPARQL query's
+/// dataset clause: every member with an address reading, and the history
+/// range's ledger ([`DatasetSpec::ledgers`]).
+pub fn sparql_dataset_ledgers(sparql: &str) -> Result<Vec<LedgerId>, DatasetParseError> {
+    Ok(DatasetSpec::from_sparql_ast(&parse_sparql_for_dataset(sparql)?)?.ledgers())
+}
+
+fn parse_sparql_for_dataset(
+    sparql: &str,
+) -> Result<fluree_db_sparql::SparqlAst, DatasetParseError> {
     let parsed = fluree_db_sparql::parse_sparql(sparql);
-    let ast = parsed.ast.ok_or_else(|| {
+    parsed.ast.ok_or_else(|| {
         let msg = parsed
             .diagnostics
             .first()
             .map(|d| d.message.clone())
             .unwrap_or_else(|| "unknown parse error".to_string());
         DatasetParseError::InvalidFrom(format!("SPARQL parse error: {msg}"))
-    })?;
-
-    let dataset_clause = match &ast.body {
-        fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Update(_) => None,
-    };
-
-    let Some(clause) = dataset_clause else {
-        return Ok(vec![]);
-    };
-
-    let spec = DatasetSpec::from_sparql_clause(clause)?;
-
-    // Collect unique identifiers (base ledger IDs, time-travel already stripped)
-    let mut seen = std::collections::HashSet::new();
-    let mut ledger_ids = Vec::new();
-    for source in spec.default_graphs.iter().chain(spec.named_graphs.iter()) {
-        // Strip #txn-meta or other fragments — the scope check is on the base ledger
-        let base = source
-            .identifier
-            .split('#')
-            .next()
-            .unwrap_or(&source.identifier);
-        if seen.insert(base.to_string()) {
-            ledger_ids.push(base.to_string());
-        }
-    }
-    // Also include the history range ledger if present
-    if let Some(range) = &spec.history_range {
-        if seen.insert(range.identifier.clone()) {
-            ledger_ids.push(range.identifier.clone());
-        }
-    }
-
-    Ok(ledger_ids)
+    })
 }
 
-#[cfg(test)]
-mod time_spec_grammar_tests {
-    //! The `--at` / `at=` / `@`-suffix grammar (#1805).
-    //!
-    //! Before this, three surfaces hand-rolled a heuristic that recognised a
-    //! bare integer and a bare ISO-8601 timestamp and swept *everything else*
-    //! into `AtCommit` — so `t:2` reached the commit-prefix resolver as the
-    //! literal string `"t:2"` and failed with "Commit prefix must be at least
-    //! 6 characters, got 3". Every tagged spelling below is a case that used
-    //! to do that.
-
-    use super::*;
-
-    /// Every canonical tag, on the strict grammar an address uses.
-    #[test]
-    fn parse_accepts_every_canonical_tag() {
-        assert_eq!(TimeSpec::parse("t:2").unwrap(), TimeSpec::AtT(2));
-        assert_eq!(TimeSpec::parse("t:0").unwrap(), TimeSpec::AtT(0));
-        assert_eq!(TimeSpec::parse("t:latest").unwrap(), TimeSpec::Latest);
-        assert_eq!(
-            TimeSpec::parse("iso:2024-01-15T10:30:00Z").unwrap(),
-            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())
-        );
-        assert_eq!(
-            TimeSpec::parse("recorded:2024-01-15T10:30:00Z").unwrap(),
-            TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string())
-        );
-        assert_eq!(
-            TimeSpec::parse("commit:abc123def").unwrap(),
-            TimeSpec::AtCommit("abc123def".to_string())
-        );
-    }
-
-    /// The address grammar must stay strict: it is what `ledger@<spec>` accepts
-    /// on every query surface, so the CLI's bare compatibility spellings must
-    /// not leak into it.
-    #[test]
-    fn parse_rejects_the_bare_cli_spellings() {
-        for bare in ["2", "latest", "2024-01-15T10:30:00Z", "abc123def"] {
-            assert!(
-                TimeSpec::parse(bare).is_err(),
-                "address grammar must reject the bare spelling {bare:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_rejects_malformed_tagged_specs() {
-        for bad in [
-            "t:",
-            "t:abc",
-            "time:",
-            "iso:",
-            "commit:",
-            "commit:abc",
-            "recorded:",
-            "snapshot:",
-            "snapshot:abc",
-        ] {
-            assert!(
-                TimeSpec::parse(bad).is_err(),
-                "expected {bad:?} to be an error"
-            );
-        }
-    }
-
-    /// Error text quotes the tag as the calling surface spells it: a bare spec
-    /// reports `'t:'`, an address suffix reports `'@t:'`. Routing the address
-    /// path through the bare entry point silently rewrote three published
-    /// messages — caught by
-    /// `it_query_time_travel::time_travel_missing_value_errors`, and pinned
-    /// here at the unit level so the next such slip fails faster.
-    #[test]
-    fn error_text_quotes_the_tag_as_the_calling_surface_spells_it() {
-        for tag in ["t:", "time:", "iso:", "commit:", "recorded:", "snapshot:"] {
-            assert_eq!(
-                TimeSpec::parse(tag).unwrap_err().to_string(),
-                format!("Missing value after '{tag}'")
-            );
-            assert_eq!(
-                TimeSpec::parse_address_suffix(tag).unwrap_err().to_string(),
-                format!("Missing value after '@{tag}'")
-            );
-        }
-
-        let bare = TimeSpec::parse("nope").unwrap_err().to_string();
-        assert!(
-            bare.contains("Expected t:, time:, recorded:, commit:, or snapshot:"),
-            "got: {bare}"
-        );
-        assert!(
-            !bare.contains('@'),
-            "bare-spec error must not mention '@': {bare}"
-        );
-
-        let addressed = TimeSpec::parse_address_suffix("nope")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            addressed.contains("Expected @t:, @time:, @recorded:, @commit:, or @snapshot:"),
-            "got: {addressed}"
-        );
-    }
-
-    /// The `--at` grammar is the canonical one plus three bare spellings.
-    #[test]
-    fn parse_at_accepts_canonical_and_legacy_spellings() {
-        // Canonical — every one of these was broken before #1805.
-        assert_eq!(TimeSpec::parse_at("t:2").unwrap(), TimeSpec::AtT(2));
-        assert_eq!(TimeSpec::parse_at("t:latest").unwrap(), TimeSpec::Latest);
-        assert_eq!(
-            TimeSpec::parse_at("time:2024-01-15T10:30:00Z").unwrap(),
-            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())
-        );
-        assert_eq!(
-            TimeSpec::parse_at("iso:2024-01-15T10:30:00Z").unwrap(),
-            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())
-        );
-        assert_eq!(
-            TimeSpec::parse_at("recorded:2024-01-15T10:30:00Z").unwrap(),
-            TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string())
-        );
-        assert_eq!(
-            TimeSpec::parse_at("commit:abc123def").unwrap(),
-            TimeSpec::AtCommit("abc123def".to_string())
-        );
-
-        // Legacy bare spellings, which must keep working.
-        assert_eq!(TimeSpec::parse_at("2").unwrap(), TimeSpec::AtT(2));
-        assert_eq!(TimeSpec::parse_at("latest").unwrap(), TimeSpec::Latest);
-        assert_eq!(
-            TimeSpec::parse_at("2024-01-15T10:30:00Z").unwrap(),
-            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())
-        );
-        assert_eq!(
-            TimeSpec::parse_at("abc123def").unwrap(),
-            TimeSpec::AtCommit("abc123def".to_string())
-        );
-    }
-
-    /// `t:2` and `2` must denote the same instant — the equivalence the CLI's
-    /// integration tests assert row-for-row.
-    #[test]
-    fn parse_at_tagged_and_bare_integers_agree() {
-        for t in [0_i64, 1, 42, 123_456] {
-            assert_eq!(
-                TimeSpec::parse_at(&t.to_string()).unwrap(),
-                TimeSpec::parse_at(&format!("t:{t}")).unwrap(),
-                "bare and tagged spellings of t={t} must agree"
-            );
-        }
-    }
-
-    /// A string that *starts with* a canonical tag is never reinterpreted as a
-    /// bare form. This is the actual bug: the old heuristic's catch-all turned
-    /// `t:abc` into `AtCommit("t:abc")` and let it fail downstream, three
-    /// layers from the typo.
-    #[test]
-    fn parse_at_never_falls_back_to_a_prefix_for_a_tagged_spec() {
-        for bad in ["t:abc", "iso:", "commit:abc", "recorded:", "t:"] {
-            let err = TimeSpec::parse_at(bad).unwrap_err().to_string();
-            assert!(
-                err.contains("Accepted: t:<N>"),
-                "{bad:?} must report the accepted spellings, got: {err}"
-            );
-        }
-        assert!(TimeSpec::parse_at("").is_err());
-    }
-
-    /// One constant, not three. The floor was a bare literal in the core
-    /// grammar (with the `6` written into its message too), a `pub const` on
-    /// the resolver, and — briefly, while closing the asymmetry below — a
-    /// third private copy here. This pins that every surface now moves
-    /// together: change `COMMIT_PREFIX_MIN_LEN` and all of them follow,
-    /// including the error text.
-    #[test]
-    fn every_surface_shares_one_commit_prefix_floor() {
-        let at_floor = "a".repeat(COMMIT_PREFIX_MIN_LEN);
-        let below = "a".repeat(COMMIT_PREFIX_MIN_LEN - 1);
-
-        // Exactly at the floor: accepted in both spellings, on both grammars.
-        assert!(TimeSpec::parse_at(&at_floor).is_ok());
-        assert!(TimeSpec::parse_at(&format!("commit:{at_floor}")).is_ok());
-        assert!(TimeSpec::parse_address_suffix(&format!("commit:{at_floor}")).is_ok());
-
-        // One below: rejected by all three, and each message quotes the
-        // constant rather than a literal that could drift away from it.
-        let expected = format!("at least {COMMIT_PREFIX_MIN_LEN} characters");
-        for err in [
-            TimeSpec::parse_at(&below).unwrap_err().to_string(),
-            TimeSpec::parse_at(&format!("commit:{below}"))
-                .unwrap_err()
-                .to_string(),
-            TimeSpec::parse_address_suffix(&format!("commit:{below}"))
-                .unwrap_err()
-                .to_string(),
-        ] {
-            assert!(
-                err.contains(&expected),
-                "message must quote the constant: {err}"
-            );
-        }
-    }
-
-    /// The tagged and bare spellings must agree about *failure* too, not just
-    /// success: a too-short prefix is rejected at the CLI boundary either way.
-    /// Before this, `commit:abc` was rejected here while a bare `abc` was
-    /// accepted and died at the resolver with the same complaint several
-    /// layers down.
-    #[test]
-    fn parse_at_rejects_a_short_prefix_in_both_spellings() {
-        for spec in ["abc", "a", "12ab", "abcde"] {
-            let bare = TimeSpec::parse_at(spec).unwrap_err().to_string();
-            let tagged = TimeSpec::parse_at(&format!("commit:{spec}"))
-                .unwrap_err()
-                .to_string();
-            let expected = format!("at least {COMMIT_PREFIX_MIN_LEN} characters");
-            assert!(
-                bare.contains(&expected),
-                "bare {spec:?} must be rejected at the boundary, got: {bare}"
-            );
-            assert!(tagged.contains(&expected), "got: {tagged}");
-        }
-        // Exactly at the floor, both spellings still succeed and agree.
-        assert_eq!(
-            TimeSpec::parse_at("abc123").unwrap(),
-            TimeSpec::AtCommit("abc123".to_string())
-        );
-        assert_eq!(
-            TimeSpec::parse_at("abc123").unwrap(),
-            TimeSpec::parse_at("commit:abc123").unwrap()
-        );
-    }
-
-    /// An all-digit string of 6+ characters is both a valid `t` and a valid hex
-    /// prefix. `--at` has always resolved that in favour of `t`; `commit:`
-    /// is the documented escape hatch, and this pins both halves.
-    #[test]
-    fn parse_at_resolves_the_digits_ambiguity_toward_t() {
-        assert_eq!(
-            TimeSpec::parse_at("123456").unwrap(),
-            TimeSpec::AtT(123_456)
-        );
-        assert_eq!(
-            TimeSpec::parse_at("commit:123456").unwrap(),
-            TimeSpec::AtCommit("123456".to_string())
-        );
-    }
-
-    /// The address path and the `--at` path are the same grammar modulo the
-    /// `@`, which is the property that made "call the shared parser" the fix.
-    #[test]
-    fn address_suffix_and_bare_spec_agree_on_the_canonical_grammar() {
-        for spec in [
-            "t:7",
-            "t:latest",
-            "time:2024-01-15T10:30:00Z",
-            "iso:2024-01-15T10:30:00Z",
-            "recorded:2024-01-15T10:30:00Z",
-            "commit:abc123def",
-            "snapshot:42",
-        ] {
-            let (identifier, from_address) =
-                parse_ledger_id_time_travel(&format!("mydb:main@{spec}")).unwrap();
-            assert_eq!(identifier, "mydb:main");
-            assert_eq!(
-                from_address.unwrap(),
-                TimeSpec::parse(spec).unwrap(),
-                "address suffix @{spec} must mean the same as the bare spec {spec}"
-            );
-            assert_eq!(
-                TimeSpec::parse_address_suffix(spec).unwrap(),
-                TimeSpec::parse(spec).unwrap(),
-                "the two entry points differ only in error text"
-            );
-        }
-    }
-
-    /// `@t:latest` used to be special-cased above the parser in this file; it
-    /// now lives in `TimeSpec::parse`, including with a fragment selector.
-    #[test]
-    fn address_latest_still_parses_with_and_without_a_fragment() {
-        let (id, spec) = parse_ledger_id_time_travel("mydb:main@t:latest").unwrap();
-        assert_eq!((id.as_str(), spec), ("mydb:main", Some(TimeSpec::Latest)));
-
-        let (id, spec) = parse_ledger_id_time_travel("mydb:main@t:latest#txn-meta").unwrap();
-        assert_eq!(
-            (id.as_str(), spec),
-            ("mydb:main#txn-meta", Some(TimeSpec::Latest))
-        );
-
-        assert!(parse_ledger_id_time_travel("@t:latest").is_err());
-    }
-
-    #[test]
-    fn from_ledger_id_time_spec_maps_every_variant() {
-        use fluree_db_core::ledger_id::LedgerIdTimeSpec;
-        assert_eq!(TimeSpec::from(LedgerIdTimeSpec::AtT(3)), TimeSpec::AtT(3));
-        assert_eq!(
-            TimeSpec::from(LedgerIdTimeSpec::AtIso("x".into())),
-            TimeSpec::AtTime("x".into())
-        );
-        assert_eq!(
-            TimeSpec::from(LedgerIdTimeSpec::AtRecorded("x".into())),
-            TimeSpec::AtRecorded("x".into())
-        );
-        assert_eq!(
-            TimeSpec::from(LedgerIdTimeSpec::AtCommit("abc123".into())),
-            TimeSpec::AtCommit("abc123".into())
-        );
-    }
+/// Whether a SPARQL query carries a dataset clause (`FROM`, `FROM NAMED` or
+/// `TO`). A query that does not parse has none.
+pub fn sparql_has_dataset_clause(sparql: &str) -> bool {
+    fluree_db_sparql::parse_sparql(sparql)
+        .ast
+        .is_some_and(|ast| crate::query::helpers::sparql_ast_has_dataset(&ast))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ledger a member's address names (a pin in the text is split off
+    /// into the member's time; the text itself is kept as written).
+    fn ledger_of(source: &GraphSource) -> String {
+        source.address().expect("an address").id().to_string()
+    }
+
+    impl GraphSource {
+        /// The graph a member's address selects, when it is not the default.
+        fn graph_sel(&self) -> Option<GraphSel> {
+            self.address()
+                .map(|a| a.graph().clone())
+                .filter(|g| !g.is_default())
+        }
+    }
 
     #[test]
     fn test_dataset_spec_empty() {
@@ -1919,9 +1301,9 @@ mod tests {
     #[test]
     fn test_dataset_spec_with_graphs() {
         let spec = DatasetSpec::new()
-            .with_default(GraphSource::new("ledger1:main"))
-            .with_default(GraphSource::new("ledger2:main"))
-            .with_named(GraphSource::new("graph1"));
+            .with_default(GraphSource::parse("ledger1:main").unwrap())
+            .with_default(GraphSource::parse("ledger2:main").unwrap())
+            .with_named(GraphSource::parse("graph1").unwrap());
 
         assert!(!spec.is_empty());
         assert_eq!(spec.num_graphs(), 3);
@@ -1929,19 +1311,45 @@ mod tests {
         assert_eq!(spec.named_graphs.len(), 1);
     }
 
+    /// A member keeps its text once where the text is its identifier (an
+    /// address `GraphSource::ledger` builds, a canonical address, a graph IRI,
+    /// a keyword), and apart only where the two differ.
+    #[test]
+    fn a_member_keeps_its_text_once_unless_it_differs_from_its_identifier() {
+        let once =
+            |source: &GraphSource| std::ptr::eq(source.written(), source.identifier.as_str());
+        let address = LedgerRef::parse("mydb:main#http://ex.org/g").unwrap();
+        assert!(once(&GraphSource::ledger(address)));
+        for s in [
+            "mydb:main",
+            "mydb:main#txn-meta",
+            "http://ex.org/g",
+            "config",
+        ] {
+            assert!(once(&GraphSource::parse(s).unwrap()), "{s}");
+        }
+        for s in ["urn:fluree:mydb:main", "mydb:main@t:1"] {
+            let source = GraphSource::parse(s).unwrap();
+            assert!(!once(&source), "{s}");
+            assert_eq!(source.written(), s);
+        }
+    }
+
     #[test]
     fn test_graph_source_with_time() {
-        let source = GraphSource::new("mydb:main").with_time(TimeSpec::at_t(42));
+        let source = GraphSource::parse("mydb:main")
+            .unwrap()
+            .with_time(TimeSpec::at_t(42));
 
-        assert_eq!(source.identifier, "mydb:main");
-        assert!(matches!(source.time_spec, Some(TimeSpec::AtT(42))));
+        assert_eq!(source.written(), "mydb:main");
+        assert!(matches!(source.time_spec(), Some(TimeSpec::AtT(42))));
     }
 
     #[test]
     fn test_graph_source_from_str() {
-        let source: GraphSource = "test:ledger".into();
-        assert_eq!(source.identifier, "test:ledger");
-        assert!(source.time_spec.is_none());
+        let source: GraphSource = "test:ledger".parse().unwrap();
+        assert_eq!(source.written(), "test:ledger");
+        assert!(source.time_spec().is_none());
     }
 
     #[test]
@@ -1992,7 +1400,7 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
+        assert_eq!(spec.default_graphs[0].written(), "ledger:main");
         assert!(spec.named_graphs.is_empty());
     }
 
@@ -2006,8 +1414,8 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 2);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger1:main");
-        assert_eq!(spec.default_graphs[1].identifier, "ledger2:main");
+        assert_eq!(spec.default_graphs[0].written(), "ledger1:main");
+        assert_eq!(spec.default_graphs[1].written(), "ledger2:main");
     }
 
     #[test]
@@ -2020,9 +1428,9 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
+        assert_eq!(spec.default_graphs[0].written(), "ledger:main");
         assert!(matches!(
-            spec.default_graphs[0].time_spec,
+            spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtT(42))
         ));
     }
@@ -2038,7 +1446,7 @@ mod tests {
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
         assert!(matches!(
-            &spec.default_graphs[0].time_spec,
+            &spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtCommit(s)) if s == "abc123"
         ));
     }
@@ -2083,12 +1491,12 @@ mod tests {
             });
             let spec = DatasetSpec::from_json(&query).unwrap();
             assert_eq!(
-                spec.default_graphs[0].time_spec.as_ref(),
+                spec.default_graphs[0].time_spec(),
                 Some(expected),
                 "from at={at}"
             );
             assert_eq!(
-                spec.named_graphs[0].time_spec.as_ref(),
+                spec.named_graphs[0].time_spec(),
                 Some(expected),
                 "fromNamed at={at}"
             );
@@ -2115,9 +1523,10 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
+        assert_eq!(spec.default_graphs[0].written(), "ledger:main@t:42");
+        assert_eq!(ledger_of(&spec.default_graphs[0]), "ledger:main");
         assert!(matches!(
-            spec.default_graphs[0].time_spec,
+            spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtT(42))
         ));
     }
@@ -2132,9 +1541,10 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main#txn-meta");
+        assert_eq!(ledger_of(&spec.default_graphs[0]), "ledger:main");
+        assert_eq!(spec.default_graphs[0].graph_sel(), Some(GraphSel::TxnMeta));
         assert!(matches!(
-            spec.default_graphs[0].time_spec,
+            spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtT(42))
         ));
     }
@@ -2149,9 +1559,9 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
+        assert_eq!(ledger_of(&spec.default_graphs[0]), "ledger:main");
         assert!(matches!(
-            &spec.default_graphs[0].time_spec,
+            &spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtTime(s)) if s == "2025-01-20T00:00:00Z"
         ));
     }
@@ -2166,9 +1576,9 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
+        assert_eq!(ledger_of(&spec.default_graphs[0]), "ledger:main");
         assert!(matches!(
-            &spec.default_graphs[0].time_spec,
+            &spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtCommit(s)) if s == "abc123def456"
         ));
     }
@@ -2196,32 +1606,39 @@ mod tests {
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 3);
 
-        assert_eq!(spec.default_graphs[0].identifier, "ledger1:main");
+        assert_eq!(ledger_of(&spec.default_graphs[0]), "ledger1:main");
         assert!(matches!(
-            spec.default_graphs[0].time_spec,
+            spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtT(10))
         ));
 
-        assert_eq!(spec.default_graphs[1].identifier, "ledger2:main");
-        assert!(spec.default_graphs[1].time_spec.is_none());
+        assert_eq!(spec.default_graphs[1].written(), "ledger2:main");
+        assert!(spec.default_graphs[1].time_spec().is_none());
 
-        assert_eq!(spec.default_graphs[2].identifier, "ledger3:main");
+        assert_eq!(ledger_of(&spec.default_graphs[2]), "ledger3:main");
         assert!(matches!(
-            &spec.default_graphs[2].time_spec,
+            &spec.default_graphs[2].time_spec(),
             Some(TimeSpec::AtTime(s)) if s == "2025-01-01T00:00:00Z"
         ));
     }
 
     #[test]
     fn test_parse_ledger_id_invalid_time_format() {
+        // `@` starts a pin only before a known tag, so in a dataset
+        // position this text is not a ledger address at all: it parses as a
+        // graph IRI (scheme `ledger`), which names no ledger to load.
         let query = json!({
             "from": "ledger:main@invalid:123",
             "select": ["?s"],
             "where": {"@id": "?s"}
         });
+        let spec = DatasetSpec::from_json(&query).unwrap();
+        assert!(spec.default_graphs[0].address().is_none());
+        assert!(spec.ledgers().is_empty());
 
-        let result = DatasetSpec::from_json(&query);
-        assert!(result.is_err());
+        // A known tag with a bad value is a bad pin.
+        let query = json!({"from": "ledger:main@t:abc", "select": ["?s"], "where": {"@id": "?s"}});
+        assert!(DatasetSpec::from_json(&query).is_err());
     }
 
     #[test]
@@ -2237,8 +1654,8 @@ mod tests {
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
         assert_eq!(spec.named_graphs.len(), 2);
-        assert_eq!(spec.named_graphs[0].identifier, "graph1");
-        assert_eq!(spec.named_graphs[1].identifier, "graph2");
+        assert_eq!(spec.named_graphs[0].written(), "graph1");
+        assert_eq!(spec.named_graphs[1].written(), "graph2");
     }
 
     #[test]
@@ -2268,23 +1685,23 @@ mod tests {
         let products = spec
             .named_graphs
             .iter()
-            .find(|g| g.source_alias.as_deref() == Some("products"))
+            .find(|g| g.alias() == Some("products"))
             .expect("should have products alias");
-        assert_eq!(products.identifier, "mydb:main");
+        assert_eq!(products.written(), "mydb:main");
         assert!(matches!(
-            &products.graph_selector,
-            Some(GraphSelector::Iri(ref iri)) if iri == "http://example.org/graphs/products"
+            &products.graph_sel(),
+            Some(GraphSel::Named(ref iri)) if iri.as_str() == "http://example.org/graphs/products"
         ));
 
         let services = spec
             .named_graphs
             .iter()
-            .find(|g| g.source_alias.as_deref() == Some("services"))
+            .find(|g| g.alias() == Some("services"))
             .expect("should have services alias");
-        assert_eq!(services.identifier, "mydb:main");
+        assert_eq!(services.written(), "mydb:main");
         assert!(matches!(
-            &services.graph_selector,
-            Some(GraphSelector::Iri(ref iri)) if iri == "http://example.org/graphs/services"
+            &services.graph_sel(),
+            Some(GraphSel::Named(ref iri)) if iri.as_str() == "http://example.org/graphs/services"
         ));
     }
 
@@ -2302,10 +1719,7 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.named_graphs.len(), 1);
-        assert_eq!(
-            spec.named_graphs[0].source_alias,
-            Some("products".to_string())
-        );
+        assert_eq!(spec.named_graphs[0].alias(), Some("products"));
     }
 
     #[test]
@@ -2331,8 +1745,8 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.named_graphs.len(), 2);
-        assert_eq!(spec.named_graphs[0].identifier, "graph1");
-        assert_eq!(spec.named_graphs[1].identifier, "graph2");
+        assert_eq!(spec.named_graphs[0].written(), "graph1");
+        assert_eq!(spec.named_graphs[1].written(), "graph2");
     }
 
     #[test]
@@ -2348,11 +1762,11 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 2);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger1:main");
-        assert!(spec.default_graphs[0].time_spec.is_none());
-        assert_eq!(spec.default_graphs[1].identifier, "ledger2:main");
+        assert_eq!(spec.default_graphs[0].written(), "ledger1:main");
+        assert!(spec.default_graphs[0].time_spec().is_none());
+        assert_eq!(spec.default_graphs[1].written(), "ledger2:main");
         assert!(matches!(
-            spec.default_graphs[1].time_spec,
+            spec.default_graphs[1].time_spec(),
             Some(TimeSpec::AtT(10))
         ));
     }
@@ -2380,155 +1794,136 @@ mod tests {
         assert!(spec.default_graphs.is_empty());
     }
 
-    // SPARQL DatasetClause Conversion Tests
+    // SPARQL dataset clause tests: the clause as the parser and prologue give it
 
-    use fluree_db_sparql::ast::{DatasetClause as SparqlDatasetClause, Iri};
-    use fluree_db_sparql::SourceSpan;
-
-    fn make_span() -> SourceSpan {
-        SourceSpan::new(0, 0)
+    /// The spec for a query with `dataset` between SELECT and WHERE, its IRIs
+    /// expanded against a prologue declaring `ex:` and the empty prefix.
+    fn sparql_spec(dataset: &str) -> Result<DatasetSpec, DatasetParseError> {
+        let q = format!(
+            "PREFIX ex: <http://ex.org/> PREFIX : <http://ex.org/local/> \
+             SELECT * {dataset} WHERE {{ ?s ?p ?o }}"
+        );
+        let ast = fluree_db_sparql::parse_sparql(&q)
+            .ast
+            .expect("test query parses");
+        DatasetSpec::from_sparql_ast(&ast)
     }
 
     #[test]
-    fn test_from_sparql_clause_empty() {
-        let clause = SparqlDatasetClause {
-            default_graphs: vec![],
-            named_graphs: vec![],
-            to_graph: None,
-            span: make_span(),
-        };
-
-        let spec = DatasetSpec::from_sparql_clause(&clause).unwrap();
-        assert!(spec.is_empty());
+    fn test_from_sparql_no_clause() {
+        assert!(sparql_spec("").unwrap().is_empty());
     }
 
     #[test]
-    fn test_from_sparql_clause_single_default() {
-        let clause = SparqlDatasetClause {
-            default_graphs: vec![Iri::full("http://example.org/graph1", make_span())],
-            named_graphs: vec![],
-            to_graph: None,
-            span: make_span(),
-        };
-
-        let spec = DatasetSpec::from_sparql_clause(&clause).unwrap();
+    fn test_from_sparql_single_default() {
+        let spec = sparql_spec("FROM <http://example.org/graph1>").unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
         assert_eq!(
-            spec.default_graphs[0].identifier,
+            spec.default_graphs[0].written(),
             "http://example.org/graph1"
         );
         assert!(spec.named_graphs.is_empty());
     }
 
     #[test]
-    fn test_from_sparql_clause_multiple_default() {
-        let clause = SparqlDatasetClause {
-            default_graphs: vec![
-                Iri::full("http://example.org/graph1", make_span()),
-                Iri::full("http://example.org/graph2", make_span()),
-            ],
-            named_graphs: vec![],
-            to_graph: None,
-            span: make_span(),
-        };
-
-        let spec = DatasetSpec::from_sparql_clause(&clause).unwrap();
+    fn test_from_sparql_multiple_default() {
+        let spec = sparql_spec("FROM <http://example.org/graph1> FROM <http://example.org/graph2>")
+            .unwrap();
         assert_eq!(spec.default_graphs.len(), 2);
         assert_eq!(
-            spec.default_graphs[0].identifier,
+            spec.default_graphs[0].written(),
             "http://example.org/graph1"
         );
         assert_eq!(
-            spec.default_graphs[1].identifier,
+            spec.default_graphs[1].written(),
             "http://example.org/graph2"
         );
     }
 
     #[test]
-    fn test_from_sparql_clause_named_graphs() {
-        let clause = SparqlDatasetClause {
-            default_graphs: vec![],
-            named_graphs: vec![
-                Iri::full("http://example.org/named1", make_span()),
-                Iri::full("http://example.org/named2", make_span()),
-            ],
-            to_graph: None,
-            span: make_span(),
-        };
-
-        let spec = DatasetSpec::from_sparql_clause(&clause).unwrap();
+    fn test_from_sparql_named_graphs() {
+        let spec = sparql_spec(
+            "FROM NAMED <http://example.org/named1> FROM NAMED <http://example.org/named2>",
+        )
+        .unwrap();
         assert!(spec.default_graphs.is_empty());
         assert_eq!(spec.named_graphs.len(), 2);
-        assert_eq!(spec.named_graphs[0].identifier, "http://example.org/named1");
-        assert_eq!(spec.named_graphs[1].identifier, "http://example.org/named2");
+        assert_eq!(spec.named_graphs[0].written(), "http://example.org/named1");
+        assert_eq!(spec.named_graphs[1].written(), "http://example.org/named2");
     }
 
     #[test]
-    fn test_from_sparql_clause_mixed() {
-        let clause = SparqlDatasetClause {
-            default_graphs: vec![Iri::full("http://example.org/default1", make_span())],
-            named_graphs: vec![
-                Iri::full("http://example.org/named1", make_span()),
-                Iri::full("http://example.org/named2", make_span()),
-            ],
-            to_graph: None,
-            span: make_span(),
-        };
-
-        let spec = DatasetSpec::from_sparql_clause(&clause).unwrap();
+    fn test_from_sparql_mixed() {
+        let spec = sparql_spec(
+            "FROM <http://example.org/default1> \
+             FROM NAMED <http://example.org/named1> FROM NAMED <http://example.org/named2>",
+        )
+        .unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
         assert_eq!(spec.named_graphs.len(), 2);
         assert_eq!(
-            spec.default_graphs[0].identifier,
+            spec.default_graphs[0].written(),
             "http://example.org/default1"
         );
     }
 
+    /// Prefixed names expand against the prologue before they are read:
+    /// they used to reach the resolver as the literal `ex:graph1`.
     #[test]
-    fn test_from_sparql_clause_prefixed_iri() {
-        let clause = SparqlDatasetClause {
-            default_graphs: vec![Iri::prefixed("ex", "graph1", make_span())],
-            named_graphs: vec![Iri::prefixed("", "localname", make_span())],
-            to_graph: None,
-            span: make_span(),
-        };
-
-        let spec = DatasetSpec::from_sparql_clause(&clause).unwrap();
+    fn test_from_sparql_prefixed_iri_is_expanded() {
+        let spec = sparql_spec("FROM ex:graph1 FROM NAMED :localname").unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ex:graph1");
+        assert_eq!(spec.default_graphs[0].written(), "http://ex.org/graph1");
         assert_eq!(spec.named_graphs.len(), 1);
-        assert_eq!(spec.named_graphs[0].identifier, ":localname");
+        assert_eq!(
+            spec.named_graphs[0].written(),
+            "http://ex.org/local/localname"
+        );
+        // An expanded hierarchical IRI is a graph IRI, never a ledger.
+        assert!(spec.default_graphs[0].address().is_none());
+    }
+
+    /// A relative FROM resolves against BASE.
+    #[test]
+    fn test_from_sparql_base_relative_iri_is_resolved() {
+        let q = "BASE <http://ex.org/graphs/> SELECT * FROM NAMED <products> WHERE { ?s ?p ?o }";
+        let ast = fluree_db_sparql::parse_sparql(q).ast.expect("parses");
+        let spec = DatasetSpec::from_sparql_ast(&ast).unwrap();
+        assert_eq!(
+            spec.named_graphs[0].written(),
+            "http://ex.org/graphs/products"
+        );
     }
 
     #[test]
-    fn test_from_sparql_clause_time_travel_suffix() {
-        let clause = SparqlDatasetClause {
-            default_graphs: vec![
-                Iri::full("ledger:main@t:42", make_span()),
-                Iri::full("ledger:main@iso:2025-01-01T00:00:00Z", make_span()),
-            ],
-            named_graphs: vec![Iri::full("ledger:main@commit:abc123def456", make_span())],
-            to_graph: None,
-            span: make_span(),
-        };
-
-        let spec = DatasetSpec::from_sparql_clause(&clause).unwrap();
+    fn test_from_sparql_time_travel_suffix() {
+        let spec = sparql_spec(
+            "FROM <ledger:main@t:42> FROM <ledger:main@iso:2025-01-01T00:00:00Z> \
+             FROM NAMED <ledger:main@commit:abc123def456>",
+        )
+        .unwrap();
         assert_eq!(spec.default_graphs.len(), 2);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
+        let ledger = |s: &GraphSource| s.address().expect("an address").id().to_string();
+        assert_eq!(ledger(&spec.default_graphs[0]), "ledger:main");
         assert!(matches!(
-            spec.default_graphs[0].time_spec,
+            spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtT(42))
         ));
-        assert_eq!(spec.default_graphs[1].identifier, "ledger:main");
+        assert_eq!(ledger(&spec.default_graphs[1]), "ledger:main");
         assert!(matches!(
-            &spec.default_graphs[1].time_spec,
+            spec.default_graphs[1].time_spec(),
             Some(TimeSpec::AtTime(s)) if s == "2025-01-01T00:00:00Z"
         ));
 
         assert_eq!(spec.named_graphs.len(), 1);
-        assert_eq!(spec.named_graphs[0].identifier, "ledger:main");
+        // The member is named as written, pin included.
+        assert_eq!(
+            spec.named_graphs[0].name(),
+            "ledger:main@commit:abc123def456"
+        );
+        assert_eq!(ledger(&spec.named_graphs[0]), "ledger:main");
         assert!(matches!(
-            &spec.named_graphs[0].time_spec,
+            spec.named_graphs[0].time_spec(),
             Some(TimeSpec::AtCommit(s)) if s == "abc123def456"
         ));
     }
@@ -2546,43 +1941,28 @@ mod tests {
                 "where": {"@id": "?s"}
             }))
         };
-        let sparql_spec = |from: &str, to: &str| {
-            DatasetSpec::from_sparql_clause(&SparqlDatasetClause {
-                default_graphs: vec![Iri::full(from, make_span())],
-                named_graphs: vec![],
-                to_graph: Some(Iri::full(to, make_span())),
-                span: make_span(),
-            })
-        };
+        let sparql_range = |from: &str, to: &str| sparql_spec(&format!("FROM <{from}> TO <{to}>"));
 
         for spec in [
             json_spec("ledger@t:1", "ledger:main@t:latest"),
-            sparql_spec("ledger@t:1", "ledger:main@t:latest"),
+            sparql_range("ledger@t:1", "ledger:main@t:latest"),
         ] {
             assert!(spec.expect("same ledger").is_history_mode());
         }
         assert!(json_spec("ledger@t:1", "other:main@t:latest").is_err());
-        assert!(sparql_spec("ledger@t:1", "ledger:dev@t:latest").is_err());
+        assert!(sparql_range("ledger@t:1", "ledger:dev@t:latest").is_err());
     }
 
     #[test]
-    fn test_from_sparql_clause_to_graph_history_range() {
-        // FROM <ledger:main@t:1> TO <ledger:main@t:latest>
-        let clause = SparqlDatasetClause {
-            default_graphs: vec![Iri::full("ledger:main@t:1", make_span())],
-            named_graphs: vec![],
-            to_graph: Some(Iri::full("ledger:main@t:latest", make_span())),
-            span: make_span(),
-        };
-
-        let spec = DatasetSpec::from_sparql_clause(&clause).unwrap();
+    fn test_from_sparql_to_graph_history_range() {
+        let spec = sparql_spec("FROM <ledger:main@t:1> TO <ledger:main@t:latest>").unwrap();
         assert!(
             spec.is_history_mode(),
             "Should detect history mode from TO clause"
         );
 
         let range = spec.history_range().expect("Should have history range");
-        assert_eq!(range.identifier, "ledger:main");
+        assert_eq!(range.ledger, "ledger:main");
         assert!(matches!(range.from, TimeSpec::AtT(1)));
         assert!(matches!(range.to, TimeSpec::Latest));
     }
@@ -2616,7 +1996,7 @@ mod tests {
         );
 
         let range = spec.history_range().expect("Should have history range");
-        assert_eq!(range.identifier, "ledger:main");
+        assert_eq!(range.ledger.as_str(), "ledger:main");
         assert!(matches!(range.from, TimeSpec::AtT(1)));
         assert!(matches!(range.to, TimeSpec::Latest));
     }
@@ -2637,7 +2017,7 @@ mod tests {
         );
 
         let range = spec.history_range().expect("Should have history range");
-        assert_eq!(range.identifier, "ledger:main");
+        assert_eq!(range.ledger.as_str(), "ledger:main");
         assert!(matches!(&range.from, TimeSpec::AtTime(s) if s == "2024-01-01T00:00:00Z"));
         assert!(matches!(&range.to, TimeSpec::AtTime(s) if s == "2024-12-31T23:59:59Z"));
     }
@@ -2831,9 +2211,9 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
+        assert_eq!(ledger_of(&spec.default_graphs[0]), "ledger:main");
         assert!(matches!(
-            spec.default_graphs[0].time_spec,
+            spec.default_graphs[0].time_spec(),
             Some(TimeSpec::Latest)
         ));
     }
@@ -2847,9 +2227,10 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main#txn-meta");
+        assert_eq!(ledger_of(&spec.default_graphs[0]), "ledger:main");
+        assert_eq!(spec.default_graphs[0].graph_sel(), Some(GraphSel::TxnMeta));
         assert!(matches!(
-            spec.default_graphs[0].time_spec,
+            spec.default_graphs[0].time_spec(),
             Some(TimeSpec::Latest)
         ));
     }
@@ -2861,44 +2242,46 @@ mod tests {
     #[test]
     fn test_graph_selector_from_str() {
         assert!(matches!(
-            GraphSelector::from_str("default"),
-            GraphSelector::Default
+            GraphSel::parse("default").unwrap(),
+            GraphSel::Default
         ));
         assert!(matches!(
-            GraphSelector::from_str("txn-meta"),
-            GraphSelector::TxnMeta
+            GraphSel::parse("txn-meta").unwrap(),
+            GraphSel::TxnMeta
         ));
         assert!(matches!(
-            GraphSelector::from_str("http://example.org/graph"),
-            GraphSelector::Iri(ref s) if s == "http://example.org/graph"
+            GraphSel::parse("http://example.org/graph").unwrap(),
+            GraphSel::Named(ref s) if s.as_str() == "http://example.org/graph"
         ));
         // IRI with hash (should not be confused with "default" or "txn-meta")
         assert!(matches!(
-            GraphSelector::from_str("http://example.org/vocab#products"),
-            GraphSelector::Iri(ref s) if s == "http://example.org/vocab#products"
+            GraphSel::parse("http://example.org/vocab#products").unwrap(),
+            GraphSel::Named(ref s) if s.as_str() == "http://example.org/vocab#products"
         ));
     }
 
     #[test]
     fn test_graph_source_with_alias() {
-        let source = GraphSource::new("ledger:main")
+        let source = GraphSource::parse("ledger:main")
+            .unwrap()
             .with_alias("myAlias")
             .with_time(TimeSpec::at_t(42));
 
-        assert_eq!(source.identifier, "ledger:main");
-        assert_eq!(source.source_alias, Some("myAlias".to_string()));
-        assert!(matches!(source.time_spec, Some(TimeSpec::AtT(42))));
+        assert_eq!(source.written(), "ledger:main");
+        assert_eq!(source.alias(), Some("myAlias"));
+        assert!(matches!(source.time_spec(), Some(TimeSpec::AtT(42))));
     }
 
     #[test]
     fn test_graph_source_with_graph_selector() {
-        let source = GraphSource::new("ledger:main").with_graph(GraphSelector::TxnMeta);
+        let source = GraphSource::ledger(
+            LedgerRef::parse("ledger:main")
+                .unwrap()
+                .with_graph(GraphSel::TxnMeta),
+        );
 
-        assert_eq!(source.identifier, "ledger:main");
-        assert!(matches!(
-            source.graph_selector,
-            Some(GraphSelector::TxnMeta)
-        ));
+        assert_eq!(source.written(), "ledger:main#txn-meta");
+        assert!(matches!(source.graph_sel(), Some(GraphSel::TxnMeta)));
     }
 
     #[test]
@@ -2910,11 +2293,8 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
-        assert_eq!(
-            spec.default_graphs[0].source_alias,
-            Some("mydb".to_string())
-        );
+        assert_eq!(spec.default_graphs[0].written(), "ledger:main");
+        assert_eq!(spec.default_graphs[0].alias(), Some("mydb"));
     }
 
     #[test]
@@ -2926,10 +2306,8 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert!(matches!(
-            spec.default_graphs[0].graph_selector,
-            Some(GraphSelector::Default)
-        ));
+        let address = spec.default_graphs[0].address().expect("an address");
+        assert_eq!(address.graph(), &GraphSel::Default);
     }
 
     #[test]
@@ -2941,14 +2319,11 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
-        assert_eq!(
-            spec.default_graphs[0].source_alias,
-            Some("meta".to_string())
-        );
+        assert_eq!(spec.default_graphs[0].written(), "ledger:main");
+        assert_eq!(spec.default_graphs[0].alias(), Some("meta"));
         assert!(matches!(
-            spec.default_graphs[0].graph_selector,
-            Some(GraphSelector::TxnMeta)
+            spec.default_graphs[0].graph_sel(),
+            Some(GraphSel::TxnMeta)
         ));
     }
 
@@ -2965,14 +2340,11 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
-        assert_eq!(
-            spec.default_graphs[0].source_alias,
-            Some("products".to_string())
-        );
+        assert_eq!(spec.default_graphs[0].written(), "ledger:main");
+        assert_eq!(spec.default_graphs[0].alias(), Some("products"));
         assert!(matches!(
-            &spec.default_graphs[0].graph_selector,
-            Some(GraphSelector::Iri(ref iri)) if iri == "http://example.org/vocab#products"
+            &spec.default_graphs[0].graph_sel(),
+            Some(GraphSel::Named(ref iri)) if iri.as_str() == "http://example.org/vocab#products"
         ));
     }
 
@@ -3000,23 +2372,23 @@ mod tests {
         let sales = spec
             .named_graphs
             .iter()
-            .find(|g| g.source_alias.as_deref() == Some("salesProducts"))
+            .find(|g| g.alias() == Some("salesProducts"))
             .expect("should have salesProducts alias");
-        assert_eq!(sales.identifier, "sales:main");
+        assert_eq!(sales.written(), "sales:main");
         assert!(matches!(
-            &sales.graph_selector,
-            Some(GraphSelector::Iri(ref iri)) if iri == "http://example.org/vocab#products"
+            &sales.graph_sel(),
+            Some(GraphSel::Named(ref iri)) if iri.as_str() == "http://example.org/vocab#products"
         ));
 
         let inventory = spec
             .named_graphs
             .iter()
-            .find(|g| g.source_alias.as_deref() == Some("inventoryProducts"))
+            .find(|g| g.alias() == Some("inventoryProducts"))
             .expect("should have inventoryProducts alias");
-        assert_eq!(inventory.identifier, "inventory:main");
+        assert_eq!(inventory.written(), "inventory:main");
         assert!(matches!(
-            &inventory.graph_selector,
-            Some(GraphSelector::Iri(ref iri)) if iri == "http://example.org/vocab#products"
+            &inventory.graph_sel(),
+            Some(GraphSel::Named(ref iri)) if iri.as_str() == "http://example.org/vocab#products"
         ));
     }
 
@@ -3030,15 +2402,13 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
+        assert_eq!(spec.default_graphs[0].written(), "ledger:main@t:5");
+        assert_eq!(ledger_of(&spec.default_graphs[0]), "ledger:main");
         assert!(matches!(
-            spec.default_graphs[0].time_spec,
+            spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtT(5))
         ));
-        assert_eq!(
-            spec.default_graphs[0].source_alias,
-            Some("oldData".to_string())
-        );
+        assert_eq!(spec.default_graphs[0].alias(), Some("oldData"));
     }
 
     #[test]
@@ -3059,8 +2429,8 @@ mod tests {
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
 
-        let policy = spec.default_graphs[0].policy_override.as_ref().unwrap();
-        assert_eq!(policy.identity, Some("did:example:user1".to_string()));
+        let policy = spec.default_graphs[0].policy_override().unwrap();
+        assert_eq!(policy.identity.as_deref(), Some("did:example:user1"));
         assert_eq!(policy.policy_class, Some(vec!["ReadOnly".to_string()]));
         assert_eq!(policy.default_allow, Some(false));
     }
@@ -3192,9 +2562,9 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main#txn-meta");
-        // No graph_selector since it's in the identifier
-        assert!(spec.default_graphs[0].graph_selector.is_none());
+        assert_eq!(spec.default_graphs[0].written(), "ledger:main#txn-meta");
+        // The fragment is the member's graph.
+        assert_eq!(spec.default_graphs[0].graph_sel(), Some(GraphSel::TxnMeta));
     }
 
     #[test]
@@ -3207,15 +2577,15 @@ mod tests {
 
         let spec = DatasetSpec::from_json(&query).unwrap();
         assert_eq!(spec.default_graphs.len(), 1);
-        assert_eq!(spec.default_graphs[0].identifier, "ledger:main");
+        assert_eq!(spec.default_graphs[0].written(), "ledger:main");
         assert!(matches!(
-            spec.default_graphs[0].time_spec,
+            spec.default_graphs[0].time_spec(),
             Some(TimeSpec::AtT(42))
         ));
         // New fields are None
-        assert!(spec.default_graphs[0].source_alias.is_none());
-        assert!(spec.default_graphs[0].graph_selector.is_none());
-        assert!(spec.default_graphs[0].policy_override.is_none());
+        assert!(spec.default_graphs[0].alias().is_none());
+        assert!(spec.default_graphs[0].graph_sel().is_none());
+        assert!(spec.default_graphs[0].policy_override().is_none());
     }
 
     // =============================================================================
@@ -3275,6 +2645,121 @@ mod tests {
     fn test_sparql_dataset_ledger_ids_parse_error() {
         let result = sparql_dataset_ledger_ids("NOT VALID SPARQL }{}{");
         assert!(result.is_err());
+    }
+
+    // =============================================================================
+    // The parsers' public shape, as an authorizer outside db reads it
+    // =============================================================================
+
+    /// What an authorizer that calls `from_query_json` sees: every member's
+    /// `identifier`, default graphs then named graphs, and whether any member
+    /// carries its own policy.
+    fn reported(body: &JsonValue) -> (Vec<String>, bool) {
+        let (spec, _) = DatasetSpec::from_query_json(body).expect("parse");
+        let ids = spec
+            .default_graphs
+            .iter()
+            .chain(spec.named_graphs.iter())
+            .map(|g| g.identifier.clone())
+            .collect();
+        let overridden = spec
+            .default_graphs
+            .iter()
+            .chain(spec.named_graphs.iter())
+            .any(|g| g.policy_override.is_some());
+        (ids, overridden)
+    }
+
+    /// The JSON-LD shapes an authorizer built on `from_query_json` depends on:
+    /// every place a body can name a ledger is reported, with the reference as
+    /// the query named it (a pin removed, a `#graph` kept), and a per-source
+    /// policy is visible on the member.
+    #[test]
+    fn from_query_json_reports_every_named_ledger() {
+        let cases: Vec<(JsonValue, Vec<&str>)> = vec![
+            (json!({"select": ["?s"]}), vec![]),
+            (json!({"from": "a:main"}), vec!["a:main"]),
+            (json!({"from": ["a:main", "b"]}), vec!["a:main", "b"]),
+            (
+                json!({"from": {"@id": "hist:main", "t": 42}}),
+                vec!["hist:main"],
+            ),
+            (json!({"from": "hist:main@t:42"}), vec!["hist:main"]),
+            (
+                json!({"from": "hist:main@t:42#txn-meta"}),
+                vec!["hist:main#txn-meta"],
+            ),
+            (
+                json!({"from": "a:main", "fromNamed": {"x": {"@id": "c:main"}}}),
+                vec!["a:main", "c:main"],
+            ),
+            (json!({"from-named": ["d:main"]}), vec!["d:main"]),
+            (json!({"opts": {"from": "e:main"}}), vec!["e:main"]),
+            (json!({"ledger": "f:main"}), vec!["f:main"]),
+            // An address is reported as `name[:branch][#graph]` whatever its
+            // spelling; a bare name stays bare.
+            (json!({"from": "urn:fluree:g:main"}), vec!["g:main"]),
+            (json!({"from": "urn:fluree:g@t:3#config"}), vec!["g#config"]),
+            (
+                json!({"from": {"@id": "urn:fluree:g:dev", "t": 3}}),
+                vec!["g:dev"],
+            ),
+        ];
+        for (body, expected) in cases {
+            let (ids, overridden) = reported(&body);
+            assert_eq!(ids, expected, "{body}");
+            assert!(!overridden, "{body}");
+        }
+
+        let (ids, overridden) = reported(&json!({
+            "from": {"@id": "a:main", "policy": {"identity": "did:example:x"}}
+        }));
+        assert_eq!(ids, vec!["a:main"]);
+        assert!(overridden, "a per-source policy is visible on the member");
+    }
+
+    /// The SPARQL shapes an authorizer built on `sparql_dataset_ledger_ids`
+    /// depends on, including the lexical corners: no space after `FROM`, a
+    /// bare prefixed name whose prefix is not declared (a ledger address as
+    /// written), and a commented-out clause (not part of the query).
+    #[test]
+    fn sparql_dataset_ledger_ids_reports_every_named_ledger() {
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            ("SELECT ?s WHERE { ?s ?p ?o }", vec![]),
+            ("SELECT ?s FROM<x:main> WHERE { ?s ?p ?o }", vec!["x:main"]),
+            (
+                "SELECT ?s FROM ledger:main WHERE { ?s ?p ?o }",
+                vec!["ledger:main"],
+            ),
+            (
+                "SELECT ?s FROM <a> FROM <b:main> FROM NAMED <c> WHERE { ?s ?p ?o }",
+                vec!["a", "b:main", "c"],
+            ),
+            (
+                "# FROM <hidden:main>\nSELECT ?s FROM <a:main> WHERE { ?s ?p ?o }",
+                vec!["a:main"],
+            ),
+            (
+                "SELECT ?s FROM <hist:main@t:1> TO <hist:main@t:latest> WHERE { ?s ?p ?o }",
+                vec!["hist:main"],
+            ),
+            (
+                "SELECT ?s FROM <urn:fluree:u:main#config> WHERE { ?s ?p ?o }",
+                vec!["u:main"],
+            ),
+            (
+                "SELECT ?s FROM <urn:fluree:u@t:2> FROM NAMED <urn:fluree:v:dev> \
+                 WHERE { ?s ?p ?o }",
+                vec!["u", "v:dev"],
+            ),
+        ];
+        for (sparql, expected) in cases {
+            assert_eq!(
+                sparql_dataset_ledger_ids(sparql).unwrap(),
+                expected,
+                "{sparql}"
+            );
+        }
     }
 
     // --- GovernanceOptions::default_allow tri-state parsing ---
@@ -3386,15 +2871,15 @@ mod tests {
         let (spec, _) = DatasetSpec::from_query_json(query).expect("parses");
         spec.named_graphs
             .iter()
-            .find(|s| s.source_alias.as_deref() == Some(alias))
+            .find(|s| s.alias() == Some(alias))
             .expect("named source present")
-            .graph_selector
+            .graph_sel()
             .clone()
     }
 
     fn default_selector(query: &JsonValue) -> Option<GraphSelector> {
         let (spec, _) = DatasetSpec::from_query_json(query).expect("parses");
-        spec.default_graphs[0].graph_selector.clone()
+        spec.default_graphs[0].graph_sel().clone()
     }
 
     #[test]
@@ -3410,12 +2895,12 @@ mod tests {
 
         assert!(matches!(
             named_selector(&with_at, "g"),
-            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+            Some(GraphSel::Named(ref s)) if s.as_str() == "http://ex.org/g1"
         ));
         // Previously `None` — silently the whole ledger.
         assert!(matches!(
             named_selector(&without_at, "g"),
-            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+            Some(GraphSel::Named(ref s)) if s.as_str() == "http://ex.org/g1"
         ));
         assert_eq!(
             named_selector(&with_at, "g"),
@@ -3436,12 +2921,12 @@ mod tests {
 
         assert!(matches!(
             default_selector(&with_bare),
-            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+            Some(GraphSel::Named(ref s)) if s.as_str() == "http://ex.org/g1"
         ));
         // Previously `None` — silently the whole ledger.
         assert!(matches!(
             default_selector(&with_at),
-            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+            Some(GraphSel::Named(ref s)) if s.as_str() == "http://ex.org/g1"
         ));
         assert_eq!(default_selector(&with_bare), default_selector(&with_at));
     }

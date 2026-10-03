@@ -1101,7 +1101,17 @@ impl<'a> FromQueryBuilder<'a> {
     ///
     /// Uses `.format()` config if set, otherwise defaults based on input type
     /// (JSON-LD for `.jsonld()`, SPARQL JSON for `.sparql()`).
-    pub async fn execute_formatted(mut self) -> Result<JsonValue> {
+    pub async fn execute_formatted(self) -> Result<JsonValue> {
+        self.execute_formatted_with_advisories()
+            .await
+            .map(|(json, _)| json)
+    }
+
+    /// [`Self::execute_formatted`], with the query's advisories
+    /// ([`crate::QueryAdvisory`]) alongside the formatted result.
+    pub async fn execute_formatted_with_advisories(
+        mut self,
+    ) -> Result<(JsonValue, Vec<crate::QueryAdvisory>)> {
         let errs = self.core.validate();
         if !errs.is_empty() {
             return Err(ApiError::Builder(BuilderErrors(errs)));
@@ -1131,7 +1141,7 @@ impl<'a> FromQueryBuilder<'a> {
                 .try_expand_crawl(json, r2rml_pair, &execution, &format_config)
                 .await?
             {
-                return Ok(expanded);
+                return Ok((expanded, Vec::new()));
             }
         }
         // SPARQL policy via connection opts (multi-query aliases) — see
@@ -1154,13 +1164,13 @@ impl<'a> FromQueryBuilder<'a> {
                 .first()
                 .or_else(|| spec.named_graphs.first())
             {
-                let view = self
-                    .fluree
-                    .db_or_graph_source(alias.identifier.as_str())
-                    .await?;
-                Ok(result
-                    .format_async(view.as_graph_db_ref(), &format_config)
-                    .await?)
+                let view = self.fluree.db_or_graph_source_for(alias).await?;
+                Ok((
+                    result
+                        .format_async(view.as_graph_db_ref(), &format_config)
+                        .await?,
+                    result.advisories.clone(),
+                ))
             } else {
                 Err(ApiError::query("No graph specified for formatting"))
             };
@@ -1181,27 +1191,31 @@ impl<'a> FromQueryBuilder<'a> {
                 match target {
                     // Multi-ledger: format hydration per home-ledger view so
                     // cross-graph IRIs/properties decode correctly (issue #1259).
-                    FormatTarget::Dataset(dataset) => {
-                        Ok(crate::format::format_results_async_dataset(
+                    FormatTarget::Dataset(dataset) => Ok((
+                        crate::format::format_results_async_dataset(
                             &result,
                             &result.context,
                             &dataset,
                             &format_config,
                             None,
                         )
-                        .await?)
-                    }
+                        .await?,
+                        result.advisories.clone(),
+                    )),
                     // Single-ledger: the view the query ran on, so hydration is
                     // filtered by the policy that filtered the rows.
-                    FormatTarget::Single(view) => Ok(crate::format::format_results_async(
-                        &result,
-                        &result.context,
-                        view.as_graph_db_ref(),
-                        &format_config,
-                        view.policy(),
-                        None,
-                    )
-                    .await?),
+                    FormatTarget::Single(view) => Ok((
+                        crate::format::format_results_async(
+                            &result,
+                            &result.context,
+                            view.as_graph_db_ref(),
+                            &format_config,
+                            view.policy(),
+                            None,
+                        )
+                        .await?,
+                        result.advisories.clone(),
+                    )),
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -1253,13 +1267,13 @@ impl<'a> FromQueryBuilder<'a> {
                     .first()
                     .or_else(|| spec.named_graphs.first())
                 {
-                    let view = self
-                        .fluree
-                        .db_or_graph_source(alias.identifier.as_str())
-                        .await?;
-                    Ok(result
-                        .format_async(view.as_graph_db_ref(), &format_config)
-                        .await?)
+                    let view = self.fluree.db_or_graph_source_for(alias).await?;
+                    Ok((
+                        result
+                            .format_async(view.as_graph_db_ref(), &format_config)
+                            .await?,
+                        result.advisories.clone(),
+                    ))
                 } else {
                     Err(ApiError::query("No graph specified for formatting"))
                 }
@@ -1324,10 +1338,7 @@ impl<'a> FromQueryBuilder<'a> {
                 .first()
                 .or_else(|| spec.named_graphs.first())
             {
-                let view = self
-                    .fluree
-                    .db_or_graph_source(alias.identifier.as_str())
-                    .await?;
+                let view = self.fluree.db_or_graph_source_for(alias).await?;
                 crate::format::format_results_string_async(
                     &result,
                     &result.context,
@@ -1429,10 +1440,7 @@ impl<'a> FromQueryBuilder<'a> {
                     .first()
                     .or_else(|| spec.named_graphs.first())
                 {
-                    let view = self
-                        .fluree
-                        .db_or_graph_source(alias.identifier.as_str())
-                        .await?;
+                    let view = self.fluree.db_or_graph_source_for(alias).await?;
                     crate::format::format_results_string_async(
                         &result,
                         &result.context,

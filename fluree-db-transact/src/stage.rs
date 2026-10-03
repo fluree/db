@@ -9,21 +9,22 @@
 //! staged view against SHACL shapes.
 
 use crate::error::{Result, TransactError};
-use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
+use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator, WriteGraph};
 use crate::ir::InlineValues;
 use crate::ir::{
-    names_ledger, GraphMgmtOp, GraphSel, GraphTarget, TemplateGraph, TemplateTerm, TripleTemplate,
-    Txn, TxnType,
+    GraphMgmtOp, GraphSel, GraphTarget, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::comparator::IndexType;
-use fluree_db_core::graph_registry::{FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
+use fluree_db_core::graph_registry::{DEFAULT_GRAPH_ID, FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
 use fluree_db_core::query_bounds::RangeTest;
 use fluree_db_core::range::RangeMatch;
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
-use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
+use fluree_db_core::{
+    Flake, FlakeMeta, FlakeValue, GraphId, GraphPosition, MemberRef, Sid, TargetError, TargetLedger,
+};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
     is_schema_flake, lookup_subject_classes, PolicyContext, PolicyDecision, PolicyError,
@@ -754,9 +755,29 @@ pub async fn stage_with_graph_delta(
             .clone()
             .unwrap_or_else(generate_txn_id);
 
-        // A `WITH`/`graph` template default that is this ledger's own address
-        // writes the ledger's default graph, the graph the WHERE reads for it.
-        template_default_address_to_default_graph(&mut txn, &ledger.snapshot.ledger_id);
+        // Every graph the update writes, fixed or bound per solution, resolves
+        // in this ledger through the one graph-position table: its own
+        // address writes the default graph and registers nothing, and `L#<g>`
+        // writes the graph `<g>`.
+        let graph_lookup = ledger_graph_lookup(&ledger);
+        let write_table = |iri: &str| {
+            write_graph(
+                &TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup),
+                iri,
+            )
+        };
+        // A graph name the JSON-LD parser kept as written only because it
+        // reads as a ledger address must be an address of this ledger.
+        if let Some(name) = txn.address_graph_names.iter().find(|name| {
+            !TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup).names_this_ledger(name)
+        }) {
+            return Err(TransactError::Parse(format!(
+                "graph \"{name}\" is a compact IRI whose prefix the @context does not define \
+                 (strict compact-IRI mode), and no address of this ledger ('{}')",
+                ledger.snapshot.ledger_id
+            )));
+        }
+        resolve_write_graphs(&mut txn, &write_table)?;
 
         // B2 (data writes): `#txn-meta` is never a write target (see
         // `refuse_txn_meta_write`). `txn.write_graphs` holds the fixed write
@@ -817,6 +838,7 @@ pub async fn stage_with_graph_delta(
         };
 
         let mut generator = FlakeGenerator::new(new_t, &mut ns_registry, txn_id);
+        generator.set_graph_table(&write_table);
 
         // Stream the WHERE result into a single accumulator per-batch,
         // projecting / materializing / hydrating in the same step. This keeps
@@ -882,6 +904,9 @@ pub async fn stage_with_graph_delta(
         if resolved_new_graph {
             reverse_graph = txn_reverse_graph(&ledger, &graph_sids);
         }
+        // Every graph is resolved: release the table's borrow of the ledger.
+        drop(generator);
+        drop(graph_lookup);
 
         // Per SPARQL 1.1 Update §3.1.3: INSERT/DELETE templates are instantiated
         // once per WHERE solution, so a WHERE that matches zero solutions is a
@@ -1168,37 +1193,90 @@ fn refuse_txn_meta_write(ledger: &LedgerState, iri: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPARQL `WITH <iri>` and a JSON-LD update's top-level `graph` name the
-/// update's template default graph ([`Txn::template_default_graph`]). With no
-/// `USING`/`from`, the WHERE reads the same IRI as its default graph
-/// (`resolve_where_default_graph`), and when the IRI is this ledger's own
-/// address ([`names_ledger`]) that is the ledger's default graph. Make the
-/// write half agree: the templates that took the default write the default
-/// graph, and the IRI is not registered as a named graph unless a template
-/// names it itself. Templates that name their graph are left alone.
-fn template_default_address_to_default_graph(txn: &mut Txn, ledger_id: &fluree_db_core::LedgerId) {
-    let Some(iri) = txn.template_default_graph.clone() else {
-        return;
-    };
-    if !names_ledger(ledger_id, &iri) {
-        return;
+/// The ledger's graph registry as a lookup: the snapshot's registry, then the
+/// binary index's graph dictionary, which can hold an entry the registry has
+/// not caught up with (the query path falls back the same way).
+fn ledger_graph_lookup(ledger: &LedgerState) -> impl Fn(&str) -> Option<GraphId> + Sync + '_ {
+    let binary_store: Option<Arc<fluree_db_binary_index::BinaryIndexStore>> =
+        ledger.binary_store.as_ref().and_then(|te| {
+            Arc::clone(&te.0)
+                .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+                .ok()
+        });
+    move |iri: &str| {
+        ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .or_else(|| binary_store.as_ref().and_then(|s| s.graph_id_for_iri(iri)))
     }
-    let mut named_by_a_template = false;
+}
+
+/// Where a write to the graph IRI `iri` goes in the ledger `target` reads.
+/// This is the one table every write position shares
+/// ([`TargetLedger::graph_position`]): a template's `GRAPH <iri>`, a data
+/// quad, a TriG block, `WITH`, a JSON-LD `@graph` or top-level `graph`,
+/// `CREATE GRAPH`, a sync target, and each `GRAPH ?g` binding. The ledger's
+/// own address writes its default graph, `L#<g>` the graph `<g>`, and any other
+/// IRI the graph of that IRI, which the commit registers when it is new.
+fn write_graph(target: &TargetLedger<'_>, iri: &str) -> Result<WriteGraph> {
+    match target.graph_position(iri) {
+        GraphPosition::Default => Ok(WriteGraph::Default),
+        GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => {
+            Ok(WriteGraph::Named(iri.into()))
+        }
+        GraphPosition::NotAGraph => Err(TransactError::Parse(format!(
+            "<{iri}> names no graph a write can go to: an address of this ledger ('{}') \
+             names its default graph, or one of its graphs through '#', and carries no time",
+            target.id()
+        ))),
+    }
+}
+
+/// Resolve the graphs a transaction writes by name, through `table`
+/// ([`write_graph`]): template graphs, [`Txn::write_graphs`] (`CREATE GRAPH`
+/// among them) and a sync target. `GRAPH ?g` templates resolve each binding
+/// through the same table as the WHERE streams (see
+/// [`FlakeGenerator::set_graph_table`]).
+fn resolve_write_graphs(
+    txn: &mut Txn,
+    table: &(dyn Fn(&str) -> Result<WriteGraph> + Sync),
+) -> Result<()> {
+    let mut resolved: HashMap<Arc<str>, WriteGraph> = HashMap::new();
+    let mut resolve = |iri: &str| -> Result<WriteGraph> {
+        if let Some(graph) = resolved.get(iri) {
+            return Ok(graph.clone());
+        }
+        let graph = table(iri)?;
+        resolved.insert(iri.into(), graph.clone());
+        Ok(graph)
+    };
     for template in txn
         .insert_templates
         .iter_mut()
         .chain(txn.delete_templates.iter_mut())
     {
-        if template.graph_from_template_default {
-            template.graph = TemplateGraph::Default;
-            template.graph_from_template_default = false;
-        } else if matches!(&template.graph, TemplateGraph::Iri(g) if **g == *iri) {
-            named_by_a_template = true;
+        if let TemplateGraph::Iri(iri) = &template.graph {
+            let graph = resolve(iri)?;
+            template.graph = match graph {
+                WriteGraph::Default => TemplateGraph::Default,
+                WriteGraph::Named(iri) => TemplateGraph::Iri(iri),
+            };
         }
     }
-    if !named_by_a_template {
-        txn.write_graphs.remove(&iri);
+    for iri in std::mem::take(&mut txn.write_graphs) {
+        if let WriteGraph::Named(graph) = resolve(&iri)? {
+            txn.write_graphs.insert(graph.to_string());
+        }
     }
+    if let Some(GraphSel::Graph(iri)) = &txn.sync_graph {
+        let graph = resolve(iri)?;
+        txn.sync_graph = Some(match graph {
+            WriteGraph::Default => GraphSel::Default,
+            WriteGraph::Named(iri) => GraphSel::Graph(iri.to_string()),
+        });
+    }
+    Ok(())
 }
 
 /// Ledger graph id → IRI for the named graphs `iris`. Unregistered graphs get
@@ -1399,7 +1477,7 @@ fn resolve_named_graph(
 /// datatypes, language tags, and list-index metadata are preserved exactly.
 async fn stage_graph_mgmt(
     ledger: LedgerState,
-    txn: Txn,
+    mut txn: Txn,
     mut ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
 ) -> Result<(
@@ -1407,6 +1485,38 @@ async fn stage_graph_mgmt(
     NamespaceRegistry,
     rustc_hash::FxHashMap<u16, String>,
 )> {
+    // A graph named through this ledger's address reads as it does in every
+    // other update position (`TargetLedger::graph_management_iri`): `L#<g>`
+    // is the graph `<g>`, and the address with a reserved keyword is that
+    // reserved graph, which the guards below refuse. Any other IRI, the
+    // address itself included, keeps registry semantics.
+    {
+        let graph_lookup = ledger_graph_lookup(&ledger);
+        let this_ledger = TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup);
+        let registry_iri = |iri: &mut String| {
+            if let Some(named) = this_ledger.graph_management_iri(iri) {
+                *iri = named;
+            }
+        };
+        match &mut txn.graph_mgmt {
+            Some(GraphMgmtOp::Clear(GraphTarget::Graph(iri))) => registry_iri(iri),
+            Some(GraphMgmtOp::Transfer { from, to, .. }) => {
+                for sel in [from, to] {
+                    if let GraphSel::Graph(iri) = sel {
+                        registry_iri(iri);
+                    }
+                }
+            }
+            _ => {}
+        }
+        txn.write_graphs = std::mem::take(&mut txn.write_graphs)
+            .into_iter()
+            .map(|mut iri| {
+                registry_iri(&mut iri);
+                iri
+            })
+            .collect();
+    }
     let op = txn
         .graph_mgmt
         .as_ref()
@@ -1576,6 +1686,22 @@ async fn stage_graph_mgmt(
                     let (dest_g_id, dest_sid): (GraphId, Option<Sid>) = match to {
                         GraphSel::Default => (0, None),
                         GraphSel::Graph(iri) => {
+                            // Graph management names registered graphs
+                            // exactly, a graph registered under this ledger's
+                            // own address included, but never creates one
+                            // there: an address of this ledger names its
+                            // default graph (`DEFAULT`) or, through `#`, one
+                            // of its graphs.
+                            let graph_lookup = ledger_graph_lookup(&ledger);
+                            let this_ledger =
+                                TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup);
+                            if graph_lookup(iri).is_none() && this_ledger.names_this_ledger(iri) {
+                                return Err(TransactError::Parse(format!(
+                                    "<{iri}> is an address of this ledger, not a graph to \
+                                     create: name its default graph DEFAULT, and a named \
+                                     graph by its own IRI"
+                                )));
+                            }
                             let g_id = ledger
                                 .snapshot
                                 .graph_registry
@@ -2753,31 +2879,43 @@ async fn stream_where_into_accumulator(
                 .downcast::<fluree_db_binary_index::BinaryIndexStore>()
                 .ok()
         });
-    let resolve_graph_id = |iri: &str| -> Option<GraphId> {
-        ledger
-            .snapshot
-            .graph_registry
-            .graph_id_for_iri(iri)
-            .or_else(|| binary_store.as_ref().and_then(|s| s.graph_id_for_iri(iri)))
-    };
+    let resolve_graph_id = ledger_graph_lookup(ledger);
 
-    // A WHERE default graph named by `USING`, `WITH` or JSON-LD `from`/`graph`:
-    // this ledger's own address names its default graph (see `names_ledger`),
-    // a registered IRI names that graph, and anything else names a graph that
-    // does not exist here, so `None`.
-    let resolve_where_default_graph = |iri: &str| -> Option<GraphId> {
-        if names_ledger(&ledger.snapshot.ledger_id, iri) {
-            return Some(0);
+    // A WHERE-dataset reference (`USING`, `USING NAMED`, `WITH`, JSON-LD
+    // `from` / `fromNamed` / `graph`) resolves in this ledger through the table
+    // a query's FROM uses: the ledger's own address in any spelling names its
+    // default graph, `L#config` or its URN the config graph, and a registered
+    // IRI its graph. A graph the ledger does not have is `None`: it contributes
+    // nothing (SPARQL 1.1 Update §3.1.3, Query §13.2), so a WHERE over it binds
+    // nothing. Another ledger, or a time pin, is a caller error: the WHERE
+    // reads this ledger as it stands.
+    let target_ledger = &ledger.snapshot.ledger_id;
+    let where_graph = |iri: &str| -> Result<Option<GraphId>> {
+        let member = MemberRef::parse(iri)
+            .map_err(|e| TransactError::Parse(format!("WHERE dataset graph <{iri}>: {e}")))?;
+        if member.address().is_some_and(|a| a.at().is_some()) {
+            return Err(TransactError::Parse(format!(
+                "WHERE dataset graph <{iri}> pins a time, but an update reads the ledger \
+                 as it stands; drop the pin"
+            )));
         }
-        resolve_graph_id(iri)
+        match TargetLedger::new(target_ledger, &resolve_graph_id).resolve(iri, &member, false) {
+            Ok(graph) => Ok(Some(graph.g_id)),
+            Err(TargetError::GraphNotFound(_)) => Ok(None),
+            Err(TargetError::CrossLedger { named, .. }) => Err(TransactError::Parse(format!(
+                "WHERE dataset graph <{iri}> names ledger '{named}', but an update's WHERE \
+                 reads only its own ledger ('{target_ledger}')"
+            ))),
+        }
     };
     let where_default_g_ids: Vec<Option<GraphId>> = desired_where_default_graph_iris
         .iter()
-        .map(|iri| resolve_where_default_graph(iri))
-        .collect();
+        .map(|iri| where_graph(iri))
+        .collect::<Result<_>>()?;
 
-    // Base GraphDbRef is used to provide snapshot/overlay/time; dataset controls active graphs.
-    // A single resolved default graph is the base; otherwise g_id=0 is the base reference.
+    // Base GraphDbRef is used to provide snapshot/overlay/time; dataset controls
+    // active graphs. A single resolved default graph is the base; otherwise
+    // g_id 0 is the base reference.
     let base_db = match where_default_g_ids.as_slice() {
         [Some(g_id)] => ledger.as_graph_db_ref(*g_id),
         _ => ledger.as_graph_db_ref(0),
@@ -2834,12 +2972,14 @@ async fn stream_where_into_accumulator(
         w.using_default_graph_iris.is_empty() && !w.using_named_graph_iris.is_empty()
     });
 
-    // With no `USING`/`WITH`/`from`, the WHERE reads the ledger's default graph.
-    // Otherwise each named graph that exists joins the default-graph union and
-    // one that does not contributes nothing (SPARQL 1.1 Update §3.1.3, Query
-    // §13.2), so a lone unknown IRI leaves the default graph EMPTY. Falling back
-    // to g_id 0 instead made `DELETE { ?s ?p ?o } USING <typo> WHERE { ?s ?p ?o }`
-    // delete the ledger's whole default graph.
+    // With no `USING`/`WITH`/`from`, the WHERE reads the ledger's default
+    // graph. Otherwise the default graph is the union of the named graphs that
+    // exist, so one that does not contributes nothing (SPARQL 1.1 Update
+    // §3.1.3, Query §13.2) and a lone one leaves the default graph EMPTY.
+    // Falling back to g_id 0 instead made `DELETE { ?s ?p ?o } USING <typo>
+    // WHERE { ?s ?p ?o }` delete the ledger's whole default graph. The ledger's
+    // own address is the default graph in either branch (a multi-USING used to
+    // drop it).
     let mut runtime_dataset = if where_default_is_empty {
         fluree_db_query::DataSet::new()
     } else if desired_where_default_graph_iris.is_empty() {
@@ -2902,9 +3042,10 @@ async fn stream_where_into_accumulator(
     // a graph named after the alias.
     // (name, g_id, enumerable, canonical IRI), first entry per name wins.
     let mut named: Vec<(Arc<str>, GraphId, bool, Arc<str>)> = Vec::new();
+    let ambient = allowed_named_graphs.is_none();
     if let Some(allowlist) = allowed_named_graphs {
         for (iri, alias) in allowlist {
-            let Some(g_id) = resolve_graph_id(&iri) else {
+            let Some(g_id) = where_graph(&iri)? else {
                 continue;
             };
             // Explicitly listed, so enumerable even when reserved.
@@ -2917,31 +3058,42 @@ async fn stream_where_into_accumulator(
             }
         }
     } else {
-        // The ambient graph store. Reserved system graphs (txn-meta, config)
+        // The ambient graph store: every graph of the ledger, each listed by
+        // `GRAPH ?g` under the name that reads it back in any graph position
+        // (its IRI, or `L#<iri>` for a graph registered under the ledger's own
+        // address, which a graph position reads as the default graph). Any
+        // other `GRAPH <iri>` (the ledger's own address, `L#<g>`, in any
+        // spelling) resolves through the ledger's graph-position table: see
+        // the name resolver below. Reserved system graphs (txn-meta, config)
         // stay addressable by their full IRI — config maintenance reads
-        // `GRAPH <…#config>` in an update's WHERE — but, as on the query
-        // side, are never enumerated.
+        // `GRAPH <…#config>` in an update's WHERE — but, as on the query side,
+        // are never enumerated.
         let binary_entries = binary_store
             .as_ref()
             .map(|store| store.graph_entries())
             .unwrap_or_default();
+        let target = TargetLedger::new(target_ledger, &resolve_graph_id);
         for (g_id, iri) in ledger
             .snapshot
             .graph_registry
             .iter_entries()
             .chain(binary_entries)
         {
-            let iri: Arc<str> = iri.into();
-            named.push((iri.clone(), g_id, g_id >= FIRST_USER_GRAPH_ID, iri.clone()));
-            named.push((composite_graph_key(&iri), g_id, false, iri));
+            let name: Arc<str> = target.enumeration_name(iri, g_id).as_ref().into();
+            named.push((name.clone(), g_id, g_id >= FIRST_USER_GRAPH_ID, name));
         }
+        // The default graph, under the ledger's own id.
+        let default_name: Arc<str> = target_ledger.as_str().into();
+        named.push((default_name.clone(), DEFAULT_GRAPH_ID, false, default_name));
     }
     let mut seen_named_keys: HashSet<Arc<str>> = HashSet::new();
     let mut graph_aliases: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+    let mut name_of_graph: HashMap<GraphId, Arc<str>> = HashMap::new();
     for (name, g_id, enumerable, canonical) in named {
         if !seen_named_keys.insert(name.clone()) {
             continue;
         }
+        name_of_graph.entry(g_id).or_insert_with(|| name.clone());
         runtime_dataset = if enumerable {
             runtime_dataset.with_named_graph(name, make_graph_ref(g_id))
         } else {
@@ -2950,6 +3102,19 @@ async fn stream_where_into_accumulator(
             }
             runtime_dataset.with_named_graph_alias(name, make_graph_ref(g_id))
         };
+    }
+    if ambient {
+        // `GRAPH <iri>` in the ambient WHERE reads what the ledger's
+        // graph-position table reads for `iri`, the table its templates write
+        // through: one lookup per name the dataset holds no key for.
+        let resolve_graph_id = &resolve_graph_id;
+        runtime_dataset = runtime_dataset.with_name_resolver(move |name: &str| {
+            match TargetLedger::new(target_ledger, resolve_graph_id).graph_position(name) {
+                GraphPosition::Default => name_of_graph.get(&DEFAULT_GRAPH_ID).cloned(),
+                GraphPosition::Registered { g_id, .. } => name_of_graph.get(&g_id).cloned(),
+                GraphPosition::New(_) | GraphPosition::NotAGraph => None,
+            }
+        });
     }
     generator.set_graph_aliases(graph_aliases);
 

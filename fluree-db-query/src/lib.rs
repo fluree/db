@@ -121,7 +121,7 @@ pub use binding::{
     Batch, BatchError, BatchView, Binding, RelValue, RowAccess, RowView, UnmatchedOptional,
 };
 pub use context::{ExecutionContext, WellKnownDatatypes};
-pub use dataset::{ActiveGraph, ActiveGraphs, DataSet, GraphRef};
+pub use dataset::{ActiveGraph, ActiveGraphs, DataSet, GraphRef, MemberKind};
 pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
 pub use distinct::DistinctOperator;
 pub use error::{QueryError, Result};

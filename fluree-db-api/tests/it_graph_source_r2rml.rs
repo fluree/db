@@ -73,8 +73,8 @@ impl MockR2rmlProvider {
 
 #[async_trait]
 impl R2rmlProvider for MockR2rmlProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
 
     async fn compiled_mapping(
@@ -224,7 +224,7 @@ async fn test_mock_r2rml_provider() {
     let provider = MockR2rmlProvider::new(mapping, vec![batch]);
 
     // Test has_r2rml_mapping
-    assert!(provider.has_r2rml_mapping("test-gs:main").await);
+    assert!(provider.has_r2rml_mapping("test-gs:main").await.unwrap());
 
     // Test compiled_mapping
     let loaded = provider
@@ -939,8 +939,8 @@ struct IcebergDirectProvider {
 
 #[async_trait]
 impl R2rmlProvider for IcebergDirectProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
 
     async fn compiled_mapping(
@@ -1503,8 +1503,8 @@ async fn engine_e2e_split_triples_map_class_and_predicate_not_fused() {
 
     #[async_trait]
     impl R2rmlProvider for SplitTableProvider {
-        async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-            true
+        async fn has_r2rml_mapping(&self, _gs: &str) -> fluree_db_query::Result<bool> {
+            Ok(true)
         }
         async fn compiled_mapping(
             &self,
@@ -1685,10 +1685,10 @@ async fn engine_e2e_provider_method_calls() {
 
     #[async_trait]
     impl R2rmlProvider for TrackingProvider {
-        async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
+        async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
             eprintln!("has_r2rml_mapping called for: {graph_source_id}");
             self.has_mapping_called.store(true, Ordering::SeqCst);
-            graph_source_id == "airlines-gs:main"
+            Ok(graph_source_id == "airlines-gs:main")
         }
 
         async fn compiled_mapping(
@@ -2442,8 +2442,8 @@ struct MultiTableMockProvider {
 
 #[async_trait]
 impl R2rmlProvider for MultiTableMockProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
 
     async fn compiled_mapping(
@@ -2680,8 +2680,8 @@ struct RecordingTableProvider {
 
 #[async_trait]
 impl R2rmlProvider for RecordingTableProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
 
     async fn compiled_mapping(
@@ -3469,8 +3469,8 @@ impl CountingProvider {
 
 #[async_trait]
 impl R2rmlProvider for CountingProvider {
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
-        graph_source_id == "edw-gs:main"
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(graph_source_id == "edw-gs:main")
     }
 
     async fn compiled_mapping(
@@ -4013,8 +4013,8 @@ struct LimitProbeProvider {
 
 #[async_trait]
 impl R2rmlProvider for LimitProbeProvider {
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
-        graph_source_id == "edw-gs:main"
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(graph_source_id == "edw-gs:main")
     }
     async fn compiled_mapping(
         &self,
@@ -4087,8 +4087,8 @@ struct FilterCapturingProvider {
 
 #[async_trait::async_trait]
 impl R2rmlProvider for FilterCapturingProvider {
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
-        graph_source_id == "edw-gs:main"
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(graph_source_id == "edw-gs:main")
     }
     async fn compiled_mapping(
         &self,
@@ -4767,8 +4767,8 @@ struct MultiTableMock {
 
 #[async_trait]
 impl R2rmlProvider for MultiTableMock {
-    async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _gs: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
     async fn compiled_mapping(
         &self,

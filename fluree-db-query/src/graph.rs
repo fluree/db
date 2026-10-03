@@ -23,14 +23,17 @@
 //! In single-db mode (no dataset) every graph of the ledger lives in one
 //! snapshot, partitioned by `g_id`. Named graphs resolve against the snapshot's
 //! graph registry (user graphs, `g_id >= FIRST_USER_GRAPH_ID`) without an
-//! explicit `FROM NAMED` (issue #1279); the ledger alias EXPLICITLY addresses
-//! the default graph, and reserved system graphs (txn-meta, config) stay private.
+//! explicit `FROM NAMED` (issue #1279), through the table every graph position
+//! of a ledger shares (`TargetLedger::graph_position`): the ledger's own
+//! address, in any spelling, EXPLICITLY addresses the default graph, `L#<g>`
+//! the graph `<g>`, and reserved system graphs (txn-meta, config) stay private.
 //! - `GRAPH <iri>` / bound `GRAPH ?g`: executes for a registered user graph,
-//!   the ledger alias, or an R2RML graph source; otherwise empty
-//! - unbound `GRAPH ?g`: binds ?g to each registered user graph. The ledger
-//!   alias (default graph) is NOT enumerated — W3C-conformant since issue
-//!   #1442 (decision D-2); the #1279 implicit default-graph enumeration was
-//!   dropped, while explicit alias addressing above is retained
+//!   the ledger's own address, or an R2RML graph source; otherwise empty
+//! - unbound `GRAPH ?g`: binds ?g to each registered user graph, under a name
+//!   that reads it back (`L#<iri>` for a graph registered under the ledger's
+//!   own address). The default graph is NOT enumerated — W3C-conformant since
+//!   issue #1442; the #1279 implicit default-graph enumeration
+//!   was dropped, while explicit addressing above is retained
 //!
 //! # Architecture
 //!
@@ -60,23 +63,29 @@ use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 // Note: tracing::debug removed to fix compilation - add tracing dependency if needed
 
-/// Best-effort load of the compiled R2RML mapping for `graph_iri`, used only to
-/// let [`rewrite_patterns_for_r2rml`] decide whether a same-subject `rdf:type`
-/// may be safely fused into a star scan. Returns `None` (which disables class
-/// fusion but stays correct) when there is no provider or the load fails; the
-/// R2RML operator loads the mapping again at setup, so within a query this is a
-/// cache hit under the query-scoped catalog session.
+/// Load the compiled R2RML mapping for `graph_iri`, which the caller has just
+/// found to be an R2RML graph source, so [`rewrite_patterns_for_r2rml`] can
+/// decide whether a same-subject `rdf:type` may be safely fused into a star
+/// scan. `None` only when there is no provider. A failed load fails the query
+/// rather than silently disabling the rewrite; the R2RML operator loads the
+/// mapping again at setup, so within a query this is a cache hit under the
+/// query-scoped catalog session.
 async fn r2rml_mapping_for_rewrite(
     ctx: &ExecutionContext<'_>,
     graph_iri: &str,
-) -> Option<Arc<CompiledR2rmlMapping>> {
-    let provider = ctx.r2rml_provider?;
+) -> Result<Option<Arc<CompiledR2rmlMapping>>> {
+    let Some(provider) = ctx.r2rml_provider else {
+        return Ok(None);
+    };
     let as_of_t = if ctx.dataset.is_some() {
         None
     } else {
         Some(ctx.to_t)
     };
-    provider.compiled_mapping(graph_iri, as_of_t).await.ok()
+    provider
+        .compiled_mapping(graph_iri, as_of_t)
+        .await
+        .map(Some)
 }
 
 /// GRAPH pattern operator - scopes inner patterns to a specific graph
@@ -282,16 +291,20 @@ impl GraphOperator {
         }
 
         // Check if this graph is backed by an R2RML mapping.
-        // Prefer the precomputed set (populated in runner.rs for dataset queries),
-        // but fall back to asking the provider dynamically for the no-dataset
-        // single-source path where the GRAPH IRI may differ from the ledger_id.
+        // Prefer the precomputed set (populated in runner.rs from the query's
+        // graphs), but fall back to asking the provider dynamically for the
+        // no-dataset single-source path where the GRAPH IRI may differ from the
+        // ledger_id.
         let is_r2rml_gs = if ctx.r2rml_graph_ids.contains(graph_iri.as_ref()) {
             true
-        } else if ctx.single_db_user_graph_id(&graph_iri).is_some() {
-            // Registered native graph — never R2RML; skip the per-graph probe.
+        } else if ctx.single_db_user_graph_id(&graph_iri).is_some()
+            || ctx.graph_is_native(&graph_iri)
+        {
+            // A registered graph, or a graph loaded as a ledger graph: never
+            // R2RML, so skip the per-graph probe.
             false
         } else if let Some(provider) = ctx.r2rml_provider {
-            provider.has_r2rml_mapping(&graph_iri).await
+            provider.has_r2rml_mapping(&graph_iri).await?
         } else {
             false
         };
@@ -299,7 +312,7 @@ impl GraphOperator {
         // Determine which patterns to use (rewritten for R2RML or original)
         let patterns_to_execute: std::borrow::Cow<'_, [Pattern]> = if is_r2rml_gs {
             // Rewrite triple patterns to R2RML patterns
-            let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
+            let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
             let rewrite_result = rewrite_patterns_for_r2rml(
                 &self.inner_patterns,
                 &graph_iri,
@@ -536,7 +549,7 @@ impl GraphOperator {
             graph_ctx.eager_materialization = true;
         }
 
-        let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
+        let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
         let rewrite_result = rewrite_patterns_for_r2rml(
             &self.inner_patterns,
             &graph_iri,
@@ -750,13 +763,13 @@ impl Operator for GraphOperator {
             if ctx.dataset.is_none() {
                 if let GraphName::Iri(iri) = &graph_name {
                     let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                    let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                    let is_alias = ctx.single_db_names_default_graph(iri);
                     let is_r2rml_gs = !is_user_graph
                         && !is_alias
                         && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
                             true
                         } else if let Some(provider) = ctx.r2rml_provider {
-                            provider.has_r2rml_mapping(iri).await
+                            provider.has_r2rml_mapping(iri).await?
                         } else {
                             false
                         };
@@ -793,13 +806,13 @@ impl Operator for GraphOperator {
                             // Single-db: a registered user graph, the ledger
                             // alias (default graph), or an R2RML graph source.
                             let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                            let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                            let is_alias = ctx.single_db_names_default_graph(iri);
                             let is_r2rml_gs = !is_user_graph
                                 && !is_alias
                                 && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
                                     true
                                 } else if let Some(provider) = ctx.r2rml_provider {
-                                    provider.has_r2rml_mapping(iri).await
+                                    provider.has_r2rml_mapping(iri).await?
                                 } else {
                                     false
                                 };
@@ -839,14 +852,13 @@ impl Operator for GraphOperator {
                                     // Single-db: same resolution as the concrete arm.
                                     let is_user_graph =
                                         ctx.single_db_user_graph_id(&bound_iri).is_some();
-                                    let is_alias =
-                                        bound_iri.as_ref() == ctx.active_snapshot.ledger_id;
+                                    let is_alias = ctx.single_db_names_default_graph(&bound_iri);
                                     let is_r2rml_gs = !is_user_graph
                                         && !is_alias
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
                                             true
                                         } else if let Some(provider) = ctx.r2rml_provider {
-                                            provider.has_r2rml_mapping(&bound_iri).await
+                                            provider.has_r2rml_mapping(&bound_iri).await?
                                         } else {
                                             false
                                         };
@@ -879,13 +891,14 @@ impl Operator for GraphOperator {
                                 }
                             } else {
                                 // Single-db: bind ?g to each registered user
-                                // graph (empty graphs emit no rows). The ledger
-                                // alias (default graph) is NOT enumerated: per
-                                // SPARQL 1.1, `GRAPH ?g` ranges over named
-                                // graphs only (D-2 / issue #1442 dropped the
-                                // #1279 implicit enumeration). The default
-                                // graph remains explicitly addressable via
-                                // `GRAPH <alias>` in the arms above.
+                                // graph (empty graphs emit no rows), under a
+                                // name that reads it back. The default graph is
+                                // NOT enumerated: per SPARQL 1.1, `GRAPH ?g`
+                                // ranges over named graphs only (issue
+                                // #1442 dropped the #1279 implicit
+                                // enumeration). It remains explicitly
+                                // addressable by the ledger's own address in
+                                // the arms above.
                                 for iri in ctx.single_db_user_graph_iris() {
                                     self.execute_in_graph(
                                         ctx,

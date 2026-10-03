@@ -4040,7 +4040,7 @@ async fn a_ledgers_own_graphs_are_not_sources_to_the_lane() {
             &["t=1 title=default graph title"],
         ),
         (
-            "a well-formed id that is not a source is looked up and declined",
+            "the ledger itself, loaded as a member, is declined without a lookup",
             "SELECT ?d ?t FROM NAMED <docs:main> \
              WHERE { GRAPH <docs:main> { ?d ex:title ?t } }",
             &["d=http://example.org/d t=default graph title"],
@@ -4192,59 +4192,206 @@ mod source_lookups_fail {
     }
 }
 
+/// `fluree`'s storage and nameservice, with every graph-source lookup failing.
+fn with_source_lookups_failing(fluree: &Fluree) -> Fluree {
+    let real = fluree
+        .nameservice_mode()
+        .publisher_arc()
+        .expect("read-write nameservice");
+    Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        fluree_db_api::NameServiceMode::ReadOnly(std::sync::Arc::new(SourceLookupsFail(real))),
+    )
+}
+
+/// A query on the native twin's own view.
+async fn on_twin(fluree: &Fluree, sparql: &str) -> fluree_db_api::Result<Value> {
+    fluree
+        .graph("shop-native:main")
+        .query()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+}
+
+/// A GRAPH IRI that is not a member of the query's dataset is asked about at
+/// run time. When the nameservice cannot say whether it names a mapped source,
+/// the query fails rather than reading the source as an empty graph, off the
+/// lane (the executor's probe) and on it (the lane's capability lookup). A
+/// graph loaded as a ledger graph is never asked about, so queries over
+/// ledgers answer as they do with a healthy nameservice; and an IRI that is no
+/// graph-source id needs no lookup.
+#[tokio::test]
+async fn graph_source_probes_fail_closed_and_skip_ledger_graphs() {
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let (_server, fluree) = setup().await;
+    let down = with_source_lookups_failing(&fluree);
+
+    let into_source = format!(
+        "{PREFIX}SELECT ?o ?t WHERE {{ GRAPH <shop-sql:main> {{ ?o ex:total ?t FILTER(?t > 40) }} }}"
+    );
+    let into_source_jsonld = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?o", "?t"],
+        "where": [["graph", "shop-sql:main", {"@id": "?o", "ex:total": "?t"}]]
+    });
+    let native = format!("{PREFIX}SELECT ?o ?t WHERE {{ ?o ex:total ?t FILTER(?t > 40) }}");
+    let native_member = format!(
+        "{PREFIX}SELECT ?o ?t FROM NAMED <shop-native:main> \
+         WHERE {{ GRAPH <shop-native:main> {{ ?o ex:total ?t FILTER(?t > 40) }} }}"
+    );
+    let native_default = format!(
+        "{PREFIX}SELECT ?o ?t FROM <shop-native:main> WHERE {{ ?o ex:total ?t FILTER(?t > 40) }}"
+    );
+    let no_source_id =
+        format!("{PREFIX}SELECT ?s WHERE {{ GRAPH <http://example.org/nowhere> {{ ?s ?p ?o }} }}");
+    // A single GRAPH block feeding a COUNT: on the lane this plans the fused
+    // source aggregate, which decides at open whether the graph is a source.
+    let member_count = format!(
+        "{PREFIX}SELECT (COUNT(?o) AS ?n) FROM NAMED <shop-native:main> \
+         WHERE {{ GRAPH <shop-native:main> {{ ?o ex:total ?t }} }}"
+    );
+    let own_id_count = format!(
+        "{PREFIX}SELECT (COUNT(?o) AS ?n) WHERE {{ GRAPH <shop-native:main> {{ ?o ex:total ?t }} }}"
+    );
+
+    let native_rows = rows_of(&on_twin(&fluree, &native).await.expect("native"));
+    assert_eq!(native_rows.len(), 2, "{native_rows:?}");
+    let count_rows = rows_of(&query(&fluree, &member_count).await);
+    assert_eq!(count_rows, ["n=4"]);
+    assert_eq!(
+        rows_of(&on_twin(&fluree, &own_id_count).await.expect("own id")),
+        count_rows
+    );
+
+    let mut failures = Vec::new();
+    for lane_off in [false, true] {
+        set_fast_paths_disabled(lane_off);
+        let lane = if lane_off { "lane off" } else { "lane on" };
+
+        // The backend's fault, so a 500 the client may retry, not a 400.
+        match on_twin(&down, &into_source).await {
+            Err(e) if e.to_string().contains(INJECTED) && e.status_code() == 500 => {}
+            other => failures.push(format!("{lane}: GRAPH <source> gave {other:?}")),
+        }
+        let jsonld = down
+            .graph("shop-native:main")
+            .query()
+            .jsonld(&into_source_jsonld)
+            .execute_formatted()
+            .await;
+        match jsonld {
+            Err(e) if e.to_string().contains(INJECTED) && e.status_code() == 500 => {}
+            other => failures.push(format!("{lane}: JSON-LD graph <source> gave {other:?}")),
+        }
+
+        match on_twin(&down, &native).await {
+            Ok(v) if rows_of(&v) == native_rows => {}
+            other => failures.push(format!("{lane}: the twin's own view gave {other:?}")),
+        }
+        for (name, sparql) in [
+            ("FROM NAMED <ledger> + GRAPH", &native_member),
+            ("FROM <ledger>", &native_default),
+        ] {
+            match down.query_from().sparql(sparql).execute_formatted().await {
+                Ok(v) if rows_of(&v) == native_rows => {}
+                other => failures.push(format!("{lane}: {name} gave {other:?}")),
+            }
+        }
+        match down
+            .query_from()
+            .sparql(&member_count)
+            .execute_formatted()
+            .await
+        {
+            Ok(v) if rows_of(&v) == count_rows => {}
+            other => failures.push(format!(
+                "{lane}: COUNT over the ledger member gave {other:?}"
+            )),
+        }
+        match on_twin(&down, &own_id_count).await {
+            Ok(v) if rows_of(&v) == count_rows => {}
+            other => failures.push(format!("{lane}: COUNT over the own id gave {other:?}")),
+        }
+        match on_twin(&down, &no_source_id).await {
+            Ok(v) if rows_of(&v).is_empty() => {}
+            other => failures.push(format!("{lane}: a non-id GRAPH IRI gave {other:?}")),
+        }
+    }
+    set_fast_paths_disabled(false);
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 /// Declining an IRI that names no source is not swallowing a failure: when
 /// the nameservice cannot answer for a well-formed id, the probe fails the
-/// query rather than quietly plan a possible SQL source as a native graph. A
-/// ledger's own graph needs no lookup, and with the lane off the same query
-/// answers, which pins the failure on the probe.
+/// query rather than quietly plan a possible SQL source as a native graph.
+/// The id here, `maybe-source:main`, is a `GRAPH` IRI that a query on the
+/// ledger's view (no dataset) names and the ledger has no graph by, which is
+/// what is still asked about at run time: on the lane (its capability lookup)
+/// and off it (the executor's probe). A dataset member's `GRAPH` never is: a
+/// graph the query loaded as a ledger graph is never asked about, so the
+/// ledger's own graph and the ledger itself, named as dataset members, answer
+/// with the same nameservice down.
 #[tokio::test]
 async fn a_failed_source_lookup_still_fails_the_query() {
     let _lock = KILL_SWITCH.lock().await;
     set_fast_paths_disabled(false);
     let fluree = FlureeBuilder::memory().build_memory();
     docs_ledger(&fluree).await;
-    let real = fluree
-        .nameservice_mode()
-        .publisher_arc()
-        .expect("read-write nameservice");
-    let down = Fluree::from_backend(
-        fluree.config().clone(),
-        fluree.backend().clone(),
-        fluree_db_api::NameServiceMode::ReadOnly(std::sync::Arc::new(SourceLookupsFail(real))),
-    );
+    let down = with_source_lookups_failing(&fluree);
 
-    let well_formed = format!(
-        "{PREFIX}SELECT ?d ?t FROM NAMED <docs:main> WHERE {{ GRAPH <docs:main> {{ ?d ex:title ?t }} }}"
-    );
+    let well_formed =
+        format!("{PREFIX}SELECT ?d ?t WHERE {{ GRAPH <maybe-source:main> {{ ?d ex:title ?t }} }}");
     let lane_on = down
-        .query_from()
+        .graph("docs:main")
+        .query()
         .sparql(&well_formed)
         .execute_formatted()
         .await;
-    let own = format!(
+    let own_graph = format!(
         "{PREFIX}SELECT ?e ?t FROM NAMED <docs:main#urn:ex:doc:1> \
          WHERE {{ GRAPH <docs:main#urn:ex:doc:1> {{ ?e ex:title ?t }} }}"
     );
-    let own_graph = down.query_from().sparql(&own).execute_formatted().await;
+    let own_graph = down
+        .query_from()
+        .sparql(&own_graph)
+        .execute_formatted()
+        .await;
+    let own_ledger = format!(
+        "{PREFIX}SELECT ?d ?t FROM NAMED <docs:main> \
+         WHERE {{ GRAPH <docs:main> {{ ?d ex:title ?t }} }}"
+    );
+    let own_ledger = down
+        .query_from()
+        .sparql(&own_ledger)
+        .execute_formatted()
+        .await;
     set_fast_paths_disabled(true);
     let lane_off = down
-        .query_from()
+        .graph("docs:main")
+        .query()
         .sparql(&well_formed)
         .execute_formatted()
         .await;
     set_fast_paths_disabled(false);
 
-    let err = lane_on.expect_err("a failed lookup must fail the query");
-    assert!(
-        err.to_string().contains(INJECTED),
-        "unexpected error: {err}"
-    );
+    for (lane, result) in [("lane on", lane_on), ("lane off", lane_off)] {
+        let err = result.expect_err(&format!("{lane}: a failed lookup must fail the query"));
+        assert!(
+            err.to_string().contains(INJECTED),
+            "{lane}: unexpected error: {err}"
+        );
+        assert_eq!(err.status_code(), 500, "{lane}: {err}");
+    }
     assert_eq!(
         rows_of(&own_graph.expect("a ledger's own graph needs no lookup")),
         ["e=http://example.org/ep1 t=episode one"]
     );
     assert_eq!(
-        rows_of(&lane_off.expect("with the lane off nothing asks for the source")),
+        rows_of(&own_ledger.expect("a ledger loaded as a member needs no lookup")),
         ["d=http://example.org/d t=default graph title"]
     );
 }

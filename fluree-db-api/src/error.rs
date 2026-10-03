@@ -326,6 +326,14 @@ pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// A graph the addressed ledger does not have (404).
+    ///
+    /// Deliberately not [`ApiError::is_not_found`]: that condition means "no
+    /// such ledger" and sends a lookup on to graph sources, while here the
+    /// ledger exists and only the graph is missing.
+    #[error("Graph not found: {0}")]
+    GraphNotFound(String),
+
     /// Ledger already exists
     #[error("Ledger already exists: {0}")]
     LedgerExists(String),
@@ -623,7 +631,7 @@ impl ApiError {
             ApiError::InvalidLedgerId(_) => 400,
             ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
             ApiError::BranchConflict(_) => 409,
-            ApiError::NotFound(_) => 404,
+            ApiError::NotFound(_) | ApiError::GraphNotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
             ApiError::LedgerExists(_) => 409,
             ApiError::ReindexConflict { .. } => 409,
@@ -661,6 +669,10 @@ impl ApiError {
             // A malformed ledger config graph is the operator's to fix, and no
             // change to the request can clear it.
             ApiError::LedgerConfig(_) => 500,
+            // A nameservice lookup the query needed failed (a graph-source
+            // probe or lookup): a backend fault, as `ApiError::NameService` is.
+            // MUST precede the generic `ApiError::Query(_) => 400` below.
+            ApiError::Query(fluree_db_query::QueryError::Nameservice(_)) => 500,
             // Most errors are client errors (bad input)
             ApiError::Parse(_)
             | ApiError::Query(_)
@@ -732,6 +744,20 @@ impl ApiError {
     }
 }
 
+/// A reference that does not name a graph of the ledger a surface reads: a
+/// caller mistake, never an internal error. Another ledger's address is a 400
+/// that names the fix; a graph the ledger does not have is a 404.
+impl From<fluree_db_core::TargetError> for ApiError {
+    fn from(e: fluree_db_core::TargetError) -> Self {
+        match e {
+            fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
+            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
+                ApiError::invalid_query(cross.to_string())
+            }
+        }
+    }
+}
+
 /// Result type alias for API operations
 pub type Result<T> = std::result::Result<T, ApiError>;
 
@@ -787,6 +813,16 @@ mod tests {
         assert_eq!(
             ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
             400
+        );
+    }
+
+    /// A nameservice lookup that fails while a query runs is the backend's
+    /// fault: a 500 like `ApiError::NameService`, never the generic 400.
+    #[test]
+    fn a_failed_nameservice_lookup_in_a_query_is_500() {
+        assert_eq!(
+            ApiError::Query(fluree_db_query::QueryError::Nameservice("down".into())).status_code(),
+            500
         );
     }
 

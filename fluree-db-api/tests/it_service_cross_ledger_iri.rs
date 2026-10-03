@@ -16,6 +16,7 @@
 //! stamping changes the binding representation, and these pin that it did not
 //! disturb them.
 
+use crate::support::recording_ns::RecordingLookups;
 use crate::support::{build_and_publish_index, genesis_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::{DataSetDb, DatasetSpec, FlureeBuilder, GraphSource};
 use serde_json::{json, Value as JsonValue};
@@ -58,8 +59,8 @@ async fn seed_pair(fluree: &MemoryFluree, suffix: &str) -> (String, String) {
 
 async fn dataset_for(fluree: &MemoryFluree, alpha: &str, beta: &str) -> DataSetDb {
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new(alpha))
-        .with_named(GraphSource::new(beta));
+        .with_default(GraphSource::parse(alpha).unwrap())
+        .with_named(GraphSource::parse(beta).unwrap());
     fluree
         .build_dataset_view(&spec)
         .await
@@ -923,4 +924,219 @@ async fn stamped_predicate_equality_against_primary_encodable_constant() {
             "!= in {blk}"
         );
     }
+}
+
+/// A SERVICE endpoint names a member of the query's dataset. One that does not
+/// used to run its block against the dataset the query was written in, so
+/// `SERVICE <fluree:ledger:beta>` over a dataset without beta answered with
+/// alpha's rows, and so did an endpoint naming no ledger at all. It is a caller
+/// error now, and contributes no rows under SILENT; a member endpoint, in any
+/// spelling of its address, still answers.
+#[tokio::test]
+async fn service_to_a_non_member_is_refused_not_answered_by_the_dataset() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_pair(&fluree, "nonmember").await;
+    let gamma = "xl-gamma-nonmember:main";
+    seed(
+        &fluree,
+        gamma,
+        json!([{"@id": format!("{BETA}g1"), format!("{BETA}tag"): "gamma"}]),
+    )
+    .await;
+    // alpha as the default graph and gamma as a named graph: beta exists but
+    // is not a member.
+    let spec = DatasetSpec::new()
+        .with_default(GraphSource::parse(&alpha).unwrap())
+        .with_named(GraphSource::parse(gamma).unwrap());
+    let dataset = fluree
+        .build_dataset_view(&spec)
+        .await
+        .expect("build_dataset_view");
+
+    for endpoint in [
+        format!("fluree:ledger:{beta}"),
+        "fluree:ledger:xl-nosuch:main".to_string(),
+    ] {
+        let q = format!("SELECT ?s WHERE {{ SERVICE <{endpoint}> {{ ?s <{ALPHA}tag> ?t }} }}");
+        let err = fluree
+            .query_dataset(&dataset, &q)
+            .await
+            .expect_err("a non-member endpoint is not the current dataset");
+        assert_eq!(err.status_code(), 400, "{err}");
+        assert!(
+            err.to_string().contains("not in this query's dataset"),
+            "unexpected error: {err}"
+        );
+
+        let silent =
+            format!("SELECT ?s WHERE {{ SERVICE SILENT <{endpoint}> {{ ?s <{ALPHA}tag> ?t }} }}");
+        assert_eq!(
+            rows(&fluree, &dataset, &silent).await,
+            Vec::<JsonValue>::new(),
+            "SILENT contributes nothing for {endpoint}"
+        );
+    }
+
+    // The member answers, under each spelling of its address.
+    for endpoint in [
+        format!("fluree:ledger:{gamma}"),
+        "fluree:ledger:xl-gamma-nonmember".to_string(),
+        format!("fluree:ledger:urn:fluree:{gamma}"),
+    ] {
+        let q = format!("SELECT ?s WHERE {{ SERVICE <{endpoint}> {{ ?s <{BETA}tag> ?t }} }}");
+        assert_eq!(
+            rows(&fluree, &dataset, &q).await,
+            vec![json!([format!("{BETA}g1")])],
+            "{endpoint}"
+        );
+    }
+
+    // A SERVICE endpoint names a whole ledger; a pin or a graph is malformed.
+    for endpoint in [
+        format!("fluree:ledger:{gamma}@t:1"),
+        format!("fluree:ledger:{gamma}#txn-meta"),
+    ] {
+        let q = format!("SELECT ?s WHERE {{ SERVICE <{endpoint}> {{ ?s <{BETA}tag> ?t }} }}");
+        let err = fluree
+            .query_dataset(&dataset, &q)
+            .await
+            .expect_err("an endpoint with a pin or a graph is malformed");
+        assert!(
+            err.to_string().contains("Invalid fluree:ledger endpoint"),
+            "unexpected error for {endpoint}: {err}"
+        );
+    }
+}
+
+/// A dataset may hold one ledger at two times (two pins are two members). A
+/// SERVICE naming that ledger does not say which time to read, so it is
+/// refused (no rows under SILENT) instead of answered by whichever member a
+/// map yielded first. A ledger held at one time is read the same way on every
+/// run, whichever of its members the dataset holds.
+#[tokio::test]
+async fn a_service_to_a_ledger_held_at_two_times_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let alpha = "xl-alpha-twotimes:main";
+    seed(
+        &fluree,
+        alpha,
+        json!([{"@id": format!("{ALPHA}a1"), format!("{ALPHA}tag"): "shared"}]),
+    )
+    .await;
+    let beta = "xl-beta-twotimes:main";
+    let beta_1 = seed(
+        &fluree,
+        beta,
+        json!([{"@id": format!("{BETA}b1"), format!("{BETA}tag"): "first"}]),
+    )
+    .await;
+    fluree
+        .insert(
+            beta_1,
+            &json!({"@graph": [{"@id": format!("{BETA}b2"), format!("{BETA}tag"): "second"}]}),
+        )
+        .await
+        .expect("second commit");
+    let service = |silent: &str| {
+        format!(
+            "SELECT ?s WHERE {{ SERVICE {silent} <fluree:ledger:{beta}> {{ ?s <{BETA}tag> ?t }} }}"
+        )
+    };
+
+    let two_times = DatasetSpec::new()
+        .with_default(GraphSource::parse(alpha).unwrap())
+        .with_named(GraphSource::parse(&format!("{beta}@t:1")).unwrap())
+        .with_named(GraphSource::parse(beta).unwrap());
+    let dataset = fluree
+        .build_dataset_view(&two_times)
+        .await
+        .expect("build_dataset_view");
+    let err = fluree
+        .query_dataset(&dataset, &service(""))
+        .await
+        .expect_err("the endpoint does not say which time to read");
+    assert_eq!(err.status_code(), 400, "{err}");
+    assert!(err.to_string().contains("more than one time"), "{err}");
+    assert_eq!(
+        rows(&fluree, &dataset, &service("SILENT")).await,
+        Vec::<JsonValue>::new()
+    );
+
+    // One time, two members (its default graph and its txn-meta graph): each
+    // freshly built dataset reads the ledger's default graph.
+    let one_time = DatasetSpec::new()
+        .with_default(GraphSource::parse(alpha).unwrap())
+        .with_named(GraphSource::parse(&format!("{beta}#txn-meta")).unwrap())
+        .with_named(GraphSource::parse(beta).unwrap());
+    for run in 0..8 {
+        let dataset = fluree
+            .build_dataset_view(&one_time)
+            .await
+            .expect("build_dataset_view");
+        assert_eq!(
+            rows(&fluree, &dataset, &service("")).await,
+            vec![json!([format!("{BETA}b1")]), json!([format!("{BETA}b2")])],
+            "run {run}"
+        );
+    }
+}
+
+/// Naming a ledger as a SERVICE endpoint never loads it: SERVICE endpoints are
+/// not authorized the way dataset members are, so a load would be a way around
+/// that. The refusal (and the empty SILENT answer) comes without the
+/// nameservice ever being asked about the endpoint's ledger, while the
+/// dataset's own members are loaded through it as usual.
+#[tokio::test]
+async fn a_service_endpoint_is_never_loaded() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_pair(&fluree, "noload").await;
+    let gamma = "xl-gamma-noload:main";
+    seed(
+        &fluree,
+        gamma,
+        json!([{"@id": format!("{BETA}g1"), format!("{BETA}tag"): "gamma"}]),
+    )
+    .await;
+    let recording = std::sync::Arc::new(RecordingLookups::new(
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("read-write nameservice"),
+    ));
+    let observed = fluree_db_api::Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        fluree_db_api::NameServiceMode::ReadOnly(recording.clone()),
+    );
+
+    let q = format!(
+        "SELECT ?s FROM <{alpha}> FROM NAMED <{gamma}> \
+         WHERE {{ SERVICE <fluree:ledger:{beta}> {{ ?s <{BETA}tag> ?t }} }}"
+    );
+    let err = observed
+        .query_from()
+        .sparql(&q)
+        .execute_formatted()
+        .await
+        .expect_err("a non-member endpoint is refused");
+    assert_eq!(err.status_code(), 400, "{err}");
+
+    let silent = q.replace("SERVICE <", "SERVICE SILENT <");
+    let out = observed
+        .query_from()
+        .sparql(&silent)
+        .execute_formatted()
+        .await
+        .expect("SILENT answers");
+    assert_eq!(out["results"]["bindings"], json!([]), "{out}");
+
+    assert!(
+        recording.asked_about("xl-alpha-noload"),
+        "the dataset's members load through this nameservice"
+    );
+    assert!(
+        !recording.asked_about("xl-beta-noload"),
+        "the SERVICE endpoint's ledger was looked up: {:?}",
+        recording.asked()
+    );
 }

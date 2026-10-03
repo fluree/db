@@ -1381,7 +1381,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .nameservice()
             .lookup_graph_source(&id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))
+            .map_err(|e| QueryError::Nameservice(e.to_string()))
     }
 
     /// The SQL source behind `graph_source_id`, or `None` when it is
@@ -1447,7 +1447,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -1769,7 +1769,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -2313,17 +2313,23 @@ impl std::fmt::Debug for FlureeR2rmlProvider<'_> {
 #[async_trait]
 impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     /// Check if a graph source has an R2RML mapping.
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
-        match self
+    ///
+    /// The probe receives GRAPH IRIs as a query wrote them. One that does not
+    /// parse as a graph-source id names no source, so it is `false` without a
+    /// lookup. A failed lookup of a well-formed id fails the query: reading it
+    /// as "no mapping" would query an R2RML / Iceberg / SQL source as an empty
+    /// native graph whenever the nameservice is unavailable.
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> QueryResult<bool> {
+        let Ok(id) = fluree_db_core::LedgerId::parse(graph_source_id) else {
+            return Ok(false);
+        };
+        let record = self
             .fluree
             .nameservice()
-            .lookup_graph_source(graph_source_id)
+            .lookup_graph_source(&id)
             .await
-        {
-            Ok(Some(record)) => mapping_source_of(&record).is_some(),
-            Ok(None) => false,
-            Err(_) => false,
-        }
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
+        Ok(record.is_some_and(|r| mapping_source_of(&r).is_some()))
     }
 
     /// Get the compiled R2RML mapping for a graph source.
@@ -2340,7 +2346,7 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -3246,7 +3252,7 @@ impl FlureeR2rmlProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;

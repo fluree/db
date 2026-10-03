@@ -100,12 +100,17 @@ impl Fluree {
         let input = input.as_input();
 
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query(
-                json,
-                &db.snapshot,
-                db.default_context.as_ref(),
-                None,
-            )?,
+            QueryInput::JsonLd(json) => {
+                if !options.view_is_the_dataset {
+                    super::query::refuse_cross_ledger_from(db, json)?;
+                }
+                crate::query::helpers::parse_jsonld_query(
+                    json,
+                    &db.snapshot,
+                    db.default_context.as_ref(),
+                    None,
+                )?
+            }
             QueryInput::Sparql(sparql) => {
                 self.validate_sparql_for_view(sparql)?;
                 crate::query::helpers::parse_sparql_to_ir(
@@ -307,7 +312,7 @@ impl Fluree {
             options.server_identity.as_ref(),
         )?;
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing ledger specification in connection query",
             ));
         }
@@ -337,7 +342,7 @@ impl Fluree {
         let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
         let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
             ));
         }

@@ -180,6 +180,22 @@ The requested resource doesn't exist.
 - Check if ledger was created
 - Verify entity IRI
 
+A dataset member (`FROM` / `FROM NAMED`, JSON-LD `from` / `fromNamed`, or a
+`graph()` / `db()` address) that names a graph its ledger does not have is a
+404 with `@type` `err:db/GraphNotFound`:
+
+```json
+{
+  "error": "Graph not found: ...",
+  "status": 404,
+  "@type": "err:db/GraphNotFound"
+}
+```
+
+A reference that names another ledger where only the target ledger can be
+read (a ledger route's dataset, a view's JSON-LD `from`, an update's `USING`)
+is a 400, as is one whose grammar is wrong.
+
 #### 408 Request Timeout
 
 The request took too long to process.
@@ -376,6 +392,10 @@ An unexpected error occurred on the server.
 - Unhandled exception
 - Database error
 - Internal logic error
+- A nameservice lookup a query needed failed, for instance while checking
+  whether a `GRAPH <iri>` names a graph source (`err:system/NameServiceError`).
+  The query fails rather than read a possible graph source as an empty graph;
+  the request itself was fine, so retry it.
 
 **Example:**
 ```json

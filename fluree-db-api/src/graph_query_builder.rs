@@ -176,10 +176,12 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
     /// Execution receives the view already wrapped and does not wrap it again.
     /// See [`Self::wrap_request_policy`] for which requests engage enforcement.
     async fn load_view(&self) -> Result<crate::view::GraphDb> {
+        let address = self.graph.address()?;
+        let spec = self.graph.time_spec()?;
         let result = self
             .graph
             .fluree
-            .load_graph_db_at(&self.graph.ledger_id, self.graph.time_spec.clone())
+            .load_address_at(address, spec.clone())
             .await;
 
         // If graph source fallback is enabled and the ledger wasn't found,
@@ -193,12 +195,11 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                 .as_ref()
                 .is_err_and(super::error::ApiError::is_not_found)
         {
-            let ledger_id = &self.graph.ledger_id;
-            // The id may carry a `#graph` fragment; the source is the id before it.
-            let gs_id = fluree_db_core::LedgerRef::parse(ledger_id)?.id.to_string();
+            // The address may carry a `#graph` fragment; the source is its id.
+            let gs_id = address.id().to_string();
 
             if let Some((r2rml, _)) = &self.core.r2rml {
-                if r2rml.has_r2rml_mapping(&gs_id).await {
+                if r2rml.has_r2rml_mapping(&gs_id).await? {
                     // The shared resolver builds the genesis view, carries (or
                     // refuses) the handle's pin, and resolves the model config a
                     // governed source presents to `wrap_policy`. A `None` here
@@ -207,7 +208,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     let Some(db) = self
                         .graph
                         .fluree
-                        .resolve_graph_source_at(ledger_id, &self.graph.time_spec)
+                        .resolve_graph_source_address(address, &spec)
                         .await?
                     else {
                         return result;

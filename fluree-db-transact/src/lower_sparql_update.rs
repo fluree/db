@@ -1077,10 +1077,10 @@ fn lower_insert_data(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs,
-        template_default_graph: None,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
+        address_graph_names: BTreeSet::new(),
     })
 }
 
@@ -1132,10 +1132,10 @@ fn lower_delete_data(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs,
-        template_default_graph: None,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
+        address_graph_names: BTreeSet::new(),
     })
 }
 
@@ -1236,10 +1236,10 @@ fn lower_delete_where(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs: BTreeSet::new(),
-        template_default_graph: None,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
+        address_graph_names: BTreeSet::new(),
     })
 }
 
@@ -1301,10 +1301,10 @@ fn lower_delete_where_with_graphs(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs,
-        template_default_graph: None,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
+        address_graph_names: BTreeSet::new(),
     })
 }
 
@@ -1471,7 +1471,6 @@ fn lower_modify(
         write_graphs.insert(iri.to_string());
         Arc::from(iri)
     });
-    let template_default_graph = with_graph_iri.clone();
 
     let sparql_where = SparqlWhereClause {
         prologue: prologue.clone(),
@@ -1548,10 +1547,10 @@ fn lower_modify(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs,
-        template_default_graph,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
+        address_graph_names: BTreeSet::new(),
     })
 }
 
@@ -1570,7 +1569,7 @@ fn lower_quad_pattern_to_templates(
             QuadPatternElement::Triple(tp) => {
                 let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes)?;
                 if let Some(iri) = &default_graph {
-                    t = t.in_template_default_graph(Arc::clone(iri));
+                    t = t.in_graph(Arc::clone(iri));
                 }
                 out.push(t);
             }
@@ -1630,7 +1629,6 @@ fn lower_triple_to_template(
         dtc,
         list_index: None, // Always None for SPARQL UPDATE
         graph: TemplateGraph::Default,
-        graph_from_template_default: false,
     })
 }
 
@@ -1821,7 +1819,6 @@ fn lower_triple_to_delete_template_delete_where(
         dtc,
         list_index: None,
         graph: TemplateGraph::Default,
-        graph_from_template_default: false,
     })
 }
 

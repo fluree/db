@@ -52,6 +52,10 @@ pub struct QueryExecutionOptions {
     /// layer, never derived from the request body or headers.
     pub server_identity: Option<VerifiedIdentity>,
     lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
+    /// The view the query runs on was loaded from the query's own dataset (the
+    /// connection path's one-ledger shortcut), so the view does not read the
+    /// query's dataset keys again.
+    pub(crate) view_is_the_dataset: bool,
 }
 
 impl fmt::Debug for QueryExecutionOptions {
@@ -106,6 +110,13 @@ impl QueryExecutionOptions {
         self.lifecycle_guard = Some(Arc::new(guard));
         self
     }
+
+    /// Mark the view the query runs on as loaded from the query's own dataset
+    /// (see [`QueryExecutionOptions::view_is_the_dataset`]).
+    pub(crate) fn on_the_datasets_view(mut self) -> Self {
+        self.view_is_the_dataset = true;
+        self
+    }
 }
 
 /// Result of a query execution
@@ -145,6 +156,10 @@ pub struct QueryResult {
     /// mixed-dataset paths not routed through that method leave it false → today's
     /// raw rendering is unchanged.
     pub from_graph_source: bool,
+    /// Non-fatal notes about how the query was read (see
+    /// [`crate::QueryAdvisory`]). Empty for most queries; never changes the
+    /// result.
+    pub advisories: Vec<crate::QueryAdvisory>,
 }
 
 impl std::fmt::Debug for QueryResult {

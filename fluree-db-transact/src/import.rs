@@ -25,8 +25,8 @@ mod inner {
     use fluree_db_core::ns_encoding::NsSplitMode;
     use fluree_db_core::CommitId;
     use fluree_db_core::{
-        ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid,
-        TxnMetaEntry,
+        ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, GraphPosition,
+        Sid, TargetLedger, TxnMetaEntry,
     };
 
     /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
@@ -572,63 +572,95 @@ mod inner {
         // commit metadata never reaches this loop.
         let txn_meta_iri = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
         let config_iri = fluree_db_core::graph_registry::config_graph_iri(ledger_id);
+        let this_ledger = fluree_db_core::LedgerId::parse(ledger_id).ok();
 
         for block in &phase1.named_graphs {
-            // Refuse by literal IRI, mirroring the staged-write guard's shape.
-            if block.iri == txn_meta_iri {
-                return Err(TransactError::ReservedGraphTarget {
-                    graph_iri: block.iri.clone(),
-                });
-            }
-            if block.iri == config_iri {
-                return Err(TransactError::ConfigGraphImportUnsupported {
-                    graph_iri: block.iri.clone(),
-                });
-            }
-
-            // Allocate or reuse g_id for this graph IRI.
-            //
-            // When spooling (index build) is active, allocate from the shared
-            // graph allocator so the commit's `graph_delta` and the index's
-            // `graphs.dict` / query graph registry agree on the same g_id
-            // (allocator convention: dict_id + 1 = g_id). Without spooling
-            // (commit-only paths), fall back to the session counter.
-            let g_id = if let Some(&existing) = state.graph_ids.get(&block.iri) {
-                existing
-            } else {
-                // New graph IRI in this session — allocate and record in delta.
-                let id = match spool_ctx.as_mut() {
-                    Some(sc) => sc.graph_g_id_for_iri(&block.iri),
-                    None => {
-                        let id = state.next_gid;
-                        state.next_gid += 1;
-                        id
+            // The block's graph, through the table every graph position of a
+            // ledger shares: the ledger's own address is its default graph
+            // (`None`), `L#<g>` the graph `<g>`, and any other IRI the graph
+            // of that IRI.
+            let block_graph: Option<String> = match &this_ledger {
+                Some(id) => {
+                    let lookup = |iri: &str| state.graph_ids.get(iri).copied();
+                    match TargetLedger::new(id, &lookup).graph_position(&block.iri) {
+                        GraphPosition::Default => None,
+                        GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => {
+                            Some(iri.to_string())
+                        }
+                        GraphPosition::NotAGraph => {
+                            return Err(TransactError::Parse(format!(
+                                "TriG block <{}> names no graph an import can write: an \
+                                 address of this ledger names its default graph, or one of \
+                                 its graphs through '#', and carries no time",
+                                block.iri
+                            )))
+                        }
                     }
-                };
-                state.graph_ids.insert(block.iri.clone(), id);
-                graph_delta.insert(id, block.iri.clone());
-                id
+                }
+                None => Some(block.iri.clone()),
             };
 
-            // Second arm, mirroring `stage.rs`: refuse by what the IRI actually
-            // *routes to*, not only by how it is spelled. The shared graph
-            // allocator is pre-seeded with the two reserved IRIs, so this is
-            // belt-and-braces today; it is what keeps the guard correct if the
-            // seeding ever changes. One integer compare per graph block.
-            if g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID {
-                return Err(if g_id == fluree_db_core::graph_registry::CONFIG_GRAPH_ID {
-                    TransactError::ConfigGraphImportUnsupported {
-                        graph_iri: block.iri.clone(),
+            let graph: Option<(u16, Sid)> = match block_graph {
+                None => None,
+                Some(iri) => {
+                    // Refuse by literal IRI, mirroring the staged-write guard's
+                    // shape.
+                    if iri == txn_meta_iri {
+                        return Err(TransactError::ReservedGraphTarget { graph_iri: iri });
                     }
-                } else {
-                    TransactError::ReservedGraphTarget {
-                        graph_iri: block.iri.clone(),
+                    if iri == config_iri {
+                        return Err(TransactError::ConfigGraphImportUnsupported { graph_iri: iri });
                     }
-                });
-            }
 
-            // Create a graph Sid (using the graph IRI's namespace + local name)
-            let graph_sid = worker_cache.sid_for_iri(&block.iri);
+                    // Allocate or reuse g_id for this graph IRI.
+                    //
+                    // When spooling (index build) is active, allocate from the
+                    // shared graph allocator so the commit's `graph_delta` and
+                    // the index's `graphs.dict` / query graph registry agree on
+                    // the same g_id (allocator convention: dict_id + 1 = g_id).
+                    // Without spooling (commit-only paths), fall back to the
+                    // session counter.
+                    let g_id = if let Some(&existing) = state.graph_ids.get(&iri) {
+                        existing
+                    } else {
+                        // New graph IRI in this session — allocate and record in delta.
+                        let id = match spool_ctx.as_mut() {
+                            Some(sc) => sc.graph_g_id_for_iri(&iri),
+                            None => {
+                                let id = state.next_gid;
+                                state.next_gid += 1;
+                                id
+                            }
+                        };
+                        state.graph_ids.insert(iri.clone(), id);
+                        graph_delta.insert(id, iri.clone());
+                        id
+                    };
+
+                    // Second arm, mirroring `stage.rs`: refuse by what the IRI
+                    // actually *routes to*, not only by how it is spelled. The
+                    // shared graph allocator is pre-seeded with the two reserved
+                    // IRIs, so this is belt-and-braces today; it is what keeps
+                    // the guard correct if the seeding ever changes. One integer
+                    // compare per graph block.
+                    if g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID {
+                        return Err(if g_id == fluree_db_core::graph_registry::CONFIG_GRAPH_ID {
+                            TransactError::ConfigGraphImportUnsupported { graph_iri: iri }
+                        } else {
+                            TransactError::ReservedGraphTarget { graph_iri: iri }
+                        });
+                    }
+
+                    // Create a graph Sid (using the graph IRI's namespace + local name)
+                    Some((g_id, worker_cache.sid_for_iri(&iri)))
+                }
+            };
+            // A block of the default graph spools under the default graph's id
+            // and encodes flakes with no graph.
+            let (g_id, graph_sid) = match graph {
+                Some((g_id, sid)) => (g_id, Some(sid)),
+                None => (fluree_db_core::graph_registry::DEFAULT_GRAPH_ID, None),
+            };
 
             // Process each triple in this named graph
             for triple in &block.triples {
@@ -666,16 +698,19 @@ mod inner {
                     }
 
                     let meta = lang.as_deref().map(FlakeMeta::with_lang);
-                    let flake = Flake::new_in_graph(
-                        graph_sid.clone(),
-                        s.clone(),
-                        p.clone(),
-                        o,
-                        dt,
-                        new_t,
-                        true,
-                        meta,
-                    );
+                    let flake = match &graph_sid {
+                        Some(graph_sid) => Flake::new_in_graph(
+                            graph_sid.clone(),
+                            s.clone(),
+                            p.clone(),
+                            o,
+                            dt,
+                            new_t,
+                            true,
+                            meta,
+                        ),
+                        None => Flake::new(s.clone(), p.clone(), o, dt, new_t, true, meta),
+                    };
 
                     writer.push_flake(&flake).map_err(|e| {
                         TransactError::Parse(format!("failed to encode named graph flake: {e}"))
@@ -703,7 +738,7 @@ mod inner {
                     None => fluree_db_core::DatatypeConstraint::Explicit(dt),
                 };
                 let bundle = crate::generate::flakes::reified_triple_bundle(
-                    Some(graph_sid.clone()),
+                    graph_sid.clone(),
                     s,
                     p,
                     o,

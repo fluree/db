@@ -216,7 +216,28 @@ pub fn resolve_dataset_clause(ast: &SparqlAst) -> Result<Option<ResolvedDatasetC
 
     let (prefixes, base) = prologue_environment(&ast.prologue);
     let expand = |iri: &crate::ast::term::Iri| -> Result<Arc<str>> {
-        term::expand_iri_with(&prefixes, base.as_deref(), iri).map(Arc::from)
+        match &iri.value {
+            // A dataset IRI written in full is taken as written (BASE-resolved
+            // when relative). `FROM <mydb:main>` names a ledger even when the
+            // query also declares a `mydb:` prefix, so the misused-prefix check
+            // that pattern IRIs get does not apply to a dataset clause.
+            crate::ast::term::IriValue::Full(s) => Ok(match base.as_deref() {
+                Some(base) if !fluree_vocab::iri::is_absolute_iri(s) => {
+                    Arc::from(fluree_vocab::iri::resolve_iri(base, s))
+                }
+                _ => Arc::clone(s),
+            }),
+            // `FROM ledger:main` with no `ledger:` prefix declared names the
+            // ledger address as written; a declared prefix expands.
+            crate::ast::term::IriValue::Prefixed { prefix, local }
+                if !prefixes.contains_key(prefix) =>
+            {
+                Ok(Arc::from(format!("{prefix}:{local}")))
+            }
+            crate::ast::term::IriValue::Prefixed { .. } => {
+                term::expand_iri_with(&prefixes, base.as_deref(), iri).map(Arc::from)
+            }
+        }
     };
 
     Ok(Some(ResolvedDatasetClause {

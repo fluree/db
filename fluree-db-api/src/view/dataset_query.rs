@@ -90,8 +90,11 @@ impl Fluree {
         if dataset.is_single_ledger() {
             if let Some(view) = dataset.primary() {
                 match &input {
+                    // This view is the whole dataset, already read from the body.
                     QueryInput::JsonLd(_) => {
-                        return self.query_with_options(view, input, options).await;
+                        return self
+                            .query_with_options(view, input, options.on_the_datasets_view())
+                            .await;
                     }
                     QueryInput::Sparql(sparql) => {
                         // Reuse the entry method's AST when it threaded one
@@ -182,14 +185,17 @@ impl Fluree {
             .await?;
 
         // 5. Build result with max_t across all views
-        Ok(build_query_result(
+        let advisories = dataset.advisories(&parsed.patterns);
+        let mut result = build_query_result(
             vars,
             parsed,
             batches,
             dataset.result_t(),
             dataset.composite_overlay(),
             primary.binary_graph(),
-        ))
+        );
+        result.advisories = advisories;
+        Ok(result)
     }
 
     pub(crate) async fn query_dataset_with_r2rml_options(
@@ -206,6 +212,7 @@ impl Fluree {
         if dataset.is_single_ledger() {
             if let Some(view) = dataset.primary() {
                 match &input {
+                    // This view is the whole dataset, already read from the body.
                     QueryInput::JsonLd(_) => {
                         return self
                             .query_view_with_r2rml_options(
@@ -213,7 +220,7 @@ impl Fluree {
                                 input,
                                 r2rml_provider,
                                 r2rml_table_provider,
-                                options,
+                                options.on_the_datasets_view(),
                             )
                             .await;
                     }
@@ -295,14 +302,17 @@ impl Fluree {
             )
             .await?;
 
-        Ok(build_query_result(
+        let advisories = dataset.advisories(&parsed.patterns);
+        let mut result = build_query_result(
             vars,
             parsed,
             batches,
             dataset.result_t(),
             dataset.composite_overlay(),
             primary.binary_graph(),
-        ))
+        );
+        result.advisories = advisories;
+        Ok(result)
     }
 
     /// Execute a dataset query with tracking.

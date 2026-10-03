@@ -246,6 +246,11 @@ pub struct GraphDb {
     /// (`alias@time:` / `@recorded:` / `@snapshot:`). Pushed into the R2RML
     /// provider before execution; `None` reads the source's current state.
     pub(crate) graph_source_time: Option<fluree_db_query::r2rml::SourceTime>,
+    /// The snapshot is a graph source's empty genesis. Set together with
+    /// `graph_source_id`, and kept when a system graph is selected (which
+    /// drops `graph_source_id`), because the view's own id still names the
+    /// graph source: see [`Self::member_kind`].
+    pub(crate) over_graph_source: bool,
 }
 
 impl std::fmt::Debug for GraphDb {
@@ -314,6 +319,7 @@ impl GraphDb {
             cross_ledger_resolved_ts: Arc::new(std::collections::HashMap::new()),
             graph_source_id: None,
             graph_source_time: None,
+            over_graph_source: false,
         }
     }
 
@@ -799,6 +805,16 @@ impl GraphDb {
     /// Used internally by query execution for `f:query` policy support.
     pub fn policy_enforcer(&self) -> Option<&Arc<QueryPolicyEnforcer>> {
         self.policy_enforcer.as_ref()
+    }
+
+    /// What this view reads, for the executor's graph-source classification:
+    /// a view over a ledger is never looked up as a graph source.
+    pub(crate) fn member_kind(&self) -> fluree_db_query::MemberKind {
+        if self.graph_source_id.is_some() || self.over_graph_source {
+            fluree_db_query::MemberKind::GraphSource
+        } else {
+            fluree_db_query::MemberKind::Native
+        }
     }
 
     /// Check if this is a root/unrestricted policy view.

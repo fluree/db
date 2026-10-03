@@ -37,6 +37,7 @@
 pub mod admin;
 pub mod authorization;
 pub use authorization::PolicyAuthorization;
+pub mod advisory;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
@@ -103,6 +104,7 @@ mod revert_preview;
 pub(crate) mod runtime_dicts;
 pub mod server_defaults;
 pub(crate) mod sparql_lang;
+pub mod target_dataset;
 mod time_resolve;
 pub mod tx;
 pub mod tx_builder;
@@ -151,8 +153,9 @@ pub use commit_transfer::{
     PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult, StagedPush,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
-    TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS,
+    sparql_dataset_ledger_ids, sparql_dataset_ledgers, sparql_has_dataset_clause,
+    DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource, TimeSpec,
+    ACCEPTED_TIME_SPEC_SPELLINGS,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
@@ -192,7 +195,7 @@ pub use ledger_manager::{
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
     UpdatePlan, WritePathStats,
 };
-pub use ledger_view::{CommitRef, LedgerView, COMMIT_PREFIX_MIN_LEN};
+pub use ledger_view::{CommitRef, GraphNames, LedgerView, COMMIT_PREFIX_MIN_LEN};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
     AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,
@@ -219,6 +222,11 @@ pub use rebase::{
 };
 pub use revert::{RevertReport, RevertSelection, StagedRevert};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
+pub use target_dataset::{
+    jsonld_dataset_ledger, jsonld_lane, jsonld_names_dataset, jsonld_view_ledger,
+    resolve_in_target, resolve_jsonld_dataset_in_target, GraphLookup, InTarget, JsonLdInTarget,
+    JsonLdLane, SingleFrom,
+};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
     TransactResultRef,
@@ -361,12 +369,13 @@ pub use fluree_db_transact::{
 };
 
 // Re-export SPARQL types (product feature; always enabled)
+pub use advisory::QueryAdvisory;
 pub use fluree_db_sparql::{
-    lower_sparql, parse_sparql, validate as validate_sparql, Capabilities as SparqlCapabilities,
-    Diagnostic as SparqlDiagnostic, LowerError as SparqlLowerError,
-    ParseOutput as SparqlParseOutput, Prologue as SparqlPrologue, QueryBody as SparqlQueryBody,
-    Severity as SparqlSeverity, SourceSpan as SparqlSourceSpan, SparqlAst,
-    UpdateOperation as SparqlUpdateOperation,
+    lower_sparql, parse_sparql, resolve_dataset_clause, validate as validate_sparql,
+    Capabilities as SparqlCapabilities, Diagnostic as SparqlDiagnostic,
+    LowerError as SparqlLowerError, ParseOutput as SparqlParseOutput, Prologue as SparqlPrologue,
+    QueryBody as SparqlQueryBody, ResolvedDatasetClause, Severity as SparqlSeverity,
+    SourceSpan as SparqlSourceSpan, SparqlAst, UpdateOperation as SparqlUpdateOperation,
 };
 
 // Re-export Cypher types (product feature; always enabled).
@@ -4736,23 +4745,43 @@ impl Fluree {
     /// `FlureeBuilder::without_ledger_caching()`, returns an ephemeral
     /// handle that wraps a fresh load.
     pub async fn ledger_cached(&self, ledger_id: &str) -> Result<LedgerHandle> {
+        // Not a call to `ledger_handle`: awaiting it would nest one more future
+        // in every caller's, and some test futures sit at the type-layout
+        // depth limit.
         let ledger_id = LedgerId::parse(ledger_id)?;
         match &self.ledger_manager {
             Some(mgr) => mgr.get_or_load(&ledger_id).await,
-            None => {
-                // Caching disabled: load fresh, wrap in ephemeral handle.
-                // Note: This handle is NOT cached; each call loads fresh.
-                // Extract the concrete BinaryIndexStore from the state's TypeErasedStore
-                // so the handle's binary_store stays coherent with db.range_provider.
-                let state = self.ledger(&ledger_id).await?;
-                let binary_store = state.binary_store.as_ref().and_then(|te| {
-                    te.0.clone()
-                        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
-                        .ok()
-                });
-                Ok(LedgerHandle::new(ledger_id, state, binary_store))
-            }
+            None => Ok(Self::ephemeral_handle(
+                &ledger_id,
+                self.ledger(&ledger_id).await?,
+            )),
         }
+    }
+
+    /// [`ledger_cached`](Self::ledger_cached) for an id the caller has
+    /// already parsed (a route's path ledger): the handle is found by the id
+    /// as it stands, with no second parse.
+    pub async fn ledger_handle(&self, ledger_id: &LedgerId) -> Result<LedgerHandle> {
+        match &self.ledger_manager {
+            Some(mgr) => mgr.get_or_load(ledger_id).await,
+            None => Ok(Self::ephemeral_handle(
+                ledger_id,
+                self.ledger(ledger_id).await?,
+            )),
+        }
+    }
+
+    /// Caching disabled: a fresh load wrapped in an ephemeral handle, which is
+    /// NOT cached (each call loads fresh). The concrete `BinaryIndexStore` is
+    /// taken from the state's type-erased store, so the handle's binary store
+    /// stays coherent with the snapshot's range provider.
+    fn ephemeral_handle(ledger_id: &LedgerId, state: LedgerState) -> LedgerHandle {
+        let binary_store = state.binary_store.as_ref().and_then(|te| {
+            te.0.clone()
+                .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+                .ok()
+        });
+        LedgerHandle::new(ledger_id.clone(), state, binary_store)
     }
 
     /// Disconnect a ledger from the connection cache

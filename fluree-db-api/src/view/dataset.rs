@@ -40,6 +40,10 @@ pub struct DataSetDb {
     /// We keep this because `HashMap` does not preserve insertion order, but
     /// connection queries need stable "primary" selection for parsing/formatting.
     pub named_order: Vec<Arc<str>>,
+    /// Further names for named graphs: `GRAPH <alias>` resolves to the member
+    /// the alias maps to, but `GRAPH ?g` does not enumerate it, so one graph
+    /// never binds `?g` twice. Keys are aliases, values member names.
+    pub named_aliases: HashMap<Arc<str>, Arc<str>>,
     /// Optional history range (from_t, to_t) for history/changes queries.
     ///
     /// When set, query execution runs in history mode (`@op` support) and applies
@@ -55,6 +59,7 @@ impl DataSetDb {
             default: Vec::new(),
             named: HashMap::new(),
             named_order: Vec::new(),
+            named_aliases: HashMap::new(),
             history_range: None,
         }
     }
@@ -63,9 +68,7 @@ impl DataSetDb {
     pub fn single(view: GraphDb) -> Self {
         Self {
             default: vec![view],
-            named: HashMap::new(),
-            named_order: Vec::new(),
-            history_range: None,
+            ..Self::new()
         }
     }
 
@@ -82,6 +85,20 @@ impl DataSetDb {
             self.named_order.push(Arc::clone(&key));
         }
         self.named.insert(key, view);
+        self
+    }
+
+    /// Let `GRAPH <alias>` address the named graph `member` without `GRAPH ?g`
+    /// enumerating it. Ignored when `member` is not a named graph here.
+    pub fn with_named_alias(
+        mut self,
+        alias: impl Into<Arc<str>>,
+        member: impl Into<Arc<str>>,
+    ) -> Self {
+        let member = member.into();
+        if self.named.contains_key(&member) {
+            self.named_aliases.insert(alias.into(), member);
+        }
         self
     }
 
@@ -162,9 +179,13 @@ impl DataSetDb {
         self.named.get_mut(&iri)
     }
 
-    /// Get a named graph by IRI.
+    /// Get a named graph by name or alias.
     pub fn get_named(&self, name: &str) -> Option<&GraphDb> {
-        self.named.get(name)
+        self.named.get(name).or_else(|| {
+            self.named_aliases
+                .get(name)
+                .and_then(|member| self.named.get(member))
+        })
     }
 
     /// Every view in the dataset, default graphs first.
@@ -215,14 +236,11 @@ impl DataSetDb {
                 Arc::clone(&view.ledger_id),
             );
             graph.policy_enforcer = view.policy_enforcer().cloned();
+            graph.kind = view.member_kind();
             ds = ds.with_default_graph(graph);
         }
 
-        for iri in &self.named_order {
-            let view = self
-                .named
-                .get(iri)
-                .expect("named_order key must exist in named map");
+        fn graph_ref(view: &GraphDb) -> fluree_db_query::GraphRef<'_> {
             let mut graph = fluree_db_query::GraphRef::new(
                 view.snapshot.as_ref(),
                 view.graph_id,
@@ -231,10 +249,39 @@ impl DataSetDb {
                 Arc::clone(&view.ledger_id),
             );
             graph.policy_enforcer = view.policy_enforcer().cloned();
-            ds = ds.with_named_graph(Arc::clone(iri), graph);
+            graph.kind = view.member_kind();
+            graph
+        }
+        for iri in &self.named_order {
+            let view = self
+                .named
+                .get(iri)
+                .expect("named_order key must exist in named map");
+            ds = ds.with_named_graph(Arc::clone(iri), graph_ref(view));
+        }
+        for (alias, member) in &self.named_aliases {
+            if let Some(view) = self.named.get(member) {
+                ds = ds.with_named_graph_alias(Arc::clone(alias), graph_ref(view));
+            }
         }
 
         ds
+    }
+
+    /// The advisories for a query over this dataset whose lowered patterns are
+    /// `patterns` ([`crate::QueryAdvisory`]).
+    pub(crate) fn advisories(
+        &self,
+        patterns: &[fluree_db_query::ir::Pattern],
+    ) -> Vec<crate::QueryAdvisory> {
+        let mut out = Vec::new();
+        if self.default.is_empty()
+            && !self.named.is_empty()
+            && crate::advisory::reads_default_graph(patterns)
+        {
+            out.push(crate::QueryAdvisory::EmptyDefaultGraph);
+        }
+        out
     }
 
     /// Build a composite overlay across all graphs (for hydration formatting).

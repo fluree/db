@@ -6306,3 +6306,317 @@ fn doc_search_vector_uses_flatrank_without_an_index() {
         "expected clusters.md to outrank expenses.md:\n{out}"
     );
 }
+
+/// #1972: the local query router resolves the body's dataset in the target
+/// ledger. A JSON-LD `from` naming one of its graphs (string or object form),
+/// another branch, or a missing ledger used to run on the view path, which
+/// ignored it and answered from the default graph; SPARQL `FROM` of another
+/// branch failed on the view path. Each now reads what it names.
+#[test]
+fn local_query_reads_the_graph_or_branch_its_dataset_names() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "routedb");
+    fluree_cmd(&tmp)
+        .args([
+            "branch",
+            "create",
+            "feature-x",
+            "--ledger",
+            "routedb",
+            "--direct",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-l",
+            "routedb:feature-x",
+            "--direct",
+            "-e",
+            "<http://example.org/f> <http://example.org/p> \"on-feature\" .",
+        ])
+        .assert()
+        .success();
+
+    let jsonld = |from: &str| {
+        format!(
+            r#"{{"from": {from}, "select": "?o",
+                 "where": {{"@id": "?s", "http://example.org/p": "?o"}}}}"#
+        )
+    };
+    let query = |body: &str| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args(["query", "-l", "routedb", "--format", "json", "-e", body]);
+        cmd
+    };
+
+    // The default graph, as a control.
+    query(&jsonld(r#""routedb""#))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in-default"));
+    // A graph of the ledger, by address and by object form.
+    for from in [
+        r#""routedb:main#http://example.org/g1""#,
+        r#"{"@id": "routedb:main", "graph": "http://example.org/g1"}"#,
+    ] {
+        query(&jsonld(from))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("in-g1"))
+            .stdout(predicate::str::contains("in-default").not());
+    }
+    // The config graph holds none of these triples.
+    query(&jsonld(r#""routedb:main#config""#))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in-default").not());
+    // Another branch, in JSON-LD and SPARQL.
+    query(&jsonld(r#""routedb:feature-x""#))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("on-feature"));
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "-l",
+            "routedb",
+            "--sparql",
+            "--format",
+            "json",
+            "-e",
+            "SELECT ?o FROM <routedb:feature-x> WHERE { ?s <http://example.org/p> ?o }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("on-feature"));
+    // A ledger that does not exist is an error, not the default graph.
+    query(&jsonld(r#"{"@id": "nope:main"}"#))
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("in-default").not());
+}
+
+/// Locally, the ledger's own address with a reserved keyword names that
+/// reserved graph in writes and reads alike, as its `urn:fluree:` form does:
+/// `L#config` writes and reads the config graph, a write to `L#txn-meta` is
+/// refused, and no write registers a graph under either name. SPARQL and
+/// JSON-LD.
+#[test]
+fn local_reserved_keyword_addresses_name_the_reserved_graphs() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "kwdb"]).assert().success();
+    let update = |body: &str| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args(["update", "-l", "kwdb", "--direct", "-e", body]);
+        cmd
+    };
+    update(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { GRAPH <kwdb:main#config> { ex:c1 ex:p \"cfg-sparql\" } }",
+    )
+    .assert()
+    .success();
+    update(
+        r#"{"@context": {"ex": "http://example.org/"}, "graph": "kwdb#config",
+            "insert": {"@id": "ex:c2", "ex:p": "cfg-jsonld"}}"#,
+    )
+    .assert()
+    .success();
+
+    let query = |args: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args(["query", "-l", "kwdb", "--format", "json"]);
+        cmd.args(args);
+        cmd
+    };
+    for read in [
+        query(&[
+            "--sparql",
+            "-e",
+            "SELECT ?o FROM <kwdb:main#config> WHERE { ?s <http://example.org/p> ?o }",
+        ]),
+        query(&[
+            "-e",
+            r#"{"from": "kwdb#config", "select": "?o",
+                "where": {"@id": "?s", "http://example.org/p": "?o"}}"#,
+        ]),
+    ] {
+        let mut read = read;
+        read.assert()
+            .success()
+            .stdout(predicate::str::contains("cfg-sparql"))
+            .stdout(predicate::str::contains("cfg-jsonld"));
+    }
+
+    update(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { GRAPH <kwdb:main#txn-meta> { ex:t ex:p \"tm\" } }",
+    )
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("reserved"));
+    update(
+        r#"{"@context": {"ex": "http://example.org/"},
+            "insert": {"@id": "ex:t", "@graph": "kwdb#txn-meta", "ex:p": "tm"}}"#,
+    )
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("reserved"));
+
+    // No graph is registered under either keyword address.
+    query(&[
+        "--sparql",
+        "-e",
+        "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("#config").not())
+    .stdout(predicate::str::contains("#txn-meta").not());
+}
+
+/// A dataset naming only named graphs has an empty default graph; a query that
+/// also matches outside `GRAPH` is told so on stderr, on the view path and on
+/// the connection path, and the rows are unchanged (none).
+#[test]
+fn a_named_only_dataset_warns_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "advdb");
+    fluree_cmd(&tmp)
+        .args(["create", "advother"])
+        .assert()
+        .success();
+
+    for sparql in [
+        // The target's own ledger: the view path.
+        "SELECT ?o FROM NAMED <advdb:main> WHERE { ?s <http://example.org/p> ?o }",
+        // Another ledger: the connection path.
+        "SELECT ?o FROM NAMED <advother:main> WHERE { ?s <http://example.org/p> ?o }",
+    ] {
+        fluree_cmd(&tmp)
+            .args([
+                "query", "-l", "advdb", "--sparql", "--format", "json", "-e", sparql,
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("default graph is empty"))
+            .stdout(predicate::str::contains("in-default").not());
+    }
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "-l",
+            "advdb",
+            "--sparql",
+            "--format",
+            "json",
+            "-e",
+            "SELECT ?o WHERE { ?s <http://example.org/p> ?o }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("default graph is empty").not());
+}
+
+/// fluree/db#1972 as filed. With `mydb` active, or named on the command line
+/// while another ledger is active, a JSON-LD `from` naming one of its graphs or
+/// its `#txn-meta`, and SPARQL `FROM <mydb:main#txn-meta>`, read that graph.
+/// They used to answer from the default graph, answer nothing, and fail.
+#[test]
+fn issue_1972_reproduction_reads_the_graph_each_from_names() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "mydb"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "upsert",
+            "mydb",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             @prefix fluree: <https://ns.flur.ee/db#> .\n\
+             ex:a ex:p \"in-default\" .\n\
+             GRAPH <http://example.org/g> { ex:a ex:p \"in-g\" . }\n\
+             GRAPH <#txn-meta> { fluree:commit:this ex:batch \"b-1\" . }",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["create", "other"])
+        .assert()
+        .success();
+
+    let g = r#"{"from":"mydb:main#http://example.org/g","select":"?o","where":{"@id":"http://example.org/a","http://example.org/p":"?o"}}"#;
+    let m = r#"{"from":"mydb:main#txn-meta","select":"?o","where":{"@id":"?c","http://example.org/batch":"?o"}}"#;
+    let q = "SELECT ?o FROM <mydb:main#txn-meta> WHERE { ?c <http://example.org/batch> ?o }";
+    let reads = |args: &[&str], want: &str| {
+        fluree_cmd(&tmp)
+            .arg("query")
+            .args(args)
+            .args(["--format", "json"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(want))
+            .stdout(predicate::str::contains("in-default").not());
+    };
+
+    fluree_cmd(&tmp).args(["use", "mydb"]).assert().success();
+    reads(&[g], "in-g");
+    reads(&[m], "b-1");
+    reads(&[q], "b-1");
+    fluree_cmd(&tmp).args(["use", "other"]).assert().success();
+    reads(&[g], "in-g");
+    reads(&[m], "b-1");
+    reads(&["mydb", g], "in-g");
+}
+
+/// fluree/db#1512: SPARQL `FROM <ledger#config>` reads the ledger's config
+/// graph, in every spelling of the ledger's address and by keyword. It used
+/// to fail with "Unknown named graph '#config'".
+#[test]
+fn issue_1512_sparql_from_reads_the_config_graph() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "cfgdb"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "upsert",
+            "cfgdb",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:setting \"in-default\" .\n\
+             GRAPH <urn:fluree:cfgdb:main#config> { ex:cfg ex:setting \"cfg-value\" . }",
+        ])
+        .assert()
+        .success();
+    for from in [
+        "cfgdb:main#config",
+        "cfgdb#config",
+        "urn:fluree:cfgdb:main#config",
+        "config",
+    ] {
+        fluree_cmd(&tmp)
+            .args([
+                "query",
+                "cfgdb",
+                "--format",
+                "json",
+                &format!("SELECT ?o FROM <{from}> WHERE {{ ?s <http://example.org/setting> ?o }}"),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("cfg-value"))
+            .stdout(predicate::str::contains("in-default").not());
+    }
+}

@@ -40,7 +40,7 @@ use std::collections::VecDeque;
 use tokio::sync::{oneshot, RwLock};
 
 use crate::error::{ApiError, Result};
-use crate::ledger_view::LedgerView;
+use crate::ledger_view::{GraphNames, LedgerView};
 
 // ============================================================================
 // Monotonic Clock for Eviction
@@ -558,6 +558,21 @@ impl LedgerHandle {
             "range_provider and binary_store must be coherent"
         );
         snap
+        // Locks released here
+    }
+
+    /// The cached head's graph names, for resolving a request's dataset
+    /// references ahead of its query: no [`LedgerView`] is built, and the
+    /// read-side compaction check [`snapshot`](Self::snapshot) runs, which
+    /// visits every graph in novelty, is left to the query's own load.
+    pub async fn graph_names(&self) -> GraphNames {
+        self.touch();
+        let state = self.inner.state.read().await;
+        let binary_store = self.inner.binary_store.read().await.clone();
+        GraphNames {
+            snapshot: Arc::clone(&state.snapshot),
+            binary_store,
+        }
         // Locks released here
     }
 

@@ -5,6 +5,7 @@
 //!
 //! Key types:
 //! - [`GraphRef`]: A borrowed reference to a single graph (db + overlay + time bounds)
+//! - [`MemberKind`]: Whether a graph reads a ledger's index or a graph source
 //! - [`DataSet`]: An immutable collection of default and named graphs
 //! - [`ActiveGraph`]: Enum indicating which graph(s) are currently active for scanning
 //!
@@ -25,6 +26,27 @@ use fluree_db_core::ids::GraphId;
 use fluree_db_core::{LedgerSnapshot, OverlayProvider};
 
 use crate::policy::QueryPolicyEnforcer;
+
+/// What a graph the caller loaded reads: a ledger's own index, or a graph
+/// source whose rows come from a provider.
+///
+/// The executor asks the R2RML provider whether a graph is a mapped graph
+/// source only when its kind leaves that open. A [`Native`](Self::Native)
+/// graph is never looked up, so a query over ledgers does not depend on the
+/// graph-source registry being reachable, and a lookup that does run and fails
+/// fails the query instead of reading a graph source as an empty graph.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemberKind {
+    /// The caller did not say. The executor asks the provider, as it does for
+    /// a graph source.
+    #[default]
+    Unclassified,
+    /// A ledger graph, read from its snapshot and novelty. Never looked up as
+    /// a graph source.
+    Native,
+    /// A graph source. The executor asks the provider whether it is mapped.
+    GraphSource,
+}
 
 /// Reference to a single graph view (borrowed, for execution)
 ///
@@ -65,6 +87,8 @@ pub struct GraphRef<'a> {
     /// Enables per-graph policy in datasets (e.g., different policies for
     /// different named graphs).
     pub policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
+    /// What this graph reads, when the caller that loaded it knows.
+    pub kind: MemberKind,
 }
 
 impl<'a> GraphRef<'a> {
@@ -90,6 +114,7 @@ impl<'a> GraphRef<'a> {
             to_t,
             ledger_id: ledger_id.into(),
             policy_enforcer: None,
+            kind: MemberKind::Unclassified,
         }
     }
 
@@ -117,6 +142,7 @@ impl<'a> GraphRef<'a> {
             to_t,
             ledger_id: ledger_id.into(),
             policy_enforcer: Some(policy_enforcer),
+            kind: MemberKind::Unclassified,
         }
     }
 
@@ -135,7 +161,14 @@ impl<'a> GraphRef<'a> {
             to_t,
             ledger_id: Arc::from(snapshot.ledger_id.as_str()),
             policy_enforcer: None,
+            kind: MemberKind::Unclassified,
         }
+    }
+
+    /// Record what this graph reads (see [`MemberKind`]).
+    pub fn with_kind(mut self, kind: MemberKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Check if this graph has a policy enforcer attached
@@ -155,6 +188,7 @@ impl fmt::Debug for GraphRef<'_> {
             .field("to_t", &self.to_t)
             .field("ledger_id", &self.ledger_id)
             .field("has_policy", &self.policy_enforcer.is_some())
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -179,6 +213,26 @@ pub struct DataSet<'a> {
     /// Further names for graphs, addressable by `GRAPH <name>` but not
     /// enumerated by `GRAPH ?g`, so one graph never binds `?g` twice.
     named_graph_aliases: HashMap<Arc<str>, GraphRef<'a>>,
+    /// Reads any other name as one of the above
+    /// ([`DataSet::with_name_resolver`]).
+    name_resolver: Option<GraphNameResolver<'a>>,
+}
+
+/// Reads a `GRAPH` name no member is keyed by as the key of the member it
+/// names. An update's WHERE over a ledger's whole graph store reads `GRAPH
+/// <iri>` through the ledger's graph-position table this way, so every
+/// spelling of a graph's name reaches it without a key per spelling.
+#[derive(Clone)]
+pub struct GraphNameResolver<'a>(Arc<ResolveGraphName<'a>>);
+
+/// The function a [`GraphNameResolver`] wraps: a `GRAPH` name to the key of
+/// the member it names.
+type ResolveGraphName<'a> = dyn Fn(&str) -> Option<Arc<str>> + Send + Sync + 'a;
+
+impl std::fmt::Debug for GraphNameResolver<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GraphNameResolver")
+    }
 }
 
 impl<'a> DataSet<'a> {
@@ -188,7 +242,20 @@ impl<'a> DataSet<'a> {
             default_graphs: Vec::new(),
             named_graphs: HashMap::new(),
             named_graph_aliases: HashMap::new(),
+            name_resolver: None,
         }
+    }
+
+    /// Read a `GRAPH` name that no member is keyed by through `resolve`,
+    /// which returns the key of the member the name denotes (or `None`). The
+    /// resolved name is addressable, not enumerated: `GRAPH ?g` still binds
+    /// only the members' own names.
+    pub fn with_name_resolver(
+        mut self,
+        resolve: impl Fn(&str) -> Option<Arc<str>> + Send + Sync + 'a,
+    ) -> Self {
+        self.name_resolver = Some(GraphNameResolver(Arc::new(resolve)));
+        self
     }
 
     /// Add a default graph
@@ -222,9 +289,16 @@ impl<'a> DataSet<'a> {
 
     /// Get a named graph by IRI (None if not found)
     pub fn named_graph(&self, iri: &str) -> Option<&GraphRef<'a>> {
+        self.keyed_graph(iri).or_else(|| {
+            let key = (self.name_resolver.as_ref()?.0)(iri)?;
+            self.keyed_graph(&key)
+        })
+    }
+
+    fn keyed_graph(&self, name: &str) -> Option<&GraphRef<'a>> {
         self.named_graphs
-            .get(iri)
-            .or_else(|| self.named_graph_aliases.get(iri))
+            .get(name)
+            .or_else(|| self.named_graph_aliases.get(name))
     }
 
     /// Get all named graph IRIs (for GRAPH ?g iteration)
@@ -234,7 +308,7 @@ impl<'a> DataSet<'a> {
 
     /// Check if a named graph exists
     pub fn has_named_graph(&self, iri: &str) -> bool {
-        self.named_graphs.contains_key(iri) || self.named_graph_aliases.contains_key(iri)
+        self.named_graph(iri).is_some()
     }
 
     /// Copy of this dataset where every graph matching the primary
@@ -266,6 +340,7 @@ impl<'a> DataSet<'a> {
                 to_t: graph.to_t,
                 ledger_id: Arc::clone(&graph.ledger_id),
                 policy_enforcer: graph.policy_enforcer.clone(),
+                kind: graph.kind,
             }
         };
         DataSet {
@@ -280,6 +355,10 @@ impl<'a> DataSet<'a> {
                 .iter()
                 .map(|(iri, g)| (Arc::clone(iri), patch(g)))
                 .collect(),
+            name_resolver: self.name_resolver.as_ref().map(|resolver| {
+                let resolve: Arc<ResolveGraphName<'b>> = resolver.0.clone();
+                GraphNameResolver(resolve)
+            }),
         }
     }
 
@@ -339,6 +418,39 @@ impl<'a> DataSet<'a> {
         false
     }
 
+    /// The member a SERVICE naming `ledger_id` reads, chosen the same way on
+    /// every run: the ledger's first default graph, else its named member
+    /// first in name order (named members are held in a map, whose order is
+    /// not). When the dataset holds the ledger at more than one time the
+    /// endpoint does not say which to read: `Err` carries two of the times.
+    pub fn service_member(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<Option<&GraphRef<'a>>, (i64, i64)> {
+        let of_ledger = |graph: &&GraphRef<'a>| graph.ledger_id.as_ref() == ledger_id;
+        let mut times: Option<(i64, i64)> = None;
+        for graph in self
+            .default_graphs
+            .iter()
+            .chain(self.named_graphs.values())
+            .filter(of_ledger)
+        {
+            let (low, high) = times.get_or_insert((graph.to_t, graph.to_t));
+            *low = (*low).min(graph.to_t);
+            *high = (*high).max(graph.to_t);
+        }
+        if let Some((low, high)) = times.filter(|(low, high)| low != high) {
+            return Err((low, high));
+        }
+        Ok(self.default_graphs.iter().find(of_ledger).or_else(|| {
+            self.named_graphs
+                .iter()
+                .filter(|(_, graph)| of_ledger(graph))
+                .min_by(|a, b| a.0.cmp(b.0))
+                .map(|(_, graph)| graph)
+        }))
+    }
+
     /// Find a graph by ledger ID (searching both default and named graphs)
     ///
     /// Returns the first graph whose `ledger_id` matches the given address.
@@ -354,6 +466,7 @@ impl<'a> DataSet<'a> {
     ///
     /// The dataset construction code should ensure uniqueness, or the caller
     /// should be aware that duplicate addresses may cause ambiguous behavior.
+    /// A SERVICE reads [`DataSet::service_member`] instead.
     pub fn find_by_ledger_id(&self, ledger_id: &str) -> Option<&GraphRef<'a>> {
         // Check default graphs first
         self.default_graphs

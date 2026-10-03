@@ -244,12 +244,11 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
 
     /// Execute: fetch the commit blob, decode it, resolve IRIs, return detail.
     pub async fn execute(self) -> Result<CommitDetail> {
-        // 1. Load the ledger to get namespace_codes for IRI resolution
-        let handle = self
-            .graph
-            .fluree
-            .ledger_cached(&self.graph.ledger_id)
-            .await?;
+        // 1. Load the ledger to get namespace_codes for IRI resolution. A
+        // commit belongs to the whole ledger, so a graph or pin in the handle's
+        // address does not narrow it.
+        let ledger_id = self.graph.id()?.clone();
+        let handle = self.graph.fluree.ledger_cached(ledger_id.as_str()).await?;
         let snapshot = handle.snapshot().await;
         let namespace_codes = snapshot.snapshot.shared_namespaces();
 
@@ -267,7 +266,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
         };
 
         // 4. Fetch commit blob from content-addressed storage
-        let content_store = self.graph.fluree.content_store(&self.graph.ledger_id);
+        let content_store = self.graph.fluree.content_store(ledger_id.as_str());
         let blob = content_store.get(&commit_id).await.map_err(|e| {
             if matches!(e, fluree_db_core::error::Error::NotFound(_)) {
                 ApiError::NotFound(format!("Commit {commit_id} not found"))

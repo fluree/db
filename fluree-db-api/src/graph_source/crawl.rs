@@ -1131,8 +1131,8 @@ mod e2e {
 
     #[async_trait]
     impl R2rmlProvider for MockCrawlProvider {
-        async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-            true
+        async fn has_r2rml_mapping(&self, _gs: &str) -> fluree_db_query::Result<bool> {
+            Ok(true)
         }
         async fn compiled_mapping(
             &self,
