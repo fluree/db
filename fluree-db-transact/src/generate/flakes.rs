@@ -366,9 +366,7 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::EncodedPid { .. } => Err(TransactError::InvalidTerm(
                             "Subject must be a Sid; EncodedPid cannot be used as subject".to_string(),
                         )),
-                        Binding::Iri(_) => Err(TransactError::InvalidTerm(
-                            "Raw IRI from graph source cannot be used as subject for flake generation".to_string(),
-                        )),
+                        Binding::Iri(iri) => self.raw_iri_sid(iri).map(Some),
                     }
                 } else {
                     Ok(None)
@@ -424,9 +422,7 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::EncodedPid { .. } => Err(TransactError::InvalidTerm(
                             "Predicate must be a Sid; EncodedPid must be materialized before flake generation".to_string(),
                         )),
-                        Binding::Iri(_) => Err(TransactError::InvalidTerm(
-                            "Raw IRI from graph source cannot be used as predicate for flake generation".to_string(),
-                        )),
+                        Binding::Iri(iri) => self.raw_iri_sid(iri).map(Some),
                     }
                 } else {
                     Ok(None)
@@ -470,9 +466,10 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Sid { sid, .. } => {
                             Ok((Some(FlakeValue::Ref(sid.clone())), Some(DT_ID.clone())))
                         }
-                        Binding::IriMatch { primary_sid, .. } => {
-                            Ok((Some(FlakeValue::Ref(primary_sid.clone())), Some(DT_ID.clone())))
-                        }
+                        Binding::IriMatch { primary_sid, .. } => Ok((
+                            Some(FlakeValue::Ref(primary_sid.clone())),
+                            Some(DT_ID.clone()),
+                        )),
                         Binding::Lit { val, dtc, .. } => {
                             Ok((Some(val.clone()), Some(dtc.datatype().clone())))
                         }
@@ -489,11 +486,15 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
                             "Object cannot be a grouped value (GROUP BY output)".to_string(),
                         )),
-                        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(TransactError::InvalidTerm(
+                        Binding::Path { .. }
+                        | Binding::Rel(_)
+                        | Binding::List(_)
+                        | Binding::Map(_) => Err(TransactError::InvalidTerm(
                             "Object cannot be a path or list value".to_string(),
                         )),
-                        Binding::Iri(_) => Err(TransactError::InvalidTerm(
-                            "Raw IRI from graph source cannot be used as object for flake generation".to_string(),
+                        Binding::Iri(iri) => Ok((
+                            Some(FlakeValue::Ref(self.raw_iri_sid(iri)?)),
+                            Some(DT_ID.clone()),
                         )),
                     }
                 } else {
@@ -515,6 +516,17 @@ impl<'a> FlakeGenerator<'a> {
                 })
             }
         }
+    }
+
+    /// A raw IRI binding — a `GRAPH ?g` name, or a graph source's IRI — as a
+    /// node. A raw blank-node label names no stored node.
+    fn raw_iri_sid(&mut self, iri: &str) -> Result<Sid> {
+        if iri.starts_with("_:") {
+            return Err(TransactError::InvalidTerm(format!(
+                "a blank node from a graph source ({iri}) cannot be written"
+            )));
+        }
+        Ok(self.ns_registry.sid_for_iri(iri))
     }
 
     /// A triple term's positions, resolved as a flake's own are; `None` when

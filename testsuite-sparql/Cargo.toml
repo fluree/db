@@ -14,6 +14,7 @@ publish = false
 # Fluree crates (for testing)
 fluree-db-api = { path = "../fluree-db-api", features = ["native"] }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-db-transact = { path = "../fluree-db-transact" }
 fluree-graph-turtle = { path = "../fluree-graph-turtle" }
 fluree-graph-ir = { path = "../fluree-graph-ir" }
 

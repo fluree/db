@@ -2434,6 +2434,7 @@ dependencies = [
  "anyhow",
  "fluree-db-api",
  "fluree-db-sparql",
+ "fluree-db-transact",
  "fluree-graph-ir",
  "fluree-graph-turtle",
  "quick-xml",

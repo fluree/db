@@ -1126,13 +1126,12 @@ async fn update_where_bind_error_handling_runtime_type_mismatch() {
     );
 }
 
+/// `IRI("bad:thing")` names the absolute IRI `bad:thing` (scheme `bad`); a
+/// template writes it as a node, like any IRI the WHERE clause builds.
 #[tokio::test]
-async fn update_where_bind_error_handling_invalid_iri() {
-    // IRI("bad:thing") produces a Binding::Iri at the expression level, but
-    // the transact layer rejects raw IRIs that can't be resolved to a SID
-    // for flake generation.
+async fn update_where_bind_iri_writes_the_iri() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-invalid-iri");
+    let db0 = LedgerSnapshot::genesis("it/transact-update:bind-iri");
     let ledger0 = LedgerState::new(db0, Novelty::new(0));
 
     let seeded = fluree
@@ -1151,7 +1150,7 @@ async fn update_where_bind_error_handling_invalid_iri() {
         .await
         .expect("seed error fns");
 
-    let run_err = fluree
+    let out = fluree
         .update(
             seeded.ledger,
             &json!({
@@ -1164,19 +1163,20 @@ async fn update_where_bind_error_handling_invalid_iri() {
                 "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
             }),
         )
-        .await;
+        .await
+        .expect("a built IRI is written");
 
-    assert!(
-        run_err.is_err(),
-        "expected transact error for unresolvable IRI"
-    );
-    if let Err(err) = run_err {
-        assert!(
-            err.to_string().contains("Raw IRI")
-                || err.to_string().contains("cannot be used as object"),
-            "unexpected error: {err}"
-        );
-    }
+    let q = json!({
+        "@context": ctx_ex(),
+        "select": "?e",
+        "where": {"id": "ex:error", "ex:error": "?e"}
+    });
+    let got = support::query_jsonld(&fluree, &out.ledger, &q)
+        .await
+        .expect("query")
+        .to_jsonld(&out.ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(got, json!(["bad:thing"]));
 }
 
 #[tokio::test]

@@ -760,6 +760,113 @@ pub fn parse_expected_graph(url: &str) -> Result<Vec<Triple>> {
     Ok(graph_triples(&sink.into_graph()))
 }
 
+/// A dataset's default graph and its named graphs, by name.
+pub type ExpectedDataset = (Vec<Triple>, Vec<(String, Vec<Triple>)>);
+
+/// An expected-state file's default graph and named graphs. A `.trig` file
+/// names its graphs in `GRAPH` blocks; any other file is one default graph.
+pub fn parse_expected_dataset(url: &str) -> Result<ExpectedDataset> {
+    use fluree_db_transact::{RawObject, RawTerm};
+    if !url.ends_with(".trig") {
+        return Ok((parse_expected_graph(url)?, Vec::new()));
+    }
+    let content =
+        read_file_to_string(url).with_context(|| format!("Reading expected graph file: {url}"))?;
+    let with_base = format!("@base <{url}> .\n{content}");
+    let phase1 = fluree_db_transact::parse_trig_phase1(&with_base)
+        .map_err(|e| anyhow::anyhow!("Parsing expected TriG {url}: {e}"))?;
+    let mut sink = GraphCollectorSink::new();
+    parse_turtle(&phase1.turtle, &mut sink)
+        .with_context(|| format!("Parsing expected graph: {url}"))?;
+    let default = graph_triples(&sink.into_graph());
+
+    let mut named = Vec::new();
+    for block in &phase1.named_graphs {
+        let node = |term: &RawTerm| -> Result<RdfTerm> {
+            Ok(match term {
+                RawTerm::Iri(iri) => match iri.strip_prefix("_:") {
+                    Some(label) => RdfTerm::BlankNode(label.to_string()),
+                    None => RdfTerm::Iri(iri.clone()),
+                },
+                RawTerm::PrefixedName { prefix, local } => {
+                    let ns = block
+                        .prefixes
+                        .get(prefix.as_str())
+                        .with_context(|| format!("undefined prefix {prefix}: in {url}"))?;
+                    RdfTerm::Iri(format!("{ns}{local}"))
+                }
+            })
+        };
+        fn object(o: &RawObject, node: &dyn Fn(&RawTerm) -> Result<RdfTerm>) -> Result<RdfTerm> {
+            let typed = |value: String, dt: &str| RdfTerm::Literal {
+                value,
+                datatype: Some(format!("http://www.w3.org/2001/XMLSchema#{dt}")),
+                language: None,
+            };
+            Ok(match o {
+                RawObject::Iri(iri) => node(&RawTerm::Iri(iri.clone()))?,
+                RawObject::PrefixedName { prefix, local } => node(&RawTerm::PrefixedName {
+                    prefix: prefix.clone(),
+                    local: local.clone(),
+                })?,
+                RawObject::String(s) => RdfTerm::Literal {
+                    value: s.clone(),
+                    datatype: None,
+                    language: None,
+                },
+                RawObject::Integer(n) => typed(n.to_string(), "integer"),
+                RawObject::Double(d) => typed(d.to_string(), "double"),
+                RawObject::Boolean(b) => typed(b.to_string(), "boolean"),
+                RawObject::TypedLiteral { value, datatype } => RdfTerm::Literal {
+                    value: value.clone(),
+                    datatype: Some(datatype.clone()),
+                    language: None,
+                },
+                RawObject::LangString { value, lang } => RdfTerm::Literal {
+                    value: value.clone(),
+                    datatype: None,
+                    language: Some(lang.clone()),
+                },
+                RawObject::TripleTerm {
+                    subject,
+                    predicate,
+                    object: o,
+                } => RdfTerm::Triple(Box::new(Triple {
+                    subject: node(subject)?,
+                    predicate: node(predicate)?,
+                    object: object(o, node)?,
+                })),
+            })
+        }
+        let mut triples = Vec::new();
+        for t in &block.triples {
+            let subject = node(
+                t.subject
+                    .as_ref()
+                    .context("named graph triple without subject")?,
+            )?;
+            let predicate = node(&t.predicate)?;
+            for o in &t.objects {
+                triples.push(Triple {
+                    subject: subject.clone(),
+                    predicate: predicate.clone(),
+                    object: object(o, &node)?,
+                });
+            }
+        }
+        for r in &block.reified {
+            triples.extend(reification_triples(
+                node(&r.reifier)?,
+                node(&r.subject)?,
+                node(&r.predicate)?,
+                object(&r.object, &node)?,
+            ));
+        }
+        named.push((block.iri.clone(), triples));
+    }
+    Ok((default, named))
+}
+
 /// `reifier`'s attachment to `(s, p, o)`: `reifier rdf:reifies <<( s p o )>>`.
 pub(crate) fn reification_triples(
     reifier: RdfTerm,

@@ -386,12 +386,7 @@ pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[];
 // Each test appears in EXACTLY ONE reason cluster (PR-1454 review found 10
 // entries double-counted across clusters); attribution below re-verified
 // empirically by unregistering and reading the harness's failure reasons.
-pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
-    // update: a `GRAPH ?g` name binds a raw IRI, which an INSERT template
-    // cannot write as an object (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
-];
+pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[];
 
 pub const SPARQL12_EXPRESSION: &[&str] = &[
     // not-not: the D-EBV fix makes !!?v unbind for the language-tagged,
