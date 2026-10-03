@@ -150,12 +150,22 @@ fn encode_object(
             let name_id = dicts.object_ref.insert(sid.name.as_ref());
             encode_varint(name_id as u64, buf);
         }
-        // Commits still carry reifications as `f:reifies*` bundles; the term
-        // form is interned index-side only until the write path moves over.
-        FlakeValue::TripleTerm(_) => {
-            return Err(CommitCodecError::UnsupportedValue(
-                "triple term objects are not encodable in commits yet".into(),
-            ));
+        FlakeValue::TripleTerm(term) => {
+            buf.push(OTag::TripleTerm as u8);
+            encode_varint(term.s.namespace_code as u64, buf);
+            encode_varint(dicts.subject.insert(term.s.name.as_ref()) as u64, buf);
+            encode_varint(term.p.namespace_code as u64, buf);
+            encode_varint(dicts.predicate.insert(term.p.name.as_ref()) as u64, buf);
+            encode_varint(term.dt.namespace_code as u64, buf);
+            encode_varint(dicts.datatype.insert(term.dt.name.as_ref()) as u64, buf);
+            match &term.lang {
+                Some(lang) => {
+                    buf.push(1);
+                    encode_len_prefixed_str(lang, buf);
+                }
+                None => buf.push(0),
+            }
+            encode_object(&term.o, dicts, buf)?;
         }
         FlakeValue::Long(n) => {
             buf.push(OTag::Long as u8);
@@ -461,6 +471,54 @@ mod tests {
             predicate: StringDict::deserialize(&dicts.predicate.serialize()).unwrap(),
             datatype: StringDict::deserialize(&dicts.datatype.serialize()).unwrap(),
             object_ref: StringDict::deserialize(&dicts.object_ref.serialize()).unwrap(),
+        }
+    }
+
+    /// A link `r rdf:reifies <<( s p o )>>` round-trips with each kind of
+    /// term object: a node, a language-tagged string, and a decimal.
+    #[test]
+    fn test_round_trip_triple_term() {
+        use crate::TripleTermValue;
+        let ex = |name: &str| Sid::new(101, name);
+        let objects = [
+            (FlakeValue::Ref(ex("bob")), Sid::new(1, "id"), None),
+            (
+                FlakeValue::String("chat".into()),
+                Sid::new(3, "langString"),
+                Some("fr".to_string()),
+            ),
+            (
+                FlakeValue::Decimal(Box::new("1.50".parse().unwrap())),
+                Sid::new(2, "decimal"),
+                None,
+            ),
+        ];
+        for (o, dt, lang) in objects {
+            let term = TripleTermValue {
+                s: ex("alice"),
+                p: ex("knows"),
+                o,
+                dt,
+                lang,
+            };
+            let flake = Flake::new(
+                ex("claim1"),
+                crate::rdf_reifies_sid().clone(),
+                FlakeValue::TripleTerm(Box::new(term.clone())),
+                crate::triple_term_datatype_sid().clone(),
+                7,
+                true,
+                None,
+            );
+            let mut dicts = CommitDicts::new();
+            let mut buf = Vec::new();
+            encode_op(&flake, &mut dicts, &mut buf).unwrap();
+            let mut pos = 0;
+            let decoded = decode_op(&buf, &mut pos, &round_trip_dicts(&dicts), 7).unwrap();
+            assert_eq!(pos, buf.len());
+            assert_eq!(decoded.o, FlakeValue::TripleTerm(Box::new(term)));
+            assert_eq!(decoded.s, flake.s);
+            assert_eq!(decoded.dt, flake.dt);
         }
     }
 

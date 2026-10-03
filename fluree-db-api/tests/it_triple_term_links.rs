@@ -2466,3 +2466,108 @@ async fn jsonld_import_links_annotations() {
     .await;
     assert_eq!(tagged, strings(&[&["ex:claim2"]]));
 }
+
+/// A link written straight into a commit, the form annotation writes move to:
+/// it round-trips the commit codec and reads back from novelty, from a full
+/// rebuild, and from an incremental build over it.
+#[tokio::test]
+async fn links_written_into_commits_read_back() {
+    use fluree_db_core::{Flake, FlakeValue, TripleTermValue};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/triple-term-links:committed-links";
+    let commit_link = |ledger: LedgerState, o: &'static str, claim: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+            let mut ex = |name: &str| ns.sid_for_iri(&format!("http://example.org/{name}"));
+            let (alice, knows, obj, reifier, confidence) =
+                (ex("alice"), ex("knows"), ex(o), ex(claim), ex("confidence"));
+            let t = ledger.t() + 1;
+            let id_dt = fluree_db_core::edge::id_datatype_sid();
+            let term = TripleTermValue {
+                s: alice.clone(),
+                p: knows.clone(),
+                o: FlakeValue::Ref(obj.clone()),
+                dt: id_dt.clone(),
+                lang: None,
+            };
+            let flakes = vec![
+                Flake::new(alice, knows, FlakeValue::Ref(obj), id_dt, t, true, None),
+                Flake::new(
+                    reifier.clone(),
+                    fluree_db_core::rdf_reifies_sid().clone(),
+                    FlakeValue::TripleTerm(Box::new(term)),
+                    fluree_db_core::triple_term_datatype_sid().clone(),
+                    t,
+                    true,
+                    None,
+                ),
+                Flake::new(
+                    reifier,
+                    confidence,
+                    FlakeValue::Double(0.9),
+                    fluree_db_core::Sid::new(2, "double"),
+                    t,
+                    true,
+                    None,
+                ),
+            ];
+            let view = fluree_db_transact::stage_flakes(
+                ledger,
+                flakes,
+                fluree_db_transact::StageOptions::new(),
+            )
+            .await
+            .expect("stage");
+            fluree
+                .commit_staged(
+                    view,
+                    ns,
+                    &fluree_db_ledger::IndexConfig {
+                        reindex_min_bytes: 100_000,
+                        reindex_max_bytes: 1_000_000_000,
+                    },
+                    fluree_db_transact::CommitOpts::default(),
+                )
+                .await
+                .expect("commit")
+                .1
+        }
+    };
+    let claims = |ledger: LedgerState| {
+        let fluree = &fluree;
+        async move {
+            run_link_query(
+                fluree,
+                &ledger,
+                "SELECT ?r ?o WHERE { << ex:alice ex:knows ?o ~ ?r >> ex:confidence ?c } ORDER BY ?r"
+                    .to_string(),
+            )
+            .await
+        }
+    };
+
+    let ledger = commit_link(support::genesis_ledger(&fluree, ledger_id), "bob", "claim1").await;
+    assert_eq!(
+        claims(ledger).await,
+        strings(&[&["ex:claim1", "ex:bob"]]),
+        "novelty"
+    );
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert_eq!(
+        claims(ledger.clone()).await,
+        strings(&[&["ex:claim1", "ex:bob"]]),
+        "rebuild"
+    );
+
+    commit_link(ledger, "carol", "claim2").await;
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert_eq!(
+        claims(ledger).await,
+        strings(&[&["ex:claim1", "ex:bob"], &["ex:claim2", "ex:carol"]]),
+        "incremental"
+    );
+}

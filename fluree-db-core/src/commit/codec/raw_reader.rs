@@ -208,6 +208,19 @@ pub enum RawObject<'a> {
     GeoPoint { lat: f64, lng: f64 },
     /// Vector of f64 elements (embedding).
     Vector(Vec<f64>),
+    /// An RDF 1.2 triple term.
+    TripleTerm(Box<RawTripleTerm<'a>>),
+}
+
+/// A triple term's components as the commit stores them: names borrowed from
+/// the commit's subject, predicate and datatype dictionaries.
+#[derive(Clone)]
+pub struct RawTripleTerm<'a> {
+    pub s: (u16, &'a str),
+    pub p: (u16, &'a str),
+    pub dt: (u16, &'a str),
+    pub lang: Option<&'a str>,
+    pub o: RawObject<'a>,
 }
 
 impl<'a> TryFrom<RawObject<'a>> for crate::FlakeValue {
@@ -227,6 +240,16 @@ impl<'a> TryFrom<RawObject<'a>> for crate::FlakeValue {
         }
 
         match raw {
+            RawObject::TripleTerm(term) => {
+                let RawTripleTerm { s, p, dt, lang, o } = *term;
+                Ok(FlakeValue::TripleTerm(Box::new(crate::TripleTermValue {
+                    s: Sid::new(s.0, s.1),
+                    p: Sid::new(p.0, p.1),
+                    o: FlakeValue::try_from(o)?,
+                    dt: Sid::new(dt.0, dt.1),
+                    lang: lang.map(str::to_string),
+                })))
+            }
             RawObject::Ref { ns_code, name } => Ok(FlakeValue::Ref(Sid::new(ns_code, name))),
             RawObject::Long(n) => Ok(FlakeValue::Long(n)),
             RawObject::Double(n) => Ok(FlakeValue::Double(n)),
@@ -612,6 +635,29 @@ pub(super) fn decode_raw_object<'a>(
                 vec.push(element);
             }
             Ok(RawObject::Vector(vec))
+        }
+        OTag::TripleTerm => {
+            let mut name = |dict: &'a super::string_dict::StringDict| -> Result<(u16, &'a str), CommitCodecError> {
+                let ns_code = decode_varint(data, pos)? as u16;
+                let name_id = decode_varint(data, pos)? as u32;
+                Ok((ns_code, dict.get(name_id)?))
+            };
+            let s = name(&dicts.subject)?;
+            let p = name(&dicts.predicate)?;
+            let dt = name(&dicts.datatype)?;
+            let lang = match read_u8(data, pos)? {
+                0 => None,
+                _ => Some(decode_inline_str(data, pos)?),
+            };
+            let o_tag = OTag::from_u8(read_u8(data, pos)?)?;
+            let o = retype_string_literal(decode_raw_object(o_tag, data, pos, dicts)?, dt.0, dt.1);
+            Ok(RawObject::TripleTerm(Box::new(RawTripleTerm {
+                s,
+                p,
+                dt,
+                lang,
+                o,
+            })))
         }
     }
 }

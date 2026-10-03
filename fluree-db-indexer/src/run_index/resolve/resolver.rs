@@ -14,7 +14,7 @@ use bigdecimal::BigDecimal;
 use chrono;
 use fluree_db_binary_index::format::run_record::{RunRecord, LIST_INDEX_NONE};
 use fluree_db_core::commit::codec::envelope::CodecEnvelope;
-use fluree_db_core::commit::codec::raw_reader::{CommitOps, RawObject, RawOp};
+use fluree_db_core::commit::codec::raw_reader::{CommitOps, RawObject, RawOp, RawTripleTerm};
 use fluree_db_core::commit::codec::{load_commit_ops, CommitCodecError};
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::temporal::{
@@ -813,6 +813,9 @@ impl CommitResolver {
         dicts: &mut GlobalDicts,
         is_assert: bool,
     ) -> Result<Option<(ObjKind, ObjKey)>, String> {
+        if let RawObject::TripleTerm(_) = obj {
+            return Err("triple-term objects are resolved by the chunked builds".into());
+        }
         // Vector handling is unique: assertions allocate + record fact identity;
         // retractions look up by fact identity (NOT by value, to avoid aliasing
         // between distinct subjects with the same vector value); unmatched
@@ -871,6 +874,7 @@ impl CommitResolver {
             };
         }
         let result = match obj {
+            RawObject::TripleTerm(_) => unreachable!("returned above"),
             RawObject::Long(v) => Ok((ObjKind::NUM_INT, ObjKey::encode_i64(*v))),
             RawObject::Double(v) => {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
@@ -1593,6 +1597,72 @@ impl SharedResolverState {
         }))
     }
 
+    /// A link's triple term, written straight into a commit: the term becomes
+    /// a pseudo-record in the chunk's term table, resolved as the base
+    /// triple's own record would be, and the link carries its ordinal — the
+    /// bulk-import sink's form, which the build remaps and interns.
+    fn resolve_term_chunk(
+        &mut self,
+        term: &RawTripleTerm<'_>,
+        g_id: GraphId,
+        chunk: &mut RebuildChunk,
+        is_assert: bool,
+    ) -> Result<(ObjKind, ObjKey), String> {
+        let p_id = self.resolve_predicate(term.p.0, term.p.1);
+        let dt = checked_dt_id(self.resolve_datatype(term.dt.0, term.dt.1))?;
+        // An arena handle names a value only within one graph and predicate;
+        // a term keys the object by its canonical form.
+        let lexical = match &term.o {
+            RawObject::BigIntStr(_) | RawObject::DecimalStr(_) | RawObject::Vector(_) => {
+                let value = fluree_db_core::FlakeValue::try_from(term.o.clone())
+                    .map_err(|e| e.to_string())?;
+                fluree_db_core::triple_term::lexical_term_object(&value)
+            }
+            RawObject::TripleTerm(_) => return Err("nested triple terms are not supported".into()),
+            _ => None,
+        };
+        let (o_kind, o_key) = match lexical {
+            Some((o_type, form)) => {
+                let kind = if o_type == fluree_db_core::o_type::OType::VECTOR {
+                    ObjKind::VECTOR_ID
+                } else {
+                    ObjKind::NUM_BIG
+                };
+                let id = chunk.strings.get_or_insert(form.as_bytes());
+                (kind, ObjKey::encode_u32_id(id))
+            }
+            None => self
+                .resolve_object_chunk(
+                    &term.o,
+                    g_id,
+                    term.s.0,
+                    term.s.1,
+                    p_id,
+                    LIST_INDEX_NONE,
+                    dt,
+                    chunk,
+                    is_assert,
+                )?
+                .ok_or("a triple term's object resolved to nothing")?,
+        };
+        let s_id = self.resolve_subject_chunk(term.s.0, term.s.1, chunk);
+        let lang_id = self.languages.get_or_insert(term.lang);
+        let ordinal = chunk.terms.len() as u64;
+        chunk.terms.push(RunRecord {
+            g_id,
+            s_id: SubjectId::from_u64(s_id),
+            p_id,
+            dt,
+            o_kind: o_kind.as_u8(),
+            op: 1,
+            o_key: o_key.as_u64(),
+            t: 0,
+            lang_id,
+            i: LIST_INDEX_NONE,
+        });
+        Ok((ObjKind::TRIPLE_TERM, ObjKey::from_u64(ordinal)))
+    }
+
     /// Resolve subject to a chunk-local sequential u64 ID.
     fn resolve_subject_chunk(&mut self, ns_code: u16, name: &str, chunk: &mut RebuildChunk) -> u64 {
         chunk.subjects.get_or_insert(ns_code, name.as_bytes())
@@ -1644,6 +1714,11 @@ impl SharedResolverState {
         chunk: &mut RebuildChunk,
         is_assert: bool,
     ) -> Result<Option<(ObjKind, ObjKey)>, String> {
+        if let RawObject::TripleTerm(term) = obj {
+            return self
+                .resolve_term_chunk(term, g_id, chunk, is_assert)
+                .map(Some);
+        }
         // Vector handling — see `CommitResolver::resolve_object` for details.
         // Fact-identity `(s_id, p_id, o_i, f32_bits)` → handle is required so:
         // (a) two distinct subjects with the same vector value don't alias,
@@ -1698,6 +1773,7 @@ impl SharedResolverState {
             };
         }
         let result = match obj {
+            RawObject::TripleTerm(_) => unreachable!("returned above"),
             RawObject::Long(v) => Ok((ObjKind::NUM_INT, ObjKey::encode_i64(*v))),
             RawObject::Double(v) => {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
