@@ -27,8 +27,7 @@ use crate::files::read_file_to_string;
 use crate::manifest::Test;
 use crate::result_comparison::{are_results_isomorphic, format_results_diff};
 use crate::result_format::{
-    ir_term_to_rdf_term, RdfTerm, SparqlResults, Triple, REIFIES_OBJECT, REIFIES_PREDICATE,
-    REIFIES_SUBJECT,
+    ir_term_to_rdf_term, reification_triples, RdfTerm, SparqlResults, Triple,
 };
 use crate::vocab::rdft;
 
@@ -147,7 +146,7 @@ fn evaluate_eval(test: &Test) -> Result<()> {
 /// Convert a parsed graph to harness triples, re-expanding Fluree's
 /// `list_index` collection encoding into the `rdf:first` / `rdf:rest` chains
 /// the expected N-Triples spell out, and each reifier attachment into
-/// `REIFIES_*` triples.
+/// `rdf:reifies` triples.
 ///
 /// The Turtle parser emits `( a b )` in object position as one triple per
 /// element carrying `list_index` (the transaction layer stores lists that
@@ -171,17 +170,12 @@ fn graph_to_rdf_triples(graph: &Graph) -> Vec<Triple> {
         }
     }
     for r in graph.reifications() {
-        for (predicate, term) in [
-            (REIFIES_SUBJECT, &r.triple.s),
-            (REIFIES_PREDICATE, &r.triple.p),
-            (REIFIES_OBJECT, &r.triple.o),
-        ] {
-            out.push(Triple {
-                subject: ir_term_to_rdf_term(&r.reifier),
-                predicate: RdfTerm::Iri(predicate.to_string()),
-                object: ir_term_to_rdf_term(term),
-            });
-        }
+        out.extend(reification_triples(
+            ir_term_to_rdf_term(&r.reifier),
+            ir_term_to_rdf_term(&r.triple.s),
+            ir_term_to_rdf_term(&r.triple.p),
+            ir_term_to_rdf_term(&r.triple.o),
+        ));
     }
     let mut next_cell = 0usize;
     for ((s, p), mut items) in lists {

@@ -1159,7 +1159,7 @@ pub enum UnresolvedPattern {
         /// or named IRI).
         annotation: UnresolvedTerm,
         /// The base edge being reified (subject, predicate, object).
-        edge: UnresolvedTriplePattern,
+        edge: UnresolvedTermPattern,
         /// Patterns about the annotation subject (lowered from the
         /// non-`@`-keyword properties of the enclosing node).
         body: Vec<UnresolvedPattern>,
@@ -1169,8 +1169,40 @@ pub enum UnresolvedPattern {
     TripleTermValue {
         subject: UnresolvedTerm,
         predicate: UnresolvedTerm,
-        term: UnresolvedTriplePattern,
+        term: UnresolvedTermPattern,
     },
+}
+
+/// The triple of a triple term `<<( s p o )>>`, whose object may be another
+/// triple term.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedTermPattern {
+    pub s: UnresolvedTerm,
+    pub p: UnresolvedTerm,
+    pub o: UnresolvedTermObject,
+}
+
+/// The object of an [`UnresolvedTermPattern`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnresolvedTermObject {
+    Value {
+        o: UnresolvedTerm,
+        dtc: Option<UnresolvedDatatypeConstraint>,
+    },
+    Term(Box<UnresolvedTermPattern>),
+}
+
+impl From<UnresolvedTriplePattern> for UnresolvedTermPattern {
+    fn from(tp: UnresolvedTriplePattern) -> Self {
+        Self {
+            s: tp.s,
+            p: tp.p,
+            o: UnresolvedTermObject::Value {
+                o: tp.o,
+                dtc: tp.dtc,
+            },
+        }
+    }
 }
 
 impl UnresolvedPattern {
@@ -1325,11 +1357,11 @@ impl UnresolvedQuery {
                     UnresolvedPattern::Graph {
                         patterns: inner, ..
                     } => collect(inner, out),
-                    UnresolvedPattern::EdgeAnnotation { edge, body, .. }
-                    | UnresolvedPattern::AnnotationTarget { edge, body, .. } => {
+                    UnresolvedPattern::EdgeAnnotation { edge, body, .. } => {
                         out.push(edge);
                         collect(body, out);
                     }
+                    UnresolvedPattern::AnnotationTarget { body, .. } => collect(body, out),
                     UnresolvedPattern::Filter(_)
                     | UnresolvedPattern::Bind { .. }
                     | UnresolvedPattern::Unwind { .. }

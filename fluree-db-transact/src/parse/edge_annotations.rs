@@ -94,6 +94,17 @@ pub(crate) enum ReifiedObjectShape {
         /// to the same `lang` the base flake carries via `flake.m.lang`.
         language: Option<String>,
     },
+    /// Object is a triple term: the node naming its triple,
+    /// `{"@id": s, p: o}`.
+    TripleTerm(Value),
+}
+
+/// The triple-term shape of an object written `{"@id": {"@id": s, p: o}}`.
+fn triple_term_shape(map: &Map<String, Value>, id_alias: &str) -> Option<ReifiedObjectShape> {
+    map.get("@id")
+        .or_else(|| map.get(id_alias))
+        .filter(|id| id.is_object())
+        .map(|node| ReifiedObjectShape::TripleTerm(node.clone()))
 }
 
 /// Reject the deferred JSON-LD wrapper shapes that can't carry an edge
@@ -347,6 +358,7 @@ pub(crate) fn emit_reifies_object_payload(shape: &ReifiedObjectShape) -> (Value,
         ReifiedObjectShape::Literal {
             value, language, ..
         } => (value.clone(), language.clone()),
+        ReifiedObjectShape::TripleTerm(node) => (json!({ "@id": node }), None),
     }
 }
 
@@ -1010,6 +1022,8 @@ fn lift_annotations_under_predicate(
                 // becomes a silent no-op.
                 reject_context_coercion_on_annotated_literal(map, predicate, ctx)?;
                 classify_reified_object(map)?
+            } else if let Some(shape) = triple_term_shape(map, ctx.id_key.as_str()) {
+                shape
             } else {
                 let id_alias = ctx.id_key.as_str();
                 let object_id = map
@@ -1493,6 +1507,9 @@ fn reifies_slots(block: Value) -> Result<Map<String, Value>> {
         }
         Value::Object(object) => match object.get("@id") {
             Some(Value::String(id)) if object.len() == 1 => ReifiedObjectShape::Iri(id.clone()),
+            Some(node @ Value::Object(_)) if object.len() == 1 => {
+                ReifiedObjectShape::TripleTerm(node.clone())
+            }
             _ => {
                 return Err(TransactError::Parse(
                     "@reifies object must be an @id reference or a value".to_string(),
@@ -2046,6 +2063,8 @@ fn intercept_annotations_for_predicate(
                 // cannot silently diverge from the base flake's.
                 reject_context_coercion_on_annotated_literal(map, predicate, walk.json_ld)?;
                 classify_reified_object(map)?
+            } else if let Some(shape) = triple_term_shape(map, walk.json_ld.id_key.as_str()) {
+                shape
             } else {
                 let object_id = ensure_subject_id(map, walk, ctx);
                 ReifiedObjectShape::Iri(object_id)

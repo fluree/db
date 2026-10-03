@@ -417,15 +417,12 @@ impl TermResolver<'_> {
         self.term_components(term)
     }
 
-    /// A triple term as the IR terms of its subject, predicate and object,
-    /// when the graph IR can carry its object (any term but a nested one).
+    /// A triple term as the IR terms of its subject, predicate and object (a
+    /// nested term object among them).
     fn term_components(
         &mut self,
         term: &fluree_db_core::TripleTermValue,
     ) -> Result<Option<[IrTerm; 3]>> {
-        if matches!(term.o, FlakeValue::TripleTerm(_)) {
-            return Ok(None);
-        }
         let [s, p, o] = super::triple_term_components(term);
         let s = self.binding(&s, Position::Subject)?;
         let p = self.binding(&p, Position::Predicate)?;

@@ -1282,8 +1282,6 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     // annotation blocks `s p o {| … |}` / `s p o ~ reifier {| … |}`.
     //
     // Deliberately rejected with specific deferred errors:
-    // - `<<( … )>>` triple terms as values (no Fluree representation yet;
-    //   the triple-term-as-value epic owns this),
     // - star constructs nested inside an annotation body
     //   (annotation-of-annotation — mirrors the JSON-LD `@annotation`
     //   lowering's v1 deferral),
@@ -1325,8 +1323,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     ///
     /// Grammar: `tripleTerm ::= '<<(' ttSubject predicate ttObject ')>>'`,
     /// `ttSubject ::= iri | BlankNode`, `ttObject ::= iri | BlankNode |
-    /// literal | tripleTerm`. A nested triple term in object position is a
-    /// value with no Fluree representation and keeps the deferred error.
+    /// literal | tripleTerm`.
     fn parse_reifies_triple_term(&mut self, reifier: TermId) -> Result<()> {
         self.with_nesting(|p| {
             p.check_star_allowed("triple term ('<<( … )>>')")?;
@@ -1386,10 +1383,6 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                      not allowed inside a triple term, found {}",
                     self.current().kind
                 ),
-            )),
-            TokenKind::TripleTermStart => Err(TurtleError::parse(
-                self.current().start as usize,
-                "nested triple terms ('<<( … <<( … )>> )>>') are not supported",
             )),
             _ => self.parse_object(),
         }
@@ -2524,17 +2517,25 @@ mod tests {
     }
 
     #[test]
-    fn star_rdf_reifies_nested_triple_term_still_deferred() {
-        let mut sink = StarSink::default();
-        let err = parse(
+    fn nested_triple_terms_parse() {
+        let mut sink = GraphCollectorSink::new();
+        parse(
             &format!(
                 "{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
-                 :r rdf:reifies <<( :s :p <<( :x :y 1 )>> )>> ."
+                 :r rdf:reifies <<( :s :p <<( :x :y 1 )>> )>> .\n\
+                 :d :q <<( :s :p <<( :x :y :z )>> )>> ."
             ),
             &mut sink,
         )
-        .expect_err("nested triple term is a value with no representation");
-        assert!(err.to_string().contains("nested triple terms"), "{err}");
+        .expect("nested triple terms parse");
+        let graph = sink.into_graph();
+        let reified = &graph.reifications()[0].triple;
+        // `:s :p <<( :x :y 1 )>>` is the reified triple.
+        assert!(matches!(&reified.o, Term::TripleTerm(_)));
+        assert!(graph.triples().iter().any(|t| matches!(
+            &t.o,
+            Term::TripleTerm(outer) if matches!(&outer[2], Term::TripleTerm(_))
+        )));
     }
 
     #[test]

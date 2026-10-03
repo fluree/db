@@ -145,6 +145,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 let r = self.lower_reified_triple(qt, cache, out)?;
                 Ok((r.into(), None))
             }
+            SparqlTerm::TripleTerm(tt) => {
+                let term = self.lower_triple_term(tt, out)?;
+                Ok(fluree_db_query::ir::lower_term_object(
+                    term,
+                    self.encoder,
+                    self.vars,
+                    out,
+                ))
+            }
             other if with_constraint => self.lower_object_with_constraint(other),
             other => self.lower_object_with_term_constraint(other),
         }

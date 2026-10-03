@@ -742,29 +742,36 @@ pub async fn resolve_incremental_commits_v6(
         let base_wms: Vec<(u32, u32)> = base_refs.map(|r| r.watermarks.clone()).unwrap_or_default();
         let mut builder =
             fluree_db_binary_index::dict::TermDictBuilder::above_watermarks(&base_wms);
+        // The window's terms, inner terms first, each level's base handles
+        // in one batched lookup: a reverse lookup reads a whole tree leaf.
+        let handles = crate::run_index::resolve::resolver::intern_chunk_terms(
+            &chunk_terms,
+            &o_type_registry,
+            &mut |keys| {
+                let found = match &base_reader {
+                    Some(reader) => reader.find_handles(keys)?,
+                    None => vec![None; keys.len()],
+                };
+                keys.iter()
+                    .zip(found)
+                    .map(|(&key, found)| match found {
+                        Some(handle) => Ok(handle),
+                        None => builder.get_or_insert(key),
+                    })
+                    .collect()
+            },
+        )?;
         let triple_term = ObjKind::TRIPLE_TERM.as_u8();
-        let mut record_keys = Vec::new();
-        for (idx, record) in v1_records.iter().enumerate() {
+        for record in &mut v1_records {
             if record.o_kind != triple_term {
                 continue;
             }
-            let term = chunk_terms.get(record.o_key as usize).ok_or_else(|| {
+            record.o_key = *handles.get(record.o_key as usize).ok_or_else(|| {
                 IncrementalResolveError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("term ordinal {} out of range", record.o_key),
                 ))
             })?;
-            let key = fluree_db_core::triple_term::TermKey {
-                s_id: term.s_id.as_u64(),
-                p_id: term.p_id,
-                o_type: o_type_registry.resolve(
-                    ObjKind::from_u8(term.o_kind),
-                    fluree_db_core::DatatypeDictId::from_u16(term.dt),
-                    term.lang_id,
-                ),
-                o_key: term.o_key,
-            };
-            record_keys.push((idx, key));
         }
         let prior = |g_id: u16, ann: u64| {
             prior_attachments
@@ -779,25 +786,22 @@ pub async fn resolve_incremental_commits_v6(
                 IncrementalResolveError::Io(io::Error::other("attachment ops without link ids"))
             })?)
         };
-        // Resolve every base handle in one batched pass: a reverse lookup per
-        // term reads a whole tree leaf, and a re-point needs one for the term
-        // it retracts. A dry replay names the terms the real one will ask for.
+        // A re-point needs the base handle of the term it retracts; a dry
+        // replay names the terms the real one will ask for.
         let mut base_handles = HashMap::new();
-        if let Some(reader) = &base_reader {
-            let mut wanted: Vec<_> = record_keys.iter().map(|&(_, key)| key).collect();
-            if let Some(link_ids) = link_ids {
-                crate::run_index::resolve::link_synth::replay_attachments(
-                    &mut attachments,
-                    prior,
-                    &o_type_registry,
-                    link_ids,
-                    &mut |key| {
-                        wanted.push(key);
-                        Ok(0)
-                    },
-                    &mut |_| Ok(()),
-                )?;
-            }
+        if let (Some(reader), Some(link_ids)) = (&base_reader, link_ids) {
+            let mut wanted = Vec::new();
+            crate::run_index::resolve::link_synth::replay_attachments(
+                &mut attachments,
+                prior,
+                &o_type_registry,
+                link_ids,
+                &mut |key| {
+                    wanted.push(key);
+                    Ok(0)
+                },
+                &mut |_| Ok(()),
+            )?;
             wanted.sort_unstable();
             wanted.dedup();
             for (key, handle) in wanted.iter().zip(reader.find_handles(&wanted)?) {
@@ -812,9 +816,6 @@ pub async fn resolve_incremental_commits_v6(
                 None => builder.get_or_insert(key),
             }
         };
-        for (idx, key) in record_keys {
-            v1_records[idx].o_key = handle_for(key)?;
-        }
         if let Some(link_ids) = link_ids {
             let emitted = crate::run_index::resolve::link_synth::replay_attachments(
                 &mut attachments,

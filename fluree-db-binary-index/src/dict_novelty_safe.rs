@@ -91,16 +91,23 @@ pub fn populate_dict_novelty_safe<'a>(
             // A term's components need ids for its provisional handle's key.
             // The term itself is registered whether or not the index holds
             // it: readers try the persisted dictionary first.
+            // A nested term goes first: the outer term's key names its handle.
             FlakeValue::TripleTerm(term) => {
-                subject(dict_novelty, &term.s, flake.t)?;
-                match &term.o {
-                    FlakeValue::Ref(sid) => subject(dict_novelty, sid, flake.t)?,
-                    FlakeValue::String(s) | FlakeValue::Json(s) => {
-                        string(dict_novelty, s, flake.t)?;
-                    }
-                    _ => {}
+                let mut chain = vec![&**term];
+                while let FlakeValue::TripleTerm(inner) = &chain[chain.len() - 1].o {
+                    chain.push(inner);
                 }
-                dict_novelty.terms.assign_or_lookup_at(term, flake.t);
+                for term in chain.into_iter().rev() {
+                    subject(dict_novelty, &term.s, flake.t)?;
+                    match &term.o {
+                        FlakeValue::Ref(sid) => subject(dict_novelty, sid, flake.t)?,
+                        FlakeValue::String(s) | FlakeValue::Json(s) => {
+                            string(dict_novelty, s, flake.t)?;
+                        }
+                        _ => {}
+                    }
+                    dict_novelty.terms.assign_or_lookup_at(term, flake.t);
+                }
             }
             _ => {}
         }

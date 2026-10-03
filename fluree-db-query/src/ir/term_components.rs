@@ -111,6 +111,27 @@ pub fn lower_term_value<E: IriEncoder + ?Sized>(
     );
 }
 
+/// Lower `<<( s p o )>>` as the object of an enclosing pattern — the object
+/// of a triple term, or of an annotated edge: a composed constant (typed
+/// `f:tripleTerm`, so an enclosing constant term composes too) or a fresh term
+/// variable, with the patterns relating it to the term's components.
+pub fn lower_term_object<E: IriEncoder + ?Sized>(
+    term: TriplePattern,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut Vec<Pattern>,
+) -> (Term, Option<DatatypeConstraint>) {
+    let object = term_patterns(
+        term,
+        || fresh_term_var(vars),
+        &|iri| encoder.encode_iri(iri),
+        out,
+    );
+    let dtc = matches!(object, Term::Value(_))
+        .then(|| DatatypeConstraint::Explicit(fluree_db_core::triple_term_datatype_sid().clone()));
+    (object, dtc)
+}
+
 /// The patterns of [`lower_reified_link`], given the `rdf:reifies` ref, the
 /// term variable (asked for only when the edge is not constant), and how to
 /// encode an IRI.
@@ -122,24 +143,32 @@ pub(crate) fn link_patterns(
     encode_iri: &dyn Fn(&str) -> Option<Sid>,
     out: &mut Vec<Pattern>,
 ) {
-    // Fully constant edge: compose the term itself.
-    if let Some(term) = constant_term(&edge) {
-        out.push(Pattern::Triple(TriplePattern {
-            s: annotation_ref,
-            p: reifies,
-            o: Term::Value(FlakeValue::TripleTerm(Box::new(term))),
-            dtc: None,
-        }));
-        return;
-    }
-
-    let t = term_var();
+    let mut components = Vec::new();
+    let o = term_patterns(edge, term_var, encode_iri, &mut components);
     out.push(Pattern::Triple(TriplePattern {
         s: annotation_ref,
         p: reifies,
-        o: Term::Var(t),
+        o,
         dtc: None,
     }));
+    out.extend(components);
+}
+
+/// The term `<<( s p o )>>` of `edge`: the composed term when every position
+/// is constant, else a term variable whose relation to the positions goes
+/// into `out`.
+fn term_patterns(
+    edge: TriplePattern,
+    term_var: impl FnOnce() -> VarId,
+    encode_iri: &dyn Fn(&str) -> Option<Sid>,
+    out: &mut Vec<Pattern>,
+) -> Term {
+    // Fully constant edge: compose the term itself.
+    if let Some(term) = constant_term(&edge) {
+        return Term::Value(FlakeValue::TripleTerm(Box::new(term)));
+    }
+
+    let t = term_var();
 
     let accessor = |f: Function| Expression::call(f, vec![Expression::Var(t)]);
     let same_term = |f: Function, constant: Expression| {
@@ -219,6 +248,7 @@ pub(crate) fn link_patterns(
     {
         out.push(Pattern::TermComponents(tc));
     }
+    Term::Var(t)
 }
 
 /// A `?__term_N` variable no pattern uses yet.

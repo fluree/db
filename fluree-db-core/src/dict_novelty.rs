@@ -254,27 +254,29 @@ impl DictNovelty {
                 FlakeValue::String(s) | FlakeValue::Json(s) => {
                     self.strings.assign_or_lookup_at(s, flake.t);
                 }
-                FlakeValue::TripleTerm(term) => {
-                    self.subjects
-                        .assign_or_lookup_at(term.s.namespace_code, &term.s.name, flake.t);
-                    match &term.o {
-                        FlakeValue::Ref(sid) => {
-                            self.subjects.assign_or_lookup_at(
-                                sid.namespace_code,
-                                &sid.name,
-                                flake.t,
-                            );
-                        }
-                        FlakeValue::String(s) | FlakeValue::Json(s) => {
-                            self.strings.assign_or_lookup_at(s, flake.t);
-                        }
-                        _ => {}
-                    }
-                    self.terms.assign_or_lookup_at(term, flake.t);
-                }
+                FlakeValue::TripleTerm(term) => self.register_term(term, flake.t),
                 _ => {}
             }
         }
+    }
+
+    /// Register a term's subject, object and the term itself; a nested term
+    /// first, since the outer term's key names its handle.
+    fn register_term(&mut self, term: &TripleTermValue, t: i64) {
+        self.subjects
+            .assign_or_lookup_at(term.s.namespace_code, &term.s.name, t);
+        match &term.o {
+            FlakeValue::Ref(sid) => {
+                self.subjects
+                    .assign_or_lookup_at(sid.namespace_code, &sid.name, t);
+            }
+            FlakeValue::String(s) | FlakeValue::Json(s) => {
+                self.strings.assign_or_lookup_at(s, t);
+            }
+            FlakeValue::TripleTerm(inner) => self.register_term(inner, t),
+            _ => {}
+        }
+        self.terms.assign_or_lookup_at(term, t);
     }
 
     /// Populate the novelty dictionaries from a slice of flakes.
@@ -1100,5 +1102,31 @@ mod tests {
         assert_eq!(d.terms.find(&term("a", 1)), None);
         assert_eq!(d.terms.find(&term("b", 2)), Some(0));
         assert_eq!(d.terms.resolve(0), Some(&term("b", 2)));
+    }
+
+    /// A nested term registers before the term holding it, with its subject.
+    #[test]
+    fn nested_terms_register_inner_first() {
+        let mut d = DictNovelty::with_watermarks(vec![], 0);
+        let inner = term("inner", 1);
+        let outer = TripleTermValue {
+            s: crate::Sid::new(9, "outer"),
+            p: crate::Sid::new(9, "p"),
+            o: FlakeValue::TripleTerm(Box::new(inner.clone())),
+            dt: crate::namespaces::triple_term_datatype_sid().clone(),
+            lang: None,
+        };
+        d.populate_from_flakes(&[Flake::new(
+            crate::Sid::new(9, "doc"),
+            crate::Sid::new(9, "mentions"),
+            FlakeValue::TripleTerm(Box::new(outer.clone())),
+            crate::namespaces::triple_term_datatype_sid().clone(),
+            1,
+            true,
+            None,
+        )]);
+        assert_eq!(d.terms.find(&inner), Some(0));
+        assert_eq!(d.terms.find(&outer), Some(1));
+        assert!(d.subjects.find_subject(9, "inner").is_some());
     }
 }

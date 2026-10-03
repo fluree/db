@@ -217,8 +217,7 @@ impl<'a> FlakeSink<'a> {
     }
 }
 
-/// The triple-term value of a resolved `<<( s p o )>>`. A nested triple term
-/// as its object is refused.
+/// The triple-term value of a resolved `<<( s p o )>>`.
 pub(crate) fn triple_term_value(
     s: Option<Sid>,
     p: Option<Sid>,
@@ -229,9 +228,6 @@ pub(crate) fn triple_term_value(
             "a triple term's subject and predicate must be IRIs or blank nodes",
         ));
     };
-    if matches!(o, FlakeValue::TripleTerm(_)) {
-        return Err(SinkError::rejected("nested triple terms are not supported"));
-    }
     Ok(FlakeValue::TripleTerm(Box::new(
         fluree_db_core::TripleTermValue {
             s,

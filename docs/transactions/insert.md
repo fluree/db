@@ -386,7 +386,6 @@ Inline `@annotation` queries return one row per occurrence.
 **Deferred shapes** error with explicit messages:
 
 - Annotations on list-occurrence triples (`@list` membership).
-- Nested triple terms (a triple term's object that is itself `{"@id": {...}}`).
 - More than one predicate-object pair in one `@reifies` block (use an array of blocks to
   reify several triples).
 - Annotation-of-annotation (nested `@annotation` inside an annotation body).

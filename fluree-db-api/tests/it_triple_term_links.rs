@@ -2906,3 +2906,359 @@ async fn every_write_path_takes_triple_term_values() {
         assert_eq!(named, strings(&[&["ex:o"]]), "[{label}] in the named graph");
     }
 }
+
+/// A triple term nested in another, as a value and inside an annotated
+/// edge's term, in Turtle.
+const NESTED: &str = "@prefix ex: <http://example.org/> .\n\
+     ex:doc ex:mentions <<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>> .\n\
+     ex:alice ex:says <<( ex:s ex:p \"chat\"@fr )>> {| ex:source ex:hr |} .\n";
+
+/// [`NESTED`] reads back from `ledger`, with `docs` subjects mentioning its
+/// term, through SPARQL and JSON-LD.
+async fn assert_nested(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+    label: &str,
+    docs: usize,
+) {
+    let run = |q: &str| run_link_query(fluree, ledger, q.to_string());
+    let got = run("SELECT ?s ?p ?o WHERE { ex:doc ex:mentions ?t \
+         BIND(OBJECT(?t) AS ?inner) BIND(SUBJECT(?inner) AS ?s) \
+         BIND(PREDICATE(?inner) AS ?p) BIND(OBJECT(?inner) AS ?o) }")
+    .await;
+    assert_eq!(
+        got,
+        strings(&[&["ex:s", "ex:p", "ex:o"]]),
+        "[{label}] decomposes"
+    );
+    let got =
+        run("SELECT ?d WHERE { ?d ex:mentions <<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>> }")
+            .await;
+    assert_eq!(
+        got.len(),
+        docs,
+        "[{label}] a constant nested term matches: {got:?}"
+    );
+    let got = run(
+        "SELECT ?who ?o WHERE { ex:doc ex:mentions <<( ?who ex:says <<( ex:s ex:p ?o )>> )>> }",
+    )
+    .await;
+    assert_eq!(
+        got,
+        strings(&[&["ex:alice", "ex:o"]]),
+        "[{label}] by components"
+    );
+    let got =
+        run("SELECT ?src WHERE { ex:alice ex:says <<( ex:s ex:p ?o )>> {| ex:source ?src |} }")
+            .await;
+    assert_eq!(
+        got,
+        strings(&[&["ex:hr"]]),
+        "[{label}] an annotated term-valued edge"
+    );
+    let got = run("SELECT ?src WHERE { << ex:alice ex:says ?t ~ ?r >> ex:source ?src }").await;
+    assert_eq!(got, strings(&[&["ex:hr"]]), "[{label}] its reifier");
+    let got = run("SELECT ?r WHERE { ?r rdf:reifies ?t }").await;
+    assert_eq!(got.len(), 1, "[{label}] one link: {got:?}");
+
+    let got = support::query_jsonld_formatted(
+        fluree,
+        ledger,
+        &json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?d", "?o"],
+            "where": {"@id": "?d", "ex:mentions": {"@id": {
+                "@id": "ex:alice",
+                "ex:says": {"@id": {"@id": "ex:s", "ex:p": "?o"}}
+            }}}
+        }),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{label}] JSON-LD nested pattern: {e}"));
+    assert_eq!(
+        got.as_array().map(Vec::len),
+        Some(docs),
+        "[{label}] JSON-LD matches a nested term: {got}"
+    );
+}
+
+/// The predicate of the inner term `ex:doc3` mentions.
+async fn fresh(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) -> Vec<Vec<String>> {
+    run_link_query(
+        fluree,
+        ledger,
+        "SELECT ?p WHERE { ex:doc3 ex:mentions <<( ex:bob ex:says <<( ex:x ?p ex:y )>> )>> }"
+            .to_string(),
+    )
+    .await
+}
+
+/// Nested triple terms are values like any other: they store, index,
+/// query, write back and round-trip.
+#[tokio::test]
+async fn nested_triple_terms_are_values() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/triple-term-links:nested";
+    let ledger = fluree
+        .insert_turtle(support::genesis_ledger(&fluree, ledger_id), NESTED)
+        .await
+        .expect("insert nested terms")
+        .ledger;
+    assert_nested(&fluree, &ledger, "novelty", 1).await;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert_nested(&fluree, &ledger, "rebuild", 1).await;
+
+    // A nested term whose inner term is new to the index.
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> .\n\
+             ex:doc2 ex:mentions <<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>> .\n\
+             ex:doc3 ex:mentions <<( ex:bob ex:says <<( ex:x ex:fresh ex:y )>> )>> .",
+        )
+        .await
+        .expect("insert over an index")
+        .ledger;
+    assert_nested(&fluree, &ledger, "novelty over an index", 2).await;
+    assert_eq!(
+        fresh(&fluree, &ledger).await,
+        strings(&[&["ex:fresh"]]),
+        "novelty over an index"
+    );
+
+    for (format, file) in [
+        (fluree_db_api::export::ExportFormat::Turtle, "nested.ttl"),
+        (fluree_db_api::export::ExportFormat::JsonLd, "nested.jsonld"),
+    ] {
+        let mut buf = Vec::new();
+        fluree
+            .export(ledger_id)
+            .format(format)
+            .write_to(&mut buf)
+            .await
+            .unwrap_or_else(|e| panic!("export {file}: {e}"));
+        let exported = String::from_utf8(buf).expect("utf8");
+        let (reimported, reloaded) = import(
+            &[(file, &exported)],
+            &format!("it/triple-term-links:n-{file}"),
+        )
+        .await;
+        assert_nested(&reimported, &reloaded, file, 2).await;
+        assert_eq!(
+            fresh(&reimported, &reloaded).await,
+            strings(&[&["ex:fresh"]]),
+            "[{file}] {exported}"
+        );
+    }
+
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert_nested(&fluree, &ledger, "incremental", 2).await;
+    assert_eq!(
+        fresh(&fluree, &ledger).await,
+        strings(&[&["ex:fresh"]]),
+        "incremental"
+    );
+}
+
+/// A components relation anchored on a constant subject can run before the
+/// pattern binding its term, and then offers novelty's terms of every
+/// predicate, nested ones too, not only its links'.
+#[tokio::test]
+async fn term_components_offer_novelty_value_terms_when_they_lead() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/triple-term-links:tc-novelty";
+    let docs: String = (0..300)
+        .map(|i| format!("ex:d{i} ex:mentions <<( ex:s{i} ex:p ex:o{i} )>> .\n"))
+        .collect();
+    fluree
+        .insert_turtle(
+            support::genesis_ledger(&fluree, ledger_id),
+            &format!("@prefix ex: <http://example.org/> .\n{docs}"),
+        )
+        .await
+        .expect("insert");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree
+        .insert_turtle(
+            fluree.ledger(ledger_id).await.expect("load"),
+            "@prefix ex: <http://example.org/> .\n\
+             ex:dx ex:mentions <<( ex:target ex:q ex:z )>> .\n\
+             ex:dy ex:mentions <<( ex:who ex:says <<( ex:target ex:r ex:z )>> )>> .",
+        )
+        .await
+        .expect("insert over an index")
+        .ledger;
+    let sparql = "PREFIX ex: <http://example.org/>\n\
+                  SELECT ?d ?p WHERE { ?d ex:mentions <<( ex:target ?p ?o )>> }";
+    let plan = fluree
+        .explain_sparql(&support::graphdb_from_ledger(&ledger), sparql)
+        .await
+        .expect("explain")
+        .to_string();
+    assert!(
+        plan.find("TermComponentsOperator") > plan.find("NestedLoopJoinOperator"),
+        "the components relation leads: {plan}"
+    );
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT ?d ?p WHERE { ?d ex:mentions <<( ex:target ?p ?o )>> }".to_string(),
+    )
+    .await;
+    assert_eq!(got, strings(&[&["ex:dx", "ex:q"]]));
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT ?d ?p WHERE { ?d ex:mentions <<( ?w ex:says <<( ex:target ?p ?o )>> )>> }"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(got, strings(&[&["ex:dy", "ex:r"]]), "a nested term");
+    let reloaded = fluree.ledger(ledger_id).await.expect("reload");
+    let got = run_link_query(
+        &fluree,
+        &reloaded,
+        "SELECT ?d ?p WHERE { ?d ex:mentions <<( ?w ex:says <<( ex:target ?p ?o )>> )>> }"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(
+        got,
+        strings(&[&["ex:dy", "ex:r"]]),
+        "a nested term, reloaded"
+    );
+}
+
+/// Every write surface takes a nested triple term, and an annotation on a
+/// triple whose object is one; the delete forms remove one.
+#[tokio::test]
+async fn every_write_path_takes_nested_triple_terms() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let fresh_ledger = |id: &str| support::genesis_ledger(&fluree, id);
+    let nested_jsonld = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:doc", "ex:mentions": {"@id": {
+                "@id": "ex:alice",
+                "ex:says": {"@id": {"@id": "ex:s", "ex:p": {"@id": "ex:o"}}}
+            }}},
+            {"@id": "ex:alice", "ex:says": {
+                "@id": {"@id": "ex:s", "ex:p": {"@value": "chat", "@language": "fr"}},
+                "@annotation": {"ex:source": {"@id": "ex:hr"}}
+            }}
+        ]
+    });
+    let ledger = fluree
+        .insert(fresh_ledger("it/tt-nested:jsonld"), &nested_jsonld)
+        .await
+        .expect("JSON-LD insert")
+        .ledger;
+    assert_nested(&fluree, &ledger, "JSON-LD insert", 1).await;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "delete": {"@id": "ex:doc", "ex:mentions": {"@id": {
+                    "@id": "ex:alice",
+                    "ex:says": {"@id": {"@id": "ex:s", "ex:p": {"@id": "ex:o"}}}
+                }}}
+            }),
+        )
+        .await
+        .expect("JSON-LD delete")
+        .ledger;
+    let mentions = |ledger: LedgerState| {
+        let fluree = &fluree;
+        async move {
+            run_link_query(
+                fluree,
+                &ledger,
+                "SELECT ?t WHERE { ?d ex:mentions ?t }".to_string(),
+            )
+            .await
+            .len()
+        }
+    };
+    assert_eq!(mentions(ledger).await, 0, "a JSON-LD delete removes it");
+
+    let ledger = fluree
+        .upsert_turtle(fresh_ledger("it/tt-nested:upsert"), NESTED)
+        .await
+        .expect("Turtle upsert")
+        .ledger;
+    assert_nested(&fluree, &ledger, "Turtle upsert", 1).await;
+
+    let ledger_id = "it/tt-nested:sparql";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let update = |body: &str| {
+        let body = format!("PREFIX ex: <http://example.org/>\n{body}");
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph(ledger_id)
+                .transact()
+                .sparql_update(&body)
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{body}: {e}"));
+            fluree.ledger(ledger_id).await.expect("load")
+        }
+    };
+    let ledger = update(
+        "INSERT DATA { ex:doc ex:mentions <<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>> . \
+         ex:alice ex:says <<( ex:s ex:p \"chat\"@fr )>> {| ex:source ex:hr |} }",
+    )
+    .await;
+    assert_nested(&fluree, &ledger, "SPARQL INSERT DATA", 1).await;
+    // A term built in WHERE, nested, is stored, indexed and read back.
+    let ledger = update(
+        "INSERT { ex:doc2 ex:mentions ?t } WHERE { \
+         BIND(TRIPLE(ex:alice, ex:says, TRIPLE(ex:s, ex:p, ex:o)) AS ?t) }",
+    )
+    .await;
+    assert_nested(&fluree, &ledger, "SPARQL INSERT WHERE", 2).await;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert_nested(&fluree, &ledger, "SPARQL INSERT WHERE, indexed", 2).await;
+    let ledger = update(
+        "DELETE DATA { ex:doc ex:mentions <<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>> }",
+    )
+    .await;
+    assert_eq!(mentions(ledger).await, 1, "DELETE DATA removes one");
+    let ledger =
+        update("DELETE WHERE { ?d ex:mentions <<( ?w ex:says <<( ex:s ex:p ?o )>> )>> }").await;
+    assert_eq!(
+        mentions(ledger).await,
+        0,
+        "DELETE WHERE matches through the nesting"
+    );
+
+    let trig = format!(
+        "{NESTED}ex:g {{ ex:doc ex:mentions <<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>> . }}\n"
+    );
+    let inserted = fluree
+        .insert_turtle(fresh_ledger("it/tt-nested:trig"), &trig)
+        .await
+        .expect("TriG insert")
+        .ledger;
+    assert_nested(&fluree, &inserted, "TriG insert", 1).await;
+    let (imported, imported_ledger) =
+        import(&[("nested.trig", &trig)], "it/tt-nested:import-trig").await;
+    assert_nested(&imported, &imported_ledger, "TriG import", 1).await;
+    for (fluree, ledger, label) in [
+        (&fluree, &inserted, "TriG insert"),
+        (&imported, &imported_ledger, "TriG import"),
+    ] {
+        let named = run_link_query(
+            fluree,
+            ledger,
+            "SELECT ?o WHERE { GRAPH ex:g { ex:doc ex:mentions <<( ex:alice ex:says <<( ex:s ex:p ?o )>> )>> } }"
+                .to_string(),
+        )
+        .await;
+        assert_eq!(named, strings(&[&["ex:o"]]), "[{label}] in the named graph");
+    }
+}

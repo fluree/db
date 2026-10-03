@@ -27,7 +27,7 @@ If a fact is naturally about a *node* (Alice's birthdate, Acme's industry), put 
 |---|---|---|
 | **JSON-LD insert / upsert / update** | `@annotation` (or alias `@edge`) on a value object | Most ergonomic. Covers literal-valued edges (with explicit `@type` / `@language`), parallel annotations, named reifiers, and **named-graph edges** (an annotation on an edge inside a named graph is written into that same graph, keeping the edge's graph identity). A node's `@reifies` (`{"@id": s, p: o}`, or an array of them) makes the node a reifier of that triple **without asserting it**, as `r rdf:reifies <<( s p o )>>` does. |
 | **SPARQL 1.2 UPDATE** | `INSERT DATA { :s :p :o {\| ... \|} }`, `~ <reifier>`, optional `INSERT { } WHERE { }` templates | Use this when integrating with SPARQL pipelines or when porting from RDF 1.2 / SPARQL-star. Works inside `GRAPH { }` blocks and under `WITH <g>`; `<< :s :p :o ~ :r >>` reifies without asserting. See [SPARQL 1.2 surface](#sparql-12--rdf-12-surface) below for the per-operation rules. |
-| **Turtle / N-Triples / TriG / N-Quads ingest** (`insert`, `upsert`, bulk `import`, graph sync (`fluree sync`, `/sync`), memory import; TriG via `insert` / `upsert` / `import` / `fluree sync` / `/sync`) | RDF 1.2 forms: the annotation syntax `:s :p :o ~ <reifier> {\| ... \|}`, `<< :s :p :o ~ :r >>` in subject or object position, and the canonical `:r rdf:reifies <<( :s :p :o )>>` (the only star spelling N-Triples and N-Quads have) — in the default graph and inside TriG `GRAPH { }` blocks alike | Same stored link as `@annotation`. An annotation inside a `GRAPH { }` block, or on an N-Quads statement with a graph label, is written into that graph with the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does. As in RDF 1.2, only the annotation syntax asserts the triple: `<< s p o >>` and `rdf:reifies <<( s p o )>>` reify it without asserting it, so N-Triples and N-Quads state an annotated triple as the triple plus its reifier's link. Rejected with a specific error: `<<( ... )>>` as a subject, nested triple terms, star constructs inside an annotation body, annotations on collections, and annotations in a TriG `<#txn-meta>` block. Paths that convert to JSON-LD first (`upsert`, `graph sync`, memory import) also reject an annotation on an `rdf:type` edge. See [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star). |
+| **Turtle / N-Triples / TriG / N-Quads ingest** (`insert`, `upsert`, bulk `import`, graph sync (`fluree sync`, `/sync`), memory import; TriG via `insert` / `upsert` / `import` / `fluree sync` / `/sync`) | RDF 1.2 forms: the annotation syntax `:s :p :o ~ <reifier> {\| ... \|}`, `<< :s :p :o ~ :r >>` in subject or object position, and the canonical `:r rdf:reifies <<( :s :p :o )>>` (the only star spelling N-Triples and N-Quads have) — in the default graph and inside TriG `GRAPH { }` blocks alike | Same stored link as `@annotation`. An annotation inside a `GRAPH { }` block, or on an N-Quads statement with a graph label, is written into that graph with the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does. As in RDF 1.2, only the annotation syntax asserts the triple: `<< s p o >>` and `rdf:reifies <<( s p o )>>` reify it without asserting it, so N-Triples and N-Quads state an annotated triple as the triple plus its reifier's link. Rejected with a specific error: `<<( ... )>>` as a subject, star constructs inside an annotation body, annotations on collections, and annotations in a TriG `<#txn-meta>` block. Paths that convert to JSON-LD first (`upsert`, `graph sync`, memory import) also reject an annotation on an `rdf:type` edge. See [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star). |
 
 Mint annotations through `@annotation` / `@edge` (JSON-LD) or the RDF 1.2 forms (`~`, `{| |}`, `<< >>`, `rdf:reifies <<( )>>`) in SPARQL UPDATE and Turtle. The [`f:reifies*` predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) earlier releases stored annotations under are reserved, and the write surfaces reject them; bulk import reads them, as an export written before links carries them, and stores each annotation's link instead.
 
@@ -141,7 +141,7 @@ A few rules that keep the annotation's identity in sync with the base flake:
 - **Language-tagged literals are language-pinned.** Two annotations on `"chat"@fr` and `"chat"@en` are independent; selector-form retracts and hydration both match on language.
 - **Hydration promotes annotated literals to value-object form.** A subject expansion (`select: {"?s": ["*"]}`) renders unannotated `ex:name "Alice"` as the scalar `"Alice"`, but renders the annotated form as `{"@value": "Alice", "@annotation": {...}}` so the annotation has somewhere to attach.
 
-The deferred shapes from "Current limits" below (list occurrences, nested triple terms) still apply on the literal path.
+The deferred shape from "Current limits" below (list occurrences) still applies on the literal path.
 
 ### Querying inline: edge first, metadata second
 
@@ -427,7 +427,7 @@ Notes:
 
 - An `annotationBlock` without a preceding `~` mints a fresh anonymous reifier.
 - A bare `~` (no identifier) is equivalent to `~` + a fresh blank node — useful when you want a reifier variable bound in WHERE but don't care about its IRI.
-- `tripleTerm` (the parenthesized `<<( s p o )>>` form) is a value in object position: a reifier's triple under `rdf:reifies`, a stored value under any other predicate (see [Triple terms as values](#triple-terms-as-values)). As a subject, or nested in another triple term, it errors at parse time.
+- `tripleTerm` (the parenthesized `<<( s p o )>>` form) is a value in object position: a reifier's triple under `rdf:reifies`, a stored value under any other predicate, or another triple term's object (see [Triple terms as values](#triple-terms-as-values)). As a subject it errors at parse time.
 - Property-path triples cannot carry an annotation tail. `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — write a simple-predicate triple instead.
 
 ### SPARQL UPDATE rules by operation
@@ -528,13 +528,14 @@ A triple term is also an ordinary value under any predicate. `ex:doc ex:mentions
 - SPARQL UPDATE: `INSERT DATA`, `DELETE DATA`, `DELETE WHERE` and templates.
 - JSON-LD: the triple's node as the value's `@id`, `"ex:mentions": {"@id": {"@id": "ex:s", "ex:p": {"@id": "ex:o"}}}`.
 
-A query matches one as a constant (`?d ex:mentions <<( ex:s ex:p ex:o )>>`) or by its components (`?d ex:mentions <<( ex:s ?p ?o )>>`; in JSON-LD, `{"@id": {"@id": "ex:s", "ex:p": "?o"}}`), and `SUBJECT`, `PREDICATE` and `OBJECT` take a bound one apart (JSON-LD names them `subject`, `predicate` and `object`; see [JSON-LD query](../query/jsonld-query.md#triple-term-functions)). Results, CONSTRUCT output and exports write it back in the same forms (see [Output formats](../query/output-formats.md#triple-terms)), so it round-trips.
+A query matches one as a constant (`?d ex:mentions <<( ex:s ex:p ex:o )>>`, or a `VALUES` row) or by its components (`?d ex:mentions <<( ex:s ?p ?o )>>`; in JSON-LD, `{"@id": {"@id": "ex:s", "ex:p": "?o"}}`), and `SUBJECT`, `PREDICATE` and `OBJECT` take a bound one apart (JSON-LD names them `subject`, `predicate` and `object`; see [JSON-LD query](../query/jsonld-query.md#triple-term-functions)). Results, CONSTRUCT output and exports write it back in the same forms (see [Output formats](../query/output-formats.md#triple-terms)), so it round-trips.
+
+A triple term's object may itself be a triple term — `<<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>>` — on every surface above, and a triple whose object is a triple term can be annotated like any other. `sameTerm` compares two triple terms as terms; `=` compares them as values, so `<<( :a :b 123 )>> = <<( :a :b 123.0 )>>` holds while `sameTerm` does not.
 
 ### Deferred SPARQL shapes (rejected at parse time)
 
 These produce a clear error with a span pointing at the offending construct:
 
-- **Nested triple terms.** `<<( :s :p <<( :a :b :c )>> )>>` is rejected.
 - **Annotation on a property-path triple.** `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — the grammar only attaches annotations to simple-predicate triples.
 - **Property paths and nested triple terms in a `CONSTRUCT` template's annotation.** A template annotation block (`{| ... |}`) takes simple predicates only, and a template triple term (`?r rdf:reifies <<( ... )>>`) cannot nest.
 
@@ -563,8 +564,6 @@ The bare-quoted-triple form combined with an annotation tail (`<< :s :p :o >> :p
 Today's surface covers the common LPG / RDF-star use cases. The following are not yet supported and produce a clear validation error rather than silent partial behavior:
 
 - **Annotations on list-occurrence triples.** `@list` membership is in scope as a future extension; the on-disk format already reserves space for it. Today, annotating a list element is rejected at parse time.
-- **Nested triple terms.** A triple term whose object is another triple term (`<<( :s :p <<( :a :b :c )>> )>>`), and a reifier of a triple whose object is one, are rejected on every write surface.
-- **Triple-term constants in `VALUES`.** `VALUES ?t { <<( :s :p :o )>> }` is rejected; bind one with `BIND(<<( :s :p :o )>> AS ?t)` instead.
 - **Triple-term constants in a `CONSTRUCT` template** other than the object of `rdf:reifies`. A template variable bound to a term (`CONSTRUCT { ?d :mentions ?t }`) writes it.
 
 The mandated SPARQL 1.2 `VERSION "1.2"` prologue declaration is **accepted** (lex-and-skipped): the RDF 1.2 surface runs ungated, so a conformant 1.2 client that emits the declaration parses normally.

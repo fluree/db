@@ -523,12 +523,54 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 "RDF 1.2 reified triples (`<< s p o >>`) as VALUES data",
                 qt.span,
             )),
-            // SPARQL 1.2 triple-term value as VALUES data: parse-accepted,
-            // lower-deferred (burn-down D-1).
-            SparqlTerm::TripleTerm(tt) => Err(LowerError::not_implemented(
-                "SPARQL 1.2 triple-term values (`<<( s p o )>>`) as VALUES data",
-                tt.span,
-            )),
+            SparqlTerm::TripleTerm(tt) => {
+                let node = |binding: Binding| match binding {
+                    Binding::Sid { sid, .. } => Ok(sid),
+                    _ => Err(LowerError::not_implemented(
+                        "a triple term in VALUES data whose subject is not an IRI",
+                        tt.span,
+                    )),
+                };
+                let s = match &tt.subject {
+                    SubjectTerm::Iri(iri) => {
+                        node(self.term_to_binding(&SparqlTerm::Iri(iri.clone()))?)?
+                    }
+                    _ => node(Binding::Unbound)?,
+                };
+                let p = match &tt.predicate {
+                    PredicateTerm::Iri(iri) => {
+                        node(self.term_to_binding(&SparqlTerm::Iri(iri.clone()))?)?
+                    }
+                    PredicateTerm::Var(_) => node(Binding::Unbound)?,
+                };
+                let (o, dt, lang) = match self.term_to_binding(&tt.object)? {
+                    Binding::Sid { sid, .. } => (
+                        FlakeValue::Ref(sid),
+                        fluree_db_core::edge::id_datatype_sid(),
+                        None,
+                    ),
+                    Binding::Lit { val, dtc, .. } => {
+                        let lang = dtc.lang_tag().map(str::to_string);
+                        (val, dtc.datatype().clone(), lang)
+                    }
+                    _ => {
+                        return Err(LowerError::not_implemented(
+                            "a triple term in VALUES data whose object is not a constant",
+                            tt.span,
+                        ))
+                    }
+                };
+                Ok(Binding::lit(
+                    FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+                        s,
+                        p,
+                        o,
+                        dt,
+                        lang,
+                    })),
+                    fluree_db_core::triple_term_datatype_sid().clone(),
+                ))
+            }
         }
     }
 }

@@ -316,15 +316,15 @@ fn process_triple_term<S: GraphSink>(
         Value::Array(_) => return Err(invalid("it must describe exactly one triple")),
         value => value,
     };
-    // A node with properties would assert them, and a term does not nest.
+    // A node with properties would assert them.
     let reference_or_value = match value {
-        Value::Object(o) => {
-            o.contains_key("@value") || (o.len() == 1 && o.get("@id").is_some_and(Value::is_string))
-        }
+        Value::Object(o) => o.contains_key("@value") || (o.len() == 1 && o.contains_key("@id")),
         _ => true,
     };
     if !reference_or_value {
-        return Err(invalid("its object must be a reference or a value"));
+        return Err(invalid(
+            "its object must be a reference, a value or a triple term",
+        ));
     }
     let ProcessedValue::Single(object) = process_value(value, sink)? else {
         return Err(invalid("its object must be a reference or a value"));

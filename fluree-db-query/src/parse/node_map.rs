@@ -6,8 +6,9 @@
 
 use super::ast::{
     UnresolvedDatatypeConstraint, UnresolvedIndexSearchPattern, UnresolvedIndexSearchTarget,
-    UnresolvedPathExpr, UnresolvedPattern, UnresolvedQuery, UnresolvedTerm,
-    UnresolvedTriplePattern, UnresolvedVectorSearchPattern, UnresolvedVectorSearchTarget,
+    UnresolvedPathExpr, UnresolvedPattern, UnresolvedQuery, UnresolvedTerm, UnresolvedTermObject,
+    UnresolvedTermPattern, UnresolvedTriplePattern, UnresolvedVectorSearchPattern,
+    UnresolvedVectorSearchTarget,
 };
 use super::error::{ParseError, Result};
 use super::policy::JsonLdParseCtx;
@@ -1305,7 +1306,8 @@ fn parse_literal_edge_annotation(
 }
 
 /// Lower a node-map describing one triple (an `@reifies` value, or a
-/// triple-term value's `@id`) to a single `UnresolvedTriplePattern`.
+/// triple-term value's `@id`) to its pattern; its object may be a triple
+/// term.
 ///
 /// Reuses the regular `parse_node_map` machinery via a buffer, then
 /// asserts the result is exactly one triple. `what` names the form in
@@ -1317,7 +1319,7 @@ fn parse_reifies_edge(
     subject_counter: &mut u32,
     nested_counter: &mut u32,
     object_var_parsing: bool,
-) -> Result<UnresolvedTriplePattern> {
+) -> Result<UnresolvedTermPattern> {
     let JsonValue::Object(rmap) = value else {
         return Err(ParseError::InvalidWhere(format!(
             "{what} must be a node-map describing the base triple"
@@ -1343,7 +1345,16 @@ fn parse_reifies_edge(
     }
 
     match buffer.patterns.into_iter().next().unwrap() {
-        UnresolvedPattern::Triple(tp) => Ok(tp),
+        UnresolvedPattern::Triple(tp) => Ok(tp.into()),
+        UnresolvedPattern::TripleTermValue {
+            subject,
+            predicate,
+            term,
+        } => Ok(UnresolvedTermPattern {
+            s: subject,
+            p: predicate,
+            o: UnresolvedTermObject::Term(Box::new(term)),
+        }),
         _ => Err(ParseError::InvalidWhere(format!(
             "{what} must describe a basic triple pattern; \
              property paths, lists, and other shapes are deferred to v2"

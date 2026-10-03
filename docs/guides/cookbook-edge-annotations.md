@@ -315,7 +315,7 @@ The edge and every other claim on it stay live. The named claim's body (`ex:conf
 - **Deleting a claim with `DELETE DATA { … ~ :claim {| … |} }` deletes the edge**, so the annotation syntax stops matching every other claim on it. Retract one claim with the JSON-LD by-id form (see [above](#retract-one-claim-and-keep-the-edge)).
 - **Don't write `f:reifies*` predicates by hand.** They're reserved and rejected on every write surface; they're also hidden from `?p` scans and `select: "*"`. Use `@annotation` / the annotation tail. (See [Vocabulary](../reference/vocabulary.md#edge-annotation-predicates-reserved).)
 - **Empty `@annotation: {}`** is a no-op in RDF mode (no subject minted); in LPG mode it mints a property-less relationship with identity.
-- **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements and nested triple terms. See [Current limits](../concepts/edge-annotations.md#current-limits).
+- **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements. See [Current limits](../concepts/edge-annotations.md#current-limits).
 
 ## See also
 

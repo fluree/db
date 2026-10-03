@@ -1251,8 +1251,10 @@ fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
             }
         };
         rewrite(&mut out.subject, &mut out.object);
-        if let Term::TripleTerm(tt) = &mut out.object {
+        let mut object = &mut out.object;
+        while let Term::TripleTerm(tt) = object {
             rewrite(&mut tt.subject, &mut tt.object);
+            object = &mut tt.object;
         }
         out
     };
@@ -1520,19 +1522,6 @@ fn lower_triple_to_template(
             let result = literal_to_template(lit, prologue, ns)?;
             (result.term, result.dtc)
         }
-        Term::TripleTerm(tt) => {
-            let s = subject_to_template(&tt.subject, prologue, ns, vars, bnodes)?;
-            let p = predicate_to_template(&tt.predicate, prologue, ns, vars)?;
-            let (o, dtc) = match &tt.object {
-                Term::Literal(lit) => {
-                    let result = literal_to_template(lit, prologue, ns)?;
-                    (result.term, result.dtc)
-                }
-                other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
-            };
-            let term = TemplateTripleTerm { s, p, o, dtc };
-            (TemplateTerm::TripleTerm(Box::new(term)), None)
-        }
         other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
     };
 
@@ -1642,16 +1631,7 @@ fn lower_triple_to_delete_template_delete_where(
 ) -> Result<TripleTemplate, LowerError> {
     let subject = delete_where_subject_template(&triple.subject, prologue, ns, vars, bnodes)?;
     let predicate = delete_where_predicate_template(&triple.predicate, prologue, ns, vars)?;
-    let (object, dtc) = match &triple.object {
-        Term::TripleTerm(tt) => {
-            let s = delete_where_subject_template(&tt.subject, prologue, ns, vars, bnodes)?;
-            let p = delete_where_predicate_template(&tt.predicate, prologue, ns, vars)?;
-            let (o, dtc) = delete_where_object_template(&tt.object, prologue, ns, vars, bnodes)?;
-            let term = TemplateTripleTerm { s, p, o, dtc };
-            (TemplateTerm::TripleTerm(Box::new(term)), None)
-        }
-        other => delete_where_object_template(other, prologue, ns, vars, bnodes)?,
-    };
+    let (object, dtc) = delete_where_object_template(&triple.object, prologue, ns, vars, bnodes)?;
 
     Ok(TripleTemplate {
         subject,
@@ -1763,9 +1743,11 @@ fn delete_where_object_template(
                 span: qt.span,
             });
         }
+        // `lower_delete_where` sends a triple-term object down the
+        // graph-pattern lane.
         Term::TripleTerm(tt) => {
             return Err(LowerError::UnsupportedFeature {
-                feature: "a triple term nested in a triple term",
+                feature: "a triple term on the triple-only DELETE WHERE lane",
                 span: tt.span,
             });
         }
@@ -1948,10 +1930,19 @@ fn object_to_template(
             feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
             span: qt.span,
         }),
-        Term::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
-            feature: "a triple term nested in a triple term",
-            span: tt.span,
-        }),
+        Term::TripleTerm(tt) => {
+            let s = subject_to_template(&tt.subject, prologue, ns, vars, bnodes)?;
+            let p = predicate_to_template(&tt.predicate, prologue, ns, vars)?;
+            let (o, dtc) = match &tt.object {
+                Term::Literal(lit) => {
+                    let result = literal_to_template(lit, prologue, ns)?;
+                    (result.term, result.dtc)
+                }
+                other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
+            };
+            let term = TemplateTripleTerm { s, p, o, dtc };
+            Ok(TemplateTerm::TripleTerm(Box::new(term)))
+        }
     }
 }
 

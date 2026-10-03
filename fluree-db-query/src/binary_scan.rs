@@ -4603,6 +4603,11 @@ pub(crate) fn compose_term_handle(
         Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::Unsupported) => {}
         Err(e) => return Err(e),
     }
+    // A provisional handle's key names its nested term's handle, so a term
+    // whose nested term has none stays materialized too.
+    if let FlakeValue::TripleTerm(inner) = &term.o {
+        compose_term_handle(inner, store, dict_novelty)?;
+    }
     let provisional = dict_novelty
         .filter(|dn| dn.is_initialized())
         .and_then(|dn| dn.terms.find(term))

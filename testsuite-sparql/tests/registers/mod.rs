@@ -387,34 +387,10 @@ pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[];
 // entries double-counted across clusters); attribution below re-verified
 // empirically by unregistering and reading the harness's failure reasons.
 pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
-    // data load: qt:data nests a triple term in another
-    // (`<<( … <<( … )>> )>>`, or a reifier of a triple whose object is a
-    // triple term), which ingest refuses (9)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1j",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1x",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-8",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-9",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-10",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-11",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
-    // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
-    // (D-8) — "expected subject, found 'GRAPH'" (3)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
+    // update: a `GRAPH ?g` name binds a raw IRI, which an INSERT template
+    // cannot write as an object (2)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
-    // SRX results: the harness reads no `<triple>` result term (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
-    // results not isomorphic: the template reifies `_:r rdf:reifies <<( … )>>`,
-    // a nested triple term the result drops (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
-    // SPARQL lowering: triple-term values in VALUES data not implemented (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
-    // update-3: the `{| |}` INSERT DATA executes, but the expected post-update
-    // TriG-star graph carries reifier semantics the harness comparison does
-    // not model (expected 2 triples, got 0 in the default graph) (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-3",
 ];
 
 pub const SPARQL12_EXPRESSION: &[&str] = &[
@@ -578,18 +554,9 @@ pub const RDF11_TURTLE: &[&str] = &[
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-ln-dots",
 ];
 
-pub const RDF12_TURTLE_SYNTAX: &[&str] = &[
-    // nested triple terms (`<<( s p <<( … )>> )>>`) are deferred; ingest
-    // rejects them with the specific error (2)
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-3",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-nested-1",
-];
+pub const RDF12_TURTLE_SYNTAX: &[&str] = &[];
 
 pub const RDF12_TURTLE_EVAL: &[&str] = &[
-    // action rejected: nested triple terms (`<<( s p <<( … )>> )>>`) are
-    // deferred (2)
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-03",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-04",
     // action rejected: annotation-of-annotation (a `{| |}` or `<< >>` inside an
     // annotation body) is the deferred v1 shape, mirroring JSON-LD (2)
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-04",

@@ -590,35 +590,37 @@ mod inner {
             self.write_term_record(ann, None, term, t)
         }
 
-        /// Spool `s p <<( … )>>`: the term's components as a term-table
-        /// pseudo-record, and the statement with the term's ordinal as its
-        /// object. `p` is `rdf:reifies` when `None`.
-        fn write_term_record(
+        /// A term's term-table entry, written after its inner term's when it
+        /// nests one (whose ordinal is then its object): the entry's ordinal,
+        /// or `None` when its object has no spool encoding.
+        fn spool_term(
             &mut self,
-            s: &Sid,
-            p: Option<&Sid>,
             term: &fluree_db_core::TripleTermValue,
             t: i64,
-        ) -> Result<(), CommitCodecError> {
+        ) -> Result<Option<u64>, CommitCodecError> {
             let s_id = self.assign_subject_id(&term.s);
             let p_id = self.assign_predicate_id(&term.p);
             let dt_id = self.assign_datatype_id(&term.dt)?;
             // An arena handle names a value only within one graph and
             // predicate; a term keys the object by its canonical form.
-            let resolved = match fluree_db_core::triple_term::lexical_term_object(&term.o) {
-                Some((o_type, form)) => {
-                    let o_kind = if o_type == fluree_db_core::o_type::OType::VECTOR {
-                        ObjKind::VECTOR_ID
-                    } else {
-                        ObjKind::NUM_BIG
-                    };
-                    let id = self.assign_string_id(&form);
-                    Some((o_kind.as_u8(), ObjKey::encode_u32_id(id).as_u64()))
-                }
-                None => self.resolve_object_value(&term.o, p_id),
+            let resolved = if let FlakeValue::TripleTerm(inner) = &term.o {
+                self.spool_term(inner, t)?
+                    .map(|ordinal| (ObjKind::TRIPLE_TERM.as_u8(), ordinal))
+            } else if let Some((o_type, form)) =
+                fluree_db_core::triple_term::lexical_term_object(&term.o)
+            {
+                let o_kind = if o_type == fluree_db_core::o_type::OType::VECTOR {
+                    ObjKind::VECTOR_ID
+                } else {
+                    ObjKind::NUM_BIG
+                };
+                let id = self.assign_string_id(&form);
+                Some((o_kind.as_u8(), ObjKey::encode_u32_id(id).as_u64()))
+            } else {
+                self.resolve_object_value(&term.o, p_id)
             };
             let Some((o_kind, o_key)) = resolved else {
-                return Ok(());
+                return Ok(None);
             };
             let lang_id = term
                 .lang
@@ -638,7 +640,22 @@ mod inner {
                 lang_id,
                 i: LIST_INDEX_NONE,
             });
+            Ok(Some(ordinal))
+        }
 
+        /// Spool `s p <<( … )>>`: the term's components as a term-table
+        /// pseudo-record, and the statement with the term's ordinal as its
+        /// object. `p` is `rdf:reifies` when `None`.
+        fn write_term_record(
+            &mut self,
+            s: &Sid,
+            p: Option<&Sid>,
+            term: &fluree_db_core::TripleTermValue,
+            t: i64,
+        ) -> Result<(), CommitCodecError> {
+            let Some(ordinal) = self.spool_term(term, t)? else {
+                return Ok(());
+            };
             let link_p = match (p, self.rdf_reifies_pid) {
                 (Some(p), _) => self.assign_predicate_id(p),
                 (None, Some(p)) => p,

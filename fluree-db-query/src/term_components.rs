@@ -92,39 +92,44 @@ impl TermComponentsOperator {
         }
     }
 
-    /// The terms novelty's links assert that the dictionary does not hold.
+    /// The terms novelty holds that the dictionary does not: those of any
+    /// predicate, and those nested in them. The relation may offer a term no
+    /// asserted flake still holds; the pattern binding the term joins it out.
     fn collect_novelty_terms(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<NoveltyTerm>> {
-        let reifies = fluree_db_core::rdf_reifies_sid();
-        let (first, rhs) = crate::fast_path_common::predicate_walk_bounds(reifies);
+        let dict_novelty = ctx.dict_novelty.as_ref();
         let mut seen: HashSet<TripleTermValue> = HashSet::new();
-        let mut visit = |overlay: &dyn fluree_db_core::OverlayProvider, g_id, to_t| {
-            overlay.for_each_overlay_flake(
-                g_id,
-                fluree_db_core::IndexType::Post,
-                Some(&first),
-                Some(&rhs),
-                false,
-                to_t,
-                &mut |f| {
-                    if f.op && f.p == *reifies {
-                        if let FlakeValue::TripleTerm(term) = &f.o {
-                            seen.insert((**term).clone());
+        match dict_novelty.filter(|dn| dn.is_initialized()) {
+            Some(dn) => seen.extend(dn.terms.iter().map(|(_, term)| term.clone())),
+            None => {
+                let mut visit = |overlay: &dyn fluree_db_core::OverlayProvider, g_id, to_t| {
+                    overlay.for_each_overlay_flake(
+                        g_id,
+                        fluree_db_core::IndexType::Post,
+                        None,
+                        None,
+                        false,
+                        to_t,
+                        &mut |f| {
+                            let mut value = &f.o;
+                            while let FlakeValue::TripleTerm(term) = value {
+                                seen.insert((**term).clone());
+                                value = &term.o;
+                            }
+                        },
+                    );
+                };
+                match ctx.active_graphs() {
+                    crate::dataset::ActiveGraphs::Single => {
+                        visit(ctx.overlay(), ctx.binary_g_id, ctx.to_t);
+                    }
+                    crate::dataset::ActiveGraphs::Many(graphs) => {
+                        for g in graphs {
+                            visit(g.overlay, g.g_id, g.to_t);
                         }
                     }
-                },
-            );
-        };
-        match ctx.active_graphs() {
-            crate::dataset::ActiveGraphs::Single => {
-                visit(ctx.overlay(), ctx.binary_g_id, ctx.to_t);
-            }
-            crate::dataset::ActiveGraphs::Many(graphs) => {
-                for g in graphs {
-                    visit(g.overlay, g.g_id, g.to_t);
                 }
             }
         }
-        let dict_novelty = ctx.dict_novelty.as_ref();
         let mut out = Vec::new();
         for term in seen {
             let encoded = match &self.store {

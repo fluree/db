@@ -4296,7 +4296,13 @@ mod tests {
                 assert!(
                     matches!(&edge.p, UnresolvedTerm::Iri(p) if p.as_ref() == "http://example.org/worksFor")
                 );
-                assert!(matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"));
+                assert!(matches!(
+                    &edge.o,
+                    crate::parse::ast::UnresolvedTermObject::Value {
+                        o: UnresolvedTerm::Var(v),
+                        ..
+                    } if v.as_ref() == "?org"
+                ));
                 // Body: 2 facts about the annotation (ex:role, ex:since).
                 assert_eq!(body.len(), 2, "body should have ex:role + ex:since");
             }

@@ -8,8 +8,8 @@ use super::ast::{
     UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
     UnresolvedForwardItem, UnresolvedHydrationSpec, UnresolvedNestedSelectSpec, UnresolvedOptions,
     UnresolvedPathExpr, UnresolvedPattern, UnresolvedProjection, UnresolvedQuery, UnresolvedRoot,
-    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
-    UnresolvedValue,
+    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTermObject,
+    UnresolvedTermPattern, UnresolvedTriplePattern, UnresolvedValue,
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
@@ -459,8 +459,8 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
             body,
         } => {
             let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
-            let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
             let mut out = Vec::new();
+            let lowered_edge = lower_term_pattern(edge, encoder, vars, &mut out)?;
             crate::ir::lower_reified_link(
                 lowered_annotation,
                 lowered_edge,
@@ -478,8 +478,8 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
         } => {
             let subject = lower_ref_term(subject, encoder, vars)?;
             let predicate = lower_ref_term(predicate, encoder, vars)?;
-            let term = lower_triple_pattern(term, encoder, vars)?;
             let mut out = Vec::new();
+            let term = lower_term_pattern(term, encoder, vars, &mut out)?;
             crate::ir::lower_term_value(subject, predicate, term, encoder, vars, &mut out);
             Ok(out)
         }
@@ -600,6 +600,38 @@ pub fn coerce_value_by_datatype(value: FlakeValue, datatype_iri: &str) -> Result
 }
 
 /// Lower an unresolved triple pattern to a resolved TriplePattern
+/// A triple term's triple; a nested term object lowers to a term variable
+/// (or a composed constant) whose patterns go into `out`.
+fn lower_term_pattern<E: IriEncoder>(
+    tp: &UnresolvedTermPattern,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut Vec<Pattern>,
+) -> Result<TriplePattern> {
+    match &tp.o {
+        UnresolvedTermObject::Value { o, dtc } => lower_triple_pattern(
+            &UnresolvedTriplePattern {
+                s: tp.s.clone(),
+                p: tp.p.clone(),
+                o: o.clone(),
+                dtc: dtc.clone(),
+            },
+            encoder,
+            vars,
+        ),
+        UnresolvedTermObject::Term(inner) => {
+            let inner = lower_term_pattern(inner, encoder, vars, out)?;
+            let (o, dtc) = crate::ir::lower_term_object(inner, encoder, vars, out);
+            Ok(TriplePattern {
+                s: lower_ref_term(&tp.s, encoder, vars)?,
+                p: lower_ref_term(&tp.p, encoder, vars)?,
+                o,
+                dtc,
+            })
+        }
+    }
+}
+
 fn lower_triple_pattern<E: IriEncoder>(
     pattern: &UnresolvedTriplePattern,
     encoder: &E,

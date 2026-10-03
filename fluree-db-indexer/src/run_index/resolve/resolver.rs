@@ -1618,7 +1618,6 @@ impl SharedResolverState {
                     .map_err(|e| e.to_string())?;
                 fluree_db_core::triple_term::lexical_term_object(&value)
             }
-            RawObject::TripleTerm(_) => return Err("nested triple terms are not supported".into()),
             _ => None,
         };
         let (o_kind, o_key) = match lexical {
@@ -2328,6 +2327,63 @@ pub fn remap_term_record(
         _ => {}
     }
     Ok(())
+}
+
+/// The handle of each entry of a chunk's term table, from `intern`, which
+/// maps a batch of keys to handles. An entry whose object is a triple term
+/// holds that term's ordinal, always a lower one; entries go one nesting level
+/// per batch, so an inner term's handle is in place for its outer term's key.
+pub fn intern_chunk_terms(
+    terms: &[RunRecord],
+    registry: &fluree_db_core::o_type_registry::OTypeRegistry,
+    intern: &mut dyn FnMut(&[fluree_db_core::triple_term::TermKey]) -> io::Result<Vec<u64>>,
+) -> io::Result<Vec<u64>> {
+    let triple_term = ObjKind::TRIPLE_TERM.as_u8();
+    let mut depth: Vec<usize> = Vec::with_capacity(terms.len());
+    for (i, term) in terms.iter().enumerate() {
+        let level = if term.o_kind == triple_term {
+            let inner = term.o_key as usize;
+            if inner >= i {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("term {i} names term {inner}, which does not precede it"),
+                ));
+            }
+            depth[inner] + 1
+        } else {
+            0
+        };
+        depth.push(level);
+    }
+    let mut handles = vec![0u64; terms.len()];
+    let levels = depth.iter().max().map_or(0, |max| max + 1);
+    for level in 0..levels {
+        let at: Vec<usize> = (0..terms.len()).filter(|&i| depth[i] == level).collect();
+        let keys: Vec<_> = at
+            .iter()
+            .map(|&i| {
+                let term = &terms[i];
+                fluree_db_core::triple_term::TermKey {
+                    s_id: term.s_id.as_u64(),
+                    p_id: term.p_id,
+                    o_type: registry.resolve(
+                        ObjKind::from_u8(term.o_kind),
+                        DatatypeDictId::from_u16(term.dt),
+                        term.lang_id,
+                    ),
+                    o_key: if term.o_kind == triple_term {
+                        handles[term.o_key as usize]
+                    } else {
+                        term.o_key
+                    },
+                }
+            })
+            .collect();
+        for (&i, handle) in at.iter().zip(intern(&keys)?) {
+            handles[i] = handle;
+        }
+    }
+    Ok(handles)
 }
 
 fn iso_to_epoch_ms(iso: &str) -> Option<i64> {

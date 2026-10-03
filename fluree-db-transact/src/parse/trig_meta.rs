@@ -963,9 +963,7 @@ impl<'a> TrigMetaParser<'a> {
 
     fn triple_term_value_error(&self) -> TransactError {
         TransactError::Parse(
-            "a triple term ('<<( … )>>') is a value: it cannot be a subject, and \
-             nested triple terms are not supported"
-                .to_string(),
+            "a triple term ('<<( … )>>') is a value and cannot be a subject".to_string(),
         )
     }
 
@@ -1028,10 +1026,7 @@ impl<'a> TrigMetaParser<'a> {
         self.advance(); // `<<`
         let subject = self.parse_subject()?;
         let predicate = self.parse_predicate()?;
-        let object = match self.current().kind {
-            TokenKind::TripleTermStart => return Err(self.triple_term_value_error()),
-            _ => self.parse_object()?,
-        };
+        let object = self.parse_object()?;
         let reifier = if self.check(&TokenKind::Tilde) {
             self.advance();
             self.parse_reifier_term()?
@@ -1084,7 +1079,6 @@ impl<'a> TrigMetaParser<'a> {
         };
         let predicate = self.parse_predicate()?;
         let object = match self.current().kind {
-            TokenKind::TripleTermStart => return Err(self.triple_term_value_error()),
             TokenKind::ReifiedTripleStart => {
                 return Err(TransactError::Parse(
                     "reified triples ('<< … >>') are not allowed inside a triple term".to_string(),
@@ -1300,18 +1294,6 @@ impl<'a> TrigMetaParser<'a> {
         loop {
             if self.check(&TokenKind::TripleTermStart) && self.predicate_is_reifies(predicate)? {
                 self.parse_reifies_triple_term(subject)?;
-            } else if self.check(&TokenKind::TripleTermStart) {
-                if self.annotation_depth > 0 {
-                    return Err(self.annotation_of_annotation_error());
-                }
-                let (s, p, o) = self.parse_triple_term_parts()?;
-                if matches!(
-                    self.current().kind,
-                    TokenKind::Tilde | TokenKind::AnnotationOpen
-                ) {
-                    return Err(self.triple_term_value_error());
-                }
-                objects.push(ObjectValue::TripleTerm(Box::new((s, p, o))));
             } else {
                 let object = self.parse_object()?;
                 if matches!(
@@ -1426,7 +1408,13 @@ impl<'a> TrigMetaParser<'a> {
                 }
                 TermValue::BlankNode(label) => ObjectValue::BlankNode(label),
             }),
-            TokenKind::TripleTermStart => Err(self.triple_term_value_error()),
+            TokenKind::TripleTermStart => {
+                if self.annotation_depth > 0 {
+                    return Err(self.annotation_of_annotation_error());
+                }
+                let (s, p, o) = self.parse_triple_term_parts()?;
+                Ok(ObjectValue::TripleTerm(Box::new((s, p, o))))
+            }
             _ => Err(TransactError::Parse(format!(
                 "expected object, found {}",
                 self.current().kind
@@ -2816,16 +2804,6 @@ ex:alice ex:note "value with a { brace" .
                 "triple term as subject",
                 "<<( ex:s ex:p ex:o )>> ex:q ex:z .",
                 "cannot be a subject",
-            ),
-            (
-                "nested triple term",
-                "ex:r rdf:reifies <<( ex:s ex:p <<( ex:x ex:y ex:z )>> )>> .",
-                "nested triple terms",
-            ),
-            (
-                "annotation on a triple-term value",
-                "ex:a ex:q <<( ex:s ex:p ex:o )>> {| ex:n 1 |} .",
-                "nested triple terms",
             ),
             (
                 "star inside annotation body",

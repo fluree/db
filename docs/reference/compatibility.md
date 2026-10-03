@@ -43,7 +43,7 @@ The vendored W3C RDF 1.1 and RDF 1.2 Turtle suites run in CI
 (`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the skip register.
 
 Not yet supported:
-- Nested triple terms (`<<( s p <<( ... )>> )>>`)
+- Annotation-of-annotation (a `{| ... |}` or `<< ... >>` inside an annotation body)
 
 See [Edge annotations](../concepts/edge-annotations.md).
 
@@ -191,13 +191,13 @@ Supported query and update annotation syntax:
   `?r rdf:reifies <<( s p o )>>`),
   written by every result format
 
-Also supported: triple terms as values in patterns, `INSERT DATA` / `DELETE DATA` /
-`DELETE WHERE` and templates, and the triple-term functions `TRIPLE()`, `SUBJECT()`,
-`PREDICATE()`, `OBJECT()` and `isTRIPLE()`.
+Also supported: triple terms as values, nested ones included, in patterns, `VALUES`,
+`INSERT DATA` / `DELETE DATA` / `DELETE WHERE` and templates; value equality (`=`) on
+triple terms; and the triple-term functions `TRIPLE()`, `SUBJECT()`, `PREDICATE()`,
+`OBJECT()` and `isTRIPLE()`.
 
 Not yet supported:
-- Nested triple terms, and triple-term constants in `VALUES` data or (other than the object
-  of `rdf:reifies`) in a `CONSTRUCT` template
+- Triple-term constants in a `CONSTRUCT` template other than as the object of `rdf:reifies`
 - Nested annotations (annotation-of-annotation)
 
 **Specification:** https://www.w3.org/TR/sparql12-query/
@@ -485,7 +485,7 @@ Export Fluree data to:
 - SPARQL 1.1 Federation: remote `SERVICE` endpoints (local-ledger `SERVICE` is supported)
 - Remote `LOAD` in SPARQL UPDATE
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
-- RDF 1.2 / SPARQL 1.2: nested triple terms
+- RDF 1.2 / SPARQL 1.2: annotation-of-annotation; a `GRAPH ?g` name written as an INSERT template object
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)

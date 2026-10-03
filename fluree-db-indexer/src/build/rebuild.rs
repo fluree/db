@@ -607,30 +607,27 @@ where
                 }
                 all_attachments.append(&mut attachments);
 
+                let handles = crate::run_index::resolve::resolver::intern_chunk_terms(
+                    terms,
+                    &term_registry,
+                    &mut |keys| {
+                        keys.iter()
+                            .map(|&k| term_builder.get_or_insert(k))
+                            .collect()
+                    },
+                )
+                .map_err(|e| IndexerError::StorageWrite(format!("chunk {ci}: {e}")))?;
                 let triple_term = fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8();
                 for record in records.iter_mut() {
                     if record.o_kind != triple_term {
                         continue;
                     }
-                    let term = terms.get(record.o_key as usize).ok_or_else(|| {
+                    record.o_key = *handles.get(record.o_key as usize).ok_or_else(|| {
                         IndexerError::StorageWrite(format!(
                             "term ordinal {} out of range in chunk {ci}",
                             record.o_key
                         ))
                     })?;
-                    let key = fluree_db_core::triple_term::TermKey {
-                        s_id: term.s_id.as_u64(),
-                        p_id: term.p_id,
-                        o_type: term_registry.resolve(
-                            fluree_db_core::value_id::ObjKind::from_u8(term.o_kind),
-                            fluree_db_core::DatatypeDictId::from_u16(term.dt),
-                            term.lang_id,
-                        ),
-                        o_key: term.o_key,
-                    };
-                    record.o_key = term_builder
-                        .get_or_insert(key)
-                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
                 }
 
                 // Sort by (g_id, SPOT).

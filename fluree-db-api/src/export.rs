@@ -1122,8 +1122,8 @@ fn reifies_jsonld(
 }
 
 /// A triple term as the JSON-LD node naming its triple, `{"@id": s, p: o}`;
-/// as a value it is wrapped as `{"@id": {...}}`. `None` for a nested term,
-/// which has no such node.
+/// as a value it is wrapped as `{"@id": {...}}`, a nested term included.
+/// `None` when a component has no IRI.
 fn triple_term_jsonld(
     term: &fluree_db_core::TripleTermValue,
     store: &BinaryIndexStore,

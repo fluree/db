@@ -422,6 +422,27 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
         },
     }
 
+    /// An open `<triple>`: the position its next term fills, and its terms.
+    #[derive(Default)]
+    struct TripleFrame {
+        slot: usize,
+        parts: [Option<RdfTerm>; 3],
+    }
+
+    /// Put a finished term in the innermost open triple, else the binding.
+    fn place(
+        term: RdfTerm,
+        frames: &mut [TripleFrame],
+        current_binding_name: &Option<String>,
+        current_solution: &mut Option<HashMap<String, RdfTerm>>,
+    ) {
+        if let Some(frame) = frames.last_mut() {
+            frame.parts[frame.slot] = Some(term);
+        } else if let (Some(name), Some(solution)) = (current_binding_name, current_solution) {
+            solution.insert(name.clone(), term);
+        }
+    }
+
     /// Complete a finished element — on a real `Event::End`, or immediately
     /// for a self-closing `Event::Empty` (which emits NO matching End event,
     /// so its completion must never wait for one). Returns `Some` when the
@@ -433,6 +454,7 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
         current_binding_name: &mut Option<String>,
         current_solution: &mut Option<HashMap<String, RdfTerm>>,
         current_term: &mut Option<TermKind>,
+        frames: &mut Vec<TripleFrame>,
     ) -> Option<SparqlResults> {
         match local_name {
             b"result" => {
@@ -445,40 +467,42 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
             }
             b"uri" => {
                 if let Some(TermKind::Uri) = current_term {
-                    if let Some(name) = current_binding_name.as_ref() {
-                        if let Some(solution) = current_solution.as_mut() {
-                            solution.insert(name.clone(), RdfTerm::Iri(text_buf.to_string()));
-                        }
-                    }
+                    let term = RdfTerm::Iri(text_buf.to_string());
+                    place(term, frames, current_binding_name, current_solution);
                 }
                 *current_term = None;
             }
             b"bnode" => {
                 if let Some(TermKind::Bnode) = current_term {
-                    if let Some(name) = current_binding_name.as_ref() {
-                        if let Some(solution) = current_solution.as_mut() {
-                            solution.insert(name.clone(), RdfTerm::BlankNode(text_buf.to_string()));
-                        }
-                    }
+                    let term = RdfTerm::BlankNode(text_buf.to_string());
+                    place(term, frames, current_binding_name, current_solution);
                 }
                 *current_term = None;
             }
             b"literal" => {
                 if let Some(TermKind::Literal { datatype, language }) = current_term.clone() {
-                    if let Some(name) = current_binding_name.as_ref() {
-                        if let Some(solution) = current_solution.as_mut() {
-                            solution.insert(
-                                name.clone(),
-                                RdfTerm::Literal {
-                                    value: text_buf.to_string(),
-                                    datatype,
-                                    language,
-                                },
-                            );
-                        }
-                    }
+                    let term = RdfTerm::Literal {
+                        value: text_buf.to_string(),
+                        datatype,
+                        language,
+                    };
+                    place(term, frames, current_binding_name, current_solution);
                 }
                 *current_term = None;
+            }
+            b"triple" => {
+                if let Some(TripleFrame {
+                    parts: [Some(subject), Some(predicate), Some(object)],
+                    ..
+                }) = frames.pop()
+                {
+                    let term = RdfTerm::Triple(Box::new(Triple {
+                        subject,
+                        predicate,
+                        object,
+                    }));
+                    place(term, frames, current_binding_name, current_solution);
+                }
             }
             b"boolean" => {
                 let val = text_buf.trim();
@@ -492,6 +516,7 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
     let mut current_term: Option<TermKind> = None;
     let mut text_buf = String::new();
     let mut in_boolean = false;
+    let mut frames: Vec<TripleFrame> = Vec::new();
 
     loop {
         let event = reader.read_event();
@@ -552,6 +577,16 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
                         in_boolean = true;
                         text_buf.clear();
                     }
+                    b"triple" => frames.push(TripleFrame::default()),
+                    slot @ (b"subject" | b"predicate" | b"object") => {
+                        if let Some(frame) = frames.last_mut() {
+                            frame.slot = match slot {
+                                b"subject" => 0,
+                                b"predicate" => 1,
+                                _ => 2,
+                            };
+                        }
+                    }
                     _ => {}
                 }
                 // A self-closing element (`<result/>`, `<literal/>`, …)
@@ -565,6 +600,7 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
                         &mut current_binding_name,
                         &mut current_solution,
                         &mut current_term,
+                        &mut frames,
                     ) {
                         return Ok(result);
                     }
@@ -578,6 +614,7 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
                     &mut current_binding_name,
                     &mut current_solution,
                     &mut current_term,
+                    &mut frames,
                 ) {
                     return Ok(result);
                 }
@@ -658,6 +695,14 @@ pub fn parse_srj(json: &str) -> Result<SparqlResults> {
 fn parse_srj_term(value: &serde_json::Value) -> Option<RdfTerm> {
     let obj = value.as_object()?;
     let term_type = obj.get("type")?.as_str()?;
+    if term_type == "triple" {
+        let triple = obj.get("value")?;
+        return Some(RdfTerm::Triple(Box::new(Triple {
+            subject: parse_srj_term(triple.get("subject")?)?,
+            predicate: parse_srj_term(triple.get("predicate")?)?,
+            object: parse_srj_term(triple.get("object")?)?,
+        })));
+    }
     let val = obj.get("value")?.as_str()?;
 
     match term_type {
@@ -715,32 +760,27 @@ pub fn parse_expected_graph(url: &str) -> Result<Vec<Triple>> {
     Ok(graph_triples(&sink.into_graph()))
 }
 
-/// Stand-in predicates that spell a reifier attachment as ordinary triples,
-/// so the isomorphism check sees which triple each reifier names.
-pub(crate) const REIFIES_SUBJECT: &str = "urn:fluree:testsuite:reifies-subject";
-pub(crate) const REIFIES_PREDICATE: &str = "urn:fluree:testsuite:reifies-predicate";
-pub(crate) const REIFIES_OBJECT: &str = "urn:fluree:testsuite:reifies-object";
-
-/// `reifier`'s attachment to `(s, p, o)` as its three stand-in triples.
+/// `reifier`'s attachment to `(s, p, o)`: `reifier rdf:reifies <<( s p o )>>`.
 pub(crate) fn reification_triples(
     reifier: RdfTerm,
     s: RdfTerm,
     p: RdfTerm,
     o: RdfTerm,
-) -> [Triple; 3] {
-    [
-        (REIFIES_SUBJECT, s),
-        (REIFIES_PREDICATE, p),
-        (REIFIES_OBJECT, o),
-    ]
-    .map(|(stand_in, term)| Triple {
-        subject: reifier.clone(),
-        predicate: RdfTerm::Iri(stand_in.to_string()),
-        object: term,
-    })
+) -> [Triple; 1] {
+    [Triple {
+        subject: reifier,
+        predicate: RdfTerm::Iri(RDF_REIFIES.to_string()),
+        object: RdfTerm::Triple(Box::new(Triple {
+            subject: s,
+            predicate: p,
+            object: o,
+        })),
+    }]
 }
 
-/// A parsed graph's triples, with each reification as its stand-in triples.
+const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+
+/// A parsed graph's triples, with each reification as its `rdf:reifies` triple.
 fn graph_triples(graph: &IrGraph) -> Vec<Triple> {
     let mut out: Vec<Triple> = graph
         .iter()
@@ -1198,7 +1238,7 @@ impl JsonLdContext {
 /// Expects a JSON-LD `@graph` array (or a single node object). Each node has
 /// `@id` as the subject; every other key is a predicate whose values are objects.
 /// Compact IRIs are expanded against the result's `@context`. A value's
-/// `@annotation` and a node's `@reifies` become reification stand-in triples,
+/// `@annotation` and a node's `@reifies` become `rdf:reifies` triples,
 /// as the expected graph's reifications do.
 pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<SparqlResults> {
     let ctx = JsonLdContext::parse(json);
@@ -1329,6 +1369,17 @@ fn id_term(id: &str, ctx: &JsonLdContext) -> RdfTerm {
 /// and plain string/number values.
 fn json_ld_value_to_rdf_term(val: &serde_json::Value, ctx: &JsonLdContext) -> Option<RdfTerm> {
     if let Some(obj) = val.as_object() {
+        // Triple term: {"@id": {"@id": s, p: o}}
+        if let Some(node) = obj.get("@id").and_then(|v| v.as_object()) {
+            let subject = id_term(node.get("@id")?.as_str()?, ctx);
+            let (p, o) = node.iter().find(|(k, _)| !k.starts_with('@'))?;
+            let object = json_ld_value_to_rdf_term(json_values(o).first()?, ctx)?;
+            return Some(RdfTerm::Triple(Box::new(Triple {
+                subject,
+                predicate: RdfTerm::Iri(ctx.expand_vocab(p)),
+                object,
+            })));
+        }
         // Node reference: {"@id": "http://..."}
         if let Some(id) = obj.get("@id").and_then(|v| v.as_str()) {
             return Some(match id.strip_prefix("_:") {

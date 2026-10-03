@@ -93,15 +93,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 other => self.lower_subject(other)?,
             };
             let p = self.lower_predicate(&tp.predicate)?;
-            // A triple-term value: the triple and the term's components.
-            if let SparqlTerm::TripleTerm(tt) = &tp.object {
-                if tp.annotation.is_some() {
-                    return Err(LowerError::not_implemented(
-                        "an annotation on a triple whose object is a triple term \
-                         (a nested triple term)",
-                        tt.span,
-                    ));
-                }
+            // A triple-term value: the triple and the term's components. An
+            // annotated one is an edge like any other, below.
+            if let (SparqlTerm::TripleTerm(tt), None) = (&tp.object, &tp.annotation) {
                 let term = self.lower_triple_term(tt, &mut result)?;
                 fluree_db_query::ir::lower_term_value(
                     s,

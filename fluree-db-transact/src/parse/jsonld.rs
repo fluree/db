@@ -1755,9 +1755,6 @@ fn parse_expanded_triple_term_with_ctx(
         Some(o) if objects.is_empty() && asserted.is_empty() && o.list_index.is_none() => o,
         _ => return Err(invalid("it must describe exactly one triple")),
     };
-    if matches!(o.term, TemplateTerm::TripleTerm(_)) {
-        return Err(invalid("a triple term cannot nest another"));
-    }
     Ok(ParsedValue::new(TemplateTerm::TripleTerm(Box::new(
         TemplateTripleTerm {
             s,

@@ -525,11 +525,6 @@ impl<'a> FlakeGenerator<'a> {
         bindings: &Batch,
         row: usize,
     ) -> Result<Option<fluree_db_core::TripleTermValue>> {
-        if matches!(term.o, TemplateTerm::TripleTerm(_)) {
-            return Err(TransactError::InvalidTerm(
-                "a triple term cannot nest another".to_string(),
-            ));
-        }
         let s = self.resolve_subject(&term.s, bindings, row)?;
         let p = self.resolve_predicate(&term.p, bindings, row)?;
         let explicit_dt = term
@@ -629,13 +624,6 @@ pub(crate) fn reified_triple_link(
     ann: &Sid,
     t: i64,
 ) -> Result<Flake> {
-    if matches!(o, FlakeValue::TripleTerm(_)) {
-        return Err(TransactError::UnsupportedFeature(
-            "reifying a triple whose object is a triple term needs a nested triple \
-             term, which is not supported"
-                .to_string(),
-        ));
-    }
     let dt = dtc.datatype().clone();
     validate_value_dt_pair(&o, &dt)?;
     let term = fluree_db_core::TripleTermValue {
