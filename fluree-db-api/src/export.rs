@@ -425,6 +425,26 @@ impl<'a> AnnotationContext<'a> {
     fn is_reifies_row(&self, p_id: u32) -> bool {
         self.reifies_p_ids.contains(&p_id)
     }
+
+    /// Whether a link row gives way to the `~ <r>` marker on its asserted
+    /// edge. A link whose triple is not asserted has no edge to carry it,
+    /// so it is written as a row.
+    fn link_becomes_marker(
+        &self,
+        resolver: &ExportResolver<'_>,
+        s_id: u64,
+        (o_type, o_key, p_id): (u16, u64, u32),
+        g_id: GraphId,
+    ) -> io::Result<bool> {
+        if !self.probe.has_unasserted() {
+            return Ok(true);
+        }
+        let FlakeValue::TripleTerm(term) = resolver.decode_value(o_type, o_key, p_id, g_id)? else {
+            return Ok(true);
+        };
+        let reifier = resolver.resolve_subject_sid(s_id)?;
+        Ok(!self.probe.link_is_unasserted(g_id, &reifier, &term))
+    }
 }
 
 /// An `rdf:reifies` link row: replaced by annotation syntax, and written as
@@ -631,8 +651,12 @@ async fn resolve_untranslated(
     let mut base: Vec<Flake> = Vec::with_capacity(rows.len());
     for f in rows {
         if fluree_db_core::is_rdf_reifies(&f.p) {
-            ann.probe.note_link_sid(f.s.clone());
-            continue;
+            let unasserted = matches!(&f.o, FlakeValue::TripleTerm(term)
+                if ann.probe.link_is_unasserted(g_id, &f.s, term));
+            if !unasserted {
+                ann.probe.note_link_sid(f.s.clone());
+                continue;
+            }
         }
         if fluree_db_core::namespaces::is_reserved_reifies_predicate(&f.p) {
             continue;
@@ -681,7 +705,9 @@ fn write_turtle_batch<W: Write>(
         // Annotation syntax replaces each link with the `~ <r>` marker
         // emitted below; a legacy `f:reifies*` bundle is read as its link.
         if let Some(ann) = ann {
-            if is_link_row(o_type) {
+            if is_link_row(o_type)
+                && ann.link_becomes_marker(resolver, s_id, (o_type, o_key, p_id), g_id)?
+            {
                 ann.probe.note_link_in_scope(resolver, s_id);
                 continue;
             }
@@ -874,7 +900,14 @@ pub async fn export_graph_jsonld<W: Write>(
             let o_type = batch.o_type.get_or(row, 0);
             let o_key = batch.o_key.get(row);
             if let Some(ann) = ann.as_ref() {
-                if is_link_row(o_type) {
+                if is_link_row(o_type)
+                    && ann.link_becomes_marker(
+                        &resolver,
+                        s_id,
+                        (o_type, o_key, p_id),
+                        config.g_id,
+                    )?
+                {
                     ann.probe.note_link_in_scope(&resolver, s_id);
                     continue;
                 }
@@ -897,22 +930,28 @@ pub async fn export_graph_jsonld<W: Write>(
                 continue;
             }
 
-            // Convert to JSON-LD value
-            let jval = flake_to_jsonld(&value, store, o_type, prefixes);
-            // One value per reifier, each carrying `@annotation` — the JSON-LD
-            // shape `parse/edge_annotations.rs` ingests. Repeating the base
-            // value is how the keyword attaches to an edge: two reifiers on
-            // one edge are two annotated occurrences of the same triple, which
-            // re-ingest to one triple and two bundles.
-            let jvals = match ann.as_ref() {
-                Some(ann) => annotated_jsonld_values(
-                    &resolver,
-                    ann,
-                    &jval,
-                    row_reifiers(&reifiers, row),
-                    prefixes,
-                ),
-                None => vec![jval],
+            let (key, jvals) = match reifies_jsonld(&p_iri, &value, store, prefixes) {
+                Some(block) => (REIFIES_KEY.to_string(), vec![block]),
+                None => {
+                    let jval = flake_to_jsonld(&value, store, o_type, prefixes);
+                    // One value per reifier, each carrying `@annotation` — the
+                    // JSON-LD shape `parse/edge_annotations.rs` ingests.
+                    // Repeating the base value is how the keyword attaches to
+                    // an edge: two reifiers on one edge are two annotated
+                    // occurrences of the same triple, which re-ingest to one
+                    // triple and two links.
+                    let jvals = match ann.as_ref() {
+                        Some(ann) => annotated_jsonld_values(
+                            &resolver,
+                            ann,
+                            &jval,
+                            row_reifiers(&reifiers, row),
+                            prefixes,
+                        ),
+                        None => vec![jval],
+                    };
+                    (compact_iri(&p_iri, prefixes), jvals)
+                }
             };
 
             // Check if we've moved to a new subject
@@ -939,11 +978,10 @@ pub async fn export_graph_jsonld<W: Write>(
             }
 
             // Append value to the right predicate bucket
-            let compact_p = compact_iri(&p_iri, prefixes);
-            if let Some(entry) = current_props.iter_mut().find(|(k, _)| *k == compact_p) {
+            if let Some(entry) = current_props.iter_mut().find(|(k, _)| *k == key) {
                 entry.1.extend(jvals);
             } else {
-                current_props.push((compact_p, jvals));
+                current_props.push((key, jvals));
             }
 
             stats.triples_written += 1;
@@ -1011,10 +1049,19 @@ fn merge_untranslated_jsonld(
 ) {
     let store = resolver.store;
     for flake in flakes {
-        let (Some(p_iri), Some(jval)) = (
-            store.sid_to_iri(&flake.p),
-            flake_to_jsonld_raw(flake, store, prefixes),
-        ) else {
+        let Some(p_iri) = store.sid_to_iri(&flake.p) else {
+            stats.rows_skipped += 1;
+            continue;
+        };
+        if let Some(block) = reifies_jsonld(&p_iri, &flake.o, store, prefixes) {
+            match props.iter_mut().find(|(k, _)| k == REIFIES_KEY) {
+                Some(entry) => entry.1.push(block),
+                None => props.push((REIFIES_KEY.to_string(), vec![block])),
+            }
+            stats.triples_written += 1;
+            continue;
+        }
+        let Some(jval) = flake_to_jsonld_raw(flake, store, prefixes) else {
             stats.rows_skipped += 1;
             continue;
         };
@@ -1038,6 +1085,46 @@ fn merge_untranslated_jsonld(
         }
         stats.triples_written += 1;
     }
+}
+
+const REIFIES_KEY: &str = "@reifies";
+
+/// An `rdf:reifies` link's triple as the JSON-LD `@reifies` block,
+/// `{"@id": s, p: o}` — the form JSON-LD inserts take for a reification.
+/// `None` for any other row, and for a nested term, which has no block.
+fn reifies_jsonld(
+    p_iri: &str,
+    value: &FlakeValue,
+    store: &BinaryIndexStore,
+    prefixes: &PrefixMap,
+) -> Option<serde_json::Value> {
+    let FlakeValue::TripleTerm(term) = value else {
+        return None;
+    };
+    if p_iri != fluree_vocab::rdf::REIFIES {
+        return None;
+    }
+    let meta = term.lang.clone().map(|lang| fluree_db_core::FlakeMeta {
+        lang: Some(lang),
+        i: None,
+    });
+    let object = Flake::new(
+        term.s.clone(),
+        term.p.clone(),
+        term.o.clone(),
+        term.dt.clone(),
+        0,
+        true,
+        meta,
+    );
+    let object = flake_to_jsonld_raw(&object, store, prefixes)?;
+    let mut block = serde_json::Map::new();
+    block.insert(
+        "@id".to_string(),
+        serde_json::Value::String(compact_iri(&store.sid_to_iri(&term.s)?, prefixes)),
+    );
+    block.insert(compact_iri(&store.sid_to_iri(&term.p)?, prefixes), object);
+    Some(serde_json::Value::Object(block))
 }
 
 /// JSON-LD value for an untranslated overlay flake, deriving the language tag
@@ -1559,7 +1646,9 @@ fn write_batch<W: Write>(
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
         if let Some(ann) = ann {
-            if is_link_row(o_type) {
+            if is_link_row(o_type)
+                && ann.link_becomes_marker(resolver, s_id, (o_type, o_key, p_id), g_id)?
+            {
                 ann.probe.note_link_in_scope(resolver, s_id);
                 continue;
             }

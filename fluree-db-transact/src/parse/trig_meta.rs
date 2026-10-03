@@ -88,9 +88,9 @@ pub struct NamedGraphBlock {
     pub iri: String,
     /// Triples in this graph.
     pub triples: Vec<RawTriple>,
-    /// RDF 1.2 reifier attachments (TriG-star) in this graph. The reified
-    /// base triple is also present in `triples` (Fluree asserts it), so
-    /// consumers emit the `f:reifies*` bundle from here and nothing else.
+    /// RDF 1.2 reifier attachments (TriG-star) in this graph. Each becomes
+    /// the reifier's `rdf:reifies` link; the reified triple is in `triples`
+    /// only when the annotation syntax asserted it.
     pub reified: Vec<RawReifiedTriple>,
     /// The document's prefix mappings where the block appears (for IRI
     /// expansion). Blocks with no directive between them share one map.
@@ -998,21 +998,6 @@ impl<'a> TrigMetaParser<'a> {
         });
     }
 
-    /// Assert the reified base triple (Fluree's documented divergence from
-    /// RDF 1.2's non-asserting `<< … >>` / `rdf:reifies`).
-    fn assert_base_triple(
-        &mut self,
-        subject: &TermValue,
-        predicate: &TermValue,
-        object: &ObjectValue,
-    ) {
-        self.stmt_triples.push(ParsedTriple {
-            subject: subject.clone(),
-            predicate: predicate.clone(),
-            objects: vec![object.clone()],
-        });
-    }
-
     /// `<< rtSubject predicate rtObject ( ~ reifier )? >>` — returns the
     /// reifier term, which is what the construct denotes in its position.
     fn parse_reified_triple(&mut self) -> Result<TermValue> {
@@ -1051,7 +1036,6 @@ impl<'a> TrigMetaParser<'a> {
             )));
         }
         self.advance();
-        self.assert_base_triple(&subject, &predicate, &object);
         self.attach_reifier(&subject, &predicate, &object, &reifier);
         Ok(reifier)
     }
@@ -1099,7 +1083,6 @@ impl<'a> TrigMetaParser<'a> {
                     .to_string(),
             ));
         }
-        self.assert_base_triple(&subject, &predicate, &object);
         self.attach_reifier(&subject, &predicate, &object, reifier);
         Ok(())
     }
@@ -2680,16 +2663,29 @@ ex:alice ex:note "value with a { brace" .
                                @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n";
 
     #[test]
-    fn test_trig_star_every_spelling_yields_one_attachment_and_asserts_the_base() {
-        for (label, body) in [
-            ("annotation block", "ex:s ex:p ex:o {| ex:q ex:z |} ."),
-            ("tilde reifier", "ex:s ex:p ex:o ~ ex:r ."),
-            ("tilde + block", "ex:s ex:p ex:o ~ ex:r {| ex:q ex:z |} ."),
-            ("reified subject", "<< ex:s ex:p ex:o ~ ex:r >> ex:q ex:z ."),
-            ("reified object", "ex:z ex:q << ex:s ex:p ex:o ~ ex:r >> ."),
+    fn test_trig_star_every_spelling_yields_one_attachment_and_annotations_assert_the_base() {
+        for (label, body, asserts) in [
+            ("annotation block", "ex:s ex:p ex:o {| ex:q ex:z |} .", true),
+            ("tilde reifier", "ex:s ex:p ex:o ~ ex:r .", true),
+            (
+                "tilde + block",
+                "ex:s ex:p ex:o ~ ex:r {| ex:q ex:z |} .",
+                true,
+            ),
+            (
+                "reified subject",
+                "<< ex:s ex:p ex:o ~ ex:r >> ex:q ex:z .",
+                false,
+            ),
+            (
+                "reified object",
+                "ex:z ex:q << ex:s ex:p ex:o ~ ex:r >> .",
+                false,
+            ),
             (
                 "rdf:reifies triple term",
                 "ex:r rdf:reifies <<( ex:s ex:p ex:o )>> .",
+                false,
             ),
         ] {
             let block = star_block(&format!("{STAR_PREFIX}GRAPH ex:g {{ {body} }}\n"));
@@ -2699,9 +2695,10 @@ ex:alice ex:note "value with a { brace" .
             assert_eq!(raw_iri(&r.predicate), "ex:p", "[{label}]");
             assert!(matches!(&r.object, RawObject::PrefixedName { local, .. } if local == "o"));
             let triples = triple_strs(&block);
-            assert!(
+            assert_eq!(
                 triples.iter().any(|(s, p, _)| s == "ex:s" && p == "ex:p"),
-                "[{label}] base triple must be asserted: {triples:?}"
+                asserts,
+                "[{label}] only the annotation syntax asserts the triple: {triples:?}"
             );
             assert!(
                 !triples.iter().any(|(_, p, _)| p == "rdf:reifies"),

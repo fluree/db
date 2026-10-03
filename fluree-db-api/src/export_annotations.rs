@@ -23,9 +23,13 @@ use crate::{LedgerState, Result};
 /// on the public `ExportConfig`. An external caller building an `ExportConfig`
 /// by hand passes `annotations: None` and gets the links as ordinary triples.
 pub struct AnnotationProbe<'a> {
-    /// Live links at the export's `t`, per graph, by the edge they name
-    /// (its `g` cleared).
+    /// Live links at the export's `t` whose triple is asserted, per graph,
+    /// by the edge they name (its `g` cleared). Each becomes a marker on
+    /// its edge.
     links: HashMap<GraphId, HashMap<EdgeKey, Vec<Sid>>>,
+    /// Live links whose triple is not asserted in their graph: no edge
+    /// carries their marker, so they are written as rows.
+    unasserted: HashSet<(GraphId, Sid, EdgeKey)>,
     /// Reifiers named by a `~ <r>` marker somewhere in this export.
     named: Mutex<HashSet<Sid>>,
     /// Reifiers whose link the scan passed — i.e. whose own subject is inside
@@ -95,6 +99,8 @@ impl<'a> AnnotationProbe<'a> {
     /// Read `ledger`'s live links as of `as_of_t`, or establish that it has
     /// none. `Ok(None)` when neither the index nor novelty has ever held an
     /// annotation, so a ledger without annotations pays two boolean reads.
+    /// Each link's triple is looked up once per `(graph, subject,
+    /// predicate)` to tell markers from rows.
     pub(crate) async fn for_ledger(ledger: &'a LedgerState, as_of_t: i64) -> Result<Option<Self>> {
         if !ledger.snapshot.has_annotations && !ledger.novelty.has_annotations() {
             return Ok(None);
@@ -107,6 +113,7 @@ impl<'a> AnnotationProbe<'a> {
                 .map(|(g_id, _)| g_id),
         );
         let mut links: HashMap<GraphId, HashMap<EdgeKey, Vec<Sid>>> = HashMap::new();
+        let mut unasserted: HashSet<(GraphId, Sid, EdgeKey)> = HashSet::new();
         for g_id in graphs {
             let flakes = range_with_overlay(
                 &ledger.snapshot,
@@ -119,21 +126,48 @@ impl<'a> AnnotationProbe<'a> {
             )
             .await?;
             for flake in flakes {
-                let FlakeValue::TripleTerm(term) = flake.o else {
+                let FlakeValue::TripleTerm(term) = &flake.o else {
                     continue;
                 };
-                let edge = EdgeKey {
-                    g: None,
-                    s: term.s,
-                    p: term.p,
-                    o: term.o,
-                    dt: term.dt,
-                    lang: term.lang,
-                    list_i: None,
-                };
+                let edge = term_edge(term);
                 let reifiers = links.entry(g_id).or_default().entry(edge).or_default();
                 if !reifiers.contains(&flake.s) {
                     reifiers.push(flake.s);
+                }
+            }
+        }
+        for (&g_id, graph_links) in &mut links {
+            let mut by_subject_predicate: HashMap<(Sid, Sid), Vec<EdgeKey>> = HashMap::new();
+            for edge in graph_links.keys() {
+                by_subject_predicate
+                    .entry((edge.s.clone(), edge.p.clone()))
+                    .or_default()
+                    .push(edge.clone());
+            }
+            for ((s, p), edges) in by_subject_predicate {
+                let asserted: HashSet<EdgeKey> = range_with_overlay(
+                    &ledger.snapshot,
+                    g_id,
+                    ledger.novelty.as_ref(),
+                    IndexType::Spot,
+                    RangeTest::Eq,
+                    RangeMatch::subject_predicate(s, p),
+                    RangeOptions::new().with_to_t(as_of_t),
+                )
+                .await?
+                .iter()
+                .map(|flake| EdgeKey {
+                    g: None,
+                    list_i: None,
+                    ..EdgeKey::from_flake(flake)
+                })
+                .collect();
+                for edge in edges {
+                    if !asserted.contains(&edge) {
+                        for reifier in graph_links.remove(&edge).unwrap_or_default() {
+                            unasserted.insert((g_id, reifier, edge.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -142,10 +176,31 @@ impl<'a> AnnotationProbe<'a> {
         }
         Ok(Some(Self {
             links,
+            unasserted,
             named: Mutex::new(HashSet::new()),
             in_scope: Mutex::new(HashSet::new()),
             _ledger: PhantomData,
         }))
+    }
+
+    /// Whether any live link names a triple its graph does not assert.
+    pub(crate) fn has_unasserted(&self) -> bool {
+        !self.unasserted.is_empty()
+    }
+
+    /// Whether `reifier`'s link to `term` in graph `g_id` names a triple the
+    /// graph does not assert, so the link is written as a row rather than
+    /// replaced by a marker.
+    pub(crate) fn link_is_unasserted(
+        &self,
+        g_id: GraphId,
+        reifier: &Sid,
+        term: &fluree_db_core::TripleTermValue,
+    ) -> bool {
+        !self.unasserted.is_empty()
+            && self
+                .unasserted
+                .contains(&(g_id, reifier.clone(), term_edge(term)))
     }
 
     /// Live reifiers for each edge of graph `g_id`, index-aligned with
@@ -164,6 +219,19 @@ impl<'a> AnnotationProbe<'a> {
                 links.get(&key).cloned().unwrap_or_default()
             })
             .collect()
+    }
+}
+
+/// The edge a triple term names, keyed as the probe keys it.
+fn term_edge(term: &fluree_db_core::TripleTermValue) -> EdgeKey {
+    EdgeKey {
+        g: None,
+        s: term.s.clone(),
+        p: term.p.clone(),
+        o: term.o.clone(),
+        dt: term.dt.clone(),
+        lang: term.lang.clone(),
+        list_i: None,
     }
 }
 

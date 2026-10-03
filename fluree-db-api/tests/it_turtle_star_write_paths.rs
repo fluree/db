@@ -210,13 +210,33 @@ async fn upsert_turtle_and_insert_turtle_agree_on_the_claim_graph() {
     );
 }
 
+/// Rows of `sparql` over `ledger`'s `graph` (or default graph).
+async fn select(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    graph: Option<&str>,
+    pattern: &str,
+) -> Vec<JsonValue> {
+    let body = match graph {
+        Some(g) => format!("GRAPH <{g}> {{ {pattern} }}"),
+        None => pattern.to_string(),
+    };
+    let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {body} }}");
+    let result = support::query_sparql_formatted(fluree, ledger, &sparql)
+        .await
+        .expect("query");
+    rows(&result).to_vec()
+}
+
 #[tokio::test]
-async fn rdf_reifies_triple_term_is_accepted_by_upsert_and_sync() {
-    // The canonical RDF 1.2 spelling reaches the converted paths through the
-    // same collector events as `~ r`, so it must land the same claim.
+async fn rdf_reifies_triple_term_reifies_without_asserting_on_upsert_and_sync() {
+    // `r rdf:reifies <<( s p o )>>` reaches the converted paths as a
+    // reification of a triple the graph does not assert (RDF 1.2): the
+    // reifier links to it, and the triple stays unasserted.
     let turtle = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
                   ex:claim1 rdf:reifies <<( ex:alice ex:knows ex:bob )>> .\n\
                   ex:claim1 ex:confidence 0.9 .\n";
+    let reified = "<< ex:alice ex:knows ex:bob ~ ?r >> ex:confidence ?conf";
 
     let fluree = FlureeBuilder::memory().build_memory();
     let upserted = fluree
@@ -226,7 +246,18 @@ async fn rdf_reifies_triple_term_is_accepted_by_upsert_and_sync() {
         )
         .await
         .expect("upsert_turtle with rdf:reifies <<( )>>");
-    assert_eq!(confidences(&fluree, &upserted.ledger, None).await, ["0.9"]);
+    assert_eq!(
+        select(&fluree, &upserted.ledger, None, reified).await.len(),
+        1
+    );
+    assert!(
+        select(&fluree, &upserted.ledger, None, "ex:alice ex:knows ?o")
+            .await
+            .is_empty()
+    );
+    assert!(confidences(&fluree, &upserted.ledger, None)
+        .await
+        .is_empty());
 
     let ledger_id = "it/turtle-star-sync:rdf-reifies";
     fluree
@@ -239,10 +270,14 @@ async fn rdf_reifies_triple_term_is_accepted_by_upsert_and_sync() {
     assert!(sync(&fluree, ledger_id, turtle)
         .await
         .expect("sync with rdf:reifies <<( )>>"));
+    let synced = fluree.ledger(ledger_id).await.expect("reload");
     assert_eq!(
-        annotated_knows(&fluree, ledger_id).await,
-        [("alice".into(), "bob".into(), "0.9".into())]
+        select(&fluree, &synced, Some(CLAIMS_GRAPH), reified)
+            .await
+            .len(),
+        1
     );
+    assert!(annotated_knows(&fluree, ledger_id).await.is_empty());
 }
 
 #[tokio::test]

@@ -1416,96 +1416,113 @@ fn build_annotation_sibling(
     Ok(Some(Value::Object(ann_map)))
 }
 
-/// Lower a `@reifies` block on the enclosing node. The enclosing node
-/// IS the annotation; `@reifies` names the base edge.
+/// Lower a `@reifies` block on the enclosing node: the node is a reifier,
+/// and each triple the block describes becomes its `rdf:reifies` link
+/// without being asserted (RDF 1.2). An array reifies several triples; the
+/// first rides on the node, the rest on siblings with the same `@id`.
 fn lower_reifies_block(
     map: &mut Map<String, Value>,
+    reifier: &str,
     reifies_val: Value,
-    _ctx: &mut LowerCtx,
+    graph: Option<&str>,
+    ctx: &mut LowerCtx,
 ) -> Result<()> {
-    let Value::Object(reifies_map) = reifies_val else {
+    let blocks = match reifies_val {
+        Value::Array(blocks) if !blocks.is_empty() => blocks,
+        Value::Array(_) => {
+            return Err(TransactError::Parse(
+                "@reifies must describe at least one triple".to_string(),
+            ))
+        }
+        block => vec![block],
+    };
+    for (i, block) in blocks.into_iter().enumerate() {
+        let slots = reifies_slots(block)?;
+        if i == 0 {
+            map.extend(slots);
+        } else {
+            let mut sibling = slots;
+            sibling.insert("@id".to_string(), json!(reifier));
+            if let Some(graph) = graph {
+                sibling.insert("@graph".to_string(), json!(graph));
+            }
+            ctx.siblings.push(Value::Object(sibling));
+        }
+    }
+    Ok(())
+}
+
+/// The `f:reifies*` slots naming the one triple a `@reifies` block
+/// describes: `{"@id": s, p: o}`.
+fn reifies_slots(block: Value) -> Result<Map<String, Value>> {
+    let Value::Object(block) = block else {
         return Err(TransactError::Parse(
-            "@reifies value must be a JSON object describing the base triple".to_string(),
+            "@reifies value must be a JSON object describing a triple".to_string(),
         ));
     };
-
-    // Reject nested annotations inside @reifies (v1 deferral).
-    for (k, _) in &reifies_map {
+    for k in block.keys() {
         if is_annotation_key(k) || k == REIFIES_KEY {
             return Err(TransactError::UnsupportedFeature(format!(
-                "{k} inside @reifies is the deferred nested-triple-term shape (v1)"
+                "{k} inside @reifies is the deferred nested-triple-term shape"
             )));
         }
     }
-
-    // Subject of the base edge: @id of the @reifies node-map.
-    let Some(Value::String(base_subject)) = reifies_map.get("@id") else {
+    let Some(Value::String(subject)) = block.get("@id") else {
         return Err(TransactError::Parse(
-            "@reifies must include an @id naming the base subject".to_string(),
+            "@reifies must include an @id naming the triple's subject".to_string(),
         ));
     };
-
-    // Find the single predicate-object pair (non-`@`-keyword key).
-    let pred_obj_pairs: Vec<(&String, &Value)> = reifies_map
-        .iter()
-        .filter(|(k, _)| !k.starts_with('@'))
-        .collect();
-    if pred_obj_pairs.len() != 1 {
+    let pairs: Vec<(&String, &Value)> = block.iter().filter(|(k, _)| !k.starts_with('@')).collect();
+    let [(predicate, object)] = pairs.as_slice() else {
+        return Err(TransactError::Parse(format!(
+            "@reifies must describe exactly one triple (got {} predicates); \
+             use an array to reify several",
+            pairs.len()
+        )));
+    };
+    if reifies_iris::ALL.contains(&predicate.as_str()) || *predicate == fluree_vocab::rdf::REIFIES {
         return Err(TransactError::UnsupportedFeature(format!(
-            "@reifies must describe exactly one base triple (got {} predicates); \
-             multi-triple reifiers are deferred to v2",
-            pred_obj_pairs.len()
+            "'{predicate}' is a system-controlled predicate"
         )));
     }
-    let (predicate, object_val) = pred_obj_pairs[0];
-
-    // Resolve the object: must be an IRI string, `{"@id": "..."}`, or a
-    // blank node; literal-valued reifiers are deferred.
-    let object_id = match object_val {
-        Value::String(s) => s.clone(),
-        Value::Object(ov) => match ov.get("@id") {
-            Some(Value::String(s)) => s.clone(),
+    let shape = match object {
+        Value::Object(object)
+            if object.contains_key("@value") || object.contains_key("@language") =>
+        {
+            classify_reified_object(object)?
+        }
+        Value::Object(object) => match object.get("@id") {
+            Some(Value::String(id)) if object.len() == 1 => ReifiedObjectShape::Iri(id.clone()),
             _ => {
-                return Err(TransactError::UnsupportedFeature(
-                    "@reifies object position: literal-valued or multi-property objects are deferred (v1); \
-                     reify only IRI-typed (or @id-shaped) objects"
-                        .to_string(),
-                ));
+                return Err(TransactError::Parse(
+                    "@reifies object must be an @id reference or a value".to_string(),
+                ))
             }
         },
-        _ => {
+        Value::Array(_) => {
             return Err(TransactError::Parse(
-                "@reifies object must be an IRI string, @id reference, or variable".to_string(),
-            ));
+                "@reifies must describe exactly one triple; use an array of @reifies \
+                 blocks to reify several"
+                    .to_string(),
+            ))
+        }
+        scalar => {
+            classify_reified_object(&Map::from_iter([("@value".to_string(), (*scalar).clone())]))?
         }
     };
 
-    // Inject f:reifies* predicates onto the enclosing map.
-    map.insert(
-        reifies_iris::SUBJECT.to_string(),
-        json!({"@id": base_subject}),
-    );
-    map.insert(
+    let mut slots = Map::new();
+    slots.insert(reifies_iris::SUBJECT.to_string(), json!({"@id": subject}));
+    slots.insert(
         reifies_iris::PREDICATE.to_string(),
         json!({"@id": predicate}),
     );
-    map.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
-
-    // The base edge is asserted by the user including @reifies, so
-    // we don't synthesize a sibling for it: presence of f:reifiesSubject /
-    // f:reifiesPredicate / f:reifiesObject IS the assertion intent at
-    // the system level; the actual base flake is asserted via the
-    // `f:reifies*` mechanism plus the AttachmentNovelty observer in
-    // M1's runtime path. M2 layers an arena on top.
-    //
-    // Wait — actually no. `@reifies` is *only* a query-side construct
-    // in v1 per the design doc. On the insert path, `@reifies` is
-    // currently rejected as the deferred unasserted-reifier shape.
-    Err(TransactError::UnsupportedFeature(
-        "@reifies on inserts is deferred (v1); use @annotation on the inline form instead, \
-         or split the insert into the base edge plus a separate annotation node"
-            .to_string(),
-    ))
+    let (object, lang) = emit_reifies_object_payload(&shape);
+    slots.insert(reifies_iris::OBJECT.to_string(), object);
+    if let Some(lang) = lang {
+        slots.insert(reifies_iris::LANG.to_string(), json!(lang));
+    }
+    Ok(slots)
 }
 
 /// Append synthetic sibling nodes to the document so the standard
@@ -1845,16 +1862,14 @@ fn lower_object_with_subject(
         graph: effective_graph,
     };
 
-    // 1. Honor `@reifies` on this node (rejected in v1 — see above).
-    //    Subject minting must use the merged context so a node-local
-    //    `@id` alias is recognized.
+    // 1. Honor `@reifies` on this node. Subject minting must use the
+    //    merged context so a node-local `@id` alias is recognized.
     if map.contains_key(REIFIES_KEY) {
         let val = map.remove(REIFIES_KEY).unwrap();
-        // `@reifies` is one of the cases that requires a subject id; the
-        // lower function reads `map`'s `@id` directly, but the mint must
-        // run first so the value is present.
-        let _ = ensure_subject_id(map, &child_walk, ctx);
-        lower_reifies_block(map, val, ctx)?;
+        // The lower function reads `map`'s `@id` directly, so the mint
+        // must run first.
+        let reifier = ensure_subject_id(map, &child_walk, ctx);
+        lower_reifies_block(map, &reifier, val, child_walk.graph, ctx)?;
     }
 
     // 2. Walk predicate-value pairs. Skip JSON-LD keywords plus their
@@ -3212,19 +3227,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reifies_on_insert() {
+    fn reifies_on_insert_names_its_triple_without_asserting_it() {
         let doc = json!({
             "@id": "ex:employment-1",
             "ex:role": "Engineer",
-            "@reifies": {
-                "@id": "ex:alice",
-                "ex:worksFor": { "@id": "ex:acme" }
-            }
+            "@reifies": [
+                { "@id": "ex:alice", "ex:worksFor": { "@id": "ex:acme" } },
+                { "@id": "ex:alice", "ex:age": 42 }
+            ]
         });
-        let err = lower(doc).unwrap_err();
+        let lowered = lower(doc).expect("lower");
+        let nodes = lowered["@graph"].as_array().expect("reifier + sibling");
+        assert_eq!(nodes.len(), 2, "{lowered:#}");
+        assert_eq!(nodes[0]["ex:role"], "Engineer");
+        assert_eq!(nodes[0][reifies_iris::SUBJECT], json!({"@id": "ex:alice"}));
+        assert_eq!(nodes[0][reifies_iris::OBJECT], json!({"@id": "ex:acme"}));
+        assert_eq!(nodes[1]["@id"], "ex:employment-1");
+        assert_eq!(nodes[1][reifies_iris::PREDICATE], json!({"@id": "ex:age"}));
+        assert_eq!(nodes[1][reifies_iris::OBJECT], json!({"@value": 42}));
         assert!(
-            err.to_string().contains("@reifies on inserts"),
-            "expected @reifies-on-insert deferral message, got: {err}"
+            nodes.iter().all(|n| n.get("ex:worksFor").is_none()),
+            "the triple is not asserted"
         );
     }
 

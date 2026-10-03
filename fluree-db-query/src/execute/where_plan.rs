@@ -132,25 +132,22 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, one_graph: bool) {
             body,
             term,
         } => {
-            // Build the chain (the body and the annotation's link to the
-            // edge) into a local vector. It is wrapped in
+            // Build the chain (the body, the annotation's link to the edge,
+            // and the edge) into a local vector. It is wrapped in
             // `Pattern::DefaultGraphSource` when the default graph is a union,
             // so the per-source iteration correlates them; otherwise one graph
             // is in scope and the chain joins its enclosing block.
             //
             // The order is the planner's tie-break: the body and the link are
-            // probes by reifier, and the term's components then decode from
-            // the bound term. Estimates still decide where they differ (a
+            // probes by reifier, the term's components then decode from the
+            // bound term, and the edge is a bound existence probe last. Estimates still decide where they differ (a
             // constant subject anchors the components through the term
             // dictionary).
             //
-            // The base edge is not joined: every write that attaches a
-            // reifier asserts its edge in the same graph and commit, and
-            // retracting the edge retracts the attachment, so a live link
-            // names a live edge; a policy that hides the edge hides the link.
-            // Joining it anyway probed the edge once per annotation. A
-            // reifier that does not assert its triple would end that
-            // invariant, and with it this elision.
+            // Annotation syntax asserts its triple (RDF 1.2), so the edge is
+            // joined: a reifier may reify a triple that is not asserted, and
+            // such a link must not match `s p o {| … |}`.
+            let base_edge = Pattern::Triple(edge.clone());
             let mut chain: Vec<Pattern> = Vec::new();
 
             // 1. Body patterns (recursively expanded so nested annotations —
@@ -174,6 +171,7 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, one_graph: bool) {
                 &|_| None,
                 &mut chain,
             );
+            chain.push(base_edge);
 
             // Under a default-graph union the `DefaultGraphSource` wrapper
             // switches the execution context to one member at a time, so the
@@ -2584,9 +2582,9 @@ pub fn build_where_operators_seeded_with_needed(
         return Ok(seed.unwrap_or_else(|| Box::new(EmptyOperator::new())));
     }
 
-    // Edge-annotation expansion (M1b): Pattern::EdgeAnnotation is
-    // flattened into the equivalent base edge plus the `f:reifies*`
-    // triple lookups plus the body. The standard scan/join machinery
+    // Edge-annotation expansion: Pattern::EdgeAnnotation is flattened into
+    // the equivalent base edge plus the reifier's `rdf:reifies` link plus
+    // the body. The standard scan/join machinery
     // handles the rest. The base-edge triple is always emitted, which
     // gives the annotation its visibility check for free: the base edge
     // must be currently asserted under the snapshot's normal
@@ -6615,11 +6613,11 @@ mod tests {
         let expanded = expand_edge_annotation_patterns(&patterns);
         let chain = unwrap_default_graph_source(&expanded[0]);
         // body triple + link + its predicate filter + term components +
-        // the sunk FILTER
-        assert_eq!(chain.len(), 5);
+        // the base edge + the sunk FILTER
+        assert_eq!(chain.len(), 6);
         assert_eq!(filter_count(chain), 1);
         assert!(
-            matches!(chain[4], Pattern::Filter(_)),
+            matches!(chain[5], Pattern::Filter(_)),
             "the FILTER sinks to the end of the chain, where the body is: {chain:?}"
         );
         // Copied, not relocated: the original keeps feeding

@@ -12,7 +12,7 @@ Throughout, the running example is employment: a `worksFor` edge that needs a `r
 |---|---|---|
 | JSON-LD writes, or you need named-graph edges, or literal-valued edges | **JSON-LD `@annotation`** | Most complete surface — covers everything below. |
 | A SPARQL 1.1/1.2 pipeline, or you're porting RDF-star data | **SPARQL 1.2 annotation tail** (`{\| \|}`, `~`, `rdf:reifies`) | Standards syntax. Default-graph only today. |
-| A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept `{\| \|}`, `~`, `<< >>` and `rdf:reifies <<( )>>`, and TriG `GRAPH { }` blocks accept them too (TriG via `insert` / `upsert` / `import` / `/sync`) | Same on-disk shape as `@annotation`; the reified triple is asserted; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
+| A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept `{\| \|}`, `~`, `<< >>` and `rdf:reifies <<( )>>`, and TriG `GRAPH { }` blocks accept them too (TriG via `insert` / `upsert` / `import` / `/sync`) | Same on-disk shape as `@annotation`; the annotation syntax asserts its triple, `<< >>` and `rdf:reifies` do not; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
 
 ## Attach metadata to a relationship
 
@@ -312,11 +312,11 @@ The edge and every other claim on it stay live. In RDF mode the named claim's bo
 
 ## Gotchas
 
-- **An annotation reifies exactly one live edge.** A single edge carries many parallel annotations, but one annotation `@id` can't point at two edges at once. To re-home an explicit-IRI annotation, retract the old attachment and assert the new one in the same transaction.
+- **One annotation `@id` may reify several triples**, and a single edge carries many parallel annotations. To re-home an explicit-IRI annotation, retract the old attachment and assert the new one in the same transaction; a JSON-LD upsert of the annotation does that for you.
 - **Deleting a claim with `DELETE DATA { … ~ :claim {| … |} }` deletes the edge** and detaches every other claim on it. Retract one claim with the JSON-LD by-id form (see [above](#retract-one-claim-and-keep-the-edge)).
 - **Don't write `f:reifies*` predicates by hand.** They're reserved and rejected on every write surface; they're also hidden from `?p` scans and `select: "*"`. Use `@annotation` / the annotation tail. (See [Vocabulary](../reference/vocabulary.md#edge-annotation-predicates-reserved).)
 - **Empty `@annotation: {}`** is a no-op in RDF mode (no subject minted); in LPG mode it mints a property-less relationship with identity.
-- **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements, reifiers for unasserted triples, triple terms as object values, annotation output in Turtle/CONSTRUCT, and the SPARQL 1.2 triple-term functions (`TRIPLE`, `isTRIPLE`, …). See [Current limits](../concepts/edge-annotations.md#current-limits).
+- **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements, triple terms as object values, annotation output in Turtle/CONSTRUCT, and the SPARQL 1.2 triple-term functions (`TRIPLE`, `isTRIPLE`, …). See [Current limits](../concepts/edge-annotations.md#current-limits).
 
 ## See also
 

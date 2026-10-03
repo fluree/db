@@ -25,9 +25,9 @@ If a fact is naturally about a *node* (Alice's birthdate, Acme's industry), put 
 
 | Surface | How | Notes |
 |---|---|---|
-| **JSON-LD insert / upsert / update** | `@annotation` (or alias `@edge`) on a value object | Most ergonomic. Covers literal-valued edges (with explicit `@type` / `@language`), parallel annotations, named reifiers, body cascades, and **named-graph edges** (an annotation on an edge inside a named graph is written into that same graph, keeping the edge's graph identity). `@reifies` is a query-side construct, **not** an insert form (user-authored `@reifies` on a write is rejected). |
+| **JSON-LD insert / upsert / update** | `@annotation` (or alias `@edge`) on a value object | Most ergonomic. Covers literal-valued edges (with explicit `@type` / `@language`), parallel annotations, named reifiers, body cascades, and **named-graph edges** (an annotation on an edge inside a named graph is written into that same graph, keeping the edge's graph identity). A node's `@reifies` (`{"@id": s, p: o}`, or an array of them) makes the node a reifier of that triple **without asserting it**, as `r rdf:reifies <<( s p o )>>` does. |
 | **SPARQL 1.2 UPDATE** | `INSERT DATA { :s :p :o {\| ... \|} }`, `~ <reifier>`, optional `INSERT { } WHERE { }` templates | Use this when integrating with SPARQL pipelines or when porting from RDF 1.2 / SPARQL-star. **Default graph only:** an annotation tail inside an explicit `GRAPH { }` block, or under a `WITH <g>` template, is rejected — use the JSON-LD surface or TriG-star for named-graph edge annotations. See [SPARQL 1.2 surface](#sparql-12--rdf-12-surface) below for the per-operation rules. |
-| **Turtle / N-Triples / TriG / N-Quads ingest** (`insert`, `upsert`, bulk `import`, graph sync (`fluree sync`, `/sync`), memory import; TriG via `insert` / `upsert` / `import` / `fluree sync` / `/sync`) | RDF 1.2 asserting forms: `:s :p :o ~ <reifier> {\| ... \|}`, `<< :s :p :o ~ :r >>` in subject or object position, and the canonical `:r rdf:reifies <<( :s :p :o )>>` (the only star spelling N-Triples and N-Quads have) — in the default graph and inside TriG `GRAPH { }` blocks alike | Same stored link as `@annotation`. An annotation inside a `GRAPH { }` block, or on an N-Quads statement with a graph label, is written into that graph with the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does. Every form asserts the base edge (Fluree reifies asserted edges, so `<< s p o >>` and `rdf:reifies <<( s p o )>>` are asserting here). Rejected with a specific error: `<<( ... )>>` anywhere other than the object of `rdf:reifies`, nested triple terms, star constructs inside an annotation body, annotations on collections, and annotations in a TriG `<#txn-meta>` block. Paths that convert to JSON-LD first (`upsert`, `graph sync`, memory import) also reject an annotation on an `rdf:type` edge. See [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star). |
+| **Turtle / N-Triples / TriG / N-Quads ingest** (`insert`, `upsert`, bulk `import`, graph sync (`fluree sync`, `/sync`), memory import; TriG via `insert` / `upsert` / `import` / `fluree sync` / `/sync`) | RDF 1.2 forms: the annotation syntax `:s :p :o ~ <reifier> {\| ... \|}`, `<< :s :p :o ~ :r >>` in subject or object position, and the canonical `:r rdf:reifies <<( :s :p :o )>>` (the only star spelling N-Triples and N-Quads have) — in the default graph and inside TriG `GRAPH { }` blocks alike | Same stored link as `@annotation`. An annotation inside a `GRAPH { }` block, or on an N-Quads statement with a graph label, is written into that graph with the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does. As in RDF 1.2, only the annotation syntax asserts the triple: `<< s p o >>` and `rdf:reifies <<( s p o )>>` reify it without asserting it, so N-Triples and N-Quads state an annotated triple as the triple plus its reifier's link. Rejected with a specific error: `<<( ... )>>` anywhere other than the object of `rdf:reifies`, nested triple terms, star constructs inside an annotation body, annotations on collections, and annotations in a TriG `<#txn-meta>` block. Paths that convert to JSON-LD first (`upsert`, `graph sync`, memory import) also reject an annotation on an `rdf:type` edge. See [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star). |
 
 Mint annotations through `@annotation` / `@edge` (JSON-LD) or the RDF 1.2 forms (`~`, `{| |}`, `<< >>`, `rdf:reifies <<( )>>`) in SPARQL UPDATE and Turtle. The [`f:reifies*` predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) earlier releases stored annotations under are reserved, and the write surfaces reject them; bulk import reads them, as an export written before links carries them, and stores each annotation's link instead.
 
@@ -395,7 +395,7 @@ In LPG mode, an empty block mints a fresh annotation subject — a property-less
 
 ## SPARQL 1.2 / RDF 1.2 surface
 
-`@annotation` lowers to the same on-disk model as the RDF 1.2 annotation tail. The equivalent **write** forms below produce identical storage; pick whichever is ergonomic for your input. (`@reifies` / `rdf:reifies` are **query-side** constructs — see [Querying annotation-rooted](#querying-annotation-rooted-metadata-first-edge-second) — and are rejected on the write side.)
+`@annotation` lowers to the same on-disk model as the RDF 1.2 annotation tail. The equivalent **write** forms below produce identical storage; pick whichever is ergonomic for your input. Each asserts the triple and links its reifier to it; `@reifies` and `rdf:reifies <<( … )>>` write the link alone (see [Reifiers of unasserted triples](#reifiers-of-unasserted-triples)).
 
 ### Equivalent forms
 
@@ -523,9 +523,19 @@ Anonymous annotation blocks (`{| |}` without `~`) lower to a fresh non-distingui
 
 As in RDF 1.2, an annotation subject may reify several triples: a given `@id` on two edges is linked to both, and its properties describe each. To move an explicit-IRI annotation from one edge to another, retract the old attachment and assert the new one; a JSON-LD upsert of the annotation does that for you.
 
-#### Lifecycle coupling
+#### Reifiers of unasserted triples
 
-Fluree's annotation is *lifecycle-coupled* to an asserted edge: the annotation describes a triple that's currently in the graph. RDF 1.2 also allows reifiers for unasserted propositions ("X claims Alice works for Acme without us asserting it"). That mode is **not supported in v1** — see *Current limits* below.
+A reifier may describe a triple that is not in the graph ("X claims Alice works for Acme", without asserting it). Write one with a reified triple — Turtle `<< :alice :worksFor :acme ~ :claim >> :source :x`, `:claim rdf:reifies <<( :alice :worksFor :acme )>>`, or JSON-LD:
+
+```json
+{
+  "@id": "ex:claim",
+  "ex:source": {"@id": "ex:x"},
+  "@reifies": {"@id": "ex:alice", "ex:worksFor": {"@id": "ex:acme"}}
+}
+```
+
+Reified-triple patterns (`<< :alice :worksFor ?o ~ ?r >>`, `?r rdf:reifies <<( … )>>`, JSON-LD `@reifies`) find such a reifier; the annotation syntax (`:alice :worksFor ?o {| … |}`, JSON-LD `@annotation`, a Cypher relationship) matches only asserted triples, as RDF 1.2 defines it. Export writes the reifier as its link (`@reifies` in JSON-LD), so it round-trips.
 
 ### Deferred SPARQL shapes (rejected at parse time)
 
@@ -563,10 +573,8 @@ The bare-quoted-triple form combined with an annotation tail (`<< :s :p :o >> :p
 Today's surface covers the common LPG / RDF-star use cases. The following are not yet supported and produce a clear validation error rather than silent partial behavior:
 
 - **Annotations on list-occurrence triples.** `@list` membership is in scope as a future extension; the on-disk format already reserves space for it. Today, annotating a list element is rejected at parse time.
-- **Reifiers for unasserted triples.** `@reifies` must point at an asserted edge. Pure-proposition reification (claims about triples that are not in the graph) is deferred.
 - **Triple terms as stored values.** `ex:doc ex:mentions <<( ex:s ex:p ex:o )>>` is not a representable value on any write surface (JSON-LD, SPARQL, Turtle): the only accepted position for `<<( ... )>>` is the object of `rdf:reifies`, where it names an edge rather than storing a triple. Use a separate annotation subject. A query can still build and return one: `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE` and `BIND(<<( ?s ?p ?o )>> AS ?t)` work on terms, and a bound term renders in every result format (see [Output formats](../query/output-formats.md#triple-terms)). JSON-LD queries name them `triple`, `subject`, `predicate`, `object` and `isTriple` (see [JSON-LD query](../query/jsonld-query.md#triple-term-functions)).
 - **SPARQL UPDATE annotations inside named graphs.** Annotation tails under `GRAPH { }` / `WITH <g>` in SPARQL UPDATE are rejected; write named-graph annotations with JSON-LD `@annotation` or TriG-star.
-- **Unasserted reified triples.** RDF 1.2's `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do not assert `s p o`; Fluree's do (the reifier is lifecycle-coupled to a live edge). A W3C test that depends on a reifier existing for a triple that is *not* in the graph therefore diverges.
 
 The mandated SPARQL 1.2 `VERSION "1.2"` prologue declaration is **accepted** (lex-and-skipped): the RDF 1.2 surface runs ungated, so a conformant 1.2 client that emits the declaration parses normally.
 

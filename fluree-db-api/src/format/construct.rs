@@ -118,7 +118,13 @@ pub(super) fn instantiate_construct_graph(
             Some(g) => Some(slot_of(&mut terms, g, Position::Graph)?),
             None => None,
         };
-        patterns.push(([s, p, o], graph, Vec::new(), const_term));
+        patterns.push((
+            [s, p, o],
+            graph,
+            Vec::new(),
+            const_term,
+            template.is_asserted(i),
+        ));
     }
     for r in template.reifications() {
         let reifier = slot_of(&mut terms, &r.reifier, Position::Subject)?;
@@ -158,10 +164,11 @@ pub(super) fn instantiate_construct_graph(
                         },
                     })
                 };
-            'pattern: for (slots, graph_slot, reifier_slots, const_term) in &patterns {
+            'pattern: for (slots, graph_slot, reifier_slots, const_term, asserted) in &patterns {
                 // `?r rdf:reifies ?t` with a triple term bound to ?t (or a
                 // constant one) writes what `?r rdf:reifies <<( s p o )>>`
-                // does: the term's triple and ?r's reification of it.
+                // does: ?r's reification of the term's triple, which it does
+                // not assert.
                 let components = match &slots[2] {
                     Slot::Var(v) => batch
                         .get(row, *v)
@@ -186,9 +193,9 @@ pub(super) fn instantiate_construct_graph(
                             None => None,
                         };
                         let [ts, tp, to] = components;
-                        let g = dataset.graph_mut(graph.as_ref());
-                        g.add_reification(ts.clone(), tp.clone(), to.clone(), reifier);
-                        g.add(Triple::new(ts, tp, to));
+                        dataset
+                            .graph_mut(graph.as_ref())
+                            .add_reification(ts, tp, to, reifier);
                         continue 'pattern;
                     }
                 }
@@ -226,7 +233,9 @@ pub(super) fn instantiate_construct_graph(
                 for r in reifiers.drain(..) {
                     g.add_reification(s.clone(), p.clone(), o.clone(), r);
                 }
-                g.add(Triple::new(s, p, o));
+                if *asserted {
+                    g.add(Triple::new(s, p, o));
+                }
             }
         }
     }

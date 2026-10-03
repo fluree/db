@@ -26,18 +26,15 @@ use crate::evaluator::TestEvaluator;
 use crate::files::read_file_to_string;
 use crate::manifest::Test;
 use crate::result_comparison::{are_results_isomorphic, format_results_diff};
-use crate::result_format::{ir_term_to_rdf_term, RdfTerm, SparqlResults, Triple};
+use crate::result_format::{
+    ir_term_to_rdf_term, RdfTerm, SparqlResults, Triple, REIFIES_OBJECT, REIFIES_PREDICATE,
+    REIFIES_SUBJECT,
+};
 use crate::vocab::rdft;
 
 const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
 const RDF_REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
 const RDF_NIL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil";
-
-/// Stand-in predicates that spell a reifier attachment as ordinary triples,
-/// so the isomorphism check sees which triple each reifier names.
-const REIFIES_SUBJECT: &str = "urn:fluree:testsuite:reifies-subject";
-const REIFIES_PREDICATE: &str = "urn:fluree:testsuite:reifies-predicate";
-const REIFIES_OBJECT: &str = "urn:fluree:testsuite:reifies-object";
 
 /// Register handlers for every `rdft:` test type the Turtle parser can serve.
 pub fn register_rdf_tests(evaluator: &mut TestEvaluator) {
@@ -107,9 +104,8 @@ fn evaluate_negative_syntax(test: &Test) -> Result<()> {
 /// Both documents go through the same parser, reifier attachments included:
 /// the expected `.nt` spells each one `r rdf:reifies <<( s p o )>>`, which
 /// the parser reads as the same attachment an action's `<< s p o >>` or
-/// `{| |}` produces. The parser also asserts `s p o` on both sides (Fluree
-/// reifies asserted edges), so a pass means the action desugars to the
-/// expected attachments under that model, not that the base triple is absent.
+/// `{| |}` produces. Only the annotation syntax asserts `s p o`, on either
+/// side.
 fn evaluate_eval(test: &Test) -> Result<()> {
     let url = action_url(test)?;
     let result_url = test
@@ -218,9 +214,7 @@ fn graph_to_rdf_triples(graph: &Graph) -> Vec<Triple> {
             });
         }
     }
-    // An RDF graph is a set. The parser emits a base triple again for each
-    // `rdf:reifies <<( s p o )>>`, so an expected graph that also states
-    // `s p o .` would otherwise differ from the action by a duplicate.
+    // An RDF graph is a set.
     let mut seen = HashSet::new();
     out.retain(|t| seen.insert(t.clone()));
     out

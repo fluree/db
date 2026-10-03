@@ -305,9 +305,11 @@ pub trait GraphSink {
     /// triple `(subject, predicate, object)`.
     ///
     /// Contract:
-    /// - The parser has ALREADY emitted the base triple via
-    ///   [`Self::emit_triple`] (Fluree's edge-annotation model reifies an
-    ///   asserted edge). This event only records the reifier attachment.
+    /// - This event records only the reifier attachment. The base triple is
+    ///   asserted only by the annotation syntax (`s p o ~ r` / `{| … |}`),
+    ///   whose parser emits it via [`Self::emit_triple`] first; a reified
+    ///   triple (`<< s p o >>`, `r rdf:reifies <<( s p o )>>`) does not
+    ///   assert it.
     /// - The parser mints a FRESH blank-node reifier per anonymous
     ///   occurrence (`<< s p o >>` / `{| … |}` without `~ reifier`) and
     ///   never deduplicates reifiers by base-triple identity; sinks must

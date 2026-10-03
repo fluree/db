@@ -459,14 +459,15 @@ async fn link_lowering_joins_component_variables_in_every_scope() {
 
     let got = run("SELECT ?s WHERE { ?s ex:age ?age . << ?s ?p ?o >> ex:source ?src }").await;
     assert!(got.is_empty(), "carol's claim has no source: {got:#?}");
+    // `<< ex:bob ex:knows ex:dave >>` reifies a triple it does not assert.
     let got = run(
         "SELECT ?s ?o WHERE { ?s ex:knows ?o . ?r rdf:reifies <<( ?s ex:knows ?o )>> } \
          ORDER BY ?s ?o",
     )
     .await;
-    assert_eq!(got.len(), 3, "{got:#?}");
+    assert_eq!(got.len(), 2, "{got:#?}");
     assert!(
-        got[2][0].ends_with("bob") && got[2][1].ends_with("dave"),
+        got[1][0].ends_with("alice") && got[1][1].ends_with("carol"),
         "{got:#?}"
     );
 }
@@ -2093,8 +2094,8 @@ async fn triple_terms_render_in_every_result_format() {
 }
 
 /// `?r rdf:reifies ?t` in a CONSTRUCT template, with a triple term bound to
-/// ?t, writes what the explicit `<<( s p o )>>` template writes. Under any
-/// other predicate the term (which the graph model cannot hold as an object)
+/// ?t, writes what the explicit `<<( s p o )>>` template writes: the
+/// reification, without asserting its triple. Under any other predicate the term (which the graph model cannot hold as an object)
 /// is written as its N-Triples text.
 #[tokio::test]
 async fn construct_writes_triple_terms_as_reifications() {
@@ -2144,11 +2145,7 @@ async fn construct_writes_triple_terms_as_reifications() {
         let by_term = construct("?r rdf:reifies ?t", term_form).await;
         let by_template = construct("?r rdf:reifies <<( ?s ?p ?o )>>", template_form).await;
         let lines = sorted(&by_term);
-        assert_eq!(
-            lines.len(),
-            2,
-            "the base triple and its reification: {lines:#?}"
-        );
+        assert_eq!(lines.len(), 1, "the reification alone: {lines:#?}");
         assert_eq!(lines, sorted(&by_template), "{term_form}");
         assert_eq!(
             by_term.to_construct(&ledger.snapshot).expect("JSON-LD"),
@@ -2159,7 +2156,7 @@ async fn construct_writes_triple_terms_as_reifications() {
     let hr = construct("?r rdf:reifies ?t", "?r rdf:reifies ?t ; ex:source ex:hr").await;
     assert_eq!(
         hr.to_construct(&ledger.snapshot).expect("JSON-LD")["@graph"],
-        json!([{"@id": "ex:alice", "ex:knows": [{"@id": "ex:bob", "@annotation": {"@id": "ex:claim1"}}]}])
+        json!([{"@id": "ex:claim1", "@reifies": [{"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}}]}])
     );
 
     // The shorthand's template is the WHERE clause: a constant quoted triple
@@ -2171,7 +2168,6 @@ async fn construct_writes_triple_terms_as_reifications() {
         .expect("construct where");
     let ex = |l: &str| format!("<http://example.org/{l}>");
     let mut expected = vec![
-        format!("{} {} {} .", ex("alice"), ex("knows"), ex("bob")),
         format!(
             "{} {REIFIES} <<( {} {} {} )>> .",
             ex("claim1"),

@@ -409,27 +409,19 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
     // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
-    // (D-8) — "expected subject, found 'GRAPH'" (4)
+    // (D-8) — "expected subject, found 'GRAPH'" (3)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
-    // results not isomorphic: the star data LOADS, but Fluree's model
-    // asserts the base triple of every `<< s p o >>` — RDF 1.2's
-    // non-asserting reified triples (3)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-8-nomatch",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1j",
+    // SRX results: the harness reads no `<triple>` result term (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
     // SPARQL lowering: "RDF-star quoted triples in this position lowering is
     // not yet implemented" (CONSTRUCT templates) (2)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
-    // D-4 CONSTRUCT annotation projection: lowering returns "CONSTRUCT
-    // projection of edge-annotation metadata is not supported in v1" (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-4",
-    // results not isomorphic: the expected graph (`r rdf:reifies <<( … )>>`)
-    // now parses, but CONSTRUCT emits the annotation body without the
-    // reifier's attachment — D-4 annotation projection (1)
+    // results not isomorphic: CONSTRUCT WHERE reuses the matched reifier for
+    // an anonymous `{| |}`, where the template mints a fresh blank node per
+    // solution (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
     // SPARQL lowering: triple-term values in VALUES data not implemented (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",

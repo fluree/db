@@ -377,10 +377,9 @@ Inline `@annotation` queries return one row per occurrence.
 **Deferred shapes** error with explicit messages:
 
 - Annotations on list-occurrence triples (`@list` membership).
-- Reifiers for unasserted triples (`@reifies` must point at an asserted edge).
-- Multi-triple `@reifies` (more than one predicate-object pair under `@reifies`).
+- More than one predicate-object pair in one `@reifies` block (use an array of blocks to
+  reify several triples).
 - Annotation-of-annotation (nested `@annotation` inside an annotation body).
-- `@reifies` on the insert side (use the inline `@annotation` form instead).
 - Hand-authored mention of the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations (compact or full IRI form).
 
 For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).

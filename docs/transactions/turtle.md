@@ -482,7 +482,7 @@ ex:emp1 rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
 
 Two rules to know:
 
-- **The reified triple is asserted.** RDF 1.2 says `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do *not* put `s p o` in the graph; Fluree's annotations describe a live edge, so ingest asserts the base triple as well and attaches the reifier to it. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
+- **Only the annotation syntax asserts the triple.** As RDF 1.2 defines them, `s p o ~ r` and `s p o {| … |}` put `s p o` in the graph and attach the reifier to it, while `<< s p o >>` and `r rdf:reifies <<( s p o )>>` attach the reifier without asserting `s p o`. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
 - **`<<( ... )>>` is accepted only as the object of `rdf:reifies`.** As a plain value (`ex:doc ex:mentions <<( ... )>>`), nested inside another triple term, or inside an annotation body, it is rejected with a specific "deferred" error rather than silently dropped.
 
 TriG and N-Quads accept the same forms inside `GRAPH { }` blocks (and on N-Quads statements with a graph label). The annotation is written into that graph and carries the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does:

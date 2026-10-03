@@ -34,9 +34,9 @@ Turtle 1.2 annotation syntax is accepted on ingest — `{| ... |}` annotation
 tails, the `~` reifier, `<< s p o >>` reified triples and
 `r rdf:reifies <<( s p o )>>` — on every Turtle write path (insert, upsert,
 import, graph sync over the CLI or `/sync`), inside TriG `GRAPH { }` blocks, and in N-Triples and
-N-Quads files. All forms assert the base triple: Fluree reifies asserted
-edges, so `<< s p o >>` is asserting here where RDF 1.2 makes it
-non-asserting. The `VERSION "1.2"` / `@version`
+N-Quads files. As in RDF 1.2, only the annotation syntax asserts the triple;
+`<< s p o >>` and `rdf:reifies <<( s p o )>>` reify it without asserting it.
+The `VERSION "1.2"` / `@version`
 directive and `--ltr` / `--rtl` base-direction language tags are accepted.
 The vendored W3C RDF 1.1 and RDF 1.2 Turtle suites run in CI
 (`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the skip register.

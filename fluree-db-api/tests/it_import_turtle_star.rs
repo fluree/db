@@ -177,13 +177,16 @@ async fn knows_claims(
         .collect()
 }
 
-/// N-Quads has only the `rdf:reifies <<( … )>>` spelling. The importer
-/// regroups labeled statements into TriG blocks, so the claim follows its
+/// N-Quads has only the `rdf:reifies <<( … )>>` spelling, so an annotated
+/// triple is the triple plus its reifier's link. The importer regroups
+/// labeled statements into TriG blocks, so the claim follows its
 /// statement's graph label.
 #[tokio::test]
 async fn imported_nquads_claims_land_in_their_statement_graph() {
-    const NQUADS: &str = r#"_:r1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .
+    const NQUADS: &str = r#"<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .
+_:r1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .
 _:r1 <http://example.org/confidence> "0.9" .
+<http://example.org/alice> <http://example.org/knows> <http://example.org/carol> <http://example.org/graphs/claims> .
 _:r2 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/carol> )>> <http://example.org/graphs/claims> .
 _:r2 <http://example.org/confidence> "0.5" <http://example.org/graphs/claims> .
 "#;

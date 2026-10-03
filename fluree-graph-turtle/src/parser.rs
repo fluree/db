@@ -1301,11 +1301,11 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         )
     }
 
-    /// `r rdf:reifies <<( s p o )>>` — the RDF 1.2 spelling every asserting
+    /// `r rdf:reifies <<( s p o )>>` — the RDF 1.2 spelling every reifying
     /// form desugars to, and the only star construct N-Triples/N-Quads have.
     /// The `<<(` token is current and `subject` is the reifier. Emits exactly
-    /// what `<< s p o ~ r >>` emits (base triple asserted, then the reifier
-    /// attachment), so both spellings produce one on-disk shape.
+    /// what `<< s p o ~ r >>` emits: the reifier attachment, without
+    /// asserting `s p o`.
     ///
     /// Grammar: `tripleTerm ::= '<<(' ttSubject predicate ttObject ')>>'`,
     /// `ttSubject ::= iri | BlankNode`, `ttObject ::= iri | BlankNode |
@@ -1319,7 +1319,6 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             let predicate = p.parse_predicate()?;
             let object = p.parse_tt_object()?;
             p.expect(&TokenKind::TripleTermEnd)?;
-            p.sink_emit_triple(subject, predicate, object)?;
             p.sink_emit_reified_triple(subject, predicate, object, reifier)
         })?;
         // An annotation tail here would reify the `rdf:reifies` triple
@@ -1451,11 +1450,8 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
             p.expect(&TokenKind::ReifiedTripleEnd)?;
 
-            // Fluree's edge-annotation model reifies an asserted edge: emit the
-            // base triple, then the reifier attachment (documented divergence
-            // from RDF 1.2's non-asserting `<< >>`; see the roadmap's construct
-            // inventory).
-            p.sink_emit_triple(subject, predicate, object)?;
+            // A reified triple does not assert `s p o` (RDF 1.2); only the
+            // annotation syntax does.
             p.sink_emit_reified_triple(subject, predicate, object, reifier)?;
 
             Ok(reifier)
@@ -2353,16 +2349,14 @@ mod tests {
 
     #[test]
     fn star_reified_triple_subject_position() {
-        // data-1 shape: assert base, mint anon reifier, reifier gets props.
+        // data-1 shape: mint anon reifier, reifier gets props; the reified
+        // triple is not asserted.
         let sink = parse_star(&format!("{P}<<:a :b :c>> :q :z ."));
         assert_eq!(sink.reified.len(), 1);
         let (s, p, o, r) = &sink.reified[0];
         assert_eq!((s, p, o), (&iri("a"), &iri("b"), &iri("c")));
         assert!(matches!(r, RecTerm::Blank(_)), "anon reifier: {r:?}");
-        // Base triple asserted + reifier property triple.
-        assert!(sink.triples.contains(&(iri("a"), iri("b"), iri("c"))));
-        assert!(sink.triples.contains(&(r.clone(), iri("q"), iri("z"))));
-        assert_eq!(sink.triples.len(), 2);
+        assert_eq!(sink.triples, vec![(r.clone(), iri("q"), iri("z"))]);
     }
 
     #[test]
@@ -2477,8 +2471,8 @@ mod tests {
         let (s, p, o, r) = &sink.reified[0];
         assert_eq!((s, p, o), (&iri("a"), &iri("b"), &iri("c")));
         assert_eq!(r, &iri("r"));
-        // Base triple asserted; no ordinary `rdf:reifies` triple emitted.
-        assert_eq!(sink.triples, vec![(iri("a"), iri("b"), iri("c"))]);
+        // Neither the triple nor an ordinary `rdf:reifies` triple emitted.
+        assert!(sink.triples.is_empty(), "{:?}", sink.triples);
     }
 
     #[test]
@@ -2501,9 +2495,14 @@ mod tests {
     fn star_rdf_reifies_matches_tilde_spelling() {
         let prefix = format!("{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n");
         let a = parse_star(&format!("{prefix}:r rdf:reifies <<( :a :b :c )>> ."));
-        let b = parse_star(&format!("{prefix}:a :b :c ~ :r ."));
+        let b = parse_star(&format!("{prefix}<< :a :b :c ~ :r >> ."));
+        let annotated = parse_star(&format!("{prefix}:a :b :c ~ :r ."));
         assert_eq!(a.reified, b.reified);
         assert_eq!(a.triples, b.triples);
+        assert_eq!(a.reified, annotated.reified);
+        // Only the annotation syntax asserts the triple.
+        assert!(a.triples.is_empty());
+        assert_eq!(annotated.triples, vec![(iri("a"), iri("b"), iri("c"))]);
     }
 
     #[test]
@@ -2671,19 +2670,19 @@ mod tests {
 
     #[test]
     fn star_bare_reified_triple_statement() {
-        // `<< s p o >> .` with no predicate-object list: asserts the base
-        // triple and attaches a fresh anonymous reifier, nothing more.
-        let sink = parse_star(&format!("{P}:s :p :o .\n<<:s :p :o>> ."));
+        // `<< s p o >> .` with no predicate-object list attaches a fresh
+        // anonymous reifier, nothing more.
+        let sink = parse_star(&format!("{P}<<:s :p :o>> ."));
         assert_eq!(sink.reified.len(), 1);
         assert!(matches!(sink.reified[0].3, RecTerm::Blank(_)));
-        assert_eq!(sink.triples.len(), 2, "{:?}", sink.triples);
+        assert!(sink.triples.is_empty(), "{:?}", sink.triples);
     }
 
     #[test]
     fn star_collector_sink_records_reifications() {
         // The collector (the Turtle→JSON-LD path behind upsert, graph sync
-        // and memory import) accepts every asserting star form and keeps
-        // the reifier attachments alongside the triples.
+        // and memory import) accepts every star form and keeps the reifier
+        // attachments alongside the triples.
         let mut sink = GraphCollectorSink::new();
         parse(
             &format!(
@@ -2714,9 +2713,9 @@ mod tests {
             anon.iter().all(|t| matches!(t, Term::BlankNode(_))),
             "{anon:?}"
         );
-        // Every base triple is asserted exactly once; body triples about
-        // the reifiers are ordinary triples.
-        assert_eq!(graph.len(), 5, "{:?}", graph.triples());
+        // The two annotated triples are asserted, the reified one is not;
+        // body triples about the reifiers are ordinary triples.
+        assert_eq!(graph.len(), 4, "{:?}", graph.triples());
     }
 
     #[test]

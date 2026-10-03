@@ -105,7 +105,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             let p = self.lower_predicate(&tp.predicate)?;
 
             // `?r rdf:reifies <<( s p o )>>`: the triple term is the reified
-            // triple and `?r` its reifier.
+            // triple, not asserted, and `?r` its reifier.
             if let Term::TripleTerm(term) = &tp.object {
                 if p != reifies || tp.annotation.is_some() {
                     return Err(LowerError::not_implemented(
@@ -122,7 +122,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         tp.span,
                     ));
                 }
-                let triple = out.push_pattern(reified, graph.clone());
+                let triple = out.push_reified_pattern(reified, graph.clone());
                 out.push_reification(triple, s);
                 continue;
             }

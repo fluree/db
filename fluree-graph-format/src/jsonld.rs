@@ -344,6 +344,35 @@ fn graph_nodes(
         nodes.insert(subj_key, node);
     }
 
+    // A reification of a triple the graph does not assert has no edge to
+    // annotate: its reifier names the triple with `@reifies`.
+    let asserted: std::collections::HashSet<&fluree_graph_ir::Triple> = graph.iter().collect();
+    for reification in graph.reifications() {
+        let triple = &reification.triple;
+        if asserted.contains(triple) {
+            continue;
+        }
+        let Term::Iri(p) = &triple.p else {
+            continue;
+        };
+        let mut block = Map::new();
+        block.insert(
+            "@id".to_string(),
+            JsonValue::String(term_to_subject_key(&triple.s, config, bnode_renamer)?),
+        );
+        block.insert(
+            config.compact_vocab_iri(p),
+            term_to_object(&triple.o, config, bnode_renamer),
+        );
+        let reifier = term_to_subject_key(&reification.reifier, config, bnode_renamer)?;
+        let node = nodes.entry(reifier.clone()).or_insert_with(|| {
+            let mut node = Map::new();
+            node.insert("@id".to_string(), JsonValue::String(reifier));
+            node
+        });
+        add_property(node, "@reifies", JsonValue::Object(block));
+    }
+
     // Post-process: wrap single values in arrays if multicardinal_arrays is enabled
     // Note: @list values should NOT be wrapped
     if config.multicardinal_arrays {

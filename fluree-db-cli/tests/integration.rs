@@ -2571,6 +2571,69 @@ fn export_annotations_round_trip_in_every_format() {
     }
 }
 
+/// A reifier of a triple the ledger does not assert has no edge to carry a
+/// `~` marker: it is written as its `rdf:reifies` link (`@reifies` in
+/// JSON-LD), and re-importing it reifies the triple without asserting it.
+#[test]
+fn export_round_trips_reifications_of_unasserted_triples() {
+    let src = TempDir::new().unwrap();
+    fluree_cmd(&src).arg("init").assert().success();
+    let data = src.path().join("unasserted-src");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("a.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.8 |} .\n\
+         << ex:alice ex:knows ex:carol ~ ex:claim2 >> ex:confidence 0.5 .\n",
+    )
+    .unwrap();
+    fluree_cmd(&src)
+        .args(["create", "unasserted", "--from"])
+        .arg(&data)
+        .assert()
+        .success();
+
+    for (fmt, ext) in [("turtle", "ttl"), ("ntriples", "nt"), ("jsonld", "jsonld")] {
+        let out = src.path().join(format!("unasserted.{ext}"));
+        fluree_cmd(&src)
+            .args(["export", "unasserted", "--format", fmt, "-o"])
+            .arg(&out)
+            .assert()
+            .success();
+
+        let dst = TempDir::new().unwrap();
+        fluree_cmd(&dst).arg("init").assert().success();
+        fluree_cmd(&dst)
+            .args(["create", "unasserted", "--from"])
+            .arg(&out)
+            .assert()
+            .success();
+        fluree_cmd(&dst)
+            .args([
+                "query",
+                "unasserted",
+                "--sparql",
+                "PREFIX ex: <http://example.org/> \
+                 SELECT ?r ?c WHERE { << ex:alice ex:knows ?o ~ ?r >> ex:confidence ?c }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("claim1"))
+            .stdout(predicate::str::contains("claim2"));
+        fluree_cmd(&dst)
+            .args([
+                "query",
+                "unasserted",
+                "--sparql",
+                "PREFIX ex: <http://example.org/> SELECT ?o WHERE { ex:alice ex:knows ?o }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("bob"))
+            .stdout(predicate::str::contains("carol").not());
+    }
+}
+
 /// A link's object keeps its datatype and language tag, so each object shape
 /// — a ref, a plain literal, a language-tagged one — has to reach the output.
 #[test]
@@ -2810,17 +2873,12 @@ fn an_untranslated_annotation_exports_with_its_marker() {
         .stdout(predicate::str::contains("<http://example.org/src>"));
 }
 
-/// The counter still fires when an annotation genuinely cannot be resolved.
-///
-/// Paired with the tests above on purpose. "No warning" is satisfied by a
-/// counter that has stopped working, so a `MustNotFire` assertion alone
-/// cannot distinguish "nothing was dropped" from "the accounting is dead".
-///
-/// The fixture is an export written before links whose `f:reifies*` bundle
-/// names a triple the file never asserts. Import stores its link, and the
-/// export has no base edge to hang the `~` marker on.
+/// An export written before links whose `f:reifies*` bundle names a triple
+/// the file never asserts imports as a reifier of that unasserted triple. The
+/// export has no edge to hang a `~` marker on, so it writes the link itself,
+/// and nothing goes unresolved.
 #[test]
-fn the_unresolved_counter_still_fires_when_it_should() {
+fn an_old_bundle_naming_an_unasserted_triple_exports_as_its_link() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     let src = tmp.path().join("mf-src");
@@ -2843,9 +2901,11 @@ fn the_unresolved_counter_still_fires_when_it_should() {
         .args(["export", "mf", "--format", "turtle"])
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "1 edge annotations could not be resolved",
-        ));
+        .stdout(predicate::str::contains(
+            "rdf:reifies <<( <http://example.org/x> <http://example.org/p> \
+             <http://example.org/y> )>>",
+        ))
+        .stderr(predicate::str::contains("could not be resolved").not());
 }
 
 /// Every object shape keeps its annotation, including the big-numeric ones.

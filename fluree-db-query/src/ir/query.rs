@@ -53,6 +53,9 @@ pub struct ConstructTemplate {
     /// `patterns[triple]` instantiates to. A row that leaves either unbound
     /// contributes no attachment.
     reifications: Vec<TemplateReification>,
+    /// Patterns that are only reified (`r rdf:reifies <<( s p o )>>`), so
+    /// their triple is not written. Empty when every pattern is asserted.
+    reified_only: HashSet<usize>,
 }
 
 /// A reifier attachment in a CONSTRUCT template (see
@@ -80,6 +83,7 @@ impl ConstructTemplate {
             bnode_vars,
             graphs: Vec::new(),
             reifications: Vec::new(),
+            reified_only: HashSet::new(),
         }
     }
 
@@ -93,6 +97,19 @@ impl ConstructTemplate {
         }
         self.patterns.push(pattern);
         self.patterns.len() - 1
+    }
+
+    /// Append a pattern whose triple is reified but not written (see
+    /// [`push_pattern`](Self::push_pattern)).
+    pub fn push_reified_pattern(&mut self, pattern: TriplePattern, graph: Option<Ref>) -> usize {
+        let i = self.push_pattern(pattern, graph);
+        self.reified_only.insert(i);
+        i
+    }
+
+    /// Whether `patterns[i]`'s triple is written, rather than only reified.
+    pub fn is_asserted(&self, i: usize) -> bool {
+        !self.reified_only.contains(&i)
     }
 
     /// Attach `reifier` to `patterns[triple]`, an index

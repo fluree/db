@@ -362,10 +362,10 @@ details of each.
   template is a basic graph pattern, per SPARQL 1.1).
 - A triple term in a template is accepted only as the object of `rdf:reifies`; nested triple
   terms and property paths inside a template annotation block are rejected.
-- `?r rdf:reifies <<( s p o )>>` in a template also writes `s p o`, the same as the annotation
-  tail `s p o ~ ?r`. Fluree reifies asserted edges only, as every write form does (see
-  [Edge annotations](../concepts/edge-annotations.md)), so a result never carries a reifier
-  without its triple. `?r rdf:reifies ?t`, with `?t` bound to a triple term, writes the same.
+- `?r rdf:reifies <<( s p o )>>` in a template writes the reification without `s p o`, as RDF
+  1.2 defines it; the annotation tail `s p o ~ ?r` writes both. `?r rdf:reifies ?t`, with `?t`
+  bound to a triple term, writes the same as the first. A JSON-LD result writes a reification
+  whose triple it does not carry as the reifier's `@reifies`.
   Under any other predicate, a bound triple term is written as a literal holding its N-Triples
   text: a result graph holds triple terms only as reifications.
 - A SPARQL datalog rule whose head (the template) annotates an edge or writes into a named

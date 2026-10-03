@@ -695,15 +695,53 @@ pub fn parse_expected_graph(url: &str) -> Result<Vec<Triple>> {
     let mut sink = GraphCollectorSink::new();
     parse_turtle(&with_base, &mut sink)
         .with_context(|| format!("Parsing expected graph: {url}"))?;
-    let graph = sink.into_graph();
-    Ok(graph
+    Ok(graph_triples(&sink.into_graph()))
+}
+
+/// Stand-in predicates that spell a reifier attachment as ordinary triples,
+/// so the isomorphism check sees which triple each reifier names.
+pub(crate) const REIFIES_SUBJECT: &str = "urn:fluree:testsuite:reifies-subject";
+pub(crate) const REIFIES_PREDICATE: &str = "urn:fluree:testsuite:reifies-predicate";
+pub(crate) const REIFIES_OBJECT: &str = "urn:fluree:testsuite:reifies-object";
+
+/// `reifier`'s attachment to `(s, p, o)` as its three stand-in triples.
+pub(crate) fn reification_triples(
+    reifier: RdfTerm,
+    s: RdfTerm,
+    p: RdfTerm,
+    o: RdfTerm,
+) -> [Triple; 3] {
+    [
+        (REIFIES_SUBJECT, s),
+        (REIFIES_PREDICATE, p),
+        (REIFIES_OBJECT, o),
+    ]
+    .map(|(stand_in, term)| Triple {
+        subject: reifier.clone(),
+        predicate: RdfTerm::Iri(stand_in.to_string()),
+        object: term,
+    })
+}
+
+/// A parsed graph's triples, with each reification as its stand-in triples.
+fn graph_triples(graph: &IrGraph) -> Vec<Triple> {
+    let mut out: Vec<Triple> = graph
         .iter()
         .map(|t| Triple {
             subject: ir_term_to_rdf_term(&t.s),
             predicate: ir_term_to_rdf_term(&t.p),
             object: ir_term_to_rdf_term(&t.o),
         })
-        .collect())
+        .collect();
+    for r in graph.reifications() {
+        out.extend(reification_triples(
+            ir_term_to_rdf_term(&r.reifier),
+            ir_term_to_rdf_term(&r.triple.s),
+            ir_term_to_rdf_term(&r.triple.p),
+            ir_term_to_rdf_term(&r.triple.o),
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -733,15 +771,7 @@ fn parse_ttl_result(content: &str, url: &str) -> Result<SparqlResults> {
     if is_result_set {
         parse_dawg_result_set_from_graph(&graph)
     } else {
-        let triples: Vec<Triple> = graph
-            .iter()
-            .map(|t| Triple {
-                subject: ir_term_to_rdf_term(&t.s),
-                predicate: ir_term_to_rdf_term(&t.p),
-                object: ir_term_to_rdf_term(&t.o),
-            })
-            .collect();
-        Ok(SparqlResults::Graph(triples))
+        Ok(SparqlResults::Graph(graph_triples(&graph)))
     }
 }
 
@@ -1145,7 +1175,9 @@ impl JsonLdContext {
 ///
 /// Expects a JSON-LD `@graph` array (or a single node object). Each node has
 /// `@id` as the subject; every other key is a predicate whose values are objects.
-/// Compact IRIs are expanded against the result's `@context`.
+/// Compact IRIs are expanded against the result's `@context`. A value's
+/// `@annotation` and a node's `@reifies` become reification stand-in triples,
+/// as the expected graph's reifications do.
 pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<SparqlResults> {
     let ctx = JsonLdContext::parse(json);
     let nodes = if let Some(graph) = json.get("@graph").and_then(|g| g.as_array()) {
@@ -1178,6 +1210,31 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
                 continue;
             }
 
+            if key == "@reifies" {
+                for block in json_values(value) {
+                    let Some(block) = block.as_object() else {
+                        continue;
+                    };
+                    let Some(s) = block.get("@id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let s = id_term(s, &ctx);
+                    for (p, o) in block.iter().filter(|(k, _)| !k.starts_with('@')) {
+                        for o in json_values(o) {
+                            if let Some(o) = json_ld_value_to_rdf_term(&o, &ctx) {
+                                triples.extend(reification_triples(
+                                    subject.clone(),
+                                    s.clone(),
+                                    RdfTerm::Iri(ctx.expand_vocab(p)),
+                                    o,
+                                ));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
             if key == "@type" {
                 let rdf_type =
                     RdfTerm::Iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string());
@@ -1205,6 +1262,16 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
 
             for val in &values {
                 if let Some(term) = json_ld_value_to_rdf_term(val, &ctx) {
+                    for reifier in val.get("@annotation").map(json_values).unwrap_or_default() {
+                        if let Some(r) = reifier.get("@id").and_then(|v| v.as_str()) {
+                            triples.extend(reification_triples(
+                                id_term(r, &ctx),
+                                subject.clone(),
+                                predicate.clone(),
+                                term.clone(),
+                            ));
+                        }
+                    }
                     triples.push(Triple {
                         subject: subject.clone(),
                         predicate: predicate.clone(),
@@ -1216,6 +1283,22 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
     }
 
     Ok(SparqlResults::Graph(triples))
+}
+
+/// A JSON-LD value position's values: an array's elements, or itself.
+fn json_values(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Array(values) => values.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+/// A node identifier: a blank node label or an expanded IRI.
+fn id_term(id: &str, ctx: &JsonLdContext) -> RdfTerm {
+    match id.strip_prefix("_:") {
+        Some(label) => RdfTerm::BlankNode(label.to_string()),
+        None => RdfTerm::Iri(ctx.expand_id(id)),
+    }
 }
 
 /// Convert a JSON-LD value node to an [`RdfTerm`].
