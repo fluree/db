@@ -1308,19 +1308,8 @@ impl<'a> HydrationFormatter<'a> {
 
             // Format each predicate
             for (pred, mut pred_flakes) in by_pred {
-                // System-fact filter (M1b): the seven `f:reifies*`
-                // predicates encode an annotation's reified edge. They
-                // are system-controlled — never user-data — and must
-                // not leak through wildcard subject hydration. Direct
-                // user mention in queries is already blocked by the
-                // parser firewall in `fluree-db-query::parse`; this
-                // filter closes the wildcard-projection path.
-                //
-                // Explicitly-listed levels can still reach these via
-                // a `Pattern::Triple` lookup at the planner layer
-                // (which is what the `Pattern::EdgeAnnotation` IR
-                // expansion and the `rdf:reifies` link lowering do), but those
-                // patterns don't go through hydration.
+                // The legacy `f:reifies*` bundle predicates are an internal
+                // encoding of annotations, hidden here as from wildcard scans.
                 if fluree_db_core::is_scan_hidden_predicate(&pred) {
                     continue;
                 }
@@ -1616,6 +1605,7 @@ impl<'a> HydrationFormatter<'a> {
         let mut values = Vec::new();
         for flake in pred_ctx.flakes {
             match &flake.o {
+                FlakeValue::TripleTerm(term) => values.push(self.format_triple_term(term)?),
                 FlakeValue::Ref(ref_sid) => {
                     if is_rdf_type {
                         // @type special case: compact IRI string, not {"@id": ...}
@@ -1830,7 +1820,8 @@ impl<'a> HydrationFormatter<'a> {
     }
 
     /// Render the annotation bodies of `ann_sids` through a wildcard
-    /// select spec.
+    /// select spec, without the reifiers' `rdf:reifies` links: a link is
+    /// the attachment the body hangs from, not part of it.
     async fn render_annotation_bodies<'b>(
         &'b self,
         ann_sids: &[Sid],
@@ -1842,13 +1833,15 @@ impl<'a> HydrationFormatter<'a> {
             refinements: HashMap::new(),
             reverse: HashMap::new(),
         };
+        let link_key = self.format_predicate_key(fluree_db_core::rdf_reifies_sid())?;
         let mut bodies: Vec<JsonValue> = Vec::with_capacity(ann_sids.len());
         for ann_sid in ann_sids {
             let mut body = self
                 .format_subject(ann_sid, None, &ann_level, depth.descend(), visited, cache)
                 .await?;
-            if ann_sid.namespace_code == BLANK_NODE {
-                if let Some(map) = body.as_object_mut() {
+            if let Some(map) = body.as_object_mut() {
+                map.remove(&link_key);
+                if ann_sid.namespace_code == BLANK_NODE {
                     map.remove("@id");
                 }
             }
@@ -1954,6 +1947,34 @@ impl<'a> HydrationFormatter<'a> {
     }
 
     /// Format a literal flake value
+    /// A triple term as a JSON-LD-star embedded node; a literal object
+    /// renders as this formatter renders that literal anywhere else.
+    fn format_triple_term(&self, term: &fluree_db_core::TripleTermValue) -> Result<JsonValue> {
+        super::triple_term_node(term, self.compactor, |_| match &term.o {
+            FlakeValue::TripleTerm(inner) => self.format_triple_term(inner),
+            _ => {
+                let meta = term.lang.clone().map(|lang| fluree_db_core::FlakeMeta {
+                    lang: Some(lang),
+                    i: None,
+                });
+                let object = Flake::new(
+                    term.s.clone(),
+                    term.p.clone(),
+                    term.o.clone(),
+                    term.dt.clone(),
+                    0,
+                    true,
+                    meta,
+                );
+                if self.typed {
+                    self.format_typed_literal_value(&object)
+                } else {
+                    self.format_literal_value(&object)
+                }
+            }
+        })
+    }
+
     fn format_literal_value(&self, flake: &Flake) -> Result<JsonValue> {
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;

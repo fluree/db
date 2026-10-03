@@ -1844,149 +1844,85 @@ async fn cascade_keeps_explicit_iri_annotation_metadata() {
     assert_eq!(row[1].as_str(), Some("Engineer"));
 }
 
-#[tokio::test]
-async fn variable_predicate_scan_hides_f_reifies_in_named_graph() {
-    // Annotation bundles are emitted in the reified edge's graph,
-    // so a variable-predicate scan scoped to a named graph would
-    // expose `f:reifies*` flakes there too. The filter must apply
-    // to every graph, not only the default graph.
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/edge-annotations:variable-predicate-named-graph";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
-
-    let txn = json!({
-        "@context": ctx(),
-        "@id": "ex:alice",
-        "@graph": "ex:hr-graph",
-        "ex:worksFor": {
-            "@id": "ex:acme",
-            "@annotation": {
-                "@id": "ex:emp/alice-acme",
-                "ex:role": "Engineer"
-            }
-        }
-    });
-    let committed = fluree
-        .insert(ledger0, &txn)
-        .await
-        .expect("named-graph annotated insert");
-
-    // Scope the variable-predicate scan to the named graph via the
-    // dataset alias.
-    let named_graph_alias = format!("{ledger_id}#http://example.org/hr-graph");
-    let query = json!({
-        "@context": ctx(),
-        "from": &named_graph_alias,
-        "select": ["?p"],
-        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" }
-    });
-
-    // `query_connection` is the dataset-aware path; pair with a
-    // formatter against the post-insert snapshot.
-    let result = fluree
-        .query_connection(&query)
-        .await
-        .expect("named-graph variable-predicate query");
-    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
-    let json = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    let arr = json.as_array().expect("array");
-
-    // Collect predicate bindings and assert no `f:reifies*` leaks.
-    let predicates: Vec<String> = arr
+/// The predicates a `?p` row binds, as rendered strings.
+fn predicate_column(rows: &JsonValue) -> Vec<String> {
+    rows.as_array()
+        .expect("array")
         .iter()
-        .filter_map(|row| row.as_array())
-        .filter_map(|cols| cols.first())
+        .filter_map(|row| row.as_array().and_then(|cols| cols.first()))
         .filter_map(|v| {
             v.as_str()
                 .map(String::from)
                 .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
         })
-        .collect();
-    for p in &predicates {
-        assert!(
-            !p.contains("reifies"),
-            "the link must not leak from named-graph variable-predicate scan: {p} \
-             (full bindings: {predicates:?})"
-        );
-    }
-    // The user-authored predicate should still be visible.
-    assert!(
-        predicates
-            .iter()
-            .any(|p| p == "http://example.org/role" || p == "ex:role"),
-        "user-authored ex:role must be visible in named-graph scan: {predicates:?}"
-    );
-
-    // Drop unused suppression: the test is the assertion.
-    drop(committed);
+        .collect()
 }
 
+/// `rdf:reifies` in any of its rendered forms.
+fn is_link_key(p: &str) -> bool {
+    p == "rdf:reifies" || p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies"
+}
+
+/// The reifier's link is an ordinary triple: a variable-predicate scan of
+/// the reifier returns it beside the body, in the edge's named graph too.
 #[tokio::test]
-async fn variable_predicate_scan_hides_f_reifies() {
-    // A triple pattern with a variable predicate (`?s ?p ?o`) used
-    // to surface `f:reifies*` system flakes from the annotation
-    // subject's overlay rows. The scan-layer filter in
-    // `flakes_to_bindings` skips Fluree-system-namespace predicates
-    // when the user's predicate slot is a variable, mirroring the
-    // existing filter on the binary-cursor path.
+async fn variable_predicate_scan_returns_the_link() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/edge-annotations:variable-predicate-no-leak";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
-
-    let txn = json!({
-        "@context": ctx(),
-        "@id": "ex:alice",
-        "ex:worksFor": {
-            "@id": "ex:acme",
-            "@annotation": {
-                "@id": "ex:emp/alice-acme",
-                "ex:role": "Engineer"
+    for (ledger_id, graph) in [
+        ("it/edge-annotations:link-default-graph", None),
+        ("it/edge-annotations:link-named-graph", Some("ex:hr-graph")),
+    ] {
+        let ledger0 = genesis_ledger(&fluree, ledger_id);
+        let mut txn = json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": {
+                    "@id": "ex:emp/alice-acme",
+                    "ex:role": "Engineer"
+                }
             }
+        });
+        if let Some(graph) = graph {
+            txn["@graph"] = json!(graph);
         }
-    });
-    let committed = fluree
-        .insert(ledger0, &txn)
-        .await
-        .expect("annotated insert");
+        let committed = fluree
+            .insert(ledger0, &txn)
+            .await
+            .expect("annotated insert");
 
-    // Bind ?p to every predicate the annotation subject carries.
-    let query = json!({
-        "@context": ctx(),
-        "select": ["?p"],
-        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" }
-    });
-    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
-        .await
-        .expect("variable-predicate query");
-    let arr = rows.as_array().expect("array");
-
-    // Collect the predicate bindings as strings.
-    let predicates: Vec<String> = arr
-        .iter()
-        .filter_map(|row| row.as_array())
-        .filter_map(|cols| cols.first())
-        .filter_map(|v| {
-            v.as_str()
-                .map(String::from)
-                .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
-        })
-        .collect();
-
-    // No `f:reifies*` predicate may leak.
-    for p in &predicates {
+        let mut query = json!({
+            "@context": ctx(),
+            "select": ["?p"],
+            "where": { "@id": "ex:emp/alice-acme", "?p": "?o" }
+        });
+        let rows = match graph {
+            None => support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+                .await
+                .expect("default-graph query"),
+            Some(_) => {
+                query["from"] = json!(format!("{ledger_id}#http://example.org/hr-graph"));
+                let result = fluree
+                    .query_connection(&query)
+                    .await
+                    .expect("named-graph query");
+                result
+                    .to_jsonld(&committed.ledger.snapshot)
+                    .expect("to_jsonld")
+            }
+        };
+        let mut predicates = predicate_column(&rows);
+        predicates.sort();
         assert!(
-            !p.contains("reifies"),
-            "the link must not leak through variable-predicate scan: {p} \
-             (full bindings: {predicates:?})"
+            predicates.len() == 2
+                && predicates.iter().any(|p| is_link_key(p))
+                && predicates
+                    .iter()
+                    .any(|p| p == "ex:role" || p == "http://example.org/role"),
+            "graph {graph:?}: the scan returns the link and the body: {predicates:?}"
         );
     }
-    // The user-authored `ex:role` must still be visible.
-    assert!(
-        predicates
-            .iter()
-            .any(|p| p == "http://example.org/role" || p == "ex:role"),
-        "user-authored ex:role must be visible: {predicates:?}"
-    );
 }
 
 #[tokio::test]
@@ -2153,75 +2089,44 @@ async fn opts_include_system_facts_propagates_through_dataset_path() {
 async fn opts_include_system_facts_works_for_ask_queries() {
     // ASK queries return from the parser before `parse_options()`
     // runs, so `opts.includeSystemFacts` has to be parsed inline on
-    // that branch. Without that, an ASK against an annotation
-    // subject's `?p`-shape would always answer false even with the
-    // opt-in set.
+    // that branch. Without that, an ASK against a reifier's
+    // `?p`-shape would always answer false even with the opt-in set.
+    // The flag only reveals the legacy `f:reifies*` bundle, so the
+    // reifier carries one.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:opts-ask";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
-    let _ = fluree
-        .insert(
-            ledger0,
-            &json!({
-                "@context": ctx(),
-                "@id": "ex:alice",
-                "ex:worksFor": {
-                    "@id": "ex:acme",
-                    "@annotation": {
-                        "@id": "ex:emp/alice-acme",
-                        "ex:role": "Engineer"
-                    }
-                }
-            }),
-        )
-        .await
-        .expect("annotated insert");
+    let ledger = support::commit_legacy_bundle(&fluree, genesis_ledger(&fluree, ledger_id)).await;
 
-    let ledger = fluree.ledger(ledger_id).await.expect("reload");
-
-    // Ask whether the annotation subject has *any* predicate. With
-    // the filter on (default) this still answers true via the
-    // ex:role flake. Pin the discriminating shape: a variable-predicate
-    // row whose object is a triple term, which only the link is.
-    let q_default = json!({
-        "@context": ctx(),
-        "ask": [
-            { "@id": "ex:emp/alice-acme", "?p": "?o" },
-            ["filter", "(istriple ?o)"]
-        ]
-    });
-    let resp_default = fluree
-        .query(&support::graphdb_from_ledger(&ledger), &q_default)
-        .await
-        .expect("ask default");
-    let json_default: JsonValue = resp_default
-        .to_jsonld(&ledger.snapshot)
-        .expect("to_jsonld default");
+    let ask = |opts: Option<JsonValue>| {
+        let mut q = json!({
+            "@context": ctx(),
+            "ask": [
+                { "@id": "ex:emp/alice-acme", "?p": "?o" },
+                ["filter", "(strStarts (str ?p) \"https://ns.flur.ee/db#reifies\")"]
+            ]
+        });
+        if let Some(opts) = opts {
+            q["opts"] = opts;
+        }
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            fluree
+                .query(&support::graphdb_from_ledger(ledger), &q)
+                .await
+                .expect("ask")
+                .to_jsonld(&ledger.snapshot)
+                .expect("to_jsonld")
+        }
+    };
     assert_eq!(
-        json_default,
+        ask(None).await,
         JsonValue::Bool(false),
-        "without includeSystemFacts, ASK over the hidden link must answer false: {json_default}"
+        "without includeSystemFacts the bundle stays hidden"
     );
-
-    // With the opt-in, the ASK now returns true because the scan
-    // filter is bypassed and the link binds.
-    let q_opt = json!({
-        "@context": ctx(),
-        "ask": [
-            { "@id": "ex:emp/alice-acme", "?p": "?o" },
-            ["filter", "(istriple ?o)"]
-        ],
-        "opts": { "includeSystemFacts": true }
-    });
-    let resp_opt = fluree
-        .query(&support::graphdb_from_ledger(&ledger), &q_opt)
-        .await
-        .expect("ask opt");
-    let json_opt: JsonValue = resp_opt.to_jsonld(&ledger.snapshot).expect("to_jsonld opt");
     assert_eq!(
-        json_opt,
+        ask(Some(json!({ "includeSystemFacts": true }))).await,
         JsonValue::Bool(true),
-        "ASK + opts.includeSystemFacts must surface the link: {json_opt}"
+        "includeSystemFacts reveals the bundle to ASK"
     );
 }
 
@@ -2289,19 +2194,12 @@ async fn history_query_surfaces_f_reifies_events() {
 }
 
 #[tokio::test]
-async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
-    // Annotation subjects minted by the M1a transactor lowering carry
-    // `f:reifies*` system facts in addition to the user-authored body
-    // properties. Wildcard subject hydration (`select: {"?s": ["*"]}`)
-    // expands all properties of a subject, which would otherwise leak
-    // these system facts to the user.
-    //
-    // The hydration-layer filter in `format/hydration.rs` skips any
-    // predicate where `is_reserved_reifies_predicate(&p)` returns
-    // true. This test pins that contract: the wildcard projection
-    // sees the user's `ex:role` but not any `f:reifies*` predicate.
+async fn wildcard_subject_hydration_shows_the_link_but_not_in_annotation_bodies() {
+    // A reifier's link is ordinary data, so wildcard hydration of the
+    // reifier renders it — as a JSON-LD-star embedded node. An
+    // `@annotation` body hangs from that link and leaves it out.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/edge-annotations:wildcard-hides-reifies";
+    let ledger_id = "it/edge-annotations:wildcard-link";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
 
     let txn = json!({
@@ -2320,42 +2218,37 @@ async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
         .await
         .expect("annotated insert");
 
-    let query = json!({
+    let reifier = json!({
         "@context": ctx(),
         "select": {"?ann": ["*"]},
         "where": { "@id": "?ann", "ex:role": "Engineer" }
     });
-
-    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &reifier)
         .await
-        .expect("wildcard hydration over annotation subject");
-    let arr = rows.as_array().expect("array");
-    assert!(
-        !arr.is_empty(),
-        "wildcard hydration should find the annotation subject"
+        .expect("wildcard hydration of the reifier");
+    let node = rows[0].as_object().expect("hydrated node");
+    let link = node
+        .iter()
+        .find_map(|(key, value)| is_link_key(key).then_some(value))
+        .unwrap_or_else(|| panic!("wildcard hydration renders the link: {node:#?}"));
+    assert_eq!(
+        link,
+        &json!({"@id": {"@id": "ex:alice", "ex:worksFor": {"@id": "ex:acme"}}}),
+        "the link renders as an embedded node"
     );
 
-    // The user's `ex:role` is visible.
-    let node = arr[0]
-        .as_object()
-        .expect("hydrated node should be an object");
-    let role_visible = node
-        .get("ex:role")
-        .or_else(|| node.get("http://example.org/role"))
-        .is_some();
-    assert!(
-        role_visible,
-        "user-authored ex:role must remain visible under wildcard hydration: {node:#?}"
+    let edge = json!({
+        "@context": ctx(),
+        "select": {"ex:alice": ["*"]}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &edge)
+        .await
+        .expect("hydration of the annotated edge");
+    assert_eq!(
+        rows[0]["ex:worksFor"]["@annotation"],
+        json!({"@id": "ex:emp/alice-acme", "ex:role": "Engineer"}),
+        "the annotation body leaves out the link: {rows:#?}"
     );
-
-    // The link may not appear under any namespace form (full IRI or
-    // compact alias).
-    for key in node.keys() {
-        assert!(
-            !key.contains("reifies"),
-            "the link '{key}' must not leak through wildcard hydration"
-        );
-    }
 }
 
 #[tokio::test]
@@ -6185,10 +6078,18 @@ async fn annotation_matrix_survivors(fluree: &MemoryFluree, ledger_id: &str) -> 
     };
     Survivors {
         base: count("PREFIX : <http://example.org/> SELECT ?o WHERE { :alice :knows ?o }").await,
-        claim1_body: count("PREFIX : <http://example.org/> SELECT ?p ?v WHERE { :claim1 ?p ?v }")
-            .await,
-        claim2_body: count("PREFIX : <http://example.org/> SELECT ?p ?v WHERE { :claim2 ?p ?v }")
-            .await,
+        claim1_body: count(
+            "PREFIX : <http://example.org/> \
+             SELECT ?p ?v WHERE { :claim1 ?p ?v \
+             FILTER(?p != <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>) }",
+        )
+        .await,
+        claim2_body: count(
+            "PREFIX : <http://example.org/> \
+             SELECT ?p ?v WHERE { :claim2 ?p ?v \
+             FILTER(?p != <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>) }",
+        )
+        .await,
         attached: count(
             "PREFIX : <http://example.org/> \
              SELECT ?c WHERE { :alice :knows :bob ~ ?c {| :confidence ?f |} }",
@@ -6468,4 +6369,98 @@ async fn base_edge_retraction_detaches_sibling_reifiers_the_delete_never_named()
         ":claim2's body survives its attachment — this is the orphan state the \
          docs must warn about"
     );
+}
+
+/// Wildcard reads of a legacy bundle show the link derived from it, never
+/// the bundle — from novelty, from an index, and from novelty over an index
+/// that has not seen the bundle's predicates — and a whole-graph count agrees
+/// with the rows the scan returns.
+#[tokio::test]
+async fn variable_predicate_scan_hides_legacy_bundles() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:legacy-bundle-scan";
+    let ledger = support::commit_legacy_bundle(&fluree, genesis_ledger(&fluree, ledger_id)).await;
+
+    let check = |ledger: MemoryLedger, label: &'static str, triples: usize| {
+        let fluree = &fluree;
+        async move {
+            let reifier = json!({
+                "@context": ctx(),
+                "select": ["?p"],
+                "where": { "@id": "ex:emp/alice-acme", "?p": "?o" }
+            });
+            let rows = support::query_jsonld_formatted(fluree, &ledger, &reifier)
+                .await
+                .expect("reifier scan");
+            let mut predicates = predicate_column(&rows);
+            predicates.sort();
+            assert!(
+                predicates.len() == 2
+                    && predicates.iter().any(|p| is_link_key(p))
+                    && predicates
+                        .iter()
+                        .any(|p| p == "ex:role" || p == "http://example.org/role"),
+                "[{label}] the scan shows the derived link and the body: {predicates:?}"
+            );
+
+            let all = support::query_sparql_formatted(
+                fluree,
+                &ledger,
+                "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+            )
+            .await
+            .expect("whole-graph scan");
+            let rows = all.as_array().expect("rows").len();
+            let counted = support::query_sparql_formatted(
+                fluree,
+                &ledger,
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }",
+            )
+            .await
+            .expect("whole-graph count");
+            let counted = counted[0].as_array().map_or(&counted[0], |row| &row[0]);
+            assert_eq!(rows, triples, "[{label}] base edge, link, body: {all:#}");
+            assert_eq!(
+                counted,
+                &json!(triples),
+                "[{label}] the count agrees with the scan"
+            );
+
+            let hydrated = support::query_jsonld_formatted(
+                fluree,
+                &ledger,
+                &json!({
+                    "@context": ctx(),
+                    "select": {"?ann": ["*"]},
+                    "where": { "@id": "?ann", "ex:role": "Engineer" }
+                }),
+            )
+            .await
+            .expect("wildcard hydration");
+            let keys: Vec<&String> = hydrated[0].as_object().expect("node").keys().collect();
+            assert!(
+                keys.iter().any(|k| is_link_key(k))
+                    && !keys.iter().any(|k| k.contains("reifiesSubject")),
+                "[{label}] hydration shows the link, not the bundle: {keys:?}"
+            );
+        }
+    };
+
+    check(ledger, "novelty", 3).await;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    check(fluree.ledger(ledger_id).await.expect("load"), "indexed", 3).await;
+
+    let ledger_id = "it/edge-annotations:legacy-bundle-over-index";
+    let plain = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({"@context": ctx(), "@id": "ex:x", "ex:y": {"@id": "ex:z"}}),
+        )
+        .await
+        .expect("plain insert");
+    drop(plain);
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed = fluree.ledger(ledger_id).await.expect("load");
+    let ledger = support::commit_legacy_bundle(&fluree, indexed).await;
+    check(ledger, "novelty over an index", 4).await;
 }

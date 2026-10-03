@@ -201,6 +201,10 @@ pub struct BinaryScanOperator {
     /// Novelty-only predicate overrides keyed by ephemeral p_id, populated
     /// during overlay translation (ephemeral ids sit above the persisted range).
     p_sids_ephemeral: HashMap<u32, Sid>,
+    /// p_ids a variable-predicate scan hides (see `is_internal_predicate`).
+    /// Empty for a bound predicate, under `include_system_facts`, and on
+    /// ledgers without legacy annotation bundles.
+    hidden_p_ids: Vec<u32>,
     /// Cached s_id → Sid for amortized IRI resolution.
     sid_cache: HashMap<u64, Sid>,
     /// Whether predicate is a variable (for internal predicate filtering).
@@ -761,6 +765,7 @@ impl BinaryScanOperator {
             pending_cursors: VecDeque::new(),
             p_sids: Vec::new().into(),
             p_sids_ephemeral: HashMap::new(),
+            hidden_p_ids: Vec::new(),
             sid_cache: HashMap::new(),
             p_is_var,
             include_system_facts: false,
@@ -1198,40 +1203,22 @@ impl BinaryScanOperator {
             .unwrap_or_else(|| Sid::new(0, ""))
     }
 
-    /// Filter: skip `f:reifies*` system predicates when predicate is a
-    /// variable.
+    /// Filter: skip the legacy `f:reifies*` bundle predicates when the
+    /// predicate is a variable.
     ///
-    /// The seven edge-annotation bundle predicates are hidden in
-    /// **every** graph context: the annotation bundle is emitted in the
-    /// reified edge's graph, so a per-graph `?p` scan would otherwise
-    /// leak the bundle into the user's results. They are the internal
-    /// encoding of `@annotation` — user transactions cannot write them,
-    /// so surfacing them would break export/re-import round-trips.
+    /// They are the internal encoding of annotations written before
+    /// `rdf:reifies` links, hidden in **every** graph context since a bundle
+    /// lives in its reified edge's graph. User transactions cannot write
+    /// them, so surfacing them would break export/re-import round-trips.
     ///
     /// Other Fluree-namespace predicates are NOT filtered: system
     /// metadata lives in its own graphs (txn-meta at `g_id == 1`,
     /// config at `g_id == 2`), and `f:`-vocabulary data users author in
     /// the default graph (e.g. `f:AccessPolicy` definitions) must stay
-    /// visible to wildcard scans. A default-graph namespace-wide hide
-    /// existed historically, from the era when commit metadata was
-    /// stored in the main graph.
+    /// visible to wildcard scans.
     #[inline]
     fn is_internal_predicate(&self, p_id: u32) -> bool {
-        if !self.p_is_var {
-            return false;
-        }
-        // Opt-in escape for debug / inspection workflows.
-        if self.include_system_facts {
-            return false;
-        }
-        let sid = match self.p_sids_ephemeral.get(&p_id) {
-            Some(sid) => sid,
-            None => match self.p_sids.get(p_id as usize) {
-                Some(sid) => sid,
-                None => return false,
-            },
-        };
-        fluree_db_core::is_scan_hidden_predicate(sid)
+        !self.hidden_p_ids.is_empty() && self.hidden_p_ids.contains(&p_id)
     }
 
     /// Enforce within-pattern repeated-variable constraints.
@@ -1345,7 +1332,7 @@ impl BinaryScanOperator {
     /// can drop or transform a row after the cursor yields it, and there are no
     /// overlay-only fallback rows. Each clause below maps to exactly one
     /// `continue`/drop site in `batch_to_bindings`:
-    /// - bound predicate (`!p_is_var`) → `is_internal_predicate` never skips
+    /// - no hidden predicates (`hidden_p_ids`) → `is_internal_predicate` never skips
     /// - no encoded pre-filters, datatype constraint, repeated-var checks,
     ///   bound object, object bounds, or unresolved-bound-subject IRI check
     /// - no inline ops (which may carry FILTER/BIND that drop rows)
@@ -1357,7 +1344,7 @@ impl BinaryScanOperator {
     /// returns `Ok(None)` and the caller falls back to the streaming drain.
     fn count_only_eligible(&self) -> bool {
         matches!(self.mode, crate::temporal_mode::TemporalMode::Current)
-            && !self.p_is_var
+            && self.hidden_p_ids.is_empty()
             && self.inline_ops.is_empty()
             && self.encoded_pre_filters.is_empty()
             && self.object_bounds.is_none()
@@ -2177,6 +2164,11 @@ impl Operator for BinaryScanOperator {
         let store_ref = store.as_ref();
         // Persisted p_id → Sid table, built once per store instance.
         self.p_sids = Arc::clone(store_ref.p_sid_table());
+        self.hidden_p_ids.clear();
+        if self.p_is_var && !self.include_system_facts {
+            self.hidden_p_ids
+                .extend_from_slice(store_ref.scan_hidden_p_ids());
+        }
 
         // Extract bound terms in snapshot namespace space and build the persisted-ID filter
         // by translating through full IRIs into store namespace space.
@@ -2974,6 +2966,12 @@ impl Operator for BinaryScanOperator {
             // Record novelty-only predicates so that ephemeral p_ids from
             // overlay ops can be decoded back to Sids during row binding.
             for (sid, ep_id) in &translated.ephemeral_preds {
+                if self.p_is_var
+                    && !self.include_system_facts
+                    && fluree_db_core::is_scan_hidden_predicate(sid)
+                {
+                    self.hidden_p_ids.push(*ep_id);
+                }
                 self.p_sids_ephemeral.insert(*ep_id, sid.clone());
             }
 
@@ -3174,8 +3172,10 @@ impl Operator for BinaryScanOperator {
             return Ok(None);
         }
         if !self.count_only_eligible() {
+            stamp_scan_count_drain(false);
             return Ok(None);
         }
+        stamp_scan_count_drain(true);
 
         // Residency mode: handle a store's ContentStore + retry budget for
         // the drain/fetch/retry arm in the cursor loop below.
@@ -3230,6 +3230,7 @@ impl Operator for BinaryScanOperator {
         self.sid_cache.clear();
         self.p_sids = Vec::new().into();
         self.p_sids_ephemeral.clear();
+        self.hidden_p_ids.clear();
         self.unresolved_bound_subject_iri = None;
         self.state = OperatorState::Closed;
     }
@@ -4292,6 +4293,21 @@ fn datatype_sid_for_untyped_value(
         },
         _ => None,
     }
+}
+
+/// Routing stamp for `drain_count`: `proceed` when it counts the cursor
+/// without binding rows, `fallback:gate_declined` when a per-row check
+/// (`count_only_eligible`) sends `COUNT(*)` to the streaming drain.
+fn stamp_scan_count_drain(counts: bool) {
+    use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+    stamp_fast_path(
+        "scan-count-drain",
+        if counts {
+            FastPathOutcome::Proceed
+        } else {
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+        },
+    );
 }
 
 /// Routing stamp for a bare-number object: `proceed` when the scan seeks its

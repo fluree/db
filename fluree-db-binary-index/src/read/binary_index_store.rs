@@ -327,6 +327,7 @@ pub struct BinaryIndexStore {
     /// configuration (`set_ns_split_mode`, namespace augmentation), which
     /// cannot occur once the store is behind `Arc`.
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
+    scan_hidden_p_ids: std::sync::OnceLock<Box<[u32]>>,
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
@@ -397,6 +398,7 @@ impl BinaryIndexStore {
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            scan_hidden_p_ids: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         }
     }
@@ -579,6 +581,7 @@ impl BinaryIndexStore {
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            scan_hidden_p_ids: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         })
     }
@@ -1893,6 +1896,19 @@ impl BinaryIndexStore {
                 }
             }
             table.into()
+        })
+    }
+
+    /// Persisted p_ids of the predicates wildcard scans hide
+    /// ([`fluree_db_core::is_scan_hidden_predicate`]). Empty unless the
+    /// ledger's history holds legacy annotation bundles, so a
+    /// variable-predicate scan of any other ledger checks no row.
+    pub fn scan_hidden_p_ids(&self) -> &[u32] {
+        self.scan_hidden_p_ids.get_or_init(|| {
+            fluree_vocab::reifies_iris::ALL
+                .iter()
+                .filter_map(|iri| self.find_predicate_id(iri))
+                .collect()
         })
     }
 

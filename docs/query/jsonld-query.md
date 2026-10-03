@@ -317,12 +317,13 @@ a subject:
 
 Variable-predicate scans return every stored triple, including data written
 with the Fluree vocabulary (`https://ns.flur.ee/db#`, e.g. stored
-`f:AccessPolicy` definitions). The one exception is the seven `f:reifies*`
-predicates — the internal storage encoding of edge annotations. They are
-system-written (user transactions cannot assert them), redundant with the
-edge and annotation content already in the results, and therefore hidden from
-variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` to
-surface them for debugging or inspection. Commit metadata (`f:t`, `f:address`,
+`f:AccessPolicy` definitions) and an annotation's `rdf:reifies` link. The one
+exception is the seven `f:reifies*` predicates, which ledgers written by
+earlier releases used to store edge annotations. They are system-written
+(user transactions cannot assert them), redundant with the `rdf:reifies`
+links derived from them, and therefore hidden from variable-predicate scans.
+Pass `"opts": {"includeSystemFacts": true}` to surface them for debugging or
+inspection. Commit metadata (`f:t`, `f:address`,
 …) lives in the ledger's txn-meta graph, not the default graph, so it never
 appears in default-graph scans either way.
 

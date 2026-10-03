@@ -1025,6 +1025,11 @@ pub fn count_triples_operator(out_var: VarId, fallback: Option<BoxedOperator>) -
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
+            // Leaf row counts include the legacy `f:reifies*` rows the
+            // variable-predicate scan hides.
+            if crate::fast_whole_graph_agg::graph_has_scan_hidden_predicates(ctx, store)? {
+                return Ok(None);
+            }
             let count = count_triples_from_branch_manifest(store, ctx.binary_g_id)?;
             let count_i64 = count_to_i64(count, "COUNT triples")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
@@ -1082,12 +1087,10 @@ pub fn count_distinct_position_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            // The variable-predicate scan hides `f:reifies*` (and default-graph
-            // `f:`) facts, but the SPOT/PSOT/OPST directories these folds read
-            // include them — a graph with a reified edge would over-count in
-            // every position (its reifier subject, the reifies predicates, and
-            // the annotation objects are all pipeline-invisible). Decline to
-            // the general pipeline when any such predicate exists.
+            // The variable-predicate scan hides legacy `f:reifies*` facts, but
+            // the SPOT/PSOT/OPST directories these folds read include them — a
+            // graph holding a legacy bundle would over-count in every position.
+            // Decline to the general pipeline when any such predicate has rows.
             if crate::fast_whole_graph_agg::graph_has_scan_hidden_predicates(ctx, store)? {
                 return Ok(None);
             }

@@ -519,10 +519,10 @@ fn data_properties_from_flakes(mut flakes: Vec<Flake>) -> Vec<DataProperty> {
     let mut live: Vec<DataProperty> = Vec::new();
     for flake in flakes {
         // Data properties only: skip references (relationships), rdf:type, and
-        // the reifier sidecar.
+        // a reifier's link, which is the relationship itself.
         if matches!(flake.o, FlakeValue::Ref(_))
             || fluree_db_core::is_rdf_type(&flake.p)
-            || fluree_db_core::is_scan_hidden_predicate(&flake.p)
+            || fluree_db_core::is_annotation_predicate(&flake.p)
         {
             continue;
         }

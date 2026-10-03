@@ -104,8 +104,7 @@ async fn imported_reifiers_carry_a_decodable_triple_term_link() {
         "claim2 must reify carol age 42 (literal object): {t2}"
     );
 
-    // While the link form is index-internal, wildcard scans keep hiding it
-    // exactly as they hide the `f:reifies*` bundle.
+    // The link is ordinary data to a wildcard scan.
     let sparql = "PREFIX ex: <http://example.org/>\n\
                   SELECT ?p WHERE { ex:claim1 ?p ?o } ORDER BY ?p";
     let result = support::query_sparql_formatted(&fluree, &ledger, sparql)
@@ -113,8 +112,10 @@ async fn imported_reifiers_carry_a_decodable_triple_term_link() {
         .expect("wildcard predicate scan");
     let preds: Vec<String> = rows(&result).into_iter().map(|r| r[0].clone()).collect();
     assert!(
-        !preds.iter().any(|p| p.contains("reifies")),
-        "wildcard scan must hide rdf:reifies and f:reifies*: {preds:?}"
+        preds
+            .iter()
+            .any(|p| p.ends_with("#reifies") || p == "rdf:reifies"),
+        "the wildcard scan returns the link: {preds:?}"
     );
     assert!(
         preds.iter().any(|p| p.ends_with("confidence")),

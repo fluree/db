@@ -409,22 +409,14 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
     // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
-    // (D-8) — "expected subject, found 'GRAPH'" (5)
+    // (D-8) — "expected subject, found 'GRAPH'" (4)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
-    // results not isomorphic: the star data now LOADS (the collector sink
-    // accepts `<< >>` / `{| |}` / `~`), but Fluree's model asserts the base
-    // triple of every `<< s p o >>` and binds reifiers, not triple terms —
-    // RDF 1.2's non-asserting reified triples and `?t` triple-term bindings
-    // are the Option-1 epic (8)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-3",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-7",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-2",
+    // results not isomorphic: the star data LOADS, but Fluree's model
+    // asserts the base triple of every `<< s p o >>` — RDF 1.2's
+    // non-asserting reified triples (3)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-8-nomatch",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",

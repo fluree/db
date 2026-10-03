@@ -628,9 +628,9 @@ fn overlay_all_subjects_count(
             if declined {
                 return;
             }
-            // Mirror the pipeline's `?n ?p ?o` visibility: `f:reifies*` is
-            // invisible to the scan but present in SPOT — its subjects must
-            // not be counted.
+            // Mirror the pipeline's `?n ?p ?o` visibility: legacy
+            // `f:reifies*` is invisible to the scan but present in SPOT — its
+            // subjects must not be counted.
             if fluree_db_core::is_scan_hidden_predicate(&flake.p) {
                 declined = true;
                 return;
@@ -1067,27 +1067,22 @@ fn compute_task(
 /// reads, so their presence makes the fold inexact.
 ///
 /// Two deliberate choices:
-/// - Candidates come from the store's predicate **dictionary**, not the
-///   per-graph stats: the incremental index build can persist delta-only
-///   per-graph property stats (base entries lost), so a stats-driven check
-///   can silently pass on a graph that does carry hidden facts.
+/// - Candidates come from the store's predicate **dictionary**
+///   (`scan_hidden_p_ids`), not the per-graph stats: the incremental index
+///   build can persist delta-only per-graph property stats (base entries
+///   lost), so a stats-driven check can silently pass on a graph that does
+///   carry hidden facts.
 /// - Each hidden candidate is confirmed by its **row count in the queried
 ///   graph** (`count_rows_for_predicate_psot`, directory-only): the
 ///   dictionary is global across graphs, so a `f:reifies*` predicate minted
 ///   by annotations in another graph is always present in it — bare
-///   membership would permanently decline every annotated ledger.
+///   membership would decline every graph of the ledger.
 pub(crate) fn graph_has_scan_hidden_predicates(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &BinaryIndexStore,
 ) -> Result<bool> {
-    for p_id in 0..store.predicate_count() {
-        let Some(sid) = store.predicate_sid(p_id) else {
-            // Unresolvable dictionary entry — err toward declining.
-            return Ok(true);
-        };
-        if fluree_db_core::is_scan_hidden_predicate(&sid)
-            && count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)? > 0
-        {
+    for &p_id in store.scan_hidden_p_ids() {
+        if count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)? > 0 {
             return Ok(true);
         }
     }

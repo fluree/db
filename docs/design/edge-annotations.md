@@ -55,13 +55,13 @@ Annotation syntax (`s p o ~ ?r {| ... |}`, JSON-LD `@annotation`, Cypher relatio
 
 The link names its triple without joining the base edge, so visibility is checked on the term: `QueryPolicyEnforcer` lets a flake whose object is a triple term through only when the triple that term names would be visible, recursively for nested terms. A policy hiding `ex:worksFor` therefore hides the links to `ex:worksFor` edges on every route.
 
-Wildcard scans (`?s ?p ?o`, wildcard hydration, Cypher property maps) hide `rdf:reifies`; `opts.includeSystemFacts` shows it.
+A link is ordinary data: wildcard scans (`?s ?p ?o`) and wildcard hydration return it like any triple, and hydration renders its triple term as an embedded node. An `@annotation` body leaves its reifier's link out, since the body hangs from it, and so do Cypher property maps, where the link is the relationship itself.
 
 Hydration (`@annotation` in subject expansion) and export read links the same way: hydration probes `rdf:reifies` with the rendered edge's term; export reads the ledger's live links once and writes a `~ <r>` marker on each base edge it reaches.
 
 ## Ledgers written before links
 
-Earlier releases stored an annotation as an `f:reifies*` bundle (`f:reifiesSubject`, `f:reifiesPredicate`, `f:reifiesObject`, …) on the reifier. Those bundles stay in commits, and the link is derived from them wherever it is needed: an index build derives it from each commit's bundle ops (`link_synth`), and novelty derives it for commits the index has not covered (`fluree-db-novelty/src/links.rs`). Readers see only links. A write that retracts a derived link leaves the bundle in place; the retract cancels the derived assert in novelty and at the next build alike.
+Earlier releases stored an annotation as an `f:reifies*` bundle (`f:reifiesSubject`, `f:reifiesPredicate`, `f:reifiesObject`, …) on the reifier. Those bundles stay in commits, hidden from wildcard scans and hydration unless `opts.includeSystemFacts` asks for them; the scan finds their predicate ids once per index store (`scan_hidden_p_ids`), so a ledger without bundles checks no row. The link is derived from them wherever it is needed: an index build derives it from each commit's bundle ops (`link_synth`), and novelty derives it for commits the index has not covered (`fluree-db-novelty/src/links.rs`). Readers see only links. A write that retracts a derived link leaves the bundle in place; the retract cancels the derived assert in novelty and at the next build alike.
 
 Index roots from those releases may also carry an annotation-arena section. Readers skip it, keeping only the arena's two branch CIDs, and the next index build releases the arena's blobs as garbage.
 

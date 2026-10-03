@@ -419,6 +419,11 @@ path = "tests/it_bm25_sync_scoping.rs"
 name = "it_minmax_fast_path_fired"
 path = "tests/it_minmax_fast_path_fired.rs"
 
+# Standalone routing-stamp test, same convention as above.
+[[test]]
+name = "it_scan_count_drain"
+path = "tests/it_scan_count_drain.rs"
+
 # Standalone (not in grp_transact): asserts on the `upsert deletion subject
 # pre-check` tracing event via the thread-local span capture, so it must be the
 # only test in its process. Same convention as the span-capture tests above.

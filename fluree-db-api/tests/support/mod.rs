@@ -895,3 +895,76 @@ pub async fn run_collector_and_fork_drop_scenario(
     round(main_id.clone(), 7).await;
     assert_dicts_present(main_id.clone(), "after a build following the drop").await;
 }
+
+/// Commits `ex:alice ex:worksFor ex:acme`, annotated the way releases before
+/// `rdf:reifies` links stored it: an `f:reifies*` bundle on
+/// `ex:emp/alice-acme`, beside the body `ex:role "Engineer"`. No writer
+/// produces bundles any more.
+pub async fn commit_legacy_bundle(
+    fluree: &fluree_db_api::Fluree,
+    ledger: LedgerState,
+) -> LedgerState {
+    use fluree_db_core::namespaces::{
+        reifies_object_sid, reifies_predicate_sid, reifies_subject_sid,
+    };
+    use fluree_db_core::{Flake, FlakeValue, Sid};
+
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let mut ex = |name: &str| ns.sid_for_iri(&format!("http://example.org/{name}"));
+    let (alice, works_for, acme, ann, role) = (
+        ex("alice"),
+        ex("worksFor"),
+        ex("acme"),
+        ex("emp/alice-acme"),
+        ex("role"),
+    );
+    let t = ledger.t() + 1;
+    let id_dt = fluree_db_core::edge::id_datatype_sid();
+    let flake = |s: &Sid, p: &Sid, o: FlakeValue, dt: Sid| {
+        Flake::new(s.clone(), p.clone(), o, dt, t, true, None)
+    };
+    let flakes = vec![
+        flake(
+            &alice,
+            &works_for,
+            FlakeValue::Ref(acme.clone()),
+            id_dt.clone(),
+        ),
+        flake(
+            &ann,
+            reifies_subject_sid(),
+            FlakeValue::Ref(alice.clone()),
+            id_dt.clone(),
+        ),
+        flake(
+            &ann,
+            reifies_predicate_sid(),
+            FlakeValue::Ref(works_for.clone()),
+            id_dt.clone(),
+        ),
+        flake(&ann, reifies_object_sid(), FlakeValue::Ref(acme), id_dt),
+        flake(
+            &ann,
+            &role,
+            FlakeValue::String("Engineer".into()),
+            fluree_db_core::edge::xsd_string_datatype_sid(),
+        ),
+    ];
+    let view =
+        fluree_db_transact::stage_flakes(ledger, flakes, fluree_db_transact::StageOptions::new())
+            .await
+            .expect("stage the legacy bundle");
+    fluree
+        .commit_staged(
+            view,
+            ns,
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+            fluree_db_transact::CommitOpts::default(),
+        )
+        .await
+        .expect("commit the legacy bundle")
+        .1
+}

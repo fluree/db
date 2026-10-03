@@ -399,13 +399,13 @@ pub fn is_annotation_predicate(sid: &Sid) -> bool {
     is_rdf_reifies(sid) || is_reserved_reifies_predicate(sid)
 }
 
-/// True for the predicates wildcard scans hide from users: the seven
-/// `f:reifies*` bundle predicates and, while the RDF 1.2 link form is
-/// index-internal, `rdf:reifies`. Read-side only; the write firewall is
-/// [`is_reserved_reifies_predicate`].
+/// True for the predicates wildcard scans hide from users: the seven legacy
+/// `f:reifies*` bundle predicates, an internal encoding whose links are read
+/// instead. `rdf:reifies` is ordinary data. Read-side only; the write
+/// firewall is [`is_reserved_reifies_predicate`].
 #[inline]
 pub fn is_scan_hidden_predicate(sid: &Sid) -> bool {
-    is_reserved_reifies_predicate(sid) || is_rdf_reifies(sid)
+    is_reserved_reifies_predicate(sid)
 }
 
 /// The cached `f:tripleTerm` datatype SID carried by a triple-term object,
