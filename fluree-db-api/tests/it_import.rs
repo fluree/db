@@ -1689,8 +1689,8 @@ GRAPH <http://example.org/graphs/audit> {
 #[tokio::test]
 async fn import_trig_compact_named_graph_is_queryable() {
     // Issue #1278: the compact W3C TriG form `<iri> { ... }` (no GRAPH keyword)
-    // must import through the bulk path too — `import_trig_commit` shares the
-    // same `parse_trig_phase1` parser as the upsert endpoint.
+    // must import through the bulk path too, which reads TriG with
+    // `parse_trig_phase1`.
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
 

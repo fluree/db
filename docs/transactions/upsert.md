@@ -1,6 +1,6 @@
 # Upsert
 
-Upsert operations provide idempotent transactions by **replacing the values of the predicates you supply** for an entity (matched by `@id`).
+Upsert operations **replace the values of the predicates you supply** for an entity (matched by `@id`). Repeating an upsert is idempotent, with one exception for values stored with less detail than they were written (see [Idempotency](#idempotency)).
 
 ## What is Upsert?
 
@@ -8,7 +8,7 @@ Upsert operations provide idempotent transactions by **replacing the values of t
 - If the entity exists: for each predicate present in your payload, retract existing values for that predicate and assert the new value(s)
 - If the entity doesn’t exist: create it with the supplied triples
 
-This makes upserts safe to retry: sending the same upsert repeatedly produces the same current-state values for those predicates.
+This makes upserts safe to retry: sending the same upsert repeatedly produces the same current-state values for those predicates, with one exception for values stored with less detail than they were written (see [Idempotency](#idempotency)).
 
 ## HTTP Endpoint
 
@@ -76,8 +76,12 @@ ex:alice schema:email "alice@example.org"
 ```
 
 **Operations:**
-1. Retract ALL existing properties of ex:alice
-2. Assert new properties
+1. For each predicate in the payload (`rdf:type`, `schema:name`, `schema:email`,
+   `schema:age`), retract every value ex:alice currently holds for it
+2. Assert the payload's values
+
+A value the payload restates cancels its own retraction, so it does not
+appear in the commit.
 
 **Flakes:**
 ```
@@ -86,7 +90,6 @@ ex:alice schema:name "Alice" (retract)
 ex:alice schema:email "alice@example.org" (retract)
 
 # Assertions (t=2)
-ex:alice rdf:type schema:Person (assert)
 ex:alice schema:name "Alice Smith" (assert)
 ex:alice schema:email "alice.smith@example.org" (assert)
 ex:alice schema:age 30 (assert)
@@ -100,7 +103,37 @@ ex:alice schema:email "alice.smith@example.org"
 ex:alice schema:age 30
 ```
 
-Note: The `@type` is re-asserted (types are always included in replace).
+`rdf:type schema:Person` is unchanged: it is retracted and re-asserted in the
+same transaction, and the two cancel.
+
+### Language Tags, Lists, and Blank Nodes
+
+The unit of replacement is the whole `(graph, subject, predicate)`: every
+current value is retracted exactly as it is stored.
+
+- **Language tags.** All languages of a predicate are replaced together. An
+  upsert of `{"schema:name": {"@value": "Alicia", "@language": "es"}}` over
+  `"Alice"@en` and `"Alice"@fr` leaves only `"Alicia"@es`. To change one
+  language and keep the others, use
+  [WHERE/DELETE/INSERT](update-where-delete-insert.md) with a `FILTER` on
+  `lang(?v)`, or include every language in the payload.
+- **Lists.** A `@list` value is replaced as a whole: every stored position is
+  retracted, including repeated values, and positions the new list restates
+  cancel. Replacing a list with plain values (or the reverse) works the same
+  way.
+- **Blank nodes.** A blank node in an upsert payload is identified by the
+  payload itself, so upserting the same document again addresses the same
+  node, and its values are replaced like any other subject's. An identical
+  re-upsert of a document with blank nodes commits nothing. A changed
+  document mints new blank nodes; the old ones stay (see
+  [Stable blank-node ids](update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids)
+  for editing a stored blank node in place). For Turtle and TriG the
+  identity comes from the parsed statements, not their order or spelling;
+  see [How RDF text is read](turtle.md#how-rdf-text-is-read) for the details
+  and a query that lists blank nodes nothing references.
+- **Named graphs.** The graph is part of the unit: an upsert into a named
+  graph replaces that graph's values and leaves the same predicate's values
+  in other graphs alone.
 
 ## Idempotency
 
@@ -112,19 +145,23 @@ Replace mode is idempotent—repeated submissions produce the same result:
 ```
 Result: Entity created.
 
-**Second Submission (t=2):**
+**Second Submission:**
 ```json
 {"@id": "ex:alice", "schema:name": "Alice", "schema:age": 30}
 ```
-Result: No actual changes (retracts and re-asserts same values).
+Result: nothing is committed. Each value's retraction and re-assertion cancel,
+so the transaction stages no flakes and the ledger stays at t=1. This holds
+for language-tagged values, lists, and the payload's blank nodes too.
 
-**Third Submission (t=3):**
-```json
-{"@id": "ex:alice", "schema:name": "Alice", "schema:age": 30}
-```
-Result: No actual changes.
-
-This makes upserts safe to retry.
+This makes upserts safe to retry, with one exception. A value stored with
+less detail than it was written is not re-upserted as a no-op: an integer too
+large for 64 bits written with an XSD subtype such as `xsd:nonNegativeInteger`
+(the index keeps no subtype), or a `dateTime` or `time` with digits past the
+microsecond (storage keeps six). Re-upserting such a value as written commits
+a retraction and an assertion of the same stored fact, and the value can be
+lost. Write these values at the precision they are stored with: `xsd:integer`
+for big integers, and at most six fractional digits for temporals. Graph sync
+behaves the same way.
 
 ## Comparison: Insert vs Update vs Upsert
 
@@ -173,7 +210,7 @@ POST /upsert?ledger=mydb:main
 **Behavior:**
 - Replaces values **for the predicates you supply** (per subject)
 - Leaves other predicates unchanged
-- Retry-safe/idempotent for the supplied predicates
+- Retry-safe/idempotent for the supplied predicates, except for values stored with less detail than they were written (see [Idempotency](#idempotency))
 
 ## Use Cases
 
@@ -338,9 +375,9 @@ All types are replaced together.
 
 ## Edge Cases
 
-### Empty Replacement
+### Predicates Not in the Payload
 
-Replacing with minimal data removes other properties:
+Only the predicates the payload names are replaced:
 
 **Before (t=1):**
 ```json
@@ -348,17 +385,15 @@ Replacing with minimal data removes other properties:
   "@id": "ex:alice",
   "schema:name": "Alice",
   "schema:email": "alice@example.org",
-  "schema:age": 30,
-  "schema:telephone": "+1-555-0100"
+  "schema:age": 30
 }
 ```
 
-**Replace (t=2):**
+**Upsert (t=2):**
 ```json
 {
   "@id": "ex:alice",
-  "@type": "schema:Person",
-  "schema:name": "Alice"
+  "schema:name": "Alice Smith"
 }
 ```
 
@@ -366,18 +401,15 @@ Replacing with minimal data removes other properties:
 ```json
 {
   "@id": "ex:alice",
-  "@type": "schema:Person",
-  "schema:name": "Alice"
+  "schema:name": "Alice Smith",
+  "schema:email": "alice@example.org",
+  "schema:age": 30
 }
 ```
 
-Email, age, and telephone are removed.
-
-### Partial Updates Not Possible
-
-Replace mode replaces ALL properties—partial updates not supported.
-
-For partial updates, use [WHERE/DELETE/INSERT](update-where-delete-insert.md).
+To remove a predicate's values, retract them with
+[WHERE/DELETE/INSERT](update-where-delete-insert.md), or use
+[graph sync](sync.md) to make a whole graph equal a document.
 
 ## Error Handling
 
@@ -517,12 +549,12 @@ For partial updates, use WHERE/DELETE/INSERT:
 
 | Feature | Default Mode | Replace Mode |
 |---------|--------------|--------------|
-| **Behavior** | Additive | Replace all |
-| **Existing properties** | Preserved | Removed |
-| **Idempotent** | No | Yes |
-| **Partial updates** | Yes (with WHERE/DELETE/INSERT) | No |
+| **Behavior** | Additive | Replaces each named predicate's values |
+| **Predicates not in the payload** | Preserved | Preserved |
+| **Idempotent** | No | Yes, with one exception (see [Idempotency](#idempotency)) |
+| **Partial updates** | Yes (with WHERE/DELETE/INSERT) | Per predicate |
 | **Use case** | Adding data | Synchronization |
-| **Retry safety** | Requires care | Safe by default |
+| **Retry safety** | Requires care | Safe by default, with the same exception |
 | **Performance** | Fewer operations | More operations |
 
 ## Related Documentation

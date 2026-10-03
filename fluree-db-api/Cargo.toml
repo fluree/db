@@ -421,6 +421,13 @@ path = "tests/it_minmax_fast_path_fired.rs"
 name = "it_upsert_skip_fires"
 path = "tests/it_upsert_skip_fires.rs"
 
+# Standalone (not in grp_transact): asserts on the `delete_witnessed` routing
+# stamp via the thread-local span capture, so it must be the only test in its
+# process. Same convention as `it_upsert_skip_fires`.
+[[test]]
+name = "it_delete_witness_routing"
+path = "tests/it_delete_witness_routing.rs"
+
 # Standalone (NOT in grp_ledger): sets FLUREE_MAX_GRAPH_SCAN_FLAKES to exercise
 # the whole-graph-scan cap, then clears it. The limit is read from the process
 # env per scan and has no programmatic override, so a grouped binary — whose
@@ -588,6 +595,10 @@ harness = false
 
 [[bench]]
 name = "transact_filtered_delete"
+harness = false
+
+[[bench]]
+name = "transact_upsert_replace"
 harness = false
 
 [[bench]]

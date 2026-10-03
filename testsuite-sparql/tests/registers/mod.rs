@@ -408,18 +408,14 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
-    // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
-    // (D-8) — "expected subject, found 'GRAPH'" (5)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
     // results not isomorphic: the star data now LOADS (the collector sink
-    // accepts `<< >>` / `{| |}` / `~`), but Fluree's model asserts the base
+    // accepts `<< >>` / `{| |}` / `~`; TriG graph blocks load since RDF text
+    // is parsed once on every write lane), but Fluree's model asserts the base
     // triple of every `<< s p o >>` and binds reifiers, not triple terms —
     // RDF 1.2's non-asserting reified triples and `?t` triple-term bindings
-    // are the Option-1 epic (8)
+    // are the Option-1 epic (10)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-3",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-7",
@@ -441,6 +437,16 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
     // SPARQL lowering: triple-term values in VALUES data not implemented (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
+    // SPARQL lowering: the TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE
+    // functions are accepted but not lowered — Option-1 epic (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
+    // SPARQL UPDATE lowering: "RDF-star quoted triple is not yet supported in
+    // SPARQL UPDATE lowering" (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
+    // SPARQL UPDATE: an annotation whose value is the `GRAPH ?g` binding —
+    // "Raw IRI from graph source cannot be used as object for flake
+    // generation" (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
     // update-3: the `{| |}` INSERT DATA executes, but the expected post-update
     // TriG-star graph carries reifier semantics the harness comparison does
     // not model (expected 2 triples, got 0 in the default graph) (1)

@@ -3743,7 +3743,7 @@ fn string_not_found_error(value: &str) -> std::io::Error {
 /// - langString: OType must embed the lang_id, not use XSD_STRING
 /// - numeric subtypes: xsd:int vs xsd:integer can share the same FlakeValue::Long
 /// - string subtypes: xsd:anyURI vs xsd:string share FlakeValue::String
-fn value_to_otype_okey(
+pub(crate) fn value_to_otype_okey(
     val: &FlakeValue,
     dt_sid: &Sid,
     lang: Option<&str>,

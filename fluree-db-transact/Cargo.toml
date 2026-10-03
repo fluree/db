@@ -59,6 +59,9 @@ fluree-graph-turtle = { path = "../fluree-graph-turtle" }
 # Hash map for trig_meta parser + FxHashSet for worker cache
 rustc-hash = "2"
 
+# RDF text content identity (upsert blank-node scope)
+xxhash-rust = { workspace = true, features = ["xxh3"] }
+
 # Thread-safe namespace allocator for parallel import
 parking_lot = "0.12"
 

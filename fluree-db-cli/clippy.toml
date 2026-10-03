@@ -1,0 +1,8 @@
+# RDF text is sent and staged as written, and parsed once where it is
+# staged (`fluree_db_transact::parse_rdf_text`). Converting it to JSON-LD
+# first loses collection order, refuses IRIs whose scheme reads as an
+# undefined prefix (`tag:`, `kb:`), and reads literals differently from
+# insert; the one fallback that needs it says so where it calls it.
+disallowed-methods = [
+    { path = "fluree_graph_turtle::parse_to_json", reason = "lossy JSON-LD round trip: send RDF text as written" },
+]

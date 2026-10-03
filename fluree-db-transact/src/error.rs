@@ -37,6 +37,18 @@ pub enum TransactError {
     #[error("Parse error: {0}")]
     Parse(String),
 
+    /// RDF text (Turtle, TriG) that does not parse. Positions are byte
+    /// offsets into the document as the caller sent it.
+    #[error("Turtle parse error: {0}")]
+    Turtle(#[from] fluree_graph_turtle::TurtleError),
+
+    /// A graph-scoped write (graph sync, graph insert) whose RDF body puts
+    /// statements outside the one graph the request names: a block for
+    /// another graph, or the target's statements both in blocks and as
+    /// default-graph statements. The message names the graphs.
+    #[error("{0}")]
+    PayloadGraphMismatch(String),
+
     /// A syntactically valid transaction feature is not yet implemented.
     ///
     /// Distinct from [`Self::Parse`] (which is user-error) and

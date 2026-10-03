@@ -33,6 +33,12 @@ This:
 2. Deletes that age value
 3. Inserts the new age value
 
+A DELETE retracts only facts that are stored. A template instantiated with a
+value the ledger does not hold (a constant that is absent, or a value bound by
+a different pattern) retracts nothing, and cannot cancel an INSERT of the same
+triple: `DELETE { x } INSERT { x } WHERE {}` inserts `x` when it is absent.
+See [Retraction Semantics](retractions.md#retraction-semantics).
+
 ## WHERE clause capabilities
 
 The update transaction `where` clause uses the **same pattern grammar as JSON-LD queries**, so you can use rich patterns like OPTIONAL, UNION, FILTER, VALUES, and subqueries.
@@ -688,11 +694,11 @@ Updates ALL entities with status="pending".
 
 | Feature | WHERE/DELETE/INSERT | Replace Mode |
 |---------|---------------------|--------------|
-| **Granularity** | Property-level | Entity-level |
-| **Other properties** | Preserved | Removed |
+| **Granularity** | Value-level | Predicate-level (every value, every language) |
+| **Other properties** | Preserved | Preserved |
 | **Conditional** | Yes (with filters) | No |
 | **Pattern matching** | Yes | No |
-| **Idempotent** | Depends on logic | Yes |
+| **Idempotent** | Depends on logic | Yes, with one exception (see [Upsert](upsert.md#idempotency)) |
 | **Use case** | Partial updates | Complete replacement |
 
 ## Best Practices

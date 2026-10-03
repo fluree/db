@@ -34,7 +34,9 @@
 pub mod address;
 pub mod commit;
 pub mod commit_flakes;
+pub mod current_facts;
 pub mod datatype_limit;
+mod delete_witness;
 pub mod error;
 pub mod flake_sink;
 pub mod generate;
@@ -46,6 +48,7 @@ pub mod parse;
 pub mod raw_txn_upload;
 pub mod stage;
 pub mod staged_dicts;
+pub mod template_sink;
 pub mod value_convert;
 
 #[cfg(feature = "import")]
@@ -62,9 +65,10 @@ pub use commit::{
     build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
+pub use current_facts::{CurrentFacts, Origin, Retraction, Slot, StoredFact};
 pub use error::{Result, TransactError};
 pub use flake_sink::FlakeSink;
-pub use generate::{apply_cancellation, FlakeGenerator};
+pub use generate::FlakeGenerator;
 pub use ir::{
     GraphMgmtOp, GraphSel, GraphTarget, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate,
     Txn, TxnOpts, TxnType,
@@ -77,15 +81,23 @@ pub use namespace::{
     SharedNamespaceAllocator, BLANK_NODE_ID_PREFIX, BLANK_NODE_PREFIX,
 };
 pub use parse::{
+    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, parse_trig_txn, Placement, RdfText,
+    RdfTextSummary,
+};
+pub use parse::{
     might_contain_graph_block, parse_graph_insert, parse_sync_transaction, parse_transaction,
-    parse_trig_phase1, resolve_trig_meta, unwrap_trig_graph_blocks, NamedGraphBlock, RawObject,
-    RawTerm, RawTrigMeta, RawTriple, TrigPhase1Result, UnwrappedTrig,
+    parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm, RawTrigMeta,
+    RawTriple, TrigPhase1Result,
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
-pub use stage::{generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions};
+pub use stage::{
+    generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions,
+    DELETE_WITNESSED_SITE,
+};
 pub use staged_dicts::{
     attach_binary_provider, attach_staged_dicts, detach_binary_provider, staged_dicts, StagedDicts,
 };
+pub use template_sink::{RdfTextParts, TemplateSink};
 
 #[cfg(feature = "shacl")]
 pub use stage::{validate_view_with_shacl, ShaclGraphPolicy, ShaclValidationOutcome};

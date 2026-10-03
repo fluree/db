@@ -33,7 +33,7 @@ Fluree supports Turtle and TriG on different endpoints with different semantics:
 | `/data` ([Graph Store](../api/graph-store.md) `PUT` / `POST`) | Supported | Supported (one graph per request) |
 
 - **Insert** (`/insert`): Pure insert semantics: triples are added and existing values are kept. Turtle is parsed straight to flakes. A TriG body's graph blocks land in their named graphs and a `<#txn-meta>` block becomes commit metadata; a body with graph blocks is read as TriG under either content type.
-- **Upsert** (`/upsert`): For each (subject, predicate) pair, existing values are retracted before new values are asserted. Supports TriG with GRAPH blocks for named graph ingestion.
+- **Upsert** (`/upsert`): For each (graph, subject, predicate) the document names, the stored values, every language tag and list position included, are retracted and the document's values asserted (see [Upsert](upsert.md#language-tags-lists-and-blank-nodes)). A TriG body's blocks upsert into their graphs.
 - **Sync** (`/sync?graph=<iri>`): The body becomes the named graph's entire contents, committing only the difference; an unchanged body commits nothing. See [Sync](sync.md#payload-formats) for the TriG rules.
 
 N-Triples is a subset of Turtle and is accepted wherever Turtle is: as `application/n-triples` over HTTP, and as a `.nt` file or `--format nt` from the CLI.
@@ -621,7 +621,47 @@ curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
 
 From the CLI, `fluree insert -f data.trig` and `fluree upsert -f data.trig` do the same.
 
-**Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** on `/insert`, `/upsert` and bulk import, a `GRAPH` block's contents are read by a smaller parser that rejects anonymous blank nodes (`[ … ]`) and collections (`( … )`) with `expected object, found '['`. Triples outside blocks are unaffected. `/sync` and the [Graph Store Protocol](../api/graph-store.md) read block contents with the full Turtle parser, so they accept both; for `/insert` and `/upsert`, use labeled blank nodes (`_:b1`) inside blocks.
+A `GRAPH` block's contents are Turtle like the rest of the document: anonymous blank nodes (`[ … ]`), collections (`( … )`) and RDF 1.2 annotations work inside blocks on every transaction endpoint. **Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** bulk import (`fluree create --from data.trig`) still reads block contents with a smaller parser that rejects `[ … ]` and `( … )` with `expected object, found '['`; use labeled blank nodes (`_:b1`) inside blocks there.
+
+### How RDF Text Is Read
+
+Every transaction endpoint reads Turtle and TriG with the same parser, once, and stores what it reads; nothing is converted to JSON-LD on the way. So the same document stores the same facts through `/insert`, `/upsert`, `/sync` and the Graph Store routes:
+
+- **Directives apply in document order.** A `@prefix` or `@base` applies to what follows it, in the default graph and in blocks alike; redefining a prefix later does not change the IRIs before it. A block label is resolved under the declarations in force where the block appears.
+- **Relative IRIs resolve against the base.** `<x>` resolves against the `@base` in force. With no base, a relative reference in the default graph is a parse error, while one in a `GRAPH` block, as its label or in its contents, is kept exactly as written: ledger configuration names a ledger by its id, and an id such as `org/governance:main` is a relative reference (`f:ledger <org/governance:main>`). `<#txn-meta>` with no base in force names the commit-metadata block, as always.
+- **Literals are stored as written.** A lexical form that does not fit its datatype (`"abc"^^xsd:integer`) is kept, with its declared datatype, on every endpoint, as insert always did.
+- **Any IRI scheme works.** `tag:`, `kb:` and other schemes are stored verbatim, however they are spelled.
+- **Collections keep their order and repeats**, and `rdf:type` takes a blank node or a literal like any other predicate.
+- **Blank-node labels are document-scoped:** `_:b` in the default graph and in two blocks is one node. Each `[ ]` is a new node.
+- **Errors point into the document as sent:** a parse error in a block reports its position in the whole document, and a malformed block (nested, unclosed, a directive inside it, a blank-node label) is named as such.
+
+An upsert scopes a document's blank nodes to its content, so upserting the same document again addresses the same nodes and commits nothing. The scope ignores statement order (anonymous `[ ]` nodes are numbered in document order, so moving statements that contain them relative to each other gives a new scope); any change to the statements gives a new scope and new nodes, and the previous nodes stay. To find blank-node subjects that nothing references any more:
+
+```sparql
+SELECT DISTINCT ?b WHERE {
+  ?b ?p ?o .
+  FILTER(isBlank(?b))
+  FILTER NOT EXISTS { ?s ?q ?b }
+  FILTER NOT EXISTS { GRAPH ?h { ?s2 ?q2 ?b } }
+}
+```
+
+That query lists subjects in the default graph. Blank nodes a TriG upsert wrote inside `GRAPH` blocks live in those graphs; the same check, graph by graph:
+
+```sparql
+SELECT DISTINCT ?g ?b WHERE {
+  GRAPH ?g {
+    ?b ?p ?o .
+    FILTER(isBlank(?b))
+  }
+  FILTER NOT EXISTS { ?s ?q ?b }
+  FILTER NOT EXISTS { GRAPH ?h { ?s2 ?q2 ?b } }
+}
+```
+
+Both look for references in every graph. A blank-node label names one node across a TriG document, so a node described in one graph can be referenced from another, and a check within its own graph would list it.
+
+Review the list before deleting: a document can hold unreferenced blank-node subjects on purpose. Deleting an orphaned node leaves the nodes it referenced orphaned in turn, so repeat until the query returns nothing.
 
 ### Querying Named Graphs
 
@@ -672,7 +712,7 @@ Fluree assigns internal graph IDs to named graphs:
 
 ### TriG with Transaction Metadata
 
-You can combine named graphs with transaction metadata using the special `#txn-meta` graph fragment. This works on both `insert` and `upsert`:
+You can combine named graphs with transaction metadata using the special `#txn-meta` graph fragment (with no `@base` in force). This works on both `insert` and `upsert`:
 
 ```trig
 @prefix ex: <http://example.org/ns/> .
