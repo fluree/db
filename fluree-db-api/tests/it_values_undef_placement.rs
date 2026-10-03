@@ -437,6 +437,33 @@ async fn filter_on_a_bind_target_keeps_a_row_whose_bind_errored() {
     assert_eq!(rows(&fluree, body, &["s", "t"]).await, expected);
 }
 
+/// A BIND's target is its output: a property path starting from it runs
+/// after the BIND, anchored. The path binds `?start` too, and held behind it,
+/// the BIND let the path walk from every node before keeping the rows that
+/// start at `ex:n0`.
+#[tokio::test]
+async fn bind_anchors_the_property_path_that_starts_from_its_target() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let chain: Vec<JsonValue> = (0..5)
+        .map(|i| json!({"@id": format!("ex:n{i}"), "ex:next": {"@id": format!("ex:n{}", i + 1)}}))
+        .collect();
+    seed_computed_keys(&fluree, 0, 0, chain, false).await;
+
+    let body = "SELECT ?x WHERE { BIND(ex:n0 AS ?start) ?start ex:next+ ?x }";
+    let ops = plan_ops(&fluree, body).await;
+    let at = |op: &str| {
+        ops.iter()
+            .position(|o| o.starts_with(op))
+            .unwrap_or_else(|| panic!("no {op}: {ops:?}"))
+    };
+    assert!(
+        at("PropertyPathOperator") < at("BindOperator"),
+        "the BIND should feed the path: {ops:?}"
+    );
+    let expected: Vec<Vec<Option<String>>> = (1..6).map(|i| vec![s(&format!("n{i}"))]).collect();
+    assert_eq!(rows(&fluree, body, &["x"]).await, expected);
+}
+
 #[tokio::test]
 async fn jsonld_unwind_reads_the_value_its_triple_binds_after_an_undef_cell() {
     let fluree = FlureeBuilder::memory().build_memory();

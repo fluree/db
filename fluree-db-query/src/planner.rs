@@ -1474,8 +1474,9 @@ struct DeferredPattern {
     /// `?b` otherwise drains the VALUES before the OPTIONAL that introduces `?b`
     /// is placed at all. Empty for every dependency-placed deferral.
     after_indices: Vec<usize>,
-    /// For FILTER, EXISTS, NOT EXISTS and BIND: who binds each variable the
-    /// pattern reads (see [`attach_filter_binders`]). Empty for everything else.
+    /// For FILTER, EXISTS, NOT EXISTS, BIND and UNWIND: who binds each variable
+    /// the pattern reads (see [`attach_filter_binders`]). Empty for everything
+    /// else.
     binders: Vec<VarBinders>,
 }
 
@@ -1508,6 +1509,11 @@ impl VarBinders {
 /// VALUES UNDEF column lets them run before the triple that actually binds the
 /// variable.
 ///
+/// What a pattern reads is [`deferred_required_vars`]. A BIND or UNWIND target
+/// is an output: a pattern that also binds it joins on the value the BIND or
+/// UNWIND produces, so it is not a binder to wait for. An UNWIND held behind
+/// one overwrites the value that pattern bound.
+///
 /// `seed_bound_in_every_row` are the seed variables no pattern can change;
 /// any other seed variable may be unbound on some rows and gets binders too.
 fn attach_filter_binders(
@@ -1534,7 +1540,7 @@ fn attach_filter_binders(
         .iter_mut()
         .filter(|dp| waits_for_binders(&dp.pattern))
     {
-        let mut reads = dp.pattern.referenced_vars();
+        let mut reads = deferred_required_vars(&dp.pattern);
         reads.sort_unstable();
         reads.dedup();
         for v in reads {
@@ -2944,12 +2950,6 @@ fn drain_ready_deferred(
     }
 }
 
-/// Return the *input* variables that must be bound before a deferred pattern
-/// can execute.
-///
-/// - FILTER: all referenced variables
-/// - BIND: the expression's variables (not the target variable)
-///
 /// Variables a subquery correlates on: its SELECT-list variables that are also
 /// produced by some OTHER pattern in the enclosing group. These must be bound
 /// before the subquery runs, so the planner defers it until they are. An empty
@@ -3079,6 +3079,13 @@ fn subquery_pipeline_output_vars(
     outputs
 }
 
+/// The *input* variables of a deferred pattern: the ones that must be bound
+/// before it can execute, and the ones [`attach_filter_binders`] waits on.
+///
+/// - FILTER: all referenced variables
+/// - BIND / UNWIND: the expression's variables, not the target variable
+/// - ShortestPath: its start anchors
+/// - EXISTS / NOT EXISTS: every variable they mention
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
     match pattern {
         Pattern::Filter(expr) => expr.referenced_vars(),
@@ -3087,7 +3094,8 @@ fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
         // Only the start anchors an Enumerate path search; requiring the end
         // would deadlock when no other pattern produces it.
         Pattern::ShortestPath(sp) => sp.required_input_vars(),
-        // Other patterns should not be classified as Deferred, but handle
+        // EXISTS / NOT EXISTS correlate on everything they mention. Other
+        // patterns should not be classified as Deferred, but handle
         // gracefully by returning all referenced variables.
         other => other.referenced_vars(),
     }
@@ -5674,6 +5682,30 @@ mod tests {
                 < position_of(&reordered, |p| matches!(p, Pattern::Optional(_))),
             "{reordered:?}"
         );
+    }
+
+    /// A BIND or UNWIND target is its output, so a triple that also binds it
+    /// joins on that value instead of holding it back. Placed after the
+    /// triple, an UNWIND overwrote the value the triple matched.
+    #[test]
+    fn bind_and_unwind_run_before_a_triple_that_binds_their_target() {
+        let (s, x) = (VarId(0), VarId(1));
+        let lookup = triple(s, "num", x);
+        let long = |n| Expression::Const(FlakeValue::Long(n));
+        let bind = Pattern::Bind {
+            var: x,
+            expr: long(3),
+        };
+        let unwind = Pattern::Unwind {
+            var: x,
+            list: Expression::call(Function::Range, vec![long(1), long(3)]),
+        };
+        let held: Vec<Vec<Pattern>> = [bind, unwind]
+            .into_iter()
+            .map(|binder| reorder_patterns(&[binder, lookup.clone()], None, &HashSet::new()))
+            .filter(|reordered| matches!(reordered[0], Pattern::Triple(_)))
+            .collect();
+        assert!(held.is_empty(), "held behind the triple: {held:?}");
     }
 
     #[test]
