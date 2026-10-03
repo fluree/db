@@ -482,6 +482,9 @@ impl TermResolver<'_> {
 
     fn literal(&mut self, val: &FlakeValue, dtc: &DatatypeConstraint) -> Result<Option<IrTerm>> {
         if let FlakeValue::TripleTerm(term) = val {
+            if let Some([s, p, o]) = self.term_components(term)? {
+                return Ok(Some(IrTerm::triple(s, p, o)));
+            }
             return Ok(Some(IrTerm::Literal {
                 value: LiteralValue::String(Arc::from(self.triple_term_text(term)?)),
                 datatype: self.datatype(dtc.datatype())?,

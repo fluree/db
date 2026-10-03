@@ -378,26 +378,18 @@ pub const SPARQL12_CODEPOINT_ESCAPES: &[&str] = &[];
 
 pub const SPARQL12_SYNTAX_TRIPLE_TERMS_NEGATIVE: &[&str] = &[];
 
-// SPARQL 1.2 triple-term syntax is fully accepted (accept-then-defer,
-// decision D-1): reifier forms (buckets A/D) by PR-W2A; the
-// TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE builtins (bucket B) and bare
-// `<<( )>>` triple-term values (bucket C) by PR-W2BC. All parse + validate;
-// evaluation is deferred to the first-class-triple-term epic (ROADMAP §2/§4,
-// docs/audit/burn-down/sparql12-wave2-triple-terms.md §1.2/§1.3), so the
-// sibling SPARQL12_EVAL_TRIPLE_TERMS register still stands.
+// SPARQL 1.2 triple-term syntax is fully accepted: reifier forms, the
+// TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE builtins and `<<( )>>` triple-term
+// values. What still fails to evaluate is in SPARQL12_EVAL_TRIPLE_TERMS.
 pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[];
 
-// Blocked on Turtle-star data loading and engine triple-term support —
-// audit §4.3 / Phase D. Re-baseline this whole register after Turtle-star
-// ingest (PR-W15) lands: the residual blockers are wave-2 query syntax /
-// triple-term functions / CONSTRUCT projection / result serialization,
-// scoped by the Option-1 first-class-triple-term epic (ROADMAP §2).
 // Each test appears in EXACTLY ONE reason cluster (PR-1454 review found 10
 // entries double-counted across clusters); attribution below re-verified
 // empirically by unregistering and reading the harness's failure reasons.
 pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
-    // data load: qt:data uses `<<( … )>>` triple-term VALUES, rejected by
-    // ingest with the specific deferred error — Option-1 epic (10)
+    // data load: qt:data nests a triple term in another
+    // (`<<( … <<( … )>> )>>`, or a reifier of a triple whose object is a
+    // triple term), which ingest refuses (9)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1x",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-8",
@@ -406,7 +398,6 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-11",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
     // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
     // (D-8) — "expected subject, found 'GRAPH'" (3)
@@ -593,12 +584,8 @@ pub const RDF11_TURTLE: &[&str] = &[
 ];
 
 pub const RDF12_TURTLE_SYNTAX: &[&str] = &[
-    // triple terms as values (`<<( s p o )>>` anywhere but the object of
-    // `rdf:reifies`, and nested triple terms) are deferred: the graph IR has
-    // no triple-term Term, so ingest rejects them with the specific error (5)
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-3",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-7",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-8",
+    // nested triple terms (`<<( s p <<( … )>> )>>`) are deferred; ingest
+    // rejects them with the specific error (2)
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-3",
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-nested-1",
 ];

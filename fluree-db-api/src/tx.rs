@@ -2455,6 +2455,20 @@ fn convert_named_graphs_to_templates(
                     Some(DatatypeConstraint::Explicit(dt_sid)),
                 ))
             }
+            RawObject::TripleTerm {
+                subject,
+                predicate,
+                object,
+            } => {
+                let (o, dtc) = convert_object(object, prefixes, ns_registry)?;
+                let term = fluree_db_transact::TemplateTripleTerm {
+                    s: convert_term(subject, prefixes, ns_registry)?,
+                    p: convert_term(predicate, prefixes, ns_registry)?,
+                    o,
+                    dtc,
+                };
+                Ok((TemplateTerm::TripleTerm(Box::new(term)), None))
+            }
         }
     }
 

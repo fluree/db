@@ -33,6 +33,22 @@ pub enum RdfTerm {
         datatype: Option<String>,
         language: Option<String>,
     },
+    /// A triple term, `<<( s p o )>>`.
+    Triple(Box<Triple>),
+}
+
+impl RdfTerm {
+    pub(crate) fn has_blank_node(&self) -> bool {
+        match self {
+            RdfTerm::BlankNode(_) => true,
+            RdfTerm::Triple(t) => {
+                t.subject.has_blank_node()
+                    || t.predicate.has_blank_node()
+                    || t.object.has_blank_node()
+            }
+            RdfTerm::Iri(_) | RdfTerm::Literal { .. } => false,
+        }
+    }
 }
 
 /// An RDF triple in a CONSTRUCT/DESCRIBE result graph.
@@ -205,6 +221,7 @@ pub fn project_to_csv_space(results: SparqlResults) -> SparqlResults {
                                     language: None,
                                 },
                                 RdfTerm::BlankNode(b) => RdfTerm::BlankNode(b),
+                                RdfTerm::Triple(t) => RdfTerm::Triple(t),
                                 RdfTerm::Literal { value, .. } => RdfTerm::Literal {
                                     value,
                                     datatype: None,
@@ -1080,6 +1097,11 @@ pub(crate) fn ir_term_to_rdf_term(term: &IrTerm) -> RdfTerm {
                 language: language_opt,
             }
         }
+        IrTerm::TripleTerm(t) => RdfTerm::Triple(Box::new(Triple {
+            subject: ir_term_to_rdf_term(&t[0]),
+            predicate: ir_term_to_rdf_term(&t[1]),
+            object: ir_term_to_rdf_term(&t[2]),
+        })),
     }
 }
 

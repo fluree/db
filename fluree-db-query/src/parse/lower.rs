@@ -471,6 +471,18 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
             out.extend(lower_unresolved_patterns(body, encoder, vars, pp_counter)?);
             Ok(out)
         }
+        UnresolvedPattern::TripleTermValue {
+            subject,
+            predicate,
+            term,
+        } => {
+            let subject = lower_ref_term(subject, encoder, vars)?;
+            let predicate = lower_ref_term(predicate, encoder, vars)?;
+            let term = lower_triple_pattern(term, encoder, vars)?;
+            let mut out = Vec::new();
+            crate::ir::lower_term_value(subject, predicate, term, encoder, vars, &mut out);
+            Ok(out)
+        }
     }
 }
 
@@ -1475,6 +1487,11 @@ fn lower_construct_patterns<E: IriEncoder>(
                     Ref::Iri(std::sync::Arc::from(name.as_ref()))
                 };
                 lower_construct_patterns(patterns, Some(&name), encoder, vars, out)?;
+            }
+            UnresolvedPattern::TripleTermValue { .. } => {
+                return Err(ParseError::InvalidConstruct(
+                    "a triple-term value in a CONSTRUCT template is not supported".to_string(),
+                ))
             }
             // Filters, optionals and binds have no meaning in a template.
             _ => {}

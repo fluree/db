@@ -606,6 +606,13 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
             "rdf:JSON must pair only with FlakeValue::Json (got {val:?})"
         )));
     }
+    if (dt == fluree_db_core::triple_term_datatype_sid())
+        != matches!(val, FlakeValue::TripleTerm(_))
+    {
+        return Err(TransactError::FlakeGeneration(format!(
+            "f:tripleTerm must pair only with a triple term (got {val:?})"
+        )));
+    }
     Ok(())
 }
 
@@ -622,6 +629,13 @@ pub(crate) fn reified_triple_link(
     ann: &Sid,
     t: i64,
 ) -> Result<Flake> {
+    if matches!(o, FlakeValue::TripleTerm(_)) {
+        return Err(TransactError::UnsupportedFeature(
+            "reifying a triple whose object is a triple term needs a nested triple \
+             term, which is not supported"
+                .to_string(),
+        ));
+    }
     let dt = dtc.datatype().clone();
     validate_value_dt_pair(&o, &dt)?;
     let term = fluree_db_core::TripleTermValue {

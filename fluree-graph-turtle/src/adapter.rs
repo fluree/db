@@ -183,8 +183,9 @@ fn term_to_subject_key(term: &Term) -> String {
     match term {
         Term::Iri(iri) => iri.to_string(),
         Term::BlankNode(id) => format!("_:{}", id.as_str()),
-        Term::Literal { .. } => {
-            // Literals shouldn't be subjects in RDF, but handle gracefully
+        Term::Literal { .. } | Term::TripleTerm(_) => {
+            // Literals and triple terms shouldn't be subjects in RDF, but
+            // handle gracefully
             "_:literal".to_string()
         }
     }
@@ -201,6 +202,16 @@ fn term_to_iri(term: &Term) -> String {
 /// Convert an object term to a JSON-LD value object.
 fn term_to_object_value(term: &Term) -> JsonValue {
     match term {
+        // The JSON-LD-star embedded node a triple-term value takes.
+        Term::TripleTerm(t) => {
+            let mut node = Map::new();
+            node.insert(
+                "@id".to_string(),
+                JsonValue::String(term_to_subject_key(&t[0])),
+            );
+            node.insert(term_to_iri(&t[1]), term_to_object_value(&t[2]));
+            json!({ "@id": node })
+        }
         Term::Iri(iri) => {
             json!({ "@id": iri.as_ref() })
         }
@@ -264,7 +275,7 @@ fn term_to_type_value(term: &Term) -> Option<JsonValue> {
     match term {
         Term::Iri(iri) => Some(JsonValue::String(iri.to_string())),
         Term::BlankNode(id) => Some(JsonValue::String(format!("_:{}", id.as_str()))),
-        Term::Literal { .. } => None,
+        Term::Literal { .. } | Term::TripleTerm(_) => None,
     }
 }
 

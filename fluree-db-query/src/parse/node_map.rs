@@ -899,6 +899,44 @@ fn parse_property(
                 query,
                 ctx,
             );
+        } else if let Some(term) = nested_map
+            .get("@id")
+            .or_else(|| nested_map.get(ctx.ctx.context.id_key.as_str()))
+            .filter(|id| id.is_object())
+        {
+            // A triple term as the value: `{"@id": {"@id": s, p: o}}`.
+            if is_reverse || nested_map.len() > 1 {
+                return Err(ParseError::InvalidWhere(
+                    "a triple term ({\"@id\": {...}}) is a value: it cannot be a \
+                     subject or carry properties"
+                        .to_string(),
+                ));
+            }
+            let id_key = ctx.ctx.context.id_key.as_str();
+            if !term
+                .get("@id")
+                .or_else(|| term.get(id_key))
+                .is_some_and(JsonValue::is_string)
+            {
+                return Err(ParseError::InvalidWhere(
+                    "a triple term must name its subject with @id".to_string(),
+                ));
+            }
+            let term = parse_reifies_edge(
+                term,
+                "a triple term",
+                ctx.ctx,
+                // The term names its subject, so nothing mints one.
+                &mut 0,
+                ctx.nested_counter,
+                ctx.object_var_parsing,
+            )?;
+            query.patterns.push(UnresolvedPattern::TripleTermValue {
+                subject: subject.clone(),
+                predicate,
+                term,
+            });
+            return Ok(());
         } else {
             // Determine the nested subject:
             // - If nested object has an explicit @id, use it (var or IRI).
@@ -998,6 +1036,7 @@ fn parse_annotation_target(
     let reifies_val = map.get(REIFIES_KEY).expect("caller checked @reifies");
     let edge = parse_reifies_edge(
         reifies_val,
+        REIFIES_KEY,
         ctx,
         subject_counter,
         nested_counter,
@@ -1265,30 +1304,26 @@ fn parse_literal_edge_annotation(
     Ok(())
 }
 
-/// Lower the @reifies value (a node-map describing the base triple) to
-/// a single `UnresolvedTriplePattern`.
+/// Lower a node-map describing one triple (an `@reifies` value, or a
+/// triple-term value's `@id`) to a single `UnresolvedTriplePattern`.
 ///
 /// Reuses the regular `parse_node_map` machinery via a buffer, then
-/// asserts the result is exactly one triple. Multi-triple shapes and
-/// non-triple patterns (paths, value objects) are deferred to v2 with
-/// explicit error messages.
+/// asserts the result is exactly one triple. `what` names the form in
+/// errors.
 fn parse_reifies_edge(
     value: &JsonValue,
+    what: &str,
     ctx: &JsonLdParseCtx,
     subject_counter: &mut u32,
     nested_counter: &mut u32,
     object_var_parsing: bool,
 ) -> Result<UnresolvedTriplePattern> {
     let JsonValue::Object(rmap) = value else {
-        return Err(ParseError::InvalidWhere(
-            "@reifies must be a node-map describing the base triple".to_string(),
-        ));
+        return Err(ParseError::InvalidWhere(format!(
+            "{what} must be a node-map describing the base triple"
+        )));
     };
 
-    // Re-using a fresh UnresolvedQuery as a parsing buffer avoids
-    // duplicating node-map traversal. The result must lower to exactly
-    // one Triple; anything else is the deferred multi-triple-reifier
-    // shape.
     let mut buffer = UnresolvedQuery::new(ctx.context.clone());
     parse_node_map(
         rmap,
@@ -1301,7 +1336,7 @@ fn parse_reifies_edge(
 
     if buffer.patterns.len() != 1 {
         return Err(ParseError::InvalidWhere(format!(
-            "@reifies must describe exactly one base triple (got {} patterns); \
+            "{what} must describe exactly one base triple (got {} patterns); \
              multi-triple reifiers are deferred to v2",
             buffer.patterns.len()
         )));
@@ -1309,11 +1344,10 @@ fn parse_reifies_edge(
 
     match buffer.patterns.into_iter().next().unwrap() {
         UnresolvedPattern::Triple(tp) => Ok(tp),
-        _ => Err(ParseError::InvalidWhere(
-            "@reifies must describe a basic triple pattern; \
+        _ => Err(ParseError::InvalidWhere(format!(
+            "{what} must describe a basic triple pattern; \
              property paths, lists, and other shapes are deferred to v2"
-                .to_string(),
-        )),
+        ))),
     }
 }
 

@@ -234,7 +234,7 @@ SELECT ?person ?org WHERE {
 }
 ```
 
-The triple term `<<( s p o )>>` is accepted **only** as the object of `rdf:reifies`. The parenthesis-free `<< s p o ~ :r >>` is a reified triple: it stands for its reifier and does not assert `s p o` (a reifier-less `<< s p o >>` under `f:t` / `f:op` is the separate flake-metadata construct). Per-operation reifier rules (variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
+The triple term `<<( s p o )>>` names a reifier's triple as the object of `rdf:reifies`; under any other predicate it is an ordinary stored value (see [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values)). The parenthesis-free `<< s p o ~ :r >>` is a reified triple: it stands for its reifier and does not assert `s p o` (a reifier-less `<< s p o >>` under `f:t` / `f:op` is the separate flake-metadata construct). Per-operation reifier rules (variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
 
 ## Annotate an edge inside a named graph
 
@@ -315,7 +315,7 @@ The edge and every other claim on it stay live. The named claim's body (`ex:conf
 - **Deleting a claim with `DELETE DATA { … ~ :claim {| … |} }` deletes the edge**, so the annotation syntax stops matching every other claim on it. Retract one claim with the JSON-LD by-id form (see [above](#retract-one-claim-and-keep-the-edge)).
 - **Don't write `f:reifies*` predicates by hand.** They're reserved and rejected on every write surface; they're also hidden from `?p` scans and `select: "*"`. Use `@annotation` / the annotation tail. (See [Vocabulary](../reference/vocabulary.md#edge-annotation-predicates-reserved).)
 - **Empty `@annotation: {}`** is a no-op in RDF mode (no subject minted); in LPG mode it mints a property-less relationship with identity.
-- **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements, triple terms as object values, annotation output in Turtle/CONSTRUCT, and the SPARQL 1.2 triple-term functions (`TRIPLE`, `isTRIPLE`, …). See [Current limits](../concepts/edge-annotations.md#current-limits).
+- **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements and nested triple terms. See [Current limits](../concepts/edge-annotations.md#current-limits).
 
 ## See also
 

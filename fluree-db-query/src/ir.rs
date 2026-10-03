@@ -62,5 +62,5 @@ pub use projection::{
 };
 pub use query::{ConstructTemplate, Query, QueryOutput, Restriction, TemplateReification};
 pub use reasoning::{ReasoningConfig, ReasoningModes};
-pub use term_components::{lower_reified_link, Component, TermComponentsPattern};
+pub use term_components::{lower_reified_link, lower_term_value, Component, TermComponentsPattern};
 pub use triple::{Ref, Term, TriplePattern};

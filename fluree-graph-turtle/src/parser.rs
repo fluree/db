@@ -1025,7 +1025,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             | TokenKind::Double(_) => self.parse_literal(),
             TokenKind::KwTrue | TokenKind::KwFalse => self.parse_literal(),
             TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
-            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
+            TokenKind::TripleTermStart => self.parse_triple_term_value(),
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
                 format!("expected object, found {}", self.current().kind),
@@ -1294,11 +1294,27 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     fn triple_term_deferred_error(&self) -> TurtleError {
         TurtleError::parse(
             self.current().start as usize,
-            "RDF 1.2 triple terms as values ('<<( … )>>') are deferred in Turtle \
-             ingest except as the object of rdf:reifies; the supported forms are \
-             'r rdf:reifies <<( s p o )>>', reified triples '<< s p o >>' with \
-             optional '~ reifier', and annotation blocks '{| … |}'",
+            "a triple term ('<<( … )>>') is a value and cannot be a subject",
         )
+    }
+
+    /// `<<( ttSubject predicate ttObject )>>` as a value; the `<<(` token is
+    /// current.
+    fn parse_triple_term_value(&mut self) -> Result<TermId> {
+        if !self.sink.supports_triple_terms() {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                "triple terms ('<<( … )>>') as values are not supported on this ingest path",
+            ));
+        }
+        self.with_nesting(|p| {
+            p.expect(&TokenKind::TripleTermStart)?;
+            let subject = p.parse_tt_subject()?;
+            let predicate = p.parse_predicate()?;
+            let object = p.parse_tt_object()?;
+            p.expect(&TokenKind::TripleTermEnd)?;
+            Ok(p.sink.term_triple(subject, predicate, object)?)
+        })
     }
 
     /// `r rdf:reifies <<( s p o )>>` — the RDF 1.2 spelling every reifying
@@ -1371,7 +1387,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                     self.current().kind
                 ),
             )),
-            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
+            TokenKind::TripleTermStart => Err(TurtleError::parse(
+                self.current().start as usize,
+                "nested triple terms ('<<( … <<( … )>> )>>') are not supported",
+            )),
             _ => self.parse_object(),
         }
     }
@@ -1515,7 +1534,6 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                     self.current().kind
                 ),
             )),
-            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
             TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
             _ => self.parse_object(),
         }
@@ -2516,7 +2534,7 @@ mod tests {
             &mut sink,
         )
         .expect_err("nested triple term is a value with no representation");
-        assert!(err.to_string().contains("deferred"), "{err}");
+        assert!(err.to_string().contains("nested triple terms"), "{err}");
     }
 
     #[test]
@@ -2560,34 +2578,36 @@ mod tests {
     }
 
     #[test]
-    fn star_triple_term_under_other_predicate_still_deferred() {
-        // `<<( )>>` is only a value under rdf:reifies; `:q <<( … )>>` (the
-        // W3C data-0-tripleterms shape) keeps the deferred error.
-        let mut sink = StarSink::default();
-        let err = parse(&format!("{P}:a :q <<( :a :b :c )>> ."), &mut sink)
-            .expect_err("triple term under a non-reifies predicate");
-        assert!(err.to_string().contains("triple terms as values"), "{err}");
-    }
-
-    #[test]
-    fn star_triple_term_rejected_with_deferred_error() {
-        let mut sink = StarSink::default();
-        let err = parse(&format!("{P}:x1 :left <<( :a :b 123 )>> ."), &mut sink)
-            .expect_err("triple terms as values must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("triple terms as values"), "{msg}");
-        assert!(msg.contains("deferred"), "{msg}");
-    }
-
-    #[test]
-    fn star_triple_term_in_reified_triple_rejected() {
-        let mut sink = StarSink::default();
-        let err = parse(
-            &format!("{P}:f :g << :s :p <<(:x2 :y3 123 )>> >> ."),
+    fn triple_term_value_parses_as_an_object() {
+        // The W3C data-0-tripleterms shape: `<<( )>>` as an ordinary value,
+        // here and as a reified triple's object.
+        let mut sink = GraphCollectorSink::new();
+        parse(
+            &format!("{P}:a :q <<( :a :b :c )>> .\n:f :g << :s :p <<( :x :y 123 )>> >> ."),
             &mut sink,
         )
-        .expect_err("nested triple term must be rejected");
-        assert!(err.to_string().contains("triple terms as values"));
+        .expect("triple-term values parse");
+        let graph = sink.into_graph();
+        let iri_term = |suffix: &str| Term::iri(format!("http://example/{suffix}"));
+        let term = |s: &str, p: &str, o: Term| Term::triple(iri_term(s), iri_term(p), o);
+        assert!(graph
+            .triples()
+            .iter()
+            .any(|t| t.o == term("a", "b", iri_term("c"))));
+        let reified = &graph.reifications()[0].triple;
+        assert!(matches!(&reified.o, Term::TripleTerm(t) if t[0] == iri_term("x")));
+    }
+
+    #[test]
+    fn triple_term_value_needs_a_sink_that_holds_one() {
+        let mut sink = StarSink::default();
+        let err = parse(&format!("{P}:a :q <<( :a :b :c )>> ."), &mut sink)
+            .expect_err("this sink holds no triple terms");
+        assert!(
+            err.to_string()
+                .contains("not supported on this ingest path"),
+            "{err}"
+        );
     }
 
     #[test]

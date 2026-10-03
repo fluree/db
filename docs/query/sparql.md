@@ -1077,7 +1077,7 @@ SELECT ?ann ?role WHERE {
 }
 ```
 
-A triple term `<<( s p o )>>` is accepted **only** as the object of `rdf:reifies`. The bare (parenthesis-free) `<< s p o >>` form is a separate, Fluree-specific construct for `f:t` / `f:op` flake-metadata extraction (see [Time Travel](#history-queries) above) — the two do not compose.
+Under any other predicate a triple term is an ordinary value: `?d ex:mentions <<( ex:s ?p ?o )>>` matches stored terms by their components, and `INSERT DATA { ex:doc ex:mentions <<( ex:s ex:p ex:o )>> }` stores one without asserting or reifying its triple (see [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values)). The bare (parenthesis-free) `<< s p o >>` form is a separate, Fluree-specific construct for `f:t` / `f:op` flake-metadata extraction (see [Time Travel](#history-queries) above) — the two do not compose.
 
 ### Updating with annotations
 
@@ -1095,10 +1095,9 @@ Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } 
 ### Boundaries (rejected at parse / lowering time)
 
 - **Simple-predicate triples only.** `?s ex:p1/ex:p2 ?o {| ... |}` (property-path) is rejected.
-- **Triple terms only as `rdf:reifies` objects**; any other use errors at parse time.
+- **Triple terms in object position only**, not nested, and not as `VALUES` data.
 - **No reserved predicates by hand.** The [system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
 - **`CONSTRUCT` template annotation blocks take simple predicates only**, and a template triple term cannot nest.
-- **SPARQL 1.2 triple-term functions** (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` constructor) are deferred.
 
 ## SPARQL UPDATE
 

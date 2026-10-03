@@ -218,6 +218,15 @@ fn process_node<S: GraphSink>(
 fn process_value<S: GraphSink>(value: &Value, sink: &mut S) -> Result<ProcessedValue> {
     match value {
         Value::Object(obj) => {
+            if let Some(Value::Object(term)) = obj.get("@id") {
+                if obj.len() > 1 {
+                    return Err(AdapterError::InvalidStructure(
+                        "a triple term ({\"@id\": {...}}) is a value and cannot carry properties"
+                            .to_string(),
+                    ));
+                }
+                return Ok(ProcessedValue::Single(process_triple_term(term, sink)?));
+            }
             // Check for @id (reference to another node)
             if let Some(id_val) = obj.get("@id") {
                 // An embedded node object carrying more than a bare `@id`
@@ -282,6 +291,46 @@ fn process_value<S: GraphSink>(value: &Value, sink: &mut S) -> Result<ProcessedV
         )),
         _ => Ok(ProcessedValue::None),
     }
+}
+
+/// `{"@id": {"@id": s, p: o}}`: the triple term `<<( s p o )>>`.
+fn process_triple_term<S: GraphSink>(
+    term: &serde_json::Map<String, Value>,
+    sink: &mut S,
+) -> Result<TermId> {
+    let invalid = |msg: &str| AdapterError::InvalidStructure(format!("triple term: {msg}"));
+    if !sink.supports_triple_terms() {
+        return Err(invalid("this destination does not hold triple-term values"));
+    }
+    let subject = match term.get("@id").and_then(Value::as_str) {
+        Some(id) if id.starts_with("_:") => sink.term_blank(Some(strip_blank_prefix(id))),
+        Some(id) => sink.term_iri(id),
+        None => return Err(invalid("@id must name the subject")),
+    };
+    let mut pairs = term.iter().filter(|(k, _)| !k.starts_with('@'));
+    let (Some((predicate, values)), None) = (pairs.next(), pairs.next()) else {
+        return Err(invalid("it must describe exactly one triple"));
+    };
+    let value = match values {
+        Value::Array(items) if items.len() == 1 => &items[0],
+        Value::Array(_) => return Err(invalid("it must describe exactly one triple")),
+        value => value,
+    };
+    // A node with properties would assert them, and a term does not nest.
+    let reference_or_value = match value {
+        Value::Object(o) => {
+            o.contains_key("@value") || (o.len() == 1 && o.get("@id").is_some_and(Value::is_string))
+        }
+        _ => true,
+    };
+    if !reference_or_value {
+        return Err(invalid("its object must be a reference or a value"));
+    }
+    let ProcessedValue::Single(object) = process_value(value, sink)? else {
+        return Err(invalid("its object must be a reference or a value"));
+    };
+    let predicate = sink.term_iri(predicate);
+    Ok(sink.term_triple(subject, predicate, object)?)
 }
 
 /// Process a @list value and return the list items with indices

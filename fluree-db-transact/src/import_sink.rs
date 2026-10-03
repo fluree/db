@@ -40,7 +40,7 @@ mod inner {
     use fluree_db_indexer::run_index::global_dict::{DictWorkerCache, SharedDictAllocator};
     use fluree_db_indexer::run_index::shared_pool::{SharedNumBigPool, SharedVectorArenaPool};
     use fluree_db_indexer::run_index::spool::{SpoolFileInfo, SpoolWriter};
-    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
     use rustc_hash::FxHashMap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -587,6 +587,19 @@ mod inner {
             term: &fluree_db_core::TripleTermValue,
             t: i64,
         ) -> Result<(), CommitCodecError> {
+            self.write_term_record(ann, None, term, t)
+        }
+
+        /// Spool `s p <<( … )>>`: the term's components as a term-table
+        /// pseudo-record, and the statement with the term's ordinal as its
+        /// object. `p` is `rdf:reifies` when `None`.
+        fn write_term_record(
+            &mut self,
+            s: &Sid,
+            p: Option<&Sid>,
+            term: &fluree_db_core::TripleTermValue,
+            t: i64,
+        ) -> Result<(), CommitCodecError> {
             let s_id = self.assign_subject_id(&term.s);
             let p_id = self.assign_predicate_id(&term.p);
             let dt_id = self.assign_datatype_id(&term.dt)?;
@@ -626,9 +639,10 @@ mod inner {
                 i: LIST_INDEX_NONE,
             });
 
-            let link_p = match self.rdf_reifies_pid {
-                Some(p) => p,
-                None => {
+            let link_p = match (p, self.rdf_reifies_pid) {
+                (Some(p), _) => self.assign_predicate_id(p),
+                (None, Some(p)) => p,
+                (None, None) => {
                     let p = self.assign_predicate_id(fluree_db_core::rdf_reifies_sid());
                     self.rdf_reifies_pid = Some(p);
                     p
@@ -642,10 +656,10 @@ mod inner {
                     d
                 }
             };
-            let ann_id = self.assign_subject_id(ann);
+            let stmt_s_id = self.assign_subject_id(s);
             self.records.push(RunRecord {
                 g_id: self.g_id,
-                s_id: SubjectId::from_u64(ann_id),
+                s_id: SubjectId::from_u64(stmt_s_id),
                 p_id: link_p,
                 dt: link_dt,
                 o_kind: ObjKind::TRIPLE_TERM.as_u8(),
@@ -690,18 +704,19 @@ mod inner {
             result
         }
 
-        /// Spool an `rdf:reifies` link in an explicit named graph (`g_id`);
-        /// see [`Self::write_link_record`].
-        pub fn push_named_graph_link(
+        /// Spool `s p <<( … )>>` in an explicit named graph (`g_id`); see
+        /// [`Self::write_term_record`].
+        pub fn push_named_graph_term(
             &mut self,
             g_id: GraphId,
-            ann: &Sid,
+            s: &Sid,
+            p: Option<&Sid>,
             term: &fluree_db_core::TripleTermValue,
             t: i64,
         ) -> Result<(), CommitCodecError> {
             let saved = self.g_id;
             self.g_id = g_id;
-            let result = self.write_link_record(ann, term, t);
+            let result = self.write_term_record(s, p, term, t);
             self.g_id = saved;
             result
         }
@@ -967,7 +982,7 @@ mod inner {
             // Write spool record only after commit encoding succeeded
             if let Some(ctx) = &mut self.spool_ctx {
                 if let FlakeValue::TripleTerm(term) = &o {
-                    if let Err(e) = ctx.write_link_record(&s, term, self.t) {
+                    if let Err(e) = ctx.write_term_record(&s, Some(&p), term, self.t) {
                         self.encode_error.get_or_insert(e);
                     }
                     return;
@@ -1169,6 +1184,29 @@ mod inner {
 
         fn supports_reified_triples(&self) -> bool {
             true
+        }
+
+        fn supports_triple_terms(&self) -> bool {
+            true
+        }
+
+        fn term_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+        ) -> Result<TermId, SinkError> {
+            let term = crate::flake_sink::triple_term_value(
+                self.resolve_sid(subject),
+                self.resolve_sid(predicate),
+                self.resolve_object(object),
+            )?;
+            Ok(self.add_term(ResolvedTerm::Literal {
+                value: term,
+                dtc: DatatypeConstraint::Explicit(
+                    fluree_db_core::triple_term_datatype_sid().clone(),
+                ),
+            }))
         }
 
         /// The reified triple's link, written to the commit and the spool

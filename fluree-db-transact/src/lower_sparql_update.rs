@@ -1074,15 +1074,14 @@ fn lower_delete_where(
         &mut local_bnodes,
     )?;
 
-    // `GRAPH <iri> { ... }` blocks route through the same Modify machinery
-    // that DELETE/INSERT ... WHERE uses (staging-time SPARQL WHERE lowering +
-    // graph-scoped delete templates). The triple-only fast path below stays
-    // byte-identical for patterns without GRAPH blocks.
-    if expanded_pattern
-        .patterns
-        .iter()
-        .any(|el| matches!(el, QuadPatternElement::Graph { .. }))
-    {
+    // `GRAPH <iri> { ... }` blocks and triple-term objects route through the
+    // same Modify machinery that DELETE/INSERT ... WHERE uses (staging-time
+    // SPARQL WHERE lowering + graph-scoped delete templates). The triple-only
+    // fast path below stays byte-identical for patterns without either.
+    if expanded_pattern.patterns.iter().any(|el| match el {
+        QuadPatternElement::Graph { .. } => true,
+        QuadPatternElement::Triple(t) => matches!(t.object, Term::TripleTerm(_)),
+    }) {
         return lower_delete_where_with_graphs(&expanded_pattern, prologue, ns, vars, opts);
     }
 
@@ -1104,35 +1103,14 @@ fn lower_delete_where(
     for tp in triples {
         // WHERE side: lower to UnresolvedPattern::Triple with bnodes rewritten as vars
         let s = subject_to_unresolved_delete_where(&tp.subject, prologue, &mut bnode_vars)?;
-        match &tp.object {
-            Term::TripleTerm(tt) if is_rdf_reifies(&tp.predicate, prologue)? => {
-                let edge_s =
-                    subject_to_unresolved_delete_where(&tt.subject, prologue, &mut bnode_vars)?;
-                let edge_p = predicate_to_unresolved(&tt.predicate, prologue)?;
-                let edge_o =
-                    object_to_unresolved_delete_where(&tt.object, prologue, &mut bnode_vars)?;
-                where_patterns.push(UnresolvedPattern::AnnotationTarget {
-                    annotation: s,
-                    edge: UnresolvedTriplePattern {
-                        s: edge_s,
-                        p: edge_p,
-                        o: edge_o.term,
-                        dtc: edge_o.dtc,
-                    },
-                    body: Vec::new(),
-                });
-            }
-            object => {
-                let p = predicate_to_unresolved(&tp.predicate, prologue)?;
-                let obj = object_to_unresolved_delete_where(object, prologue, &mut bnode_vars)?;
-                where_patterns.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
-                    s,
-                    p,
-                    o: obj.term,
-                    dtc: obj.dtc,
-                }));
-            }
-        }
+        let p = predicate_to_unresolved(&tp.predicate, prologue)?;
+        let obj = object_to_unresolved_delete_where(&tp.object, prologue, &mut bnode_vars)?;
+        where_patterns.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+            s,
+            p,
+            o: obj.term,
+            dtc: obj.dtc,
+        }));
 
         // DELETE side: lower to TripleTemplate with the same bnode->var mapping
         delete_templates.push(lower_triple_to_delete_template_delete_where(
@@ -1192,7 +1170,7 @@ fn lower_delete_where_with_graphs(
         with_graph_iri: None,
         using_default_graph_iris: Vec::new(),
         using_named_graph_iris: Vec::new(),
-        pattern: quad_pattern_to_graph_pattern(&rewritten, prologue)?,
+        pattern: quad_pattern_to_graph_pattern(&rewritten),
     };
 
     let mut write_graphs = BTreeSet::new();
@@ -1306,10 +1284,7 @@ fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
 /// Runs of default-graph triples become one BGP; each `GRAPH <iri>|?g { ... }`
 /// block becomes a `GraphPattern::Graph` wrapping its own BGP. Source order is
 /// preserved so bindings join exactly as the user wrote them.
-fn quad_pattern_to_graph_pattern(
-    pattern: &QuadPattern,
-    prologue: &Prologue,
-) -> Result<GraphPattern, LowerError> {
+fn quad_pattern_to_graph_pattern(pattern: &QuadPattern) -> GraphPattern {
     let span = pattern.span;
     let mut parts: Vec<GraphPattern> = Vec::new();
     let mut bgp: Vec<TriplePattern> = Vec::new();
@@ -1322,63 +1297,21 @@ fn quad_pattern_to_graph_pattern(
                 triples,
                 span: g_span,
             } => {
-                parts.extend(triples_to_graph_patterns(
-                    std::mem::take(&mut bgp),
-                    prologue,
-                    span,
-                )?);
-                let inner = triples_to_graph_patterns(triples.clone(), prologue, *g_span)?;
-                parts.push(GraphPattern::Graph {
-                    name: name.clone(),
-                    pattern: Box::new(group(inner, *g_span)),
-                    span: *g_span,
-                });
-            }
-        }
-    }
-    parts.extend(triples_to_graph_patterns(bgp, prologue, span)?);
-    Ok(group(parts, span))
-}
-
-fn group(mut parts: Vec<GraphPattern>, span: SourceSpan) -> GraphPattern {
-    if parts.len() == 1 {
-        parts.pop().expect("len checked")
-    } else {
-        GraphPattern::Group {
-            patterns: parts,
-            span,
-        }
-    }
-}
-
-/// Triples as WHERE patterns: runs of ordinary triples as BGPs, and each
-/// `r rdf:reifies <<( s p o )>>` as the reifier pattern the query parser
-/// builds for it.
-fn triples_to_graph_patterns(
-    triples: Vec<TriplePattern>,
-    prologue: &Prologue,
-    span: SourceSpan,
-) -> Result<Vec<GraphPattern>, LowerError> {
-    let mut parts = Vec::new();
-    let mut bgp = Vec::new();
-    for tp in triples {
-        let reifies = is_rdf_reifies(&tp.predicate, prologue)?;
-        match tp.object {
-            Term::TripleTerm(triple_term) if reifies => {
                 if !bgp.is_empty() {
                     parts.push(GraphPattern::Bgp {
                         patterns: std::mem::take(&mut bgp),
                         span,
                     });
                 }
-                parts.push(GraphPattern::AnnotationTarget {
-                    reifier: tp.subject,
-                    predicate: tp.predicate,
-                    triple_term,
-                    span: tp.span,
+                parts.push(GraphPattern::Graph {
+                    name: name.clone(),
+                    pattern: Box::new(GraphPattern::Bgp {
+                        patterns: triples.clone(),
+                        span: *g_span,
+                    }),
+                    span: *g_span,
                 });
             }
-            object => bgp.push(TriplePattern { object, ..tp }),
         }
     }
     if !bgp.is_empty() {
@@ -1387,7 +1320,15 @@ fn triples_to_graph_patterns(
             span,
         });
     }
-    Ok(parts)
+
+    if parts.len() == 1 {
+        parts.pop().expect("len checked")
+    } else {
+        GraphPattern::Group {
+            patterns: parts,
+            span,
+        }
+    }
 }
 
 /// Lower Modify operation (DELETE/INSERT with WHERE).
@@ -1579,7 +1520,7 @@ fn lower_triple_to_template(
             let result = literal_to_template(lit, prologue, ns)?;
             (result.term, result.dtc)
         }
-        Term::TripleTerm(tt) if is_rdf_reifies(&triple.predicate, prologue)? => {
+        Term::TripleTerm(tt) => {
             let s = subject_to_template(&tt.subject, prologue, ns, vars, bnodes)?;
             let p = predicate_to_template(&tt.predicate, prologue, ns, vars)?;
             let (o, dtc) = match &tt.object {
@@ -1603,14 +1544,6 @@ fn lower_triple_to_template(
         list_index: None, // Always None for SPARQL UPDATE
         graph: TemplateGraph::Default,
         graph_from_template_default: false,
-    })
-}
-
-/// True when `p` is `rdf:reifies`, whose object is a triple term.
-fn is_rdf_reifies(p: &PredicateTerm, prologue: &Prologue) -> Result<bool, LowerError> {
-    Ok(match p {
-        PredicateTerm::Iri(iri) => expand_iri(iri, prologue)? == fluree_vocab::rdf::REIFIES,
-        PredicateTerm::Var(_) => false,
     })
 }
 
@@ -1641,7 +1574,7 @@ fn subject_to_unresolved_delete_where(
             span: qt.span,
         }),
         SubjectTerm::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
-            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            feature: "a triple term (`<<( s p o )>>`) as a subject",
             span: tt.span,
         }),
     }
@@ -1694,7 +1627,7 @@ fn object_to_unresolved_delete_where(
             span: qt.span,
         }),
         Term::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
-            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            feature: "a triple term nested in a triple term",
             span: tt.span,
         }),
     }
@@ -1710,7 +1643,7 @@ fn lower_triple_to_delete_template_delete_where(
     let subject = delete_where_subject_template(&triple.subject, prologue, ns, vars, bnodes)?;
     let predicate = delete_where_predicate_template(&triple.predicate, prologue, ns, vars)?;
     let (object, dtc) = match &triple.object {
-        Term::TripleTerm(tt) if is_rdf_reifies(&triple.predicate, prologue)? => {
+        Term::TripleTerm(tt) => {
             let s = delete_where_subject_template(&tt.subject, prologue, ns, vars, bnodes)?;
             let p = delete_where_predicate_template(&tt.predicate, prologue, ns, vars)?;
             let (o, dtc) = delete_where_object_template(&tt.object, prologue, ns, vars, bnodes)?;
@@ -1768,8 +1701,7 @@ fn delete_where_subject_template(
         }
         SubjectTerm::TripleTerm(tt) => {
             return Err(LowerError::UnsupportedFeature {
-                feature:
-                    "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+                feature: "a triple term (`<<( s p o )>>`) as a subject",
                 span: tt.span,
             });
         }
@@ -1833,8 +1765,7 @@ fn delete_where_object_template(
         }
         Term::TripleTerm(tt) => {
             return Err(LowerError::UnsupportedFeature {
-                feature:
-                    "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+                feature: "a triple term nested in a triple term",
                 span: tt.span,
             });
         }
@@ -1952,7 +1883,7 @@ fn subject_to_template(
             span: qt.span,
         }),
         SubjectTerm::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
-            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            feature: "a triple term (`<<( s p o )>>`) as a subject",
             span: tt.span,
         }),
     }
@@ -2018,7 +1949,7 @@ fn object_to_template(
             span: qt.span,
         }),
         Term::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
-            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            feature: "a triple term nested in a triple term",
             span: tt.span,
         }),
     }

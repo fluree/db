@@ -650,7 +650,9 @@ mod inner {
 
                     // Spool the named-graph flake under its g_id (so it enters
                     // the index), then encode it into the commit blob.
-                    if let Some(sc) = spool_ctx.as_mut() {
+                    if let (Some(sc), FlakeValue::TripleTerm(term)) = (spool_ctx.as_mut(), &o) {
+                        sc.push_named_graph_term(g_id, &s, Some(&p), term, new_t)?;
+                    } else if let Some(sc) = spool_ctx.as_mut() {
                         sc.push_named_graph_record(
                             g_id,
                             crate::import_sink::FlakeRecord {
@@ -710,7 +712,7 @@ mod inner {
                     new_t,
                 )?;
                 if let (Some(sc), FlakeValue::TripleTerm(term)) = (spool_ctx.as_mut(), &link.o) {
-                    sc.push_named_graph_link(g_id, &ann, term, new_t)?;
+                    sc.push_named_graph_term(g_id, &ann, None, term, new_t)?;
                 }
                 writer.push_flake(&link).map_err(|e| {
                     TransactError::Parse(format!("failed to encode link flake: {e}"))
@@ -908,6 +910,26 @@ mod inner {
                 let (fv, dt) =
                     convert_string_literal(value, datatype, &mut NsAllocator::Cached(ns));
                 Ok((fv, dt, None))
+            }
+            RawObject::TripleTerm {
+                subject,
+                predicate,
+                object,
+            } => {
+                let s = expand_term(subject, prefixes, ns, skolem_base)?;
+                let p = expand_term(predicate, prefixes, ns, skolem_base)?;
+                let (o, dt, lang) = expand_object(object, prefixes, ns, skolem_base)?;
+                let dtc = match lang {
+                    Some(lang) => fluree_db_core::DatatypeConstraint::LangTag(Arc::from(lang)),
+                    None => fluree_db_core::DatatypeConstraint::Explicit(dt),
+                };
+                let term = crate::flake_sink::triple_term_value(Some(s), Some(p), Some((o, dtc)))
+                    .map_err(|e| TransactError::Parse(e.to_string()))?;
+                Ok((
+                    term,
+                    fluree_db_core::triple_term_datatype_sid().clone(),
+                    None,
+                ))
             }
         }
     }

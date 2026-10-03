@@ -301,6 +301,32 @@ pub trait GraphSink {
         false
     }
 
+    /// Whether this sink accepts triple-term values (`<<( s p o )>>` as an
+    /// object). Parsers MUST check this before calling
+    /// [`Self::term_triple`]; defaults to `false`.
+    fn supports_triple_terms(&self) -> bool {
+        false
+    }
+
+    /// The triple-term value `<<( subject predicate object )>>`, valid for
+    /// the current statement like a literal. Only called when
+    /// [`Self::supports_triple_terms`] returns `true`; the default refuses.
+    fn term_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> std::result::Result<TermId, SinkError> {
+        let _ = (subject, predicate, object);
+        debug_assert!(
+            self.supports_triple_terms(),
+            "term_triple called on a sink that does not support triple terms"
+        );
+        Err(SinkError::rejected(
+            "this sink cannot represent triple terms",
+        ))
+    }
+
     /// Emit an RDF 1.2 reified-triple event: `reifier` reifies the base
     /// triple `(subject, predicate, object)`.
     ///
@@ -449,7 +475,10 @@ impl GraphCollectorSink {
         if cfg!(debug_assertions) {
             for &slot in &self.literal_slots[..self.literal_cursor] {
                 debug_assert!(
-                    matches!(self.terms[slot as usize], Term::Literal { .. }),
+                    matches!(
+                        self.terms[slot as usize],
+                        Term::Literal { .. } | Term::TripleTerm(_)
+                    ),
                     "retiring non-literal slot {slot}: {:?} — literal_slots is polluted, \
                      recycling it would clobber a producer-cached term id",
                     self.terms[slot as usize]
@@ -546,6 +575,24 @@ impl GraphSink for GraphCollectorSink {
             language: None,
         };
         self.add_literal_term(term)
+    }
+
+    fn supports_triple_terms(&self) -> bool {
+        true
+    }
+
+    fn term_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> std::result::Result<TermId, SinkError> {
+        let term = Term::triple(
+            self.get_term(subject).clone(),
+            self.get_term(predicate).clone(),
+            self.get_term(object).clone(),
+        );
+        Ok(self.add_literal_term(term))
     }
 
     /// Retire this statement's literal slots for reuse, and move the rewind

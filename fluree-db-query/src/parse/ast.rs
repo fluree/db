@@ -1164,6 +1164,13 @@ pub enum UnresolvedPattern {
         /// non-`@`-keyword properties of the enclosing node).
         body: Vec<UnresolvedPattern>,
     },
+
+    /// `subject predicate <<( s p o )>>`: a triple term as a value.
+    TripleTermValue {
+        subject: UnresolvedTerm,
+        predicate: UnresolvedTerm,
+        term: UnresolvedTriplePattern,
+    },
 }
 
 impl UnresolvedPattern {
@@ -1331,7 +1338,8 @@ impl UnresolvedQuery {
                     | UnresolvedPattern::Path { .. }
                     | UnresolvedPattern::Subquery(_)
                     | UnresolvedPattern::IndexSearch(_)
-                    | UnresolvedPattern::VectorSearch(_) => {}
+                    | UnresolvedPattern::VectorSearch(_)
+                    | UnresolvedPattern::TripleTermValue { .. } => {}
                 }
             }
         }

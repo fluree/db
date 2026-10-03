@@ -483,7 +483,7 @@ ex:emp1 rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
 Two rules to know:
 
 - **Only the annotation syntax asserts the triple.** As RDF 1.2 defines them, `s p o ~ r` and `s p o {| … |}` put `s p o` in the graph and attach the reifier to it, while `<< s p o >>` and `r rdf:reifies <<( s p o )>>` attach the reifier without asserting `s p o`. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
-- **`<<( ... )>>` is accepted only as the object of `rdf:reifies`.** As a plain value (`ex:doc ex:mentions <<( ... )>>`), nested inside another triple term, or inside an annotation body, it is rejected with a specific "deferred" error rather than silently dropped.
+- **`<<( ... )>>` is a value.** Under `rdf:reifies` it is a reifier's triple; under any other predicate (`ex:doc ex:mentions <<( ... )>>`) it is stored as a value, without asserting or reifying its triple (see [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values)). As a subject, nested inside another triple term, or inside an annotation body, it is rejected with a specific error rather than silently dropped.
 
 TriG and N-Quads accept the same forms inside `GRAPH { }` blocks (and on N-Quads statements with a graph label). The annotation is written into that graph and carries the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does:
 

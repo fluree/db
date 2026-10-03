@@ -562,7 +562,7 @@ fn term_to_subject_key(
     match term {
         Term::Iri(iri) => Ok(config.compact_id_iri(iri)),
         Term::BlankNode(id) => Ok(bnode_renamer.rename(id)),
-        Term::Literal { .. } => Err(LiteralAsNode),
+        Term::Literal { .. } | Term::TripleTerm(_) => Err(LiteralAsNode),
     }
 }
 
@@ -584,6 +584,20 @@ fn term_to_object(
             datatype,
             language,
         } => format_literal(value, datatype, language.as_deref()),
+        // A JSON-LD-star embedded node, as query results write a term.
+        Term::TripleTerm(t) => {
+            let mut node = Map::new();
+            if let Ok(s) = term_to_subject_key(&t[0], config, bnode_renamer) {
+                node.insert("@id".to_string(), JsonValue::String(s));
+            }
+            if let Term::Iri(p) = &t[1] {
+                node.insert(
+                    config.compact_vocab_iri(p),
+                    term_to_object(&t[2], config, bnode_renamer),
+                );
+            }
+            json!({ "@id": node })
+        }
     }
 }
 
@@ -661,7 +675,7 @@ fn add_type_value(
     let type_iri = match object {
         Term::Iri(iri) => config.compact_vocab_iri(iri),
         Term::BlankNode(id) => bnode_renamer.rename(id),
-        Term::Literal { .. } => return, // Types should be IRIs
+        Term::Literal { .. } | Term::TripleTerm(_) => return, // Types should be IRIs
     };
 
     match node.get_mut("@type") {

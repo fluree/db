@@ -93,6 +93,26 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 other => self.lower_subject(other)?,
             };
             let p = self.lower_predicate(&tp.predicate)?;
+            // A triple-term value: the triple and the term's components.
+            if let SparqlTerm::TripleTerm(tt) = &tp.object {
+                if tp.annotation.is_some() {
+                    return Err(LowerError::not_implemented(
+                        "an annotation on a triple whose object is a triple term \
+                         (a nested triple term)",
+                        tt.span,
+                    ));
+                }
+                let term = self.lower_triple_term(tt, &mut result)?;
+                fluree_db_query::ir::lower_term_value(
+                    s,
+                    p,
+                    term,
+                    self.encoder,
+                    self.vars,
+                    &mut result,
+                );
+                continue;
+            }
             // Full constraint-preserving object lowering on the annotation
             // path (see `lower_object_with_constraint`); plain triples keep
             // only language-tag / explicit-datatype constraints (see

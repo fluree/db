@@ -90,6 +90,27 @@ pub fn lower_reified_link<E: IriEncoder + ?Sized>(
     );
 }
 
+/// Lower `subject predicate <<( s p o )>>`, a triple-term value under any
+/// predicate: the triple with a term variable (or a composed constant term)
+/// and the term's components, as [`lower_reified_link`] lowers a link.
+pub fn lower_term_value<E: IriEncoder + ?Sized>(
+    subject: Ref,
+    predicate: Ref,
+    term: TriplePattern,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut Vec<Pattern>,
+) {
+    link_patterns(
+        subject,
+        term,
+        predicate,
+        || fresh_term_var(vars),
+        &|iri| encoder.encode_iri(iri),
+        out,
+    );
+}
+
 /// The patterns of [`lower_reified_link`], given the `rdf:reifies` ref, the
 /// term variable (asked for only when the edge is not constant), and how to
 /// encode an IRI.

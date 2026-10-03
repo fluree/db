@@ -374,9 +374,19 @@ Inline `@annotation` queries return one row per occurrence.
 }
 ```
 
+**Triple terms as values:** a value whose `@id` is the node of one triple stores that triple term, without asserting or reifying the triple (see [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values)):
+
+```json
+{
+  "@id": "ex:doc",
+  "ex:mentions": { "@id": { "@id": "ex:alice", "ex:knows": { "@id": "ex:bob" } } }
+}
+```
+
 **Deferred shapes** error with explicit messages:
 
 - Annotations on list-occurrence triples (`@list` membership).
+- Nested triple terms (a triple term's object that is itself `{"@id": {...}}`).
 - More than one predicate-object pair in one `@reifies` block (use an array of blocks to
   reify several triples).
 - Annotation-of-annotation (nested `@annotation` inside an annotation body).

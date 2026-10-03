@@ -25,6 +25,7 @@ Fluree implements the W3C RDF 1.1 specification:
 Fluree implements the RDF 1.2 reification model used for edge annotations:
 - `rdf:reifies` with triple terms (`<<( s p o )>>`) as the reified object
 - Reifiers identified by IRI, blank node, or variable
+- Triple terms as values under any predicate, on every write surface
 
 Fluree also exposes a non-standard extension that reads commit metadata off a
 quoted triple (`<< s p o >> f:t ?t`, `f:op ?op`) for transaction-time and
@@ -42,10 +43,7 @@ The vendored W3C RDF 1.1 and RDF 1.2 Turtle suites run in CI
 (`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the skip register.
 
 Not yet supported:
-- Triple terms as arbitrary object values: `<<( ... )>>` is accepted on
-  ingest only as the object of `rdf:reifies`
-- Triple terms in subject position and nested triple terms
-- Multiple triples reified by a single annotation
+- Nested triple terms (`<<( s p <<( ... )>> )>>`)
 
 See [Edge annotations](../concepts/edge-annotations.md).
 
@@ -192,13 +190,14 @@ Supported query and update annotation syntax:
 - Annotations in `CONSTRUCT` templates (`~ ?r`, `{| ... |}`, and `?r rdf:reifies <<( s p o )>>`),
   written by every result format
 
+Also supported: triple terms as values in patterns, `INSERT DATA` / `DELETE DATA` /
+`DELETE WHERE` and templates, and the triple-term functions `TRIPLE()`, `SUBJECT()`,
+`PREDICATE()`, `OBJECT()` and `isTRIPLE()`.
+
 Not yet supported:
-- Triple-term accessor functions: `TRIPLE()`, `SUBJECT()`, `PREDICATE()`,
-  `OBJECT()`, `isTRIPLE()`
-- Triple terms as arbitrary values (a `CONSTRUCT` template accepts one only as the object of
-  `rdf:reifies`) or in subject position; multi-triple and nested annotations
-- Named-graph edge annotations in SPARQL UPDATE (default graph only)
-- W3C SPARQL 1.2 test-suite execution (manifests present but not yet run)
+- Nested triple terms, and triple-term constants in `VALUES` data or (other than the object
+  of `rdf:reifies`) in a `CONSTRUCT` template
+- Nested annotations (annotation-of-annotation)
 
 **Specification:** https://www.w3.org/TR/sparql12-query/
 
@@ -485,7 +484,7 @@ Export Fluree data to:
 - SPARQL 1.1 Federation: remote `SERVICE` endpoints (local-ledger `SERVICE` is supported)
 - Remote `LOAD` in SPARQL UPDATE
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
-- RDF 1.2 / SPARQL 1.2: triple terms as values and the triple-term accessor functions; the RDF 1.2 Turtle evaluation suite (blocked on triple terms)
+- RDF 1.2 / SPARQL 1.2: nested triple terms
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)

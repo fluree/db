@@ -353,7 +353,7 @@ All formats use the same representation:
 
 ### Triple Terms
 
-A triple term (an `rdf:reifies` object, or the result of `TRIPLE(...)`) is written in SPARQL
+A triple term (a stored value, an `rdf:reifies` object, or the result of `TRIPLE(...)`) is written in SPARQL
 JSON as a `triple` term
 ([SPARQL 1.2 Query Results JSON Format](https://www.w3.org/TR/sparql12-results-json/)):
 
@@ -372,7 +372,10 @@ node, the form of the JSON-LD-star community group report:
 {"@id": {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}}}
 ```
 
-TSV and CSV write `<<( s p o )>>`.
+TSV and CSV write `<<( s p o )>>`. In a CONSTRUCT result, Turtle, TriG, N-Triples and N-Quads
+write `<<( s p o )>>` and JSON-LD the embedded node; RDF/XML has no syntax for a triple term and
+refuses such a result. JSON-LD writes take the same embedded node as a value (see
+[Edge annotations](../concepts/edge-annotations.md#triple-terms-as-values)).
 
 ## Rust API
 

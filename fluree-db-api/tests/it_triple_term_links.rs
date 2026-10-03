@@ -2096,8 +2096,8 @@ async fn triple_terms_render_in_every_result_format() {
 
 /// `?r rdf:reifies ?t` in a CONSTRUCT template, with a triple term bound to
 /// ?t, writes what the explicit `<<( s p o )>>` template writes: the
-/// reification, without asserting its triple. Under any other predicate the term (which the graph model cannot hold as an object)
-/// is written as its N-Triples text.
+/// reification, without asserting its triple. Under any other predicate it
+/// is written as a triple-term value.
 #[tokio::test]
 async fn construct_writes_triple_terms_as_reifications() {
     const REIFIES: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
@@ -2185,7 +2185,7 @@ async fn construct_writes_triple_terms_as_reifications() {
     let nt = render(&about, FormatterConfig::ntriples());
     assert!(
         nt.contains(
-            r#" <http://example.org/about> "<<( <http://example.org/doc> <http://example.org/title> \"chat\"@fr )>>"^^"#
+            r#" <http://example.org/about> <<( <http://example.org/doc> <http://example.org/title> "chat"@fr )>> ."#
         ),
         "{nt}"
     );
@@ -2545,4 +2545,311 @@ async fn links_written_into_commits_read_back() {
         strings(&[&["ex:claim1", "ex:bob"], &["ex:claim2", "ex:carol"]]),
         "incremental"
     );
+}
+
+/// `ex:doc ex:mentions <<( ex:s ex:p ex:o )>>` and
+/// `ex:doc ex:quotes <<( ex:s ex:says "chat"@fr )>>`, as Turtle.
+const TERM_VALUES: &str = "@prefix ex: <http://example.org/> .\n\
+     ex:doc ex:mentions <<( ex:s ex:p ex:o )>> .\n\
+     ex:doc ex:quotes <<( ex:s ex:says \"chat\"@fr )>> .\n";
+
+fn term_values_jsonld() -> JsonValue {
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:doc",
+        "ex:mentions": {"@id": {"@id": "ex:s", "ex:p": {"@id": "ex:o"}}},
+        "ex:quotes": {"@id": {"@id": "ex:s", "ex:says": {"@value": "chat", "@language": "fr"}}}
+    })
+}
+
+/// [`TERM_VALUES`] reads back from `ledger`, with `docs` subjects
+/// mentioning the first term, through SPARQL and JSON-LD.
+async fn assert_term_values(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+    label: &str,
+    docs: usize,
+) {
+    let run = |q: &str| run_link_query(fluree, ledger, q.to_string());
+    let got = run("SELECT ?s ?p ?o WHERE { ex:doc ex:mentions ?t \
+         BIND(SUBJECT(?t) AS ?s) BIND(PREDICATE(?t) AS ?p) BIND(OBJECT(?t) AS ?o) }")
+    .await;
+    assert_eq!(got, strings(&[&["ex:s", "ex:p", "ex:o"]]), "[{label}]");
+    let got = run(
+        "SELECT ?o WHERE { ex:doc ex:quotes ?t BIND(OBJECT(?t) AS ?o) \
+         FILTER(LANG(?o) = \"fr\") }",
+    )
+    .await;
+    assert_eq!(got.len(), 1, "[{label}] the term keeps its tag: {got:?}");
+    let got = run("SELECT ?d WHERE { ?d ex:mentions <<( ex:s ex:p ex:o )>> }").await;
+    assert_eq!(
+        got.len(),
+        docs,
+        "[{label}] a constant term matches: {got:?}"
+    );
+    let got = run("SELECT ?d WHERE { BIND(<<( ex:s ex:p ex:o )>> AS ?t) ?d ex:mentions ?t }").await;
+    assert_eq!(got.len(), docs, "[{label}] a built term joins: {got:?}");
+    let got = run("SELECT ?r WHERE { ?r rdf:reifies ?t }").await;
+    assert!(got.is_empty(), "[{label}] a value is not a link: {got:?}");
+
+    let jsonld = |term: JsonValue| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?d", "?o"],
+            "where": {"@id": "?d", "ex:mentions": {"@id": term}}
+        })
+    };
+    let got = support::query_jsonld_formatted(
+        fluree,
+        ledger,
+        &jsonld(json!({"@id": "ex:s", "ex:p": "?o"})),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{label}] JSON-LD triple-term pattern: {e}"));
+    assert_eq!(
+        got.as_array().map(Vec::len),
+        Some(docs),
+        "[{label}] JSON-LD matches the term by its components: {got}"
+    );
+    let got = support::query_jsonld_formatted(
+        fluree,
+        ledger,
+        &jsonld(json!({"@id": "ex:s", "ex:p": {"@id": "ex:other"}})),
+    )
+    .await
+    .expect("JSON-LD constant term");
+    assert_eq!(got, json!([]), "[{label}] another term does not match");
+}
+
+/// A triple term is a value under any predicate, not only as a link's
+/// object: it reads back, decomposes and matches as a constant from novelty,
+/// a full rebuild and an incremental build, and is never read as a link.
+#[tokio::test]
+async fn triple_terms_are_values_under_any_predicate() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/triple-term-links:values";
+    let ledger = fluree
+        .insert_turtle(support::genesis_ledger(&fluree, ledger_id), TERM_VALUES)
+        .await
+        .expect("insert triple-term values")
+        .ledger;
+    assert_term_values(&fluree, &ledger, "novelty", 1).await;
+    let constructed = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         CONSTRUCT { ?d ex:mentions ?t } WHERE { ?d ex:mentions ?t }",
+    )
+    .await
+    .expect("CONSTRUCT a term value")
+    .to_construct(&ledger.snapshot)
+    .expect("format");
+    let mentions = constructed.to_string();
+    assert!(
+        mentions.contains(r#""@id":{"@id":"ex:s","ex:p":{"@id":"ex:o"}}"#),
+        "CONSTRUCT writes the term, not its text: {mentions}"
+    );
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert_term_values(&fluree, &ledger, "rebuild", 1).await;
+
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> .\n\
+             ex:doc2 ex:mentions <<( ex:s ex:p ex:o )>> .\n\
+             ex:doc2 ex:cites <<( ex:s ex:fresh ex:o )>> .",
+        )
+        .await
+        .expect("insert over an index")
+        .ledger;
+    assert_term_values(&fluree, &ledger, "novelty over an index", 2).await;
+
+    // Indexed rows and novelty rows export as terms and re-import, including
+    // a term whose predicate the index has never seen.
+    for (format, file) in [
+        (fluree_db_api::export::ExportFormat::Turtle, "values.ttl"),
+        (fluree_db_api::export::ExportFormat::JsonLd, "values.jsonld"),
+    ] {
+        let mut buf = Vec::new();
+        fluree
+            .export(ledger_id)
+            .format(format)
+            .write_to(&mut buf)
+            .await
+            .unwrap_or_else(|e| panic!("export {file}: {e}"));
+        let exported = String::from_utf8(buf).expect("utf8");
+        let (reimported, ledger) = import(
+            &[(file, &exported)],
+            &format!("it/triple-term-links:{file}"),
+        )
+        .await;
+        assert_term_values(&reimported, &ledger, file, 2).await;
+        let cited = run_link_query(
+            &reimported,
+            &ledger,
+            "SELECT ?p WHERE { ex:doc2 ex:cites ?t BIND(PREDICATE(?t) AS ?p) }".to_string(),
+        )
+        .await;
+        assert_eq!(cited, strings(&[&["ex:fresh"]]), "[{file}] {exported}");
+    }
+
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert_term_values(&fluree, &ledger, "incremental", 2).await;
+}
+
+/// Every write surface takes a triple-term value, and the delete forms
+/// remove one.
+#[tokio::test]
+async fn every_write_path_takes_triple_term_values() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let fresh = |id: &str| support::genesis_ledger(&fluree, id);
+
+    let ledger = fluree
+        .insert(fresh("it/tt-values:jsonld"), &term_values_jsonld())
+        .await
+        .expect("JSON-LD insert")
+        .ledger;
+    assert_term_values(&fluree, &ledger, "JSON-LD insert", 1).await;
+
+    let ledger = fluree
+        .upsert_turtle(fresh("it/tt-values:upsert"), TERM_VALUES)
+        .await
+        .expect("Turtle upsert")
+        .ledger;
+    assert_term_values(&fluree, &ledger, "Turtle upsert", 1).await;
+
+    let ledger_id = "it/tt-values:sparql";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let update = |body: &str| {
+        let body = format!("PREFIX ex: <http://example.org/>\n{body}");
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph(ledger_id)
+                .transact()
+                .sparql_update(&body)
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{body}: {e}"));
+            fluree.ledger(ledger_id).await.expect("load")
+        }
+    };
+    let ledger = update(
+        "INSERT DATA { ex:doc ex:mentions <<( ex:s ex:p ex:o )>> ; \
+         ex:quotes <<( ex:s ex:says \"chat\"@fr )>> }",
+    )
+    .await;
+    assert_term_values(&fluree, &ledger, "SPARQL INSERT DATA", 1).await;
+    let mentions = |ledger: LedgerState| {
+        let fluree = &fluree;
+        async move {
+            run_link_query(
+                fluree,
+                &ledger,
+                "SELECT ?p ?t WHERE { ex:doc ?p ?t }".to_string(),
+            )
+            .await
+            .len()
+        }
+    };
+    let ledger = update("DELETE DATA { ex:doc ex:mentions <<( ex:s ex:p ex:o )>> }").await;
+    assert_eq!(mentions(ledger).await, 1, "DELETE DATA removes the value");
+    let ledger = update("DELETE WHERE { ?d ex:quotes <<( ex:s ex:says ?o )>> }").await;
+    assert_eq!(
+        mentions(ledger).await,
+        0,
+        "DELETE WHERE matches it by components"
+    );
+
+    let ledger = fluree
+        .update(
+            fluree.ledger("it/tt-values:jsonld").await.expect("load"),
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "delete": {"@id": "ex:doc", "ex:mentions": {"@id": {"@id": "ex:s", "ex:p": {"@id": "ex:o"}}}}
+            }),
+        )
+        .await
+        .expect("JSON-LD delete")
+        .ledger;
+    assert_eq!(
+        mentions(ledger).await,
+        1,
+        "a JSON-LD delete removes the value"
+    );
+
+    let (imported, ledger) =
+        import(&[("values.ttl", TERM_VALUES)], "it/tt-values:import-ttl").await;
+    assert_term_values(&imported, &ledger, "Turtle import", 1).await;
+    let (imported, ledger) = import(
+        &[("values.jsonld", &term_values_jsonld().to_string())],
+        "it/tt-values:import-jsonld",
+    )
+    .await;
+    assert_term_values(&imported, &ledger, "JSON-LD import", 1).await;
+
+    // Graph sync stores them, and a re-sync of the same text finds no delta.
+    let ledger_id = "it/tt-values:sync";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let sync = || {
+        fluree.sync_named_graph_rdf_with(
+            ledger_id,
+            "http://example.org/g",
+            TERM_VALUES,
+            fluree_db_api::SyncGraphOpts::default(),
+            fluree_db_api::TxnOpts::default(),
+            None,
+        )
+    };
+    let first = sync().await.expect("sync");
+    assert_eq!(first.asserted, 2, "{first:?}");
+    let again = sync().await.expect("re-sync");
+    assert!(
+        !again.committed,
+        "an unchanged graph has no delta: {again:?}"
+    );
+    let synced = run_link_query(
+        &fluree,
+        &fluree.ledger(ledger_id).await.expect("load"),
+        "SELECT ?o WHERE { GRAPH ex:g { ex:doc ex:mentions ?t } BIND(OBJECT(?t) AS ?o) }"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(synced, strings(&[&["ex:o"]]), "graph sync");
+
+    // N-Quads and TriG, in the default graph and a named one.
+    let nquads = "<http://example.org/doc> <http://example.org/mentions> \
+                  <<( <http://example.org/s> <http://example.org/p> <http://example.org/o> )>> .\n\
+                  <http://example.org/doc> <http://example.org/quotes> \
+                  <<( <http://example.org/s> <http://example.org/says> \"chat\"@fr )>> .\n\
+                  <http://example.org/doc> <http://example.org/mentions> \
+                  <<( <http://example.org/s> <http://example.org/p> <http://example.org/o> )>> \
+                  <http://example.org/g> .\n";
+    let (imported, ledger) = import(&[("values.nq", nquads)], "it/tt-values:import-nq").await;
+    assert_term_values(&imported, &ledger, "N-Quads import", 1).await;
+    let trig = format!("{TERM_VALUES}ex:g {{ ex:doc ex:mentions <<( ex:s ex:p ex:o )>> . }}\n");
+    let (imported, imported_ledger) =
+        import(&[("values.trig", &trig)], "it/tt-values:import-trig").await;
+    assert_term_values(&imported, &imported_ledger, "TriG import", 1).await;
+    let inserted = fluree
+        .insert_turtle(fresh("it/tt-values:trig-insert"), &trig)
+        .await
+        .expect("TriG insert")
+        .ledger;
+    assert_term_values(&fluree, &inserted, "TriG insert", 1).await;
+    for (fluree, ledger, label) in [
+        (&imported, &imported_ledger, "TriG import"),
+        (&fluree, &inserted, "TriG insert"),
+    ] {
+        let named = run_link_query(
+            fluree,
+            ledger,
+            "SELECT ?o WHERE { GRAPH ex:g { ex:doc ex:mentions ?t } BIND(OBJECT(?t) AS ?o) }"
+                .to_string(),
+        )
+        .await;
+        assert_eq!(named, strings(&[&["ex:o"]]), "[{label}] in the named graph");
+    }
 }

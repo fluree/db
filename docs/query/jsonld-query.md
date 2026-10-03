@@ -1104,7 +1104,7 @@ Edge annotations attach metadata to a specific `(subject, predicate, object)` ed
 - **Inline form** with `@annotation` — match an edge and pull metadata about it.
 - **Annotation-rooted form** with `@reifies` — match metadata first, find the edges it reifies.
 
-`@edge` is an alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc. Note `@reifies` is a **query-side** construct only — user-authored `@reifies` on an insert/update is rejected; write with `@annotation` instead.
+`@edge` is an alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc.
 
 **Inline form (`@annotation`):**
 
@@ -1154,7 +1154,22 @@ Filter by annotation metadata first, then surface the reified edge.
 }
 ```
 
-The base edge identified by `@reifies` is also matched as an ordinary triple, so the visibility check is automatic — if the edge is currently retracted or hidden by policy, the row drops.
+As in RDF 1.2, `@reifies` matches the reifier's link only, so it also finds reifiers of triples that are not asserted. To require the edge, add it as an ordinary pattern, or query with `@annotation`.
+
+**Triple terms as values:** a value whose `@id` is a node describing one triple matches a stored triple term, by its components when they are variables:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?doc", "?o"],
+  "where": {
+    "@id": "?doc",
+    "ex:mentions": { "@id": { "@id": "ex:alice", "ex:knows": "?o" } }
+  }
+}
+```
+
+See [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values).
 
 **Subject expansion output:**
 

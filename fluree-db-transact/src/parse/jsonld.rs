@@ -14,7 +14,8 @@
 use super::txn_meta::extract_txn_meta;
 use crate::error::{Result, TransactError};
 use crate::ir::{
-    GraphSel, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+    GraphSel, InlineValues, TemplateGraph, TemplateTerm, TemplateTripleTerm, TripleTemplate, Txn,
+    TxnOpts, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::DatatypeConstraint;
@@ -1612,6 +1613,15 @@ fn parse_expanded_value_with_ctx(
 ) -> Result<ParsedValue> {
     match value {
         Value::Object(obj) => {
+            if let Some(Value::Object(term)) = obj.get("@id") {
+                if obj.len() > 1 {
+                    return Err(TransactError::Parse(
+                        "a triple term ({\"@id\": {...}}) is a value and cannot carry properties"
+                            .to_string(),
+                    ));
+                }
+                return parse_expanded_triple_term_with_ctx(term, ctx);
+            }
             // Check for @id (reference)
             if let Some(id) = obj.get("@id") {
                 // If the object has additional keys, materialize it as a nested node.
@@ -1716,6 +1726,46 @@ fn parse_expanded_value_with_ctx(
             "Unsupported value: {value:?}"
         ))),
     }
+}
+
+/// `{"@id": {"@id": s, p: o}}`: the triple term `<<( s p o )>>`.
+fn parse_expanded_triple_term_with_ctx(
+    term: &serde_json::Map<String, Value>,
+    ctx: &mut TemplateParseCtx<'_>,
+) -> Result<ParsedValue> {
+    let invalid = |msg: &str| TransactError::Parse(format!("triple term: {msg}"));
+    let s = match term.get("@id") {
+        Some(id) => parse_expanded_id_with_ctx(id, ctx)?,
+        None => return Err(invalid("@id must name the subject")),
+    };
+    let mut pairs = term.iter().filter(|(k, _)| !k.starts_with('@'));
+    let (Some((key, values)), None) = (pairs.next(), pairs.next()) else {
+        return Err(invalid("it must describe exactly one triple"));
+    };
+    let p = if key.starts_with('?') {
+        TemplateTerm::Var(ctx.vars.get_or_insert(key))
+    } else {
+        TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(key))
+    };
+    // A node with properties would assert them; a list or another term is
+    // not one object.
+    let mut asserted = Vec::new();
+    let mut objects = parse_expanded_objects_with_ctx(values, ctx, &mut asserted)?;
+    let o = match objects.pop() {
+        Some(o) if objects.is_empty() && asserted.is_empty() && o.list_index.is_none() => o,
+        _ => return Err(invalid("it must describe exactly one triple")),
+    };
+    if matches!(o.term, TemplateTerm::TripleTerm(_)) {
+        return Err(invalid("a triple term cannot nest another"));
+    }
+    Ok(ParsedValue::new(TemplateTerm::TripleTerm(Box::new(
+        TemplateTripleTerm {
+            s,
+            p,
+            o: o.term,
+            dtc: o.dtc,
+        },
+    ))))
 }
 
 // Compatibility wrapper used by unit tests.

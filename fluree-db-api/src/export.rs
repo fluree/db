@@ -395,6 +395,9 @@ struct AnnotationContext<'a> {
     /// space, persisted and ephemeral. Hoisted out of the row loop: suppression
     /// is then a scan of at most fourteen `u32`s, not an IRI comparison.
     reifies_p_ids: Vec<u32>,
+    /// `rdf:reifies`' `p_id`s, persisted and ephemeral: a triple-term row
+    /// under any other predicate is a value, not a link.
+    link_p_ids: Vec<u32>,
     graph_sid: Option<Sid>,
 }
 
@@ -414,11 +417,31 @@ impl<'a> AnnotationContext<'a> {
                 .filter(|(_, sid)| fluree_db_core::namespaces::is_reserved_reifies_predicate(sid))
                 .map(|(p_id, _)| *p_id),
         );
+        let mut link_p_ids: Vec<u32> = resolver
+            .store
+            .find_predicate_id(fluree_vocab::rdf::REIFIES)
+            .into_iter()
+            .collect();
+        link_p_ids.extend(
+            resolver
+                .ephemeral_preds_reverse
+                .iter()
+                .filter(|(_, sid)| fluree_db_core::is_rdf_reifies(sid))
+                .map(|(p_id, _)| *p_id),
+        );
         Some(Self {
             probe,
             reifies_p_ids,
+            link_p_ids,
             graph_sid: config.graph_sid.clone(),
         })
+    }
+
+    /// An `rdf:reifies` link row: replaced by annotation syntax, and written
+    /// as the triple it is under `--raw-reifies`.
+    #[inline]
+    fn is_link_row(&self, p_id: u32, o_type: u16) -> bool {
+        o_type == OType::TRIPLE_TERM.as_u16() && self.link_p_ids.contains(&p_id)
     }
 
     #[inline]
@@ -447,13 +470,6 @@ impl<'a> AnnotationContext<'a> {
     }
 }
 
-/// An `rdf:reifies` link row: replaced by annotation syntax, and written as
-/// the triple it is under `--raw-reifies`.
-#[inline]
-fn is_link_row(o_type: u16) -> bool {
-    o_type == OType::TRIPLE_TERM.as_u16()
-}
-
 /// Live reifiers for every row of `batch`, row-aligned.
 ///
 /// Returns an empty vec when the export is not emitting annotation syntax;
@@ -479,7 +495,7 @@ async fn batch_reifiers(
     for row in 0..batch.row_count {
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
-        if ann.is_reifies_row(p_id) || is_link_row(o_type) {
+        if ann.is_reifies_row(p_id) || ann.is_link_row(p_id, o_type) {
             continue;
         }
         let o_key = batch.o_key.get(row);
@@ -705,7 +721,7 @@ fn write_turtle_batch<W: Write>(
         // Annotation syntax replaces each link with the `~ <r>` marker
         // emitted below; a legacy `f:reifies*` bundle is read as its link.
         if let Some(ann) = ann {
-            if is_link_row(o_type)
+            if ann.is_link_row(p_id, o_type)
                 && ann.link_becomes_marker(resolver, s_id, (o_type, o_key, p_id), g_id)?
             {
                 ann.probe.note_link_in_scope(resolver, s_id);
@@ -900,7 +916,7 @@ pub async fn export_graph_jsonld<W: Write>(
             let o_type = batch.o_type.get_or(row, 0);
             let o_key = batch.o_key.get(row);
             if let Some(ann) = ann.as_ref() {
-                if is_link_row(o_type)
+                if ann.is_link_row(p_id, o_type)
                     && ann.link_becomes_marker(
                         &resolver,
                         s_id,
@@ -1089,21 +1105,30 @@ fn merge_untranslated_jsonld(
 
 const REIFIES_KEY: &str = "@reifies";
 
-/// An `rdf:reifies` link's triple as the JSON-LD `@reifies` block,
-/// `{"@id": s, p: o}` — the form JSON-LD inserts take for a reification.
-/// `None` for any other row, and for a nested term, which has no block.
+/// An `rdf:reifies` link's triple as the JSON-LD `@reifies` block — the
+/// form JSON-LD inserts take for a reification. `None` for any other row.
 fn reifies_jsonld(
     p_iri: &str,
     value: &FlakeValue,
     store: &BinaryIndexStore,
     prefixes: &PrefixMap,
 ) -> Option<serde_json::Value> {
-    let FlakeValue::TripleTerm(term) = value else {
-        return None;
-    };
-    if p_iri != fluree_vocab::rdf::REIFIES {
-        return None;
+    match value {
+        FlakeValue::TripleTerm(term) if p_iri == fluree_vocab::rdf::REIFIES => {
+            triple_term_jsonld(term, store, prefixes)
+        }
+        _ => None,
     }
+}
+
+/// A triple term as the JSON-LD node naming its triple, `{"@id": s, p: o}`;
+/// as a value it is wrapped as `{"@id": {...}}`. `None` for a nested term,
+/// which has no such node.
+fn triple_term_jsonld(
+    term: &fluree_db_core::TripleTermValue,
+    store: &BinaryIndexStore,
+    prefixes: &PrefixMap,
+) -> Option<serde_json::Value> {
     let meta = term.lang.clone().map(|lang| fluree_db_core::FlakeMeta {
         lang: Some(lang),
         i: None,
@@ -1191,6 +1216,9 @@ fn flake_to_jsonld_raw(
             "@value": v,
             "@type": compact_iri(&dt_iri().unwrap_or_else(|| "https://ns.flur.ee/db#vector".to_string()), prefixes)
         })),
+        FlakeValue::TripleTerm(term) => {
+            Some(serde_json::json!({ "@id": triple_term_jsonld(term, store, prefixes)? }))
+        }
         // Temporal / other types always encode into V3 ops.
         _ => None,
     }
@@ -1503,12 +1531,15 @@ fn flake_to_jsonld(
         }
 
         FlakeValue::Null => serde_json::Value::Null,
-        FlakeValue::TripleTerm(_) => {
-            let dt = resolve_datatype_iri(store, o_type)
-                .unwrap_or_else(|| format!("{}tripleTerm", fluree_vocab::fluree::DB));
-            let compact_dt = compact_iri(&dt, prefixes);
-            serde_json::json!({ "@value": value.to_string(), "@type": compact_dt })
-        }
+        FlakeValue::TripleTerm(term) => match triple_term_jsonld(term, store, prefixes) {
+            Some(node) => serde_json::json!({ "@id": node }),
+            None => {
+                let dt = resolve_datatype_iri(store, o_type)
+                    .unwrap_or_else(|| format!("{}tripleTerm", fluree_vocab::fluree::DB));
+                let compact_dt = compact_iri(&dt, prefixes);
+                serde_json::json!({ "@value": value.to_string(), "@type": compact_dt })
+            }
+        },
     }
 }
 
@@ -1646,7 +1677,7 @@ fn write_batch<W: Write>(
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
         if let Some(ann) = ann {
-            if is_link_row(o_type)
+            if ann.is_link_row(p_id, o_type)
                 && ann.link_becomes_marker(resolver, s_id, (o_type, o_key, p_id), g_id)?
             {
                 ann.probe.note_link_in_scope(resolver, s_id);

@@ -9,7 +9,7 @@ use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal};
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -217,6 +217,32 @@ impl<'a> FlakeSink<'a> {
     }
 }
 
+/// The triple-term value of a resolved `<<( s p o )>>`. A nested triple term
+/// as its object is refused.
+pub(crate) fn triple_term_value(
+    s: Option<Sid>,
+    p: Option<Sid>,
+    o: Option<(FlakeValue, DatatypeConstraint)>,
+) -> Result<FlakeValue, SinkError> {
+    let (Some(s), Some(p), Some((o, dtc))) = (s, p, o) else {
+        return Err(SinkError::rejected(
+            "a triple term's subject and predicate must be IRIs or blank nodes",
+        ));
+    };
+    if matches!(o, FlakeValue::TripleTerm(_)) {
+        return Err(SinkError::rejected("nested triple terms are not supported"));
+    }
+    Ok(FlakeValue::TripleTerm(Box::new(
+        fluree_db_core::TripleTermValue {
+            s,
+            p,
+            o,
+            dt: dtc.datatype().clone(),
+            lang: dtc.lang_tag().map(str::to_string),
+        },
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // GraphSink implementation
 // ---------------------------------------------------------------------------
@@ -321,6 +347,27 @@ impl GraphSink for FlakeSink<'_> {
 
     fn supports_reified_triples(&self) -> bool {
         true
+    }
+
+    fn supports_triple_terms(&self) -> bool {
+        true
+    }
+
+    fn term_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<TermId, SinkError> {
+        let term = triple_term_value(
+            self.resolve_sid(subject),
+            self.resolve_sid(predicate),
+            self.resolve_object(object),
+        )?;
+        Ok(self.add_term(ResolvedTerm::Literal {
+            value: term,
+            dtc: DatatypeConstraint::Explicit(fluree_db_core::triple_term_datatype_sid().clone()),
+        }))
     }
 
     /// The reified triple's link; the parser has already emitted the base

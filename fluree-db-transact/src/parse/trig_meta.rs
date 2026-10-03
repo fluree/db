@@ -187,6 +187,12 @@ pub enum RawObject {
     TypedLiteral { value: String, datatype: String },
     /// Language-tagged string.
     LangString { value: String, lang: String },
+    /// A triple term, `<<( subject predicate object )>>`.
+    TripleTerm {
+        subject: RawTerm,
+        predicate: RawTerm,
+        object: Box<RawObject>,
+    },
 }
 
 /// Phase 1: Parse TriG input and extract GRAPH blocks (no namespace resolution).
@@ -381,6 +387,9 @@ fn raw_object_to_txn_meta_value(
                 dt_name: dt_sid.name.to_string(),
             })
         }
+        RawObject::TripleTerm { .. } => Err(TransactError::Parse(
+            "txn-meta does not support triple-term values".to_string(),
+        )),
     }
 }
 
@@ -571,6 +580,7 @@ enum ObjectValue {
         value: String,
         lang: String,
     },
+    TripleTerm(Box<(TermValue, TermValue, ObjectValue)>),
 }
 
 impl<'a> TrigMetaParser<'a> {
@@ -947,15 +957,14 @@ impl<'a> TrigMetaParser<'a> {
     // RDF 1.2 star constructs inside GRAPH blocks (TriG-star)
     // ---------------------------------------------------------------------
     //
-    // Mirrors the streaming Turtle parser's asserting forms: the reified
-    // base triple is asserted, each anonymous occurrence mints a fresh
-    // reifier, `<<( … )>>` is a value only as the object of `rdf:reifies`,
-    // and star constructs inside an annotation body are deferred.
+    // Mirrors the streaming Turtle parser: each anonymous occurrence mints a
+    // fresh reifier, `<<( … )>>` is a value only in object position, and star
+    // constructs inside an annotation body are deferred.
 
     fn triple_term_value_error(&self) -> TransactError {
         TransactError::Parse(
-            "RDF 1.2 triple terms as values ('<<( … )>>') are deferred; inside a TriG \
-             GRAPH block a triple term is accepted only as the object of rdf:reifies"
+            "a triple term ('<<( … )>>') is a value: it cannot be a subject, and \
+             nested triple terms are not supported"
                 .to_string(),
         )
     }
@@ -1046,6 +1055,24 @@ impl<'a> TrigMetaParser<'a> {
         if self.annotation_depth > 0 {
             return Err(self.annotation_of_annotation_error());
         }
+        let (subject, predicate, object) = self.parse_triple_term_parts()?;
+        if matches!(
+            self.current().kind,
+            TokenKind::Tilde | TokenKind::AnnotationOpen
+        ) {
+            return Err(TransactError::Parse(
+                "an annotation tail on an 'rdf:reifies <<( … )>>' statement would reify \
+                 the reification itself (annotation-of-annotation), which is deferred; \
+                 annotate the base triple instead"
+                    .to_string(),
+            ));
+        }
+        self.attach_reifier(&subject, &predicate, &object, reifier);
+        Ok(())
+    }
+
+    /// `<<( ttSubject predicate ttObject )>>`, the `<<(` token current.
+    fn parse_triple_term_parts(&mut self) -> Result<(TermValue, TermValue, ObjectValue)> {
         self.advance(); // `<<(`
         let subject = match self.current().kind {
             TokenKind::ReifiedTripleStart | TokenKind::TripleTermStart => {
@@ -1072,19 +1099,7 @@ impl<'a> TrigMetaParser<'a> {
             )));
         }
         self.advance();
-        if matches!(
-            self.current().kind,
-            TokenKind::Tilde | TokenKind::AnnotationOpen
-        ) {
-            return Err(TransactError::Parse(
-                "an annotation tail on an 'rdf:reifies <<( … )>>' statement would reify \
-                 the reification itself (annotation-of-annotation), which is deferred; \
-                 annotate the base triple instead"
-                    .to_string(),
-            ));
-        }
-        self.attach_reifier(&subject, &predicate, &object, reifier);
-        Ok(())
+        Ok((subject, predicate, object))
     }
 
     /// `reifier ::= '~' (iri | BlankNode)?` — the `~` is already consumed;
@@ -1283,11 +1298,20 @@ impl<'a> TrigMetaParser<'a> {
     ) -> Result<Vec<ObjectValue>> {
         let mut objects = Vec::with_capacity(1);
         loop {
-            if self.check(&TokenKind::TripleTermStart) {
-                if !self.predicate_is_reifies(predicate)? {
+            if self.check(&TokenKind::TripleTermStart) && self.predicate_is_reifies(predicate)? {
+                self.parse_reifies_triple_term(subject)?;
+            } else if self.check(&TokenKind::TripleTermStart) {
+                if self.annotation_depth > 0 {
+                    return Err(self.annotation_of_annotation_error());
+                }
+                let (s, p, o) = self.parse_triple_term_parts()?;
+                if matches!(
+                    self.current().kind,
+                    TokenKind::Tilde | TokenKind::AnnotationOpen
+                ) {
                     return Err(self.triple_term_value_error());
                 }
-                self.parse_reifies_triple_term(subject)?;
+                objects.push(ObjectValue::TripleTerm(Box::new((s, p, o))));
             } else {
                 let object = self.parse_object()?;
                 if matches!(
@@ -1655,6 +1679,19 @@ impl<'a> TrigMetaParser<'a> {
     /// Convert an ObjectValue to RawObject.
     fn convert_object_to_raw(&self, obj: &ObjectValue) -> Result<RawObject> {
         match obj {
+            ObjectValue::TripleTerm(term) => {
+                let (subject, predicate, object) = &**term;
+                if matches!(predicate, TermValue::BlankNode(_)) {
+                    return Err(TransactError::Parse(
+                        "blank nodes not allowed as predicate".to_string(),
+                    ));
+                }
+                Ok(RawObject::TripleTerm {
+                    subject: Self::convert_node_to_raw(subject),
+                    predicate: Self::convert_node_to_raw(predicate),
+                    object: Box::new(self.convert_object_to_raw(object)?),
+                })
+            }
             ObjectValue::String(s) => Ok(RawObject::String(s.clone())),
             ObjectValue::Integer(n) => Ok(RawObject::Integer(*n)),
             ObjectValue::Double(n) => {
@@ -1720,6 +1757,9 @@ impl<'a> TrigMetaParser<'a> {
             }
             ObjectValue::BlankNode(_) => Err(TransactError::Parse(
                 "blank nodes not allowed in txn-meta objects".to_string(),
+            )),
+            ObjectValue::TripleTerm(_) => Err(TransactError::Parse(
+                "txn-meta does not support triple-term values".to_string(),
             )),
             ObjectValue::LangString { value, lang } => Ok(TxnMetaValue::LangString {
                 value: value.clone(),
@@ -1809,6 +1849,9 @@ impl<'a> TrigMetaParser<'a> {
                             }
                             ObjectValue::BlankNode(_) => Err(TransactError::Parse(
                                 "blank nodes not allowed in txn-meta objects".to_string(),
+                            )),
+                            ObjectValue::TripleTerm(_) => Err(TransactError::Parse(
+                                "txn-meta does not support triple-term values".to_string(),
                             )),
                             ObjectValue::LangString { value, lang } => Ok(RawObject::LangString {
                                 value: value.clone(),
@@ -2770,14 +2813,19 @@ ex:alice ex:note "value with a { brace" .
         let mut ns = test_registry();
         for (label, body, needle) in [
             (
-                "triple term as value",
-                "ex:a ex:q <<( ex:s ex:p ex:o )>> .",
-                "triple terms as values",
+                "triple term as subject",
+                "<<( ex:s ex:p ex:o )>> ex:q ex:z .",
+                "cannot be a subject",
             ),
             (
                 "nested triple term",
                 "ex:r rdf:reifies <<( ex:s ex:p <<( ex:x ex:y ex:z )>> )>> .",
-                "triple terms as values",
+                "nested triple terms",
+            ),
+            (
+                "annotation on a triple-term value",
+                "ex:a ex:q <<( ex:s ex:p ex:o )>> {| ex:n 1 |} .",
+                "nested triple terms",
             ),
             (
                 "star inside annotation body",

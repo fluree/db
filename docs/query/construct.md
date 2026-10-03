@@ -360,8 +360,9 @@ details of each.
 
 - `GRAPH` blocks cannot nest, and the `CONSTRUCT WHERE` shorthand has no `GRAPH` form (its
   template is a basic graph pattern, per SPARQL 1.1).
-- A triple term in a template is accepted only as the object of `rdf:reifies`; nested triple
-  terms and property paths inside a template annotation block are rejected.
+- A triple-term constant in a template is accepted only as the object of `rdf:reifies`; nested
+  triple terms and property paths inside a template annotation block are rejected. A template
+  variable bound to a stored triple term (`CONSTRUCT { ?d ex:mentions ?t }`) writes the term.
 - `?r rdf:reifies <<( s p o )>>` in a template writes the reification without `s p o`, as RDF
   1.2 defines it; the annotation tail `s p o ~ ?r` writes both. `?r rdf:reifies ?t`, with `?t`
   bound to a triple term, writes the same as the first. A JSON-LD result writes a reification
