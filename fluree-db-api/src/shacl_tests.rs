@@ -5280,3 +5280,229 @@ async fn shacl_sparql_invalid_query_fails_closed() {
         "expected pre-binding restriction error naming MINUS, got: {message}"
     );
 }
+
+/// A ledger whose `ex:Player` nodes are checked by one `sh:sparql` constraint
+/// with the given `sh:select`.
+async fn ledger_with_player_constraint(
+    fluree: &crate::Fluree,
+    ledger_id: &str,
+    select: &str,
+) -> crate::LedgerState {
+    let shape_txn = json!({
+        "@context": shacl_context(),
+        "@id": "ex:PlayerShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:sparql": {
+            "@id": "ex:PlayerShape-sparql",
+            "sh:message": "player constraint",
+            "sh:select": select
+        }
+    });
+    let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+    fluree.upsert(ledger, &shape_txn).await.unwrap().ledger
+}
+
+/// Insert one `ex:Player` with the given `ex:score`.
+async fn insert_player(
+    fluree: &crate::Fluree,
+    ledger: crate::LedgerState,
+    id: &str,
+    score: i64,
+) -> Result<crate::LedgerState, ApiError> {
+    let player = json!({
+        "@context": shacl_context(),
+        "@id": id,
+        "@type": "ex:Player",
+        "ex:score": score
+    });
+    fluree
+        .upsert(ledger, &player)
+        .await
+        .map(|result| result.ledger)
+}
+
+// `sh:select` is lowered like a SPARQL query but skips the SPARQL validator,
+// so the grouped-query semantics reach shape constraints directly: a stored
+// shape's verdict follows them.
+
+/// HAVING without GROUP BY or an aggregate is a filter over the solutions
+/// (SPARQL 1.1 §18.2.4.2). It used to be dropped, so every scored player was a
+/// violation.
+#[tokio::test]
+async fn shacl_sparql_having_without_grouping_filters() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_player_constraint(
+        &fluree,
+        "shacl/sparql-having-filter:main",
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s } HAVING (?s > 10)",
+    )
+    .await;
+    let ledger = insert_player(&fluree, ledger, "ex:low", 5)
+        .await
+        .expect("HAVING filters out a score of 5");
+    let err = insert_player(&fluree, ledger, "ex:high", 20)
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "player constraint");
+}
+
+/// A HAVING read of a variable that is not a GROUP BY key means `SAMPLE(?v)`
+/// (SPARQL 1.1 §18.2.4.1). It used to read the per-group list: a panic in a
+/// debug build, and no solutions (so no violation) in release.
+#[tokio::test]
+async fn shacl_sparql_having_reads_a_sample_of_a_non_key_variable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_player_constraint(
+        &fluree,
+        "shacl/sparql-having-sample:main",
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s } \
+         GROUP BY $this HAVING (?s > 10)",
+    )
+    .await;
+    let ledger = insert_player(&fluree, ledger, "ex:low", 5)
+        .await
+        .expect("the sampled score 5 is not > 10");
+    let err = insert_player(&fluree, ledger, "ex:high", 20)
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "player constraint");
+}
+
+/// Projecting a variable that is neither a GROUP BY key nor an aggregate is a
+/// validator error for a SPARQL query; `sh:select` skips the validator, and the
+/// plan-time check now fails the constraint closed. The per-group list used to
+/// read as no value, reporting a violation at the focus node. The failure is
+/// the SPARQL-constraint type, naming the constraint, its shape and the
+/// variable.
+#[tokio::test]
+async fn shacl_sparql_grouped_projection_of_a_non_key_fails_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_player_constraint(
+        &fluree,
+        "shacl/sparql-grouped-projection:main",
+        "SELECT $this ?value WHERE { $this <http://example.org/ns/score> ?value } \
+         GROUP BY $this",
+    )
+    .await;
+    let err = insert_player(&fluree, ledger, "ex:p1", 5)
+        .await
+        .unwrap_err();
+    let ApiError::Transact(TransactError::Shacl(fluree_db_shacl::ShaclError::SparqlConstraint {
+        constraint,
+        message,
+    })) = err
+    else {
+        panic!("expected a sh:sparql constraint failure, got: {err:?}");
+    };
+    assert_eq!(constraint, "http://example.org/ns/PlayerShape-sparql");
+    assert!(
+        message.contains("on shape http://example.org/ns/PlayerShape: projected variable ?value is neither a GROUP BY key nor an aggregate result"),
+        "{message}"
+    );
+    assert!(!message.contains("VarId("), "{message}");
+}
+
+/// Insert an `ex:Player` with the given friends, each scoring 1.
+async fn insert_friends(
+    fluree: &crate::Fluree,
+    ledger: crate::LedgerState,
+    player: &str,
+    friends: &[&str],
+) -> Result<crate::LedgerState, ApiError> {
+    let mut graph: Vec<JsonValue> = friends
+        .iter()
+        .map(|f| json!({"@id": f, "ex:score": 1}))
+        .collect();
+    graph.push(json!({
+        "@id": player,
+        "@type": "ex:Player",
+        "ex:score": 5,
+        "ex:friend": friends.iter().map(|f| json!({"@id": f})).collect::<Vec<_>>()
+    }));
+    let data = json!({"@context": shacl_context(), "@graph": graph});
+    fluree
+        .upsert(ledger, &data)
+        .await
+        .map(|result| result.ledger)
+}
+
+/// Grouped `sh:select` shapes, each run against a player with three friends
+/// (a violation: more than two, or two sharing a score) and one with a single
+/// friend (conforms).
+///
+/// `$this` is constant within one evaluation, so a (sub-)SELECT that projects
+/// it groups by it. The sub-SELECT form grouped by another variable (every
+/// sub-SELECT here must project `$this`) used to join a per-group list and
+/// never fired; after the plan-time check it refused every write. It now
+/// evaluates, and fires.
+#[tokio::test]
+async fn shacl_sparql_grouped_constraints_fire_on_their_groups() {
+    const FRIEND: &str = "<http://example.org/ns/friend>";
+    const SCORE: &str = "<http://example.org/ns/score>";
+    let shapes = [
+        // Two friends sharing a score (a sub-SELECT grouped by the score).
+        (
+            format!(
+                "SELECT $this WHERE {{ {{ SELECT $this ?v (COUNT(?x) AS ?c) WHERE {{ \
+                 $this {FRIEND} ?x . ?x {SCORE} ?v }} GROUP BY ?v }} FILTER(?c > 1) }}"
+            ),
+            "player constraint",
+        ),
+        (
+            format!(
+                "SELECT $this WHERE {{ $this {FRIEND} ?x }} GROUP BY $this HAVING (COUNT(?x) > 2)"
+            ),
+            "player constraint",
+        ),
+        (
+            format!(
+                "SELECT $this WHERE {{ {{ SELECT $this (COUNT(?x) AS ?c) WHERE {{ \
+                 $this {FRIEND} ?x }} GROUP BY $this }} FILTER (?c > 2) }}"
+            ),
+            "player constraint",
+        ),
+        (
+            format!(
+                "SELECT $this WHERE {{ {{ SELECT $this (COUNT(?x) AS ?c) WHERE {{ \
+                 $this {FRIEND} ?x }} }} FILTER (?c > 2) }}"
+            ),
+            "player constraint",
+        ),
+        (
+            format!("SELECT $this WHERE {{ $this {FRIEND} ?x }} HAVING (COUNT(?x) > 2)"),
+            "player constraint",
+        ),
+        (
+            format!(
+                "SELECT $this (CONCAT(\"has \", STR(COUNT(?x))) AS ?message) WHERE {{ \
+                 $this {FRIEND} ?x }} GROUP BY $this HAVING (COUNT(?x) > 2)"
+            ),
+            "has 3",
+        ),
+        (
+            format!(
+                "SELECT $this (STR($this) AS ?value) WHERE {{ $this {FRIEND} ?x }} \
+                 GROUP BY $this HAVING (COUNT(?x) > 2)"
+            ),
+            "player constraint",
+        ),
+    ];
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, (select, message)) in shapes.iter().enumerate() {
+        let ledger =
+            ledger_with_player_constraint(&fluree, &format!("shacl/grouped-{i}:main"), select)
+                .await;
+        let err = insert_friends(&fluree, ledger, "ex:p1", &["ex:f1", "ex:f2", "ex:f3"])
+            .await
+            .expect_err(select);
+        let violation = shacl_violation_message(err);
+        assert!(violation.contains(message), "{select}: {violation}");
+        let ledger =
+            ledger_with_player_constraint(&fluree, &format!("shacl/grouped-{i}-ok:main"), select)
+                .await;
+        insert_friends(&fluree, ledger, "ex:p2", &["ex:g1"])
+            .await
+            .unwrap_or_else(|e| panic!("{select}: {e:?}"));
+    }
+}

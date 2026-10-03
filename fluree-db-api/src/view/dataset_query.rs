@@ -734,7 +734,7 @@ impl Fluree {
             .with_multi_default_graph(dataset.default.len() >= 2);
         let prepared = prepare_execution_with_config(db, executable, &prepare_config)
             .await
-            .map_err(query_error_to_api_error)?;
+            .map_err(|e| query_error_to_api_error(e.name_variables(vars)))?;
 
         // Binary scans rely on a ledger-specific binary index store. For datasets that span
         // multiple ledgers, using only the primary view's store will silently drop results.
@@ -913,7 +913,9 @@ impl Fluree {
         prepare_config.planning = prepare_config
             .planning
             .with_multi_default_graph(dataset.default.len() >= 2);
-        let prepared = prepare_execution_with_config(db, executable, &prepare_config).await?;
+        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
+            .await
+            .map_err(|e| e.name_variables(vars))?;
 
         let primary_ledger_id: &str = primary.ledger_id.as_ref();
         let is_single_ledger_dataset = dataset

@@ -407,7 +407,7 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     // projection check below still rejects any HAVING that lifts an aggregate not
     // present in the SELECT projection (that query stays on the generic path — the
     // conservative admission line). Post-aggregate BINDs are not foldable.
-    if !aggregation.binds.is_empty() {
+    if query.grouping.as_ref()?.binds().next().is_some() {
         return None;
     }
 
@@ -5641,7 +5641,8 @@ mod tests {
             output: QueryOutput::select_all(vec![out]),
             patterns,
             reasoning: ReasoningConfig::default(),
-            grouping: Grouping::assemble(group_by, vec![agg], vec![], None),
+            grouping: Grouping::assemble(group_by, vec![agg], vec![], None)
+                .expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
@@ -6836,7 +6837,7 @@ mod tests {
             output: QueryOutput::select_all(vec![g, c]),
             patterns: vec![graph_triple(s, o)],
             reasoning: ReasoningConfig::default(),
-            grouping: Grouping::assemble(vec![g], vec![agg], vec![], None),
+            grouping: Grouping::assemble(vec![g], vec![agg], vec![], None).expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
@@ -6866,7 +6867,8 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             // HAVING references the projected aggregate ?c (no synthetic extra) →
             // outs == projected → fused.
-            grouping: Grouping::assemble(vec![g], vec![agg], vec![], Some(Expression::Var(c))),
+            grouping: Grouping::assemble(vec![g], vec![agg], vec![], Some(Expression::Var(c)))
+                .expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
@@ -6904,7 +6906,8 @@ mod tests {
                 vec![agg, agg2],
                 vec![],
                 Some(Expression::Var(c2)),
-            ),
+            )
+            .expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
@@ -7301,7 +7304,8 @@ mod tests {
                 output: QueryOutput::select_all(vec![out]),
                 patterns: vec![graph_triple(s, o)],
                 reasoning: ReasoningConfig::default(),
-                grouping: Grouping::assemble(vec![], vec![agg], vec![], None),
+                grouping: Grouping::assemble(vec![], vec![agg], vec![], None)
+                    .expect("valid grouping"),
                 ordering: Vec::new(),
                 order_binds: Vec::new(),
                 limit: None,

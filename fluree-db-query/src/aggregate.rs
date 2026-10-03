@@ -1046,9 +1046,8 @@ fn agg_sample(values: &[Binding]) -> Binding {
 
 /// collect() - gather every non-null value into a list (Cypher semantics: nulls
 /// are dropped; an empty collection yields an empty list, not null). The list
-/// is carried as a `Grouped` binding, which the JSON-LD formatter renders as a
-/// JSON array. DISTINCT, when requested, is applied upstream by
-/// [`AggregateFn::apply`].
+/// is a `Binding::List`, which the JSON-LD formatter renders as a JSON array.
+/// DISTINCT, when requested, is applied upstream by [`AggregateFn::apply`].
 fn agg_collect(values: &[Binding]) -> Binding {
     let items: Vec<Binding> = values
         .iter()

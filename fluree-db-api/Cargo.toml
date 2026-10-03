@@ -386,6 +386,11 @@ path = "tests/it_count_star_row_multiplicity.rs"
 name = "it_distinct_object_numbig_gate"
 path = "tests/it_distinct_object_numbig_gate.rs"
 
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_grouped_projection_lanes"
+path = "tests/it_grouped_projection_lanes.rs"
+
 [[test]]
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
@@ -656,6 +661,10 @@ harness = false
 
 [[bench]]
 name = "query_hot_whole_graph_agg"
+harness = false
+
+[[bench]]
+name = "query_hot_grouped_projection"
 harness = false
 
 [[test]]

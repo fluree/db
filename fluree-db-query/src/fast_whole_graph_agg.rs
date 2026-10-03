@@ -233,8 +233,9 @@ pub(crate) fn detect_whole_graph_scalar_aggs(query: &Query) -> Option<WholeGraph
     let kind = match &query.grouping {
         // Scalars: single implicit group, aggregates only.
         Some(Grouping::Implicit {
-            aggregation: Aggregation { aggregates, binds },
+            aggregation: Aggregation { aggregates },
             having: None,
+            binds,
         }) => {
             if !binds.is_empty() || select_vars.len() != aggregates.len() {
                 return None;
@@ -254,8 +255,9 @@ pub(crate) fn detect_whole_graph_scalar_aggs(query: &Query) -> Option<WholeGraph
         // Histogram: GROUP BY the accessor value, one COUNT(*) / COUNT(?n).
         Some(Grouping::Explicit {
             group_by,
-            aggregation: Some(Aggregation { aggregates, binds }),
+            aggregation: Some(Aggregation { aggregates }),
             having: None,
+            binds,
         }) => {
             let prop_var = prop_var?;
             // The group key is the accessor var or its projection alias

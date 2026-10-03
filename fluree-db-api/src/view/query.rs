@@ -1779,7 +1779,7 @@ impl Fluree {
         );
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
-            .map_err(query_error_to_api_error)?;
+            .map_err(|e| query_error_to_api_error(e.name_variables(vars)))?;
 
         // A time-pinned graph-source view reads that table state, never current.
         crate::graph_source::pin_graph_source_times([db], r2rml.table_provider)
@@ -1848,7 +1848,9 @@ impl Fluree {
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config).await?;
+        let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
+            .await
+            .map_err(|e| e.name_variables(vars))?;
 
         crate::graph_source::pin_graph_source_times([db], r2rml.table_provider)?;
 

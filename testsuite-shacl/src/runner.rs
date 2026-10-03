@@ -59,6 +59,8 @@ async fn execute(case: &TestCase) -> Result<Outcome> {
         graph: None,
         shapes: ShapesSource::InlineTurtle(shapes),
         include_attached: false,
+        max_fuel: None,
+        cancellation: None,
     };
     let report: ValidateReport = fluree
         .validate_ledger(alias, &options)

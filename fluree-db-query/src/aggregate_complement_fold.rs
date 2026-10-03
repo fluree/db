@@ -149,11 +149,12 @@ fn try_rewrite_without_feature(sq: &mut SubqueryPattern, next_var: &mut u16) -> 
         group_by,
         aggregation: Some(agg),
         having: None,
+        binds,
     }) = &sq.grouping
     else {
         return false;
     };
-    if group_by.len() != 1 || !agg.binds.is_empty() || agg.aggregates.len() != 1 {
+    if group_by.len() != 1 || !binds.is_empty() || agg.aggregates.len() != 1 {
         return false;
     }
     let key = *group_by.iter().next().expect("len checked == 1");
@@ -265,9 +266,9 @@ fn try_rewrite_without_feature(sq: &mut SubqueryPattern, next_var: &mut u16) -> 
                         output_var: u_cnt,
                     },
                 ]),
-                binds: Vec::new(),
             },
             having: None,
+            binds: Vec::new(),
         });
 
     // --- per-feature WITH aggregate: SELECT ?key (SUM(av_w))(COUNT(av_w)) GROUP BY ?key ---
@@ -289,9 +290,9 @@ fn try_rewrite_without_feature(sq: &mut SubqueryPattern, next_var: &mut u16) -> 
                         output_var: w_cnt,
                     },
                 ]),
-                binds: Vec::new(),
             }),
             having: None,
+            binds: Vec::new(),
         },
     );
 

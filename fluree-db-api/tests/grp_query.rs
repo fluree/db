@@ -43,6 +43,8 @@ mod it_query_jsonld;
 mod it_query_jsonld_basic;
 #[path = "it_query_jsonld_compound.rs"]
 mod it_query_jsonld_compound;
+#[path = "it_query_jsonld_grouped_projection.rs"]
+mod it_query_jsonld_grouped_projection;
 #[path = "it_query_list_functions.rs"]
 mod it_query_list_functions;
 #[path = "it_query_misc.rs"]

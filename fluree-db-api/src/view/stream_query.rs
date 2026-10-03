@@ -123,7 +123,7 @@ impl Fluree {
             super::query::QuerySyntax::of(&input),
         )?;
 
-        ensure_streamable(&parsed.output)?;
+        ensure_streamable(&mut parsed, &vars)?;
 
         let executable = self
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
@@ -263,7 +263,8 @@ impl Fluree {
             executable,
             &prepare_config,
         )
-        .await?;
+        .await
+        .map_err(|e| e.name_variables(vars))?;
 
         // Wire R2RML so a graph-source query that routed through the
         // single-ledger streaming path applies its mapping (parity with the
@@ -394,7 +395,7 @@ impl Fluree {
             &parsed,
             super::query::QuerySyntax::of(&input),
         )?;
-        ensure_streamable(&parsed.output)?;
+        ensure_streamable(&mut parsed, &vars)?;
 
         let executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
@@ -528,7 +529,10 @@ fn query_error_code(e: &fluree_db_query::QueryError) -> &'static str {
         // (mirrors the server `@type` `err:r2rml/UnsupportedPattern`) so the
         // streaming path is as machine-discriminable as the buffered one.
         QE::R2rmlUnsupportedPattern { .. } => "r2rml_unsupported_pattern",
-        QE::InvalidQuery(_) | QE::InvalidFilter(_) | QE::InvalidExpression(_) => "invalid_query",
+        QE::InvalidQuery(_)
+        | QE::UngroupedRead(_)
+        | QE::InvalidFilter(_)
+        | QE::InvalidExpression(_) => "invalid_query",
         _ => "internal",
     }
 }
@@ -559,16 +563,33 @@ impl BatchSink for CollectSink {
     }
 }
 
-/// Reject query shapes the streaming endpoint does not support.
+/// Reject query shapes the streaming endpoint does not support, before the
+/// response starts, and make the rest safe to stream.
 ///
 /// Uses `QueryError::InvalidQuery` (not `ApiError::query`, which maps to a 500)
 /// so these client mistakes surface as a `4xx`.
-fn ensure_streamable(output: &fluree_db_query::ir::QueryOutput) -> Result<()> {
+///
+/// Stream rows are SPARQL-results bindings, which have no list type, so a
+/// JSON-LD query that projects a per-group list (a variable the WHERE binds
+/// that its grouping neither keys, aggregates nor binds) is refused here:
+/// explicitly, or through `select *` when `/query` would return one (the
+/// grouping does not run on the streaming lane). It used to stream one row per
+/// list element — a cartesian product across list columns. A projected
+/// variable nothing binds is refused as unbound. The plan's output is then set
+/// to refuse per-group lists outright.
+fn ensure_streamable(query: &mut fluree_db_query::ir::Query, vars: &VarRegistry) -> Result<()> {
+    use fluree_db_query::ir::UngroupedProjection;
     let reject = |what: &str| {
         Err(ApiError::Query(fluree_db_query::QueryError::InvalidQuery(
             format!("{what} queries are not supported on the streaming endpoint; use /query"),
         )))
     };
+    let invalid = |message: String| {
+        Err(ApiError::Query(fluree_db_query::QueryError::InvalidQuery(
+            message,
+        )))
+    };
+    let output = &query.output;
     if output.is_ask() {
         return reject("ASK");
     }
@@ -581,6 +602,64 @@ fn ensure_streamable(output: &fluree_db_query::ir::QueryOutput) -> Result<()> {
     if output.has_hydration() {
         return reject("hydration");
     }
+    if let (Some(grouping), UngroupedProjection::PerGroupList) =
+        (&query.grouping, output.ungrouped_projection())
+    {
+        let produced: std::collections::HashSet<fluree_db_query::VarId> = grouping
+            .group_by_vars()
+            .chain(grouping.aggregates().map(|spec| spec.output_var))
+            .chain(grouping.binds().map(|(var, _)| *var))
+            .collect();
+        let where_vars = fluree_db_query::ir::pattern::produced_vars_of(&query.patterns);
+        match output.projected_vars() {
+            Some(projected) => {
+                if let Some(var) = projected.iter().find(|v| !produced.contains(v)) {
+                    return if where_vars.contains(var) {
+                        invalid(format!(
+                            "list-valued column {} cannot be streamed as SPARQL-results \
+                             rows: it is neither a groupBy key nor an aggregate; aggregate it \
+                             (e.g. with group-concat) or use /query",
+                            vars.name(*var)
+                        ))
+                    } else {
+                        // The plan-time error `/query` returns for it.
+                        invalid(
+                            fluree_db_query::ir::UngroupedRead {
+                                var: *var,
+                                stage: fluree_db_query::ir::ReadStage::UnboundProjection,
+                            }
+                            .named_message(vars),
+                        )
+                    };
+                }
+            }
+            // `select *` under `groupBy` on `/query`: the streaming lane
+            // returns the keys and aggregates only, and streams the same. The
+            // `GroupByOperator` lane also returns every other variable the
+            // WHERE binds, as a per-group list.
+            None if grouping.aggregates_stream() => {}
+            None => {
+                let mut lists: Vec<&str> = where_vars
+                    .iter()
+                    .filter(|v| !produced.contains(v))
+                    .map(|v| vars.name(*v))
+                    .filter(|name| !crate::format::is_internal_var_name(name))
+                    .collect();
+                if !lists.is_empty() {
+                    lists.sort_unstable();
+                    return invalid(format!(
+                        "select * under groupBy includes list-valued columns ({}), which cannot \
+                         be streamed as SPARQL-results rows; project the groupBy keys and \
+                         aggregates, or use /query",
+                        lists.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    query
+        .output
+        .set_ungrouped_projection(UngroupedProjection::Reject);
     Ok(())
 }
 
@@ -627,7 +706,14 @@ impl BatchSink for NdjsonRowSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::ensure_streamable;
-    use fluree_db_query::ir::{ConstructTemplate, QueryOutput};
+    use fluree_db_query::ir::{ConstructTemplate, Query, QueryOutput};
+    use fluree_db_query::VarRegistry;
+
+    fn query_with(output: QueryOutput) -> Query {
+        let mut query = Query::new(Default::default());
+        query.output = output;
+        query
+    }
 
     /// The WHERE-dedup license for CONSTRUCT and ASK (#1700 follow-up;
     /// `result_is_multiplicity_blind` in fluree-db-query's
@@ -639,13 +725,18 @@ mod tests {
     /// `it_query_construct.rs` for the non-streaming half of the same gate.
     #[test]
     fn streaming_endpoint_keeps_rejecting_construct_and_ask() {
+        let vars = VarRegistry::new();
         assert!(
-            ensure_streamable(&QueryOutput::Construct(ConstructTemplate::new(Vec::new()))).is_err(),
+            ensure_streamable(
+                &mut query_with(QueryOutput::Construct(ConstructTemplate::new(Vec::new()))),
+                &vars
+            )
+            .is_err(),
             "streaming CONSTRUCT would bypass Graph::canonicalize and observe \
              WHERE-level dedup"
         );
         assert!(
-            ensure_streamable(&QueryOutput::Ask).is_err(),
+            ensure_streamable(&mut query_with(QueryOutput::Ask), &vars).is_err(),
             "streaming ASK has no row stream to emit; its boolean is computed \
              from solution-sequence emptiness on the buffered path"
         );

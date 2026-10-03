@@ -244,6 +244,17 @@ fn parse_query_ast_internal(
                 "\"ask\" must be an array or object of where-clause patterns".to_string(),
             ));
         }
+        // `ask` returns before `parse_options`, so grouping options would be
+        // dropped, and they change the answer (a `having` that rejects every
+        // group is false). Refuse them, as SPARQL ASK does.
+        if let Some(key) = ["groupBy", "group-by", "having"]
+            .into_iter()
+            .find(|key| obj.contains_key(*key))
+        {
+            return Err(ParseError::InvalidOption(format!(
+                "\"ask\" does not support \"{key}\""
+            )));
+        }
         let object_var_parsing = options::parse_object_var_parsing(obj);
         where_clause::parse_where_with_counters(
             ask_val,
@@ -847,7 +858,7 @@ fn parse_select_string(
         // `(as (- (max ?u) (min ?u)) ?spread)`). Each one is hoisted into
         // `aggregates` with a synthetic output var and the call is rewritten
         // to reference that var; the surrounding expression then lowers as a
-        // post-aggregation bind via `lower_select_expr_bind`.
+        // post-aggregation bind (`lower::lower_select_computations`).
         let mut inner_tok = list[1].clone();
         hoist_inline_aggregates(&mut inner_tok, aggregates)?;
         let expr = filter_sexpr::expr_from_sexpr_token(&inner_tok)?;
@@ -1463,7 +1474,14 @@ pub fn parse_query<E: IriEncoder>(
     strict_override: Option<bool>,
 ) -> Result<Query> {
     let (ast, select_mode) = parse_query_ast(json, strict_override)?;
-    lower_query(ast, encoder, vars, select_mode)
+    let mut query = lower_query(ast, encoder, vars, select_mode)?;
+    // The JSON-LD query surface projects a variable its grouping does not
+    // produce as a per-group list (documented in `docs/query/jsonld-query.md`).
+    // Only the top-level output may: a subquery's projection cannot carry it.
+    query
+        .output
+        .set_ungrouped_projection(crate::ir::UngroupedProjection::PerGroupList);
+    Ok(query)
 }
 
 /// Parse a filter expression value and lower it to a Expression.
@@ -3682,16 +3700,14 @@ mod tests {
         let encoder = encode::MemoryEncoder::with_common_namespaces();
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
-        let agg = query
-            .grouping
-            .as_ref()
-            .and_then(|g| g.aggregation())
-            .expect("aggregation phase present");
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
         // One aggregate, one post-aggregation BIND.
         assert_eq!(agg.aggregates.len(), 1);
-        assert_eq!(agg.binds.len(), 1);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 1);
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
-        assert_eq!(agg.binds[0].0, adjusted_var);
+        assert_eq!(binds[0].0, adjusted_var);
     }
 
     #[test]
@@ -3839,18 +3855,16 @@ mod tests {
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
         // One aggregate, two post-aggregation BINDs (in select order).
-        let agg = query
-            .grouping
-            .as_ref()
-            .and_then(|g| g.aggregation())
-            .expect("aggregation phase present");
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
         assert_eq!(agg.aggregates.len(), 1);
-        assert_eq!(agg.binds.len(), 2);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 2);
 
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
         let again_var = vars.get("?again").expect("?again registered");
-        assert_eq!(agg.binds[0].0, adjusted_var);
-        assert_eq!(agg.binds[1].0, again_var);
+        assert_eq!(binds[0].0, adjusted_var);
+        assert_eq!(binds[1].0, again_var);
 
         // No leaked Pattern::Bind for these — they must NOT have been
         // pre-aggregation.

@@ -153,6 +153,14 @@ error, not a `200` stream), and should use [`/query`](endpoints.md#post-query):
   formatting.
 - **History (`to` / `FROM … TO …`)** — top-level JSON-LD `to` and the SPARQL
   history range use a distinct history execution path.
+- **A JSON-LD per-group list** — a `groupBy` query that projects a variable
+  that is neither a `groupBy` key nor an aggregate (`/query` returns it as a
+  per-group array). Stream rows are SPARQL-results bindings, which have no list
+  type. Aggregate the variable instead (for example
+  `(as (groupconcat ?x ", ") ?xs)`), or use `/query`. A JSON-LD `select "*"`
+  under `groupBy` is refused the same way when the `where` binds a variable
+  that is not a key (project the keys and aggregates instead), and a projected
+  variable that nothing binds is refused as unbound.
 
 ## Auth, policy, and dataset behavior
 

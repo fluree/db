@@ -267,3 +267,211 @@ async fn sparql_from_clause_is_rejected_before_streaming() {
         ),
     }
 }
+
+/// e1–e3 Net, e4–e5 Local, e6 Remote.
+async fn seed_areas() -> (support::MemoryFluree, support::MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "stream/areas:main");
+    let seed = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:e1", "ex:area": "Net"},
+            {"@id": "ex:e2", "ex:area": "Net"},
+            {"@id": "ex:e3", "ex:area": "Net"},
+            {"@id": "ex:e4", "ex:area": "Local"},
+            {"@id": "ex:e5", "ex:area": "Local"},
+            {"@id": "ex:e6", "ex:area": "Remote"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &seed).await.expect("seed").ledger;
+    (fluree, ledger)
+}
+
+/// #1978 on the stream lane: a grouped SELECT expression streams one row per
+/// group (it streamed one row per solution).
+#[tokio::test]
+async fn sparql_grouped_select_expression_streams_one_row_per_group() {
+    let (fluree, ledger) = seed_areas().await;
+    let sparql = r#"PREFIX ex: <http://example.org/>
+        SELECT (IF(?a = "Net", "network", "other") AS ?seg) (COUNT(?e) AS ?n)
+        WHERE { ?e ex:area ?a } GROUP BY ?a"#
+        .to_string();
+    let records = collect_records(&fluree, ledger, OwnedStreamQuery::Sparql(sparql)).await;
+    let last = records.last().expect("terminal record");
+    assert_eq!(last["type"], "end", "{records:?}");
+    assert_eq!(last["rows"], 3);
+    let mut rows: Vec<(String, String)> = records
+        .iter()
+        .filter(|r| r["type"] == "row")
+        .map(|r| {
+            (
+                r["row"]["seg"]["value"].as_str().unwrap().to_string(),
+                r["row"]["n"]["value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("network".to_string(), "3".to_string()),
+            ("other".to_string(), "1".to_string()),
+            ("other".to_string(), "2".to_string())
+        ]
+    );
+}
+
+/// NDJSON rows are SPARQL-results bindings, which have no list type. A JSON-LD
+/// query projecting a per-group list is refused before the stream starts (it
+/// used to stream one row per list element: 97 rows from 2 groups on a
+/// two-list query), and the error names the column.
+#[tokio::test]
+async fn jsonld_per_group_list_is_rejected_before_streaming() {
+    let (fluree, ledger) = seed_areas().await;
+    let graph = support::graphdb_from_ledger(&ledger);
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "?e"],
+        "where": {"@id": "?e", "ex:area": "?a"},
+        "groupBy": ["?a"]
+    });
+    match fluree
+        .plan_stream_query(&graph, &OwnedStreamQuery::JsonLd(query))
+        .await
+    {
+        Ok(_) => panic!("a per-group list must be rejected on the streaming endpoint"),
+        Err(e) => assert!(
+            e.to_string()
+                .contains("list-valued column ?e cannot be streamed as SPARQL-results rows"),
+            "{e}"
+        ),
+    }
+
+    drop(graph);
+
+    // Aggregated, the same grouping streams.
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "(as (count ?e) ?n)"],
+        "where": {"@id": "?e", "ex:area": "?a"},
+        "groupBy": ["?a"]
+    });
+    let records = collect_records(&fluree, ledger, OwnedStreamQuery::JsonLd(query)).await;
+    assert_eq!(records.last().expect("terminal")["rows"], 3, "{records:?}");
+}
+
+/// `select *` under `groupBy` on the `GroupByOperator` lane includes the
+/// per-group lists: `/query` returns them, and the stream refuses the query
+/// before it starts instead of silently dropping those columns. With every
+/// WHERE variable a key, it streams. So does a query whose aggregates all
+/// stream: `/query` then returns the keys and aggregates only.
+#[tokio::test]
+async fn jsonld_wildcard_with_list_columns_is_rejected_before_streaming() {
+    let (fluree, ledger) = seed_areas().await;
+    let query = |group_by: Value| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "*",
+            "where": {"@id": "?e", "ex:area": "?a"},
+            "groupBy": group_by
+        })
+    };
+
+    // `/query`: keys and per-group lists.
+    let rows = support::query_jsonld(&fluree, &ledger, &query(json!(["?a"])))
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    let net = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row.to_string().contains("\"Net\""))
+        .cloned()
+        .unwrap_or_else(|| panic!("a Net row: {rows}"));
+    assert!(
+        net.to_string().contains("ex:e1") && net.to_string().contains("ex:e3"),
+        "the Net row lists its entities: {net}"
+    );
+
+    // The stream: a 4xx before the first row.
+    let graph = support::graphdb_from_ledger(&ledger);
+    match fluree
+        .plan_stream_query(&graph, &OwnedStreamQuery::JsonLd(query(json!(["?a"]))))
+        .await
+    {
+        Ok(_) => panic!("select * with a per-group list must be rejected on the stream"),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("select * under groupBy includes list-valued columns (?e)")
+                    && message.contains("use /query"),
+                "{message}"
+            );
+        }
+    }
+    drop(graph);
+
+    let records = collect_records(
+        &fluree,
+        ledger.clone(),
+        OwnedStreamQuery::JsonLd(query(json!(["?a", "?e"]))),
+    )
+    .await;
+    assert_eq!(records.last().expect("terminal")["rows"], 6, "{records:?}");
+
+    // A `count` in HAVING: every aggregate streams, and `/query` has no list.
+    let mut counted = query(json!(["?a"]));
+    counted["having"] = json!("(> (count ?e) 0)");
+    let rows = support::query_jsonld(&fluree, &ledger, &counted)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert!(
+        rows.as_array().is_some_and(|rows| rows.len() == 3) && !rows.to_string().contains("ex:e"),
+        "the keys only: {rows}"
+    );
+    let records = collect_records(&fluree, ledger, OwnedStreamQuery::JsonLd(counted)).await;
+    assert_eq!(records.last().expect("terminal")["rows"], 3, "{records:?}");
+}
+
+/// A grouped projection of a variable nothing binds is the same named 400 on
+/// `/query` and on the stream (before it starts): unbound, not a per-group
+/// list, and never an internal id.
+#[tokio::test]
+async fn jsonld_unbound_projection_is_the_same_4xx_on_query_and_stream() {
+    let (fluree, ledger) = seed_areas().await;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "?nosuch", "(as (count ?e) ?n)"],
+        "where": {"@id": "?e", "ex:area": "?a"},
+        "groupBy": ["?a"]
+    });
+    let expected = "projected variable ?nosuch is unbound: nothing in the query binds it";
+
+    let Err(e) = support::query_jsonld(&fluree, &ledger, &query).await else {
+        panic!("/query: an unbound projected variable must be rejected");
+    };
+    let message = e.to_string();
+    assert!(
+        message.contains(expected) && !message.contains("VarId("),
+        "/query: {message}"
+    );
+    assert_eq!(e.status_code(), 400, "/query: {message}");
+
+    let graph = support::graphdb_from_ledger(&ledger);
+    let Err(e) = fluree
+        .plan_stream_query(&graph, &OwnedStreamQuery::JsonLd(query))
+        .await
+    else {
+        panic!("stream: an unbound projected variable must be rejected");
+    };
+    let message = e.to_string();
+    assert!(
+        message.contains(expected) && !message.contains("list-valued"),
+        "stream: {message}"
+    );
+    assert_eq!(e.status_code(), 400, "stream: {message}");
+}
