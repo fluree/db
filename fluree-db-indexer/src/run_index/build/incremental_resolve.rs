@@ -70,6 +70,8 @@ pub enum IncrementalResolveError {
     Resolve(ResolverError),
     /// I/O error.
     Io(io::Error),
+    /// The window cannot be applied incrementally; a full rebuild can.
+    NeedsRebuild(String),
 }
 
 impl std::fmt::Display for IncrementalResolveError {
@@ -80,6 +82,7 @@ impl std::fmt::Display for IncrementalResolveError {
             Self::CommitChain(msg) => write!(f, "commit chain: {msg}"),
             Self::Resolve(e) => write!(f, "resolve: {e}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
+            Self::NeedsRebuild(msg) => write!(f, "needs a full rebuild: {msg}"),
         }
     }
 }
@@ -676,7 +679,12 @@ pub async fn resolve_incremental_commits_v6(
     //     dictionary, or a fresh one above the base watermarks.
     let mut chunk_terms = chunk.terms;
     for term in &mut chunk_terms {
-        remap_record(term, &reconcile.subject_remap, &reconcile.string_remap)?;
+        crate::run_index::resolve::resolver::remap_term_record(
+            term,
+            &reconcile.subject_remap,
+            &reconcile.string_remap,
+        )
+        .map_err(|e| IncrementalResolveError::Resolve(ResolverError::Resolve(e)))?;
     }
     // Attachment ops replay per reifier from the attachment the base index
     // holds, so a re-point that touched one slot still moves the link.
@@ -843,6 +851,11 @@ pub async fn resolve_incremental_commits_v6(
         (new_terms, wms.into_iter().collect::<Vec<_>>())
     };
     drop(chunk_terms);
+    if root.has_annotations && root.term_dict.is_none() && !new_terms.is_empty() {
+        return Err(IncrementalResolveError::NeedsRebuild(
+            "the window holds triple terms over an annotated index built before links".to_string(),
+        ));
+    }
 
     // VECTOR_ID handles are already globally-correct: chunk inserts
     // appended to the pre-loaded base arena (step 4b) so they return

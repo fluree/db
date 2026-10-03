@@ -595,34 +595,10 @@ where
                 // their ordinal for the global handle.
                 let terms = &mut chunk_terms[ci];
                 for term in terms.iter_mut() {
-                    let local_s = term.s_id.as_u64() as usize;
-                    let global_s = *s_remap.get(local_s).ok_or_else(|| {
-                        IndexerError::StorageWrite(format!(
-                            "term subject remap miss: chunk {ci}, local_s={local_s}"
-                        ))
-                    })?;
-                    term.s_id = fluree_db_core::subject_id::SubjectId::from_u64(global_s);
-                    let kind = fluree_db_core::value_id::ObjKind::from_u8(term.o_kind);
-                    if kind == fluree_db_core::value_id::ObjKind::REF_ID {
-                        let local_o = term.o_key as usize;
-                        term.o_key = *s_remap.get(local_o).ok_or_else(|| {
-                            IndexerError::StorageWrite(format!(
-                                "term object remap miss: chunk {ci}, local_o={local_o}"
-                            ))
-                        })?;
-                    } else if kind == fluree_db_core::value_id::ObjKind::LEX_ID
-                        || kind == fluree_db_core::value_id::ObjKind::JSON_ID
-                    {
-                        let local_str = fluree_db_core::value_id::ObjKey::from_u64(term.o_key)
-                            .decode_u32_id() as usize;
-                        let global_str = *str_remap.get(local_str).ok_or_else(|| {
-                            IndexerError::StorageWrite(format!(
-                                "term string remap miss: chunk {ci}, local_str={local_str}"
-                            ))
-                        })?;
-                        term.o_key =
-                            fluree_db_core::value_id::ObjKey::encode_u32_id(global_str).as_u64();
-                    }
+                    crate::run_index::resolve::resolver::remap_term_record(
+                        term, s_remap, str_remap,
+                    )
+                    .map_err(|e| IndexerError::StorageWrite(format!("chunk {ci}: {e}")))?;
                 }
                 let mut attachments = std::mem::take(&mut chunk_attachments[ci]);
                 for op in &mut attachments {
@@ -1066,7 +1042,7 @@ where
                 crate::run_index::build::ClassMembership::build_from_global_types(&types_paths)
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
-            let spot_class_stats = {
+            let (spot_class_stats, live_term_rows) = {
                 use crate::run_index::build::SpotClassStatsCollector;
                 use crate::run_index::runs::spool::V1SpoolMergeAdapter;
                 use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
@@ -1093,16 +1069,32 @@ where
 
                 // Iterate with dedup: next_deduped() returns the winning record
                 // per identity group (highest t wins). Feed assertions to collector.
+                //
+                // Link counts come from here, not from pass 1: a commit chain can
+                // re-assert a live link (a bulk import restating an annotation),
+                // which pass 1 counts once per copy.
+                let mut live_term_rows: std::collections::BTreeMap<(u32, u32), u64> =
+                    std::collections::BTreeMap::new();
                 while let Some((winner, op)) = merge
                     .next_deduped()
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?
                 {
                     if op == 1 {
+                        if fluree_db_core::o_type::OType::from_u16(winner.o_type)
+                            == fluree_db_core::o_type::OType::TRIPLE_TERM
+                        {
+                            let inner = fluree_db_core::triple_term::term_handle_p_id(winner.o_key);
+                            *live_term_rows.entry((winner.p_id, inner)).or_insert(0) += 1;
+                        }
                         collector.on_record(&winner);
                     }
                 }
+                let live_term_rows: Vec<(u32, u32, u64)> = live_term_rows
+                    .into_iter()
+                    .map(|((p_id, inner), n)| (p_id, inner, n))
+                    .collect();
 
-                collector.finish()
+                (collector.finish(), live_term_rows)
             };
 
             // ---- Build IndexStats for FIR6 root ----
@@ -1161,7 +1153,7 @@ where
                 let root_classes =
                     fluree_db_core::index_stats::union_per_graph_classes(&final_graphs);
                 let links = crate::stats::link_stat_entries(
-                    &id_stats_result.term_rows,
+                    &live_term_rows,
                     shared.predicates.get(fluree_vocab::rdf::REIFIES),
                     |p_id| {
                         predicate_sids

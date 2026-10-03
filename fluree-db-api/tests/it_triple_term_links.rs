@@ -2203,8 +2203,9 @@ async fn construct_writes_triple_terms_as_reifications() {
 
 /// An annotated ledger whose index predates links (simulated by dropping the
 /// root's term dictionary) refuses link reads until a full rebuild links its
-/// annotations. An incremental build in between does not start a term
-/// dictionary, which would cover its window alone and lift the refusal.
+/// annotations. A new link declines the incremental build, whose term
+/// dictionary would cover its window alone and lift the refusal; the index
+/// build falls back to the full rebuild.
 #[tokio::test]
 async fn link_reads_refuse_an_index_built_before_links() {
     use fluree_db_binary_index::format::index_root::IndexRoot;
@@ -2234,7 +2235,7 @@ async fn link_reads_refuse_an_index_built_before_links() {
         (IndexRoot::decode(&bytes).expect("decode"), record.index_t)
     };
     let query = "PREFIX ex: <http://example.org/>\n\
-                 SELECT ?r WHERE { << ?s ex:knows ?o ~ ?r >> ex:src ex:x } ORDER BY ?r";
+                 SELECT ?r ?s WHERE { << ?s ex:knows ?o ~ ?r >> ex:src ex:x } ORDER BY ?r";
 
     let ledger = support::genesis_ledger(&fluree, ledger_id);
     fluree
@@ -2268,43 +2269,27 @@ async fn link_reads_refuse_an_index_built_before_links() {
         .upsert_turtle(ledger, &claim(2))
         .await
         .expect("claim 2");
-    support::build_and_publish_index(&fluree, ledger_id).await;
-    let (root, _) = current_root().await;
-    assert!(
-        root.term_dict.is_none(),
-        "an incremental build over a pre-link index must not start a term dictionary"
-    );
     let ledger = fluree.ledger(ledger_id).await.expect("load");
     assert!(support::query_sparql(&fluree, &ledger, query)
         .await
         .is_err());
 
-    // Same `t` as the incremental root, so it publishes with allow-equal.
-    let record = fluree
-        .nameservice()
-        .lookup(ledger_id)
-        .await
-        .expect("ns lookup")
-        .expect("ns record");
-    let rebuilt = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
-        ledger_id,
-        &record,
-        fluree_db_indexer::IndexerConfig::default(),
-    )
-    .await
-    .expect("rebuild");
-    fluree
-        .publisher()
-        .expect("read-write nameservice")
-        .publish_index_allow_equal(ledger_id, rebuilt.index_t, &rebuilt.root_id)
-        .await
-        .expect("publish rebuild");
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let (root, _) = current_root().await;
+    assert!(
+        root.term_dict.is_some(),
+        "the index build fell back to a rebuild"
+    );
     let ledger = fluree.ledger(ledger_id).await.expect("load");
     let result = support::query_sparql_formatted(&fluree, &ledger, query)
         .await
         .expect("a rebuilt index answers");
-    assert_eq!(rows(&result), strings(&[&["ex:claim1"], &["ex:claim2"]]));
+    // Each reifier decodes to its own triple: a dictionary started over the
+    // window alone would hand claim 2's term the handle claim 1's link holds.
+    assert_eq!(
+        rows(&result),
+        strings(&[&["ex:claim1", "ex:s1"], &["ex:claim2", "ex:s2"]])
+    );
 }
 
 /// The JSON-LD twin of `triple_constructs_the_terms_links_hold`: the

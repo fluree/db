@@ -2296,6 +2296,40 @@ impl std::error::Error for ResolverError {}
 ///
 /// Returns `None` if parsing fails (caller skips emission rather than
 /// poisoning the index with `0`).
+/// Remap a chunk term-table entry ([`SharedResolverState::resolve_term_chunk`])
+/// to global ids: its subject, and a ref or string-keyed object. A term keys
+/// a decimal, big-integer or vector object by the string id of its canonical
+/// form, so those kinds remap as strings here, though in an ordinary record
+/// they hold arena handles.
+pub fn remap_term_record(
+    term: &mut RunRecord,
+    subject_remap: &[u64],
+    string_remap: &[u32],
+) -> Result<(), String> {
+    let local_s = term.s_id.as_u64() as usize;
+    let global_s = *subject_remap
+        .get(local_s)
+        .ok_or_else(|| format!("term subject remap miss: local_s={local_s}"))?;
+    term.s_id = SubjectId::from_u64(global_s);
+    match ObjKind::from_u8(term.o_kind) {
+        ObjKind::REF_ID => {
+            let local_o = term.o_key as usize;
+            term.o_key = *subject_remap
+                .get(local_o)
+                .ok_or_else(|| format!("term object remap miss: local_o={local_o}"))?;
+        }
+        ObjKind::LEX_ID | ObjKind::JSON_ID | ObjKind::NUM_BIG | ObjKind::VECTOR_ID => {
+            let local_str = ObjKey::from_u64(term.o_key).decode_u32_id() as usize;
+            let global_str = *string_remap
+                .get(local_str)
+                .ok_or_else(|| format!("term string remap miss: local_str={local_str}"))?;
+            term.o_key = ObjKey::encode_u32_id(global_str).as_u64();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn iso_to_epoch_ms(iso: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(iso)
         .ok()
@@ -2328,6 +2362,44 @@ fn split_iri_to_value_type_tag(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod term_remap_tests {
+    use super::*;
+
+    fn term(o_kind: ObjKind, o_key: u64) -> RunRecord {
+        RunRecord {
+            g_id: 0,
+            s_id: SubjectId::from_u64(1),
+            p_id: 0,
+            dt: 0,
+            o_kind: o_kind.as_u8(),
+            op: 1,
+            o_key,
+            t: 0,
+            lang_id: 0,
+            i: LIST_INDEX_NONE,
+        }
+    }
+
+    #[test]
+    fn lexical_term_objects_remap_as_strings() {
+        let subjects = [10, 11, 12];
+        let strings = [20, 21];
+        let remapped = |kind: ObjKind, o_key: u64| {
+            let mut t = term(kind, o_key);
+            remap_term_record(&mut t, &subjects, &strings).unwrap();
+            (t.s_id.as_u64(), t.o_key)
+        };
+        let str1 = ObjKey::encode_u32_id(1).as_u64();
+        let global = ObjKey::encode_u32_id(21).as_u64();
+        for kind in [ObjKind::NUM_BIG, ObjKind::VECTOR_ID, ObjKind::LEX_ID] {
+            assert_eq!(remapped(kind, str1), (11, global), "{kind:?}");
+        }
+        assert_eq!(remapped(ObjKind::REF_ID, 2), (11, 12));
+        assert_eq!(remapped(ObjKind::NUM_INT, 7), (11, 7));
+    }
+}
 
 #[cfg(test)]
 mod tests {
