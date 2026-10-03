@@ -105,7 +105,7 @@ impl Fluree {
                         .as_ref()
                         .and_then(|s| s.graph_id_for_iri(&iri))
                 })
-                .ok_or_else(|| ApiError::invalid_query(format!("Unknown named graph '#{iri}'")))?,
+                .ok_or_else(|| ApiError::GraphNotFound(format!("<{iri}>")))?,
         };
 
         if g_id != DEFAULT_GRAPH_ID && view.binary_store.is_some() && view.dict_novelty.is_some() {

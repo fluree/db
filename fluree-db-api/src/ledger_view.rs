@@ -414,7 +414,7 @@ async fn resolve_commit_prefix(
     }
 
     match matches.len() {
-        0 => Err(ApiError::NotFound(format!(
+        0 => Err(ApiError::CommitNotFound(format!(
             "No commit found with prefix: {normalized}"
         ))),
         1 => {
@@ -458,7 +458,7 @@ async fn resolve_t_to_commit_id(
         )));
     }
     if target_t > current_t {
-        return Err(ApiError::NotFound(format!(
+        return Err(ApiError::CommitNotFound(format!(
             "Transaction t={target_t} not found (latest is t={current_t})"
         )));
     }
@@ -506,7 +506,7 @@ async fn resolve_t_to_commit_id(
     }
 
     match matches.len() {
-        0 => Err(ApiError::NotFound(format!(
+        0 => Err(ApiError::CommitNotFound(format!(
             "No commit found for t={target_t}"
         ))),
         1 => {

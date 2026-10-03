@@ -38,7 +38,7 @@ Fluree exposes two query styles over HTTP:
 - **Ledger-scoped** (`POST /query/{ledger}`): the ledger is fixed by the URL. The request may still select a **named graph inside that ledger**:
   - JSON-LD: `"from": "default"`, `"from": "txn-meta"`, or `"from": "<graph IRI>"`
   - SPARQL: `FROM <default>`, `FROM <txn-meta>`, `FROM <graph IRI>`, and `FROM NAMED <graph IRI>`
-  - `urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, is accepted wherever `default` is
+  - `urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, is accepted wherever `default` is, and `GRAPH <urn:default> { ... }` reads the default graph as `GRAPH <ledger:main>` does. A write cannot name a graph `urn:default` (see [SPARQL UPDATE](../query/sparql.md))
   - `GRAPH <iri> { ... }` and `GRAPH ?g { ... }` resolve the ledger's registered user named graphs **without** an explicit `FROM NAMED` (the reserved `#txn-meta` / `#config` graphs stay private). Supplying `FROM NAMED` still narrows resolution to exactly the graphs listed.
 
 If the request body tries to target a different ledger than the one in the URL, the server rejects it with a "Ledger mismatch" error.

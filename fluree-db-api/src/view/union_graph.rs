@@ -10,21 +10,24 @@
 use std::sync::Arc;
 
 use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
-use fluree_db_core::{GraphId, DEFAULT_GRAPH_ID};
+use fluree_db_core::{GraphId, DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI};
 use fluree_db_query::{DataSet, ExecutableQuery, GraphRef};
 
 use crate::view::{DataSetDb, GraphDb};
 use crate::{Fluree, Result};
 
 /// `view`'s user named graphs: every registered graph except the reserved
-/// `#txn-meta` / `#config` graphs and a graph named like the ledger itself,
-/// whose alias names its default graph. The set `GRAPH ?g` ranges over.
+/// `#txn-meta` / `#config` graphs and a graph registered under a name of the
+/// default graph (the ledger alias, `urn:default`). The set `GRAPH ?g` ranges
+/// over.
 fn user_graphs(view: &GraphDb) -> impl Iterator<Item = (GraphId, &str)> {
     let alias = view.snapshot.ledger_id.as_str();
     view.snapshot
         .graph_registry
         .iter_entries()
-        .filter(move |(g_id, iri)| *g_id >= FIRST_USER_GRAPH_ID && *iri != alias)
+        .filter(move |(g_id, iri)| {
+            *g_id >= FIRST_USER_GRAPH_ID && *iri != alias && *iri != DEFAULT_GRAPH_IRI
+        })
 }
 
 /// `view`'s graph `g_id` as a dataset member, under `view`'s policy.
@@ -136,10 +139,10 @@ impl Fluree {
 /// alone. [`Fluree::build_executable_for_view`] settles which.
 ///
 /// The ledger's default graph and each user named graph are default-graph
-/// members. Each named graph stays addressable by `GRAPH` and the ledger alias
-/// still names the default graph alone, as without the union: the dataset is
-/// [implicit](DataSet::implicit), so only default-graph patterns read it
-/// differently.
+/// members. Each named graph stays addressable by `GRAPH`, and the ledger alias
+/// and `urn:default` still name the default graph alone, as without the union:
+/// the dataset is [implicit](DataSet::implicit), so only default-graph patterns
+/// read it differently.
 pub(crate) fn union_default_dataset<'a>(
     view: &'a GraphDb,
     executable: &ExecutableQuery,
@@ -153,7 +156,8 @@ pub(crate) fn union_default_dataset<'a>(
         .with_named_graph_alias(
             view.snapshot.ledger_id.as_str(),
             member(view, DEFAULT_GRAPH_ID),
-        );
+        )
+        .with_named_graph_alias(DEFAULT_GRAPH_IRI, member(view, DEFAULT_GRAPH_ID));
     for (g_id, iri) in user_graphs(view) {
         ds = ds
             .with_default_graph(member(view, g_id))

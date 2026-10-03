@@ -109,6 +109,7 @@ There are two ways to target graphs in `insert` / `delete` templates:
 Notes:
 - `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`)
 - The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in a top-level `graph` and in `from`: the update reads and writes the default graph and never creates a named graph called by the address. A per-node `@graph` or a `["graph", …]` template resolves the address like any other graph IRI. `urn:fluree:mydb:main#config` is the config graph, not the address.
+- `urn:default` names the default graph in a top-level `graph`, in `from` and `fromNamed`, and in a `["graph", "urn:default", …]` pattern in the `where`. A per-node `@graph` or a `["graph", …]` template naming `urn:default` is refused with a `400`, since the default graph is not a named graph.
 - Named-graph reads are available after indexing completes (see `docs/query/datasets.md`)
 
 ## Dataset scoping for WHERE (`from` / `fromNamed`)

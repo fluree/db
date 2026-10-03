@@ -1204,6 +1204,8 @@ SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
 
 The ledger’s own address (`mydb`, `mydb:main` or `urn:fluree:mydb:main`, with no `#fragment` and no time pin) names the ledger’s default graph in `USING` and `WITH`. `WITH <mydb:main>` therefore reads and writes the default graph and never creates a named graph called `mydb:main`. Only these two clauses treat the address this way: a `GRAPH <iri>` block in a template or in the `WHERE`, `USING NAMED`, and an `INSERT DATA`/`DELETE DATA` quad resolve it like any other graph IRI. The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
 
+`urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, names the default graph in every clause that reads a graph: `USING`, `USING NAMED`, `WITH`, and `GRAPH <urn:default>` in the `WHERE`. `WITH <urn:default>` also writes the default graph. The default graph is not a named graph, so a write that names one by it (a `GRAPH <urn:default>` template or `INSERT DATA` quad, `CREATE GRAPH`, or a `CLEAR`/`DROP`/`ADD`/`COPY`/`MOVE` operand) is refused with a `400`; leave out `GRAPH`, or write `DEFAULT` in graph management.
+
 ### Graph variables in templates
 
 A `GRAPH ?g { ... }` block in an INSERT or DELETE template writes to whichever graph `?g` names in each `WHERE` solution. This rewrites every match in the graph it was found in:

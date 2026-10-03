@@ -41,7 +41,13 @@ pub const CONFIG_GRAPH_ID: GraphId = 2;
 pub const FIRST_USER_GRAPH_ID: GraphId = 3;
 
 /// The name ledger info gives the default graph, which has no IRI of its own.
-/// Anywhere a graph within a ledger is addressed, it names the default graph.
+///
+/// It names the default graph wherever a graph is read or chosen as a default
+/// graph: a query's dataset and `GRAPH` patterns, an update's `USING` /
+/// `USING NAMED` / `WITH` and `GRAPH` patterns in its WHERE, and the JSON-LD
+/// twins. The default graph is no named graph, so a write that names a graph
+/// by it (a `GRAPH` template or quad, a TriG block, an import, a graph
+/// management or sync target) is refused rather than creating one.
 pub const DEFAULT_GRAPH_IRI: &str = "urn:default";
 
 /// Construct the ledger-scoped txn-meta graph IRI from a ledger ID.

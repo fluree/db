@@ -756,7 +756,7 @@ impl Operator for GraphOperator {
             if ctx.explicit_dataset().is_none() {
                 if let GraphName::Iri(iri) = &graph_name {
                     let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                    let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                    let is_alias = ctx.names_default_graph(iri);
                     let is_r2rml_gs = !is_user_graph
                         && !is_alias
                         && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
@@ -796,10 +796,11 @@ impl Operator for GraphOperator {
                             }
                             // else: graph not found → no output for this row
                         } else {
-                            // Single-db: a registered user graph, the ledger
-                            // alias (default graph), or an R2RML graph source.
+                            // Single-db: a registered user graph, a name of
+                            // the default graph (`names_default_graph`), or an
+                            // R2RML graph source.
                             let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                            let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                            let is_alias = ctx.names_default_graph(iri);
                             let is_r2rml_gs = !is_user_graph
                                 && !is_alias
                                 && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
@@ -845,8 +846,7 @@ impl Operator for GraphOperator {
                                     // Single-db: same resolution as the concrete arm.
                                     let is_user_graph =
                                         ctx.single_db_user_graph_id(&bound_iri).is_some();
-                                    let is_alias =
-                                        bound_iri.as_ref() == ctx.active_snapshot.ledger_id;
+                                    let is_alias = ctx.names_default_graph(&bound_iri);
                                     let is_r2rml_gs = !is_user_graph
                                         && !is_alias
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {

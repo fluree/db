@@ -326,6 +326,23 @@ pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// A graph the addressed ledger does not have (404).
+    ///
+    /// Deliberately not [`ApiError::is_not_found`]: that condition means "no
+    /// such ledger" and sends a lookup on to graph sources, while here the
+    /// ledger exists and only the graph is missing.
+    #[error("Graph not found: {0}")]
+    GraphNotFound(String),
+
+    /// A commit reference (a CID, a hex prefix, a `t`) that names no commit of
+    /// the ledger it is resolved in (404).
+    ///
+    /// Deliberately not [`ApiError::is_not_found`], for the reason
+    /// [`ApiError::GraphNotFound`] is not: the ledger exists, and a time pin
+    /// that resolves to no commit must not read as a missing ledger.
+    #[error("{0}")]
+    CommitNotFound(String),
+
     /// Ledger already exists
     #[error("Ledger already exists: {0}")]
     LedgerExists(String),
@@ -623,7 +640,8 @@ impl ApiError {
             ApiError::InvalidLedgerId(_) => 400,
             ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
             ApiError::BranchConflict(_) => 409,
-            ApiError::NotFound(_) => 404,
+            ApiError::NotFound(_) | ApiError::GraphNotFound(_) => 404,
+            ApiError::CommitNotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
             ApiError::LedgerExists(_) => 409,
             ApiError::ReindexConflict { .. } => 409,

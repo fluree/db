@@ -366,11 +366,11 @@ async fn malformed_path_pin_is_a_400() {
     }
 }
 
-/// A commit pin the ledger cannot resolve is the caller's mistake: a 400 on
-/// every surface that takes one, naming the cause. Each of these passes the
-/// address grammar and was a 500 from the resolver.
+/// A malformed commit pin is the caller's mistake: a 400 on every surface that
+/// takes one, naming the cause. Each of these passes the address grammar and
+/// was a 500 from the resolver.
 #[tokio::test]
-async fn an_unresolvable_commit_pin_is_a_400() {
+async fn a_malformed_commit_pin_is_a_400() {
     let (_tmp, app, commit1) = fixture().await;
     let from = |iri: &str| {
         format!("PREFIX ex: <http://ex.org/> SELECT ?s ?n FROM <{iri}> WHERE {{ ?s ex:name ?n }}")
@@ -380,7 +380,6 @@ async fn an_unresolvable_commit_pin_is_a_400() {
         // Too short once `sha256:` is stripped.
         ("sha256:abc", "at least 6 characters"),
         (&commit1.id[..8], "abbreviated CID"),
-        ("ffffffff", "No commit found"),
     ] {
         let pin = format!("@commit:{commit}");
         let (status, body) = sparql(&app, &query_uri(&pin), SPARQL_DEFAULT).await;
@@ -408,6 +407,55 @@ async fn an_unresolvable_commit_pin_is_a_400() {
             StatusCode::BAD_REQUEST,
             "branch at {commit}: {body}"
         );
+    }
+}
+
+/// A commit reference that names no commit is a 404 typed
+/// `err:db/CommitNotFound`, apart from a missing ledger, on every surface that
+/// resolves one: a query's pin, branch create's `at`, commit show and revert.
+/// The pins were a 500, and the others a 404 labelled `err:db/LedgerNotFound`.
+#[tokio::test]
+async fn a_commit_reference_that_names_no_commit_is_a_404() {
+    let (_tmp, app, _) = fixture().await;
+    let missing = "ffffffff";
+    let pin = format!("@commit:{missing}");
+    let json_ct = [("content-type", "application/json")];
+
+    let (status, body) = sparql(&app, &query_uri(&pin), SPARQL_DEFAULT).await;
+    let mut responses = vec![("path pin", status, body)];
+    let sparql_from = format!(
+        "PREFIX ex: <http://ex.org/> SELECT ?s ?n FROM <{LEDGER}{pin}> WHERE {{ ?s ex:name ?n }}"
+    );
+    let (status, body) = sparql(&app, "/v1/fluree/query", &sparql_from).await;
+    responses.push(("FROM pin", status, body));
+    let jsonld_from = with(
+        jsonld_default(),
+        "from",
+        json!({ "@id": LEDGER, "at": missing }),
+    );
+    let (status, body) = jsonld(&app, "/v1/fluree/query", &jsonld_from).await;
+    responses.push(("JSON-LD from at", status, body));
+    let branch = json!({ "ledger": "pinned", "branch": "b-missing", "at": missing });
+    let (status, body) = jsonld(&app, "/v1/fluree/branch", &branch).await;
+    responses.push(("branch create at", status, body));
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/v1/fluree/show/{LEDGER}?commit={missing}"),
+        &[],
+        "",
+    )
+    .await;
+    responses.push(("commit show", status, body));
+    let revert = json!({ "ledger": "pinned", "branch": "main", "commit": missing }).to_string();
+    let (status, body) = send(&app, "POST", "/v1/fluree/revert", &json_ct, revert).await;
+    responses.push(("revert", status, body));
+
+    for (surface, status, body) in responses {
+        assert_eq!(status, StatusCode::NOT_FOUND, "{surface}: {body}");
+        let json: JsonValue = serde_json::from_str(&body).unwrap_or_else(|_| panic!("{body}"));
+        assert_eq!(json["@type"], "err:db/CommitNotFound", "{surface}: {body}");
+        assert!(body.contains(missing), "{surface}: {body}");
     }
 }
 

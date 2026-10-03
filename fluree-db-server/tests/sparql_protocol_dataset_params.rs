@@ -287,10 +287,11 @@ async fn a_value_that_is_not_an_iri_is_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
 }
 
-/// A graph the ledger does not hold is the caller's mistake: a 400 naming the
-/// graph, on both routes. It was a 500.
+/// A graph the ledger does not hold is a 404 naming the graph, typed
+/// `err:db/GraphNotFound` so it reads apart from a missing ledger, on both
+/// routes. It was a 500.
 #[tokio::test]
-async fn a_graph_the_ledger_does_not_hold_is_a_400() {
+async fn a_graph_the_ledger_does_not_hold_is_a_404() {
     let (_tmp, app) = seeded_app().await;
     let unknown = "http://ex.org/nope";
 
@@ -304,7 +305,11 @@ async fn a_graph_the_ledger_does_not_hold_is_a_400() {
         for key in ["default-graph-uri", "named-graph-uri"] {
             let (status, json) =
                 get_query(&app, &path, NAMES, &format!("{key}={}", enc(&graph))).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {key}: {json}");
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path} {key}: {json}");
+            assert_eq!(
+                json["@type"], "err:db/GraphNotFound",
+                "{path} {key}: {json}"
+            );
             assert!(json.to_string().contains(unknown), "{json}");
         }
     }

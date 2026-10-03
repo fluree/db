@@ -1410,7 +1410,7 @@ impl<'a> ExecutionContext<'a> {
     /// reserved for the default graph and never resolves here, even if a
     /// registered graph shares the ledger's IRI.
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
-        if self.explicit_dataset().is_some() || iri == self.active_snapshot.ledger_id.as_str() {
+        if self.explicit_dataset().is_some() || self.names_default_graph(iri) {
             return None;
         }
         self.active_snapshot
@@ -1421,19 +1421,25 @@ impl<'a> ExecutionContext<'a> {
 
     /// User-registered named graph IRIs of the active snapshot, for `GRAPH ?g`
     /// discovery. Excludes the default, reserved system graphs, and any graph
-    /// colliding with the ledger alias (which addresses the default graph);
-    /// empty when the query names a dataset.
+    /// registered under a name that addresses the default graph (see
+    /// [`Self::names_default_graph`]); empty when the query names a dataset.
     pub fn single_db_user_graph_iris(&self) -> Vec<Arc<str>> {
         if self.explicit_dataset().is_some() {
             return Vec::new();
         }
-        let alias = self.active_snapshot.ledger_id.as_str();
         self.active_snapshot
             .graph_registry
             .iter_entries()
-            .filter(|(g, iri)| *g >= FIRST_USER_GRAPH_ID && *iri != alias)
+            .filter(|(g, iri)| *g >= FIRST_USER_GRAPH_ID && !self.names_default_graph(iri))
             .map(|(_, iri)| Arc::from(iri))
             .collect()
+    }
+
+    /// Whether `GRAPH <iri>` addresses the active ledger's default graph: the
+    /// ledger alias, or `urn:default`
+    /// ([`DEFAULT_GRAPH_IRI`](fluree_db_core::DEFAULT_GRAPH_IRI)).
+    pub fn names_default_graph(&self, iri: &str) -> bool {
+        iri == self.active_snapshot.ledger_id.as_str() || iri == fluree_db_core::DEFAULT_GRAPH_IRI
     }
 
     /// Create a new context with a specific named graph active
