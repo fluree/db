@@ -457,7 +457,7 @@ ex:dataset-import-2024-01-22 a ex:DatasetImport ;
 
 ## Edge annotations (RDF 1.2 / Turtle-star)
 
-The Turtle parser (which also reads N-Triples) accepts the RDF 1.2 *asserting* forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer. All of them store the same `rdf:reifies` link that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so cascade retracts and hydration treat every surface as one, and the annotations are queryable from every query surface:
+The Turtle parser (which also reads N-Triples) accepts the RDF 1.2 reifying forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer. All of them store the same `rdf:reifies` link that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so retractions and hydration treat every surface as one, and the annotations are queryable from every query surface:
 
 ```turtle
 @prefix ex:  <http://example.org/> .

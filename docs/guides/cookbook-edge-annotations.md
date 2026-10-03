@@ -170,9 +170,9 @@ Once you've bound the annotation — by `@id` or by selector — it's an ordinar
 }
 ```
 
-## Retract an edge — and understand the cascade
+## Retract an edge — and understand what stays
 
-Retracting the base edge cascades to the annotation's attachment. What happens to the annotation's *body* depends on the mode.
+Retracting the base edge retracts that triple and nothing else, as RDF 1.2 defines it: the annotation's link and body stay, and the annotation syntax (`@annotation`, `{| |}`) stops matching it because it joins the edge. `@reifies` still finds it.
 
 ```json
 {
@@ -183,8 +183,7 @@ Retracting the base edge cascades to the annotation's attachment. What happens t
 }
 ```
 
-- **RDF mode (default):** anonymous annotation subjects on the edge are fully removed (attachment + body). Explicit-IRI annotations keep their body facts as ordinary RDF — only the attachment is retracted, so a user-named resource is never deleted by surprise.
-- **LPG mode (`opts.lpgEdgeLifecycle: true`):** explicit-IRI annotations cascade their body too — the property-graph "delete the relationship deletes its properties" lifecycle.
+To delete the edge's annotations with it — the property-graph "delete the relationship deletes its properties" lifecycle — set LPG mode:
 
 ```json
 {
@@ -193,7 +192,7 @@ Retracting the base edge cascades to the annotation's attachment. What happens t
 }
 ```
 
-History preserves both events either way — query at the pre-retract `t` and the annotation comes back. See [Retractions](../transactions/retractions.md#edge-annotation-cascade) for the metadata-only-retract and same-transaction-replacement rules.
+History preserves every event either way — query at the pre-retract `t` and the annotation comes back. See [Retractions](../transactions/retractions.md#edge-annotation-cascade).
 
 ## The same patterns in SPARQL 1.2
 
@@ -291,12 +290,12 @@ SPARQL
 The natural-looking SPARQL form deletes more than the claim:
 
 ```sparql
-# Retracts the base edge ex:alice ex:knows ex:bob — and with it the
-# attachment of EVERY claim on that edge, not only ex:claim1.
+# Retracts the base edge ex:alice ex:knows ex:bob — so the annotation
+# syntax stops matching EVERY claim on that edge, not only ex:claim1.
 DELETE DATA { ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} . }
 ```
 
-`DELETE DATA` / `DELETE WHERE` with an annotation tail always retract the base edge, and the edge retract cascades to all of its annotations ([Retractions](../transactions/retractions.md#edge-annotation-cascade)). SPARQL has no form for "retract this one claim, keep the edge". Use the JSON-LD by-id retract, which removes exactly one attachment:
+`DELETE DATA` / `DELETE WHERE` with an annotation tail always retract the base edge ([Retractions](../transactions/retractions.md#edge-annotation-cascade)). To retract one claim and keep the edge, retract its link — the JSON-LD by-id retract, which removes exactly one attachment:
 
 ```json
 {
@@ -308,12 +307,12 @@ DELETE DATA { ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} . }
 }
 ```
 
-The edge and every other claim on it stay live. In RDF mode the named claim's body (`ex:confidence`, `ex:source`) survives as ordinary RDF about `ex:claim1` — retract it in the same transaction if it should go too; in LPG mode (`opts.lpgEdgeLifecycle: true`) the body is removed with the attachment.
+The edge and every other claim on it stay live. The named claim's body (`ex:confidence`, `ex:source`) survives as ordinary RDF about `ex:claim1` — retract it in the same transaction if it should go too; in LPG mode (`opts.lpgEdgeLifecycle: true`) the body is removed with the attachment.
 
 ## Gotchas
 
 - **One annotation `@id` may reify several triples**, and a single edge carries many parallel annotations. To re-home an explicit-IRI annotation, retract the old attachment and assert the new one in the same transaction; a JSON-LD upsert of the annotation does that for you.
-- **Deleting a claim with `DELETE DATA { … ~ :claim {| … |} }` deletes the edge** and detaches every other claim on it. Retract one claim with the JSON-LD by-id form (see [above](#retract-one-claim-and-keep-the-edge)).
+- **Deleting a claim with `DELETE DATA { … ~ :claim {| … |} }` deletes the edge**, so the annotation syntax stops matching every other claim on it. Retract one claim with the JSON-LD by-id form (see [above](#retract-one-claim-and-keep-the-edge)).
 - **Don't write `f:reifies*` predicates by hand.** They're reserved and rejected on every write surface; they're also hidden from `?p` scans and `select: "*"`. Use `@annotation` / the annotation tail. (See [Vocabulary](../reference/vocabulary.md#edge-annotation-predicates-reserved).)
 - **Empty `@annotation: {}`** is a no-op in RDF mode (no subject minted); in LPG mode it mints a property-less relationship with identity.
 - **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements, triple terms as object values, annotation output in Turtle/CONSTRUCT, and the SPARQL 1.2 triple-term functions (`TRIPLE`, `isTRIPLE`, …). See [Current limits](../concepts/edge-annotations.md#current-limits).

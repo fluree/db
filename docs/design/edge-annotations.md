@@ -37,13 +37,14 @@ Query lowering of annotation patterns is described in [Annotation patterns read 
 
 ## Transaction-time rules
 
-`cascade_attachment_retracts` keeps links pointing at live edges:
+A transaction retracts what it names. RDF 1.2 deletes nothing else when a triple goes: a reifier's link and body outlive the triple it reifies, and the annotation syntax, which joins the triple, stops matching them.
 
-1. A retracted triple retracts every link naming it (a POST probe on `rdf:reifies` with the term as the object).
-2. A transaction that retracts all of a reifier's body retracts its links.
-3. A reifier left with no link loses its body when it is a blank node, or in LPG mode (`opts.lpgEdgeLifecycle`, which Cypher `DELETE` sets); an IRI reifier's body otherwise stays as ordinary RDF.
+LPG mode (`opts.lpgEdgeLifecycle`, which Cypher `DELETE` sets) adds the property-graph relationship lifecycle in `cascade_attachment_retracts`:
 
-The cascade is a Fluree rule, not an entailment: RDF 1.2 does not delete a reifier's statements when the triple it reifies is deleted. Annotation-syntax reads rely on it (see below). A ledger that has never held an annotation pays nothing: `snapshot.has_annotations` and `Novelty::has_annotations` gate the pass.
+1. A retracted triple retracts every link naming it (a POST probe on `rdf:reifies` with the term as the object, in the triple's graph).
+2. A reifier left with no link loses its body.
+
+A ledger that has never held an annotation pays nothing: `snapshot.has_annotations` and `Novelty::has_annotations` gate the pass.
 
 A reifier may reify several triples. Re-pointing one is a retract of the old link and an assert of the new; a JSON-LD upsert does that for a reifier it names. In LPG mode, an empty `@annotation: {}` mints a fresh property-less reifier so the relationship keeps an identity; in RDF mode it writes nothing.
 

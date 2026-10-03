@@ -42,7 +42,7 @@ Binary columnar index format: branch/leaf/leaflet hierarchy, dictionary artifact
 
 ### [Edge annotations (storage internals)](edge-annotations.md)
 
-Storage of RDF 1.2 edge annotations: the `rdf:reifies` link as the record, the term dictionary that indexes it, the transaction-time cascade, and ledgers written before links. (User-facing contract lives in [Edge annotations (concept doc)](../concepts/edge-annotations.md).)
+Storage of RDF 1.2 edge annotations: the `rdf:reifies` link as the record, the term dictionary that indexes it, the LPG-mode transaction-time cascade, and ledgers written before links. (User-facing contract lives in [Edge annotations (concept doc)](../concepts/edge-annotations.md).)
 
 ### [Spatial Index](spatial-index.md)
 

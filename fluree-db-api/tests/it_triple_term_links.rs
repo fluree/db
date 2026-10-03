@@ -1069,11 +1069,12 @@ async fn change_claims_without_indexing(
             ledger,
             &json!({
                 "@context": { "ex": "http://example.org/" },
-                "delete": { "@id": "ex:alice", "ex:knows": { "@id": "ex:carol" } }
+                "delete": { "@id": "ex:alice", "ex:knows": { "@id": "ex:carol" } },
+                "opts": { "lpgEdgeLifecycle": true }
             }),
         )
         .await
-        .expect("retract an annotated edge")
+        .expect("retract an annotated edge and its relationship")
         .ledger
 }
 

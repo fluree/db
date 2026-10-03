@@ -245,9 +245,9 @@ async fn links_in(
 }
 
 /// TriG import writes a GRAPH block's link into that graph, naming the
-/// block's edge, and deleting that edge must cascade to it.
+/// block's edge; deleting the edge leaves the link, as RDF 1.2 does.
 #[tokio::test]
-async fn imported_trig_star_link_lands_in_its_graph_and_cascades() {
+async fn imported_trig_star_link_lands_in_its_graph_and_outlives_its_edge() {
     let alias = "it/import-trig-star:graph-anchored";
     let trig = format!(
         "@prefix ex: <http://example.org/> .\n\
@@ -277,11 +277,9 @@ async fn imported_trig_star_link_lands_in_its_graph_and_cascades() {
         .await
         .expect("delete the imported base edge");
 
+    // RDF 1.2: deleting a triple leaves its reifier's link.
     let remaining = links_in(&fluree, alias, CLAIMS_GRAPH).await;
-    assert!(
-        remaining.is_empty(),
-        "the claim's link must not outlive the edge it reifies: {remaining:#?}"
-    );
+    assert_eq!(remaining.len(), 1, "{remaining:#?}");
 }
 
 /// A multi-chunk import: a fixture large enough to be cut up, with star

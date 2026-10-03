@@ -382,7 +382,7 @@ Inline `@annotation` queries return one row per occurrence.
 - Annotation-of-annotation (nested `@annotation` inside an annotation body).
 - Hand-authored mention of the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations (compact or full IRI form).
 
-For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).
+For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For what a retraction leaves, and the LPG-mode cascade, see [Retractions](retractions.md#edge-annotation-cascade).
 
 ## Turtle and TriG
 

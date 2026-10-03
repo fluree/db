@@ -851,125 +851,98 @@ async fn annotation_rooted_query_returns_no_rows_when_metadata_doesnt_match() {
     );
 }
 
+/// Retracting a base edge leaves its reifier and link (RDF 1.2): `@reifies`
+/// still finds the claim and the annotation syntax, which joins the edge,
+/// stops matching it until the edge is asserted again. In LPG mode the
+/// retract deletes the relationship: the link goes with the edge, so
+/// re-asserting the edge alone brings no claim back.
 #[tokio::test]
-async fn retracting_base_edge_cascades_f_reifies_bundle() {
-    // M1b cascade: when a base edge is retracted, the `f:reifies*`
-    // bundle pointing at it must be retracted in the same
-    // transaction so the durable encoding doesn't keep orphaned
-    // attachment pointers.
-    //
-    // The naïve "post-delete @reifies returns zero rows" check is
-    // ambiguous: the base-edge triple emitted by the M1b expansion
-    // *also* drops the row when the edge isn't currently asserted,
-    // so zero rows after delete tells us nothing about whether the
-    // f:reifies* bundle was retracted or merely orphaned.
-    //
-    // The discriminating test: after the cascade-eligible delete,
-    // re-insert *just* the base edge (no `@annotation` block). This
-    // re-asserts the visibility-check edge but does not re-emit any
-    // f:reifies* facts. So:
-    //   - if cascade fired, the f:reifies* facts are retracted,
-    //     re-inserting the edge doesn't bring them back, and
-    //     `@reifies` returns zero rows.
-    //   - if cascade didn't fire, the f:reifies* facts are still
-    //     asserted from the original insert, the visibility check
-    //     now passes, and `@reifies` returns the original
-    //     annotation — proving the bundle was orphaned, not cleaned.
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/edge-annotations:cascade-base-retract";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+async fn retracting_a_base_edge_keeps_its_reifier_outside_lpg_mode() {
+    for lpg in [false, true] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = "it/edge-annotations:base-retract";
+        let ledger0 = genesis_ledger(&fluree, ledger_id);
 
-    // 1. Insert an annotated edge.
-    let insert = json!({
-        "@context": ctx(),
-        "@id": "ex:alice",
-        "ex:worksFor": {
-            "@id": "ex:acme",
-            "@annotation": {
-                "@id": "ex:emp/alice-acme",
-                "ex:role": "Engineer"
+        let insert = json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" }
             }
+        });
+        let after_insert = fluree
+            .insert(ledger0, &insert)
+            .await
+            .expect("annotated insert");
+
+        let reified = json!({
+            "@context": ctx(),
+            "select": ["?person", "?org"],
+            "where": {
+                "ex:role": "Engineer",
+                "@reifies": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
+            }
+        });
+        let annotated = json!({
+            "@context": ctx(),
+            "select": ["?role"],
+            "where": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "?role" } }
+            }
+        });
+        let rows = |ledger: &MemoryLedger, q: &JsonValue| {
+            let (fluree, ledger, q) = (&fluree, ledger.clone(), q.clone());
+            async move {
+                support::query_jsonld_formatted(fluree, &ledger, &q)
+                    .await
+                    .expect("query")
+                    .as_array()
+                    .expect("array")
+                    .len()
+            }
+        };
+        assert_eq!(rows(&after_insert.ledger, &reified).await, 1);
+
+        let mut delete = json!({
+            "@context": ctx(),
+            "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+            "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+        });
+        if lpg {
+            delete["opts"] = json!({ "lpgEdgeLifecycle": true });
         }
-    });
-    let after_insert = fluree
-        .insert(ledger0, &insert)
-        .await
-        .expect("annotated insert");
+        let after_delete = fluree
+            .update(after_insert.ledger, &delete)
+            .await
+            .expect("base-edge delete");
+        assert_eq!(
+            rows(&after_delete.ledger, &reified).await,
+            usize::from(!lpg),
+            "[lpg={lpg}] the link outlives the edge only outside LPG mode"
+        );
+        assert_eq!(
+            rows(&after_delete.ledger, &annotated).await,
+            0,
+            "[lpg={lpg}] the annotation syntax needs the edge"
+        );
 
-    let q = json!({
-        "@context": ctx(),
-        "select": ["?person", "?org"],
-        "where": {
-            "ex:role": "Engineer",
-            "@reifies": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
-        }
-    });
-
-    // Sanity: the annotation is reachable via @reifies before delete.
-    let pre = support::query_jsonld_formatted(&fluree, &after_insert.ledger, &q)
-        .await
-        .expect("pre-cascade query");
-    assert_eq!(
-        pre.as_array().expect("array").len(),
-        1,
-        "@reifies should find the annotation before cascade: {pre:#?}"
-    );
-
-    // 2. Retract the base edge via SPARQL-style update. The
-    //    transactor's cascade pass should retract the corresponding
-    //    `f:reifies*` bundle automatically.
-    let delete = json!({
-        "@context": ctx(),
-        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
-        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
-    });
-    let after_delete = fluree
-        .update(after_insert.ledger, &delete)
-        .await
-        .expect("base-edge delete");
-
-    // 3. Re-insert *only* the base edge. No `@annotation` block,
-    //    so no f:reifies* assertions are emitted by the lowering.
-    let reinsert = json!({
-        "@context": ctx(),
-        "@id": "ex:alice",
-        "ex:worksFor": { "@id": "ex:acme" }
-    });
-    let after_reinsert = fluree
-        .insert(after_delete.ledger, &reinsert)
-        .await
-        .expect("plain re-insert");
-
-    // 4. The base edge is now currently asserted again (visibility
-    //    check passes), so any zero-row result must come from the
-    //    f:reifies* facts being retracted — the cascade contract.
-    let post = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &q)
-        .await
-        .expect("post-cascade-and-reinsert query");
-    let arr = post.as_array().expect("array");
-    assert!(
-        arr.is_empty(),
-        "after cascade + plain re-insert, @reifies must return zero rows \
-         (proving the f:reifies* bundle was retracted, not just orphaned). got: {arr:#?}"
-    );
-
-    // Cross-check: a bare-triple query for the re-inserted edge
-    // must return one row, confirming the visibility-check side of
-    // the proof — the edge IS currently asserted, so zero rows
-    // above isn't a visibility miss.
-    let bare = json!({
-        "@context": ctx(),
-        "select": ["?person", "?org"],
-        "where": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
-    });
-    let bare_rows = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &bare)
-        .await
-        .expect("bare triple query after re-insert");
-    assert_eq!(
-        bare_rows.as_array().expect("array").len(),
-        1,
-        "the re-inserted base edge must be currently asserted (cross-check)"
-    );
+        let reinsert = json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme" }
+        });
+        let after_reinsert = fluree
+            .insert(after_delete.ledger, &reinsert)
+            .await
+            .expect("plain re-insert");
+        assert_eq!(
+            rows(&after_reinsert.ledger, &annotated).await,
+            usize::from(!lpg),
+            "[lpg={lpg}] re-asserting the edge brings back only a claim whose link survived"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1151,12 +1124,13 @@ async fn first_annotation_through_incremental_index_flips_has_annotations() {
                  fast-path would skip post-reindex retracts)"
             );
 
-            // Step 4: retract the base edge. The cascade gate sees
-            // `snapshot.has_annotations = true` so the scan runs.
+            // Step 4: retract the base edge in LPG mode. The cascade gate
+            // sees `snapshot.has_annotations = true` so the scan runs.
             let delete = json!({
                 "@context": ctx(),
                 "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
-                "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+                "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+                "opts": { "lpgEdgeLifecycle": true }
             });
             let after_delete = fluree
                 .update(post_reindex, &delete)
@@ -1250,7 +1224,8 @@ async fn cascade_fires_for_indexed_annotation_when_edge_is_retracted() {
             let delete = json!({
                 "@context": ctx(),
                 "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
-                "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+                "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+                "opts": { "lpgEdgeLifecycle": true }
             });
             let after_delete = fluree.update(reloaded, &delete).await.expect("delete");
 
@@ -1441,86 +1416,57 @@ async fn subject_expansion_emits_no_annotation_when_edge_has_none() {
     );
 }
 
+/// An anonymous annotation's body is ordinary RDF about its blank-node
+/// reifier: it outlives the edge (RDF 1.2), unless the retract runs in LPG
+/// mode, where deleting the edge deletes the relationship and its properties.
 #[tokio::test]
-async fn cascade_cleans_up_anonymous_annotation_metadata() {
-    // RDF-mode cleanup contract: when the cascade retracts the
-    // `f:reifies*` bundle for an anonymous (blank-node) annotation,
-    // it must also retract the annotation's body metadata. Without
-    // this, the body flakes (`_:fluree_ann_0 ex:role "Engineer"`)
-    // remain in the graph as orphaned RDF — unreachable through
-    // `@reifies` (the bundle is gone) but still discoverable via
-    // a `?s ex:role "Engineer"` scan.
-    //
-    // Explicit-IRI annotations are deliberately NOT cleaned up in
-    // RDF mode — they're user-addressable subjects that may have
-    // independent meaning. The opt-in `lpgEdgeLifecycle` flag
-    // would extend cleanup to those; not in scope here.
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/edge-annotations:cascade-anonymous-metadata";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+async fn anonymous_annotation_body_outlives_its_edge_outside_lpg_mode() {
+    for lpg in [false, true] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = "it/edge-annotations:anonymous-body";
+        let ledger0 = genesis_ledger(&fluree, ledger_id);
+        let txn = json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "Engineer" } }
+        });
+        let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
 
-    // Insert with an *anonymous* annotation (no @id on the
-    // annotation block — the lowering mints a blank-node SID).
-    let txn = json!({
-        "@context": ctx(),
-        "@id": "ex:alice",
-        "ex:worksFor": {
-            "@id": "ex:acme",
-            "@annotation": { "ex:role": "Engineer" }
+        let mut delete = json!({
+            "@context": ctx(),
+            "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+            "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+        });
+        if lpg {
+            delete["opts"] = json!({ "lpgEdgeLifecycle": true });
         }
-    });
-    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+        let after_delete = fluree
+            .update(after_insert.ledger, &delete)
+            .await
+            .expect("delete");
 
-    // Sanity: the role is queryable before the cascade.
-    let q_role = json!({
-        "@context": ctx(),
-        "select": ["?role"],
-        "where": { "ex:role": "?role" }
-    });
-    let pre = support::query_jsonld_formatted(&fluree, &after_insert.ledger, &q_role)
-        .await
-        .expect("pre-cascade role query");
-    assert_eq!(
-        pre.as_array().expect("array").len(),
-        1,
-        "ex:role should be present before cascade: {pre:#?}"
-    );
-
-    // Retract the base edge — cascade fires.
-    let delete = json!({
-        "@context": ctx(),
-        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
-        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
-    });
-    let after_delete = fluree
-        .update(after_insert.ledger, &delete)
-        .await
-        .expect("delete");
-
-    // After the cascade, no row should match `?s ex:role ?role` —
-    // the anonymous annotation's body metadata is gone too.
-    let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q_role)
-        .await
-        .expect("post-cascade role query");
-    let arr = post.as_array().expect("array");
-    assert!(
-        arr.is_empty(),
-        "anonymous annotation's metadata must be cleaned up by RDF-mode cascade; \
-         got: {arr:#?}"
-    );
+        let q_role = json!({
+            "@context": ctx(),
+            "select": ["?role"],
+            "where": { "ex:role": "?role" }
+        });
+        let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q_role)
+            .await
+            .expect("role query");
+        assert_eq!(
+            post.as_array().expect("array").len(),
+            usize::from(!lpg),
+            "[lpg={lpg}] the body outlives the edge only outside LPG mode: {post:#?}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn retracting_all_annotation_metadata_cleans_bundle_too() {
-    // When a user retracts every asserted user-property flake of
-    // an annotation subject in a single transaction, the cascade
-    // should also retract the `f:reifies*` bundle pointing at the
-    // (still-asserted) base edge. Without this auto-cleanup, the
-    // bundle stays asserted as an orphan: an inline `@annotation`
-    // query would still surface the annotation subject (because
-    // `f:reifiesSubject/Predicate/Object` still pin it to the
-    // base edge), even though the user clearly intended to delete
-    // the whole annotation.
+async fn retracting_an_annotation_body_keeps_its_link() {
+    // Retracting every property of a reifier retracts just those
+    // triples: the reifier still reifies the edge (its link is a triple
+    // of its own), so `@annotation` still finds it. The JSON-LD
+    // `@annotation` delete retracts the link.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:metadata-retract-cleans-bundle";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -1571,15 +1517,13 @@ async fn retracting_all_annotation_metadata_cleans_bundle_too() {
         .await
         .expect("metadata-only retract");
 
-    // The bundle should also be gone — inline `@annotation` no
-    // longer finds the orphaned annotation.
     let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q_ann)
         .await
-        .expect("post-cleanup ?ann query");
-    let arr = post.as_array().expect("array");
-    assert!(
-        arr.is_empty(),
-        "after metadata retract, the bundle must be cleaned too; got: {arr:#?}"
+        .expect("post-retract ?ann query");
+    assert_eq!(
+        post.as_array().expect("array").len(),
+        1,
+        "the link outlives the body: {post:#?}"
     );
 
     // The base edge itself should still be queryable — the cleanup
@@ -2351,8 +2295,8 @@ async fn wildcard_subject_hydration_keeps_explicit_iri_annotations_visible() {
 
 #[tokio::test]
 async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
-    // Regression: the cascade's link retract must carry the named graph of
-    // the original assertion. A default-graph retract would not match it in
+    // Regression: the LPG cascade's link retract must carry the named graph
+    // of the original assertion. A default-graph retract would not match it in
     // Fluree's flake identity model, leaving the link live in the named
     // graph after its edge is gone.
     let fluree = FlureeBuilder::memory().build_memory();
@@ -2387,7 +2331,8 @@ async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
             "@id": "ex:alice",
             "@graph": "ex:hr-graph",
             "ex:worksFor": { "@id": "ex:acme" }
-        }
+        },
+        "opts": { "lpgEdgeLifecycle": true }
     });
     let after_delete = fluree
         .update(after_insert.ledger, &delete)
@@ -6026,17 +5971,16 @@ async fn one_reifier_on_the_same_edge_in_two_graphs_writes_in_one_transaction() 
 // ===========================================================================
 // Annotation-form DELETE: the full spelling matrix (issue #1861)
 //
-// Two separate rules combine into a result that surprises people, and the
-// docs used to describe each one only in isolation:
+// Two rules combine into a result that surprises people:
 //
 //   1. The annotation form ASSERTS the base triple. RDF 1.2 Turtle §2.11.1
 //      defines `s p o ~ :r {| … |}` as "both reify and assert" the triple, and
 //      SPARQL 1.2 Update §3.1.2 routes `DELETE DATA`'s QuadData through the
 //      same production. So the annotation form of a delete is a base-edge
-//      retraction. This is spec-mandated, not a Fluree choice.
-//   2. Retracting a base edge cascades to EVERY reifier attached to it, not
-//      just the one named. This one IS a Fluree choice — neither spec entails
-//      it — and it is why sibling claims lose their attachment.
+//      retraction.
+//   2. Retracting a base edge leaves every reifier's link (RDF 1.2), but the
+//      annotation syntax joins the edge, so sibling claims stop matching it
+//      while the reified-triple form still finds them.
 //
 // The rows below are measured, not assumed. `docs/concepts/edge-annotations.md`
 // quotes this table; if a row changes here, that section is wrong.
@@ -6057,8 +6001,11 @@ struct Survivors {
     claim1_body: usize,
     /// Body properties still on `:claim2`.
     claim2_body: usize,
-    /// Reifiers still attached to `:alice :knows :bob`.
+    /// Reifiers the annotation syntax still matches on `:alice :knows :bob`
+    /// (it needs the edge and a `:confidence`).
     attached: usize,
+    /// Reifiers still linked to `:alice :knows :bob`, asserted or not.
+    linked: usize,
     /// Rows for `:alice :knows :carol` — 1 means the object was rewritten.
     new_object: usize,
 }
@@ -6095,6 +6042,11 @@ async fn annotation_matrix_survivors(fluree: &MemoryFluree, ledger_id: &str) -> 
              SELECT ?c WHERE { :alice :knows :bob ~ ?c {| :confidence ?f |} }",
         )
         .await,
+        linked: count(
+            "PREFIX : <http://example.org/> \
+             SELECT ?c WHERE { << :alice :knows :bob ~ ?c >> }",
+        )
+        .await,
         new_object: count(
             "PREFIX : <http://example.org/> \
              SELECT ?o WHERE { :alice :knows ?o . FILTER(?o = :carol) }",
@@ -6118,10 +6070,10 @@ enum MatrixOp {
 /// them change what the documentation has to say:
 ///
 /// - **Row 10** (`~ :claim1` with no block) reads as "detach claim1" and is
-///   the worst outcome in the table: the edge goes, BOTH claims are detached,
-///   and BOTH bodies are left standing as well-formed-looking orphans.
-/// - **Row 7** is an `upsert`, with no delete written anywhere, and it fires
-///   the identical cascade.
+///   the worst outcome in the table: the edge goes too, so claim2 stops
+///   matching the annotation syntax.
+/// - **Row 7** is an `upsert`, with no delete written anywhere, and it
+///   retracts the edge claim2 reifies all the same.
 #[tokio::test]
 async fn annotation_form_delete_matrix() {
     let rows: Vec<(&str, MatrixOp, Option<Survivors>)> = vec![
@@ -6138,6 +6090,7 @@ async fn annotation_form_delete_matrix() {
                 claim1_body: 0,
                 claim2_body: 2,
                 attached: 0,
+                linked: 1,
                 new_object: 0,
             }),
         ),
@@ -6155,6 +6108,7 @@ async fn annotation_form_delete_matrix() {
                 claim1_body: 1,
                 claim2_body: 1,
                 attached: 0,
+                linked: 0,
                 new_object: 0,
             }),
         ),
@@ -6168,11 +6122,12 @@ async fn annotation_form_delete_matrix() {
                 claim1_body: 2,
                 claim2_body: 2,
                 attached: 1,
+                linked: 1,
                 new_object: 0,
             }),
         ),
-        // Row 4 — property-level retraction: what a reader usually means by
-        // "withdraw claim1". Pass 2 then retires the now-empty reifier.
+        // Row 4 — property-level retraction: the body goes, and claim1 stays
+        // linked to the edge, a reifier with nothing left to say.
         (
             "property-level retraction of the claim body",
             MatrixOp::Sparql(
@@ -6184,10 +6139,12 @@ async fn annotation_form_delete_matrix() {
                 claim1_body: 0,
                 claim2_body: 2,
                 attached: 1,
+                linked: 2,
                 new_object: 0,
             }),
         ),
-        // Row 6 — the baseline: deleting the bare edge detaches both claims.
+        // Row 6 — the baseline: deleting the bare edge leaves both claims
+        // linked to a triple no longer asserted.
         (
             "bare base edge",
             MatrixOp::Sparql("PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob }"),
@@ -6196,11 +6153,12 @@ async fn annotation_form_delete_matrix() {
                 claim1_body: 2,
                 claim2_body: 2,
                 attached: 0,
+                linked: 2,
                 new_object: 0,
             }),
         ),
-        // Row 7 — an upsert that changes the object. No delete is written and
-        // the same cascade fires.
+        // Row 7 — an upsert that changes the object. The upsert re-points
+        // claim1; claim2 stays linked to the retracted edge.
         (
             "upsert changing the object",
             MatrixOp::UpsertTurtle(
@@ -6212,6 +6170,7 @@ async fn annotation_form_delete_matrix() {
                 claim1_body: 2,
                 claim2_body: 2,
                 attached: 0,
+                linked: 1,
                 new_object: 1,
             }),
         ),
@@ -6226,7 +6185,7 @@ async fn annotation_form_delete_matrix() {
             None,
         ),
         // Row 10 — the sharpest footgun, and absent from the issue. Reads as
-        // "detach claim1"; removes the edge and orphans both bodies.
+        // "detach claim1"; removes the edge as well.
         (
             "bare reifier, no body block",
             MatrixOp::Sparql(
@@ -6237,6 +6196,7 @@ async fn annotation_form_delete_matrix() {
                 claim1_body: 2,
                 claim2_body: 2,
                 attached: 0,
+                linked: 1,
                 new_object: 0,
             }),
         ),
@@ -6327,16 +6287,12 @@ async fn annotation_form_delete_retracts_the_base_edge_in_both_spellings() {
     }
 }
 
-/// The half that is Fluree's own semantics: the cascade reaches reifiers the
-/// delete never named.
-///
-/// Pinned separately and explicitly because nothing in RDF 1.2 or SPARQL 1.2
-/// entails it — SPARQL 1.2 Update §3.1.2 Example 6 makes the converse point,
-/// that deleting a reifying triple leaves the asserted triple alone. A reader
-/// who checks the spec and finds Fluree deleting more will otherwise conclude
-/// there is a second bug.
+/// Deleting the base edge reaches reifiers the delete never named only in
+/// what the annotation syntax matches: their links and bodies stay (RDF 1.2;
+/// SPARQL 1.2 Update §3.1.2 Example 6 makes the converse point), and the
+/// annotation syntax, which joins the edge, stops matching them.
 #[tokio::test]
-async fn base_edge_retraction_detaches_sibling_reifiers_the_delete_never_named() {
+async fn base_edge_retraction_leaves_sibling_reifiers_the_delete_never_named() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "ann-sibling-cascade:main";
     fluree
@@ -6362,13 +6318,10 @@ async fn base_edge_retraction_detaches_sibling_reifiers_the_delete_never_named()
     let after = annotation_matrix_survivors(&fluree, ledger_id).await;
     assert_eq!(
         after.attached, 0,
-        ":claim2 is detached though it was never named"
+        "the annotation syntax no longer matches :claim2, though it was never named"
     );
-    assert_eq!(
-        after.claim2_body, 2,
-        ":claim2's body survives its attachment — this is the orphan state the \
-         docs must warn about"
-    );
+    assert_eq!(after.linked, 1, ":claim2's link outlives the edge");
+    assert_eq!(after.claim2_body, 2, ":claim2's body outlives the edge");
 }
 
 /// Wildcard reads of a legacy bundle show the link derived from it, never

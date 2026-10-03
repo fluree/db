@@ -623,11 +623,11 @@ async fn live_reifies_flakes(fluree: &fluree_db_api::Fluree, ledger_id: &str) ->
     live
 }
 
-/// Deleting a base edge must retract the claim that reifies it, even once the
-/// link has been indexed in a named graph — the cascade's link lookup and the
-/// retract it writes are both scoped to the edge's graph.
+/// Deleting a base edge in LPG mode must retract the claim that reifies it,
+/// even once the link has been indexed in a named graph — the cascade's link
+/// lookup and the retract it writes are both scoped to the edge's graph.
 #[tokio::test]
-async fn deleting_an_indexed_named_graph_edge_cascades_to_its_claim() {
+async fn deleting_an_indexed_named_graph_edge_in_lpg_mode_cascades_to_its_claim() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations-indexed:cascade-named-graph";
 
@@ -661,11 +661,15 @@ async fn deleting_an_indexed_named_graph_edge_cascades_to_its_claim() {
     let deleted = fluree
         .graph(ledger_id)
         .transact()
-        .sparql_update(
-            "PREFIX ex: <http://example.org/>\n\
-             DELETE DATA { GRAPH <http://example.org/claims-graph> \
-             { ex:alice ex:knows ex:bob } }",
-        )
+        .update(&json!({
+            "@context": ctx(),
+            "delete": {
+                "@id": "ex:alice",
+                "@graph": "ex:claims-graph",
+                "ex:knows": {"@id": "ex:bob"}
+            },
+            "opts": {"lpgEdgeLifecycle": true}
+        }))
         .commit()
         .await
         .expect("delete the base edge");
@@ -675,64 +679,5 @@ async fn deleting_an_indexed_named_graph_edge_cascades_to_its_claim() {
         live_reifies_flakes(&fluree, ledger_id).await,
         0,
         "the claim's link must not outlive the edge it reifies"
-    );
-}
-
-/// The *other* cascade pass against an indexed named-graph link.
-///
-/// Pass 1 fires when the base edge is deleted. Pass 2 fires when the user
-/// deletes an annotation's last piece of metadata without touching the edge,
-/// which would leave the link behind with nothing to describe.
-#[tokio::test]
-async fn deleting_an_indexed_named_graph_claim_body_cascades_its_link() {
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/edge-annotations-indexed:cascade-named-graph-orphan";
-
-    let committed = fluree
-        .insert(
-            genesis_ledger(&fluree, ledger_id),
-            &json!({
-                "@context": ctx(),
-                "@id": "ex:alice",
-                "@graph": "ex:claims-graph",
-                "ex:knows": {
-                    "@id": "ex:bob",
-                    // A string, deliberately. A bare `0.9` in the SPARQL below
-                    // is an `xsd:decimal` while JSON-LD stores it as an
-                    // `xsd:double`, so `DELETE DATA` would match nothing, the
-                    // transaction would still commit, and this test would pass
-                    // without the cascade ever running.
-                    "@annotation": {"@id": "ex:claim1", "ex:role": "Engineer"}
-                }
-            }),
-        )
-        .await
-        .expect("annotated named-graph insert");
-
-    support::rebuild_and_publish_index(&fluree, ledger_id).await;
-
-    assert!(
-        live_reifies_flakes(&fluree, ledger_id).await > 0,
-        "the indexed link must be visible to this read before the delete"
-    );
-
-    // Delete the claim's only metadata fact, leaving the edge itself alone.
-    let deleted = fluree
-        .graph(ledger_id)
-        .transact()
-        .sparql_update(
-            "PREFIX ex: <http://example.org/>\n\
-             DELETE DATA { GRAPH <http://example.org/claims-graph> \
-             { ex:claim1 ex:role \"Engineer\" } }",
-        )
-        .commit()
-        .await
-        .expect("delete the claim body");
-    assert!(deleted.receipt.t > committed.ledger.t());
-
-    assert_eq!(
-        live_reifies_flakes(&fluree, ledger_id).await,
-        0,
-        "a link whose claim has no body left must not survive as an orphan"
     );
 }

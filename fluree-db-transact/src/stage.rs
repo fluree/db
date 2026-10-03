@@ -51,16 +51,15 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 /// Given `graph_sids` (ledger GraphId → Sid), returns the
 /// inverse mapping. Used by SHACL/policy to determine which graph a flake
 /// belongs to based on its `Flake.g` field.
-/// Retract the annotations a transaction's retracts leave dangling, so a link
-/// never names a triple that is no longer asserted (annotation-syntax reads
-/// rely on it and skip the base edge).
+/// In LPG mode (`opts.lpgEdgeLifecycle`, which Cypher `DELETE` sets), deleting
+/// a relationship's edge deletes the relationship:
 ///
 /// 1. A retracted triple retracts every link naming it.
-/// 2. Retracting all of a reifier's body retracts its links.
-/// 3. A reifier left with no link loses its body when it is a blank node, or
-///    in LPG mode (`opts.lpgEdgeLifecycle`), where deleting a relationship
-///    deletes its properties. An IRI reifier's body otherwise stays, as
-///    ordinary RDF about a named resource.
+/// 2. A reifier left with no link loses its body.
+///
+/// RDF 1.2 entails neither, so outside LPG mode a transaction retracts only
+/// what it names: a reifier and its link outlive the triple they reify, and
+/// the annotation syntax, which joins the triple, stops matching them.
 ///
 /// Links derived from legacy `f:reifies*` bundles read like any other link;
 /// retracting one leaves the bundle, whose derived assert the retract cancels
@@ -78,7 +77,9 @@ async fn cascade_attachment_retracts(
     use std::collections::BTreeMap;
 
     let mut cascade = Vec::new();
-    if !ledger.snapshot.has_annotations && !ledger.novelty.has_annotations() {
+    if !lpg_edge_lifecycle
+        || (!ledger.snapshot.has_annotations && !ledger.novelty.has_annotations())
+    {
         return Ok(cascade);
     }
 
@@ -166,67 +167,12 @@ async fn cascade_attachment_retracts(
             }
         }
 
-        // 2. Reifiers whose whole body this transaction retracts. Same-txn
-        //    asserts count toward what survives, so replacing a body value
-        //    keeps the reifier.
-        type FlakeIdentity = (Sid, FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>);
-        let identity =
-            |f: &Flake| -> FlakeIdentity { (f.p.clone(), f.o.clone(), f.dt.clone(), f.m.clone()) };
-        let mut body_retracts: BTreeMap<(GraphId, Sid), (Option<Sid>, HashSet<FlakeIdentity>)> =
-            BTreeMap::new();
-        let mut body_asserts: HashSet<(GraphId, Sid)> = HashSet::new();
-        for f in flakes.iter().filter(|f| !is_annotation_predicate(&f.p)) {
-            let key = (resolve_flake_graph_id(f, reverse_graph)?, f.s.clone());
-            if f.op {
-                body_asserts.insert(key);
-            } else {
-                body_retracts
-                    .entry(key)
-                    .or_insert_with(|| (f.g.clone(), HashSet::new()))
-                    .1
-                    .insert(identity(f));
-            }
-        }
-        for ((g_id, ann), (g_sid, retracted)) in body_retracts {
-            if body_asserts.contains(&(g_id, ann.clone())) {
-                continue;
-            }
-            let current = scan(
-                g_id,
-                IndexType::Spot,
-                RangeMatch::new().with_subject(ann.clone()),
-            )
-            .await?;
-            let (links, body): (Vec<Flake>, Vec<Flake>) = current
-                .into_iter()
-                .filter(|f| !fluree_db_core::is_reserved_reifies_predicate(&f.p))
-                .partition(|f| is_rdf_reifies(&f.p));
-            if links.is_empty() || body.iter().any(|f| !retracted.contains(&identity(f))) {
-                continue;
-            }
-            for link in links {
-                let already = unlinked
-                    .get(&(g_id, ann.clone()))
-                    .is_some_and(|(_, terms)| terms.contains(&link.o));
-                if already || txn_link_retracts.contains(&(g_id, ann.clone(), link.o.clone())) {
-                    continue;
-                }
-                cascade.push(retract(&link, g_sid.as_ref()));
-                unlinked
-                    .entry((g_id, ann.clone()))
-                    .or_insert_with(|| (g_sid.clone(), Vec::new()))
-                    .1
-                    .push(link.o);
-            }
-        }
-
-        // 3. Bodies of reifiers left with no link.
+        // 2. Bodies of reifiers left with no link.
         for (key, g_sid) in explicit {
             unlinked.entry(key).or_insert((g_sid, Vec::new()));
         }
         for ((g_id, ann), (g_sid, terms)) in unlinked {
-            let anonymous = ann.namespace_code == fluree_vocab::namespaces::BLANK_NODE;
-            if !(anonymous || lpg_edge_lifecycle) || txn_linked.contains(&(g_id, ann.clone())) {
+            if txn_linked.contains(&(g_id, ann.clone())) {
                 continue;
             }
             let current = scan(
@@ -704,22 +650,8 @@ pub async fn stage_with_graph_delta(
             f
         };
 
-        // Cascade-retract `f:reifies*` bundles for any base edge that
-        // is being retracted in this transaction. Without this, a
-        // DELETE of the base edge would leave the attachment pointers
-        // orphaned in the durable encoding, and `@reifies` queries
-        // would still surface annotations for retracted edges.
-        //
-        // **M2 scan-based path:** the cascade looks up annotations
-        // via `range_with_overlay` over the merged snapshot+novelty
-        // view. This catches annotations whether they're still in
-        // the novelty overlay or have rolled into indexed base
-        // storage post-reindex.
-        //
-        // M1b minimum: retracts the `f:reifies*` bundle only. The
-        // anonymous-annotation metadata cascade (RDF default) and the
-        // explicit-IRI metadata cascade (LPG mode opt-in) are tracked
-        // as follow-ups in the plan.
+        // LPG relationship lifecycle: deleting an edge deletes its
+        // relationships (see `cascade_attachment_retracts`).
         let lpg_edge_lifecycle = txn.opts.lpg_edge_lifecycle.unwrap_or(false);
         let cascade = cascade_attachment_retracts(
             &flakes,

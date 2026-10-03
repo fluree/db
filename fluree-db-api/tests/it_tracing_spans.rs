@@ -909,8 +909,8 @@ async fn annotation_hydration_emits_inject_annotations_span() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn annotation_cascade_emits_cascade_reifies_bundle_span() {
-    // Retracting a base edge that has annotations should emit a
-    // `cascade_reifies_bundle` span tagged with the cascade row
+    // Retracting a base edge that has annotations in LPG mode should
+    // emit a `cascade_reifies_bundle` span tagged with the cascade row
     // count. On non-annotation ledgers the gate skips it.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = support::genesis_ledger(&fluree, "tracing-cascade:main");
@@ -943,7 +943,8 @@ async fn annotation_cascade_emits_cascade_reifies_bundle_span() {
                 "delete": {
                     "@id": "ex:alice",
                     "ex:worksFor": { "@id": "ex:acme" }
-                }
+                },
+                "opts": { "lpgEdgeLifecycle": true }
             }),
         )
         .await
