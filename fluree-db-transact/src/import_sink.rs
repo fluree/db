@@ -759,6 +759,18 @@ mod inner {
         prefix_map: HashMap<String, String>,
         /// Optional spool context for Tier 2 parallel pipeline.
         spool_ctx: Option<SpoolContext>,
+        /// Each reifier's `f:reifiesSubject` / `f:reifiesPredicate` /
+        /// `f:reifiesObject` flakes seen so far, when its bundle arrives as
+        /// plain triples (the JSON-LD `@annotation` lowering).
+        pending_links: HashMap<Sid, PendingLink>,
+    }
+
+    /// A bundle's link-bearing slots, collected until all three are in.
+    #[derive(Default)]
+    struct PendingLink {
+        s: Option<Sid>,
+        p: Option<Sid>,
+        object: Option<Flake>,
     }
 
     impl<'a> ImportSink<'a> {
@@ -789,6 +801,7 @@ mod inner {
                 encode_error: None,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
+                pending_links: HashMap::new(),
             })
         }
 
@@ -812,6 +825,7 @@ mod inner {
                 encode_error: None,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
+                pending_links: HashMap::new(),
             })
         }
 
@@ -967,6 +981,44 @@ mod inner {
                     t: self.t,
                 });
                 if let Err(e) = written {
+                    self.encode_error.get_or_insert(e);
+                }
+                self.observe_bundle_slot(&flake);
+            }
+        }
+
+        /// Spool the RDF 1.2 link of a bundle that arrives as plain triples
+        /// once its subject, predicate and object slots are in, as
+        /// `emit_reified_triple` does for a reified triple it parses.
+        fn observe_bundle_slot(&mut self, flake: &Flake) {
+            let entry = if fluree_db_core::is_reifies_subject(&flake.p) {
+                let FlakeValue::Ref(sid) = &flake.o else {
+                    return;
+                };
+                let entry = self.pending_links.entry(flake.s.clone()).or_default();
+                entry.s = Some(sid.clone());
+                entry
+            } else if fluree_db_core::is_reifies_predicate(&flake.p) {
+                let FlakeValue::Ref(sid) = &flake.o else {
+                    return;
+                };
+                let entry = self.pending_links.entry(flake.s.clone()).or_default();
+                entry.p = Some(sid.clone());
+                entry
+            } else if fluree_db_core::is_reifies_object(&flake.p) {
+                let entry = self.pending_links.entry(flake.s.clone()).or_default();
+                entry.object = Some(flake.clone());
+                entry
+            } else {
+                return;
+            };
+            let (Some(s), Some(p), Some(object)) = (&entry.s, &entry.p, &entry.object) else {
+                return;
+            };
+            let (s, p, object) = (s.clone(), p.clone(), object.clone());
+            self.pending_links.remove(&flake.s);
+            if let Some(ctx) = &mut self.spool_ctx {
+                if let Err(e) = ctx.write_link_record(&s, &p, &object, self.t) {
                     self.encode_error.get_or_insert(e);
                 }
             }

@@ -2424,3 +2424,45 @@ GRAPH <http://example.org/graphs/audit> {
     .await;
     assert_eq!(got, strings(&[&["ex:event1"], &["ex:event2"]]));
 }
+
+/// Bulk import of JSON-LD `@annotation` writes its bundle as plain triples;
+/// the sink spools the link from them, as it does for a reified triple.
+#[tokio::test]
+async fn jsonld_import_links_annotations() {
+    const DOC: &str = r#"{"@context": {"ex": "http://example.org/"},
+      "@graph": [
+        {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob",
+          "@annotation": {"@id": "ex:claim1", "ex:confidence": 0.9}}},
+        {"@id": "ex:doc", "ex:title": {"@value": "chat", "@language": "fr",
+          "@annotation": {"@id": "ex:claim2", "ex:source": {"@id": "ex:fr"}}}}
+      ]}"#;
+    let (fluree, ledger) = import(
+        &[("data.jsonld", DOC)],
+        "it/triple-term-links:jsonld-import",
+    )
+    .await;
+    let got = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT ?r ?s ?o WHERE { ?r rdf:reifies ?t \
+         BIND(SUBJECT(?t) AS ?s) BIND(STR(OBJECT(?t)) AS ?o) } ORDER BY ?r"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(
+        got,
+        strings(&[
+            &["ex:claim1", "ex:alice", "http://example.org/bob"],
+            &["ex:claim2", "ex:doc", "chat"]
+        ])
+    );
+    // The language tag is part of the term, so the tagged edge's quoted
+    // pattern finds its reifier.
+    let tagged = run_link_query(
+        &fluree,
+        &ledger,
+        "SELECT ?r WHERE { << ex:doc ex:title \"chat\"@fr ~ ?r >> ex:source ex:fr }".to_string(),
+    )
+    .await;
+    assert_eq!(tagged, strings(&[&["ex:claim2"]]));
+}
