@@ -15,7 +15,6 @@
 
 pub mod aggregate;
 pub(crate) mod aggregate_complement_fold;
-pub mod annotation_edge_probe;
 pub mod binary_history;
 pub mod binary_range;
 pub mod binary_scan;

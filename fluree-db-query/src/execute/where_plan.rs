@@ -3117,27 +3117,6 @@ pub fn build_where_operators_seeded_with_needed(
                         }
                     }
 
-                    // Value-only edge-annotation probe (a Cypher relationship
-                    // binding): answer the whole batch with three set-wise
-                    // reifies scans + hash lookups instead of per-row chains.
-                    if let Some(builder) = crate::optional::AnnotationValueOptionalBuilder::try_new(
-                        required_schema.clone(),
-                        inner_patterns.clone(),
-                        stats.clone(),
-                        *planning,
-                    ) {
-                        operator = Some(Box::new(
-                            OptionalOperator::with_builder(
-                                child,
-                                required_schema,
-                                Box::new(builder),
-                            )
-                            .with_out_schema(augmented_ref),
-                        ));
-                        i += 1;
-                        continue;
-                    }
-
                     // General path: use PlanTreeOptionalBuilder for multi-pattern or
                     // non-triple single patterns (VALUES, BIND, subquery, etc.)
                     let builder = PlanTreeOptionalBuilder::new(
@@ -3374,29 +3353,16 @@ pub fn build_where_operators_seeded_with_needed(
             Pattern::DefaultGraphSource {
                 patterns: inner_patterns,
             } => {
-                // Internal — synthesized by `expand_edge_annotation_patterns`
-                // to correlate the f:reifies* triple chain with a single
-                // default-graph source under multi-source default queries.
+                // Internal — synthesized by the edge-annotation expansion to
+                // correlate an annotated edge's chain with a single
+                // default-graph source under a default-graph union.
                 let child = require_child(operator, "DEFAULT-GRAPH-SOURCE pattern")?;
-                // Variables anything outside the wrapper still reads: the
-                // post-WHERE pipeline (projection pushdown set when there is
-                // one, else every needed var) plus every later pattern in
-                // this block. Earlier patterns reach the wrapper through the
-                // child's schema. The wrapper drops the `f:reifies*` lookups
-                // whose variable appears in neither.
-                let mut needed_outside: HashSet<VarId> = match required_where_vars {
-                    Some(required) => required.iter().copied().collect(),
-                    None => needed_vars.clone(),
-                };
-                let mut outside_counts: HashMap<VarId, usize> = HashMap::new();
-                collect_var_stats(&patterns[i + 1..], &mut outside_counts, &mut needed_outside);
                 operator = Some(Box::new(
                     crate::default_graph_source::DefaultGraphSourceOperator::new(
                         child,
                         inner_patterns.clone(),
                         *planning,
                         stats.clone(),
-                        needed_outside,
                     ),
                 ));
                 i += 1;
