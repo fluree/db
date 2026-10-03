@@ -574,6 +574,7 @@ mod inner {
         let config_iri = fluree_db_core::graph_registry::config_graph_iri(ledger_id);
 
         for block in &phase1.named_graphs {
+            crate::stage::refuse_default_graph_name(&block.iri)?;
             // Refuse by literal IRI, mirroring the staged-write guard's shape.
             if block.iri == txn_meta_iri {
                 return Err(TransactError::ReservedGraphTarget {

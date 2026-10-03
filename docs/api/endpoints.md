@@ -542,7 +542,7 @@ Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Oper
 - `200 OK`: Decoded commit returned
 - `400 Bad Request`: Missing or invalid `commit` parameter
 - `401 Unauthorized`: Bearer token required but missing
-- `404 Not Found`: Ledger or commit not found
+- `404 Not Found`: Ledger or commit not found; a `commit` that names no commit is typed `err:db/CommitNotFound`
 - `501 Not Implemented`: Proxy storage mode (no local index available)
 
 **Peer mode:** Forwards to the transactor.
@@ -1219,10 +1219,10 @@ The SPARQL Protocol's form-encoded POST is also accepted: `Content-Type: applica
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `default-context` | boolean | `false` | When `true`, use the ledger's stored default JSON-LD context if the request omits its own `@context` (JSON-LD) or `PREFIX` declarations (ledger-scoped SPARQL). |
-| `default-graph-uri` | IRI, repeatable | — | SPARQL only. A default graph for the query, as `FROM <iri>` would name it; repeat the parameter to merge several. On `/query` it names a ledger (`books:main`); on `/query/{ledger}` a graph within that ledger. |
+| `default-graph-uri` | IRI, repeatable | — | SPARQL only. A default graph for the query, as `FROM <iri>` would name it; repeat the parameter to merge several. On `/query` it names a ledger (`books:main`); on `/query/{ledger}` a graph within that ledger, where `urn:default` (the name [`/info`](#get-infoledger-id) lists the default graph under) names the default graph. |
 | `named-graph-uri` | IRI, repeatable | — | SPARQL only. A named graph for the query, as `FROM NAMED <iri>` would name it. |
 
-When `default-graph-uri` or `named-graph-uri` is present, it replaces any `FROM` / `FROM NAMED` in the query text (W3C SPARQL 1.1 Protocol §2.1.4: the protocol dataset takes precedence). They are read from the URL for `GET` and for `POST` with `Content-Type: application/sparql-query`, and from the URL or the body for a form-encoded `POST`. On a JSON-LD query they are a `400`; use `from` / `fromNamed` in the body instead. They are also a `400` when the `FROM` they would replace pins a time (`FROM … TO …`, or an `@t:`, `@time:`, `@iso:`, `@recorded:`, `@commit:` or `@snapshot:` suffix), since replacing it would silently read the current state; put the pin on the parameter value instead, as in `default-graph-uri=books:main@t:100`.
+When `default-graph-uri` or `named-graph-uri` is present, it replaces any `FROM` / `FROM NAMED` in the query text (W3C SPARQL 1.1 Protocol §2.1.4: the protocol dataset takes precedence). They are read from the URL for `GET` and for `POST` with `Content-Type: application/sparql-query`, and from the URL or the body for a form-encoded `POST`. On a JSON-LD query they are a `400`; use `from` / `fromNamed` in the body instead. They are also a `400` when the `FROM` they would replace pins a time (`FROM … TO …`, or an `@t:`, `@time:`, `@iso:`, `@recorded:`, `@commit:` or `@snapshot:` suffix), since replacing it would silently read the current state; put the pin on the parameter value instead, as in `default-graph-uri=books:main@t:100`. A graph the ledger does not hold is a `404` with `@type` `err:db/GraphNotFound`.
 
 **Request Headers:**
 ```http
@@ -2251,7 +2251,7 @@ POST /branch
 - `201 Created` - Branch created successfully
 - `400 Bad Request` - Invalid request body (including malformed `at` value), the source branch has no commits yet, or `at` names no commit on it: a time before its first commit, a malformed timestamp, a transaction number below 1, or `snapshot:<id>` (a graph-source table snapshot)
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
-- `404 Not Found` - Source branch does not exist, or `at` commit is not reachable from source HEAD
+- `404 Not Found` - Source branch does not exist, or `at` names no commit, or one not reachable from source HEAD (`@type` `err:db/CommitNotFound`)
 - `409 Conflict` - Branch already exists
 - `500 Internal Server Error` - Server error
 

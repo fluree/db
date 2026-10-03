@@ -201,6 +201,17 @@ pub enum TransactError {
         graph_iri: String,
     },
 
+    /// A write named `urn:default` as a named graph: a `GRAPH` template or
+    /// data quad, a TriG block, a bulk-import block, a graph-management
+    /// operand or a sync target. The name stands for the default graph
+    /// wherever a graph is read, so a named graph by that name would hold data
+    /// no read of `urn:default` reaches.
+    #[error(
+        "<urn:default> names the default graph, not a named graph: write default-graph \
+         triples without GRAPH, or name it DEFAULT in graph management"
+    )]
+    DefaultGraphNameAsGraph,
+
     /// A bulk RDF import (`fluree create --from`, the server's source-import
     /// route) carried a `GRAPH <urn:fluree:{ledger}#config> { … }` block.
     ///

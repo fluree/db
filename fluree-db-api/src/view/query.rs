@@ -1145,7 +1145,7 @@ impl Fluree {
         // Prefix-expanded, BASE-resolved FROM / FROM NAMED IRIs (shared
         // resolution with constant IRIs; shipped by pr-base).
         let Some(clause) = fluree_db_sparql::resolve_dataset_clause(ast)
-            .map_err(|e| ApiError::query(e.to_string()))?
+            .map_err(|e| ApiError::invalid_query(e.to_string()))?
         else {
             return Ok(None);
         };
@@ -1190,7 +1190,8 @@ impl Fluree {
     ///
     /// - the ledger alias → the default graph (g_id 0), mirroring
     ///   `ExecutionContext::single_db_user_graph_id`, which reserves the alias
-    ///   for the default graph;
+    ///   for the default graph; `urn:default`, the name ledger info lists it
+    ///   under, likewise;
     /// - a registered named-graph IRI → that graph's g_id;
     /// - this ledger's own reserved-graph IRI, written out in full → that
     ///   reserved graph.
@@ -1255,7 +1256,10 @@ impl Fluree {
         use crate::dataset::GraphSelector;
         use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
 
-        if iri == db.snapshot.ledger_id.as_str() || iri == db.ledger_id.as_ref() {
+        if iri == db.snapshot.ledger_id.as_str()
+            || iri == db.ledger_id.as_ref()
+            || iri == fluree_db_core::DEFAULT_GRAPH_IRI
+        {
             return Ok(Some(Self::apply_graph_selector(
                 db.clone(),
                 &GraphSelector::Default,
@@ -1925,7 +1929,7 @@ fn query_error_to_status(err: &fluree_db_query::QueryError) -> u16 {
 /// (streaming views, R2RML-provider queries). One definition so the message
 /// cannot drift between its call sites.
 fn single_ledger_dataset_clause_error() -> ApiError {
-    ApiError::query(
+    ApiError::invalid_query(
         "SPARQL FROM/FROM NAMED clauses are not supported on a single-ledger GraphDb. \
          Use query_connection_sparql for multi-ledger queries.",
     )
@@ -1935,7 +1939,7 @@ fn single_ledger_dataset_clause_error() -> ApiError {
 /// this ledger (or the `FROM..TO` history extension). The message mentions
 /// `FROM` so callers and tests can recognize the dataset-clause rejection.
 fn cross_ledger_dataset_error() -> ApiError {
-    ApiError::query(
+    ApiError::invalid_query(
         "SPARQL FROM/FROM NAMED references a graph that is not in this ledger. \
          A within-ledger dataset names this ledger's graphs (its default graph \
          via the ledger alias, or a registered named graph) — check the IRI \
@@ -1949,7 +1953,7 @@ fn cross_ledger_dataset_error() -> ApiError {
 /// a time range, not a cross-ledger graph — reusing the graph-membership
 /// message there would misdescribe the rejection.
 fn history_range_dataset_error() -> ApiError {
-    ApiError::query(
+    ApiError::invalid_query(
         "SPARQL `FROM <from> TO <to>` is the Fluree history-range extension, not \
          a within-ledger dataset clause; issue it through the connection/history \
          query path.",
