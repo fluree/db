@@ -1,8 +1,8 @@
 //! SPARQL `# PRAGMA` request options over HTTP: the counterpart of a JSON-LD
 //! body's `opts` and of the `fluree-*` headers. Each pragma is checked against
-//! the header that already carries the same option, and a pragma wins over that
-//! header. Policy pragmas are covered in `policy_integration.rs`, and the
-//! `validation-mode` pragma in `override_control_identity.rs`.
+//! the header that already carries the same option. Policy pragmas are covered
+//! in `policy_integration.rs`, and the `validation-mode` pragma in
+//! `override_control_identity.rs`.
 
 use axum::body::Body;
 use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
@@ -135,8 +135,13 @@ async fn update(
         .unwrap()
 }
 
+/// Whether `json` is a fuel-limit error. Only its message counts: a tracked
+/// success reports `fuel` too.
 fn is_fuel_error(json: &JsonValue) -> bool {
-    json.to_string().to_lowercase().contains("fuel")
+    ["error", "message"]
+        .iter()
+        .filter_map(|key| json.get(*key).and_then(JsonValue::as_str))
+        .any(|message| message.to_lowercase().contains("fuel"))
 }
 
 /// `# PRAGMA max-fuel` caps a query exactly as `fluree-max-fuel` does: a
@@ -168,15 +173,103 @@ async fn max_fuel_pragma_caps_a_query_like_the_header() {
     assert!(is_fuel_error(&json), "{json}");
 }
 
-/// A pragma is the request's own option, so it wins over the header naming
-/// the same thing.
+/// `max-fuel` is a cap, so a pragma tightens the header's but cannot lift it:
+/// the header may be an application's and the text its end user's.
 #[tokio::test]
-async fn pragma_wins_over_the_header() {
+async fn max_fuel_pragma_only_tightens_the_header() {
     let (_tmp, app) = seeded("prag:over").await;
 
+    for (pragma, header) in [("100000", "0.5"), ("0.5", "100000")] {
+        let sparql = format!("# PRAGMA max-fuel: {pragma}\n{NAMES}");
+        let (status, json) =
+            query(&app, "prag:over", &sparql, &[("fluree-max-fuel", header)]).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "pragma {pragma} with header {header}: {json}"
+        );
+        assert!(is_fuel_error(&json), "{json}");
+    }
+
     let sparql = format!("# PRAGMA max-fuel: 100000\n{NAMES}");
-    let (status, json) = query(&app, "prag:over", &sparql, &[("fluree-max-fuel", "0.5")]).await;
+    let (status, json) = query(&app, "prag:over", &sparql, &[("fluree-max-fuel", "100000")]).await;
+    assert_eq!(status, StatusCode::OK, "control: {json}");
+}
+
+/// A multi-query alias's pragma holds to the alias's own `max-fuel` the same
+/// way (an envelope cannot carry one).
+#[tokio::test]
+async fn multi_query_alias_max_fuel_pragma_only_tightens_its_opts() {
+    let (_tmp, app) = seeded("prag:mq").await;
+    let alias = |pragma: &str, max_fuel: f64| {
+        let envelope = serde_json::json!({
+            "queries": {
+                "names": {
+                    "language": "sparql",
+                    "query": format!(
+                        "{pragma}\nPREFIX ex: <http://example.org/>\n\
+                         SELECT ?name FROM <prag:mq> WHERE {{ ?s ex:name ?name }}"
+                    ),
+                    "opts": {"max-fuel": max_fuel}
+                }
+            }
+        });
+        let app = app.clone();
+        async move {
+            let (status, json) = send(
+                &app,
+                post("/v1/fluree/multi-query", "application/json", &[])
+                    .body(Body::from(envelope.to_string()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            json
+        }
+    };
+
+    let json = alias("", 100_000.0).await;
+    let rows = json.pointer("/results/names/results/bindings");
+    assert_eq!(
+        rows.and_then(JsonValue::as_array).map(Vec::len),
+        Some(2),
+        "control: {json}"
+    );
+    for (pragma, max_fuel) in [("100000", 0.5), ("0.5", 100_000.0)] {
+        let json = alias(&format!("# PRAGMA max-fuel: {pragma}"), max_fuel).await;
+        assert!(
+            is_fuel_error(&json["errors"]["names"]),
+            "pragma {pragma} with opts {max_fuel}: {json}"
+        );
+    }
+}
+
+/// A multi-query alias's `# PRAGMA meta` adds to the tracking its `opts` ask
+/// for, as on a single query.
+#[tokio::test]
+async fn multi_query_alias_meta_pragma_adds_to_its_opts() {
+    let (_tmp, app) = seeded("prag:mq-meta").await;
+    let envelope = serde_json::json!({
+        "queries": {
+            "names": {
+                "language": "sparql",
+                "query": "# PRAGMA meta: time\nPREFIX ex: <http://example.org/>\n\
+                          SELECT ?name FROM <prag:mq-meta> WHERE { ?s ex:name ?name }",
+                "opts": {"meta": {"fuel": true}}
+            }
+        }
+    });
+    let (status, json) = send(
+        &app,
+        post("/v1/fluree/multi-query", "application/json", &[])
+            .body(Body::from(envelope.to_string()))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{json}");
+    let tracking = &json["tracking"]["names"];
+    assert!(tracking.get("fuel").is_some(), "opts' fuel: {json}");
+    assert!(tracking.get("time").is_some(), "pragma's time: {json}");
 }
 
 /// `# PRAGMA meta` reports tracking as `fluree-track-*` does.
@@ -192,6 +285,37 @@ async fn meta_pragma_reports_tracking() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.headers().get("x-fdb-fuel").is_some());
     assert!(resp.headers().get("x-fdb-time").is_some());
+}
+
+/// `# PRAGMA meta` adds to the tracking the headers ask for but cannot switch
+/// it off: an application reading fuel from the response keeps it whatever
+/// the text says.
+#[tokio::test]
+async fn meta_pragma_adds_to_header_tracking() {
+    let (_tmp, app) = seeded("prag:meta-add").await;
+
+    let sparql = format!("# PRAGMA meta: time\n{NAMES}");
+    let resp = query_raw(
+        &app,
+        "prag:meta-add",
+        &sparql,
+        &[("fluree-track-fuel", "true")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-fdb-fuel").is_some(), "header's fuel");
+    assert!(resp.headers().get("x-fdb-time").is_some(), "pragma's time");
+
+    let sparql = format!("# PRAGMA meta: false\n{NAMES}");
+    let resp = query_raw(
+        &app,
+        "prag:meta-add",
+        &sparql,
+        &[("fluree-track-meta", "true")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-fdb-fuel").is_some(), "header's fuel");
 }
 
 /// `# PRAGMA min-t` waits for the ledger as `fluree-min-t` does; a `t` it never

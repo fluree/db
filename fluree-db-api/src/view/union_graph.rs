@@ -88,17 +88,26 @@ impl Fluree {
     /// when a query on it reads one (see [`Self::reads_union_default_graph`]).
     ///
     /// A member that names a graph of its own (`ledger#graph`, a named-graph
-    /// IRI) is taken as named, and the named graphs stay exactly those the
-    /// query named. A history range reads the default graph alone.
+    /// IRI) is taken as named, and so is every member of that ledger: a default
+    /// graph that names one of a ledger's graphs chose that ledger's graphs
+    /// itself. The named graphs stay exactly those the query named. A history
+    /// range reads the default graph alone.
     pub(crate) async fn runtime_dataset<'a>(
         &self,
         dataset: &'a DataSetDb,
         requested: Option<bool>,
     ) -> Result<DataSet<'a>> {
+        let names_a_graph: std::collections::HashSet<&str> = dataset
+            .default
+            .iter()
+            .filter(|v| v.graph_id != DEFAULT_GRAPH_ID)
+            .map(|v| v.ledger_id.as_ref())
+            .collect();
         let mut widened = Vec::with_capacity(dataset.default.len());
         for view in &dataset.default {
             widened.push(
                 !dataset.is_history_mode()
+                    && !names_a_graph.contains(view.ledger_id.as_ref())
                     && self.reads_union_default_graph(view, requested).await?,
             );
         }

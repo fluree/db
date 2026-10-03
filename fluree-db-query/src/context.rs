@@ -1225,6 +1225,9 @@ impl<'a> ExecutionContext<'a> {
     /// of [`Self::path_graphs`] share one ledger's namespace table, so any of
     /// them serves.
     pub fn path_snapshot(&self) -> Result<&'a LedgerSnapshot, QueryError> {
+        if self.dataset.is_none() {
+            return Ok(self.active_snapshot);
+        }
         Ok(self
             .path_graphs()?
             .first()

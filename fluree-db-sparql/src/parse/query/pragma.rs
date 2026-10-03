@@ -32,6 +32,11 @@ const NAMES: &[(&str, Form)] = &[
     ("unique-properties", Form::Update),
 ];
 
+/// Every pragma name the parser accepts, for hosts that must handle each one.
+pub fn pragma_names() -> impl Iterator<Item = &'static str> {
+    NAMES.iter().map(|(name, _)| *name)
+}
+
 /// Collect the `# PRAGMA` directives among `comments`, with an error
 /// diagnostic for each one that cannot be applied to `ast`'s request form.
 pub(super) fn extract_pragmas(comments: &[Comment], ast: &SparqlAst) -> (Pragmas, Vec<Diagnostic>) {

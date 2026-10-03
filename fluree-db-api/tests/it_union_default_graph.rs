@@ -335,6 +335,69 @@ async fn from_the_ledger_reads_the_union_and_a_named_graph_narrows() {
     );
 }
 
+/// A `FROM` that names the ledger and one of its graphs chose its default
+/// graph: those two graphs, not the union. Another ledger in the same `FROM`
+/// still reads its own union.
+#[tokio::test]
+async fn from_the_ledger_and_one_of_its_graphs_reads_just_those() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed(&fluree, "union/from-both:main").await;
+    let ledger = set_union(&fluree, ledger, true).await;
+
+    let from_both = format!(
+        "PREFIX ex: <http://example.org/>
+         SELECT ?name FROM <union/from-both:main> FROM <{G1}> WHERE {{ ?s ex:name ?name }}"
+    );
+    assert_eq!(
+        sparql(&fluree, &ledger, &from_both).await,
+        strs(&["Alice", "Bob"])
+    );
+
+    let jsonld = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ["union/from-both:main", {"@id": "union/from-both:main", "graph": G1}],
+        "select": "?name",
+        "where": {"@id": "?s", "ex:name": "?name"}
+    });
+    let connection = fluree
+        .query_connection(&jsonld)
+        .await
+        .expect("JSON-LD connection query");
+    assert_eq!(
+        column(&connection.to_jsonld(&ledger.snapshot).expect("jsonld")),
+        strs(&["Alice", "Bob"])
+    );
+
+    let other = fluree
+        .stage_owned(genesis_ledger(&fluree, "union/from-other:main"))
+        .upsert_turtle(&format!(
+            r#"
+            @prefix ex: <http://example.org/> .
+            ex:dave ex:name "Dave" .
+            GRAPH <{G1}> {{ ex:erin ex:name "Erin" . }}
+            GRAPH <{G2}> {{ ex:frank ex:name "Frank" . }}
+            "#
+        ))
+        .execute()
+        .await
+        .expect("seed other")
+        .ledger;
+    let jsonld = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ["union/from-both:main", {"@id": "union/from-other:main", "graph": G1}],
+        "select": "?name",
+        "where": {"@id": "?s", "ex:name": "?name"}
+    });
+    let connection = fluree
+        .query_connection(&jsonld)
+        .await
+        .expect("JSON-LD connection query across ledgers");
+    assert_eq!(
+        column(&connection.to_jsonld(&other.snapshot).expect("jsonld")),
+        strs(&["Alice", "Bob", "Carol", "Erin"])
+    );
+}
+
 /// The setting is read as of the query's `t`: before it was written, the
 /// default graph reads alone.
 #[tokio::test]

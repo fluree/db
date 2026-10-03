@@ -364,8 +364,14 @@ impl PropertyPathOperator {
         index: IndexType,
         range_match: impl Fn(&LedgerSnapshot) -> RangeMatch,
     ) -> Result<Vec<Flake>> {
-        let mut out = Vec::new();
-        for graph in graphs {
+        let Some((first, rest)) = graphs.split_first() else {
+            return Ok(Vec::new());
+        };
+        // Grow the first graph's edges rather than copying them, so the usual
+        // single-graph read hands back its scan as is.
+        let mut out =
+            Self::read_graph_edges(ctx, first, index, range_match(first.snapshot)).await?;
+        for graph in rest {
             let flakes =
                 Self::read_graph_edges(ctx, graph, index, range_match(graph.snapshot)).await?;
             out.extend(flakes);

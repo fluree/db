@@ -150,20 +150,8 @@ fn governance_from_headers(
     identity: Option<&str>,
     headers: &FlureeHeaders,
 ) -> Result<GovernanceOptions> {
-    let policy_values_map = headers.policy_values_map()?;
     Ok(GovernanceOptions {
         identity: identity.map(String::from),
-        policy_class: if headers.policy_class.is_empty() {
-            None
-        } else {
-            Some(headers.policy_class.clone())
-        },
-        policy: headers.policy.clone(),
-        policy_values: policy_values_map,
-        default_allow: headers.default_allow,
-        // Deliberately absent: this is the caller's *selection*, and the
-        // verified identity is not selectable. `bound_governance` stamps it
-        // after authorization resolution.
-        ..Default::default()
+        ..headers.policy_selection()?
     })
 }
