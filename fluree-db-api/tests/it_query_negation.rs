@@ -1044,6 +1044,54 @@ SELECT ?p ?org WHERE {
     assert_eq!(normalize_rows(&rows), expected);
 }
 
+/// A small outer side seeds the semijoin's build with its own keys. An
+/// unbound OPTIONAL key seeds as a free variable, so its projected lookup
+/// still sees every match.
+#[tokio::test]
+async fn semijoin_seeds_its_build_from_a_small_outer_side() {
+    use fluree_db_api::{QueryInput, ReindexOptions};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "negation:seeded-semijoin";
+    seed_knows_works_for(&fluree, ledger_id).await;
+    let not_exists = r"PREFIX ex: <http://example.com/>
+SELECT ?p ?org WHERE {
+  ?p ex:knows ?f .
+  OPTIONAL { ?p ex:worksFor ?org }
+  FILTER NOT EXISTS { ?p ex:knows ?x . ?x ex:worksFor ?org }
+}";
+    let cases = [
+        (
+            not_exists.to_string(),
+            json!([["ex:carol", "ex:globex"], ["ex:dave", null]]),
+        ),
+        (
+            not_exists.replace("NOT EXISTS", "EXISTS"),
+            json!([["ex:alice", null]]),
+        ),
+    ];
+    for indexed in [false, true] {
+        if indexed {
+            fluree
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .expect("reindex");
+        }
+        let view = fluree.db(ledger_id).await.expect("view");
+        for (query, expected) in &cases {
+            let result = fluree
+                .query(&view, QueryInput::Sparql(query))
+                .await
+                .expect("query");
+            assert_eq!(
+                normalize_rows(&result.to_jsonld(&view.snapshot).unwrap()),
+                normalize_rows(expected),
+                "indexed={indexed}: {query}"
+            );
+        }
+    }
+}
+
 /// A missing OPTIONAL binding must use a reusable existence lookup, while
 /// bound values still constrain the inner match and outer duplicates survive.
 #[tokio::test]

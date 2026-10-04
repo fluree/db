@@ -2,8 +2,10 @@
 //!
 //! Replaces per-row correlated subquery evaluation with a build-probe approach:
 //!
-//! 1. **Build phase** (`open`): Execute inner patterns once (uncorrelated), collect
-//!    distinct key tuples (the correlation variables) into a `HashSet`.
+//! 1. **Build phase** (`open`): Execute inner patterns once, collect distinct key
+//!    tuples (the correlation variables) into a `HashSet`. An outer side with
+//!    few distinct keys seeds the build with them, so a point query does not
+//!    pay for the whole inner relation.
 //! 2. **Probe phase** (`next_batch`): For each outer row, extract key var values and
 //!    probe the set. EXISTS keeps matches; NOT EXISTS keeps non-matches.
 //!
@@ -22,17 +24,27 @@ use crate::group_aggregate::{CompositeGroupKey, GroupKeyOwned};
 use crate::ir::Pattern;
 use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::seed::{EmptyOperator, SeedOperator};
+use crate::seed::{BatchSeedOperator, EmptyOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Avoid retaining every one of the exponentially many binding masks. Further
 /// masks use the existing seeded evaluation; cached masks remain reusable.
 const MAX_PARTIAL_KEY_SETS: usize = 4;
+
+/// Outer sides with at most this many distinct keys build the inner side
+/// seeded by those keys. Each seeded key costs an index lookup where the
+/// unseeded build costs a scan row, so the unseeded build wins once the
+/// outer side is a sizeable fraction of the inner relation.
+const SEEDED_BUILD_MAX_KEYS: usize = 1024;
+
+/// Bound on the outer rows buffered while deciding, whatever their keys.
+const SEEDED_BUILD_MAX_ROWS: usize = 64 * 1024;
 
 /// Approximate retained key storage, shared by the base and projected sets.
 /// Counts the tuple and its cells; excludes table slack and shared payloads.
@@ -62,6 +74,12 @@ pub struct SemijoinOperator {
     partial_keys_safe: bool,
     /// Key positions (not batch columns) -> projected, normalized inner keys.
     partial_key_sets: FxHashMap<Vec<usize>, FxHashSet<CompositeGroupKey>>,
+    /// Outer batches read during `open()` to size the build, replayed first.
+    buffered: VecDeque<Batch>,
+    /// The child returned `None` while buffering.
+    child_exhausted: bool,
+    /// The build was seeded by the outer keys.
+    seeded: bool,
     /// Column indices of key_vars within child.schema(), computed in `open()`.
     key_col_indices: Vec<usize>,
     /// Stats for nested query building.
@@ -98,6 +116,9 @@ impl SemijoinOperator {
             key_set: FxHashSet::default(),
             partial_keys_safe,
             partial_key_sets: FxHashMap::default(),
+            buffered: VecDeque::new(),
+            child_exhausted: false,
+            seeded: false,
             norm: None,
             key_col_indices: Vec::new(),
             stats,
@@ -218,6 +239,19 @@ impl SemijoinOperator {
     }
 }
 
+impl SemijoinOperator {
+    /// Outer batches buffered by `open()` first, then the child's.
+    async fn next_child_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if let Some(batch) = self.buffered.pop_front() {
+            return Ok(Some(batch));
+        }
+        if self.child_exhausted {
+            return Ok(None);
+        }
+        self.child.next_batch(ctx).await
+    }
+}
+
 /// Composite key over the columns `cols` of one row.
 fn row_key(
     batch: &Batch,
@@ -247,9 +281,80 @@ impl Operator for SemijoinOperator {
             self.norm = equality_norm(ctx);
         }
 
+        // Compute key column indices for the child (outer) schema.
+        let child_schema = self.child.schema().to_vec();
+        self.key_col_indices = self
+            .key_vars
+            .iter()
+            .map(|kv| {
+                child_schema.iter().position(|v| v == kv).ok_or_else(|| {
+                    QueryError::Internal(format!("key var {kv:?} not found in child schema"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.child.open(ctx).await?;
+
+        // Read the outer side until it ends or shows more distinct keys than a
+        // seeded build should look up. Only a conjunction of triples seeds: a
+        // seeded solution of it is a solution of the unseeded body.
+        let mut seen: FxHashSet<CompositeGroupKey> = FxHashSet::default();
+        let mut seed_rows: Vec<Vec<Binding>> = Vec::new();
+        let mut overflow = !self.partial_keys_safe;
+        let mut buffered_rows = 0usize;
+        while !overflow {
+            let Some(batch) = self.child.next_batch(ctx).await? else {
+                self.child_exhausted = true;
+                break;
+            };
+            for row_idx in 0..batch.len() {
+                // An unbound key seeds as a free variable, so the build holds
+                // every inner solution the row could match. A poisoned row
+                // keeps its seeded per-row evaluation.
+                if self
+                    .key_col_indices
+                    .iter()
+                    .any(|&ci| matches!(batch.get_by_col(row_idx, ci), Binding::Poisoned))
+                {
+                    continue;
+                }
+                let key = row_key(&batch, row_idx, &self.key_col_indices, &self.norm);
+                if seen.insert(key) {
+                    seed_rows.push(
+                        self.key_col_indices
+                            .iter()
+                            .map(|&ci| batch.get_by_col(row_idx, ci).clone())
+                            .collect(),
+                    );
+                    if seen.len() > SEEDED_BUILD_MAX_KEYS {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            buffered_rows += batch.len();
+            overflow |= buffered_rows > SEEDED_BUILD_MAX_ROWS;
+            self.buffered.push_back(batch);
+        }
+        drop(seen);
+        self.seeded = !overflow;
+
         // Build phase: execute inner patterns once, collect distinct key tuples.
         #[allow(clippy::box_default)]
-        let seed: BoxedOperator = Box::new(EmptyOperator::new());
+        let seed: BoxedOperator = if overflow {
+            Box::new(EmptyOperator::new())
+        } else {
+            let schema: Arc<[VarId]> = Arc::from(self.key_vars.clone().into_boxed_slice());
+            let columns = (0..self.key_vars.len())
+                .map(|col| seed_rows.iter().map(|r| r[col].clone()).collect())
+                .collect();
+            Box::new(BatchSeedOperator::from_batch(Batch::new(schema, columns)?))
+        };
+        tracing::debug!(
+            seeded = self.seeded,
+            seed_keys = seed_rows.len(),
+            "semijoin build"
+        );
+        drop(seed_rows);
         let mut inner_op = build_where_operators_seeded(
             Some(seed),
             &self.inner_patterns,
@@ -293,19 +398,6 @@ impl Operator for SemijoinOperator {
         inner_op.close();
         build_result?;
 
-        // Compute key column indices for the child (outer) schema.
-        let child_schema = self.child.schema().to_vec();
-        self.key_col_indices = self
-            .key_vars
-            .iter()
-            .map(|kv| {
-                child_schema.iter().position(|v| v == kv).ok_or_else(|| {
-                    QueryError::Internal(format!("key var {kv:?} not found in child schema"))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        self.child.open(ctx).await?;
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -316,7 +408,7 @@ impl Operator for SemijoinOperator {
         }
 
         loop {
-            let input_batch = match self.child.next_batch(ctx).await? {
+            let input_batch = match self.next_child_batch(ctx).await? {
                 Some(b) if !b.is_empty() => b,
                 Some(_) => continue,
                 None => {
@@ -336,6 +428,7 @@ impl Operator for SemijoinOperator {
         self.child.close();
         self.key_set.clear();
         self.partial_key_sets.clear();
+        self.buffered.clear();
         self.state = OperatorState::Closed;
     }
 
@@ -345,7 +438,7 @@ impl Operator for SemijoinOperator {
         }
         let mut count: u64 = 0;
         loop {
-            match self.child.next_batch(ctx).await? {
+            match self.next_child_batch(ctx).await? {
                 Some(batch) if !batch.is_empty() => {
                     let keep = self.keep_mask(ctx, &batch).await?;
                     let kept = keep.iter().filter(|&&k| k).count() as u64;
@@ -569,6 +662,57 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, QueryError::Cancelled { .. }), "{err:?}");
         assert!(op.partial_key_sets.is_empty());
+    }
+
+    /// A conjunction of triples seeds its build from an outer side with few
+    /// distinct keys (unbound keys included); more keys, or another body
+    /// shape, build the whole body.
+    #[tokio::test]
+    async fn build_is_seeded_only_for_few_keys_over_triples() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let rows = |n: u64| {
+            (0..n)
+                .map(|i| {
+                    vec![
+                        Binding::encoded_sid(i),
+                        Binding::encoded_sid(1),
+                        if i % 2 == 0 {
+                            Binding::Unbound
+                        } else {
+                            Binding::encoded_sid(2)
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        let values = Pattern::Values {
+            vars: vec![VarId(0), VarId(1), VarId(2)],
+            rows: vec![],
+        };
+        for (n, body, seeded) in [
+            (SEEDED_BUILD_MAX_KEYS as u64, triple(), true),
+            (SEEDED_BUILD_MAX_KEYS as u64 + 1, triple(), false),
+            (2, values, false),
+        ] {
+            let mut op = SemijoinOperator::new(
+                Box::new(BatchSeedOperator::from_batch(batch(rows(n)))),
+                vec![body],
+                vec![VarId(0), VarId(1), VarId(2)],
+                false,
+                None,
+                PlanningContext::current(),
+            );
+            op.open(&ctx).await.unwrap();
+            assert_eq!(op.seeded, seeded, "{n} keys");
+            let mut replayed = 0;
+            while let Some(batch) = op.next_child_batch(&ctx).await.unwrap() {
+                replayed += batch.len();
+            }
+            assert_eq!(replayed as u64, n, "every outer row is replayed");
+            op.close();
+        }
     }
 
     #[tokio::test]
