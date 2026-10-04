@@ -23,7 +23,7 @@ fluree materialize <GRAPH_SOURCE> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--into <LEDGER>` | Name for the twin ledger. Defaults to the graph-source id with a `-twin` suffix, preserving any `:branch` (`dw-gs:main` → `dw-gs-twin:main`). |
-| `--output <FORM>` | `pack` (a `.flpack` file — the default), `ledger` (a local native ledger, left registered), or `s3` (direct-S3 CAS publish — not yet wired in the file-backed CLI; see DEC-003 §3). |
+| `--output <FORM>` | `pack` (a `.flpack` file — the default), `ledger` (a local native ledger, left registered), or `s3` (direct-S3 CAS publish — not yet supported by the file-backed CLI). |
 | `--output-path <PATH>` | Destination for `--output pack` (default: `<twin>.flpack` in the current directory). |
 | `--verify <MODE>` | Depth of the parity gate run before the twin is announced: `quick` (default) or `full`. See [Verification](#verification). A failed gate **drops the twin** and exits non-zero. |
 | `--max-performance` | Own-the-box: auto-size memory/parallelism to the host (~80% RAM). Only on a cleared machine — the default is deliberately conservative to stay co-resident-safe. |

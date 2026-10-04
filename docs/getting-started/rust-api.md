@@ -36,12 +36,15 @@ Available feature flags:
 - `credential` (default in server/CLI) - DID/JWS/VerifiableCredential support for signed queries and transactions
 - `shacl` (default in server/CLI) - SHACL constraint validation
 - `iceberg` (default in server/CLI) - Apache Iceberg/R2RML graph source support
+- `sql` (default in server/CLI) - SQL graph sources (R2RML over a Trino-protocol endpoint); implies `iceberg`
+- `delta` (default in server/CLI) - Delta Lake graph sources (R2RML over Delta tables); implies `iceberg`
+- `graphql` (default in server/CLI) - GraphQL over the schema derived from a ledger's data; implies `shacl`
 - `aws` - AWS-backed storage support (S3, storage-backed nameservice). Enables `FlureeBuilder::s3()` and S3-based JSON-LD configs.
 - `ipfs` - IPFS-backed storage via Kubo HTTP RPC
 - `vector` - Embedded vector similarity search (HNSW indexes via usearch)
 - `search-remote-client` - Remote search service client (HTTP client for remote BM25 and vector search services)
 - `aws-testcontainers` - Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
-- `full` - Convenience bundle: `native`, `credential`, `iceberg`, `shacl`, `ipfs`
+- `full` - Convenience bundle: `native`, `credential`, `iceberg`, `sql`, `shacl`, `ipfs`, `graphql` (excludes `delta`, `aws`, `vector`)
 
 ## Quick Start
 

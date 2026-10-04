@@ -71,9 +71,8 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     // Reject up front — before any work — rather than build then fail.
     if params.output == MaterializeOutput::S3 {
         return Err(CliError::Usage(
-            "--output s3 is not yet wired in the file-backed CLI; build with \
-             --output pack and upload the pack, or use the direct-S3 CAS builder \
-             (DEC-003 §3)"
+            "--output s3 is not yet supported by the file-backed CLI; build with \
+             --output pack and upload the pack"
                 .to_string(),
         ));
     }
