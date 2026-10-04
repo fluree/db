@@ -1,0 +1,30 @@
+[package]
+name = "fluree-db-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native core of the `fluree` Python package"
+# Distributed as the `fluree` wheel (built by maturin), not on crates.io.
+publish = false
+
+[lib]
+name = "_fluree"
+crate-type = ["cdylib"]
+# The tests are pytest suites under tests/; a Rust test harness for an
+# extension module would have to link libpython, which CI does not provide.
+test = false
+doctest = false
+
+[dependencies]
+bytes = "1"
+fluree-db-api = { path = "../fluree-db-api", features = ["native", "shacl", "aws"] }
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-sparql = { path = "../fluree-db-sparql" }
+pyo3 = "0.29"
+pythonize = "0.29"
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

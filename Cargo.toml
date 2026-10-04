@@ -54,6 +54,7 @@ members = [
     "fluree-db-consensus",
     "fluree-raft-core",
     "fluree-db-wasm",
+    "fluree-db-python",
 ]
 exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load", "fluree-sql-bridge"]
 

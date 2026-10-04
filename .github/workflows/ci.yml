@@ -344,6 +344,53 @@ jobs:
   #    which is the package's hosting contract.
   # ubuntu-24.04 ships a matching Chrome + chromedriver pair. Same RUSTFLAGS
   # restatement as the wasm32 job (an env RUSTFLAGS masks .cargo/config.toml).
+  python:
+    # The `fluree` Python package is tested by pytest (its Rust lib is
+    # `test = false`), so no job above runs its tests. One abi3 wheel per OS,
+    # tested on the oldest and newest supported Pythons. A debug build: the
+    # release profile's LTO costs minutes and buys nothing for a test run.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            rustflags: "-C link-arg=-fuse-ld=mold"
+          # mold is Linux-only; clear the workflow-level linker flag.
+          - os: macos-15
+            rustflags: ""
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: |
+            3.10
+            3.14
+
+      - name: Build the wheel
+        run: |
+          python3.14 -m pip install "maturin>=1.9,<2"
+          python3.14 -m maturin build --locked --manifest-path fluree-db-python/Cargo.toml --out dist
+
+      - name: Test on Python 3.10 and 3.14
+        run: |
+          for py in 3.10 3.14; do
+            "python$py" -m venv "venv-$py"
+            "venv-$py/bin/pip" install dist/*.whl pytest pandas
+            "venv-$py/bin/python" -m pytest fluree-db-python/tests
+          done
+
   wasm-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
