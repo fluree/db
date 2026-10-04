@@ -58,9 +58,10 @@ pub struct CypherTransaction {
     ledger_id: LedgerId,
     /// `t` of the pinned base — the commit-time precondition.
     base_t: i64,
-    /// Head ref of the pinned base (`None` on an empty ledger) — the
-    /// `expected` side of the publish CAS.
-    base_head: Option<RefValue>,
+    /// Head ref of the pinned base — the `expected` side of the publish CAS.
+    /// A ledger with no commit yet has the unborn ref (`id: None`, `t: 0`)
+    /// that `create_ledger` publishes, as the autocommit path expects too.
+    base_head: RefValue,
     /// The transaction's private state: base + every staged statement.
     state: LedgerState,
     /// Built-but-unpublished commits, in statement order.
@@ -131,10 +132,10 @@ impl Fluree {
     ) -> Result<CypherTransaction> {
         let handle = self.ledger_cached(ledger_id).await?;
         let state = handle.snapshot().await.to_ledger_state();
-        let base_head = state.head_commit_id.clone().map(|cid| RefValue {
-            id: Some(cid),
+        let base_head = RefValue {
+            id: state.head_commit_id.clone(),
             t: state.t(),
-        });
+        };
         Ok(CypherTransaction {
             // The id the handle resolved to, not the caller's spelling: the
             // commit derives storage paths and cache keys from it.
@@ -435,8 +436,8 @@ impl Fluree {
         if txn.pending.is_empty() {
             // Nothing published, head unchanged — mirror the autocommit no-op
             // receipt exactly. A `create_ledger` ledger has a nameservice
-            // record but no genesis commit, so `base_head` is legitimately
-            // `None` here; that must stay a successful no-op, not an error.
+            // record but no genesis commit, so `base_head` legitimately has
+            // no id here; that must stay a successful no-op, not an error.
             return Ok(TransactResultRef {
                 receipt: CommitReceipt::no_op(txn.base_t),
                 indexing: IndexingStatus {
@@ -454,8 +455,7 @@ impl Fluree {
         let guard = handle.lock_for_write().await;
 
         let head = guard.state();
-        let base_head_id = txn.base_head.as_ref().and_then(|r| r.id.clone());
-        if head.t() != txn.base_t || head.head_commit_id != base_head_id {
+        if head.t() != txn.base_t || head.head_commit_id != txn.base_head.id {
             return Err(ApiError::Transact(TransactError::CommitConflict {
                 expected_t: txn.base_t,
                 head_t: head.t(),
@@ -482,7 +482,7 @@ impl Fluree {
             .compare_and_set_ref(
                 &txn.ledger_id,
                 RefKind::CommitHead,
-                txn.base_head.as_ref(),
+                Some(&txn.base_head),
                 &new_head,
             )
             .await
