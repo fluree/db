@@ -15,6 +15,7 @@
 //! - **Snapshots are frozen.** `Snapshot` pins one `GraphDb`; every query on it
 //!   sees the same state however the ledger moves on.
 
+mod branch;
 mod connection;
 mod convert;
 mod error;

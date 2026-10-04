@@ -5,10 +5,11 @@
 //! `("literal", lexical, datatype_iri, language)`. Unbound cells are `None`.
 
 use crate::error::{fluree_error, invalid_request};
-use fluree_db_api::TimeSpec;
+use fluree_db_api::{CommitRef, ResolvedFlake, ResolvedValue, TimeSpec};
+use fluree_db_core::{CommitSummary, ContentId};
 use fluree_db_sparql::ast::{QueryBody, SelectVariables};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use serde_json::Value as JsonValue;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
@@ -34,6 +35,20 @@ pub(crate) fn time_spec(at: Option<&Bound<'_, PyTuple>>) -> PyResult<TimeSpec> {
         "time" => TimeSpec::AtTime(value.extract()?),
         "commit" => TimeSpec::AtCommit(value.extract()?),
         other => return Err(invalid_request(format!("unknown time kind {other:?}"))),
+    })
+}
+
+/// A commit named by its `t` (an int), its full id, or a prefix of its hex
+/// digest. Only a canonical CID counts as an id, so a digest is never misread
+/// as one.
+pub(crate) fn commit_ref(commit: &Bound<'_, PyAny>) -> PyResult<CommitRef> {
+    if let Ok(t) = commit.extract::<i64>() {
+        return Ok(CommitRef::T(t));
+    }
+    let text: String = commit.extract()?;
+    Ok(match ContentId::parse_canonical(&text) {
+        Some(cid) => CommitRef::Exact(cid),
+        None => CommitRef::Prefix(text),
     })
 }
 
@@ -149,5 +164,47 @@ pub(crate) fn term<'py>(py: Python<'py>, term: &JsonValue) -> PyResult<Bound<'py
         _ => Err(fluree_error(format!(
             "unsupported SPARQL result term: {term}"
         ))),
+    }
+}
+
+/// A commit summary as the dict `fluree.Commit` is built from.
+pub(crate) fn commit_summary<'py>(
+    py: Python<'py>,
+    summary: &CommitSummary,
+) -> PyResult<Bound<'py, PyDict>> {
+    let commit = PyDict::new(py);
+    commit.set_item("t", summary.t)?;
+    commit.set_item("id", summary.commit_id.to_string())?;
+    commit.set_item("digest", summary.commit_id.digest_hex())?;
+    commit.set_item("asserts", summary.asserts)?;
+    commit.set_item("retracts", summary.retracts)?;
+    commit.set_item("time", summary.time.as_deref())?;
+    commit.set_item("message", summary.message.as_deref())?;
+    Ok(commit)
+}
+
+/// `(subject, predicate, object, assert, graph)`, the object a term tuple.
+/// The flake's IRIs must be whole, not compacted.
+pub(crate) fn flake<'py>(py: Python<'py>, flake: &ResolvedFlake) -> PyResult<Bound<'py, PyTuple>> {
+    let object = if flake.dt == "@id" {
+        ("iri", lexical(&flake.o)).into_pyobject(py)?
+    } else {
+        (
+            "literal",
+            lexical(&flake.o),
+            &flake.dt,
+            flake.lang.as_deref(),
+        )
+            .into_pyobject(py)?
+    };
+    (&flake.s, &flake.p, object, flake.op, flake.graph.as_deref()).into_pyobject(py)
+}
+
+fn lexical(value: &ResolvedValue) -> String {
+    match value {
+        ResolvedValue::String(s) | ResolvedValue::Lexical(s) => s.clone(),
+        ResolvedValue::Boolean(b) => b.to_string(),
+        ResolvedValue::Long(n) => n.to_string(),
+        ResolvedValue::Double(d) => d.to_string(),
     }
 }

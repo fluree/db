@@ -18,7 +18,18 @@ JSON-LD or Turtle and query it with SPARQL or JSON-LD::
             print(name, age)
 """
 
-from fluree._connection import Change, Commit, Connection, Ledger, QueryProfile, Snapshot, connect
+from fluree._connection import Connection, Ledger, QueryProfile, Snapshot, connect
+from fluree._records import (
+    Branch,
+    Change,
+    Commit,
+    Conflict,
+    MergePreview,
+    MergeResult,
+    RebaseResult,
+    RevertPreview,
+    RevertResult,
+)
 from fluree._fluree import __version__
 from fluree._results import Rows, RowStream
 from fluree._terms import IRI, BlankNode, LangString, Literal
@@ -35,8 +46,10 @@ from fluree.errors import (
 __all__ = [
     "IRI",
     "BlankNode",
+    "Branch",
     "Change",
     "Commit",
+    "Conflict",
     "ConflictError",
     "Connection",
     "FlureeError",
@@ -44,11 +57,16 @@ __all__ = [
     "LangString",
     "Ledger",
     "Literal",
+    "MergePreview",
+    "MergeResult",
     "NotFoundError",
     "PermissionDeniedError",
     "QueryProfile",
     "QueryTimeoutError",
+    "RebaseResult",
     "ResourceLimitError",
+    "RevertPreview",
+    "RevertResult",
     "RowStream",
     "Rows",
     "Snapshot",

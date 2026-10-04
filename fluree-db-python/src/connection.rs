@@ -3,21 +3,25 @@
 //! These take ledger ids and plain data and return plain data; the Python
 //! layer owns argument handling, defaults, and result objects.
 
-use crate::convert::{from_json, jsonld_columns, sparql_columns, time_spec, to_json};
+use crate::branch;
+use crate::convert::{
+    commit_ref, commit_summary, flake, from_json, jsonld_columns, sparql_columns, time_spec,
+    to_json,
+};
 use crate::error::{api_error, fluree_error, invalid_request, not_found};
 use crate::query::{execute, Controls};
 use crate::runtime::{block_on, enter, runtime, InRuntime};
 use crate::stream::{RowStream, CHANNEL_DEPTH};
 use fluree_db_api::{
-    build_transact_policy_context, export::ExportFormat, ApiError, CommitDetail, DataSetDb,
-    DropMode, Fluree, FlureeBuilder, FormatterConfig, GovernanceOptions, GraphDb,
+    build_transact_policy_context, export::ExportFormat, ApiError, CommitDetail, CommitRef,
+    DataSetDb, DropMode, Fluree, FlureeBuilder, FormatterConfig, GovernanceOptions, GraphDb,
     GraphSnapshotQueryBuilder, OwnedStreamQuery, ParsedContext, QueryCancellation,
-    QueryExecutionOptions, ResolvedValue, TimeSpec, Tracker,
+    QueryExecutionOptions, TimeSpec, Tracker,
 };
 use fluree_db_core::ledger_id::normalize_ledger_id;
 use fluree_db_core::ContentId;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 
@@ -176,6 +180,76 @@ impl Connection {
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         block_on(py, self.fluree.disconnect())
+    }
+
+    /// Every branch of `ledger`'s ledger, by name.
+    fn branches<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        branch::list(py, &self.fluree, &canonical(ledger)?)
+    }
+
+    /// Branch `name` off `ledger` at its head or at `at`; returns its id.
+    #[pyo3(signature = (ledger, name, at = None))]
+    fn create_branch(
+        &self,
+        py: Python<'_>,
+        ledger: &str,
+        name: &str,
+        at: Option<&Bound<'_, PyTuple>>,
+    ) -> PyResult<String> {
+        branch::create(py, &self.fluree, &canonical(ledger)?, name, time_spec(at)?)
+    }
+
+    fn drop_branch(&self, py: Python<'_>, ledger: &str) -> PyResult<()> {
+        branch::drop(py, &self.fluree, &canonical(ledger)?)
+    }
+
+    fn merge<'py>(
+        &self,
+        py: Python<'py>,
+        target: &str,
+        source: &str,
+        strategy: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        branch::merge(py, &self.fluree, &canonical(target)?, source, strategy)
+    }
+
+    fn rebase<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        strategy: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        branch::rebase(py, &self.fluree, &canonical(ledger)?, strategy)
+    }
+
+    fn revert<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        commits: &Bound<'py, PyList>,
+        strategy: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        branch::revert(py, &self.fluree, &canonical(ledger)?, commits, strategy)
+    }
+
+    fn merge_preview<'py>(
+        &self,
+        py: Python<'py>,
+        target: &str,
+        source: &str,
+        options: branch::MergePreviewArgs,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        branch::merge_preview(py, &self.fluree, &canonical(target)?, source, options)
+    }
+
+    fn revert_preview<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        commits: &Bound<'py, PyList>,
+        options: branch::RevertPreviewArgs,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        branch::revert_preview(py, &self.fluree, &canonical(ledger)?, commits, options)
     }
 
     /// Commit a transaction. `kind` is `"jsonld"` (payload: a JSON-able
@@ -441,17 +515,7 @@ impl Connection {
             block_on(py, self.fluree.commit_log(&id, limit))?.map_err(api_error)?;
         let commits = summaries
             .iter()
-            .map(|s| {
-                let commit = PyDict::new(py);
-                commit.set_item("t", s.t)?;
-                commit.set_item("id", s.commit_id.to_string())?;
-                commit.set_item("digest", s.commit_id.digest_hex())?;
-                commit.set_item("asserts", s.asserts)?;
-                commit.set_item("retracts", s.retracts)?;
-                commit.set_item("time", s.time.as_deref())?;
-                commit.set_item("message", s.message.as_deref())?;
-                Ok(commit)
-            })
+            .map(|s| commit_summary(py, s))
             .collect::<PyResult<_>>()?;
         Ok((commits, total))
     }
@@ -468,21 +532,13 @@ impl Connection {
     ) -> PyResult<Bound<'py, PyDict>> {
         let id = canonical(ledger)?;
         let policy = governance(policy)?;
-        let reference = if let Ok(t) = commit.extract::<i64>() {
-            CommitRef::T(t)
-        } else {
-            let text: String = commit.extract()?;
-            match text.parse::<ContentId>() {
-                Ok(cid) => CommitRef::Id(cid),
-                Err(_) => CommitRef::Prefix(text),
-            }
-        };
+        let reference = commit_ref(commit)?;
         let fluree = &*self.fluree;
         let detail = block_on(py, async {
             let graph = fluree.graph(&id);
             let builder = match &reference {
                 CommitRef::T(t) => graph.commit_t(*t),
-                CommitRef::Id(cid) => graph.commit(cid),
+                CommitRef::Exact(cid) => graph.commit(cid),
                 CommitRef::Prefix(prefix) => graph.commit_prefix(prefix),
             };
             // An empty context leaves IRIs whole rather than compacted to
@@ -625,12 +681,6 @@ impl Connection {
     }
 }
 
-enum CommitRef {
-    T(i64),
-    Id(ContentId),
-    Prefix(String),
-}
-
 fn commit_detail_to_py<'py>(
     py: Python<'py>,
     detail: &CommitDetail,
@@ -651,26 +701,10 @@ fn commit_detail_to_py<'py>(
     let flakes = detail
         .flakes
         .iter()
-        .map(|f| {
-            let object = if f.dt == "@id" {
-                ("iri", lexical(&f.o)).into_pyobject(py)?
-            } else {
-                ("literal", lexical(&f.o), &f.dt, f.lang.as_deref()).into_pyobject(py)?
-            };
-            (&f.s, &f.p, object, f.op, f.graph.as_deref()).into_pyobject(py)
-        })
+        .map(|f| flake(py, f))
         .collect::<PyResult<Vec<_>>>()?;
     commit.set_item("flakes", flakes)?;
     Ok(commit)
-}
-
-fn lexical(value: &ResolvedValue) -> String {
-    match value {
-        ResolvedValue::String(s) | ResolvedValue::Lexical(s) => s.clone(),
-        ResolvedValue::Boolean(b) => b.to_string(),
-        ResolvedValue::Long(n) => n.to_string(),
-        ResolvedValue::Double(d) => d.to_string(),
-    }
 }
 
 /// A ledger view frozen at one `t`: every query sees the same state.

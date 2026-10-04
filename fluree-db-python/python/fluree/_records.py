@@ -1,0 +1,260 @@
+"""Records the API returns: commits, changes, branches, and the outcomes and
+previews of merging, rebasing and reverting."""
+
+from __future__ import annotations
+
+import datetime as _dt
+from dataclasses import dataclass
+from typing import Any, Literal as _Literal
+
+from fluree._terms import IRI, BlankNode, _datetime, to_python
+
+
+@dataclass(frozen=True, slots=True)
+class Commit:
+    """The outcome of a transaction.
+
+    ``id`` is the commit's content id (a CID). ``digest`` is its hex hash, the
+    form ``fluree log`` shows: like a git SHA, a unique prefix of it
+    (``short_id``, say) identifies the commit. A prefix of ``id`` does not,
+    since every CID starts with the same header characters.
+
+    ``id`` and ``digest`` are ``None`` when the transaction changed nothing, in
+    which case no commit was written and ``t`` is the ledger's unchanged ``t``.
+
+    ``time`` and ``message`` are filled in for commits read from
+    :meth:`Ledger.log` and the previews.
+    """
+
+    t: int
+    id: str | None
+    digest: str | None
+    asserts: int
+    retracts: int
+    time: _dt.datetime | None = None
+    message: str | None = None
+
+    @property
+    def short_id(self) -> str | None:
+        """The first 12 hex digits of ``digest``, as ``fluree log`` prints them."""
+        return None if self.digest is None else self.digest[:12]
+
+
+@dataclass(frozen=True, slots=True)
+class Change:
+    """One fact asserted or retracted at transaction ``t``: ``subject``'s
+    ``predicate`` gained (``op == "assert"``) or lost (``op == "retract"``)
+    ``value``, in the default graph or the named ``graph``.
+
+    ``t`` is ``None`` for the net changes a merge preview reports, which span
+    several commits.
+    """
+
+    t: int | None
+    op: _Literal["assert", "retract"]
+    subject: IRI | BlankNode
+    predicate: IRI
+    value: Any
+    graph: IRI | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Branch:
+    """A branch of a ledger. Open it with ``conn.ledger(branch.id)``.
+
+    ``source`` is the branch it was created from, ``None`` for the ledger's
+    first branch. ``t`` and ``head`` are its latest commit's ``t`` and id.
+    """
+
+    name: str
+    id: str
+    source: str | None
+    t: int
+    head: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Conflict:
+    """A property of a subject that both sides changed.
+
+    ``source`` and ``target`` are what each side wrote to it, when the preview
+    was asked for ``details``; otherwise ``None``.
+    """
+
+    subject: IRI | BlankNode
+    predicate: IRI
+    graph: IRI | None
+    source: list[Change] | None = None
+    target: list[Change] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MergeResult:
+    """The outcome of :meth:`Ledger.merge`.
+
+    A ``fast_forward`` merge moved ``target`` to ``source``'s latest commit
+    without writing one; otherwise ``id`` is the new merge commit. ``t`` is
+    ``target``'s ``t`` afterwards. ``conflicts`` counts the properties
+    ``strategy`` resolved.
+    """
+
+    source: str
+    target: str
+    fast_forward: bool
+    t: int
+    id: str
+    digest: str
+    conflicts: int
+    strategy: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RebaseResult:
+    """The outcome of :meth:`Ledger.rebase`.
+
+    Of the branch's ``total`` own commits, ``replayed`` were rewritten on top
+    of its source's latest commit (``source_t``) and ``skipped`` were dropped
+    by the ``"skip"`` strategy. ``conflicts`` lists ``(t, properties,
+    resolution)`` for each commit that conflicted, ``t`` being the commit's
+    original ``t``; ``failures`` lists ``(t, error)`` for commits that failed
+    validation once replayed. A ``fast_forward`` rebase had no commits of its
+    own to replay.
+    """
+
+    fast_forward: bool
+    replayed: int
+    skipped: int
+    total: int
+    source_t: int
+    conflicts: list[tuple[int, int, str]]
+    failures: list[tuple[int, str]]
+
+
+@dataclass(frozen=True, slots=True)
+class RevertResult:
+    """The outcome of :meth:`Ledger.revert`.
+
+    ``reverted`` holds the ids of the undone commits, newest first. When
+    ``committed`` is false the commits had nothing left to undo, no commit was
+    written, and ``t``/``id`` describe the unchanged head. ``conflicts`` counts
+    the properties changed since that ``strategy`` resolved.
+    """
+
+    committed: bool
+    t: int
+    id: str
+    digest: str
+    reverted: list[str]
+    conflicts: int
+    strategy: str
+
+
+@dataclass(frozen=True, slots=True)
+class MergePreview:
+    """What merging ``source`` into ``target`` would do, without doing it.
+
+    - ``ahead``: commits on ``source`` that ``target`` lacks, newest first;
+      ``behind``: the reverse. Each list may be capped; ``ahead_count`` and
+      ``behind_count`` are the full counts.
+    - ``ancestor_t``: the ``t`` of the last commit the two share.
+    - ``fast_forward``: ``target`` has no commits of its own since, so the
+      merge just moves it forward.
+    - ``conflicts``: properties both sides changed (may be capped;
+      ``conflict_count`` is the full count).
+    - ``mergeable``: the merge would succeed under the previewed strategy,
+      including the ledger's SHACL shapes; when it would fail validation,
+      ``violations`` holds the report.
+    - ``changes``: the net facts the merge would bring in, when asked for. Pass
+      ``changes_after`` back as ``changes_after=`` to read the next page.
+    """
+
+    source: str
+    target: str
+    fast_forward: bool
+    mergeable: bool
+    ancestor_t: int | None
+    ahead: list[Commit]
+    ahead_count: int
+    behind: list[Commit]
+    behind_count: int
+    conflicts: list[Conflict]
+    conflict_count: int
+    violations: str | None
+    changes: list[Change] | None
+    changes_after: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RevertPreview:
+    """What reverting would do, without doing it.
+
+    ``commits`` are the commits that would be undone, newest first (may be
+    capped; ``commit_count`` is the full count). ``conflicts`` are properties
+    changed again since those commits. ``revertable`` says whether the revert
+    would succeed under the previewed strategy and the ledger's SHACL shapes;
+    when validation would fail, ``violations`` holds the report.
+    """
+
+    revertable: bool
+    commits: list[Commit]
+    commit_count: int
+    conflicts: list[Conflict]
+    conflict_count: int
+    violations: str | None
+
+
+def _node(iri: str) -> IRI | BlankNode:
+    return BlankNode(iri[2:]) if iri.startswith("_:") else IRI(iri)
+
+
+def _commit(summary: dict[str, Any]) -> Commit:
+    time = summary["time"]
+    return Commit(**{**summary, "time": None if time is None else _datetime(time)})
+
+
+def _change(t: int | None, flake: tuple[Any, ...]) -> Change:
+    """A :class:`Change` from the native ``(s, p, object, assert, graph)``."""
+    s, p, o, op, g = flake
+    return Change(
+        t=t,
+        op="assert" if op else "retract",
+        subject=_node(s),
+        predicate=IRI(p),
+        value=_node(o[1]) if o[0] == "iri" else to_python(o),
+        graph=None if g is None else IRI(g),
+    )
+
+
+def _conflict(raw: dict[str, Any]) -> Conflict:
+    side = raw["source"], raw["target"]
+    source, target = ([_change(None, f) for f in flakes] if flakes is not None else None for flakes in side)
+    return Conflict(
+        subject=_node(raw["subject"]),
+        predicate=IRI(raw["predicate"]),
+        graph=None if raw["graph"] is None else IRI(raw["graph"]),
+        source=source,
+        target=target,
+    )
+
+
+def _merge_preview(raw: dict[str, Any]) -> MergePreview:
+    changes = raw["changes"]
+    return MergePreview(
+        **{
+            **raw,
+            "ahead": [_commit(c) for c in raw["ahead"]],
+            "behind": [_commit(c) for c in raw["behind"]],
+            "conflicts": [_conflict(c) for c in raw["conflicts"]],
+            "changes": None if changes is None else [_change(None, f) for f in changes],
+        }
+    )
+
+
+def _revert_preview(raw: dict[str, Any]) -> RevertPreview:
+    return RevertPreview(
+        **{
+            **raw,
+            "commits": [_commit(c) for c in raw["commits"]],
+            "conflicts": [_conflict(c) for c in raw["conflicts"]],
+        }
+    )

@@ -71,7 +71,34 @@ sees identically.
 - `ledger.log()` lists commits, newest first; `ledger.changes(commit)` lists
   what one commit asserted and retracted.
 
-## Policy
+## Branches
+
+A branch is a ledger that shares another's history up to the point it was
+created, then changes on its own. Branch ids are `ledger:branch`; a ledger's
+first branch is `main`.
+
+```python
+dev = people.branch("dev")                  # or people.at(t=5).branch("fix")
+dev.insert({...})
+
+preview = people.merge_preview("dev")       # ahead/behind commits, conflicts
+if preview.mergeable:
+    people.merge("dev")                     # bring dev's commits into main
+```
+
+- `ledger.branches()` lists a ledger's branches; `conn.drop("people:dev")`
+  drops one.
+- `ledger.merge(source, strategy=...)` settles properties both branches changed:
+  `"take-both"` (default) keeps both values, `"take-source"` or
+  `"take-branch"` picks a side, `"abort"` raises `fluree.ConflictError`.
+  `merge_preview(...)` reports what a merge would do, including the net
+  changes (`changes=True`) and what each side wrote to each conflict
+  (`details=True`).
+- `branch.rebase()` replays a branch's own commits on top of the latest
+  commit of the branch it came from.
+- `ledger.revert(commits)` undoes one or more commits in a new commit;
+  `revert_preview(...)` checks first.
+
 
 `ledger.with_policy(identity=..., policy_class=..., policy=..., values=...,
 default_allow=...)` returns a governed handle: reads through it are filtered by

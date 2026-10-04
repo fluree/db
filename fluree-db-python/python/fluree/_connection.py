@@ -10,8 +10,22 @@ from pathlib import Path
 from typing import Any, Literal as _Literal, Union
 
 from fluree import _fluree
+from fluree._records import (
+    Branch,
+    Change,
+    Commit,
+    MergePreview,
+    MergeResult,
+    RebaseResult,
+    RevertPreview,
+    RevertResult,
+    _change,
+    _commit,
+    _merge_preview,
+    _revert_preview,
+)
 from fluree._results import Rows, RowStream
-from fluree._terms import IRI, BlankNode, _datetime, to_python
+from fluree._terms import IRI
 from fluree.errors import InvalidRequestError, PermissionDeniedError
 
 MEMORY = ":memory:"
@@ -20,6 +34,10 @@ Query = Union[str, dict[str, Any]]
 Data = Union[str, dict[str, Any], list[Any], "os.PathLike[str]"]
 Format = _Literal["jsonld", "turtle", "trig"]
 ExportFormat = _Literal["turtle", "trig", "ntriples", "nquads", "jsonld"]
+MergeStrategy = _Literal["take-both", "abort", "take-source", "take-branch"]
+RebaseStrategy = _Literal["take-both", "abort", "take-source", "take-branch", "skip"]
+RevertStrategy = _Literal["abort", "take-source", "take-branch"]
+CommitRef = Union[int, str, Commit]
 
 _EXPORT_SUFFIXES: dict[str, ExportFormat] = {
     ".ttl": "turtle",
@@ -64,50 +82,6 @@ def connect(
     if os.fspath(path) == MEMORY:  # type: ignore[arg-type]
         return Connection(_fluree.Connection.memory())
     return Connection(_fluree.Connection.file(Path(path), indexing=indexing))  # type: ignore[arg-type]
-
-
-@dataclass(frozen=True, slots=True)
-class Commit:
-    """The outcome of a transaction.
-
-    ``id`` is the commit's content id (a CID). ``digest`` is its hex hash, the
-    form ``fluree log`` shows: like a git SHA, a unique prefix of it
-    (``short_id``, say) identifies the commit. A prefix of ``id`` does not,
-    since every CID starts with the same header characters.
-
-    ``id`` and ``digest`` are ``None`` when the transaction changed nothing, in
-    which case no commit was written and ``t`` is the ledger's unchanged ``t``.
-
-    ``time`` and ``message`` are filled in for commits read from
-    :meth:`Ledger.log`.
-    """
-
-    t: int
-    id: str | None
-    digest: str | None
-    asserts: int
-    retracts: int
-    time: _dt.datetime | None = None
-    message: str | None = None
-
-    @property
-    def short_id(self) -> str | None:
-        """The first 12 hex digits of ``digest``, as ``fluree log`` prints them."""
-        return None if self.digest is None else self.digest[:12]
-
-
-@dataclass(frozen=True, slots=True)
-class Change:
-    """One fact asserted or retracted at transaction ``t``: ``subject``'s
-    ``predicate`` gained (``op == "assert"``) or lost (``op == "retract"``)
-    ``value``, in the default graph or the named ``graph``."""
-
-    t: int
-    op: _Literal["assert", "retract"]
-    subject: IRI | BlankNode
-    predicate: IRI
-    value: Any
-    graph: IRI | None = None
 
 
 class Connection:
@@ -173,9 +147,17 @@ class Connection:
         return Ledger(self, self._native.restore(Path(path), ledger))
 
     def drop(self, ledger: str) -> None:
-        """Delete a ledger, every branch and all history. Takes the ledger name
-        without a branch (``"people"``, not ``"people:main"``)."""
-        self._native.drop(ledger)
+        """Delete a ledger, every branch and all history (``"people"``), or one
+        branch (``"people:dev"``).
+
+        A ledger's first branch cannot be dropped on its own; drop the ledger.
+        A branch that other branches were created from is hidden at once but
+        its storage is kept until they are dropped too.
+        """
+        if ":" in ledger:
+            self._native.drop_branch(ledger)
+        else:
+            self._native.drop(ledger)
 
 
 class Ledger:
@@ -355,30 +337,168 @@ class Ledger:
     def log(self, limit: int | None = None) -> list[Commit]:
         """The ledger's commits, newest first; at most ``limit`` of them."""
         commits, _total = self._connection._native.log(self._id, limit)
-        return [
-            Commit(**{**c, "time": None if c["time"] is None else _datetime(c["time"])})
-            for c in commits
-        ]
+        return [_commit(c) for c in commits]
 
-    def changes(self, commit: int | str) -> list[Change]:
+    def changes(self, commit: CommitRef) -> list[Change]:
         """The facts one commit asserted and retracted.
 
-        ``commit`` is its ``t``, its id, or a prefix of its hex digest
-        (:attr:`Commit.short_id`). Under :meth:`with_policy`, facts the policy
+        ``commit`` is its ``t``, its id, a prefix of its hex digest
+        (:attr:`Commit.short_id`), or a :class:`Commit`. Under :meth:`with_policy`, facts the policy
         hides are left out.
         """
-        detail = self._connection._native.commit_detail(self._id, commit, self._policy)
-        return [
-            Change(
-                t=detail["t"],
-                op="assert" if op else "retract",
-                subject=_node(s),
-                predicate=IRI(p),
-                value=_node(o[1]) if o[0] == "iri" else to_python(o),
-                graph=None if g is None else IRI(g),
-            )
-            for s, p, o, op, g in detail["flakes"]
-        ]
+        detail = self._connection._native.commit_detail(self._id, _commit_ref(commit), self._policy)
+        return [_change(detail["t"], flake) for flake in detail["flakes"]]
+
+    def branch(self, name: str) -> Ledger:
+        """Create branch ``name`` from this ledger's latest state and return
+        it. Branch from a past state with ``ledger.at(...).branch(name)``.
+
+        The new branch shares this one's history up to that point; from then
+        on each changes independently, until :meth:`merge` brings one's
+        commits into the other.
+        """
+        return self._create_branch(name, None)
+
+    def branches(self) -> list[Branch]:
+        """Every branch of this ledger, by name."""
+        return [Branch(**b) for b in self._connection._native.branches(self._id)]
+
+    def merge(self, source: str | Ledger, *, strategy: MergeStrategy = "take-both") -> MergeResult:
+        """Bring the commits of branch ``source`` (a name like ``"dev"``, or
+        its :class:`Ledger`) into this branch.
+
+        If this branch has no commits of its own since ``source`` was created
+        from it, it moves forward to ``source``'s latest commit. Otherwise one
+        merge commit applies ``source``'s changes, and ``strategy`` settles
+        properties both branches changed:
+
+        - ``"take-both"``: keep both values.
+        - ``"abort"``: change nothing and raise :class:`ConflictError`.
+        - ``"take-source"``: ``source``'s value wins.
+        - ``"take-branch"``: this branch's value wins.
+
+        Preview a merge with :meth:`merge_preview`.
+        """
+        self._require_unrestricted("merge")
+        raw = self._connection._native.merge(self._id, self._source_branch(source), strategy)
+        return MergeResult(**raw)
+
+    def merge_preview(
+        self,
+        source: str | Ledger,
+        *,
+        strategy: MergeStrategy = "take-both",
+        details: bool = False,
+        changes: bool = False,
+        changes_after: str | None = None,
+        validate: bool = True,
+        conflicts: bool = True,
+        max_commits: int | None = 500,
+        max_conflicts: int | None = 200,
+        max_changes: int | None = 500,
+    ) -> MergePreview:
+        """What :meth:`merge` of ``source`` would do, without doing it.
+
+        - ``strategy``: the one to judge ``mergeable`` by.
+        - ``details``: include what each side wrote to each conflict.
+        - ``changes``: include the net facts the merge would bring in, at most
+          ``max_changes`` of them per call; pass the result's
+          ``changes_after`` back to read the next page.
+        - ``validate=False`` skips checking the merged state against the
+          ledger's SHACL shapes.
+        - ``conflicts=False`` skips finding conflicts, the costly part on
+          branches that have drifted far apart.
+        - ``max_commits`` and ``max_conflicts`` cap the lists returned, not the
+          work; ``None`` lifts a cap.
+        """
+        self._require_unrestricted("merge_preview")
+        if changes_after is not None and not changes:
+            raise InvalidRequestError("changes_after needs changes=True")
+        options = {
+            "strategy": strategy,
+            "conflicts": conflicts,
+            "details": details,
+            "changes": changes,
+            "changes_after": changes_after,
+            "validate": validate,
+            "max_commits": max_commits,
+            "max_conflicts": max_conflicts,
+            "max_changes": max_changes,
+        }
+        native = self._connection._native
+        return _merge_preview(native.merge_preview(self._id, self._source_branch(source), options))
+
+    def rebase(self, *, strategy: RebaseStrategy = "take-both") -> RebaseResult:
+        """Replay this branch's own commits on top of the latest commit of the
+        branch it was created from, as if it had been created from there.
+
+        ``strategy`` settles properties both branches changed: ``"take-both"``
+        keeps both values, ``"abort"`` changes nothing and raises
+        :class:`ConflictError`, ``"take-source"`` lets the source branch's
+        value win, ``"take-branch"`` lets this branch's win, and ``"skip"``
+        drops each of this branch's commits that conflicts.
+        """
+        self._require_unrestricted("rebase")
+        return RebaseResult(**self._connection._native.rebase(self._id, strategy))
+
+    def revert(
+        self,
+        commits: CommitRef | list[CommitRef],
+        *,
+        strategy: RevertStrategy = "abort",
+    ) -> RevertResult:
+        """Undo one commit or several, in one new commit.
+
+        A commit is named by its ``t``, its id, a prefix of its hex digest, or
+        a :class:`Commit`. ``strategy`` settles properties that later commits
+        changed again: ``"abort"`` changes nothing and raises
+        :class:`ConflictError`, ``"take-source"`` undoes them anyway, and
+        ``"take-branch"`` keeps the later values. Merge commits cannot be
+        reverted.
+
+        Preview a revert with :meth:`revert_preview`.
+        """
+        self._require_unrestricted("revert")
+        native = self._connection._native
+        return RevertResult(**native.revert(self._id, _commit_refs(commits), strategy))
+
+    def revert_preview(
+        self,
+        commits: CommitRef | list[CommitRef],
+        *,
+        strategy: RevertStrategy = "abort",
+        validate: bool = True,
+        conflicts: bool = True,
+        max_commits: int | None = 500,
+        max_conflicts: int | None = 200,
+    ) -> RevertPreview:
+        """What :meth:`revert` would do, without doing it. ``strategy`` is the
+        one to judge ``revertable`` by; the other options are as for
+        :meth:`merge_preview`."""
+        self._require_unrestricted("revert_preview")
+        options = {
+            "strategy": strategy,
+            "conflicts": conflicts,
+            "validate": validate,
+            "max_commits": max_commits,
+            "max_conflicts": max_conflicts,
+        }
+        native = self._connection._native
+        return _revert_preview(native.revert_preview(self._id, _commit_refs(commits), options))
+
+    def _create_branch(self, name: str, at: tuple[str, Any] | None) -> Ledger:
+        self._require_unrestricted("branch")
+        return Ledger(self._connection, self._connection._native.create_branch(self._id, name, at))
+
+    def _source_branch(self, source: str | Ledger) -> str:
+        """The branch name of ``source``, which must be a branch of this ledger."""
+        ledger_id = source.id if isinstance(source, Ledger) else source
+        name, sep, branch = ledger_id.partition(":")
+        if not sep:
+            return ledger_id
+        if name != self._id.partition(":")[0]:
+            raise InvalidRequestError(f"{ledger_id!r} is not a branch of {self._id!r}")
+        return branch
 
     def export(
         self,
@@ -428,7 +548,7 @@ class Ledger:
         return text
 
     def _require_unrestricted(self, operation: str) -> None:
-        # Export, archive, and set_context bypass policy enforcement entirely.
+        # These operations bypass policy enforcement entirely.
         if self._policy is not None:
             raise PermissionDeniedError(
                 f"{operation} is not subject to policy, so it is not available on a "
@@ -491,6 +611,10 @@ class Snapshot:
     ) -> str | None:
         """Export the data as of this snapshot; see :meth:`Ledger.export`."""
         return self._ledger._export(path, format, graph, all_graphs, context, ("t", self.t))
+
+    def branch(self, name: str) -> Ledger:
+        """Create branch ``name`` from this past state; see :meth:`Ledger.branch`."""
+        return self._ledger._create_branch(name, ("t", self.t))
 
     @property
     def ledger(self) -> str:
@@ -600,12 +724,27 @@ def _sparql_result(result: tuple[Any, ...]) -> Any:
     return result[1]
 
 
+def _commit_ref(commit: CommitRef) -> int | str:
+    if isinstance(commit, Commit):
+        if commit.id is None:
+            raise InvalidRequestError("that transaction changed nothing, so it has no commit")
+        return commit.id
+    if isinstance(commit, bool) or not isinstance(commit, (int, str)):
+        raise TypeError(f"a commit is a t, an id, a digest prefix, or a Commit, not {type(commit).__name__}")
+    return commit
+
+
+def _commit_refs(commits: CommitRef | list[CommitRef]) -> list[int | str]:
+    if isinstance(commits, (int, str, Commit)):
+        return [_commit_ref(commits)]
+    refs = [_commit_ref(c) for c in commits]
+    if not refs:
+        raise InvalidRequestError("name at least one commit")
+    return refs
+
+
 _F = "https://ns.flur.ee/db#"
 _IRI_FORBIDDEN = set('<>"{}|^`\\') | {chr(c) for c in range(0x21)}
-
-
-def _node(iri: str) -> IRI | BlankNode:
-    return BlankNode(iri[2:]) if iri.startswith("_:") else IRI(iri)
 
 
 def _iri_ref(iri: str) -> str:
