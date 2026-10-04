@@ -59,8 +59,21 @@ print(txn.committed)     # the Commit; an exception in the block rolls back
 ```
 
 A write that fails (bad syntax, denied by policy, a SHACL violation) raises at
-once and is left out. The commit holds only the net change, and if another
-commit lands first, the writes are staged again on top of it.
+once and is left out. The commit holds only the net change.
+
+If another commit lands first, a transaction that only wrote is staged again
+on top of it (each update's `WHERE` matches the new data). One that was also
+read raises `fluree.ConflictError` instead, since what it read may have
+decided what it wrote. To read and then write safely, hand the work to
+`transact`, which runs it again on a conflict:
+
+```python
+def birthday(txn):
+    (age,) = txn.query("SELECT ?age WHERE { ex:alice ex:age ?age }")[0]
+    txn.upsert({"@id": "ex:alice", "ex:age": age + 1})
+
+people.transact(birthday)
+```
 
 ## Querying
 

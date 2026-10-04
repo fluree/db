@@ -230,6 +230,27 @@ class Ledger:
             message=message,
         )
 
+    async def transact(self, fn: Callable[..., Awaitable[T]], /, *args: Any, **kwargs: Any) -> T:
+        """Run ``await fn(txn, *args, **kwargs)`` in a :class:`Transaction`
+        and commit it, running ``fn`` again if another commit lands first;
+        see :meth:`fluree.Ledger.transact`."""
+        for attempt in range(_sync._TRANSACT_ATTEMPTS):
+            txn = await self.transaction()
+            try:
+                result = await fn(txn, *args, **kwargs)
+                if txn._sync._native.is_open:
+                    await txn.commit()
+                return result
+            except fluree.ConflictError:
+                if txn._sync._native.is_open or attempt + 1 == _sync._TRANSACT_ATTEMPTS:
+                    await txn._close()
+                    raise
+            except BaseException:
+                await txn._close()
+                raise
+            await asyncio.sleep(_sync._backoff(attempt))
+        raise AssertionError("unreachable")
+
     def transaction(self, *, message: str | None = None) -> _Opening[Transaction]:
         """Open a :class:`Transaction`. Await it, or use it with ``async with``
         to commit on a clean exit and roll back on an exception."""
@@ -501,6 +522,10 @@ class Transaction:
 
     async def rollback(self) -> None:
         await _call(self._sync.rollback)
+
+    async def _close(self) -> None:
+        if self._sync._native.is_open:
+            await self.rollback()
 
 
 class CypherTransaction:

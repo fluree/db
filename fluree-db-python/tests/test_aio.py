@@ -155,3 +155,26 @@ def test_errors_are_the_sync_api_errors():
                 await ledger.query("SELECT nonsense")
 
     run(main())
+
+
+def test_transact_reruns_on_conflict():
+    age_query = "PREFIX ex: <http://example.org/> SELECT ?age WHERE { ex:alice ex:age ?age }"
+
+    async def main():
+        async with fluree.aio.connect(":memory:") as conn:
+            ledger = await conn.create("people")
+            await ledger.insert({"@context": CONTEXT, "@id": "ex:alice", "ex:age": 30})
+            attempts = []
+
+            async def birthday(txn):
+                (age,) = (await txn.query(age_query))[0]
+                attempts.append(age)
+                if len(attempts) == 1:
+                    await ledger.upsert({"@context": CONTEXT, "@id": "ex:alice", "ex:age": 50})
+                await txn.upsert({"@context": CONTEXT, "@id": "ex:alice", "ex:age": age + 1})
+                return age + 1
+
+            assert await ledger.transact(birthday) == 51
+            assert attempts == [30, 50]
+
+    run(main())

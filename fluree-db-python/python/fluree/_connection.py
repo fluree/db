@@ -5,10 +5,12 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import random as _random
+import time as _time
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Mapping
-from typing import Any, Literal as _Literal, Union
+from collections.abc import Callable, Mapping
+from typing import Any, Literal as _Literal, TypeVar, Union
 
 from fluree import _fluree
 from fluree._cypher import CypherResult, CypherTransaction, _params, _result
@@ -33,9 +35,23 @@ from fluree._records import (
 )
 from fluree._results import Rows, RowStream
 from fluree._terms import IRI
-from fluree.errors import InvalidRequestError, PermissionDeniedError
+from fluree.errors import ConflictError, InvalidRequestError, PermissionDeniedError
 
 MEMORY = ":memory:"
+
+_T = TypeVar("_T")
+_TRANSACT_ATTEMPTS = 10
+
+
+def _backoff(attempt: int) -> float:
+    """Seconds to wait before retry ``attempt + 1``: exponential, jittered,
+    capped at a second."""
+    return min(1.0, 0.005 * 2**attempt) * (0.5 + _random.random() / 2)
+
+
+def _close(txn: Any) -> None:
+    if txn._native.is_open:
+        txn.rollback()
 
 Query = Union[str, dict[str, Any]]
 Data = Union[str, dict[str, Any], list[Any], "os.PathLike[str]"]
@@ -275,6 +291,36 @@ class Ledger:
             self._id, kind, payload, graph, allow_empty, dry_run, self._policy, message
         )
         return Commit(**commit)
+
+    def transact(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+        """Run ``fn(txn, *args, **kwargs)`` in a :class:`Transaction` and
+        commit it, running ``fn`` again in a fresh transaction if another
+        commit lands first. Returns what ``fn`` returns.
+
+        The way to read and then write safely: values ``fn`` reads from
+        ``txn`` are re-read on every attempt, so what it writes never rests
+        on data another writer has since changed. ``fn`` may commit ``txn``
+        itself (to pass a ``message``); otherwise it is committed when ``fn``
+        returns. An exception from ``fn`` rolls the transaction back and
+        propagates.
+        """
+        for attempt in range(_TRANSACT_ATTEMPTS):
+            txn = self.transaction()
+            try:
+                result = fn(txn, *args, **kwargs)
+                if txn._native.is_open:
+                    txn.commit()
+                return result
+            except ConflictError:
+                # Only a conflict on this transaction's own commit is retried.
+                if txn._native.is_open or attempt + 1 == _TRANSACT_ATTEMPTS:
+                    _close(txn)
+                    raise
+            except BaseException:
+                _close(txn)
+                raise
+            _time.sleep(_backoff(attempt))
+        raise AssertionError("unreachable")
 
     def transaction(self, *, message: str | None = None) -> Transaction:
         """Open a :class:`Transaction`: several writes, each seeing the ones
@@ -852,9 +898,17 @@ class Transaction:
     visible on the ledger until :meth:`commit`.
 
     A fact that one write adds and a later one removes (or the reverse) is
-    left out of the commit, so the commit holds only the net change. The
-    writes stage against the ledger as it was when the transaction began; if
-    another commit lands first, they are staged again on top of it.
+    left out of the commit, so the commit holds only the net change.
+
+    The writes stage against the ledger as it was when the transaction
+    began. If another commit lands first:
+
+    - a transaction that was only written to is staged again on top of it —
+      each update's ``WHERE`` matches the new data;
+    - a transaction that was also *read* (``query``, ``cypher``, ``explain``)
+      raises :class:`ConflictError` on :meth:`commit`, since what was read may
+      have decided what was written. Run it again, or use
+      :meth:`Ledger.transact`, which does.
 
     As a context manager it commits on a clean exit and rolls back on an
     exception; :attr:`committed` holds the resulting :class:`Commit`.

@@ -3,7 +3,7 @@ import threading
 import pytest
 
 import fluree
-from fluree import Change, IRI, InvalidRequestError, PermissionDeniedError
+from fluree import IRI, Change, ConflictError, InvalidRequestError, PermissionDeniedError
 
 EX = "http://example.org/"
 F = "https://ns.flur.ee/db#"
@@ -112,12 +112,93 @@ def test_a_concurrent_commit_is_built_on(ledger):
     ledger.insert(person("alice", "Alice", 30))
     txn = ledger.transaction()
     txn.update(BIRTHDAY)
-    assert people(txn) == [("Alice", 31)]
     ledger.upsert({"@context": CONTEXT, "@id": "ex:alice", "ex:age": 50})
     ledger.insert(person("carol", "Carol"))
     txn.commit()
-    # Staged again over the commits that landed first: 50 + 1.
+    # Never read, so staged again over the commits that landed first: 50 + 1.
     assert people(ledger) == [("Alice", 51), ("Carol", None)]
+
+
+def age_of_alice(source):
+    return source.query(AGE)[0].age
+
+
+AGE = f"PREFIX ex: <{EX}> SELECT ?age WHERE {{ ex:alice ex:age ?age }}"
+
+
+def set_age(ledger_or_txn, age):
+    ledger_or_txn.upsert({"@context": CONTEXT, "@id": "ex:alice", "ex:age": age})
+
+
+def test_a_read_transaction_refuses_a_moved_ledger(ledger):
+    ledger.insert(person("alice", "Alice", 30))
+    txn = ledger.transaction()
+    set_age(txn, age_of_alice(txn) + 1)  # decided from what it read
+    set_age(ledger, 50)  # another writer, meanwhile
+    with pytest.raises(ConflictError):
+        txn.commit()
+    assert age_of_alice(ledger) == 50  # their update is not lost
+
+
+def test_transact_reruns_on_conflict(ledger):
+    ledger.insert(person("alice", "Alice", 30))
+    attempts = []
+
+    def birthday(txn):
+        attempts.append(age_of_alice(txn))
+        if len(attempts) == 1:
+            set_age(ledger, 50)  # another writer lands mid-transaction
+        set_age(txn, attempts[-1] + 1)
+        return attempts[-1] + 1
+
+    assert ledger.transact(birthday) == 51
+    assert attempts == [30, 50]
+    assert age_of_alice(ledger) == 51
+
+
+def test_transact_arguments_and_self_commit(ledger):
+    def add(txn, name, *, age):
+        txn.insert(person(name.lower(), name, age))
+        return txn.commit(message=f"add {name}")
+
+    commit = ledger.transact(add, "Alice", age=30)
+    assert ledger.log()[0].message == "add Alice" and commit.t == 1
+
+
+def test_transact_rolls_back_on_error(ledger):
+    def broken(txn):
+        txn.insert(person("alice", "Alice"))
+        raise RuntimeError("nope")
+
+    with pytest.raises(RuntimeError):
+        ledger.transact(broken)
+    assert people(ledger) == []
+
+
+def test_transact_gives_up(ledger):
+    ledger.insert(person("alice", "Alice", 30))
+    attempts = []
+
+    def always_raced(txn):
+        attempts.append(1)
+        set_age(txn, age_of_alice(txn) + 1)
+        set_age(ledger, 100 + len(attempts))
+
+    with pytest.raises(ConflictError):
+        ledger.transact(always_raced)
+    assert len(attempts) == 10
+
+
+def test_transact_retries_only_its_own_commit(ledger):
+    attempts = []
+
+    def unrelated(txn):
+        attempts.append(1)
+        raise ConflictError("not from this transaction's commit")
+
+    with pytest.raises(ConflictError):
+        ledger.transact(unrelated)
+    assert attempts == [1]
 
 
 def test_message_on_single_writes(ledger):
