@@ -2454,6 +2454,75 @@ async fn multi_operation_sparql_update_executes_sequentially() {
     );
 }
 
+/// A fact an operation reverses back to how the request found it is not in
+/// the commit: last-wins netting alone committed `INSERT x ; DELETE x` as a
+/// retraction of a fact the ledger never held, visible in its history.
+#[tokio::test]
+async fn multi_operation_reversed_facts_leave_no_commit() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "multiop-net:main";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let update = |sparql: &'static str| {
+        let fluree = fluree.clone();
+        async move {
+            fluree
+                .graph(ledger_id)
+                .transact()
+                .sparql_update(sparql)
+                .commit()
+                .await
+                .expect("commit")
+                .receipt
+        }
+    };
+
+    let seeded =
+        update(r#"PREFIX ex: <http://example.org/ns/> INSERT DATA { ex:s ex:p "kept" }"#).await;
+    assert_eq!(seeded.t, 1);
+
+    for (sparql, what) in [
+        (
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { ex:tmp ex:p "transient" } ;
+               DELETE DATA { ex:tmp ex:p "transient" }"#,
+            "insert-then-delete of a new fact",
+        ),
+        (
+            r#"PREFIX ex: <http://example.org/ns/>
+               DELETE DATA { ex:s ex:p "kept" } ;
+               INSERT DATA { ex:s ex:p "kept" }"#,
+            "delete-then-reinsert of an existing fact",
+        ),
+    ] {
+        let receipt = update(sparql).await;
+        assert_eq!(
+            (receipt.t, receipt.flake_count),
+            (1, 0),
+            "{what} must commit nothing"
+        );
+    }
+
+    // A reversal is netted only against what the base held: a fact the
+    // base has, asserted again and then deleted, is still deleted.
+    let receipt = update(
+        r#"PREFIX ex: <http://example.org/ns/>
+           INSERT DATA { ex:s ex:p "kept" } ;
+           DELETE DATA { ex:s ex:p "kept" }"#,
+    )
+    .await;
+    assert_eq!((receipt.t, receipt.retract_count), (2, 1));
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/ns/> SELECT ?o WHERE { ex:s ex:p ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert!(json["results"]["bindings"].as_array().unwrap().is_empty());
+}
+
 /// PR-1454 review: atomicity on mid-request failure. Op 1 stages
 /// successfully; op 2 — evaluating over op 1's data, proving it actually
 /// ran against the sequential state — fails at staging. The request must

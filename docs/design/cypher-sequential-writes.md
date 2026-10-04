@@ -31,7 +31,8 @@ atomic commit" for SPARQL 1.1 `;`-separated updates (roadmap D-10,
 `Fluree::stage_transaction_from_txns`): each operation stages against a
 *virtual state* (base + prior operations' flakes applied as a commit-record-less
 overlay via `LedgerState::apply_staged_flakes_for_sequential_staging`), flakes
-fold last-wins per fact identity re-stamped to the single final `t+1`, and one
+fold last-wins per fact identity re-stamped to the single final `t+1` (a fact a
+later operation reversed back to how the base had it is dropped), and one
 commit publishes.
 
 The Cypher driver builds on the same machinery, factored into a reusable

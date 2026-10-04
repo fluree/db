@@ -391,7 +391,7 @@ impl Fluree {
 
         let final_state = stager.state().clone();
         Ok(SequentialOutcome {
-            stage_result: stager.finish()?,
+            stage_result: stager.finish().await?,
             return_result,
             final_state,
         })
